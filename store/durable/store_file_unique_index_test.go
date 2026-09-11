@@ -171,6 +171,12 @@ func TestDurableUniqueIndexBatchUsesFinalImages(t *testing.T) {
 			err, store.ErrUniqueIndexViolation)
 	}
 	if err := collection.Update(func(batch *WriteBatch) error {
+		return batch.Put([]byte("d"), []byte(`{"u":"x"}`))
+	}); !errors.Is(err, store.ErrUniqueIndexViolation) {
+		t.Fatalf("insert overlay unique conflict = %v, want %v",
+			err, store.ErrUniqueIndexViolation)
+	}
+	if err := collection.Update(func(batch *WriteBatch) error {
 		return batch.Put([]byte("c"), []byte(`{"u":{}}`))
 	}); !errors.Is(err, store.ErrIndexScalar) {
 		t.Fatalf("batch container = %v, want %v", err, store.ErrIndexScalar)
@@ -551,7 +557,7 @@ func TestRecoveryJournalUniqueEmptyBaseFinalImage(t *testing.T) {
 
 func TestRecoveryJournalUniqueSameLeafExactPressure(t *testing.T) {
 	const (
-		rows    = 65
+		rows    = 130
 		indexes = 17
 	)
 	options := syncPrimaryJournalTestOptions()
@@ -636,7 +642,8 @@ func TestRecoveryJournalUniqueSameLeafExactPressure(t *testing.T) {
 	recoveryJournalReplayBatchEntryHook = func(
 		replayed *Collection, _ storeio.RecoveryRecord, _ int,
 	) error {
-		if replayed.automaticCheckpoints.Load() != 0 {
+		if replayed.automaticCheckpoints.Load() != 0 ||
+			replayed.primaryOverlayPressureFolds.Load() != 0 {
 			pressureCheckpointed = true
 		}
 		return nil
@@ -654,7 +661,7 @@ func TestRecoveryJournalUniqueSameLeafExactPressure(t *testing.T) {
 	defer recovered.Close()
 	defer file.Close()
 	if !pressureCheckpointed {
-		t.Fatal("same-leaf exact overlay pressure did not checkpoint")
+		t.Fatal("same-leaf exact overlay pressure did not fold")
 	}
 	for _, row := range []int{0, rows / 2, rows - 1} {
 		assertDurableRaw(

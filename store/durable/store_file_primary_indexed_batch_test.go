@@ -1,6 +1,7 @@
 package durable
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -133,6 +134,334 @@ func TestFilePrimaryIndexedBatchAtomicPublication(t *testing.T) {
 				t.Fatalf("post-checkpoint new postings = %v", got)
 			}
 		})
+	}
+}
+
+// TestFilePrimaryIndexedBatchStableSlotTermChangeKeepsOverlay pins the
+// Update hot path: existing-key replacements that keep posting slots publish
+// overlay records instead of folding a fresh exact epoch.
+func TestFilePrimaryIndexedBatchStableSlotTermChangeKeepsOverlay(t *testing.T) {
+	for _, lane := range primaryIndexedBatchLanes() {
+		t.Run(lane.name, func(t *testing.T) {
+			coll, file, _ := openPrimaryBatchStore(t, lane.options)
+			defer coll.Close()
+			defer file.Close()
+			for i, country := range []string{"old", "stay", "keep"} {
+				key := fmt.Sprintf("indexed-%d", i)
+				doc := []byte(fmt.Sprintf(`{"country":%q,"i":%d}`, country, i))
+				if _, err := coll.Put([]byte(key), doc); err != nil {
+					t.Fatalf("seed %s: %v", key, err)
+				}
+			}
+			if err := coll.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if coll.primaryEpoch == nil || !coll.primaryEpoch.overlayEmpty() {
+				t.Fatal("seed fold left an overlay window")
+			}
+			epoch := coll.primaryEpoch
+			if err := coll.Update(func(batch *WriteBatch) error {
+				if err := batch.Put(
+					[]byte("indexed-0"), []byte(`{"country":"new","i":0}`),
+				); err != nil {
+					return err
+				}
+				return batch.Put(
+					[]byte("indexed-1"), []byte(`{"country":"new","i":1}`),
+				)
+			}); err != nil {
+				t.Fatalf("indexed Update: %v", err)
+			}
+			if coll.primaryEpoch != epoch {
+				t.Fatal("stable-slot term change swapped a folded exact epoch")
+			}
+			if coll.primaryEpoch.overlayEmpty() {
+				t.Fatal("stable-slot term change emitted no overlay records")
+			}
+			if !coll.primaryUnifiedOverlay.hasPending() {
+				t.Fatal("existing indexed Update did not publish row overlay")
+			}
+			if len(coll.primaryPendingParents) != 0 {
+				t.Fatal("existing indexed Update dirtied primary leaves")
+			}
+			newCountry := primaryExactTestNeedle(t, `"new"`)
+			got := primaryExactTestKeys(t, coll, "country", newCountry)
+			slices.Sort(got)
+			if !slices.Equal(got, []string{"indexed-0", "indexed-1"}) {
+				t.Fatalf("live new postings = %v", got)
+			}
+			if got := primaryExactTestKeys(t, coll, "country", primaryExactTestNeedle(t, `"old"`)); len(got) != 0 {
+				t.Fatalf("live retained old postings = %v", got)
+			}
+			if err := coll.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if !coll.primaryEpoch.overlayEmpty() {
+				t.Fatal("checkpoint left overlay records")
+			}
+			if coll.primaryUnifiedOverlay.hasPending() {
+				t.Fatal("checkpoint left row overlay")
+			}
+			got = primaryExactTestKeys(t, coll, "country", newCountry)
+			slices.Sort(got)
+			if !slices.Equal(got, []string{"indexed-0", "indexed-1"}) {
+				t.Fatalf("post-checkpoint new postings = %v", got)
+			}
+		})
+	}
+}
+
+// TestFilePrimaryIndexedBatchInsertKeepsOverlay pins insert-only Updates on
+// the same unified overlay as point Put: hashed free slots, exact deltas, and
+// no dirty compact leaves until Flush.
+func TestFilePrimaryIndexedBatchInsertKeepsOverlay(t *testing.T) {
+	for _, lane := range primaryIndexedBatchLanes() {
+		t.Run(lane.name, func(t *testing.T) {
+			coll, file, _ := openPrimaryBatchStore(t, lane.options)
+			defer coll.Close()
+			defer file.Close()
+			for i, country := range []string{"old", "stay", "keep"} {
+				key := fmt.Sprintf("indexed-%d", i)
+				doc := []byte(fmt.Sprintf(`{"country":%q,"i":%d}`, country, i))
+				if _, err := coll.Put([]byte(key), doc); err != nil {
+					t.Fatalf("seed %s: %v", key, err)
+				}
+			}
+			if err := coll.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if coll.primaryEpoch == nil || !coll.primaryEpoch.overlayEmpty() {
+				t.Fatal("seed fold left an overlay window")
+			}
+			beforeLen := coll.Len()
+			epoch := coll.primaryEpoch
+			if err := coll.Update(func(batch *WriteBatch) error {
+				if err := batch.Put(
+					[]byte("indexed-3"), []byte(`{"country":"new","i":3}`),
+				); err != nil {
+					return err
+				}
+				return batch.Put(
+					[]byte("indexed-4"), []byte(`{"country":"new","i":4}`),
+				)
+			}); err != nil {
+				t.Fatalf("indexed insert Update: %v", err)
+			}
+			if coll.primaryEpoch != epoch {
+				t.Fatal("insert overlay swapped a folded exact epoch")
+			}
+			if coll.primaryEpoch.overlayEmpty() {
+				t.Fatal("insert overlay emitted no exact records")
+			}
+			if !coll.primaryUnifiedOverlay.hasPending() {
+				t.Fatal("insert Update did not publish row overlay")
+			}
+			if len(coll.primaryPendingParents) != 0 {
+				t.Fatal("insert Update dirtied primary leaves")
+			}
+			if got := coll.Len(); got != beforeLen+2 {
+				t.Fatalf("document count = %d, want %d", got, beforeLen+2)
+			}
+			newCountry := primaryExactTestNeedle(t, `"new"`)
+			got := primaryExactTestKeys(t, coll, "country", newCountry)
+			slices.Sort(got)
+			if !slices.Equal(got, []string{"indexed-3", "indexed-4"}) {
+				t.Fatalf("live insert postings = %v", got)
+			}
+			for _, key := range []string{"indexed-3", "indexed-4"} {
+				raw, found, err := coll.AppendRaw(nil, []byte(key))
+				if err != nil || !found || !bytes.Contains(raw, []byte(`"new"`)) {
+					t.Fatalf("live insert %s found=%v err=%v raw=%q",
+						key, found, err, raw)
+				}
+			}
+			if err := coll.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if !coll.primaryEpoch.overlayEmpty() {
+				t.Fatal("checkpoint left overlay records")
+			}
+			if coll.primaryUnifiedOverlay.hasPending() {
+				t.Fatal("checkpoint left row overlay")
+			}
+			got = primaryExactTestKeys(t, coll, "country", newCountry)
+			slices.Sort(got)
+			if !slices.Equal(got, []string{"indexed-3", "indexed-4"}) {
+				t.Fatalf("post-checkpoint insert postings = %v", got)
+			}
+		})
+	}
+}
+
+// TestFilePrimaryIndexedBatchInsertRefillsEmptyLeaf pins overlay insert into a
+// leaf whose last row was deleted. Point Put already refills that empty marker;
+// the batch path must do the same without dirtying the compact leaf.
+func TestFilePrimaryIndexedBatchInsertRefillsEmptyLeaf(t *testing.T) {
+	lane := primaryIndexedBatchLanes()[0]
+	coll, file, _ := openPrimaryBatchStore(t, lane.options)
+	defer coll.Close()
+	defer file.Close()
+	if _, err := coll.Put([]byte("only"), []byte(`{"country":"old","i":0}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := coll.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := coll.Delete([]byte("only")); err != nil || !deleted {
+		t.Fatalf("delete last row = %v,%v", deleted, err)
+	}
+	if err := coll.Update(func(batch *WriteBatch) error {
+		return batch.Put([]byte("refilled"), []byte(`{"country":"new","i":1}`))
+	}); err != nil {
+		t.Fatalf("refill insert: %v", err)
+	}
+	if !coll.primaryUnifiedOverlay.hasPending() {
+		t.Fatal("empty-leaf insert did not publish row overlay")
+	}
+	if len(coll.primaryPendingParents) != 0 {
+		t.Fatal("empty-leaf insert dirtied primary leaves")
+	}
+	raw, found, err := coll.AppendRaw(nil, []byte("refilled"))
+	if err != nil || !found || !bytes.Contains(raw, []byte(`"new"`)) {
+		t.Fatalf("refilled row found=%v err=%v raw=%q", found, err, raw)
+	}
+	gone, found, err := coll.AppendRaw(nil, []byte("only"))
+	if err != nil || found {
+		t.Fatalf("deleted row found=%v err=%v raw=%q", found, err, gone)
+	}
+	newCountry := primaryExactTestNeedle(t, `"new"`)
+	if got := primaryExactTestKeys(t, coll, "country", newCountry); !slices.Equal(got, []string{"refilled"}) {
+		t.Fatalf("refilled postings = %v", got)
+	}
+	if err := coll.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	raw, found, err = coll.AppendRaw(nil, []byte("refilled"))
+	if err != nil || !found || !bytes.Contains(raw, []byte(`"new"`)) {
+		t.Fatalf("post-checkpoint refilled found=%v err=%v raw=%q", found, err, raw)
+	}
+}
+
+// TestFilePrimaryIndexedBatchInsertOverlaysUntilSplit pins insert Updates on
+// ordinary overlay until a leaf must split. The split absorbs the pending
+// overlay into the replacement children instead of checkpoint-folding a compact
+// leaf first, then leftover inserts overlay into the new topology.
+func TestFilePrimaryIndexedBatchInsertOverlaysUntilSplit(t *testing.T) {
+	options := primaryLargeTopologyOptions(512)
+	options.Indexes = []store.IndexDefinition{
+		{Name: "country", Paths: []string{"/country"}},
+	}
+	coll, _ := openBatchCollection(t, options)
+	if _, err := coll.Put([]byte("seed"), []byte(`{"country":"seed","i":-1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := coll.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	const batch = 16
+	const batches = 20
+	overlayOnly := 0
+	splitSeen := false
+	for round := 0; round < batches; round++ {
+		beforeSplits := coll.Stats().PrimaryLeafSplits
+		if err := coll.Update(func(wb *WriteBatch) error {
+			for i := 0; i < batch; i++ {
+				n := round*batch + i
+				key := fmt.Sprintf("row-%04d", n)
+				doc := fmt.Sprintf(`{"country":"new","i":%d}`, n)
+				if err := wb.Put([]byte(key), []byte(doc)); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("insert batch %d: %v", round, err)
+		}
+		if coll.Stats().PrimaryLeafSplits > beforeSplits {
+			splitSeen = true
+		}
+		if coll.Stats().PrimaryLeafSplits == beforeSplits &&
+			coll.primaryUnifiedOverlay.hasPending() &&
+			len(coll.primaryPendingParents) == 0 {
+			overlayOnly++
+		}
+		last := []byte(fmt.Sprintf("row-%04d", round*batch+batch-1))
+		raw, found, err := coll.AppendRaw(nil, last)
+		if err != nil || !found || !bytes.Contains(raw, []byte(`"new"`)) {
+			t.Fatalf("live insert %s found=%v err=%v raw=%q", last, found, err, raw)
+		}
+	}
+	if overlayOnly == 0 {
+		t.Fatal("insert batches never stayed on row overlay")
+	}
+	if !splitSeen {
+		t.Fatal("stacked overlay inserts never split the seeded leaf")
+	}
+	want := uint64(1 + batch*batches)
+	if got := coll.Len(); got != want {
+		t.Fatalf("document count = %d, want %d", got, want)
+	}
+	needle := primaryExactTestNeedle(t, `"new"`)
+	if got := primaryExactTestKeys(t, coll, "country", needle); len(got) != batch*batches {
+		t.Fatalf("live insert postings = %d, want %d", len(got), batch*batches)
+	}
+	if err := coll.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if coll.primaryUnifiedOverlay.hasPending() {
+		t.Fatal("checkpoint left row overlay")
+	}
+	if got := primaryExactTestKeys(t, coll, "country", needle); len(got) != batch*batches {
+		t.Fatalf("post-checkpoint insert postings = %d, want %d", len(got), batch*batches)
+	}
+}
+
+// TestFilePrimaryIndexedBatchExactOverlayPressureKeepsRowOverlay fills the
+// exact overlay past its record cap with slot-stable term changes. The batch
+// path must fold and keep using row overlay instead of dirtying compact
+// primary leaves.
+func TestFilePrimaryIndexedBatchExactOverlayPressureKeepsRowOverlay(t *testing.T) {
+	lane := primaryIndexedBatchLanes()[0]
+	coll, file, _ := openPrimaryBatchStore(t, lane.options)
+	defer coll.Close()
+	defer file.Close()
+	key := []byte("pressure-0")
+	if _, err := coll.Put(key, []byte(`{"country":"c0","i":0}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := coll.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if len(coll.primaryPendingParents) != 0 {
+		t.Fatal("seed flush left dirty primary leaves")
+	}
+	updates := primaryExactOverlayTermRecordCap/2 + 32
+	for i := 1; i <= updates; i++ {
+		doc := []byte(fmt.Sprintf(`{"country":"c%d","i":0}`, i))
+		if err := coll.Update(func(batch *WriteBatch) error {
+			return batch.Put(key, doc)
+		}); err != nil {
+			t.Fatalf("update %d: %v", i, err)
+		}
+		if len(coll.primaryPendingParents) != 0 {
+			t.Fatalf("update %d dirtied primary leaves", i)
+		}
+	}
+	if coll.primaryOverlayPressureFolds.Load() == 0 &&
+		coll.automaticCheckpoints.Load() == 0 {
+		t.Fatal("exact overlay pressure did not fold and retry overlay")
+	}
+	want := fmt.Sprintf(`{"country":"c%d","i":0}`, updates)
+	got, found, err := coll.AppendRaw(nil, key)
+	if err != nil || !found || string(got) != want {
+		t.Fatalf("final value found=%v err=%v got=%s want=%s", found, err, got, want)
+	}
+	gotKeys := primaryExactTestKeys(
+		t, coll, "country",
+		primaryExactTestNeedle(t, fmt.Sprintf(`"c%d"`, updates)),
+	)
+	if len(gotKeys) != 1 || gotKeys[0] != "pressure-0" {
+		t.Fatalf("final posting = %v", gotKeys)
 	}
 }
 

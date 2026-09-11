@@ -17,6 +17,9 @@ const (
 	fileFormatMaxExactIndexes = 64
 
 	primaryExactCatalogHeaderBytes = 16
+	// primaryExactCatalogEntryFixedBytes is one level-0 record without its
+	// routing prefix: PageRef, first tile, flags, prefix length, member.
+	primaryExactCatalogEntryFixedBytes = PageRefSize + 4 + 1 + 1 + 2
 	// PrimaryExactCatalogPrefixBytes caps the routing prefix of a leaf's
 	// first term stored in its catalog entry. The prefix routes multi-TB
 	// probes without opening leaves; resident probes route through the
@@ -210,6 +213,9 @@ func OpenPrimaryExactRootPage(
 			}
 		}
 	}
+	// Detach from src: callers release the page lease before walking
+	// catalogs, and a tiny cache can recycle the root buffer under the view.
+	view.payload = append([]byte(nil), payload...)
 	return view, nil
 }
 
@@ -235,12 +241,14 @@ func (v PrimaryExactRootView) Entry(index uint32) (PrimaryExactRootEntry, bool) 
 }
 
 // PrimaryExactCatalogEntry is one ordered term-leaf reference in a level-0
-// catalog page: the leaf, the first posting tile of its first term (pieces of
-// one giant term share the term and ascend by tile), the content-derived
-// piece/run-cut flags, and a routing prefix of the first term's canonical
-// bytes (truncated to PrimaryExactCatalogPrefixBytes).
+// catalog page: the durable pack or singleton leaf, the member ordinal inside
+// a pack (zero for a singleton leaf page), the first posting tile of its
+// first term (pieces of one giant term share the term and ascend by tile),
+// the content-derived piece/run-cut flags, and a routing prefix of the first
+// term's canonical bytes (truncated to PrimaryExactCatalogPrefixBytes).
 type PrimaryExactCatalogEntry struct {
 	Leaf      PageRef
+	Member    uint16
 	FirstTile uint32
 	Flags     uint8
 	Prefix    []byte
@@ -248,7 +256,19 @@ type PrimaryExactCatalogEntry struct {
 
 // PrimaryExactCatalogEntryBytes is the encoded size of one level-0 entry.
 func PrimaryExactCatalogEntryBytes(prefixLen int) int {
-	return PageRefSize + 4 + 1 + 1 + prefixLen
+	return primaryExactCatalogEntryFixedBytes + prefixLen
+}
+
+func validPrimaryExactCatalogLeaf(ref PageRef, member uint16, bounds PrimaryExactIndexBounds) bool {
+	switch ref.Kind {
+	case PagePrimaryExactPack:
+		return member < uint16(PrimaryExactPackMaxMembers) &&
+			validPrimaryExactRef(ref, PagePrimaryExactPack, bounds)
+	case PagePrimaryExactLeaf:
+		return member == 0 && validPrimaryExactRef(ref, PagePrimaryExactLeaf, bounds)
+	default:
+		return false
+	}
 }
 
 // EncodePrimaryExactCatalogLeafPage writes one level-0 catalog page: ordered
@@ -261,7 +281,11 @@ func EncodePrimaryExactCatalogLeafPage(
 	for i := range entries {
 		if len(entries[i].Prefix) > PrimaryExactCatalogPrefixBytes ||
 			entries[i].Flags&^primaryExactCatalogFlags != 0 ||
-			entries[i].Leaf.Kind != PagePrimaryExactLeaf {
+			(entries[i].Leaf.Kind != PagePrimaryExactPack &&
+				entries[i].Leaf.Kind != PagePrimaryExactLeaf) ||
+			entries[i].Leaf.Kind == PagePrimaryExactPack &&
+				int(entries[i].Member) >= PrimaryExactPackMaxMembers ||
+			entries[i].Leaf.Kind == PagePrimaryExactLeaf && entries[i].Member != 0 {
 			return nil, fmt.Errorf("%w: exact catalog entry", ErrInvalidWrite)
 		}
 		payloadBytes += PrimaryExactCatalogEntryBytes(len(entries[i].Prefix))
@@ -290,8 +314,9 @@ func EncodePrimaryExactCatalogLeafPage(
 		binary.LittleEndian.PutUint32(payload[at:at+4], entry.FirstTile)
 		payload[at+4] = entry.Flags
 		payload[at+5] = uint8(len(entry.Prefix))
-		copy(payload[at+6:], entry.Prefix)
-		at += 6 + len(entry.Prefix)
+		binary.LittleEndian.PutUint16(payload[at+6:at+8], entry.Member)
+		copy(payload[at+8:], entry.Prefix)
+		at += 8 + len(entry.Prefix)
 	}
 	page := dst
 	if _, err := sealInitializedPage(page); err != nil {
@@ -387,18 +412,19 @@ func OpenPrimaryExactCatalogPage(
 		}
 		return view, nil
 	}
-	// Level 0: sequential variable-length entries; validate shape, leaf
-	// references, and prefix ordering. Prefixes are truncated, so ordering is
-	// enforced as non-decreasing by prefix bytes with strictly increasing
-	// first tiles between full-key (untruncated) duplicates — one giant
-	// term's stripe pieces. The online Open path cross-checks every prefix,
-	// tile, and flag against the admitted leaf content itself.
+	// Level 0: sequential variable-length entries; validate shape, pack or
+	// singleton-leaf references, member ordinals, and prefix ordering. Prefixes
+	// are truncated, so ordering is enforced as non-decreasing by prefix
+	// bytes with strictly increasing first tiles between full-key
+	// (untruncated) duplicates — one giant term's stripe pieces. The online
+	// Open path cross-checks every prefix, tile, and flag against the admitted
+	// leaf content itself.
 	at := primaryExactCatalogHeaderBytes
 	var previousPrefix []byte
 	previousTile := uint32(0)
 	previousFull := false
 	for i := uint32(0); i < view.count; i++ {
-		if at+PageRefSize+6 > len(payload) {
+		if at+primaryExactCatalogEntryFixedBytes > len(payload) {
 			return PrimaryExactCatalogView{}, primaryExactCorrupt("catalog entry")
 		}
 		record := payload[at:]
@@ -409,13 +435,14 @@ func OpenPrimaryExactCatalogPage(
 		tile := binary.LittleEndian.Uint32(record[PageRefSize : PageRefSize+4])
 		flags := record[PageRefSize+4]
 		prefixLen := int(record[PageRefSize+5])
+		member := binary.LittleEndian.Uint16(record[PageRefSize+6 : PageRefSize+8])
 		if flags&^primaryExactCatalogFlags != 0 ||
 			prefixLen > PrimaryExactCatalogPrefixBytes ||
-			at+PageRefSize+6+prefixLen > len(payload) ||
-			!validPrimaryExactRef(leaf, PagePrimaryExactLeaf, bounds) {
+			at+primaryExactCatalogEntryFixedBytes+prefixLen > len(payload) ||
+			!validPrimaryExactCatalogLeaf(leaf, member, bounds) {
 			return PrimaryExactCatalogView{}, primaryExactCorrupt("catalog entry")
 		}
-		prefix := record[PageRefSize+6 : PageRefSize+6+prefixLen]
+		prefix := record[PageRefSize+8 : PageRefSize+8+prefixLen]
 		full := prefixLen < PrimaryExactCatalogPrefixBytes
 		if i != 0 {
 			switch bytes.Compare(previousPrefix, prefix) {
@@ -428,7 +455,7 @@ func OpenPrimaryExactCatalogPage(
 			}
 		}
 		previousPrefix, previousTile, previousFull = prefix, tile, full
-		at += PageRefSize + 6 + prefixLen
+		at += primaryExactCatalogEntryFixedBytes + prefixLen
 	}
 	if at != len(payload) {
 		return PrimaryExactCatalogView{}, primaryExactCorrupt("catalog length")
@@ -465,16 +492,19 @@ func (v PrimaryExactCatalogView) ForEachEntry(
 		prefixLen := int(record[PageRefSize+5])
 		entry := PrimaryExactCatalogEntry{
 			Leaf: decodePageRef(record[:PageRefSize]),
+			Member: binary.LittleEndian.Uint16(
+				record[PageRefSize+6 : PageRefSize+8],
+			),
 			FirstTile: binary.LittleEndian.Uint32(
 				record[PageRefSize : PageRefSize+4],
 			),
 			Flags:  record[PageRefSize+4],
-			Prefix: record[PageRefSize+6 : PageRefSize+6+prefixLen],
+			Prefix: record[PageRefSize+8 : PageRefSize+8+prefixLen],
 		}
 		if err := fn(entry); err != nil {
 			return err
 		}
-		at += PageRefSize + 6 + prefixLen
+		at += primaryExactCatalogEntryFixedBytes + prefixLen
 	}
 	return nil
 }
@@ -483,7 +513,7 @@ func validPrimaryExactRef(
 	ref PageRef, kind PageKind, bounds PrimaryExactIndexBounds,
 ) bool {
 	if !bounds.valid() || ref.Kind != kind ||
-		!validPhysicalPageSize(ref.Length) ||
+		!validPageExtentSize(kind, ref.Length) ||
 		ref.Length < bounds.AllocationQuantum ||
 		ref.Length > bounds.MaxPageSize ||
 		ref.Length%bounds.AllocationQuantum != 0 ||

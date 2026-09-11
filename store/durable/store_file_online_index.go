@@ -824,7 +824,7 @@ func (b *onlineIndexBuild) prepareResident(
 		if uint32(candidateID) == targetID {
 			leaves, cutErr := c.foldEmitCutLeaves(
 				fresh, terms,
-				storeio.IndexTermLeafCutBudget(uint32(c.options.MaxPageSize)),
+				storeio.IndexTermLeafPackCutBudget(uint32(c.options.MaxPageSize)),
 				fresh.exact[candidateID].leaves[:0], false,
 			)
 			if cutErr != nil {
@@ -1353,24 +1353,14 @@ func (c *Collection) stageOnlineExactRootLocked(
 				resident.catalog = resident.catalog[:0]
 				continue
 			}
-			staged := make(
-				[]primaryExactStagedLeaf, 0, len(resident.leaves),
+			staged, err := stagePackedExactLeaves(
+				tx, uint32(c.options.PageSize),
+				uint32(c.options.MaxPageSize), uint32(candidateID),
+				resident.leaves, nil, &c.exactPackEncoder,
+				&c.exactPackWire,
 			)
-			for leafAt := range resident.leaves {
-				leaf := &resident.leaves[leafAt]
-				ref, err := stagePrimaryExactLeafPage(
-					tx, leaf.encoded, uint32(c.options.PageSize),
-					uint32(c.options.MaxPageSize),
-				)
-				if err != nil {
-					return storeio.PageRef{}, err
-				}
-				leaf.ref = ref
-				staged = append(staged, primaryExactStagedLeaf{
-					ref: ref, firstKey: leaf.firstKey,
-					firstTile: leaf.firstTile, piece: leaf.piece,
-					runCut: leaf.runCut,
-				})
+			if err != nil {
+				return storeio.PageRef{}, err
 			}
 			catalogRef, pages, err := stagePrimaryExactCatalog(
 				tx, uint32(c.options.PageSize),

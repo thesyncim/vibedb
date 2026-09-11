@@ -58,25 +58,23 @@ import (
 // first nil slot sees a consistent prefix of the single writer's publications.
 
 // Overlay capacity. Sized for the pressure-driven churn window (records
-// ≈ 32 B × record-emitting mutations per window); the mixed harness's
-// 64-mutation checkpoint cadence uses ~130 records per window, and the
-// capacity below covers ~2,000 record-emitting mutations before the
-// ensure-step escalates to a checkpoint (the
-// ensureBufferedPrimaryMutationCapacity discipline — fold and empty, never
-// resize under readers). A single mutation that cannot fit even an empty
-// overlay (a rebase group over a huge bucket, a run of maximum-size terms)
-// escalates to a resident fold instead, which installs a fresh epoch with an
-// empty overlay — correctness never depends on these sizes.
+// ≈ 32 B × record-emitting mutations per window). Slot-stable indexed
+// Updates now stay on the overlay path across folds, so the window can
+// cover a useful burst (~4,000 record-emitting mutations) before a
+// foreground fold. Intern bytes stay 1 MiB so 256-byte compound terms
+// hit the entry/record caps first. A single mutation that cannot fit
+// even an empty overlay escalates to a resident fold instead — correctness
+// never depends on these sizes. Tables stay 4× their entry caps so reader
+// probes stay ~1 slot at the worst admitted load factor (1/4). Never
+// resize under readers.
 const (
-	primaryExactOverlayTermRecordCap = 4096
-	primaryExactOverlayTileRecordCap = 4096
-	primaryExactOverlayTermEntryCap  = 2048
-	primaryExactOverlayTileEntryCap  = 2048
-	// Tables are 4× their entry caps so reader probes stay ~1 slot at the
-	// worst admitted load factor (1/4).
-	primaryExactOverlayTermTableSlots = 8192
+	primaryExactOverlayTermRecordCap  = 8192
+	primaryExactOverlayTileRecordCap  = 4096
+	primaryExactOverlayTermEntryCap   = 4096
+	primaryExactOverlayTileEntryCap   = 2048
+	primaryExactOverlayTermTableSlots = 16384
 	primaryExactOverlayTileTableSlots = 8192
-	primaryExactOverlayTermBytesCap   = 128 << 10
+	primaryExactOverlayTermBytesCap   = 1 << 20
 )
 
 // primaryExactTermRecord is one absolute posting overwrite: term (named by
@@ -927,7 +925,7 @@ func (c *Collection) prepareDirtyPrimaryExactFold(
 	if err := c.foldLiveTable(epoch, fresh, atGen, pending); err != nil {
 		return primaryExactPrepared{}, err
 	}
-	budget := storeio.IndexTermLeafCutBudget(uint32(c.options.MaxPageSize))
+	budget := storeio.IndexTermLeafPackCutBudget(uint32(c.options.MaxPageSize))
 
 	for indexID := range epoch.exact {
 		resident := &epoch.exact[indexID]

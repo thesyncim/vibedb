@@ -145,6 +145,9 @@ type verifyWalker struct {
 	reachable []reachExtent
 	haveLast  bool
 	lastKey   []byte
+
+	exactSeen        map[storeio.PageRef]struct{}
+	exactPackDecoder storeio.PrimaryExactPackDecoder
 }
 
 type reachExtent struct {
@@ -192,6 +195,14 @@ func (w *verifyWalker) walkExactIndexes() {
 		return
 	}
 	w.count("primary-exact-root")
+	if err := w.exactPackDecoder.Prepare(
+		storeio.PrimaryExactPackMaxPayloadBytes - storeio.PrimaryExactPackHeaderBytes,
+	); err != nil {
+		w.fail("primary-exact-root", rootRef.Offset, rootRef.LogicalID,
+			"pack decoder: %v", err)
+		return
+	}
+	w.exactSeen = make(map[storeio.PageRef]struct{})
 	for indexID := 0; indexID < view.Len(); indexID++ {
 		entry, ok := view.Entry(uint32(indexID))
 		if !ok {
@@ -202,7 +213,7 @@ func (w *verifyWalker) walkExactIndexes() {
 		if entry.LeafCount == 0 {
 			continue
 		}
-		state := verifyExactCatalogState{}
+		state := verifyExactCatalogState{indexID: uint32(indexID)}
 		w.walkExactCatalogPage(entry.Catalog, bounds, true, &state)
 		if state.leaves != entry.LeafCount {
 			w.fail("primary-exact-root", rootRef.Offset, rootRef.LogicalID,
@@ -216,6 +227,9 @@ type verifyExactCatalogState struct {
 	previousKey  []byte
 	previousTile uint32
 	leaves       uint32
+	indexID      uint32
+	packRef      storeio.PageRef
+	packPage     []byte
 }
 
 // walkExactCatalogPage proves one PagePrimaryExactCatalog page and, for a
@@ -255,18 +269,60 @@ func (w *verifyWalker) walkExactCatalogPage(
 		return
 	}
 	if err := view.ForEachEntry(func(entry storeio.PrimaryExactCatalogEntry) error {
-		w.record(entry.Leaf, "primary-exact-leaf")
-		leaf, ok := w.openAndCheckIdentity(entry.Leaf, "primary-exact-leaf")
-		if !ok {
-			return nil
+		kind := "primary-exact-leaf"
+		if entry.Leaf.Kind == storeio.PagePrimaryExactPack {
+			kind = "primary-exact-pack"
 		}
-		payload, err := storeio.OpenPrimaryExactLeafPage(
-			leaf, entry.Leaf, bounds,
-		)
-		if err != nil {
-			w.fail("primary-exact-leaf", entry.Leaf.Offset,
-				entry.Leaf.LogicalID, "admit: %v", err)
-			return nil
+		if _, seen := w.exactSeen[entry.Leaf]; !seen {
+			if w.exactSeen == nil {
+				w.exactSeen = make(map[storeio.PageRef]struct{})
+			}
+			w.exactSeen[entry.Leaf] = struct{}{}
+			w.record(entry.Leaf, kind)
+			if entry.Leaf.Kind == storeio.PagePrimaryExactPack {
+				w.count("primary-exact-pack")
+			}
+		}
+		var payload []byte
+		switch entry.Leaf.Kind {
+		case storeio.PagePrimaryExactPack:
+			if entry.Leaf != state.packRef {
+				page, ok := w.openAndCheckIdentity(entry.Leaf, kind)
+				if !ok {
+					return nil
+				}
+				if err := storeio.OpenPrimaryExactPackPage(
+					page, entry.Leaf, bounds, &w.exactPackDecoder,
+				); err != nil {
+					w.fail(kind, entry.Leaf.Offset, entry.Leaf.LogicalID,
+						"admit: %v", err)
+					return nil
+				}
+				state.packRef = entry.Leaf
+				state.packPage = page
+			}
+			raw, err := w.exactPackDecoder.Member(int(entry.Member), state.indexID)
+			if err != nil {
+				w.fail(kind, entry.Leaf.Offset, entry.Leaf.LogicalID,
+					"pack member %d: %v", entry.Member, err)
+				return nil
+			}
+			payload = raw
+		default:
+			state.packRef = storeio.PageRef{}
+			leaf, ok := w.openAndCheckIdentity(entry.Leaf, kind)
+			if !ok {
+				return nil
+			}
+			opened, err := storeio.OpenPrimaryExactLeafPage(
+				leaf, entry.Leaf, bounds,
+			)
+			if err != nil {
+				w.fail(kind, entry.Leaf.Offset,
+					entry.Leaf.LogicalID, "admit: %v", err)
+				return nil
+			}
+			payload = opened
 		}
 		var allLive [storeio.TermPostingTileChunks]uint64
 		for i := range allLive {

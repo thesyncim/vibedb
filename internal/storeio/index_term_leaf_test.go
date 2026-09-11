@@ -36,6 +36,17 @@ func TestIndexTermLeafExactRangeAndAdaptivePostings(t *testing.T) {
 	if view.DictionaryLen() == 0 {
 		t.Fatal("repeated out-of-line dense payload was not dictionary encoded")
 	}
+	if got := view.FirstCanonical(); !bytes.Equal(got, fixture.terms[0].Key.Canonical) {
+		t.Fatalf("FirstCanonical = %x, want %x", got, fixture.terms[0].Key.Canonical)
+	}
+	if tile, ok := view.FirstPostingTile(); !ok {
+		t.Fatal("FirstPostingTile missed")
+	} else {
+		want := fixture.terms[0].Postings[0].Posting.TileID
+		if tile != want {
+			t.Fatalf("FirstPostingTile = %d, want %d", tile, want)
+		}
+	}
 
 	for i := range fixture.terms {
 		key := fixture.terms[i].Key.Canonical

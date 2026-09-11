@@ -21,6 +21,41 @@ import (
 // contains every logical mutation and its one journal record. It also avoids a
 // retry train of median splits. K is derived once from the canonical byte-aware
 // VCS1 planner and is bounded by the configured batch and tablet namespaces.
+func (c *Collection) canAbsorbOverlayIntoBatchTopology(
+	source storeio.BucketID,
+) bool {
+	if c == nil || c.primaryUnifiedOverlay == nil ||
+		!c.primaryUnifiedOverlay.hasPending() ||
+		len(c.primaryPendingParents) != 0 ||
+		len(c.primaryPendingOverflowRetire) != 0 {
+		return false
+	}
+	overlay := c.primaryUnifiedOverlay
+	return overlay.bucketCount.Load() == 1 && overlay.pendingBucket(source)
+}
+
+func (c *Collection) canAbsorbOverlayIntoBatchCOW(
+	source storeio.BucketID,
+) bool {
+	if c == nil || c.primaryUnifiedOverlay == nil ||
+		!c.primaryUnifiedOverlay.hasPending() ||
+		len(c.primaryPendingOverflowRetire) != 0 {
+		return false
+	}
+	overlay := c.primaryUnifiedOverlay
+	if overlay.bucketCount.Load() != 1 || !overlay.pendingBucket(source) {
+		return false
+	}
+	switch len(c.primaryPendingParents) {
+	case 0:
+		return true
+	case 1:
+		return c.primaryPendingParents[0].resident.Bucket == source
+	default:
+		return false
+	}
+}
+
 func (c *Collection) preparePrimaryBatchTopology(
 	_ *fileStoreState,
 	batch *WriteBatch,
@@ -29,20 +64,31 @@ func (c *Collection) preparePrimaryBatchTopology(
 	if batch == nil || len(offendingKey) == 0 {
 		return storeio.ErrInvalidWrite
 	}
-	// A structural transaction rebuilds sealed parent pages. Materialize every
-	// deferred leaf first, then derive the topology from that exact published cut.
-	if err := c.flushPendingForStructural(); err != nil {
-		return err
-	}
 	state := c.state.Load()
 	if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
 		return ErrClosed
 	}
-	if err := c.planPrimaryBatch(state, batch); err != nil {
-		return err
-	}
 	route, err := c.currentPrimaryResidentRoute(state, offendingKey)
 	if err != nil {
+		return err
+	}
+	absorb := c.canAbsorbOverlayIntoBatchTopology(route.Bucket)
+	if !absorb {
+		// A structural transaction rebuilds sealed parent pages. Materialize every
+		// deferred leaf first, then derive the topology from that exact published cut.
+		if err := c.flushPendingForStructural(); err != nil {
+			return err
+		}
+		state = c.state.Load()
+		if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
+			return ErrClosed
+		}
+		route, err = c.currentPrimaryResidentRoute(state, offendingKey)
+		if err != nil {
+			return err
+		}
+	}
+	if err := c.planPrimaryBatch(state, batch); err != nil {
 		return err
 	}
 	leafIndex := -1
@@ -83,6 +129,16 @@ func (c *Collection) preparePrimaryBatchTopology(
 	)
 	if err != nil {
 		return err
+	}
+	if absorb {
+		baseRows = slices.Grow(baseRows, storeio.CommonPrimaryLeafWideSlots)
+		appliedRows, applyErr := c.primaryUnifiedOverlay.applyBucket(
+			baseRows, route.Bucket, state.root.Generation,
+		)
+		if applyErr != nil {
+			return applyErr
+		}
+		baseRows = appliedRows
 	}
 	prospective, applied, err := c.mergePrimaryBatchLeafRows(
 		baseRows, &c.batchPrimaryLeaves[leafIndex], c.structuralRows[:0],
@@ -235,7 +291,8 @@ func (c *Collection) preparePrimaryBatchTopology(
 
 	tabletID := path.tablet.TabletID()
 	generation := state.root.Generation + 1
-	return c.commitPrimaryStructural(
+	c.absorbOverlayOnStructural = absorb
+	err = c.commitPrimaryStructural(
 		state, &path, structuralSplit,
 		func(tx *storeio.WriteTransaction) (
 			[]storeio.SegmentedTabletRouterLeaf, []storeio.PageRef,
@@ -245,6 +302,23 @@ func (c *Collection) preparePrimaryBatchTopology(
 			// load-bearing for deletes: a row removed by the logical batch still
 			// exists in this content-equivalent generation and must land in the
 			// range its key routes to.
+			if c.primaryExactActive() {
+				// Capture the source bucket's pre-split contribution from
+				// the held routing lease, so the commit diffs old against
+				// new instead of re-resolving the index. Floor zero reuses
+				// the source bucket; the remaining floors are fresh tiles.
+				if err := c.captureStructuralOldLocked(
+					route.Bucket, path.leafLease.Page(),
+					storeio.CommonPrimaryLeafBounds{
+						FileEnd:           tx.FileEnd(),
+						NextLogicalID:     tx.NextLogicalID(),
+						AllocationQuantum: uint32(c.options.PageSize),
+					},
+				); err != nil {
+					return nil, nil, nil, err
+				}
+				c.structuralExactOldReady = true
+			}
 			encoded := make([]storeio.PageRef, len(floors))
 			baseAt := 0
 			for rank := range floors {
@@ -338,6 +412,10 @@ func (c *Collection) preparePrimaryBatchTopology(
 			return final, []storeio.PageRef{currentLeaves[sourceIndex].ref}, nil, nil
 		},
 	)
+	if err != nil {
+		c.absorbOverlayOnStructural = false
+	}
+	return err
 }
 
 // planPrimaryBatchTopologyCuts refines a shared cut set until every resulting

@@ -818,6 +818,34 @@ func (v IndexTermLeafView) PostingLen() int    { return int(v.postingCount) }
 func (v IndexTermLeafView) DictionaryLen() int { return int(v.dictionaryN) }
 func (v IndexTermLeafView) EncodedBytes() int  { return len(v.encoded) }
 
+// FirstCanonical aliases the first term's restart key inside the admitted
+// encoded image. Term 0 is always a restart, so the full canonical bytes live
+// in the key stream. The leaf image is immutable after Open; callers must not
+// mutate the returned slice.
+func (v IndexTermLeafView) FirstCanonical() []byte {
+	if v.termCount == 0 {
+		return nil
+	}
+	record := v.descriptor(0)
+	start := int(v.keyAt) + int(binary.LittleEndian.Uint16(record[0:2]))
+	length := int(binary.LittleEndian.Uint16(record[4:6]))
+	end := start + length
+	if length == 0 || start < int(v.keyAt) || end > int(v.postingAt) || end > len(v.encoded) {
+		return nil
+	}
+	return v.encoded[start:end]
+}
+
+// FirstPostingTile returns the first live posting tile of term 0.
+func (v IndexTermLeafView) FirstPostingTile() (uint32, bool) {
+	if v.termCount == 0 {
+		return 0, false
+	}
+	it := v.matchAt(0).MaskIterator()
+	tileID, _, more := it.Next()
+	return tileID, more
+}
+
 // Lookup returns the exact term's first/count posting aggregate. Its internally
 // computed route selects candidates only; complete canonical bytes remain the
 // proof of identity, so a collision cannot produce a false match.

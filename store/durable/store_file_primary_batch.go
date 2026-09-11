@@ -26,6 +26,11 @@ var errPrimaryBatchExactCheckpointRequired = errors.New(
 	"vibedb: ordered primary stable-slot exact delta requires checkpoint",
 )
 
+// Ordinary overlay pressure folds the live window and retries a handful of
+// times, matching point Put. Declining to COW after the first exact-overlay
+// fill would rewrite compact primary leaves for the rest of a write burst.
+const primaryOrdinaryOverlayPressureRetries = 3
+
 func primaryUnifiedOverlayFoldExtent(
 	payloadBytes int, quantum, maxLeafBytes uint32,
 ) (uint32, bool) {
@@ -51,13 +56,16 @@ func primaryUnifiedOverlayFoldExtent(
 // route and document bytes (nil for a delete). Keys and values borrow the
 // WriteBatch arena, stable for the whole Update.
 type primaryBatchMutation struct {
-	key      []byte
-	value    []byte
-	stored   storeio.CommonPrimaryLeafValue
-	resident storeio.ResidentPrimaryRoute
-	remove   bool
-	found    bool
-	oldSlot  uint8
+	key            []byte
+	value          []byte
+	stored         storeio.CommonPrimaryLeafValue
+	resident       storeio.ResidentPrimaryRoute
+	remove         bool
+	found          bool
+	oldSlot        uint8
+	capturedOldRaw bool
+	oldRawOff      int
+	oldRawLen      int
 }
 
 // primaryBatchLeaf accumulates every mutation a batch routes to one leaf and the
@@ -81,6 +89,12 @@ type primaryBatchLeaf struct {
 	mutationEnd  int
 	stableSlots  bool
 	skip         bool
+	// basePage is a copy of the leaf's pre-batch page, kept only when the
+	// batch rewrites slots with exact indexes active. It lets exact-index
+	// preparation diff the base and final bucket contributions and emit
+	// overlay records solely for changed (term, tile) pairs instead of a
+	// whole-bucket rebase on every insert/delete batch.
+	basePage []byte
 }
 
 // stagedPrimaryBatch is the opaque product of stagePrimaryBatchLocked: dirty
@@ -93,7 +107,8 @@ type stagedPrimaryBatch struct {
 	state           *fileStoreState
 	generation      uint64
 	preparedExact   primaryExactPrepared
-	preparedOverlay *primaryUnifiedOverlayBatchPrepared
+	preparedOverlay primaryUnifiedOverlayBatchPrepared
+	overlayDocDelta int
 	live            bool
 }
 
@@ -189,9 +204,7 @@ func (c *Collection) applyPrimaryBatch(batch *WriteBatch) (bool, uint64, error) 
 	// this slice populated also falsely makes every later buffered journal-
 	// delta checkpoint ineligible.
 	c.batchPrimaryAdmitted = c.batchPrimaryAdmitted[:0]
-	c.publishPrimaryBatch(
-		staged.state, staged.generation, staged.preparedExact,
-	)
+	c.publishPrimaryBatch(staged)
 	if c.buffered() {
 		// Buffered-visible deposits its already-published batch's redo record
 		// for the shared group sync after the writer is released.
@@ -227,6 +240,384 @@ func (c *Collection) stagePrimaryBatchConditionalLocked(
 	batch *WriteBatch,
 ) (stagedPrimaryBatch, error) {
 	return c.stagePrimaryBatchForJournalLocked(batch, true)
+}
+
+// stagePrimaryBatchOrdinaryOverlayLocked publishes one inline Put batch
+// through the same unified row overlay as point Put, plus exact-index overlay
+// deltas. Replacements keep posting slots; inserts claim hashed free slots.
+// Primary leaves stay clean until Flush. Deletes, overflow, overlay tombstones,
+// and geometry that cannot fit decline to the compact COW path without mutating
+// overlay state. A declined overlay window is absorbed into that dirty COW
+// image (or into a later topology split) instead of barrier-folding first.
+// Overlay record or intern pressure folds the live window and retries so a
+// long indexed burst does not fall back to rewriting compact leaves.
+func (c *Collection) stagePrimaryBatchOrdinaryOverlayLocked(
+	batch *WriteBatch,
+) (staged stagedPrimaryBatch, handled bool, err error) {
+	if c == nil || batch == nil || len(batch.entries) == 0 ||
+		c.primaryUnifiedOverlay == nil || c.options.OpaqueValues {
+		return stagedPrimaryBatch{}, false, nil
+	}
+	if len(c.primaryPendingOverflowRetire) != 0 ||
+		len(c.primaryMutationAdmitted) != 0 ||
+		len(c.batchPrimaryAdmitted) != 0 {
+		return stagedPrimaryBatch{}, false, nil
+	}
+	for attempt := 0; attempt < primaryOrdinaryOverlayPressureRetries; attempt++ {
+		// A pending packed logical cut is a writer-exclusive barrier: the
+		// concurrent lane left state at the physical fold base, and this
+		// batch must publish against a physical generation. Classify it as
+		// a barrier fold, not overlay-window pressure.
+		if c.packedLogicalCutPending() {
+			if err := c.materializePrimaryParentsLocked(
+				primaryMaterializationBarrier,
+			); err != nil {
+				return stagedPrimaryBatch{}, true, err
+			}
+		}
+		staged, handled, pressure, err :=
+			c.tryStagePrimaryBatchOrdinaryOverlayLocked(batch)
+		if err != nil {
+			return staged, true, err
+		}
+		if handled {
+			return staged, true, nil
+		}
+		if !pressure {
+			return stagedPrimaryBatch{}, false, nil
+		}
+		if !c.primaryUnifiedOverlay.hasPending() &&
+			len(c.primaryPendingParents) == 0 {
+			return stagedPrimaryBatch{}, false, nil
+		}
+		if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
+			return stagedPrimaryBatch{}, true, err
+		}
+	}
+	return stagedPrimaryBatch{}, false, nil
+}
+
+func (c *Collection) primaryBatchShouldSkipInsertOverlay(
+	state *fileStoreState, batch *WriteBatch,
+) (bool, error) {
+	if c == nil || batch == nil || state == nil {
+		return false, nil
+	}
+	router := c.primaryRouter.Load()
+	overlay := c.primaryUnifiedOverlay
+	if router == nil || overlay == nil {
+		return false, nil
+	}
+	for ei := range batch.entries {
+		entry := batch.entries[ei]
+		if entry.remove {
+			return false, nil
+		}
+		key := batch.key(entry)
+		resident, err := c.currentPrimaryResidentRoute(state, key)
+		if err != nil {
+			return false, err
+		}
+		lease, err := router.AcquireLeaf(c.cache, resident)
+		if err != nil {
+			return false, err
+		}
+		stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+			lease.Page(), c.storeID, resident.Bucket,
+		)
+		lease.Release()
+		if !ok {
+			return false, nil
+		}
+		_, baseFound := stripe.FindKey(key)
+		_, disposition, _ := overlay.lookup(
+			resident.Bucket, resident.Hash, key, state.root.Generation,
+		)
+		switch disposition {
+		case primaryUnifiedOverlayValue:
+			return false, nil
+		case primaryUnifiedOverlayDeleted:
+			return false, nil
+		case primaryUnifiedOverlayMissing:
+			if baseFound {
+				return false, nil
+			}
+			return true, nil
+		default:
+			return false, nil
+		}
+	}
+	return false, nil
+}
+
+func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
+	batch *WriteBatch,
+) (staged stagedPrimaryBatch, handled bool, pressure bool, err error) {
+	state := c.state.Load()
+	if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
+		return stagedPrimaryBatch{}, false, false, nil
+	}
+	if state.root.Generation == 0 ||
+		state.root.Generation >= uint64(1)<<48 {
+		return stagedPrimaryBatch{}, true, false, storeio.ErrGenerationOrder
+	}
+	c.primaryUnifiedSeen = true
+	c.recyclePrimaryUnifiedOverlayIfSafe()
+	c.batchOverlayFilledEmpty = c.batchOverlayFilledEmpty[:0]
+	c.batchOverlayPlanned = false
+	if len(batch.entries) > 32 {
+		skip, skipErr := c.primaryBatchShouldSkipInsertOverlay(state, batch)
+		if skipErr != nil {
+			return stagedPrimaryBatch{}, true, false, skipErr
+		}
+		if skip {
+			return stagedPrimaryBatch{}, false, false, nil
+		}
+	}
+	if err := c.planPrimaryBatch(state, batch); err != nil {
+		return stagedPrimaryBatch{}, true, false, err
+	}
+	c.batchOverlayPlanned = true
+	if len(c.batchPrimaryLeaves) == 0 || len(c.batchPrimaryMutations) == 0 {
+		return stagedPrimaryBatch{}, false, false, nil
+	}
+	for index := range c.batchPrimaryMutations {
+		mutation := &c.batchPrimaryMutations[index]
+		if mutation.remove || mutation.stored.IsOverflow() ||
+			len(mutation.stored.Inline) == 0 ||
+			len(mutation.stored.Inline) > c.options.InlineValueBytes {
+			return stagedPrimaryBatch{}, false, false, nil
+		}
+	}
+
+	generation := state.root.Generation + 1
+	overlay := c.primaryUnifiedOverlay
+	maxPayload := storeio.CommonPrimaryLeafMaxExtentBytes -
+		storeio.PageHeaderSize - storeio.PageTrailerSize
+	c.batchOverlayMutations = c.batchOverlayMutations[:0]
+	c.batchOldRawArena = c.batchOldRawArena[:0]
+	overlayDocDelta := 0
+	router := c.primaryRouter.Load()
+	if router == nil {
+		return stagedPrimaryBatch{}, false, false, nil
+	}
+
+	for leafIndex := range c.batchPrimaryLeaves {
+		leaf := &c.batchPrimaryLeaves[leafIndex]
+		lease, acquireErr := router.AcquireLeaf(c.cache, leaf.resident)
+		if acquireErr != nil {
+			return stagedPrimaryBatch{}, true, false, acquireErr
+		}
+		if storeio.PrimaryLeafClass(lease.Page()) != storeio.CommonPrimaryLeafCompact {
+			lease.Release()
+			return stagedPrimaryBatch{}, false, false, nil
+		}
+		stripe, stripeOK := storeio.AdmittedCompactPrimaryStripe(
+			lease.Page(), c.storeID, leaf.resident.Bucket,
+		)
+		if !stripeOK {
+			lease.Release()
+			return stagedPrimaryBatch{}, true, false, storeio.ErrCommonPrimaryLeafCorrupt
+		}
+		if stripe.Len() > storeio.CommonPrimaryLeafWideSlots &&
+			state.root.IndexCount != 0 {
+			lease.Release()
+			return stagedPrimaryBatch{}, false, false, nil
+		}
+		pendingRaw, pendingRows := overlay.pendingBucketDeltas(leaf.resident.Bucket)
+		if stripe.Len()+pendingRows > storeio.CommonPrimaryLeafWideSlots &&
+			state.root.IndexCount != 0 {
+			lease.Release()
+			return stagedPrimaryBatch{}, false, false, nil
+		}
+		occupied := overlay.pendingInsertSlots(leaf.resident.Bucket)
+		leafWasEmpty := stripe.Len()+pendingRows == 0
+		filledEmpty := false
+		leafInserts := 0
+		rawDelta := 0
+		for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
+			mutation := &c.batchPrimaryMutations[mutationAt]
+			if mutation.resident.Bucket != leaf.resident.Bucket {
+				lease.Release()
+				return stagedPrimaryBatch{}, true, false,
+					storeio.ErrSegmentedTabletRouterCorrupt
+			}
+			rank, baseFound := stripe.FindKey(mutation.key)
+			current, disposition, overlaySlot := overlay.lookup(
+				leaf.resident.Bucket, mutation.resident.Hash, mutation.key,
+				state.root.Generation,
+			)
+			found := baseFound
+			stableSlot := uint8(0)
+			oldLen := 0
+			countDelta := 0
+			var oldRaw []byte
+			switch disposition {
+			case primaryUnifiedOverlayValue:
+				found = true
+				stableSlot = overlaySlot
+				oldLen = len(current)
+				oldRaw = current
+			case primaryUnifiedOverlayDeleted:
+				lease.Release()
+				return stagedPrimaryBatch{}, false, false, nil
+			case primaryUnifiedOverlayMissing:
+				if !baseFound {
+					if leaf.resident.Ref.Length ==
+						storeio.CommonPrimaryLeafMaxExtentBytes {
+						// A packed max-extent leaf still needs the COW builder
+						// to prove the prospective image before splitting.
+						lease.Release()
+						return stagedPrimaryBatch{}, false, false, nil
+					}
+					leafInserts++
+					if state.root.IndexCount != 0 &&
+						stripe.Len()+pendingRows+leafInserts >
+							storeio.CommonPrimaryLeafWideSlots {
+						lease.Release()
+						return stagedPrimaryBatch{}, false, false, nil
+					}
+					var slotOK bool
+					stableSlot, slotOK = stripe.ChooseInsertSlotHashed(
+						mutation.resident.Hash, occupied,
+					)
+					if !slotOK {
+						lease.Release()
+						return stagedPrimaryBatch{}, false, false, nil
+					}
+					occupied[stableSlot>>6] |= uint64(1) << uint(stableSlot&63)
+					countDelta = 1
+					if leafWasEmpty {
+						filledEmpty = true
+					}
+					break
+				}
+				if _, overflow := stripe.OverflowRef(rank); overflow {
+					lease.Release()
+					return stagedPrimaryBatch{}, false, false, nil
+				}
+				var slotOK bool
+				stableSlot, slotOK = stripe.PostingSlot(rank)
+				if !slotOK {
+					lease.Release()
+					return stagedPrimaryBatch{}, false, false, nil
+				}
+				var decoded bool
+				c.overflowValueScratch, decoded = stripe.AppendValue(
+					c.overflowValueScratch[:0], rank,
+				)
+				if !decoded {
+					lease.Release()
+					return stagedPrimaryBatch{}, true, false,
+						storeio.ErrCommonPrimaryLeafCorrupt
+				}
+				oldLen = len(c.overflowValueScratch)
+				oldRaw = c.overflowValueScratch
+			default:
+				lease.Release()
+				return stagedPrimaryBatch{}, true, false,
+					storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			if found && oldLen <= 0 {
+				lease.Release()
+				return stagedPrimaryBatch{}, false, false, nil
+			}
+			value := mutation.stored.Inline
+			if found &&
+				leaf.resident.Ref.Length == storeio.CommonPrimaryLeafMaxExtentBytes &&
+				!bytes.Equal(value, oldRaw) {
+				lease.Release()
+				return stagedPrimaryBatch{}, false, false, nil
+			}
+			mutation.found = found
+			mutation.oldSlot = stableSlot
+			mutationDelta := len(value) - oldLen
+			if !found {
+				mutationDelta = storeio.CommonPrimaryUnifiedInsertedTrivialBytes(
+					mutation.key, len(value),
+				)
+				if mutationDelta == 0 {
+					lease.Release()
+					return stagedPrimaryBatch{}, true, false, storeio.ErrInvalidWrite
+				}
+			} else {
+				off := len(c.batchOldRawArena)
+				c.batchOldRawArena = append(c.batchOldRawArena, oldRaw...)
+				mutation.oldRawOff = off
+				mutation.oldRawLen = len(oldRaw)
+				mutation.capturedOldRaw = true
+			}
+			rawDelta += mutationDelta
+			overlayDocDelta += countDelta
+			c.batchOverlayMutations = append(c.batchOverlayMutations, primaryUnifiedOverlayBatchMutation{
+				bucket:          leaf.resident.Bucket,
+				hash:            mutation.resident.Hash,
+				key:             mutation.key,
+				value:           value,
+				rawDelta:        mutationDelta,
+				countDelta:      countDelta,
+				kind:            primaryUnifiedOverlayPut,
+				stableSlot:      stableSlot,
+				fixedLeafBytes:  overlay.maxLeafBytes,
+				reservationWide: true,
+			})
+		}
+		if stripe.EncodedPayloadBytes()+pendingRaw+rawDelta > maxPayload {
+			// Uncompressed overlay reservation is not a topology signal.
+			// Decline to copy-on-write so compression can absorb the pending
+			// rows into the same leaf; split only if that image cannot encode.
+			lease.Release()
+			return stagedPrimaryBatch{}, false, false, nil
+		}
+		if filledEmpty {
+			c.batchOverlayFilledEmpty = append(
+				c.batchOverlayFilledEmpty, leaf.resident,
+			)
+		}
+		lease.Release()
+	}
+	if len(c.batchOverlayMutations) != len(c.batchPrimaryMutations) {
+		return stagedPrimaryBatch{}, false, false, nil
+	}
+	if err := c.validatePrimaryUniqueBatch(); err != nil {
+		return stagedPrimaryBatch{}, true, false, err
+	}
+	if overlayDocDelta != 0 {
+		if _, ok := fileLogicalDocumentCount(
+			state.root.DocumentCount, overlayDocDelta,
+		); !ok {
+			return stagedPrimaryBatch{}, true, false, storeio.ErrInvalidWrite
+		}
+	}
+	if c.state.Load() != state {
+		return stagedPrimaryBatch{}, false, false, nil
+	}
+	prepared, prepareErr := overlay.prepareBatch(generation, c.batchOverlayMutations)
+	if prepareErr != nil {
+		if errors.Is(prepareErr, storeio.ErrPageCachePinned) {
+			return stagedPrimaryBatch{}, false, overlay.hasPending(), nil
+		}
+		return stagedPrimaryBatch{}, true, false, prepareErr
+	}
+	preparedExact, exactPressure, exactErr :=
+		c.preparePrimaryBatchExactOverlayDeltas(generation)
+	if exactErr != nil {
+		overlay.abortBatch(&prepared)
+		return stagedPrimaryBatch{}, true, false, exactErr
+	}
+	if exactPressure {
+		overlay.abortBatch(&prepared)
+		c.unwindPrimaryExactPrepared(&preparedExact)
+		return stagedPrimaryBatch{}, false, overlay.hasPending(), nil
+	}
+	return stagedPrimaryBatch{
+		state:           state,
+		generation:      generation,
+		preparedExact:   preparedExact,
+		preparedOverlay: prepared,
+		overlayDocDelta: overlayDocDelta,
+		live:            true,
+	}, true, false, nil
 }
 
 // stagePrimaryBatchUnifiedOverlayLocked stages the narrow checkpoint-group
@@ -548,7 +939,7 @@ func (c *Collection) stagePrimaryBatchUnifiedOverlayLocked(
 	return stagedPrimaryBatch{
 		state:           state,
 		generation:      generation,
-		preparedOverlay: &prepared,
+		preparedOverlay: prepared,
 		live:            true,
 	}, true, nil
 }
@@ -625,9 +1016,18 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 		if staged, handled, err := c.stagePrimaryBatchUnifiedOverlayLocked(batch); handled {
 			return staged, err
 		}
+	} else if staged, handled, err := c.stagePrimaryBatchOrdinaryOverlayLocked(batch); handled {
+		return staged, err
 	}
+	c.absorbOverlayOnCOW = false
 	if c.primaryUnifiedOverlay.hasPending() {
-		if err := c.materializePrimaryParentsLocked(primaryMaterializationBarrier); err != nil {
+		absorb := c.batchOverlayPlanned && len(c.batchPrimaryLeaves) == 1 &&
+			c.canAbsorbOverlayIntoBatchCOW(c.batchPrimaryLeaves[0].resident.Bucket)
+		if absorb {
+			c.absorbOverlayOnCOW = true
+		} else if err := c.materializePrimaryParentsLocked(
+			primaryMaterializationBarrier,
+		); err != nil {
 			return stagedPrimaryBatch{}, err
 		}
 	}
@@ -684,6 +1084,7 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 		splitKey, generation, buildErr := c.buildPrimaryBatchLeaves(state)
 		if errors.Is(buildErr, ErrPrimaryLeafSplitRequired) {
 			lastErr = buildErr
+			c.absorbOverlayOnCOW = false
 			if group := c.checkpointGroup.Load(); group != nil &&
 				group.visibleTxn.Load() > group.certTxn.Load() {
 				// The failed leaf build has not admitted frames or prepared a
@@ -769,9 +1170,8 @@ func (c *Collection) unwindStagedPrimaryBatch(staged *stagedPrimaryBatch) {
 	if staged == nil || !staged.live {
 		return
 	}
-	if staged.preparedOverlay != nil {
-		c.primaryUnifiedOverlay.abortBatch(staged.preparedOverlay)
-		staged.preparedOverlay = nil
+	if staged.preparedOverlay.live {
+		c.primaryUnifiedOverlay.abortBatch(&staged.preparedOverlay)
 	}
 	c.unwindPrimaryExactPrepared(&staged.preparedExact)
 	c.unadmitPrimaryBatchLeaves()
@@ -829,15 +1229,15 @@ func (c *Collection) preparePrimaryBatchConditionalLocked(
 	return nil
 }
 
-// preparePrimaryBatchExact stages the exact-index half of one batch. Batch leaf
-// construction may reassign stable slots, so each touched leaf contributes one
-// absolute rebase group at the batch generation. All groups share one prepared
-// chain-head set and are installed with the primary router flips.
+// preparePrimaryBatchExact stages the exact-index half of one batch.
+// Slot-stable replacements (every existing PUT keeps its posting slot) emit
+// the same O(touched terms) overlay records as a point mutation. Leaves that
+// reassign slots still emit one absolute rebase group.
 //
 // The resident overlay is deliberately fixed-size. If the complete batch does
-// not fit, discard its unreachable records and build one fresh foreground epoch
-// from the final images of all touched buckets. This is the same bounded
-// pressure escape used by a single slot-reassigning mutation: publication stays
+// not fit, discard its unreachable records and either checkpoint (when a
+// live window already occupies the overlay) or build one fresh foreground
+// epoch from the final images of all touched buckets. Publication stays
 // atomic and no background or offline maintenance is required.
 func (c *Collection) preparePrimaryBatchExact(
 	state *fileStoreState, generation uint64,
@@ -846,6 +1246,7 @@ func (c *Collection) preparePrimaryBatchExact(
 	if epoch == nil {
 		return primaryExactPrepared{}, nil
 	}
+	certifiedReplay := c.journalReplaying && c.primaryUniqueReplayValidated
 	prepared := primaryExactPrepared{
 		active:         true,
 		gen:            generation,
@@ -872,18 +1273,24 @@ func (c *Collection) preparePrimaryBatchExact(
 				if !mutation.found {
 					continue
 				}
-				oldRaw, found, resolveErr := c.resolvePrimaryGraph(
-					c.overflowValueScratch[:0], state, mutation.key,
-				)
-				if resolveErr != nil {
-					c.unwindPrimaryExactPrepared(&prepared)
-					return primaryExactPrepared{}, resolveErr
+				var oldRaw []byte
+				if mutation.capturedOldRaw {
+					oldRaw = c.batchOldRawArena[mutation.oldRawOff : mutation.oldRawOff+mutation.oldRawLen]
+				} else {
+					resolved, found, resolveErr := c.resolvePrimaryGraph(
+						c.overflowValueScratch[:0], state, mutation.key,
+					)
+					if resolveErr != nil {
+						c.unwindPrimaryExactPrepared(&prepared)
+						return primaryExactPrepared{}, resolveErr
+					}
+					if !found {
+						c.unwindPrimaryExactPrepared(&prepared)
+						return primaryExactPrepared{}, storeio.ErrPrimaryExactIndexCorrupt
+					}
+					c.overflowValueScratch = resolved
+					oldRaw = resolved
 				}
-				if !found {
-					c.unwindPrimaryExactPrepared(&prepared)
-					return primaryExactPrepared{}, storeio.ErrPrimaryExactIndexCorrupt
-				}
-				c.overflowValueScratch = oldRaw
 				ok, deltaErr := c.preparePrimaryExactDeltaRaw(
 					epoch, &prepared, mutation.resident,
 					oldRaw, mutation.value, mutation.remove, true,
@@ -905,10 +1312,31 @@ func (c *Collection) preparePrimaryBatchExact(
 			continue
 		}
 		image := c.batchPrimaryLeafArena[leaf.imageOffset : leaf.imageOffset+leaf.imageLength]
-		ok, err := c.preparePrimaryExactRebase(
-			epoch, &prepared, image, leaf.resident.Bucket,
-			generation, bounds,
-		)
+		var ok bool
+		var err error
+		if len(leaf.basePage) != 0 {
+			// Slot-rewriting batch with the base page retained: publish
+			// records only for changed pairs instead of a whole-bucket
+			// rebase.
+			var checkpoint bool
+			ok, checkpoint, err = c.preparePrimaryExactBucketDiff(
+				epoch, &prepared, leaf.basePage, image,
+				leaf.resident.Bucket, generation, bounds,
+			)
+			if err == nil && !ok && checkpoint {
+				// The diff fits a drained window: fold the window with a
+				// checkpoint and retry the batch instead of rebuilding.
+				// The retry re-derives from the checkpoint's fresh epoch,
+				// so the same emission is guaranteed room.
+				c.unwindPrimaryExactPrepared(&prepared)
+				return primaryExactPrepared{}, errPrimaryBatchExactCheckpointRequired
+			}
+		} else {
+			ok, err = c.preparePrimaryExactRebase(
+				epoch, &prepared, image, leaf.resident.Bucket,
+				generation, bounds,
+			)
+		}
 		if err != nil {
 			c.unwindPrimaryExactPrepared(&prepared)
 			return primaryExactPrepared{}, err
@@ -918,14 +1346,18 @@ func (c *Collection) preparePrimaryBatchExact(
 			break
 		}
 	}
+	// Slot-stable batches, including indexed-field updates, publish overlay
+	// records. The checkpoint dirty-fold re-encodes only those terms; a full
+	// structural rebuild here was rewriting every leaf on every Update.
 	if !pressure {
 		return prepared, nil
 	}
 
 	c.unwindPrimaryExactPrepared(&prepared)
-	if stablePressure {
+	if stablePressure && (certifiedReplay || !epoch.overlayEmpty()) {
 		return primaryExactPrepared{}, errPrimaryBatchExactCheckpointRequired
 	}
+	c.primaryExactStructuralRebuilds.Add(1)
 	c.resetStructuralExactLocked()
 	defer c.resetStructuralExactLocked()
 	for i := range c.batchPrimaryLeaves {
@@ -943,6 +1375,52 @@ func (c *Collection) preparePrimaryBatchExact(
 	return c.prepareStructuralExactLocked(generation)
 }
 
+// preparePrimaryBatchExactOverlayDeltas stages exact overlay records for a
+// row-overlay batch. pressure asks the caller to fold the live overlay window
+// and retry rather than rebuild from leaf images the overlay path never
+// materialized.
+func (c *Collection) preparePrimaryBatchExactOverlayDeltas(
+	generation uint64,
+) (primaryExactPrepared, bool, error) {
+	epoch := c.primaryEpoch
+	if epoch == nil {
+		return primaryExactPrepared{}, false, nil
+	}
+	prepared := primaryExactPrepared{
+		active:         true,
+		gen:            generation,
+		termLinks:      c.exactTermLinkScratch[:0],
+		tileLinks:      c.exactTileLinkScratch[:0],
+		termRecordMark: epoch.termRecordN,
+		tileRecordMark: epoch.tileRecordN,
+	}
+	for i := range c.batchPrimaryMutations {
+		mutation := &c.batchPrimaryMutations[i]
+		if mutation.remove {
+			c.unwindPrimaryExactPrepared(&prepared)
+			return primaryExactPrepared{}, true, nil
+		}
+		var oldRaw []byte
+		if mutation.capturedOldRaw {
+			oldRaw = c.batchOldRawArena[mutation.oldRawOff : mutation.oldRawOff+mutation.oldRawLen]
+		}
+		ok, deltaErr := c.preparePrimaryExactDeltaRaw(
+			epoch, &prepared, mutation.resident,
+			oldRaw, mutation.value, false, mutation.found,
+			mutation.oldSlot, mutation.oldSlot, generation,
+		)
+		if deltaErr != nil {
+			c.unwindPrimaryExactPrepared(&prepared)
+			return primaryExactPrepared{}, false, deltaErr
+		}
+		if !ok {
+			c.unwindPrimaryExactPrepared(&prepared)
+			return primaryExactPrepared{}, true, nil
+		}
+	}
+	return prepared, false, nil
+}
+
 // planPrimaryBatch validates and routes every WriteBatch entry, groups the
 // mutations by the leaf they land in, and builds the batch's journal record —
 // every entry in WriteBatch order, so replay reproduces the group. An absent-key
@@ -953,6 +1431,7 @@ func (c *Collection) planPrimaryBatch(state *fileStoreState, batch *WriteBatch) 
 	c.batchPrimaryLeaves = c.batchPrimaryLeaves[:0]
 	c.batchPrimaryMutations = c.batchPrimaryMutations[:0]
 	c.batchJournalEntries = c.batchJournalEntries[:0]
+	c.batchOldRawArena = c.batchOldRawArena[:0]
 	if err := c.canonicalizePrimaryBatchValues(batch); err != nil {
 		return err
 	}
@@ -1259,6 +1738,7 @@ func (c *Collection) buildPrimaryBatchLeaves(
 ) ([]byte, uint64, error) {
 	baseGen := state.root.Generation
 	c.batchPrimaryLeafArena = c.batchPrimaryLeafArena[:0]
+	c.batchOldRawArena = c.batchOldRawArena[:0]
 	c.batchPrimaryOverflowVolatile = c.batchPrimaryOverflowVolatile[:0]
 	c.batchPrimaryOverflowDurable = c.batchPrimaryOverflowDurable[:0]
 	running := c.batchPrimaryOverflowFileEnd
@@ -1312,8 +1792,9 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	state *fileStoreState, baseGen uint64, li int,
 ) ([]byte, error) {
 	leaf := &c.batchPrimaryLeaves[li]
-	leaf.stableSlots = c.journalReplaying && c.primaryUniqueReplayValidated &&
+	replayStableSlots := c.journalReplaying && c.primaryUniqueReplayValidated &&
 		state.root.IndexCount != 0
+	leaf.stableSlots = replayStableSlots
 	inputBounds := c.primaryLeafBounds(state)
 	var (
 		path  filePrimaryMutationPath
@@ -1357,6 +1838,24 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	); err != nil {
 		return nil, err
 	}
+	if c.absorbOverlayOnCOW {
+		baseRows = slices.Grow(baseRows, storeio.CommonPrimaryLeafWideSlots)
+		appliedRows, applyErr := c.primaryUnifiedOverlay.applyBucket(
+			baseRows, leaf.resident.Bucket, state.root.Generation,
+		)
+		if applyErr != nil {
+			if errors.Is(applyErr, storeio.ErrCommonPrimaryLeafFull) {
+				c.primaryLeafSplitRequired.Add(1)
+				c.absorbOverlayOnCOW = false
+				return c.primaryBatchProspectiveSplitKey(appliedRows), errors.Join(
+					ErrPrimaryLeafSplitRequired, applyErr,
+				)
+			}
+			c.absorbOverlayOnCOW = false
+			return nil, applyErr
+		}
+		baseRows = appliedRows
+	}
 	leaf.initialLen = len(baseRows)
 	leaf.docDelta = 0
 	final, applied, err := c.mergePrimaryBatchLeafRows(
@@ -1371,9 +1870,21 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		leaf.skip = true
 		return nil, nil
 	}
-	if leaf.stableSlots {
+	if replayStableSlots {
 		for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
 			if !c.batchPrimaryMutations[mutationAt].found {
+				leaf.stableSlots = false
+				break
+			}
+		}
+	} else if state.root.IndexCount != 0 && len(final) == len(baseRows) {
+		// An ordinary all-existing PUT batch can retain every row's posting
+		// slot. Inserts, deletes, and mixed topology keep the established
+		// placement and exact-rebase path below.
+		leaf.stableSlots = true
+		for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
+			mutation := &c.batchPrimaryMutations[mutationAt]
+			if !mutation.found || mutation.remove {
 				leaf.stableSlots = false
 				break
 			}
@@ -1402,26 +1913,61 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		}
 	}
 	leaf.frameGen = baseGen + 1
-	image, err := storeio.EncodeBestCompactPrimaryStripe(
-		c.primaryLeafScratch,
-		storeio.CommonPrimaryLeafHeader{
-			StoreID: c.storeID, Generation: leaf.frameGen,
-			Bucket: leaf.resident.Bucket,
-		},
-		c.storeID, final, c.primaryUnifiedBuilder,
-	)
-	if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
-		c.primaryLeafSplitRequired.Add(1)
-		return c.primaryBatchProspectiveSplitKey(final), errors.Join(
-			ErrPrimaryLeafSplitRequired, err,
+	var image []byte
+	if leaf.stableSlots {
+		c.batchPrimaryReplacements = c.batchPrimaryReplacements[:0]
+		for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
+			mutation := &c.batchPrimaryMutations[mutationAt]
+			c.batchPrimaryReplacements = append(
+				c.batchPrimaryReplacements,
+				storeio.CommonPrimaryUnifiedReplacement{
+					Key: mutation.key, Value: mutation.value, Slot: mutation.oldSlot,
+				},
+			)
+		}
+		patched, ok, patchErr := stripe.PatchCompactPrimaryStripeReplacements(
+			c.primaryLeafScratch, leaf.frameGen,
+			c.batchPrimaryReplacements, c.primaryUnifiedBuilder,
 		)
+		c.primaryCompactColumnPatchAttempts.Add(1)
+		if patchErr != nil {
+			return nil, patchErr
+		}
+		if ok {
+			c.primaryCompactColumnPatches.Add(1)
+			image = patched
+		}
 	}
-	if err != nil {
-		return nil, err
+	if image == nil {
+		encoded, err := storeio.EncodeBestCompactPrimaryStripe(
+			c.primaryLeafScratch,
+			storeio.CommonPrimaryLeafHeader{
+				StoreID: c.storeID, Generation: leaf.frameGen,
+				Bucket: leaf.resident.Bucket,
+			},
+			c.storeID, final, c.primaryUnifiedBuilder,
+		)
+		if errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
+			c.primaryLeafSplitRequired.Add(1)
+			return c.primaryBatchProspectiveSplitKey(final), errors.Join(
+				ErrPrimaryLeafSplitRequired, err,
+			)
+		}
+		if err != nil {
+			return nil, err
+		}
+		image = encoded
 	}
 	leaf.imageOffset = len(c.batchPrimaryLeafArena)
 	c.batchPrimaryLeafArena = append(c.batchPrimaryLeafArena, image...)
 	leaf.imageLength = len(c.batchPrimaryLeafArena) - leaf.imageOffset
+	if !leaf.stableSlots && c.primaryEpoch != nil && !c.absorbOverlayOnCOW {
+		// Slot-rewriting batch on an indexed collection: retain the base
+		// page so exact preparation can diff contributions. Overlay-absorbed
+		// leaves keep the whole-bucket rebase (the base image alone no
+		// longer describes the read-rule state once overlay rows merge in).
+		leaf.basePage = append(leaf.basePage[:0], page...)
+	}
 	return nil, nil
 }
 
@@ -1472,6 +2018,15 @@ func (c *Collection) mergePrimaryBatchLeafRows(
 		default:
 			mutation.found = true
 			mutation.oldSlot = base.Slot
+			// Copy inline bodies now: RenderRecords aliases mutation scratch
+			// that the next leaf reset, and prepare must not re-read the graph.
+			if !base.Value.IsOverflow() && len(base.Value.Inline) > 0 {
+				off := len(c.batchOldRawArena)
+				c.batchOldRawArena = append(c.batchOldRawArena, base.Value.Inline...)
+				mutation.oldRawOff = off
+				mutation.oldRawLen = len(base.Value.Inline)
+				mutation.capturedOldRaw = true
+			}
 			if !mutation.remove {
 				final = append(final, storeio.CommonPrimaryLeafRecord{
 					Key: mutation.key, Value: mutation.stored, Slot: base.Slot,
@@ -1614,18 +2169,9 @@ func (c *Collection) unadmitPrimaryBatchLeaves() {
 // publish precede the retirement scans, so a reader admitted before the fence
 // is seen by those scans and its frame is deferred, and a reader arriving after
 // the fence takes the gated slow path against the new root.
-func (c *Collection) publishPrimaryBatch(
-	state *fileStoreState,
-	generation uint64,
-	preparedExact primaryExactPrepared,
-) {
+func (c *Collection) publishPrimaryBatch(staged stagedPrimaryBatch) {
 	c.snapshotGate.Lock()
-	c.publishPrimaryBatchGateHeld(stagedPrimaryBatch{
-		state:         state,
-		generation:    generation,
-		preparedExact: preparedExact,
-		live:          true,
-	})
+	c.publishPrimaryBatchGateHeld(staged)
 	c.snapshotGate.Unlock()
 }
 
@@ -1637,16 +2183,31 @@ func (c *Collection) publishPrimaryBatch(
 func (c *Collection) publishPrimaryBatchGateHeld(staged stagedPrimaryBatch) {
 	state := staged.state
 	generation := staged.generation
-	if staged.preparedOverlay != nil {
+	if staged.preparedOverlay.live {
 		nextRoot := state.root
 		nextRoot.Generation = generation
+		if staged.overlayDocDelta != 0 {
+			if nextCount, ok := fileLogicalDocumentCount(
+				state.root.DocumentCount, staged.overlayDocDelta,
+			); ok {
+				nextRoot.DocumentCount = nextCount
+			}
+		}
 		nextState := &fileStoreState{
 			root: nextRoot, fileEnd: state.fileEnd,
 			freeHead: state.freeHead,
 		}
 		c.beginReaderFence()
-		c.primaryUnifiedOverlay.publishBatch(staged.preparedOverlay)
-		c.primaryRouter.Load().AdvanceGeneration(generation)
+		c.primaryUnifiedOverlay.publishBatch(&staged.preparedOverlay)
+		c.installPrimaryExactResidentLocked(staged.preparedExact)
+		router := c.primaryRouter.Load()
+		router.AdvanceGeneration(generation)
+		for _, route := range c.batchOverlayFilledEmpty {
+			if router.ClearEmpty(route) {
+				c.removePrimaryEmptyLeaf()
+			}
+		}
+		c.batchOverlayFilledEmpty = c.batchOverlayFilledEmpty[:0]
 		c.pageValidator.update(nextState)
 		c.publishFileState(nextState)
 		c.endReaderFence()
@@ -1697,6 +2258,10 @@ func (c *Collection) publishPrimaryBatchGateHeld(staged stagedPrimaryBatch) {
 	c.installPrimaryExactResidentLocked(preparedExact)
 	c.pageValidator.update(nextState)
 	c.publishFileState(nextState)
+	if c.absorbOverlayOnCOW {
+		c.primaryUnifiedOverlay.markFolded(generation, false)
+		c.absorbOverlayOnCOW = false
+	}
 	for _, prev := range c.batchPrimaryPrevVolatile {
 		c.retirePrimaryVolatileRefLocked(prev)
 	}

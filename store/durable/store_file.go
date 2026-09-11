@@ -200,6 +200,12 @@ type Collection struct {
 	// infallible link at publish).
 	exactTermLinkScratch []primaryExactTermLink
 	exactTileLinkScratch []primaryExactTileLink
+	// exactPackEncoder is the writer-owned pack workspace reused across
+	// checkpoints and bulk-equivalent folds so Prepare does not grow a fresh
+	// 64 KiB LZ4 frame on every index. exactPackWire is the matching sealed
+	// pack payload buffer.
+	exactPackEncoder storeio.PrimaryExactPackEncoder
+	exactPackWire    []byte
 	// fold* slices are the streamed checkpoint fold's writer-owned scratch:
 	// the resolved changed-tile set, per-index entry ordering, per-term
 	// overlay tiles, the flat term/posting builder inputs, and the base-key
@@ -228,11 +234,21 @@ type Collection struct {
 	// start of each structural transaction.
 	structuralExactReencoded map[storeio.BucketID]*structuralBucketContribution
 	structuralExactRemoved   []storeio.BucketID
-	readFile                 *os.File
-	writeFile                *os.File
-	directRead               bool
-	directWrite              bool
-	leases                   *storeio.GenerationLeases
+	// structuralExactOld holds the pre-transaction contribution of every
+	// affected bucket whose old leaf image the stager had in hand, so the
+	// structural commit can publish overlay records solely for changed
+	// (term, tile) pairs and fold them with the bounded dirty fold instead
+	// of re-resolving the whole index. structuralExactOldReady reports the
+	// capture is complete for the transaction's affected set; when false
+	// (pressure fallback, empty-leaf reclaim, or a future stager that does
+	// not capture) the commit keeps the full structural rebuild.
+	structuralExactOld      map[storeio.BucketID]*structuralBucketContribution
+	structuralExactOldReady bool
+	readFile                *os.File
+	writeFile               *os.File
+	directRead              bool
+	directWrite             bool
+	leases                  *storeio.GenerationLeases
 	// readEpochs is the direct-read fast path's reader registry. A point read
 	// claims one epoch slot instead of a snapshot-gate round trip plus a
 	// mutex-guarded generation lease; long-lived Snapshots keep their leases.
@@ -302,7 +318,12 @@ type Collection struct {
 	// writer, so no transaction can overlap a Reset.
 	writeTransaction storeio.WriteTransaction
 
-	automaticCheckpoints                  atomic.Uint64
+	automaticCheckpoints atomic.Uint64
+	// primaryExactStructuralRebuilds counts exact preparations that fell
+	// back to a full structural index rebuild. Steady insert/delete batches
+	// and splits must not move it: the bucket diff publishes only changed
+	// pairs and folds them with the bounded dirty fold.
+	primaryExactStructuralRebuilds        atomic.Uint64
 	primaryOverlayFolds                   atomic.Uint64
 	primaryOverlayMaterializationAttempts atomic.Uint64
 	primaryOverlayMaterializations        atomic.Uint64
@@ -572,6 +593,8 @@ type Collection struct {
 	// steady-state cost is the frames it publishes, not the slices it plans with.
 	// batchPrimaryLeafArena holds the finalized image of every touched leaf at
 	// once (they must coexist until the single admit-all step).
+	// batchOldRawArena holds decoded old documents captured during the leaf
+	// merge so exact overlay prep does not re-read them through the graph.
 	batchPrimaryLeaves       []primaryBatchLeaf
 	batchPrimaryMutations    []primaryBatchMutation
 	batchJournalEntries      []storeio.RecoveryBatchEntry
@@ -586,7 +609,21 @@ type Collection struct {
 	batchPrimaryOverflowVolatile []storeio.PageRef
 	batchPrimaryOverflowDurable  []storeio.PageRef
 	batchPrimaryLeafArena        []byte
+	batchOldRawArena             []byte
+	batchPrimaryReplacements     []storeio.CommonPrimaryUnifiedReplacement
+	batchOverlayMutations        []primaryUnifiedOverlayBatchMutation
 	batchPrimarySplitKey         []byte
+	batchOverlayFilledEmpty      []storeio.ResidentPrimaryRoute
+	batchOverlayPlanned          bool
+	// absorbOverlayOnStructural is set by batch topology when the only pending
+	// overlay belongs to the leaf being split. The structural commit applies
+	// those rows into the replacement leaves and marks the overlay folded
+	// instead of checkpoint-folding an intermediate leaf first.
+	absorbOverlayOnStructural bool
+	// absorbOverlayOnCOW folds one pending overlay bucket into the copy-on-write
+	// leaf image so a full overlay window does not checkpoint before the
+	// compressed leaf is published dirty.
+	absorbOverlayOnCOW bool
 	// The overflow pre-plan lays every new chain below the rewritten leaves and
 	// records the exact visible high-water marks. These are published only after
 	// all chains, leaves, exact-index records, and the WAL fence have succeeded.

@@ -36,10 +36,13 @@ type Node struct {
 
 	membershipTransitionContext bool
 
-	issuedReads  map[readContextKey]readIssue
-	pendingReads []ReadBarrier
-	readBytes    int
-	readSeq      uint64
+	issuedReads           map[readContextKey]readIssue
+	pendingReads          []ReadBarrier
+	readBytes             int
+	readSeq               uint64
+	cancelledReads        map[readContextKey]cancelledRead
+	staleReadsDropped     uint64
+	duplicateReadsDropped uint64
 
 	settlementReadyID     uint64
 	settlementStart       int
@@ -333,6 +336,7 @@ func newNode(
 		electionGatePristine: true,
 		published:            pub,
 		issuedReads:          make(map[readContextKey]readIssue),
+		cancelledReads:       make(map[readContextKey]cancelledRead),
 		commitIndex:          raw.BasicStatus().GetCommit(),
 		observedTerm:         raw.BasicStatus().GetTerm(),
 		pendingDurableLast: func() uint64 {
@@ -1064,6 +1068,19 @@ func (n *Node) RecordNextReadState() (bool, error) {
 	}
 	issue, ok := n.issuedReads[key]
 	if !ok {
+		if n.dropStaleReadState(key) {
+			// Withdrawn on leadership loss; the owner already holds
+			// its leadership-lost outcome. Consume the stale
+			// response and continue with the remaining states.
+			n.readPos++
+			return true, nil
+		}
+		if n.dropDuplicateReadState(key) {
+			// Already pending from an earlier delivery of this
+			// same response. Consume and continue.
+			n.readPos++
+			return true, nil
+		}
 		return false, n.fail(PhaseReadStatesRecorded, state.Index, errors.New("unknown or duplicate ReadIndex context returned by core"))
 	}
 	delete(n.issuedReads, key)

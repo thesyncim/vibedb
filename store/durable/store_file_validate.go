@@ -196,6 +196,24 @@ func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) erro
 			},
 		)
 		return err
+	case storeio.PagePrimaryExactPack:
+		header, _, err := storeio.OpenPage(page)
+		if err != nil {
+			return err
+		}
+		bounds := storeio.PrimaryExactIndexBounds{StoreID: header.StoreID, Generation: v.generation.Load(), FileEnd: v.fileEnd.Load(), NextLogicalID: v.nextLogicalID.Load(), AllocationQuantum: v.pageSize, MaxPageSize: storeio.MaxPhysicalPageSize, IndexCount: v.indexHighWater}
+		var decoder storeio.PrimaryExactPackDecoder
+		if err := decoder.Prepare(storeio.PrimaryExactPackMaxPayloadBytes - storeio.PrimaryExactPackHeaderBytes); err != nil {
+			return err
+		}
+		return storeio.OpenPrimaryExactPackPage(page, ref, bounds, &decoder)
+	case storeio.PagePrimaryExactInventory:
+		header, _, err := storeio.OpenPage(page)
+		if err != nil {
+			return err
+		}
+		_, err = storeio.OpenPrimaryExactInventoryPage(page, ref, storeio.PrimaryExactIndexBounds{StoreID: header.StoreID, Generation: v.generation.Load(), FileEnd: v.fileEnd.Load(), NextLogicalID: v.nextLogicalID.Load(), AllocationQuantum: v.pageSize, MaxPageSize: storeio.MaxPhysicalPageSize, IndexCount: v.indexHighWater})
+		return err
 	default:
 		// validPageKind is intentionally private to storeio, so this default is
 		// also the format-evolution tripwire: adding a durable kind cannot

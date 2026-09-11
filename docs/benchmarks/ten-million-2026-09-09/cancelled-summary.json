@@ -1,0 +1,49 @@
+{
+  "status": "cancelled_by_user",
+  "candidate_commit": "23f884e14b5a8c43c773255eeb5486740771a42d",
+  "crdb_status": "not_started",
+  "read_trials_status": "not_started",
+  "acknowledged_rows": 4871616,
+  "seed_duration_seconds": 930.791450007,
+  "acknowledged_rows_per_second": 5233.842661493467,
+  "seed_batches": 76119,
+  "seed_batch": 64,
+  "milestones": [
+    {
+      "rows": 1048576,
+      "seconds": 109.757340133,
+      "interval_rows_per_second": 9553.584286293502
+    },
+    {
+      "rows": 2031616,
+      "seconds": 211.578289804,
+      "interval_rows_per_second": 9654.594689760424
+    },
+    {
+      "rows": 3014656,
+      "seconds": 461.373699209,
+      "interval_rows_per_second": 3935.380567407349
+    },
+    {
+      "rows": 4063232,
+      "seconds": 702.273093693,
+      "interval_rows_per_second": 4352.754818026926
+    },
+    {
+      "rows": 4871616,
+      "seconds": 930.791450007,
+      "interval_rows_per_second": 3537.5013764287037
+    }
+  ],
+  "partial_stopped_allocated_bytes": 6026260480,
+  "partial_stopped_apparent_bytes": 5791215095,
+  "temporary_database_volume": "removed_by_runner_default_cleanup",
+  "evidence_directory": "/private/tmp/vibedb-10m-final-23f884e-sep8",
+  "provenance": {
+    "manifest.json": "e2340fa0dc7d3938ddf7737c9c026ac98b41775e9efefaa9d25ac5281cd8c9a2",
+    "candidate-first/candidate/run.json": "7ee5fb2554a81a690e7dd789dd5bfd8aea8d9da5696fba6983659a48550befb1",
+    "candidate-first/candidate/raw-evidence/setup-phase-timings.json": "e075223a9fa72a2632674521fff8920c3f72828e48908219115811be55be19fd",
+    "candidate-first/candidate/resource-samples.jsonl": "e07ab1d89e75f373290780ec6193a5ea9c262f01b5b0dbf95a324eae3ac929f1",
+    "candidate-first/candidate/setup.log": "a640e38f43b341ee272af7645e26409c99db1476a0c7d6c8a2c4e14342819e35"
+  }
+}

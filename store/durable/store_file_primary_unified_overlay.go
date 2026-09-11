@@ -152,6 +152,14 @@ type primaryUnifiedOverlay struct {
 	// base. Records remain readable until a reader-free publication can recycle
 	// the arena; generations above folded are the next checkpoint's dirty set.
 	folded atomic.Uint64
+
+	// Writer-owned prepareBatch scratch. One unpublished batch is live at a
+	// time; abortBatch/publishBatch drop the prepared view, and the backing
+	// stays so a warmed Update does not allocate per call.
+	prepareBatchRecords []primaryUnifiedOverlayBatchRecord
+	prepareBatchBuckets []primaryUnifiedOverlayBatchBucket
+	prepareBatchHashes  []primaryUnifiedOverlayBatchHash
+	prepareBatchKeys    []primaryUnifiedOverlayBatchKey
 }
 
 type primaryUnifiedOverlayPrepared struct {
@@ -1067,15 +1075,20 @@ func (o *primaryUnifiedOverlay) prepareBatch(
 		return primaryUnifiedOverlayBatchPrepared{}, storeio.ErrCommonPrimaryLeafCorrupt
 	}
 
+	o.prepareBatchRecords = slices.Grow(o.prepareBatchRecords[:0], len(mutations))
+	o.prepareBatchRecords = o.prepareBatchRecords[:len(mutations)]
+	o.prepareBatchBuckets = slices.Grow(o.prepareBatchBuckets[:0], len(mutations))[:0]
+	o.prepareBatchHashes = slices.Grow(o.prepareBatchHashes[:0], len(mutations))[:0]
+	o.prepareBatchKeys = slices.Grow(o.prepareBatchKeys[:0], len(mutations))[:0]
 	prepared := primaryUnifiedOverlayBatchPrepared{
-		records:    make([]primaryUnifiedOverlayBatchRecord, len(mutations)),
-		buckets:    make([]primaryUnifiedOverlayBatchBucket, 0, len(mutations)),
-		hashes:     make([]primaryUnifiedOverlayBatchHash, 0, len(mutations)),
+		records:    o.prepareBatchRecords[:len(mutations)],
+		buckets:    o.prepareBatchBuckets,
+		hashes:     o.prepareBatchHashes,
 		countAfter: count,
 		usedAfter:  used,
 		generation: generation,
 	}
-	keys := make([]primaryUnifiedOverlayBatchKey, 0, len(mutations))
+	keys := o.prepareBatchKeys
 	for index := range mutations {
 		mutation := &mutations[index]
 		bucketSlot, bucketFound, slotOK := o.batchBucketSlot(

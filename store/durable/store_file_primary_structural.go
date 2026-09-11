@@ -1215,6 +1215,10 @@ func (c *Collection) commitPrimaryStructural(
 	}
 	abort = false
 	c.installPrimaryExactResidentLocked(preparedExact)
+	if c.absorbOverlayOnStructural {
+		c.primaryUnifiedOverlay.markFolded(generation, retiring)
+		c.absorbOverlayOnStructural = false
+	}
 	c.pageValidator.update(nextState)
 	if nextRouter != nil {
 		c.primaryRouter.Store(nextRouter)
@@ -1322,6 +1326,22 @@ func (c *Collection) structuralSplitPrimaryLeaf(keyBytes []byte) error {
 			)
 			if !ok {
 				return nil, nil, nil, storeio.ErrCommonPrimaryLeafCorrupt
+			}
+			if c.primaryExactActive() {
+				// The left half keeps the source bucket: capture its
+				// pre-split contribution so the commit diffs old against
+				// new. The right half is a fresh bucket.
+				if err := c.captureStructuralOldLocked(
+					route.Bucket, path.leafLease.Page(),
+					storeio.CommonPrimaryLeafBounds{
+						FileEnd:           tx.FileEnd(),
+						NextLogicalID:     tx.NextLogicalID(),
+						AllocationQuantum: uint32(c.options.PageSize),
+					},
+				); err != nil {
+					return nil, nil, nil, err
+				}
+				c.structuralExactOldReady = true
 			}
 			rows, renderErr := stripe.RenderRecordsWithScratch(
 				c.primaryLeafMutationScratch,
@@ -1494,6 +1514,19 @@ func (c *Collection) structuralSplitPrimaryMacroTablet(
 				ref, encodeErr := c.encodeStructuralLeaf(
 					tx, generation, storeio.BucketID(bucketU), rows,
 				)
+				if encodeErr == nil && c.primaryExactActive() {
+					// The source bucket vanishes with its rows relocated:
+					// capture its pre-move contribution for the retraction
+					// records before releasing the lease.
+					encodeErr = c.captureStructuralOldLocked(
+						source.bucket, lease.Page(),
+						storeio.CommonPrimaryLeafBounds{
+							FileEnd:           tx.FileEnd(),
+							NextLogicalID:     tx.NextLogicalID(),
+							AllocationQuantum: uint32(c.options.PageSize),
+						},
+					)
+				}
 				lease.Release()
 				if encodeErr != nil {
 					return nil, nil, nil, encodeErr
@@ -1508,6 +1541,9 @@ func (c *Collection) structuralSplitPrimaryMacroTablet(
 				})
 				retired = append(retired, source.ref)
 				removedBuckets = append(removedBuckets, source.bucket)
+			}
+			if c.primaryExactActive() {
+				c.structuralExactOldReady = true
 			}
 			c.structuralRepairPostingsHook(removedBuckets)
 			return left, retired, &primaryLocalizedLeafSplit{

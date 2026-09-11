@@ -1,0 +1,17 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/store/durable
+cpu: Apple M4 Max
+BenchmarkExactPackResidentEqualityRotating/long/card=8-16         	 1442416	       413.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkExactPackResidentEqualityRotating/long/card=8-16         	 1462495	       409.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkExactPackResidentEqualityRotating/long/card=1024-16      	 1474852	       412.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkExactPackResidentEqualityRotating/long/card=1024-16      	 1454263	       411.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStringCompressionGetRaw/distinct=32-16                   	 2345281	       256.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStringCompressionGetRaw/distinct=32-16                   	 2329000	       256.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStringCompressionGetRaw/distinct=128-16                  	 2290798	       262.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStringCompressionGetRaw/distinct=128-16                  	 2297096	       262.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStringCompressionScanAllBytes/distinct=32-16             	     247	   2412462 ns/op	1860.71 MB/s	       120.6 ns/doc	       0 B/op	       0 allocs/op
+BenchmarkStringCompressionScanAllBytes/distinct=32-16             	     247	   2431525 ns/op	1846.12 MB/s	       121.6 ns/doc	       0 B/op	       0 allocs/op
+BenchmarkStringCompressionScanAllBytes/distinct=128-16            	     234	   2559341 ns/op	1753.92 MB/s	       128.0 ns/doc	       0 B/op	       0 allocs/op
+BenchmarkStringCompressionScanAllBytes/distinct=128-16            	     231	   2576734 ns/op	1742.08 MB/s	       128.8 ns/doc	       0 B/op	       0 allocs/op
+PASS

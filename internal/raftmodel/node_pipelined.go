@@ -115,6 +115,17 @@ func (n *Node) acceptPipelinedReadStates(states []raft.ReadState) ([]ReadOutcome
 		}
 		issue, ok := n.issuedReads[key]
 		if !ok {
+			if n.dropStaleReadState(key) {
+				// Withdrawn on leadership loss; the owner already
+				// holds its leadership-lost outcome. Drop the stale
+				// response and continue with the remaining states.
+				continue
+			}
+			if n.dropDuplicateReadState(key) {
+				// Already pending from an earlier delivery of this
+				// same response. Drop and continue.
+				continue
+			}
 			return nil, n.fail(PhaseFailed, state.Index, errors.New("unknown or duplicate ReadIndex context returned by core"))
 		}
 		delete(n.issuedReads, key)

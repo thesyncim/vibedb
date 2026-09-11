@@ -23,15 +23,17 @@ type primaryExactTermPostings map[uint32]uint64
 // cutter. encoded is the canonical IndexTermLeaf byte stream; it is GC-owned
 // and shared by reference across index epochs when a fold carries the leaf
 // forward untouched, which is what makes the checkpoint fold O(dirty leaves).
-// ref is the durable page currently holding encoded (zero until staged);
-// carrying it forward is what lets a checkpoint stage only dirty leaves and
-// retire only their superseded pages. firstKey/firstTile order the leaves —
+// ref is the durable pack (or singleton leaf page) currently holding encoded
+// (zero until staged); carrying it forward is what lets a checkpoint stage
+// only dirty leaves and retire only packs with no live member. member is the
+// ordinal inside that pack (zero for a singleton leaf page). firstKey/firstTile order the leaves —
 // stripe pieces of one giant term share firstKey and ascend by firstTile —
 // and piece marks a rule-2 stripe piece (always a single-term leaf).
 type primaryExactLeaf struct {
 	encoded   []byte
 	view      storeio.IndexTermLeafView
 	ref       storeio.PageRef
+	member    uint16
 	firstKey  []byte
 	firstTile uint32
 	piece     bool
@@ -150,31 +152,95 @@ func (c *Collection) derivePrimaryLiveFromRouter(
 	return live, nil
 }
 
-// openPrimaryExactLeafResident admits one durable term leaf into its resident
-// form: copies the canonical bytes out of the page, admits the view against
-// the epoch's live lookup, derives the leaf's first (term, tile) from the
-// admitted content, and cross-checks it against the catalog entry the leaf
-// was reached through — a grafted or reordered catalog fails closed here.
-func (c *Collection) openPrimaryExactLeafResident(
-	entry storeio.PrimaryExactCatalogEntry,
+// hydratePrimaryExactLeaves admits one physical index's catalog members.
+// Consecutive catalog entries that share a pack decode that pack once.
+func (c *Collection) hydratePrimaryExactLeaves(
+	indexID uint32,
+	entries []storeio.PrimaryExactCatalogEntry,
 	bounds storeio.PrimaryExactIndexBounds,
 	live storeio.IndexTermLeafLiveLookup,
+) ([]primaryExactLeaf, error) {
+	leaves := make([]primaryExactLeaf, 0, len(entries))
+	var decoder storeio.PrimaryExactPackDecoder
+	if err := decoder.Prepare(
+		storeio.PrimaryExactPackMaxPayloadBytes - storeio.PrimaryExactPackHeaderBytes,
+	); err != nil {
+		return nil, err
+	}
+	var packLease storeio.PageLease
+	held := false
+	current := storeio.PageRef{}
+	release := func() {
+		if held {
+			packLease.Release()
+			held = false
+			current = storeio.PageRef{}
+			decoder.Reset()
+		}
+	}
+	defer release()
+	for at := range entries {
+		entry := entries[at]
+		var encoded []byte
+		switch entry.Leaf.Kind {
+		case storeio.PagePrimaryExactPack:
+			if entry.Leaf != current {
+				release()
+				lease, err := c.cache.Acquire(entry.Leaf)
+				if err != nil {
+					return nil, err
+				}
+				if err := storeio.OpenPrimaryExactPackPage(
+					lease.Page(), entry.Leaf, bounds, &decoder,
+				); err != nil {
+					lease.Release()
+					return nil, err
+				}
+				packLease, held, current = lease, true, entry.Leaf
+			}
+			raw, err := decoder.Member(int(entry.Member), indexID)
+			if err != nil {
+				return nil, err
+			}
+			encoded = append([]byte(nil), raw...)
+		default:
+			release()
+			lease, err := c.cache.Acquire(entry.Leaf)
+			if err != nil {
+				return nil, err
+			}
+			payload, openErr := storeio.OpenPrimaryExactLeafPage(
+				lease.Page(), entry.Leaf, bounds,
+			)
+			if openErr == nil {
+				encoded = append([]byte(nil), payload...)
+			}
+			lease.Release()
+			if openErr != nil {
+				return nil, openErr
+			}
+		}
+		leaf, err := c.admitPrimaryExactEncodedLeaf(encoded, entry, live)
+		if err != nil {
+			return nil, err
+		}
+		if n := len(leaves); n != 0 {
+			previous := &leaves[n-1]
+			cmp := bytes.Compare(previous.firstKey, leaf.firstKey)
+			if cmp > 0 || cmp == 0 && previous.firstTile >= leaf.firstTile {
+				return nil, storeio.ErrPrimaryExactIndexCorrupt
+			}
+		}
+		leaves = append(leaves, leaf)
+	}
+	return leaves, nil
+}
+
+func (c *Collection) admitPrimaryExactEncodedLeaf(
+	encoded []byte,
+	entry storeio.PrimaryExactCatalogEntry,
+	live storeio.IndexTermLeafLiveLookup,
 ) (primaryExactLeaf, error) {
-	lease, err := c.cache.Acquire(entry.Leaf)
-	if err != nil {
-		return primaryExactLeaf{}, err
-	}
-	payload, openErr := storeio.OpenPrimaryExactLeafPage(
-		lease.Page(), entry.Leaf, bounds,
-	)
-	var encoded []byte
-	if openErr == nil {
-		encoded = append([]byte(nil), payload...)
-	}
-	lease.Release()
-	if openErr != nil {
-		return primaryExactLeaf{}, openErr
-	}
 	view, err := storeio.OpenIndexTermLeaf(encoded, c.storeID, live)
 	if err != nil {
 		return primaryExactLeaf{}, err
@@ -186,6 +252,7 @@ func (c *Collection) openPrimaryExactLeafResident(
 		return primaryExactLeaf{}, err
 	}
 	leaf.ref = entry.Leaf
+	leaf.member = entry.Member
 	prefix := leaf.firstKey
 	if len(prefix) > storeio.PrimaryExactCatalogPrefixBytes {
 		prefix = prefix[:storeio.PrimaryExactCatalogPrefixBytes]
@@ -206,24 +273,18 @@ func (c *Collection) openPrimaryExactLeafResident(
 }
 
 // newPrimaryExactResidentLeaf derives the resident router fields from an
-// admitted view: the first term's canonical bytes (copied — the iterator's
-// key scratch does not survive), its first posting tile, and the rule-1
-// predicate of the first term — a pure content function recomputed with the
-// same route hash the cutter decided by.
+// admitted view: the first term's canonical bytes (aliased from encoded —
+// the leaf image is immutable after Open), its first posting tile, and the
+// rule-1 predicate of the first term — a pure content function recomputed
+// with the same route hash the cutter decided by.
 func (c *Collection) newPrimaryExactResidentLeaf(
 	encoded []byte, view storeio.IndexTermLeafView, piece bool,
 ) (primaryExactLeaf, error) {
-	it := view.Ordered()
-	key, match, ok := it.Next()
-	if !ok {
+	firstKey := view.FirstCanonical()
+	tileID, ok := view.FirstPostingTile()
+	if len(firstKey) == 0 || !ok {
 		return primaryExactLeaf{}, storeio.ErrPrimaryExactIndexCorrupt
 	}
-	mi := match.MaskIterator()
-	tileID, _, more := mi.Next()
-	if !more {
-		return primaryExactLeaf{}, storeio.ErrPrimaryExactIndexCorrupt
-	}
-	firstKey := append([]byte(nil), key...)
 	return primaryExactLeaf{
 		encoded:   encoded,
 		view:      view,
@@ -310,23 +371,13 @@ func (c *Collection) buildPrimaryExactEpoch(
 			return nil, storeio.ErrPrimaryExactIndexCorrupt
 		}
 		resident := &epoch.exact[indexID]
-		resident.leaves = make([]primaryExactLeaf, 0, len(entries))
-		for at := range entries {
-			leaf, leafErr := c.openPrimaryExactLeafResident(
-				entries[at], bounds, liveLookup,
-			)
-			if leafErr != nil {
-				return nil, leafErr
-			}
-			if n := len(resident.leaves); n != 0 {
-				previous := &resident.leaves[n-1]
-				cmp := bytes.Compare(previous.firstKey, leaf.firstKey)
-				if cmp > 0 || cmp == 0 && previous.firstTile >= leaf.firstTile {
-					return nil, storeio.ErrPrimaryExactIndexCorrupt
-				}
-			}
-			resident.leaves = append(resident.leaves, leaf)
+		leaves, leafErr := c.hydratePrimaryExactLeaves(
+			uint32(indexID), entries, bounds, liveLookup,
+		)
+		if leafErr != nil {
+			return nil, leafErr
 		}
+		resident.leaves = leaves
 	}
 	return epoch, nil
 }
@@ -1003,6 +1054,7 @@ func unionPrimaryExactRangeMasks(
 // content.
 type primaryExactStagedLeaf struct {
 	ref       storeio.PageRef
+	member    uint16
 	firstKey  []byte
 	firstTile uint32
 	piece     bool
@@ -1036,7 +1088,7 @@ func stagePrimaryExactCatalog(
 			flags |= storeio.PrimaryExactCatalogRunCut
 		}
 		entries[i] = storeio.PrimaryExactCatalogEntry{
-			Leaf: staged[i].ref, FirstTile: staged[i].firstTile,
+			Leaf: staged[i].ref, Member: staged[i].member, FirstTile: staged[i].firstTile,
 			Flags: flags, Prefix: prefix,
 		}
 		entryBytes += storeio.PrimaryExactCatalogEntryBytes(len(prefix))
@@ -1199,7 +1251,7 @@ func (c *Collection) encodePrimaryExactLeaves(
 	if err != nil || len(ordered) == 0 {
 		return nil, err
 	}
-	budget := storeio.IndexTermLeafCutBudget(uint32(c.options.MaxPageSize))
+	budget := storeio.IndexTermLeafPackCutBudget(uint32(c.options.MaxPageSize))
 	var leaves []primaryExactLeaf
 	err = storeio.CutIndexTermLeaves(
 		ordered, budget,
@@ -1256,7 +1308,7 @@ func primaryExactIndexPageBound(
 	if len(spans) == 0 {
 		return 0, storeio.ErrInvalidWrite
 	}
-	budget := storeio.IndexTermLeafCutBudget(maxPageSize)
+	budget := storeio.IndexTermLeafPackCutBudget(maxPageSize)
 	var components [store.MaxIndexColumns]storeio.IndexTermComponent
 	var canonical [storeio.IndexTermMaxKeyBytes]byte
 	total := 1 + 4 // the root page plus arithmetic headroom
@@ -1423,7 +1475,7 @@ func buildPrimaryExactIndexes(
 		}
 	}
 
-	budget := storeio.IndexTermLeafCutBudget(maxPageSize)
+	budget := storeio.IndexTermLeafPackCutBudget(maxPageSize)
 	rootEntries := make([]storeio.PrimaryExactRootEntry, len(indexes))
 	var catalogPages []storeio.PageRef
 	for indexID := range indexes {
@@ -1438,7 +1490,12 @@ func buildPrimaryExactIndexes(
 		if len(ordered) == 0 {
 			continue
 		}
-		var staged []primaryExactStagedLeaf
+		pack, packErr := newPrimaryExactPackBuilder(
+			sink, pageSize, maxPageSize, uint32(indexID), nil, nil,
+		)
+		if packErr != nil {
+			return storeio.PageRef{}, packErr
+		}
 		err = storeio.CutIndexTermLeaves(
 			ordered, budget,
 			func(leafTerms []storeio.IndexTermLeafTerm, piece bool) error {
@@ -1451,28 +1508,20 @@ func buildPrimaryExactIndexes(
 						ErrPrimaryCutoverUnsupported, indexID, encErr,
 					)
 				}
-				ref, stageErr := stagePrimaryExactLeafPage(
-					sink, encoded, pageSize, maxPageSize,
-				)
-				if stageErr != nil {
-					return stageErr
-				}
 				firstTile := leafTerms[0].Postings[0].Posting.TileID
-				staged = append(staged, primaryExactStagedLeaf{
-					ref:       ref,
-					firstKey:  leafTerms[0].Key.Canonical,
-					firstTile: firstTile,
-					piece:     piece,
-					runCut: storeio.IndexTermLeafRunCut(
-						leafTerms[0].Key.RouteHash,
-					),
-				})
-				return nil
+				return pack.AddEncoded(
+					encoded, leafTerms[0].Key.Canonical, firstTile, piece,
+					storeio.IndexTermLeafRunCut(leafTerms[0].Key.RouteHash),
+				)
 			},
 		)
 		if err != nil {
 			return storeio.PageRef{}, err
 		}
+		if err := pack.Finish(); err != nil {
+			return storeio.PageRef{}, err
+		}
+		staged := pack.appendStagedTo(nil)
 		catalogRef, pages, err := stagePrimaryExactCatalog(
 			sink, pageSize, maxPageSize, staged, catalogPages,
 		)
@@ -1502,10 +1551,9 @@ func buildPrimaryExactIndexes(
 	return rootPage.Ref(), nil
 }
 
-// stagePrimaryExactLeafPage wraps one cutter-emitted canonical leaf in its
-// durable page envelope. The extent always fits by construction (invariant
-// 9: the cutter's budget is derived from MaxPageSize), so a failure here is
-// corruption-class, not a capacity condition.
+// stagePrimaryExactLeafPage wraps one cutter-emitted canonical leaf in a
+// singleton leaf envelope. Production exact indexes stage packs instead;
+// this remains for tests and Open of unreleased singleton-leaf images.
 func stagePrimaryExactLeafPage(
 	sink storeio.PrimaryGraphBuildSink,
 	encoded []byte,
