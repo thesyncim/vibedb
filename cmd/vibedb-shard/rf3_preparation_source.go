@@ -124,7 +124,14 @@ func newRF3PreparationSource(schemas *rf3SchemaActivator, registry *rafttranspor
 		if err != nil {
 			return nil, err
 		}
-		bootstrap, err := readRF3BoundedFile(template.StaticBootstrapPath, nodecontrol.MaxSourceBootstrapBytes)
+		// Learners reopen this group's original WAL base. The split-child
+		// template at ChildRegistry.StaticBootstrapPath is a different
+		// identity (vibedb-rf3-split-child-bootstrap) and cannot
+		// authenticate a live snapshot artifact.
+		bootstrap, err := readRF3BoundedFile(
+			filepath.Join(state.manifest.Route.MemberRoot, "node-bootstrap.pb"),
+			nodecontrol.MaxSourceBootstrapBytes,
+		)
 		if err != nil {
 			return nil, err
 		}
