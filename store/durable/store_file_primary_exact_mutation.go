@@ -2,6 +2,7 @@ package durable
 
 import (
 	"bytes"
+	"slices"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
@@ -26,12 +27,26 @@ import (
 //     — using the pre-image the leaf lookup already has in hand.
 //   - insert / delete: one term record per index carrying a term, plus one
 //     tile record for the touched quadrant's live mask.
-//   - slot-reassigning compact VCS1 workspace rewrite
-//     (PlaceCommonPrimaryLeafRecords reassigns every slot): fall back
+//   - slot-reassigning batch leaf rewrite (an insert or delete forces
+//     PlaceCommonPrimaryLeafRecords, whose cuckoo placement may displace
+//     unmutated rows): diff the retained base page against the final image —
+//     both derivations O(leaf rows), the leaf class bounds slots — and emit
+//     absolute non-rebased records solely for changed live words and
+//     (term, tile) pairs. A batch that would overflow the overlay window
+//     folds the window with a checkpoint and retries when the diff fits a
+//     drained window, so steady batches never take the structural rebuild.
+//   - slot-reassigning compact VCS1 workspace rewrite outside the batch
+//     lane (PlaceCommonPrimaryLeafRecords reassigns every slot): fall back
 //     to deriveBucketExactContribution (O(leaf rows), exactly the old cost,
 //     once per leaf-class transition) and emit a rebase group — 4 rebased
 //     tile records plus absolute term records for every term present in the
 //     bucket, all at one generation.
+//   - structural split: the stager captures each affected bucket's old
+//     contribution from the lease it already holds, the commit publishes the
+//     old→new diff as absolute non-rebased records, and the checkpoint dirty
+//     fold re-encodes only the dirty term runs — O(affected rows) per split.
+//     Stagers that cannot capture (pressure fallback, empty-leaf reclaim)
+//     keep the full structural rebuild.
 //
 // The canonical per-mutation-transaction lane and structural transactions
 // keep their fold-first shape: they resolve base+overlay through the
@@ -467,6 +482,310 @@ func (c *Collection) preparePrimaryExactRebase(
 	return true, nil
 }
 
+// emitAbsoluteExactTermRecord publishes one absolute (index, term, tile, bits)
+// overlay record: newest-wins at a newer generation, voiding nothing and
+// setting no rebase floor. Callers emit each pair at most once per prepared.
+func (c *Collection) emitAbsoluteExactTermRecord(
+	epoch *primaryExactEpoch, prepared *primaryExactPrepared,
+	indexID int, term string, tileID uint32, generation, bits uint64,
+) bool {
+	termBytes := []byte(term)
+	chainHash := primaryExactTermChainHash(
+		storeio.IndexTermRouteHash(c.storeID, termBytes),
+		uint32(indexID),
+	)
+	return c.emitPrimaryExactTermRecord(
+		epoch, prepared, chainHash, uint32(indexID), termBytes,
+		tileID, generation, bits,
+	)
+}
+
+// unionSortedExactDiffTerms lists every term present on either side of a
+// bucket-contribution diff in byte order, so diff emission is deterministic.
+func unionSortedExactDiffTerms(
+	finalTerms, baseTerms map[string]map[uint32]uint64,
+) []string {
+	union := make([]string, 0, len(finalTerms)+len(baseTerms))
+	for term := range finalTerms {
+		union = append(union, term)
+	}
+	for term := range baseTerms {
+		if _, ok := finalTerms[term]; !ok {
+			union = append(union, term)
+		}
+	}
+	slices.Sort(union)
+	return union
+}
+
+// unionSortedExactDiffTiles lists every tile present on either side of one
+// term's contribution in numeric order.
+func unionSortedExactDiffTiles(
+	finalTiles, baseTiles map[uint32]uint64,
+) []uint32 {
+	union := make([]uint32, 0, len(finalTiles)+len(baseTiles))
+	for tileID := range finalTiles {
+		union = append(union, tileID)
+	}
+	for tileID := range baseTiles {
+		if _, ok := finalTiles[tileID]; !ok {
+			union = append(union, tileID)
+		}
+	}
+	slices.Sort(union)
+	return union
+}
+
+// exactDiffCost is the overlay-window cost of publishing one bucket
+// contribution diff: record counts plus upper bounds on the new entries and
+// interned term bytes the records need.
+type exactDiffCost struct {
+	termRecords int
+	tileRecords int
+	terms       int
+	tiles       int
+	termBytes   int
+}
+
+func (d *exactDiffCost) add(o exactDiffCost) {
+	d.termRecords += o.termRecords
+	d.tileRecords += o.tileRecords
+	d.terms += o.terms
+	d.tiles += o.tiles
+	d.termBytes += o.termBytes
+}
+
+// countExactContributionDiff tallies the absolute records publishing the
+// base→final bucket change needs: one per changed live word and per changed
+// (term, tile) pair, with the union terms/tiles/bytes bounding new entries.
+func countExactContributionDiff(
+	baseLive, finalLive map[uint32]uint64,
+	baseByIndex, finalByIndex []map[string]map[uint32]uint64,
+) exactDiffCost {
+	var cost exactDiffCost
+	seenTiles := make(map[uint32]struct{}, 8)
+	for tile, bits := range finalLive {
+		seenTiles[tile] = struct{}{}
+		if baseLive[tile] != bits {
+			cost.tileRecords++
+		}
+	}
+	for tile := range baseLive {
+		if _, ok := finalLive[tile]; !ok {
+			seenTiles[tile] = struct{}{}
+			cost.tileRecords++
+		}
+	}
+	cost.tiles = len(seenTiles)
+	for indexID := range finalByIndex {
+		finalTerms := finalByIndex[indexID]
+		var baseTerms map[string]map[uint32]uint64
+		if indexID < len(baseByIndex) {
+			baseTerms = baseByIndex[indexID]
+		}
+		for term, finalTiles := range finalTerms {
+			cost.terms++
+			cost.termBytes += len(term)
+			baseTiles := baseTerms[term]
+			for tile, bits := range finalTiles {
+				if baseTiles[tile] != bits {
+					cost.termRecords++
+				}
+			}
+			for tile := range baseTiles {
+				if _, ok := finalTiles[tile]; !ok {
+					cost.termRecords++
+				}
+			}
+		}
+		for term, baseTiles := range baseTerms {
+			if _, ok := finalTerms[term]; ok {
+				continue
+			}
+			cost.terms++
+			cost.termBytes += len(term)
+			cost.termRecords += len(baseTiles)
+		}
+	}
+	for indexID := len(finalByIndex); indexID < len(baseByIndex); indexID++ {
+		for term, baseTiles := range baseByIndex[indexID] {
+			cost.terms++
+			cost.termBytes += len(term)
+			cost.termRecords += len(baseTiles)
+		}
+	}
+	return cost
+}
+
+// fitsDrainedExactWindow reports whether the diff would fit a freshly folded
+// (empty) overlay window. A diff that fits drained but not the current window
+// earns a checkpoint-and-retry instead of a full rebuild: after the drain the
+// same emission is guaranteed room by these same caps.
+func (d exactDiffCost) fitsDrainedExactWindow() bool {
+	return d.termRecords <= primaryExactOverlayTermRecordCap &&
+		d.tileRecords <= primaryExactOverlayTileRecordCap &&
+		d.terms <= primaryExactOverlayTermEntryCap &&
+		d.tiles <= primaryExactOverlayTileEntryCap &&
+		d.termBytes <= primaryExactOverlayTermBytesCap
+}
+
+// exactWindowRoom returns the current overlay window's remaining record,
+// entry, and byte room, saturated at zero.
+func exactWindowRoom(epoch *primaryExactEpoch) exactDiffCost {
+	room := exactDiffCost{
+		termRecords: primaryExactOverlayTermRecordCap,
+		tileRecords: primaryExactOverlayTileRecordCap,
+		terms:       primaryExactOverlayTermEntryCap,
+		tiles:       primaryExactOverlayTileEntryCap,
+		termBytes:   primaryExactOverlayTermBytesCap,
+	}
+	if epoch == nil {
+		return room
+	}
+	room.termRecords -= epoch.termRecordN
+	room.tileRecords -= epoch.tileRecordN
+	room.terms -= epoch.termEntryN
+	room.tiles -= epoch.tileEntryN
+	room.termBytes -= epoch.termBytesN
+	if room.termRecords < 0 {
+		room.termRecords = 0
+	}
+	if room.tileRecords < 0 {
+		room.tileRecords = 0
+	}
+	if room.terms < 0 {
+		room.terms = 0
+	}
+	if room.tiles < 0 {
+		room.tiles = 0
+	}
+	if room.termBytes < 0 {
+		room.termBytes = 0
+	}
+	return room
+}
+
+// fitsExactWindowRoom reports whether every cost component fits the room.
+func (d exactDiffCost) fitsExactWindowRoom(room exactDiffCost) bool {
+	return d.termRecords <= room.termRecords &&
+		d.tileRecords <= room.tileRecords &&
+		d.terms <= room.terms &&
+		d.tiles <= room.tiles &&
+		d.termBytes <= room.termBytes
+}
+
+// preparePrimaryExactBucketDiff maintains the exact index for a slot-rewriting
+// batch leaf without a whole-bucket rebase. It derives the base and final
+// bucket contributions — both O(leaf rows); the leaf class bounds slots — and
+// emits absolute overlay records solely for live words and (term, tile) pairs
+// whose bits changed. Unchanged pairs keep resolving through the published
+// base and overlay, so a steady insert/delete batch publishes O(changed terms)
+// records and never trips overlay pressure into a full structural rebuild.
+//
+// Each emitted record carries exactly the absolute value a rebase group would
+// hold for that pair, newest-wins at a newer generation, so the resolved index
+// is identical to the rebase output. The records are non-rebased: they void
+// nothing and set no rebase floor, keeping the checkpoint dirty fold eligible.
+// ok=false reports overlay pressure with the prepared records already unwound
+// by the caller; checkpoint then reports whether a drained window would fit,
+// in which case the caller folds the window and retries instead of rebuilding.
+func (c *Collection) preparePrimaryExactBucketDiff(
+	epoch *primaryExactEpoch, prepared *primaryExactPrepared,
+	basePage, leafImage []byte, bucket storeio.BucketID,
+	generation uint64,
+	bounds storeio.CommonPrimaryLeafBounds,
+) (ok, checkpoint bool, err error) {
+	baseLive, baseByIndex, err := c.deriveBucketExactContribution(
+		basePage, bucket, bounds,
+	)
+	if err != nil {
+		return false, false, err
+	}
+	finalLive, finalByIndex, err := c.deriveBucketExactContribution(
+		leafImage, bucket, bounds,
+	)
+	if err != nil {
+		return false, false, err
+	}
+	cost := countExactContributionDiff(
+		baseLive, finalLive, baseByIndex, finalByIndex,
+	)
+	checkpoint = cost.fitsDrainedExactWindow()
+	if !cost.fitsExactWindowRoom(exactWindowRoom(epoch)) {
+		return false, checkpoint, nil
+	}
+	if !c.emitExactContributionDiff(
+		epoch, prepared, baseLive, baseByIndex,
+		finalLive, finalByIndex, bucket, generation,
+	) {
+		return false, checkpoint, nil
+	}
+	return true, false, nil
+}
+
+// emitExactContributionDiff publishes the absolute records taking one
+// bucket's tiles from the base contribution to the final contribution: one
+// live-word record per changed quadrant tile and one term record per changed
+// (term, tile) pair, in deterministic order. Either side may be nil (a fresh
+// or a removed bucket). Every pair emits at most once; false reports overlay
+// pressure mid-emission.
+func (c *Collection) emitExactContributionDiff(
+	epoch *primaryExactEpoch, prepared *primaryExactPrepared,
+	baseLive map[uint32]uint64, baseByIndex []map[string]map[uint32]uint64,
+	finalLive map[uint32]uint64, finalByIndex []map[string]map[uint32]uint64,
+	bucket storeio.BucketID, generation uint64,
+) bool {
+	for quadrant := uint32(0); quadrant < 4; quadrant++ {
+		tileID := uint32(bucket)<<2 | quadrant
+		if finalLive[tileID] == baseLive[tileID] {
+			continue
+		}
+		if !c.emitPrimaryExactTileRecord(
+			epoch, prepared, tileID, generation, finalLive[tileID], false,
+		) {
+			return false
+		}
+	}
+	for indexID := range finalByIndex {
+		finalTerms := finalByIndex[indexID]
+		var baseTerms map[string]map[uint32]uint64
+		if indexID < len(baseByIndex) {
+			baseTerms = baseByIndex[indexID]
+		}
+		for _, term := range unionSortedExactDiffTerms(finalTerms, baseTerms) {
+			finalTiles := finalTerms[term]
+			baseTiles := baseTerms[term]
+			for _, tileID := range unionSortedExactDiffTiles(finalTiles, baseTiles) {
+				if finalTiles[tileID] == baseTiles[tileID] {
+					continue
+				}
+				if !c.emitAbsoluteExactTermRecord(
+					epoch, prepared, indexID, term, tileID,
+					generation, finalTiles[tileID],
+				) {
+					return false
+				}
+			}
+		}
+	}
+	for indexID := range baseByIndex {
+		if indexID < len(finalByIndex) {
+			continue
+		}
+		for term, baseTiles := range baseByIndex[indexID] {
+			for tileID := range baseTiles {
+				if !c.emitAbsoluteExactTermRecord(
+					epoch, prepared, indexID, term, tileID,
+					generation, 0,
+				) {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
 // preparePrimaryExactBufferedMutation rebases the exact contribution after the
 // exceptional structural lane has placed an owned raw workspace back into
 // compact VCS1. Steady-state VCS1 overlay mutations use
@@ -712,6 +1031,39 @@ type structuralBucketContribution struct {
 func (c *Collection) resetStructuralExactLocked() {
 	c.structuralExactReencoded = nil
 	c.structuralExactRemoved = c.structuralExactRemoved[:0]
+	c.structuralExactOld = nil
+	c.structuralExactOldReady = false
+}
+
+// captureStructuralOldLocked records one affected bucket's pre-transaction
+// exact-index contribution from its published leaf image, so the structural
+// commit can diff old against new instead of re-resolving the index. The
+// image must be the bucket's last published leaf: stagers capture from the
+// routing or enumeration lease they already hold, and absorbed overlay rows
+// are safe — unpublished rows carry no exact records, so every old posting
+// the diff must retract is present in the image.
+func (c *Collection) captureStructuralOldLocked(
+	bucket storeio.BucketID, leafPage []byte,
+	bounds storeio.CommonPrimaryLeafBounds,
+) error {
+	if !c.primaryExactActive() {
+		return nil
+	}
+	bucketLive, byIndex, err := c.deriveBucketExactContribution(
+		leafPage, bucket, bounds,
+	)
+	if err != nil {
+		return err
+	}
+	if c.structuralExactOld == nil {
+		c.structuralExactOld = make(
+			map[storeio.BucketID]*structuralBucketContribution,
+		)
+	}
+	c.structuralExactOld[bucket] = &structuralBucketContribution{
+		live: bucketLive, byIndex: byIndex,
+	}
+	return nil
 }
 
 // accumulateStructuralLeafLocked records one re-encoded leaf's exact-index
@@ -748,20 +1100,122 @@ func (c *Collection) recordStructuralRemovedBucketLocked(
 	c.structuralExactRemoved = append(c.structuralExactRemoved, bucket)
 }
 
+// prepareStructuralExactDirtyLocked folds a structural transaction whose
+// stager captured every affected bucket's old contribution: it publishes
+// absolute overlay records for the old→new diff of every affected bucket and
+// folds them with the checkpoint dirty fold, which re-encodes only the dirty
+// term runs and carries every other leaf forward by reference. Staging then
+// persists only the re-encoded leaves, so a split costs O(affected rows),
+// never O(index).
+//
+// ok=false asks the caller to keep the full structural rebuild: the diff does
+// not fit the current overlay window (no checkpoint can run mid-transaction).
+// Every record is absolute and non-rebased, so the resolved index is identical
+// to the rebuild output and the fold stays escalation-free.
+func (c *Collection) prepareStructuralExactDirtyLocked(
+	generation uint64,
+) (prepared primaryExactPrepared, ok bool, err error) {
+	epoch := c.primaryEpoch
+	affected := make([]storeio.BucketID, 0,
+		len(c.structuralExactReencoded)+len(c.structuralExactRemoved))
+	for bucket := range c.structuralExactReencoded {
+		affected = append(affected, bucket)
+	}
+	for _, bucket := range c.structuralExactRemoved {
+		if _, ok := c.structuralExactReencoded[bucket]; !ok {
+			affected = append(affected, bucket)
+		}
+	}
+	slices.Sort(affected)
+	var cost exactDiffCost
+	for _, bucket := range affected {
+		var oldLive map[uint32]uint64
+		var oldByIndex []map[string]map[uint32]uint64
+		if old := c.structuralExactOld[bucket]; old != nil {
+			oldLive, oldByIndex = old.live, old.byIndex
+		} else if _, reencoded := c.structuralExactReencoded[bucket]; reencoded {
+			// A re-encoded bucket without a captured old is a fresh tile
+			// set with no base state to retract: diff against empty.
+		} else {
+			// A removed bucket without a captured old may still hold
+			// postings the diff cannot see: keep the full rebuild.
+			return primaryExactPrepared{}, false, nil
+		}
+		var newLive map[uint32]uint64
+		var newByIndex []map[string]map[uint32]uint64
+		if new := c.structuralExactReencoded[bucket]; new != nil {
+			newLive, newByIndex = new.live, new.byIndex
+		}
+		cost.add(countExactContributionDiff(
+			oldLive, newLive, oldByIndex, newByIndex,
+		))
+	}
+	prepared = primaryExactPrepared{
+		active:         true,
+		gen:            generation,
+		termLinks:      c.exactTermLinkScratch[:0],
+		tileLinks:      c.exactTileLinkScratch[:0],
+		termRecordMark: epoch.termRecordN,
+		tileRecordMark: epoch.tileRecordN,
+	}
+	if !cost.fitsExactWindowRoom(exactWindowRoom(epoch)) {
+		return primaryExactPrepared{}, false, nil
+	}
+	for _, bucket := range affected {
+		var oldLive map[uint32]uint64
+		var oldByIndex []map[string]map[uint32]uint64
+		if old := c.structuralExactOld[bucket]; old != nil {
+			oldLive, oldByIndex = old.live, old.byIndex
+		}
+		var newLive map[uint32]uint64
+		var newByIndex []map[string]map[uint32]uint64
+		if new := c.structuralExactReencoded[bucket]; new != nil {
+			newLive, newByIndex = new.live, new.byIndex
+		}
+		if !c.emitExactContributionDiff(
+			epoch, &prepared, oldLive, oldByIndex,
+			newLive, newByIndex, bucket, generation,
+		) {
+			c.unwindPrimaryExactPrepared(&prepared)
+			return primaryExactPrepared{}, false, nil
+		}
+	}
+	folded, err := c.prepareDirtyPrimaryExactFold(
+		generation, generation, &prepared,
+	)
+	if err != nil {
+		c.unwindPrimaryExactPrepared(&prepared)
+		return primaryExactPrepared{}, false, err
+	}
+	return folded, true, nil
+}
+
 // prepareStructuralExactLocked folds the structural accumulators into a
-// fresh epoch: it drops the tiles of every re-encoded or removed bucket,
-// resolves every untouched tile through the read rule, and merges the
-// re-encoded contributions, so it is correct whether a tablet rebuild
-// reassigned slots, added a leaf, or removed one. Structural transactions
-// fold first (flushPendingForStructural checkpoints the deferred lanes), so
-// the overlay it resolves is empty in practice. Returns active=false for a
-// collection without exact indexes.
+// fresh epoch. When the stager captured every affected bucket's old
+// contribution it publishes overlay diff records and folds them with the
+// bounded dirty fold; otherwise it drops the tiles of every re-encoded or
+// removed bucket, resolves every untouched tile through the read rule, and
+// merges the re-encoded contributions, so it is correct whether a tablet
+// rebuild reassigned slots, added a leaf, or removed one. Structural
+// transactions fold first (flushPendingForStructural checkpoints the deferred
+// lanes), so the overlay it resolves is empty in practice. Returns
+// active=false for a collection without exact indexes.
 func (c *Collection) prepareStructuralExactLocked(
 	generation uint64,
 ) (primaryExactPrepared, error) {
 	if !c.primaryExactActive() {
 		return primaryExactPrepared{}, nil
 	}
+	if c.structuralExactOldReady {
+		if prepared, ok, err := c.prepareStructuralExactDirtyLocked(
+			generation,
+		); err != nil {
+			return primaryExactPrepared{}, err
+		} else if ok {
+			return prepared, nil
+		}
+	}
+	c.primaryExactStructuralRebuilds.Add(1)
 	affected := make(map[storeio.BucketID]bool)
 	for bucket := range c.structuralExactReencoded {
 		affected[bucket] = true

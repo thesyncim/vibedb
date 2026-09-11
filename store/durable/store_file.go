@@ -234,11 +234,21 @@ type Collection struct {
 	// start of each structural transaction.
 	structuralExactReencoded map[storeio.BucketID]*structuralBucketContribution
 	structuralExactRemoved   []storeio.BucketID
-	readFile                 *os.File
-	writeFile                *os.File
-	directRead               bool
-	directWrite              bool
-	leases                   *storeio.GenerationLeases
+	// structuralExactOld holds the pre-transaction contribution of every
+	// affected bucket whose old leaf image the stager had in hand, so the
+	// structural commit can publish overlay records solely for changed
+	// (term, tile) pairs and fold them with the bounded dirty fold instead
+	// of re-resolving the whole index. structuralExactOldReady reports the
+	// capture is complete for the transaction's affected set; when false
+	// (pressure fallback, empty-leaf reclaim, or a future stager that does
+	// not capture) the commit keeps the full structural rebuild.
+	structuralExactOld      map[storeio.BucketID]*structuralBucketContribution
+	structuralExactOldReady bool
+	readFile                *os.File
+	writeFile               *os.File
+	directRead              bool
+	directWrite             bool
+	leases                  *storeio.GenerationLeases
 	// readEpochs is the direct-read fast path's reader registry. A point read
 	// claims one epoch slot instead of a snapshot-gate round trip plus a
 	// mutex-guarded generation lease; long-lived Snapshots keep their leases.
@@ -308,7 +318,12 @@ type Collection struct {
 	// writer, so no transaction can overlap a Reset.
 	writeTransaction storeio.WriteTransaction
 
-	automaticCheckpoints                  atomic.Uint64
+	automaticCheckpoints atomic.Uint64
+	// primaryExactStructuralRebuilds counts exact preparations that fell
+	// back to a full structural index rebuild. Steady insert/delete batches
+	// and splits must not move it: the bucket diff publishes only changed
+	// pairs and folds them with the bounded dirty fold.
+	primaryExactStructuralRebuilds        atomic.Uint64
 	primaryOverlayFolds                   atomic.Uint64
 	primaryOverlayMaterializationAttempts atomic.Uint64
 	primaryOverlayMaterializations        atomic.Uint64

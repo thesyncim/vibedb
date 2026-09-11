@@ -89,6 +89,12 @@ type primaryBatchLeaf struct {
 	mutationEnd  int
 	stableSlots  bool
 	skip         bool
+	// basePage is a copy of the leaf's pre-batch page, kept only when the
+	// batch rewrites slots with exact indexes active. It lets exact-index
+	// preparation diff the base and final bucket contributions and emit
+	// overlay records solely for changed (term, tile) pairs instead of a
+	// whole-bucket rebase on every insert/delete batch.
+	basePage []byte
 }
 
 // stagedPrimaryBatch is the opaque product of stagePrimaryBatchLocked: dirty
@@ -1306,10 +1312,31 @@ func (c *Collection) preparePrimaryBatchExact(
 			continue
 		}
 		image := c.batchPrimaryLeafArena[leaf.imageOffset : leaf.imageOffset+leaf.imageLength]
-		ok, err := c.preparePrimaryExactRebase(
-			epoch, &prepared, image, leaf.resident.Bucket,
-			generation, bounds,
-		)
+		var ok bool
+		var err error
+		if len(leaf.basePage) != 0 {
+			// Slot-rewriting batch with the base page retained: publish
+			// records only for changed pairs instead of a whole-bucket
+			// rebase.
+			var checkpoint bool
+			ok, checkpoint, err = c.preparePrimaryExactBucketDiff(
+				epoch, &prepared, leaf.basePage, image,
+				leaf.resident.Bucket, generation, bounds,
+			)
+			if err == nil && !ok && checkpoint {
+				// The diff fits a drained window: fold the window with a
+				// checkpoint and retry the batch instead of rebuilding.
+				// The retry re-derives from the checkpoint's fresh epoch,
+				// so the same emission is guaranteed room.
+				c.unwindPrimaryExactPrepared(&prepared)
+				return primaryExactPrepared{}, errPrimaryBatchExactCheckpointRequired
+			}
+		} else {
+			ok, err = c.preparePrimaryExactRebase(
+				epoch, &prepared, image, leaf.resident.Bucket,
+				generation, bounds,
+			)
+		}
 		if err != nil {
 			c.unwindPrimaryExactPrepared(&prepared)
 			return primaryExactPrepared{}, err
@@ -1330,6 +1357,7 @@ func (c *Collection) preparePrimaryBatchExact(
 	if stablePressure && (certifiedReplay || !epoch.overlayEmpty()) {
 		return primaryExactPrepared{}, errPrimaryBatchExactCheckpointRequired
 	}
+	c.primaryExactStructuralRebuilds.Add(1)
 	c.resetStructuralExactLocked()
 	defer c.resetStructuralExactLocked()
 	for i := range c.batchPrimaryLeaves {
@@ -1933,6 +1961,13 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	leaf.imageOffset = len(c.batchPrimaryLeafArena)
 	c.batchPrimaryLeafArena = append(c.batchPrimaryLeafArena, image...)
 	leaf.imageLength = len(c.batchPrimaryLeafArena) - leaf.imageOffset
+	if !leaf.stableSlots && c.primaryEpoch != nil && !c.absorbOverlayOnCOW {
+		// Slot-rewriting batch on an indexed collection: retain the base
+		// page so exact preparation can diff contributions. Overlay-absorbed
+		// leaves keep the whole-bucket rebase (the base image alone no
+		// longer describes the read-rule state once overlay rows merge in).
+		leaf.basePage = append(leaf.basePage[:0], page...)
+	}
 	return nil, nil
 }
 
