@@ -87,6 +87,17 @@ func NewAuthenticatedExecutionPeerRuntime(options AuthenticatedExecutionPeerOpti
 	}, nil
 }
 
+// Transport exposes the peer's shared ordinary transport. A control-plane
+// service that must be constructed before this runtime exists (its routes
+// are wired ahead of the peer so the control listener can start) attaches to
+// it here once built, rather than through the constructor.
+func (runtime *AuthenticatedExecutionPeerRuntime) Transport() *rafttransport.OrdinaryTransport {
+	if runtime == nil {
+		return nil
+	}
+	return runtime.transport
+}
+
 // RegisterExecutionGroup atomically makes one adopted Runtime visible to the
 // deterministic execution lane and ordinary transport. The transport roster
 // is published from inside the serialized lane after Host ownership and

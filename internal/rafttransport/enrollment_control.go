@@ -13,6 +13,7 @@ import (
 	"io"
 	"math"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -115,7 +116,7 @@ type EnrollmentControlServiceOptions struct {
 // It does not retain connections or start goroutines.
 type EnrollmentControlService struct {
 	registry      *StaticRegistry
-	transport     *OrdinaryTransport
+	transport     atomic.Pointer[OrdinaryTransport]
 	verifier      EnrollmentVerifier
 	authorize     EnrollmentControlAuthorizer
 	readDeadline  DeadlineFunc
@@ -136,11 +137,31 @@ func NewEnrollmentControlService(
 	if options.Transport != nil && options.Transport.registry != registry {
 		return nil, ErrEnrollmentControl
 	}
-	return &EnrollmentControlService{
-		registry: registry, transport: options.Transport, verifier: options.Verifier,
+	service := &EnrollmentControlService{
+		registry: registry, verifier: options.Verifier,
 		authorize: options.Authorize, readDeadline: options.ReadDeadline,
 		writeDeadline: options.WriteDeadline,
-	}, nil
+	}
+	if options.Transport != nil {
+		service.transport.Store(options.Transport)
+	}
+	return service, nil
+}
+
+// AttachTransport binds the preferred commit owner once it exists. A serving
+// process builds its control routes - including this service - before it can
+// construct the peer's own OrdinaryTransport, so construction alone cannot
+// supply it. Every enrollment handled before this call still commits (the
+// registry directory cut still lands), but skips installing that peer's
+// queue on this transport, permanently stranding the previously-approved
+// caller's later ordinary traffic to it behind ErrNodeNotFound. The control
+// listener must not start accepting connections until this has run.
+func (service *EnrollmentControlService) AttachTransport(transport *OrdinaryTransport) error {
+	if service == nil || transport == nil || transport.registry != service.registry {
+		return ErrEnrollmentControl
+	}
+	service.transport.Store(transport)
+	return nil
 }
 
 // Serve reads and commits exactly one enrollment request. Remote authorization
@@ -171,8 +192,8 @@ func (service *EnrollmentControlService) Serve(
 	if err = service.authorize(ctx, connection, intent); err != nil {
 		return errors.Join(ErrEnrollmentControlUnauthorized, err)
 	}
-	if service.transport != nil {
-		err = service.transport.EnrollMemberContext(ctx, intent, service.verifier)
+	if transport := service.transport.Load(); transport != nil {
+		err = transport.EnrollMemberContext(ctx, intent, service.verifier)
 	} else {
 		err = service.registry.EnrollMemberContext(ctx, intent, service.verifier)
 	}

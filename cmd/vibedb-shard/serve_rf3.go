@@ -820,6 +820,15 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			resultErr = finishRF3Serving(errors.Join(resultErr, componentShutdownError(peer.Run(retireCtx))), lanes, servingRegistry)
 		}
 	}()
+	// enrollmentControl was built before this peer - and its transport - could
+	// exist (its route has to be ready when controlMux is assembled, well
+	// ahead of this construction). Attach the transport now, before the
+	// control listener starts accepting connections below, so every
+	// enrollment commits its queue and not just its registry directory cut;
+	// see EnrollmentControlService.AttachTransport.
+	if err := enrollmentControl.AttachTransport(peer.Transport()); err != nil {
+		return err
+	}
 	observationControl, err := replicacontrol.NewService(replicacontrol.ServiceOptions{
 		Observer:     peer.Owners(),
 		Authorize:    rf3ReplicaObservationAuthorizer(transportRegistry, policy),
