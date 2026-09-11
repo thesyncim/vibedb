@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
@@ -22,6 +23,15 @@ import (
 )
 
 var errGatewayReplicaControl = errors.New("vibedb-gateway: invalid replica control configuration")
+
+// gatewayReplicaSnapshotTimeout bounds source export and learner bootstrap.
+// Generic replica-control RPCs stay on the short manifest read timeout so a
+// down peer cannot stall health/observe rounds for minutes.
+const gatewayReplicaSnapshotTimeout = 2 * time.Minute
+
+func gatewayReplicaSnapshotDeadline() time.Time {
+	return time.Now().Add(gatewayReplicaSnapshotTimeout)
+}
 
 type gatewayReplicaRemoteClientOptions struct {
 	Opener        *gatewayShardControlOpener
@@ -332,15 +342,15 @@ func newGatewayReplicaRemoteClients(
 		return gatewayReplicaMoveControls{}, err
 	}
 	source, err := snapshottransfer.NewSourceControlClient(snapshottransfer.SourceControlClientOptions{
-		Opener: options.Opener, ReadDeadline: options.ReadDeadline,
-		WriteDeadline: options.WriteDeadline,
+		Opener: options.Opener, ReadDeadline: gatewayReplicaSnapshotDeadline,
+		WriteDeadline: gatewayReplicaSnapshotDeadline,
 	})
 	if err != nil {
 		return gatewayReplicaMoveControls{}, err
 	}
 	bootstrap, err := snapshottransfer.NewBootstrapControlClient(snapshottransfer.BootstrapControlClientOptions{
-		Opener: options.Opener, ReadDeadline: options.ReadDeadline,
-		WriteDeadline: options.WriteDeadline,
+		Opener: options.Opener, ReadDeadline: gatewayReplicaSnapshotDeadline,
+		WriteDeadline: gatewayReplicaSnapshotDeadline,
 	})
 	if err != nil {
 		return gatewayReplicaMoveControls{}, err
