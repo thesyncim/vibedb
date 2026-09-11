@@ -106,14 +106,11 @@ func TestGatewayGrantedMembershipInstallsEveryPeerBeforeProposal(t *testing.T) {
 	if _, err := client.ApplyMembership(t.Context(), route, request); err != nil {
 		t.Fatal(err)
 	}
-	// AddLearner still attempts the enrolled target's install too, best
-	// effort (see installGatewayMembershipGrant): a cold-bootstrapped target
-	// already runs a membership-grant-control listener, and without the
-	// grant installed locally before its own log replication resumes, it can
-	// never authorize the ConfChange entry that added it as a learner. The
-	// target also becomes a known peer via the enrollment fanout checked
-	// separately below.
-	want := []rafttransport.NodeID{{1}, {2}, {3}, {4}}
+	// AddLearner is voters-only: the enrolled empty target has no group
+	// authority yet. The target becomes a known peer via the enrollment
+	// fanout checked separately below, and receives the grant on the next
+	// membership action after RegisterExecutionGroup.
+	want := []rafttransport.NodeID{{1}, {2}, {3}}
 	if !slices.Equal(installer.nodes, want) || applier.calls != 1 {
 		t.Fatalf("installed=%v apply=%d", installer.nodes, applier.calls)
 	}
@@ -131,6 +128,19 @@ func TestGatewayGrantedMembershipInstallsEveryPeerBeforeProposal(t *testing.T) {
 	installer.failFrom = 2
 	if _, err := client.ApplyMembership(t.Context(), route, request); err == nil || applier.calls != 2 {
 		t.Fatalf("quorum not reached but proposal still applied err=%v apply=%d", err, applier.calls)
+	}
+	enroller.nodes = nil
+	enroller.failAt = 1
+	installer.nodes = nil
+	installer.failAt = 0
+	installer.failFrom = 0
+	if _, err := client.ApplyMembership(t.Context(), route, request); err != nil || applier.calls != 3 {
+		t.Fatalf("retiring replica enrollment is optional err=%v apply=%d enrolled=%v", err, applier.calls, enroller.nodes)
+	}
+	enroller.nodes = nil
+	enroller.failAt = 3
+	if _, err := client.ApplyMembership(t.Context(), route, request); err == nil || applier.calls != 3 {
+		t.Fatalf("snapshot donor enrollment skipped err=%v apply=%d enrolled=%v", err, applier.calls, enroller.nodes)
 	}
 }
 

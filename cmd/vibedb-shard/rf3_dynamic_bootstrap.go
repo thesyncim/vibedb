@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -222,13 +223,17 @@ func (registry *rf3DynamicBootstrapRegistry) Serve(
 			return fmt.Errorf("%w: dynamic registrar is unavailable", snapshottransfer.ErrBootstrapUnauthorized)
 		}
 		if err := register(serveCtx, reservation.intent, reservation.proof, request.Descriptor); err != nil {
-			return fmt.Errorf("register dynamic bootstrap service: %w", err)
+			err = fmt.Errorf("register dynamic bootstrap service: %w", err)
+			fmt.Fprintf(os.Stderr, "RF3 empty-node bootstrap: %v\n", err)
+			return err
 		}
 		registry.mu.RLock()
 		service = registry.services[request.Descriptor.Group]
 		registry.mu.RUnlock()
 		if service == nil {
-			return fmt.Errorf("%w: dynamic registrar published no service", snapshottransfer.ErrBootstrapControl)
+			err := fmt.Errorf("%w: dynamic registrar published no service", snapshottransfer.ErrBootstrapControl)
+			fmt.Fprintf(os.Stderr, "RF3 empty-node bootstrap: %v\n", err)
+			return err
 		}
 	}
 	// The outer shard-control mux consumed the discriminator. Replaying the
@@ -236,7 +241,11 @@ func (registry *rf3DynamicBootstrapRegistry) Serve(
 	// bounded deadline, request authentication, journal CAS, and response
 	// handling without exposing an unexported service method here.
 	replay := &rf3FixedReplayConnection{PeerConnection: connection, prefix: raw[:]}
-	return service.Serve(serveCtx, replay)
+	if err := service.Serve(serveCtx, replay); err != nil {
+		fmt.Fprintf(os.Stderr, "RF3 empty-node bootstrap: %v\n", err)
+		return err
+	}
+	return nil
 }
 
 // rf3FixedReplayConnection restores bytes consumed by a process-level router.

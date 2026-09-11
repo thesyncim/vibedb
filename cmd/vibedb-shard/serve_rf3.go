@@ -628,6 +628,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		return closePrepared(fmt.Errorf("%w: restore membership grant: %v", errRF3Serving, err))
 	}
 	deadline := func() time.Time { return time.Now().Add(rf3NetworkTimeout) }
+	snapshotBootstrapDeadline := func() time.Time { return time.Now().Add(rf3SnapshotBootstrapTimeout) }
 	membershipControl, err := shardservice.NewMembershipGrantControlService(
 		grantInstaller, policy, deadline, deadline,
 	)
@@ -1060,7 +1061,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			Registry:     transportRegistry,
 			Budget:       migrationBudget,
 			Authorize:    authorizeData,
-			ReadDeadline: deadline, WriteDeadline: deadline,
+			ReadDeadline: snapshotBootstrapDeadline, WriteDeadline: snapshotBootstrapDeadline,
 			MaxConnections: manifest.ReplicaControl.MaxSourceConcurrent,
 			MaxChunkBytes:  manifest.ReplicaControl.SourceChunkBytes,
 			MaxInflightBytes: int64(manifest.ReplicaControl.SourceChunkBytes) *
@@ -1088,7 +1089,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			sourceData, serviceErr = snapshottransfer.NewGroupDataRegistry(
 				snapshottransfer.GroupDataRegistryOptions{
 					Registry: transportRegistry, Services: dataServices,
-					ReadDeadline: deadline, MaxConnections: manifest.ReplicaControl.MaxSourceConcurrent,
+					ReadDeadline: snapshotBootstrapDeadline, MaxConnections: manifest.ReplicaControl.MaxSourceConcurrent,
 					MaxInflightBytes: int64(manifest.ReplicaControl.SourceChunkBytes) *
 						int64(manifest.ReplicaControl.MaxSourceConcurrent),
 				},
@@ -1280,7 +1281,9 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			MaxConnections: snapshotConcurrency, MaxHandshakes: snapshotConcurrency,
 			HandshakeDeadline: deadline,
 		}, func(ctx context.Context, connection rafttransport.PeerConnection) {
-			if err := snapshotMux.Serve(ctx, connection); err != nil && ctx.Err() == nil {
+			serveCtx, cancel := context.WithTimeout(ctx, rf3SnapshotBootstrapTimeout)
+			defer cancel()
+			if err := snapshotMux.Serve(serveCtx, connection); err != nil && ctx.Err() == nil {
 				fmt.Fprintf(os.Stderr, "RF3 snapshot request failed: %v\n", err)
 			}
 		})

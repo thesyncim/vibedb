@@ -986,14 +986,27 @@ func installGatewayMembershipGrant(
 		}
 		var enrollErrors error
 		enrolledVoters := 0
+		requiredVoters := 0
+		requiredEnrolled := 0
 		for _, endpoint := range route.Serving.Replicas {
+			optional := endpoint.Member == grant.SourceMember
+			if !optional {
+				requiredVoters++
+			}
 			if _, err := enroller.EnrollMember(ctx, endpoint.Node, intent); err != nil {
 				enrollErrors = errors.Join(enrollErrors, err)
 				continue
 			}
 			enrolledVoters++
+			if !optional {
+				requiredEnrolled++
+			}
 		}
-		if enrolledVoters < gateway.ServingReplicaCount/2+1 {
+		// The retiring replica may be down. Every other current voter must
+		// admit the learner, including the snapshot donor whose TLS allowlist
+		// is updated only by this Merge.
+		if enrolledVoters < gateway.ServingReplicaCount/2+1 ||
+			requiredVoters == 0 || requiredEnrolled != requiredVoters {
 			return errors.Join(enrollErrors, errGatewayReplicaControl)
 		}
 	}
@@ -1009,23 +1022,15 @@ func installGatewayMembershipGrant(
 			installErrors = errors.Join(installErrors, installErr)
 		}
 	}
-	if route.HasEnrolledTarget {
-		// AddLearner still attempts this, best-effort: a cold-bootstrapped
-		// target (unlike an in-process empty node still lacking an authority
-		// slot) already runs a membership-grant-control listener and can
-		// accept it before ConfChange is even proposed. Without the grant
-		// installed locally before its own log replication resumes, the
-		// target can never authorize the very ConfChange entry that added it
-		// as a learner (validateAuthorizedConfiguration requires a matching
-		// grant digest), so it would reject every AppEntries batch carrying
-		// that entry forever - a permanent catch-up deadlock. A target that
-		// genuinely cannot accept it yet (the empty-node case) is unaffected:
-		// targetInstalled already defaults true for AddLearner, so a failure
-		// here does not block the action.
+	if route.HasEnrolledTarget && kind != raftservice.MembershipAddLearner {
+		// AddLearner cannot install on an in-process empty node: its registry
+		// has no group yet, so every attempt is node-not-found and crowds out
+		// snapshot bootstrap. Cold-bootstrapped targets receive the grant after
+		// RegisterExecutionGroup, on the next membership action.
 		installErr := installer.InstallMembershipGrant(ctx, target.Node, grant)
 		if installErr == nil {
 			targetInstalled = true
-		} else if kind != raftservice.MembershipAddLearner {
+		} else {
 			installErrors = errors.Join(installErrors, installErr)
 		}
 	}

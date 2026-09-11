@@ -39,17 +39,23 @@ func rf3DynamicSnapshotTarget(registry *rafttransport.StaticRegistry,
 	if registry == nil || member == 0 || incarnation == 0 {
 		return false
 	}
-	role, err := registry.Role(group, member)
-	if err != nil || role != rafttransport.MemberLearner {
-		return false
-	}
 	node, err := registry.Node(group, member)
 	if err != nil {
 		return false
 	}
 	peer, err := registry.PhysicalPeer(node)
-	return err == nil && peer.State == rafttransport.PeerEnrolled &&
-		peer.Incarnation == incarnation
+	if err != nil || peer.State != rafttransport.PeerEnrolled || peer.Incarnation != incarnation {
+		return false
+	}
+	role, err := registry.Role(group, member)
+	if err != nil {
+		// Construction and pre-ConfChange grant publication omit MemberEnrolled
+		// from the committed authority view. The group member mapping plus
+		// physical enrollment is the scale-out snapshot identity until
+		// raftservice publishes MemberLearner.
+		return true
+	}
+	return role == rafttransport.MemberLearner || role == rafttransport.MemberEnrolled
 }
 
 func rf3DynamicSnapshotDataAuthorizer(registry *rafttransport.StaticRegistry,

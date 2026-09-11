@@ -32,6 +32,38 @@ func (source *rf3SnapshotFenceFixture) SnapshotAuthorizationFence() (replicateds
 	return source.fence, source.err
 }
 
+func TestRF3DynamicSnapshotTargetAdmitsEnrolledAndLearnerPeers(t *testing.T) {
+	group := rf3CommandGroup()
+	nodes := [2]rafttransport.NodeID{{1}, {4}}
+	members := []rafttransport.Member{
+		{Group: group, ReplicaSetVersion: 1, MemberID: 1, Node: nodes[0], Role: rafttransport.MemberVoter},
+		{Group: group, ReplicaSetVersion: 1, MemberID: 4, Node: nodes[1], Role: rafttransport.MemberEnrolled},
+	}
+	registry, err := rafttransport.NewStaticRegistry(nodes[0], members, rafttransport.Limits{MaxGroups: 1, MaxMembers: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rf3DynamicSnapshotTarget(registry, group, 4, 1) {
+		t.Fatal("enrolled replacement rejected before ConfChange promoted it to learner")
+	}
+	members[1].Role = rafttransport.MemberLearner
+	registry, err = rafttransport.NewStaticRegistry(nodes[0], members, rafttransport.Limits{MaxGroups: 1, MaxMembers: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rf3DynamicSnapshotTarget(registry, group, 4, 1) {
+		t.Fatal("learner snapshot target rejected")
+	}
+	members[1].Role = rafttransport.MemberVoter
+	registry, err = rafttransport.NewStaticRegistry(nodes[0], members, rafttransport.Limits{MaxGroups: 1, MaxMembers: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rf3DynamicSnapshotTarget(registry, group, 4, 1) {
+		t.Fatal("voter admitted as a dynamic snapshot learner")
+	}
+}
+
 func TestRF3SnapshotDataAuthorizationUsesCurrentDurableFenceBeforeArtifactRead(t *testing.T) {
 	group := rf3CommandGroup()
 	identity := raftmember.RuntimeIdentity{Group: group, MemberID: 1}
