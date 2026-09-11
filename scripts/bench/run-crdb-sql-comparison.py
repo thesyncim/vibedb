@@ -44,6 +44,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=1000)
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--clients", default="1,8")
+    parser.add_argument("--workloads", default="point_hit,point_miss,range_64,group_16,update_existing",
+                        help="comma-separated rf3-sqlbench workloads")
     parser.add_argument("--order", choices=["vibedb-first", "crdb-first"], default="vibedb-first")
     args = parser.parse_args()
     dest = args.output.resolve()
@@ -129,7 +131,8 @@ def main():
                 deadline = time.monotonic() + 90
                 while True:
                     log = output(["docker", "exec", name, "cat", "/evidence/vibedb.log"])
-                    if "VibeDB development cluster ready:" in log:
+                    if ("VibeDB development cluster ready:" in log or
+                            "VibeDB development RF3 physical cluster ready:" in log):
                         break
                     if time.monotonic() > deadline or "cluster dev: " in log:
                         raise RuntimeError("VibeDB startup failed: " + log)
@@ -149,6 +152,7 @@ def main():
                 completed = inside("/bench/rf3-sqlbench", "-engine", engine, "-url", url,
                     "-rows", str(args.rows), "-operations", str(args.operations), "-scans", str(args.scans),
                     "-warmup", str(args.warmup), "-repetitions", str(args.repetitions), "-clients", args.clients,
+                    "-workloads", args.workloads,
                     "-indexes", args.indexes, "-shared-bytes", str(args.shared_bytes),
                     "-shared-cardinality", str(args.shared_cardinality),
                     "-payload-mode", args.payload_mode, "-timeout", args.timeout,

@@ -25,7 +25,7 @@ func TestNewConfigPinsEveryField(t *testing.T) {
 		CheckQuorum:                 true,
 		PreVote:                     true,
 		ReadOnlyOption:              raft.ReadOnlySafe,
-		Logger:                      nil,
+		Logger:                      raftLogger,
 		DisableProposalForwarding:   true,
 		DisableConfChangeValidation: false,
 		StepDownOnRemoval:           true,

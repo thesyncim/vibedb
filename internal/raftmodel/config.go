@@ -52,7 +52,7 @@ func newConfig(id uint64, storage raft.Storage, applied uint64, async bool) raft
 		CheckQuorum:                 true,
 		PreVote:                     true,
 		ReadOnlyOption:              raft.ReadOnlySafe,
-		Logger:                      nil,
+		Logger:                      raftLogger,
 		DisableProposalForwarding:   true,
 		DisableConfChangeValidation: false,
 		StepDownOnRemoval:           true,
