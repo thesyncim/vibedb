@@ -302,6 +302,23 @@ func (c *Collection) preparePrimaryBatchTopology(
 			// load-bearing for deletes: a row removed by the logical batch still
 			// exists in this content-equivalent generation and must land in the
 			// range its key routes to.
+			if c.primaryExactActive() {
+				// Capture the source bucket's pre-split contribution from
+				// the held routing lease, so the commit diffs old against
+				// new instead of re-resolving the index. Floor zero reuses
+				// the source bucket; the remaining floors are fresh tiles.
+				if err := c.captureStructuralOldLocked(
+					route.Bucket, path.leafLease.Page(),
+					storeio.CommonPrimaryLeafBounds{
+						FileEnd:           tx.FileEnd(),
+						NextLogicalID:     tx.NextLogicalID(),
+						AllocationQuantum: uint32(c.options.PageSize),
+					},
+				); err != nil {
+					return nil, nil, nil, err
+				}
+				c.structuralExactOldReady = true
+			}
 			encoded := make([]storeio.PageRef, len(floors))
 			baseAt := 0
 			for rank := range floors {
