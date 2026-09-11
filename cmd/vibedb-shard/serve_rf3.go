@@ -614,7 +614,8 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	members, remoteNodes, dial := preparedSet.members, preparedSet.remoteNodes, preparedSet.dial
 	nativeConfigured := preparedSet.nativeConfigured
 	transportRegistry, err := newRF3ProvisionedRegistry(manifest, profile, members,
-		rafttransport.Limits{MaxGroups: maxRF3ManifestGroups, MaxMembers: maxRF3ManifestGroups * rf3ManifestMembers},
+		rafttransport.Limits{MaxGroups: maxRF3ManifestGroups, MaxMembers: maxRF3ManifestGroups * rf3ManifestMembers,
+			MaxPeers: rafttransport.AbsoluteMaxTransportPeers},
 	)
 	if err != nil {
 		return closePrepared(fmt.Errorf("%w: transport roster: %v", errRF3Serving, err))
