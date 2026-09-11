@@ -103,6 +103,14 @@ func runtimeServiceDirectoryCut(
 	var catalogFences []serviceauthz.ServiceFence
 	var catalogGeneration uint64
 	if owner, ok := reader.(interface {
+		RefreshCatalogServiceFences(context.Context) ([]serviceauthz.ServiceFence, uint64, error)
+	}); ok {
+		var err error
+		catalogFences, catalogGeneration, err = owner.RefreshCatalogServiceFences(ctx)
+		if err != nil {
+			return serviceauthz.ServiceDirectoryCut{}, err
+		}
+	} else if owner, ok := reader.(interface {
 		CatalogServiceFences(context.Context) ([]serviceauthz.ServiceFence, uint64, error)
 	}); ok {
 		var err error

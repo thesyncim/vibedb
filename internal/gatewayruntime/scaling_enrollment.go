@@ -311,7 +311,9 @@ func allocateEnrollmentIdentity(
 	return 0, [16]byte{}, fmt.Errorf("%w: no collision-free target identity", gateway.ErrScalingIdentity)
 }
 
-func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener, read, write rafttransport.DeadlineFunc) error {
+func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener,
+	read, write rafttransport.DeadlineFunc, manifest gatewayReplicaControlManifest,
+) error {
 	if runtime.config.ScalingProvisioner != nil && runtime.config.ScalingEnrollment != nil {
 		return nil
 	}
@@ -321,6 +323,17 @@ func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener, r
 	client, err := nodecontrol.NewPreparationSourceClient(nodecontrol.ClientOptions{Opener: opener, ReadDeadline: read, WriteDeadline: write})
 	if err != nil {
 		return err
+	}
+	if len(manifest.Shards) == 0 || len(manifest.Shards) != len(manifest.SplitSnapshots) {
+		return errScalingEnrollmentUnavailable
+	}
+	snapshotAddresses := make(map[rafttransport.NodeID]string, len(manifest.Shards))
+	for index, shard := range manifest.Shards {
+		address := manifest.SplitSnapshots[index]
+		if shard.Node == (rafttransport.NodeID{}) || !validGatewayReplicaAddress(address) {
+			return errScalingEnrollmentUnavailable
+		}
+		snapshotAddresses[shard.Node] = address
 	}
 	source := func(ctx context.Context, intent gateway.GroupEnrollmentIntent) ([]byte, error) {
 		var voters [3]nodecontrol.PreparationMember
@@ -336,7 +349,11 @@ func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener, r
 				return nil, errScalingEnrollmentDrift
 			}
 			for i, member := range route.Replicas {
-				voters[i] = nodecontrol.PreparationMember{MemberID: member.Member, Node: member.Node, PeerEndpoint: distribution.EndpointID(member.Endpoint), NativeEndpoint: distribution.EndpointID(member.NativeEndpoint), ControlEndpoint: distribution.EndpointID(member.ControlEndpoint), PeerAddress: member.DataAddress, NativeAddress: member.Address, ControlAddress: member.ControlAddress}
+				snapshotAddress := snapshotAddresses[member.Node]
+				if snapshotAddress == "" {
+					return nil, errScalingEnrollmentDrift
+				}
+				voters[i] = nodecontrol.PreparationMember{MemberID: member.Member, Node: member.Node, PeerEndpoint: distribution.EndpointID(member.Endpoint), NativeEndpoint: distribution.EndpointID(member.NativeEndpoint), ControlEndpoint: distribution.EndpointID(member.ControlEndpoint), PeerAddress: member.DataAddress, NativeAddress: member.Address, ControlAddress: member.ControlAddress, SnapshotAddress: snapshotAddress}
 			}
 			node, err := runtime.authority.ReadNode(ctx, intent.Target.Node, intent.Target.NodeIncarnation)
 			if err != nil {

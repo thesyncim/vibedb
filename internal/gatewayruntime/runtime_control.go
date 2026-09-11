@@ -100,7 +100,7 @@ func (runtime *Runtime) openReplicaControl() error {
 		runtime.config.ScalingReadiness = scalingNodeReadiness{client: infoClient, domain: profile.LocalIdentity().TrustDomain}
 	}
 
-	if err := runtime.openScalingEnrollment(shardOpener, readDeadline, writeDeadline); err != nil {
+	if err := runtime.openScalingEnrollment(shardOpener, readDeadline, writeDeadline, manifest); err != nil {
 		return err
 	}
 	if config.PGDDLSocket != "" {
@@ -108,6 +108,7 @@ func (runtime *Runtime) openReplicaControl() error {
 		runtime.schemaDDL, err = newGatewaySchemaDDLRuntime(
 			runtime.authority, runtime.replicated, shardOpener, schemaDeadline, schemaDeadline,
 			config.CatalogSessionJournal+".schema-ddl", runtime.config.InternalAuthority,
+			runtime.refreshLiveControlDirectory,
 		)
 		if err != nil {
 			return fmt.Errorf("open schema DDL runtime: %w", err)

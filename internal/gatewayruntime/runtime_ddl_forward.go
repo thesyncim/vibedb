@@ -109,7 +109,8 @@ func (runtime *Runtime) openDDL() error {
 	if runtime.hotSplitFactory != nil {
 		registerSource = runtime.hotSplitFactory.RegisterProvisionedSource
 	}
-	run := newGatewayDevDDL(config.PGDDLSocket, runtime.authority, runtime.schemaDDL, registerSource, config.Logf)
+	run := newGatewayDevDDL(config.PGDDLSocket, runtime.authority, runtime.schemaDDL, registerSource,
+		runtime.refreshLiveControlDirectory, config.Logf)
 	// Check the original actor at the common local/forwarded DDL boundary.
 	// Schema recovery itself keeps its persisted owner principal unchanged.
 	runtime.pgDDL = func(ctx context.Context, actor serviceauthz.Authority, text string) error {

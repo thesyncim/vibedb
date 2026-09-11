@@ -23,6 +23,30 @@ func (authority *ReplicatedCatalogAuthority) CatalogServiceFences(ctx context.Co
 	if snapshot == nil {
 		return nil, 0, ErrReplicatedCatalog
 	}
+	return authority.catalogServiceFences(ctx, snapshot)
+}
+
+// RefreshCatalogServiceFences first fetches the authenticated catalog head.
+// Node-directory reads alone do not advance the holder for catalog-only
+// changes such as online table registration.
+func (authority *ReplicatedCatalogAuthority) RefreshCatalogServiceFences(ctx context.Context) ([]serviceauthz.ServiceFence, uint64, error) {
+	if authority == nil || ctx == nil {
+		return nil, 0, ErrReplicatedCatalog
+	}
+	ctx, err := authority.authorizedContext(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	snapshot, err := authority.Read(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	return authority.catalogServiceFences(ctx, snapshot)
+}
+
+func (authority *ReplicatedCatalogAuthority) catalogServiceFences(
+	ctx context.Context, snapshot *Snapshot,
+) ([]serviceauthz.ServiceFence, uint64, error) {
 	route, err := authority.executor.catalogOperationalRoute(ctx, authority.route, snapshot)
 	if err != nil {
 		return nil, 0, err

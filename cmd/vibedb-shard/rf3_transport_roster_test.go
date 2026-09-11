@@ -58,7 +58,7 @@ func TestRF3TransportBoundsCoverEnrolledAndMaximumGroupRosters(t *testing.T) {
 				t.Fatalf("valid %d-node roster rejected: %v", count, err)
 			}
 			t.Cleanup(func() { _ = transport.Close() })
-			if options.Queue.PerPeerFrames != 32 || options.Queue.GlobalFrames != max(64, count*32) ||
+			if options.Queue.PerPeerFrames != 32 || options.Queue.GlobalFrames != max(96, count*32) ||
 				options.Queue.PerPeerBytes != 32<<20 || options.Queue.GlobalBytes != 64<<20 {
 				t.Fatalf("roster changed byte admission or underfunded frame slots: %+v", options.Queue)
 			}

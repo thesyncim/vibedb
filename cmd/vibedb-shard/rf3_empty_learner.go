@@ -278,33 +278,24 @@ func (factory *rf3DynamicLearnerFactory) openService(
 		descriptor.TargetStore != reservation.SQL.Binding.StoreID {
 		return nil, nil, nodecontrol.ErrConflict
 	}
-	openOptions := sqldriver.ReplicatedOpenOptions{WriterLockContext: ctx, WriterLockDeadline: factory.deadline()}
-	database, err := sqldriver.OpenReplicatedSnapshotTarget(filepath.Join(reservationRoot, "member.vdb"),
-		reservation.SQL, reservation.Apply, openOptions)
-	if err != nil {
-		return nil, nil, err
-	}
-	closeDatabase := func(cause error) (*snapshottransfer.BootstrapControlService, *rf3DynamicLearnerService, error) {
-		return nil, nil, errors.Join(cause, database.Close())
-	}
 	repository, err := snapshottransfer.OpenRepository(filepath.Join(reservationRoot, "snapshot-repository"), snapshottransfer.Limits{
 		MaxArtifacts: 1, MaxArtifactBytes: rf3DynamicRepositoryMaxBytes,
 		MaxDiskBytes: rf3DynamicRepositoryMaxBytes + snapshottransfer.DescriptorBytes + 2<<20,
 		Budget:       factory.budget,
 	})
 	if err != nil {
-		return closeDatabase(err)
+		return nil, nil, err
 	}
 	cursor, err := replicatedstate.OpenSnapshotCursorStore(filepath.Join(reservationRoot, "snapshot.cursor"))
 	if err != nil {
 		_ = repository.Close()
-		return closeDatabase(err)
+		return nil, nil, err
 	}
 	journal, err := snapshottransfer.OpenBootstrapFileJournal(filepath.Join(reservationRoot, "bootstrap-journal"), 4)
 	if err != nil {
 		_ = cursor.Close()
 		_ = repository.Close()
-		return closeDatabase(err)
+		return nil, nil, err
 	}
 	opener := rafttransport.TLSSnapshotStreamOpener{
 		TLS: factory.profile,
@@ -340,7 +331,7 @@ func (factory *rf3DynamicLearnerFactory) openService(
 		_ = journal.Close()
 		_ = cursor.Close()
 		_ = repository.Close()
-		return closeDatabase(err)
+		return nil, nil, err
 	}
 	resources := &rf3DynamicLearnerService{service: service, repository: repository, cursor: cursor, journal: journal,
 		descriptor: descriptor, reservation: reservationRoot, installer: installer}

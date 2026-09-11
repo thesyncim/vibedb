@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 
@@ -27,6 +28,7 @@ type rf3DynamicBootstrapRegistry struct {
 	slots        chan struct{}
 	reservations map[raftmember.GroupKey]rf3BootstrapReservation
 	services     map[raftmember.GroupKey]*snapshottransfer.BootstrapControlService
+	register     func(context.Context, gateway.GroupEnrollmentIntent, gateway.PreparedReplicaProof, snapshottransfer.Descriptor) error
 }
 
 type rf3BootstrapReservation struct {
@@ -49,6 +51,21 @@ func newRF3DynamicBootstrapRegistry(
 		reservations: make(map[raftmember.GroupKey]rf3BootstrapReservation),
 		services:     make(map[raftmember.GroupKey]*snapshottransfer.BootstrapControlService),
 	}, nil
+}
+
+func (registry *rf3DynamicBootstrapRegistry) BindRegistrar(
+	register func(context.Context, gateway.GroupEnrollmentIntent, gateway.PreparedReplicaProof, snapshottransfer.Descriptor) error,
+) error {
+	if registry == nil || register == nil {
+		return nodecontrol.ErrControl
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if registry.register != nil {
+		return nodecontrol.ErrConflict
+	}
+	registry.register = register
+	return nil
 }
 
 // Activate records the exact enrolled intent and reservation proof.  It is
@@ -188,12 +205,29 @@ func (registry *rf3DynamicBootstrapRegistry) Serve(
 	registry.mu.RLock()
 	reservation, reserved := registry.reservations[request.Descriptor.Group]
 	service := registry.services[request.Descriptor.Group]
+	register := registry.register
 	registry.mu.RUnlock()
-	if !reserved || service == nil ||
-		request.Descriptor.TargetMember != reservation.intent.Target.Member ||
+	if !reserved {
+		return fmt.Errorf("%w: group reservation is missing", snapshottransfer.ErrBootstrapUnauthorized)
+	}
+	if request.Descriptor.TargetMember != reservation.intent.Target.Member ||
 		request.Descriptor.TargetStore != reservation.intent.Target.StoreID ||
 		request.Descriptor.TargetIncarnation != reservation.intent.Target.NodeIncarnation {
-		return snapshottransfer.ErrBootstrapUnauthorized
+		return fmt.Errorf("%w: descriptor target differs from reservation", snapshottransfer.ErrBootstrapUnauthorized)
+	}
+	if service == nil {
+		if register == nil {
+			return fmt.Errorf("%w: dynamic registrar is unavailable", snapshottransfer.ErrBootstrapUnauthorized)
+		}
+		if err := register(ctx, reservation.intent, reservation.proof, request.Descriptor); err != nil {
+			return fmt.Errorf("register dynamic bootstrap service: %w", err)
+		}
+		registry.mu.RLock()
+		service = registry.services[request.Descriptor.Group]
+		registry.mu.RUnlock()
+		if service == nil {
+			return fmt.Errorf("%w: dynamic registrar published no service", snapshottransfer.ErrBootstrapControl)
+		}
 	}
 	// The outer shard-control mux consumed the discriminator. Replaying the
 	// complete fixed request lets BootstrapControlService perform its own

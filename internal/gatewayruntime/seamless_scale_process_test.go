@@ -954,6 +954,21 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 	}()
 
 	targetProcesses := make([]*seamlessScaleNodeProcess, len(emptyTargets))
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		for index, process := range targetProcesses {
+			if process == nil || process.diagnostic == nil {
+				continue
+			}
+			diagnostic := process.diagnostic.String()
+			if len(diagnostic) > 32<<10 {
+				diagnostic = diagnostic[len(diagnostic)-(32<<10):]
+			}
+			t.Logf("empty target %d final diagnostics:\n%s", index, diagnostic)
+		}
+	})
 	var completedCycles uint64
 	var physicalPeak = countSeamlessScaleServingNodes(nodesResponse)
 	var controllerRestarted, anyTargetRestarted bool

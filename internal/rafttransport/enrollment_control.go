@@ -105,9 +105,12 @@ type EnrollmentControlServiceOptions struct {
 	// same atomic fence as OrdinaryTransport.EnrollMemberContext. Registry is
 	// still retained for detached ACK construction and must be the transport's
 	// registry when both are supplied.
-	Transport     *OrdinaryTransport
-	Verifier      EnrollmentVerifier
-	Authorize     EnrollmentControlAuthorizer
+	Transport *OrdinaryTransport
+	Verifier  EnrollmentVerifier
+	Authorize EnrollmentControlAuthorizer
+	// OnEnrolled updates dependent physical-identity admission such as the
+	// snapshot TLS listener after the registry commit and before ACK.
+	OnEnrolled    func(EnrollmentIntent) error
 	ReadDeadline  DeadlineFunc
 	WriteDeadline DeadlineFunc
 }
@@ -119,6 +122,7 @@ type EnrollmentControlService struct {
 	transport     atomic.Pointer[OrdinaryTransport]
 	verifier      EnrollmentVerifier
 	authorize     EnrollmentControlAuthorizer
+	onEnrolled    func(EnrollmentIntent) error
 	readDeadline  DeadlineFunc
 	writeDeadline DeadlineFunc
 }
@@ -139,7 +143,7 @@ func NewEnrollmentControlService(
 	}
 	service := &EnrollmentControlService{
 		registry: registry, verifier: options.Verifier,
-		authorize: options.Authorize, readDeadline: options.ReadDeadline,
+		authorize: options.Authorize, onEnrolled: options.OnEnrolled, readDeadline: options.ReadDeadline,
 		writeDeadline: options.WriteDeadline,
 	}
 	if options.Transport != nil {
@@ -209,6 +213,11 @@ func (service *EnrollmentControlService) Serve(
 			}
 		}
 		return err
+	}
+	if service.onEnrolled != nil {
+		if err = service.onEnrolled(intent); err != nil {
+			return errors.Join(ErrEnrollmentControlOutcome, err)
+		}
 	}
 	ack, err := service.registry.EnrollmentAck(intent)
 	if err != nil {

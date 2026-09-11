@@ -332,6 +332,28 @@ func (runtime *Runtime) applyLiveControlDirectory(
 	return nil
 }
 
+// refreshLiveControlDirectory synchronously publishes the latest catalog and
+// service-directory projections. Online table provisioning uses this fence
+// before reporting CREATE success so an immediately following topology DDL
+// cannot race the periodic directory refresh.
+func (runtime *Runtime) refreshLiveControlDirectory(ctx context.Context) error {
+	if runtime == nil || ctx == nil {
+		return errGatewayControlDirectory
+	}
+	reader := runtime.config.ControlDirectory
+	if reader == nil {
+		reader = runtime.authority
+	}
+	if reader == nil {
+		return errGatewayControlDirectory
+	}
+	cut, err := readGatewayControlDirectoryCut(ctx, reader)
+	if err != nil {
+		return fmt.Errorf("read live control directory: %w", err)
+	}
+	return runtime.applyLiveControlDirectory(ctx, cut)
+}
+
 func (runtime *Runtime) runControlDirectory() {
 	if runtime == nil || runtime.config.ControlDirectory == nil && runtime.authority == nil {
 		return

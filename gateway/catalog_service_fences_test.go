@@ -9,9 +9,13 @@ import (
 
 func TestCatalogServiceFencesIncludeDurableSQLScopes(t *testing.T) {
 	authority, _, snapshot := newCatalogAuthorityFixture(t)
-	fences, generation, err := authority.CatalogServiceFences(context.Background())
+	fences, generation, err := authority.RefreshCatalogServiceFences(context.Background())
 	if err != nil || generation != snapshot.Generation() {
-		t.Fatalf("fences generation=%d err=%v", generation, err)
+		t.Fatalf("refresh fences generation=%d err=%v", generation, err)
+	}
+	cached, cachedGeneration, err := authority.CatalogServiceFences(context.Background())
+	if err != nil || cachedGeneration != generation || len(cached) != len(fences) {
+		t.Fatalf("cached fences generation=%d len=%d err=%v", cachedGeneration, len(cached), err)
 	}
 	descriptor := snapshot.ReplicatedShardDescriptors()[0]
 	var relation [16]byte

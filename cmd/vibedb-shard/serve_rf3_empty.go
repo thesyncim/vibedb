@@ -365,6 +365,9 @@ func servePreparedRF3EmptyNode(
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
 	runtime.learner = learner
+	if err := receivers.BindRegistrar(runtime.RegisterBootstrapService); err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
 	defer func() { resultErr = errors.Join(resultErr, runtime.CloseBootstrapServices()) }()
 	if err := nodeOwner.bindEmptyRuntime(runtime); err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
@@ -422,7 +425,9 @@ func servePreparedRF3EmptyNode(
 		snapshotDone <- snapshotTLS.Serve(snapshotCtx, snapshotAdmission,
 			servicetls.Limits{MaxConnections: 32, MaxHandshakes: 8, HandshakeDeadline: deadline},
 			func(ctx context.Context, connection rafttransport.PeerConnection) {
-				_ = snapshotMux.Serve(ctx, connection)
+				if err := snapshotMux.Serve(ctx, connection); err != nil && ctx.Err() == nil {
+					fmt.Fprintf(os.Stderr, "RF3 empty-node snapshot request failed: %v\n", err)
+				}
 			})
 	}()
 	nativeAdmission := newRF3AcceptReadyListener(nativeListener)
