@@ -215,11 +215,13 @@ func (registry *rf3DynamicBootstrapRegistry) Serve(
 		request.Descriptor.TargetIncarnation != reservation.intent.Target.NodeIncarnation {
 		return fmt.Errorf("%w: descriptor target differs from reservation", snapshottransfer.ErrBootstrapUnauthorized)
 	}
+	serveCtx, cancel := context.WithTimeout(ctx, rf3SnapshotBootstrapTimeout)
+	defer cancel()
 	if service == nil {
 		if register == nil {
 			return fmt.Errorf("%w: dynamic registrar is unavailable", snapshottransfer.ErrBootstrapUnauthorized)
 		}
-		if err := register(ctx, reservation.intent, reservation.proof, request.Descriptor); err != nil {
+		if err := register(serveCtx, reservation.intent, reservation.proof, request.Descriptor); err != nil {
 			return fmt.Errorf("register dynamic bootstrap service: %w", err)
 		}
 		registry.mu.RLock()
@@ -234,7 +236,7 @@ func (registry *rf3DynamicBootstrapRegistry) Serve(
 	// bounded deadline, request authentication, journal CAS, and response
 	// handling without exposing an unexported service method here.
 	replay := &rf3FixedReplayConnection{PeerConnection: connection, prefix: raw[:]}
-	return service.Serve(ctx, replay)
+	return service.Serve(serveCtx, replay)
 }
 
 // rf3FixedReplayConnection restores bytes consumed by a process-level router.

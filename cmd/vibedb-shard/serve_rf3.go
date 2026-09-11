@@ -56,10 +56,13 @@ const (
 	rf3TickInterval                      = 50 * time.Millisecond
 	rf3DefaultWALGenerationIntervalTicks = uint64((10 * time.Minute) / rf3TickInterval)
 	rf3NetworkTimeout                    = 10 * time.Second
-	rf3RequestTimeout                    = 15 * time.Second
-	rf3StartupWriterLockWait             = 2 * time.Second
-	rf3DefaultExecutionLanes             = 8
-	rf3SchemaInstallRecords              = 256
+	// rf3SnapshotBootstrapTimeout bounds learner snapshot dial/receive. Control
+	// RPCs stay on rf3NetworkTimeout so a down peer cannot stall health rounds.
+	rf3SnapshotBootstrapTimeout = 2 * time.Minute
+	rf3RequestTimeout           = 15 * time.Second
+	rf3StartupWriterLockWait    = 2 * time.Second
+	rf3DefaultExecutionLanes    = 8
+	rf3SchemaInstallRecords     = 256
 	// Every admitted schema operation can own one immutable replica-local
 	// bundle until its authenticated drain completes. Keep artifact and journal
 	// cardinality equal; a smaller artifact directory would reject valid DDL

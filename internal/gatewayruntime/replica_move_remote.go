@@ -24,13 +24,53 @@ import (
 
 var errGatewayReplicaControl = errors.New("vibedb-gateway: invalid replica control configuration")
 
-// gatewayReplicaSnapshotTimeout bounds source export and learner bootstrap.
-// Generic replica-control RPCs stay on the short manifest read timeout so a
-// down peer cannot stall health/observe rounds for minutes.
+// gatewayReplicaSnapshotTimeout bounds learner snapshot bootstrap. Generic
+// replica-control RPCs, including source-export prepare, stay on the short
+// manifest read timeout so a down peer cannot stall health/observe rounds or
+// hot-split p99 for minutes.
 const gatewayReplicaSnapshotTimeout = 2 * time.Minute
 
 func gatewayReplicaSnapshotDeadline() time.Time {
 	return time.Now().Add(gatewayReplicaSnapshotTimeout)
+}
+
+// gatewaySnapshotBootstrapContext keeps learner install on the snapshot budget
+// even when the replica-move controller inherited a short RPC deadline. Process
+// shutdown still cancels the attempt.
+func gatewaySnapshotBootstrapContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		return nil, func() {}
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), gatewayReplicaSnapshotTimeout)
+	stop := context.AfterFunc(parent, func() {
+		if errors.Is(context.Cause(parent), context.Canceled) {
+			cancel()
+		}
+	})
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+type gatewaySnapshotBootstrapClient struct {
+	inner *snapshottransfer.BootstrapControlClient
+}
+
+func (client gatewaySnapshotBootstrapClient) Execute(
+	ctx context.Context,
+	target rafttransport.NodeID,
+	request snapshottransfer.BootstrapRequest,
+) (snapshottransfer.BootstrapRecord, error) {
+	if client.inner == nil {
+		return snapshottransfer.BootstrapRecord{}, snapshottransfer.ErrBootstrapControl
+	}
+	if ctx == nil {
+		return client.inner.Execute(ctx, target, request)
+	}
+	ctx, cancel := gatewaySnapshotBootstrapContext(ctx)
+	defer cancel()
+	return client.inner.Execute(ctx, target, request)
 }
 
 type gatewayReplicaRemoteClientOptions struct {
@@ -342,8 +382,8 @@ func newGatewayReplicaRemoteClients(
 		return gatewayReplicaMoveControls{}, err
 	}
 	source, err := snapshottransfer.NewSourceControlClient(snapshottransfer.SourceControlClientOptions{
-		Opener: options.Opener, ReadDeadline: gatewayReplicaSnapshotDeadline,
-		WriteDeadline: gatewayReplicaSnapshotDeadline,
+		Opener: options.Opener, ReadDeadline: options.ReadDeadline,
+		WriteDeadline: options.WriteDeadline,
 	})
 	if err != nil {
 		return gatewayReplicaMoveControls{}, err
@@ -375,7 +415,8 @@ func newGatewayReplicaRemoteClients(
 		Membership: gatewayGrantedMembershipClient{grants: options.Authority,
 			installer: grantInstaller, applier: options.Replicated,
 			nodes: options.Authority, enroller: enroller},
-		Snapshots: source, Bootstrap: bootstrap, Awaiter: remote, Ownership: remote,
+		Snapshots: source, Bootstrap: gatewaySnapshotBootstrapClient{inner: bootstrap},
+		Awaiter: remote, Ownership: remote,
 		Drainer: options.Drainer, Retirement: remote,
 	}, nil
 }

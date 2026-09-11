@@ -378,3 +378,33 @@ func TestGatewayShardControlOpenerBoundsAndReleasesAuthenticatedStreams(t *testi
 			failed, failed != nil && failed.closed.Load(), len(opener.slots))
 	}
 }
+
+func TestGatewaySnapshotBootstrapIgnoresShortRPCDeadline(t *testing.T) {
+	parent, stopParent := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer stopParent()
+	ctx, cancel := gatewaySnapshotBootstrapContext(parent)
+	defer cancel()
+	time.Sleep(50 * time.Millisecond)
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("parent RPC deadline cancelled snapshot bootstrap: %v", err)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || time.Until(deadline) < time.Minute {
+		t.Fatalf("snapshot bootstrap deadline=%v remaining=%v ok=%v", deadline, time.Until(deadline), ok)
+	}
+}
+
+func TestGatewaySnapshotBootstrapStopsOnParentCancel(t *testing.T) {
+	parent, stopParent := context.WithCancel(t.Context())
+	ctx, cancel := gatewaySnapshotBootstrapContext(parent)
+	defer cancel()
+	stopParent()
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("cause=%v err=%v", context.Cause(ctx), ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled parent did not stop snapshot bootstrap")
+	}
+}

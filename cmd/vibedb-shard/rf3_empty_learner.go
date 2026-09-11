@@ -11,10 +11,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/migrationbudget"
@@ -297,18 +299,23 @@ func (factory *rf3DynamicLearnerFactory) openService(
 		_ = repository.Close()
 		return nil, nil, err
 	}
+	snapshotIO := func() time.Time { return time.Now().Add(rf3SnapshotBootstrapTimeout) }
 	opener := rafttransport.TLSSnapshotStreamOpener{
 		TLS: factory.profile,
 		Open: func(openCtx context.Context, node rafttransport.NodeID) (net.Conn, error) {
 			if node != sourceNode {
 				return nil, snapshottransfer.ErrBootstrapUnauthorized
 			}
-			return (&net.Dialer{}).DialContext(openCtx, "tcp", sourceAddress)
+			conn, err := (&net.Dialer{Timeout: rf3NetworkTimeout}).DialContext(openCtx, "tcp", sourceAddress)
+			if err != nil {
+				return nil, fmt.Errorf("snapshot source %s: %w", sourceAddress, err)
+			}
+			return conn, nil
 		},
 		HandshakeDeadline: factory.deadline,
 	}
 	receiver := &snapshottransfer.Receiver{Repository: repository, Opener: opener, Budget: factory.budget,
-		ReadDeadline: factory.deadline, WriteDeadline: factory.deadline}
+		ReadDeadline: snapshotIO, WriteDeadline: snapshotIO}
 	installer := &rf3DynamicLearnerInstaller{
 		factory: factory, intent: intent, proof: proof, spec: spec,
 		reservationRoot: reservationRoot, repository: repository, cursor: cursor,
@@ -325,7 +332,7 @@ func (factory *rf3DynamicLearnerFactory) openService(
 		SourceNode: func(candidate snapshottransfer.Descriptor) (rafttransport.NodeID, bool) {
 			return sourceNode, candidate.Group == descriptor.Group && candidate.SourceMember == descriptor.SourceMember
 		},
-		ReadDeadline: factory.deadline, WriteDeadline: factory.deadline, MaxConcurrent: 1,
+		ReadDeadline: snapshotIO, WriteDeadline: snapshotIO, MaxConcurrent: 1,
 	})
 	if err != nil {
 		_ = journal.Close()
