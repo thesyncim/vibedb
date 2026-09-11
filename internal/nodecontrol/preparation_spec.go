@@ -30,16 +30,22 @@ const MaxSourceBootstrapBytes = 1 << 20
 // PreparationMember is a stable voter descriptor. It carries no credentials
 // or filesystem paths. The target is separate from InitialVoters so preparing
 // a learner can never be mistaken for creating a new genesis voter set.
+// ServiceKeyDigest, NodeIncarnation, and NodeRevision are the committed
+// physical-directory identity an empty learner must publish before it can
+// InstallGroup the certified roster.
 type PreparationMember struct {
-	PeerEndpoint    distribution.EndpointID `json:"peer_endpoint"`
-	NativeEndpoint  distribution.EndpointID `json:"native_endpoint,omitempty"`
-	ControlEndpoint distribution.EndpointID `json:"control_endpoint,omitempty"`
-	MemberID        uint64                  `json:"member_id"`
-	Node            rafttransport.NodeID    `json:"node"`
-	PeerAddress     string                  `json:"peer_address"`
-	NativeAddress   string                  `json:"native_address,omitempty"`
-	ControlAddress  string                  `json:"control_address,omitempty"`
-	SnapshotAddress string                  `json:"snapshot_address,omitempty"`
+	PeerEndpoint     distribution.EndpointID `json:"peer_endpoint"`
+	NativeEndpoint   distribution.EndpointID `json:"native_endpoint,omitempty"`
+	ControlEndpoint  distribution.EndpointID `json:"control_endpoint,omitempty"`
+	MemberID         uint64                  `json:"member_id"`
+	Node             rafttransport.NodeID    `json:"node"`
+	PeerAddress      string                  `json:"peer_address"`
+	NativeAddress    string                  `json:"native_address,omitempty"`
+	ControlAddress   string                  `json:"control_address,omitempty"`
+	SnapshotAddress  string                  `json:"snapshot_address,omitempty"`
+	ServiceKeyDigest replication.Digest      `json:"service_key_digest"`
+	NodeIncarnation  uint64                  `json:"node_incarnation"`
+	NodeRevision     uint64                  `json:"node_revision"`
 }
 
 // PreparationApplyProfile contains only portable schema/apply limits. The
@@ -141,7 +147,8 @@ func (spec PreparationSpec) ValidateAgainst(intent gateway.GroupEnrollmentIntent
 	seenIDs := [4]uint64{}
 	seenNodes := [4]rafttransport.NodeID{}
 	for index, member := range append(append([]PreparationMember(nil), spec.InitialVoters[:]...), spec.Target) {
-		if member.MemberID == 0 || member.Node == (rafttransport.NodeID{}) || member.PeerAddress == "" || member.PeerEndpoint == "" {
+		if member.MemberID == 0 || member.Node == (rafttransport.NodeID{}) || member.PeerAddress == "" || member.PeerEndpoint == "" ||
+			!member.hasPhysicalIdentity() {
 			return ErrControl
 		}
 		for prior := 0; prior < index; prior++ {
@@ -172,6 +179,11 @@ func (spec PreparationSpec) ValidateAgainst(intent gateway.GroupEnrollmentIntent
 		spec.Target.MemberID == spec.InitialVoters[1].MemberID ||
 		spec.Target.MemberID == spec.InitialVoters[2].MemberID {
 		return ErrConflict
+	}
+	if spec.Target.NodeIncarnation != spec.TargetNodeIncarnation ||
+		spec.Target.NodeIncarnation != intent.Target.NodeIncarnation ||
+		spec.Target.NodeRevision != intent.TargetNodeRevision {
+		return ErrStale
 	}
 	if spec.Apply.MaxSessions == 0 || spec.Apply.RetryWindow == 0 || spec.Apply.MaxCollections <= 0 ||
 		spec.Apply.MaxDocuments <= 0 || spec.Apply.MaxBytes <= 0 || len(spec.SchemaStatements) > 256 ||
@@ -242,11 +254,19 @@ func (spec PreparationSpec) ValidateShape() error {
 		len(spec.SourceBootstrap) != 0 && sha256.Sum256(spec.SourceBootstrap) != spec.SourceBootstrapDigest {
 		return ErrControl
 	}
+	if spec.Target.NodeIncarnation != spec.TargetNodeIncarnation || !spec.Target.hasPhysicalIdentity() {
+		return ErrControl
+	}
 	for index, member := range spec.InitialVoters {
 		if member.MemberID == 0 || member.Node == (rafttransport.NodeID{}) || member.PeerAddress == "" || member.PeerEndpoint == "" ||
+			!member.hasPhysicalIdentity() ||
 			index > 0 && member.MemberID <= spec.InitialVoters[index-1].MemberID {
 			return ErrControl
 		}
 	}
 	return nil
+}
+
+func (member PreparationMember) hasPhysicalIdentity() bool {
+	return member.ServiceKeyDigest != (replication.Digest{}) && member.NodeIncarnation != 0 && member.NodeRevision != 0
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/scaling"
 )
 
@@ -80,7 +81,10 @@ func TestScalingEnrollmentChoosesDistinctDeterministicSnapshotSource(t *testing.
 					NativeEndpoint:  distribution.EndpointID(replica.NativeEndpoint),
 					ControlEndpoint: distribution.EndpointID(replica.ControlEndpoint),
 					PeerAddress:     replica.DataAddress, NativeAddress: replica.Address,
-					ControlAddress: replica.ControlAddress,
+					ControlAddress:   replica.ControlAddress,
+					ServiceKeyDigest: replication.Digest{byte(replica.Member)},
+					NodeIncarnation:  replica.NodeIncarnation,
+					NodeRevision:     1,
 				}
 			}
 			slices.SortFunc(voters[:], func(left, right nodecontrol.PreparationMember) int {
@@ -104,7 +108,10 @@ func TestScalingEnrollmentChoosesDistinctDeterministicSnapshotSource(t *testing.
 					PeerEndpoint: intent.Target.Endpoint, NativeEndpoint: intent.Target.NativeEndpoint,
 					ControlEndpoint: intent.Target.ControlEndpoint,
 					PeerAddress:     target.DataAddress, NativeAddress: target.NativeAddress,
-					ControlAddress: target.ControlAddress,
+					ControlAddress:   target.ControlAddress,
+					ServiceKeyDigest: target.ServiceKeyDigest,
+					NodeIncarnation:  target.Incarnation,
+					NodeRevision:     target.Revision,
 				},
 				TargetNodeIncarnation: intent.Target.NodeIncarnation, TargetStoreID: intent.Target.StoreID,
 				Table: "catalog", CreateTable: "CREATE TABLE catalog (id TEXT PRIMARY KEY)",

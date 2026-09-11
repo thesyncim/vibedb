@@ -338,10 +338,19 @@ func servePreparedRF3EmptyNode(
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
+	observationControl, err := replicacontrol.NewService(replicacontrol.ServiceOptions{
+		Observer:     peer.Owners(),
+		Authorize:    rf3ReplicaObservationAuthorizer(transportRegistry, policy),
+		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 32,
+	})
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
 	controlMux, err := shardcontrol.New(
 		shardcontrol.Route{Discriminator: nodecontrol.NodeInfoRequestDiscriminator(), Handler: nodeInfo},
 		shardcontrol.Route{Discriminator: nodecontrol.RequestDiscriminator(), Handler: controlService},
 		shardcontrol.Route{Discriminator: snapshottransfer.BootstrapRequestDiscriminator(), Handler: receivers},
+		shardcontrol.Route{Discriminator: replicacontrol.RequestDiscriminator(), Handler: observationControl},
 		shardcontrol.Route{Discriminator: replicacontrol.CapacityRequestDiscriminator(), Handler: capacityControl},
 		shardcontrol.Route{Discriminator: shardservice.MembershipGrantRequestDiscriminator(), Handler: membershipControl},
 	)

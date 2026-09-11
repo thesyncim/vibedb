@@ -26,6 +26,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -459,6 +460,10 @@ func (installer *rf3DynamicLearnerInstaller) RecoverInstalled(
 		_ = runtime.Close()
 		return nodecontrol.ErrConflict
 	}
+	if err = installer.enrollCertifiedRosterPeers(ctx); err != nil {
+		_ = runtime.Close()
+		return err
+	}
 	if err = installer.factory.runtime.RegisterExecutionGroup(rf3DynamicRoster(installer.spec, descriptor), raftservice.ExecutionGroup{
 		Runtime: runtime, Identity: actual, Command: installer.intent.ExpectedCommand, Read: apply, Recovery: apply,
 	}); err != nil {
@@ -562,6 +567,10 @@ func (installer *rf3DynamicLearnerInstaller) installNode(
 		_ = runtime.Close()
 		return raftmember.RuntimeIdentity{}, nodecontrol.ErrControl
 	}
+	if err = installer.enrollCertifiedRosterPeers(ctx); err != nil {
+		_ = runtime.Close()
+		return raftmember.RuntimeIdentity{}, err
+	}
 	if err = installer.factory.runtime.RegisterExecutionGroup(roster, raftservice.ExecutionGroup{
 		Runtime: runtime, Identity: identity, Command: installer.intent.ExpectedCommand,
 		Read: apply, Recovery: apply,
@@ -589,6 +598,107 @@ func rf3DynamicRoster(spec nodecontrol.PreparationSpec, descriptor snapshottrans
 		ReplicaSetVersion: descriptor.ReplicaSetVersion, MemberID: descriptor.TargetMember,
 		Node: spec.Target.Node, Role: rafttransport.MemberLearner})
 	return roster
+}
+
+type rf3PhysicalPeerEnroller interface {
+	EnrollPeerContext(context.Context, rafttransport.EnrollmentIntent, rafttransport.EnrollmentVerifier) error
+}
+
+func (installer *rf3DynamicLearnerInstaller) enrollCertifiedRosterPeers(ctx context.Context) error {
+	if installer == nil || installer.factory == nil || installer.factory.runtime == nil ||
+		installer.factory.runtime.peer == nil || installer.factory.profile == nil {
+		return nodecontrol.ErrControl
+	}
+	return rf3EnrollCertifiedRosterPeers(
+		ctx,
+		installer.factory.runtime.peer.Transport(),
+		installer.factory.runtime.registry,
+		installer.spec,
+		installer.intent.ExpectedManifestDigest,
+		installer.factory.profile.LocalIdentity().TrustDomain,
+	)
+}
+
+// rf3EnrollCertifiedRosterPeers publishes the source-certified voter identities
+// into an empty-node directory. InstallGroup refuses any roster node that is
+// not already physically enrolled, so snapshot install cannot publish the
+// learner group until these peers exist.
+func rf3EnrollCertifiedRosterPeers(
+	ctx context.Context,
+	enroller rf3PhysicalPeerEnroller,
+	registry *rafttransport.StaticRegistry,
+	spec nodecontrol.PreparationSpec,
+	certified replication.Digest,
+	domain rafttransport.TrustDomain,
+) error {
+	if ctx == nil || enroller == nil || registry == nil || certified == (replication.Digest{}) ||
+		domain == (rafttransport.TrustDomain{}) {
+		return nodecontrol.ErrControl
+	}
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	local := registry.LocalNode()
+	if spec.Target.Node == local && spec.Target.ServiceKeyDigest != (replication.Digest{}) {
+		peer, err := registry.PhysicalPeer(local)
+		if err == nil && peer.ServiceKeyDigest != ([32]byte{}) &&
+			peer.ServiceKeyDigest != [32]byte(spec.Target.ServiceKeyDigest) {
+			return nodecontrol.ErrConflict
+		}
+	}
+	verifier := rafttransport.EnrollmentVerifierFunc(func(intent rafttransport.EnrollmentIntent) error {
+		if intent.Group != (raftmember.GroupKey{}) {
+			return rafttransport.ErrInvalidGroup
+		}
+		for _, voter := range spec.InitialVoters {
+			if voter.Node != intent.Peer.NodeID {
+				continue
+			}
+			if [32]byte(voter.ServiceKeyDigest) != intent.Peer.ServiceKeyDigest ||
+				voter.PeerAddress != intent.Peer.Endpoint ||
+				voter.NodeIncarnation != intent.Peer.Incarnation ||
+				voter.NodeRevision != intent.Peer.Revision {
+				return nodecontrol.ErrStale
+			}
+			return nil
+		}
+		return nodecontrol.ErrConflict
+	})
+	for _, voter := range spec.InitialVoters {
+		if voter.Node == local {
+			continue
+		}
+		if voter.ServiceKeyDigest == (replication.Digest{}) || voter.NodeIncarnation == 0 ||
+			voter.NodeRevision == 0 || voter.PeerAddress == "" {
+			return nodecontrol.ErrControl
+		}
+		intent := rafttransport.EnrollmentIntent{
+			Digest: rf3EmptyNodePeerEnrollmentDigest(certified, voter.Node),
+			Domain: domain,
+			Peer: rafttransport.PhysicalPeer{
+				NodeID: voter.Node, TrustDomain: domain,
+				Incarnation: voter.NodeIncarnation, Revision: voter.NodeRevision,
+				ServiceKeyDigest: [32]byte(voter.ServiceKeyDigest),
+				Endpoint:         voter.PeerAddress,
+				State:            rafttransport.PeerEnrolled,
+			},
+			DirectoryRevision: registry.PeerDirectoryRevision(),
+		}
+		if err := enroller.EnrollPeerContext(ctx, intent, verifier); err != nil {
+			return fmt.Errorf("RF3 empty-node roster enrollment: %w", err)
+		}
+	}
+	return nil
+}
+
+func rf3EmptyNodePeerEnrollmentDigest(certified replication.Digest, node rafttransport.NodeID) [32]byte {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("vibedb/rf3-empty-node/physical-peer/v1\x00"))
+	_, _ = hash.Write(certified[:])
+	_, _ = hash.Write(node[:])
+	var digest [32]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest
 }
 
 var _ snapshottransfer.BootstrapInstaller = (*rf3DynamicLearnerInstaller)(nil)

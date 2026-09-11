@@ -353,7 +353,14 @@ func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener,
 				if snapshotAddress == "" {
 					return nil, errScalingEnrollmentDrift
 				}
-				voters[i] = nodecontrol.PreparationMember{MemberID: member.Member, Node: member.Node, PeerEndpoint: distribution.EndpointID(member.Endpoint), NativeEndpoint: distribution.EndpointID(member.NativeEndpoint), ControlEndpoint: distribution.EndpointID(member.ControlEndpoint), PeerAddress: member.DataAddress, NativeAddress: member.Address, ControlAddress: member.ControlAddress, SnapshotAddress: snapshotAddress}
+				record, err := runtime.authority.ReadNode(ctx, member.Node, member.NodeIncarnation)
+				if err != nil {
+					return nil, err
+				}
+				voters[i], err = certifiedPreparationMember(member, record, snapshotAddress)
+				if err != nil {
+					return nil, err
+				}
 			}
 			node, err := runtime.authority.ReadNode(ctx, intent.Target.Node, intent.Target.NodeIncarnation)
 			if err != nil {
@@ -362,7 +369,15 @@ func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener,
 			if node.Revision != intent.TargetNodeRevision || node.DataEndpoint != intent.Target.Endpoint || node.NativeEndpoint != intent.Target.NativeEndpoint || node.ControlEndpoint != intent.Target.ControlEndpoint {
 				return nil, errScalingEnrollmentDrift
 			}
-			target = nodecontrol.PreparationMember{MemberID: intent.Target.Member, Node: node.NodeID, PeerEndpoint: node.DataEndpoint, NativeEndpoint: node.NativeEndpoint, ControlEndpoint: node.ControlEndpoint, PeerAddress: node.DataAddress, NativeAddress: node.NativeAddress, ControlAddress: node.ControlAddress}
+			target, err = certifiedPreparationMember(gateway.ReplicatedEndpoint{
+				Member: intent.Target.Member, Node: node.NodeID, NodeIncarnation: node.Incarnation,
+				Endpoint: string(node.DataEndpoint), DataAddress: node.DataAddress,
+				NativeEndpoint: string(node.NativeEndpoint), Address: node.NativeAddress,
+				ControlEndpoint: string(node.ControlEndpoint), ControlAddress: node.ControlAddress,
+			}, node, "")
+			if err != nil {
+				return nil, err
+			}
 		}
 		slices.SortFunc(voters[:], func(a, b nodecontrol.PreparationMember) int { return cmp.Compare(a.MemberID, b.MemberID) })
 		return client.Read(ctx, intent, voters, target)
@@ -374,4 +389,25 @@ func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener,
 	runtime.config.ScalingEnrollment = enrollment
 	runtime.config.ScalingProvisioner = enrollment.Provisioner()
 	return nil
+}
+
+func certifiedPreparationMember(
+	replica gateway.ReplicatedEndpoint, record gateway.NodeRecord, snapshotAddress string,
+) (nodecontrol.PreparationMember, error) {
+	if record.NodeID != replica.Node || record.Incarnation != replica.NodeIncarnation ||
+		record.Lifecycle != gateway.NodeActive || record.ServiceKeyDigest == (replication.Digest{}) ||
+		record.Revision == 0 || replica.Member == 0 || replica.DataAddress == "" ||
+		record.DataAddress != replica.DataAddress {
+		return nodecontrol.PreparationMember{}, errScalingEnrollmentDrift
+	}
+	return nodecontrol.PreparationMember{
+		MemberID: replica.Member, Node: replica.Node,
+		PeerEndpoint:    distribution.EndpointID(replica.Endpoint),
+		NativeEndpoint:  distribution.EndpointID(replica.NativeEndpoint),
+		ControlEndpoint: distribution.EndpointID(replica.ControlEndpoint),
+		PeerAddress:     replica.DataAddress, NativeAddress: replica.Address,
+		ControlAddress: replica.ControlAddress, SnapshotAddress: snapshotAddress,
+		ServiceKeyDigest: record.ServiceKeyDigest, NodeIncarnation: record.Incarnation,
+		NodeRevision: record.Revision,
+	}, nil
 }

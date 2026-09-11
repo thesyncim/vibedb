@@ -103,7 +103,7 @@ func (f preparationSourceOpenerFunc) OpenShardControl(c context.Context, n raftt
 func TestPreparationSourceClientRejectsReplySubstitution(t *testing.T) {
 	intent := testIntent([]byte("payload"), gateway.EnrollmentReserved)
 	domain := rafttransport.TrustDomain{ClusterID: intent.Group.ClusterID, ClusterIncarnation: intent.Group.ClusterIncarnation}
-	spec := PreparationSpec{Kind: PreparationSpecKind, Group: intent.Group, Distribution: intent.Distribution, Shard: intent.Shard, AllocationGeneration: intent.AllocationGeneration, ReplicaOrdinal: intent.ReplicaOrdinal, SourceCommand: intent.ExpectedCommand, LogicalSchemaDigest: intent.ExpectedCommand.RelationManifestDigest, InitialVoters: [3]PreparationMember{{MemberID: 1, Node: intent.Source.Node, PeerEndpoint: intent.Source.Endpoint, PeerAddress: "127.0.0.1:1001"}, {MemberID: 2, Node: rafttransport.NodeID{7}, PeerEndpoint: "peer2", PeerAddress: "127.0.0.1:1002"}, {MemberID: 3, Node: rafttransport.NodeID{8}, PeerEndpoint: "peer3", PeerAddress: "127.0.0.1:1003"}}, Target: PreparationMember{MemberID: intent.Target.Member, Node: intent.Target.Node, PeerEndpoint: intent.Target.Endpoint, NativeEndpoint: intent.Target.NativeEndpoint, ControlEndpoint: intent.Target.ControlEndpoint, PeerAddress: "127.0.0.1:1004", NativeAddress: "127.0.0.1:2004", ControlAddress: "127.0.0.1:3004"}, TargetNodeIncarnation: intent.Target.NodeIncarnation, TargetStoreID: intent.Target.StoreID, Table: "orders", CreateTable: "CREATE TABLE orders (id TEXT PRIMARY KEY)", Apply: PreparationApplyProfile{MaxSessions: 16, RetryWindow: 8, MaxCollections: 1, MaxDocuments: 1, MaxBytes: 1024, ShardKey: "id"}, Log: PreparationLogProfile{MaxFileBytes: 4096, MaxRecordBytes: 1024, MaxRecords: 4, MaxEntries: 4, MaxLiveBytes: 4096}}
+	spec := testPreparationSpec(intent)
 
 	exported, exportErr := ExportPreparationSpec(PreparationExportInput{Intent: intent, InitialVoters: spec.InitialVoters, Target: spec.Target, Log: spec.Log, Table: spec.Table, CreateTable: spec.CreateTable, Apply: spec.Apply, SourceBootstrap: []byte("source-certified-bootstrap")})
 	if exportErr != nil {
@@ -221,5 +221,33 @@ func TestNodeControlErrorResponsePreservesBoundedDiagnostics(t *testing.T) {
 	binary.BigEndian.PutUint32(header[116:120], maxPreparationSourceErrorBytes+1)
 	if _, err := ReadResponse(bytes.NewReader(header)); !errors.Is(err, ErrBound) {
 		t.Fatalf("oversized error: %v", err)
+	}
+}
+
+func testPreparationSpec(intent gateway.GroupEnrollmentIntent) PreparationSpec {
+	physical := func(member PreparationMember, digest byte, incarnation, revision uint64) PreparationMember {
+		member.ServiceKeyDigest = replication.Digest{digest}
+		member.NodeIncarnation = incarnation
+		member.NodeRevision = revision
+		return member
+	}
+	return PreparationSpec{
+		Kind: PreparationSpecKind, Group: intent.Group, Distribution: intent.Distribution, Shard: intent.Shard,
+		AllocationGeneration: intent.AllocationGeneration, ReplicaOrdinal: intent.ReplicaOrdinal,
+		SourceCommand: intent.ExpectedCommand, LogicalSchemaDigest: intent.ExpectedCommand.RelationManifestDigest,
+		InitialVoters: [3]PreparationMember{
+			physical(PreparationMember{MemberID: 1, Node: intent.Source.Node, PeerEndpoint: intent.Source.Endpoint, PeerAddress: "127.0.0.1:1001"}, 1, 1, 1),
+			physical(PreparationMember{MemberID: 2, Node: rafttransport.NodeID{7}, PeerEndpoint: "peer2", PeerAddress: "127.0.0.1:1002"}, 2, 1, 1),
+			physical(PreparationMember{MemberID: 3, Node: rafttransport.NodeID{8}, PeerEndpoint: "peer3", PeerAddress: "127.0.0.1:1003"}, 3, 1, 1),
+		},
+		Target: physical(PreparationMember{
+			MemberID: intent.Target.Member, Node: intent.Target.Node, PeerEndpoint: intent.Target.Endpoint,
+			NativeEndpoint: intent.Target.NativeEndpoint, ControlEndpoint: intent.Target.ControlEndpoint,
+			PeerAddress: "127.0.0.1:1004", NativeAddress: "127.0.0.1:2004", ControlAddress: "127.0.0.1:3004",
+		}, 4, intent.Target.NodeIncarnation, intent.TargetNodeRevision),
+		TargetNodeIncarnation: intent.Target.NodeIncarnation, TargetStoreID: intent.Target.StoreID,
+		Table: "orders", CreateTable: "CREATE TABLE orders (id TEXT PRIMARY KEY)",
+		Apply: PreparationApplyProfile{MaxSessions: 16, RetryWindow: 8, MaxCollections: 1, MaxDocuments: 1, MaxBytes: 1024, ShardKey: "id"},
+		Log:   PreparationLogProfile{MaxFileBytes: 4096, MaxRecordBytes: 1024, MaxRecords: 4, MaxEntries: 4, MaxLiveBytes: 4096},
 	}
 }

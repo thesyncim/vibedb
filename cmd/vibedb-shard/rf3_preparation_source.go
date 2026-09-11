@@ -114,6 +114,9 @@ func newRF3PreparationSource(schemas *rf3SchemaActivator, registry *rafttranspor
 			if err != nil || peer.Endpoint != voter.PeerAddress {
 				return nil, fmt.Errorf("preparation source voter %d peer endpoint %q differs from %q: %w", voter.MemberID, peer.Endpoint, voter.PeerAddress, nodecontrol.ErrStale)
 			}
+			if peer.ServiceKeyDigest != [32]byte(voter.ServiceKeyDigest) {
+				return nil, fmt.Errorf("preparation source voter %d service key differs from the committed directory: %w", voter.MemberID, nodecontrol.ErrStale)
+			}
 		}
 		template := state.manifest.SplitControl.ChildRegistry
 		description, err := sqldriver.DescribeReplicatedSchemaCatalog(state.path)
