@@ -129,7 +129,8 @@ def main():
                 deadline = time.monotonic() + 90
                 while True:
                     log = output(["docker", "exec", name, "cat", "/evidence/vibedb.log"])
-                    if "VibeDB development cluster ready:" in log:
+                    if ("VibeDB development cluster ready:" in log or
+                            "VibeDB development RF3 physical cluster ready:" in log):
                         break
                     if time.monotonic() > deadline or "cluster dev: " in log:
                         raise RuntimeError("VibeDB startup failed: " + log)
