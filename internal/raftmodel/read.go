@@ -18,6 +18,10 @@ const (
 	MaxPendingReads = 1024
 	// MaxPendingReadBytes independently bounds aggregate retained contexts.
 	MaxPendingReadBytes = MaxPendingReads * MaxReadContextBytes
+	// MaxCancelledReadContexts bounds withdrawn-read tombstones retained
+	// for late core responses. Withdrawal happens only on leadership
+	// change, so this cap is reached only under sustained flapping.
+	MaxCancelledReadContexts = MaxPendingReads
 	// MaxProposalBytes matches the independently versioned command-envelope
 	// ceiling. MaxSizePerMsg is a batching target; Raft still sends one entry
 	// larger than that target as a single message.
@@ -64,6 +68,19 @@ type readIssue struct {
 	term        uint64
 	incarnation uint64
 	context     []byte
+	sequence    uint64
+}
+
+// cancelledRead is a tombstone for a ReadIndex issue withdrawn on
+// leadership loss. The etcd core keeps quorum-confirmed ReadStates across
+// reset and buffers late MsgReadIndexResp even as follower, so a withdrawn
+// read's response can still arrive in a later Ready. The tombstone lets the
+// driver drop that stale response instead of failing the node. Contexts are
+// never reused within an incarnation, so a tombstone hit unambiguously
+// identifies a stale response.
+type cancelledRead struct {
+	term        uint64
+	incarnation uint64
 	sequence    uint64
 }
 
@@ -158,6 +175,16 @@ func (n *Node) PendingReads() int { return len(n.issuedReads) + len(n.pendingRea
 // PendingReadBytes is the aggregate number of opaque context bytes retained.
 func (n *Node) PendingReadBytes() int { return n.readBytes }
 
+// DroppedStaleReadStates counts core responses to reads withdrawn on
+// leadership loss. A nonzero count proves late responses arrived after
+// cancellation and were safely discarded instead of failing the node.
+func (n *Node) DroppedStaleReadStates() uint64 { return n.staleReadsDropped }
+
+// DroppedDuplicateReadStates counts re-delivered responses to barriers
+// that were already pending. A nonzero count proves one Ready's ReadStates
+// were observed again before storage completions advanced past them.
+func (n *Node) DroppedDuplicateReadStates() uint64 { return n.duplicateReadsDropped }
+
 func (n *Node) cancelStaleIssuedReads() []ReadOutcome {
 	if len(n.issuedReads) == 0 {
 		return nil
@@ -192,8 +219,67 @@ func (n *Node) cancelStaleIssuedReads() []ReadOutcome {
 		outcomes = append(outcomes, ReadOutcome{Barrier: barrier, Err: ErrReadLeadershipLost})
 		n.readBytes -= len(issue.context)
 		delete(n.issuedReads, item.key)
+		n.tombstoneCancelledRead(item.key, issue)
 	}
 	return outcomes
+}
+
+// tombstoneCancelledRead records a withdrawn issue so its late response is
+// dropped instead of failing the node. The set is bounded by evicting the
+// oldest sequence first; a response arriving after eviction still fails
+// closed as an unknown context.
+func (n *Node) tombstoneCancelledRead(key readContextKey, issue readIssue) {
+	if n.cancelledReads == nil {
+		n.cancelledReads = make(map[readContextKey]cancelledRead)
+	}
+	for len(n.cancelledReads) >= MaxCancelledReadContexts {
+		oldest := key
+		oldestSeq := issue.sequence
+		first := true
+		for candidate, record := range n.cancelledReads {
+			if first || record.sequence < oldestSeq {
+				oldest, oldestSeq, first = candidate, record.sequence, false
+			}
+		}
+		if first {
+			break
+		}
+		delete(n.cancelledReads, oldest)
+	}
+	n.cancelledReads[key] = cancelledRead{
+		term:        issue.term,
+		incarnation: issue.incarnation,
+		sequence:    issue.sequence,
+	}
+}
+
+// dropStaleReadState consumes one core-delivered response to a withdrawn
+// read. It reports whether the context was a known tombstone; each
+// tombstone is one-shot because the core delivers every ReadState once.
+func (n *Node) dropStaleReadState(key readContextKey) bool {
+	if _, ok := n.cancelledReads[key]; !ok {
+		return false
+	}
+	delete(n.cancelledReads, key)
+	n.staleReadsDropped++
+	return true
+}
+
+// dropDuplicateReadState consumes a re-delivered response to a barrier that
+// is already pending. The asynchronous capture path may observe one Ready's
+// ReadStates again before the storage completions advance the core past
+// them; the barrier is already tracked exactly once, so recording it again
+// would corrupt the pending set. Only a byte-identical already-pending
+// context is dropped; anything else still fails closed.
+func (n *Node) dropDuplicateReadState(key readContextKey) bool {
+	for _, barrier := range n.pendingReads {
+		barrierKey, ok := makeReadContextKey(barrier.Context)
+		if ok && barrierKey == key {
+			n.duplicateReadsDropped++
+			return true
+		}
+	}
+	return false
 }
 
 func (n *Node) releaseReads() []ReadOutcome {
