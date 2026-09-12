@@ -413,13 +413,32 @@ func (gate *ServiceDirectoryGate) CheckFrontendContinuation(
 		return DecisionDenyCapability
 	}
 	state, binding, ok := gate.lookup(peer)
-	if !ok || policyGeneration == 0 || policyGeneration != state.cut.PolicyGeneration ||
+	if !ok {
+		return DecisionDenyNoPrincipal
+	}
+	return state.checkFrontendContinuation(binding, peer, policyGeneration, envelope, actual)
+}
+
+// All parts of a request decision must use this same immutable publication.
+// Reloading the gate between checking a grant and its Active service fences
+// can combine two individually denying cuts into an allowed request.
+func (state directoryState) checkFrontendContinuation(
+	binding ServiceBinding, peer AuthenticatedPeer, policyGeneration uint64,
+	envelope FrontendContinuationEnvelope, actual FrontendContinuationScopeRecord,
+) DecisionCode {
+	if !envelope.Valid() || !actual.Valid() || !sameContinuationScope(envelope.Scope, actual) {
+		return DecisionDenyCapability
+	}
+	if policyGeneration == 0 || policyGeneration != state.cut.PolicyGeneration ||
 		binding.Roles&ServiceRoleGateway == 0 {
 		return DecisionDenyNoPrincipal
 	}
 	grant, found := state.continuations[envelope.GrantDigest]
 	tokenIndex, tokenFound := continuationTokenIndex(grant.AcceptedConnectionTokens, envelope.ConnToken)
-	if !found || !grant.Valid() || grant.State == ContinuationGrantRetired ||
+	// The owned grant was validated before this cut was published. Rehashing
+	// every token and scope per request would make admission linear in the
+	// entire drain roster rather than the two binary searches below.
+	if !found || grant.State == ContinuationGrantRetired ||
 		grant.TrustDomain != peer.Identity.TrustDomain ||
 		grant.GatewayServiceID != peer.Identity.Node || grant.PeerKeyDigest != peer.KeyDigest ||
 		grant.GatewaySessionID != binding.SessionID || grant.GatewaySessionRevision != binding.SessionRevision ||
@@ -455,11 +474,15 @@ func (gate *ServiceDirectoryGate) CheckInternalFrontendContinuation(
 	if actual.Action == FrontendActionForwardedData || authority.Node != peer.Identity.Node {
 		return DecisionDenyCapability
 	}
-	if decision := gate.CheckFrontendContinuation(peer, authority.Generation, envelope, actual); decision != DecisionAllow {
+	state, binding, ok := gate.lookup(peer)
+	if !ok {
+		return DecisionDenyNoPrincipal
+	}
+	if decision := state.checkFrontendContinuation(binding, peer, authority.Generation, envelope, actual); decision != DecisionAllow {
 		return decision
 	}
-	if gate.IsActiveGateway(peer, authority.Generation) &&
-		gate.CheckInternalScope(peer, authority, actual) != DecisionAllow {
+	if binding.Lifecycle == ServiceActive &&
+		state.checkInternalScope(binding, peer, authority, actual) != DecisionAllow {
 		return DecisionDenyCapability
 	}
 	return DecisionAllow
@@ -477,7 +500,16 @@ func (gate *ServiceDirectoryGate) CheckInternalScope(
 		return DecisionDenyCapability
 	}
 	state, binding, ok := gate.lookup(peer)
-	if !ok || authority.Generation != state.cut.PolicyGeneration || authority.Node != peer.Identity.Node {
+	if !ok {
+		return DecisionDenyNoPrincipal
+	}
+	return state.checkInternalScope(binding, peer, authority, scope)
+}
+
+func (state directoryState) checkInternalScope(
+	binding ServiceBinding, peer AuthenticatedPeer, authority Authority, scope FrontendContinuationScopeRecord,
+) DecisionCode {
+	if authority.Generation != state.cut.PolicyGeneration || authority.Node != peer.Identity.Node {
 		return DecisionDenyNoPrincipal
 	}
 	action, operation, ok := internalScopeAction(scope)
@@ -489,7 +521,7 @@ func (gate *ServiceDirectoryGate) CheckInternalScope(
 	if binding.Roles&ServiceRoleGateway != 0 {
 		request.SessionID, request.SessionRevision = binding.SessionID, binding.SessionRevision
 	}
-	return gate.CheckInternal(peer, authority, request)
+	return state.checkInternal(binding, peer, authority, request)
 }
 
 func internalScopeAction(scope FrontendContinuationScopeRecord) (ServiceAction, ServiceOperation, bool) {

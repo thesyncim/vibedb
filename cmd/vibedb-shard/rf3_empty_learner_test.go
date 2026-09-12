@@ -52,6 +52,22 @@ func TestRF3EnrollCertifiedRosterPeersPublishesDirectory(t *testing.T) {
 	if err := rf3EnrollCertifiedRosterPeers(context.Background(), registry, registry, spec, certified, domain); err != nil {
 		t.Fatalf("idempotent enroll: %v", err)
 	}
+	// Another group may certify the same voters with a different manifest.
+	// Its own proof must be checked without changing the physical directory
+	// proof or treating the shared endpoints as conflicting enrollments.
+	before := registry.PeerDirectoryRevision()
+	secondCertificate := replication.Digest(sha256.Sum256([]byte("another-certified-manifest")))
+	if err := rf3EnrollCertifiedRosterPeers(context.Background(), registry, registry, spec, secondCertificate, domain); err != nil {
+		t.Fatalf("shared peers from another group: %v", err)
+	}
+	if registry.PeerDirectoryRevision() != before {
+		t.Fatal("unchanged physical peers advanced the directory revision")
+	}
+	changedSpec := spec
+	changedSpec.InitialVoters[0].ServiceKeyDigest = replication.Digest{42}
+	if err := rf3EnrollCertifiedRosterPeers(context.Background(), registry, registry, changedSpec, secondCertificate, domain); !errors.Is(err, rafttransport.ErrPeerConflict) {
+		t.Fatalf("changed physical key reused old enrollment: %v", err)
+	}
 	for _, voter := range spec.InitialVoters {
 		peer, lookupErr := registry.PhysicalPeer(voter.Node)
 		if lookupErr != nil || peer.Endpoint != voter.PeerAddress ||

@@ -72,8 +72,6 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 			t.Fatalf("qualification count=%q want=%d", raw, qualificationRuns)
 		}
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Minute)
-	defer cancel()
 	// The persisted DDL Unix socket lives below the cluster root. Go's
 	// testing.TempDir path is long enough on macOS and containerized runs to
 	// exceed the platform Unix-socket pathname limit, so keep this fixture root
@@ -99,9 +97,13 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	vibedbBinary := filepath.Join(bin, "vibedb")
 	shardBinary := filepath.Join(bin, "vibedb-shard")
 	gatewayBinary := filepath.Join(bin, "vibedb-gateway")
-	replicaProcessBuild(t, ctx, vibedbBinary, "./cmd/vibedb")
-	replicaProcessBuild(t, ctx, shardBinary, "./cmd/vibedb-shard")
-	replicaProcessBuild(t, ctx, gatewayBinary, "./cmd/vibedb-gateway")
+	// Cold compilation is bounded by the test runner's deadline. The serving
+	// qualification keeps its full four-minute budget regardless of cache state.
+	replicaProcessBuild(t, t.Context(), vibedbBinary, "./cmd/vibedb")
+	replicaProcessBuild(t, t.Context(), shardBinary, "./cmd/vibedb-shard")
+	replicaProcessBuild(t, t.Context(), gatewayBinary, "./cmd/vibedb-gateway")
+	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Minute)
+	defer cancel()
 	state := filepath.Join(root, "state")
 	var pgListen string
 	var customBundlePath string
@@ -289,7 +291,8 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 			}}}
 		}
 	}
-	latencies = append(latencies, client.execute(t, hotMutationRequest(t, reference, 1, seed)))
+	seedLatency := client.executeObserved(t, hotMutationRequest(t, reference, 1, seed), 1)
+	latencies = append(latencies, seedLatency)
 	// The shipped window measures operations, not the number of unique rows.
 	// Serial durable INSERTs include the full request-ledger protocol and cannot
 	// reliably produce 64 operations in one second. Drive real, ReadIndex-fenced
@@ -304,6 +307,7 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	pressurePace := time.NewTicker(200 * time.Millisecond)
 	defer pressurePace.Stop()
 	var readOrdinal uint64
+	var maxPressureLatency time.Duration
 	for reads := 1; client.requests < 4_095 && time.Now().Before(pressureDeadline); reads++ {
 		select {
 		case <-ctx.Done():
@@ -311,7 +315,9 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		case <-pressurePace.C:
 		}
 		readOrdinal++
-		latencies = append(latencies, devHotReadDocuments(t, client, readRequest, keys, readOrdinal, readDiagnostic))
+		latency := devHotReadDocuments(t, client, readRequest, keys, readOrdinal, readDiagnostic)
+		maxPressureLatency = max(maxPressureLatency, latency)
+		latencies = append(latencies, latency)
 		if reads%8 != 0 {
 			continue
 		}
@@ -381,7 +387,8 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		t.Fatal("terminal operation published no serving data child")
 	}
 	readOrdinal++
-	latencies = append(latencies, devHotReadDocuments(t, client, readRequest, keys, readOrdinal, readDiagnostic))
+	postSplitLatency := devHotReadDocuments(t, client, readRequest, keys, readOrdinal, readDiagnostic)
+	latencies = append(latencies, postSplitLatency)
 	if customTable {
 		// Restart the same supervisor with the same durable root and table-schema
 		// input. The retained split-source bundle must register the custom table
@@ -465,6 +472,8 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 	}
 	sort.Slice(latencies, func(left, right int) bool { return latencies[left] < latencies[right] })
 	p99 := latencies[(len(latencies)*99+99)/100-1]
+	client.logObservedAttempts(t)
+	t.Logf("dev hot split latency stages: seed=%s pressure_max=%s post_split=%s", seedLatency, maxPressureLatency, postSplitLatency)
 	finalRSS := devHotProcessTreeRSS(t, process.PID())
 	storageGrowth := positiveDifference(replicaProcessAllocatedBytes(state, ""), baselineStorage)
 	walGrowth := positiveDifference(replicaProcessAllocatedBytes(state, ".wal"), baselineWAL)

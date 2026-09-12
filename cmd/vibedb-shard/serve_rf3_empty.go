@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
@@ -41,6 +42,7 @@ type rf3EmptyNodeRuntime struct {
 	reader    *nodecontrol.IntentReaderSlot
 	receivers *rf3DynamicBootstrapRegistry
 	learner   *rf3DynamicLearnerFactory
+	grants    *rf3DynamicGrantRouter
 	controlMu sync.Mutex
 	// servingGroups is separate from transport membership. A group becomes
 	// native-serving only after the certified snapshot installer calls
@@ -55,10 +57,22 @@ type rf3EmptyNodeRuntime struct {
 func (runtime *rf3EmptyNodeRuntime) RegisterExecutionGroup(
 	roster []rafttransport.Member, group raftservice.ExecutionGroup,
 ) error {
+	return runtime.RegisterExecutionGroupWithGrant(roster, group, membershipgrant.Grant{})
+}
+
+func (runtime *rf3EmptyNodeRuntime) RegisterExecutionGroupWithGrant(
+	roster []rafttransport.Member, group raftservice.ExecutionGroup, grant membershipgrant.Grant,
+) error {
 	if runtime == nil || runtime.peer == nil {
 		return raftservice.ErrInvalidOwner
 	}
-	if err := runtime.peer.RegisterExecutionGroup(roster, group); err != nil {
+	var err error
+	if grant != (membershipgrant.Grant{}) {
+		err = runtime.peer.RegisterExecutionGroupWithGrant(roster, group, grant)
+	} else {
+		err = runtime.peer.RegisterExecutionGroup(roster, group)
+	}
+	if err != nil {
 		return err
 	}
 	if runtime.servingGroups != nil {
@@ -137,6 +151,16 @@ func (runtime *rf3EmptyNodeRuntime) CloseBootstrapServices() error {
 	return runtime.learner.Close()
 }
 
+func rf3TransportRegistryLimits() rafttransport.Limits {
+	return rafttransport.Limits{
+		MaxGroups: maxRF3ManifestGroups,
+		// Each retained RF3 group also needs its incoming or outgoing member
+		// mapping while a certified placement transition is in progress.
+		MaxMembers: maxRF3ManifestGroups * (rf3ManifestMembers + 1),
+		MaxPeers:   rafttransport.AbsoluteMaxTransportPeers,
+	}
+}
+
 // servePreparedRF3EmptyNode starts the explicit zero-group physical-node
 // grammar. The node owns no group SQL/WAL yet, so startup must not call any
 // group bootstrap constructor or synthesize a ConfState. A later enrollment
@@ -173,8 +197,7 @@ func servePreparedRF3EmptyNode(
 	if err != nil {
 		return fmt.Errorf("%w: empty-node preparation template: %v", errRF3Serving, err)
 	}
-	transportRegistry, err := rafttransport.NewEmptyRegistry(local.Node, local.TrustDomain,
-		rafttransport.Limits{MaxGroups: maxRF3ManifestGroups, MaxMembers: maxRF3ManifestGroups * rf3ManifestMembers, MaxPeers: rafttransport.AbsoluteMaxTransportPeers})
+	transportRegistry, err := rafttransport.NewEmptyRegistry(local.Node, local.TrustDomain, rf3TransportRegistryLimits())
 	if err != nil {
 		return fmt.Errorf("%w: empty-node transport registry: %v", errRF3Serving, err)
 	}
@@ -321,19 +344,12 @@ func servePreparedRF3EmptyNode(
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
-	// transportRegistry implements TransitionGrantInstaller directly: it
-	// starts with zero group bundles (this constructor requires an empty
-	// manifest), so an install for a group RegisterExecutionGroup hasn't
-	// adopted yet correctly fails with ErrGroupNotFound rather than silently
-	// succeeding. AddLearner's own fanout already excludes this not-yet-a-
-	// member target (see MembershipGrantClient's doc comment), so the first
-	// grant this node ever needs to accept arrives for a later action
-	// (PromoteVoter, TransferLeader, RemoveSource), by which point snapshot
-	// bootstrap has already called RegisterExecutionGroup. Without this route
-	// wired at all, every install for this node fails closed with a bare EOF
-	// instead of a routable request.
+	// Catch-up delivers the exact grant after snapshot registration. Retain it
+	// beside the certified reservation so restart can restore historical
+	// configuration replay authority atomically with the recovered group.
+	grantRouter := newRF3DynamicGrantRouter(transportRegistry)
 	membershipControl, err := shardservice.NewMembershipGrantControlService(
-		transportRegistry, policy, deadline, deadline,
+		grantRouter, policy, deadline, deadline,
 	)
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
@@ -368,7 +384,7 @@ func servePreparedRF3EmptyNode(
 	}
 
 	runtime := &rf3EmptyNodeRuntime{peer: peer, registry: transportRegistry, lanes: lanes,
-		serving: servingRegistry, reader: reader, receivers: receivers, servingGroups: &servingGroups}
+		serving: servingRegistry, reader: reader, receivers: receivers, grants: grantRouter, servingGroups: &servingGroups}
 	learner, err := newRF3DynamicLearnerFactory(runtime, nodeOwner, manifest, profile, policy, gate, migrationBudget, deadline)
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
@@ -382,20 +398,6 @@ func servePreparedRF3EmptyNode(
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
 	defer nodeOwner.unbindEmptyRuntime(runtime)
-	// Reopen only descriptor-backed installs whose committed directory still
-	// certifies the target.  A seed outage leaves the node cold and retryable;
-	// corrupt or conflicting local receipts fail startup rather than guessing
-	// a replacement group identity.
-	recoveryCtx, cancelRecovery := context.WithTimeout(parent, rf3NetworkTimeout)
-	recoveryErr := learner.Recover(recoveryCtx)
-	cancelRecovery()
-	if recoveryErr != nil && !errors.Is(recoveryErr, nodecontrol.ErrStale) &&
-		!errors.Is(recoveryErr, nodecontrol.ErrNotCommitted) {
-		return errors.Join(recoveryErr, lanes.Close(), servingRegistry.Close())
-	}
-	if recoveryErr != nil {
-		fmt.Fprintf(os.Stderr, "RF3 empty-node enrollment recovery deferred: %v\n", recoveryErr)
-	}
 	peerCtx, stopPeer := context.WithCancelCause(context.Background())
 	controlCtx, stopControl := context.WithCancelCause(context.Background())
 	snapshotCtx, stopSnapshot := context.WithCancelCause(context.Background())
@@ -414,6 +416,18 @@ func servePreparedRF3EmptyNode(
 	}
 	if !peer.Running() || !peer.Owners().Running() {
 		return errors.Join(errRF3Serving, <-peerDone)
+	}
+	// Recovery publishes retained groups through the serialized execution
+	// owners, which must be running first. Native and control listeners stay
+	// closed to requests until this startup recovery has finished.
+	recoveryCtx, cancelRecovery := context.WithTimeout(parent, rf3NetworkTimeout)
+	recoveryErr := learner.Recover(recoveryCtx)
+	cancelRecovery()
+	if recoveryErr != nil {
+		// The peer now owns recovered runtimes and its listener. Join it before
+		// closing the shared lane/serving state or bootstrap repositories.
+		stopPeer(recoveryErr)
+		return finishRF3Serving(errors.Join(recoveryErr, componentShutdownError(<-peerDone)), lanes, servingRegistry)
 	}
 	pulseDone := make(chan struct{})
 	go runRF3Pulse(peerCtx, pulse, pulseDone)
@@ -445,8 +459,8 @@ func servePreparedRF3EmptyNode(
 		nativeDone <- nativeServer.ServeAuthenticated(nativeCtx, nativeAdmission, nativeTLS, deadline, 64, 16)
 	}()
 	var serial atomic.Uint64
-	fmt.Fprintf(os.Stderr, "vibedb-shard RF3 empty node ready node=%x incarnation=%d groups=0 peer=%s native=%s snapshot=%s control=%s gateway=disabled\n",
-		local.Node, manifest.NodeIncarnation, peerListener.Addr(), nativeListener.Addr(), snapshotListener.Addr(), controlListener.Addr())
+	fmt.Fprintf(os.Stderr, "vibedb-shard RF3 empty node ready node=%x incarnation=%d groups=%d peer=%s native=%s snapshot=%s control=%s gateway=disabled\n",
+		local.Node, manifest.NodeIncarnation, servingGroups.Load(), peerListener.Addr(), nativeListener.Addr(), snapshotListener.Addr(), controlListener.Addr())
 	var primary error
 	peerFinished, controlFinished, snapshotFinished, nativeFinished := false, false, false, false
 	for primary == nil {

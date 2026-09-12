@@ -458,10 +458,22 @@ func newMultiGroupRF3DurableGateway(
 	principal serviceauthz.Authority,
 ) multiGroupRF3DurableGateway {
 	t.Helper()
+	return newMultiGroupRF3DurableGatewayWithAttempts(t, cluster, snapshot, ackKey, principal, 1)
+}
+
+func newMultiGroupRF3DurableGatewayWithAttempts(
+	t testing.TB,
+	cluster *multiGroupTransactionRF3Cluster,
+	snapshot *gateway.Snapshot,
+	ackKey gateway.DurableRequestAckDerivationKey,
+	principal serviceauthz.Authority,
+	maxAttempts int,
+) multiGroupRF3DurableGateway {
+	t.Helper()
 	client := newMultiGroupRequestLedgerRF3RoundTripper(t, cluster)
 	native, err := gateway.NewReplicatedExecutorWithOptions(
 		client, gateway.ReplicatedExecutorOptions{
-			MaxAttempts: 1, AttemptTimeout: 10 * time.Second, LeaderHintCapacity: 16,
+			MaxAttempts: maxAttempts, AttemptTimeout: 10 * time.Second, LeaderHintCapacity: 16,
 		},
 	)
 	if err != nil {

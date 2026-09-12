@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -353,6 +354,12 @@ type authorityView struct {
 	grant          membershipgrant.Grant
 	revokedGrant   membershipgrant.Grant
 	promotion      *raftmember.DurablePromotionProof
+	// replay reads only this group's retained durable log. Its lifetime is the
+	// installed Runtime incarnation; it carries no historical membership roles.
+	replay raftmember.CommittedConfigurationReplay
+	// prospective is transient evidence for one received, exactly granted
+	// configuration sequence. It is never stored in an authoritySlot.
+	prospective *prospectiveConfigurationSequence
 }
 
 type authoritySlot struct{ view atomic.Pointer[authorityView] }
@@ -1034,12 +1041,12 @@ func (registry *StaticRegistry) enrollMemberWithCommitContext(
 	}
 	memberKey := memberKey{group: intent.Group, memberID: intent.Member.MemberID}
 	nodeKey := nodeKey{group: intent.Group, node: intent.Peer.NodeID}
-	if existing, ok := registry.nodes[memberKey]; ok {
+	if registry.memberIsRetired(current, memberKey) {
+		return ErrEnrollmentConflict
+	}
+	if existing, ok := registry.memberRecord(intent.Group, intent.Member.MemberID, current); ok {
 		if existing.node != intent.Peer.NodeID {
 			return ErrEnrollmentConflict
-		}
-		if currentRecord, dynamicOK := current.nodes[memberKey]; dynamicOK {
-			existing = currentRecord
 		}
 		if existing.node == intent.Peer.NodeID &&
 			existing.enrollmentDigest == intent.Digest {
@@ -1055,11 +1062,9 @@ func (registry *StaticRegistry) enrollMemberWithCommitContext(
 		if existing.enrollmentDigest != ([sha256.Size]byte{}) {
 			return ErrEnrollmentConflict
 		}
-		// A static member's node binding was declared at construction, before
-		// any dynamic enrollment protocol ever ran for it - its digest has
-		// never been certified, so this intent has no prior enrollment to
-		// conflict with. Certify it as the first digest instead of rejecting
-		// a target whose physical identity and node were already known.
+		// Construction and InstallGroup both declare stable node bindings
+		// before enrollment certifies their first intent. This updates the
+		// existing mapping without consuming another member slot.
 		peer, peerOK := registry.physicalPeerFrom(current, intent.Peer.NodeID)
 		if !peerOK {
 			return ErrPeerConflict
@@ -1093,6 +1098,7 @@ func (registry *StaticRegistry) enrollMemberWithCommitContext(
 			revision: intent.DirectoryRevision,
 		}
 		next.directoryRevision = registry.currentDirectoryRevision(current) + 1
+		next.peerDigest = physicalPeerDigest(registry.mergedPhysical(next))
 		if commit != nil {
 			if err := commit(); err != nil {
 				return err
@@ -1100,20 +1106,6 @@ func (registry *StaticRegistry) enrollMemberWithCommitContext(
 		}
 		registry.dynamic.Store(next)
 		return nil
-	}
-	if existing, ok := current.nodes[memberKey]; ok {
-		if existing.node == intent.Peer.NodeID &&
-			existing.enrollmentDigest == intent.Digest {
-			peer, peerOK := registry.physicalPeerFrom(current, intent.Peer.NodeID)
-			if !peerOK || !samePhysicalIdentity(peer, intent.Peer) {
-				return ErrEnrollmentConflict
-			}
-			if commit != nil {
-				return commit()
-			}
-			return nil
-		}
-		return ErrEnrollmentConflict
 	}
 	if expected, ok := registry.rosterDigest(intent.Group); !ok ||
 		expected != intent.ExpectedRosterDigest {
@@ -1314,6 +1306,29 @@ func (registry *StaticRegistry) InstallGroup(
 	members []Member,
 	install func(publish func()) error,
 ) error {
+	return registry.installGroup(members, membershipgrant.Grant{}, install)
+}
+
+// InstallGroupWithTransitionGrant restores an exact retained grant in the
+// same publication as its group. The grant must fit the recovered committed
+// authority and certified initial node mapping, just as InstallTransitionGrant
+// requires; no observer or execution lane can see an ungranted intermediate cut.
+func (registry *StaticRegistry) InstallGroupWithTransitionGrant(
+	members []Member,
+	grant membershipgrant.Grant,
+	install func(publish func()) error,
+) error {
+	if !grant.Valid() {
+		return ErrInvalidMember
+	}
+	return registry.installGroup(members, grant, install)
+}
+
+func (registry *StaticRegistry) installGroup(
+	members []Member,
+	grant membershipgrant.Grant,
+	install func(publish func()) error,
+) error {
 	if registry == nil || len(members) == 0 || install == nil {
 		return ErrInvalidGroup
 	}
@@ -1379,6 +1394,30 @@ func (registry *StaticRegistry) InstallGroup(
 	if voters == 0 {
 		return ErrInvalidRole
 	}
+	view := &authorityView{version: version, roles: roles}
+	if grant != (membershipgrant.Grant{}) {
+		if grant.Group != group || !grantFitsCommittedCut(view, grant) {
+			return ErrReplicaSet
+		}
+		var initial [3]membershipgrant.RosterMember
+		var target NodeID
+		for _, member := range detached {
+			if member.MemberID == grant.TargetMember {
+				target = member.Node
+			}
+			for index, memberID := range grant.InitialVoters {
+				if member.MemberID == memberID {
+					initial[index] = membershipgrant.RosterMember{Member: memberID, Node: [16]byte(member.Node)}
+				}
+			}
+		}
+		if [16]byte(target) != grant.TargetNode || membershipgrant.CertifiedRosterDigest(
+			group, grant.InitialReplicaSetVersion, initial,
+		) != grant.InitialRosterDigest {
+			return ErrReplicaSet
+		}
+		view.grant = grant
+	}
 	slices.SortFunc(detached, compareMembers)
 	next := cloneDynamicEnrollment(current)
 	for _, member := range detached {
@@ -1388,7 +1427,7 @@ func (registry *StaticRegistry) InstallGroup(
 	next.localMembers[group] = localMember
 	next.digests[group] = rosterDigest(detached)
 	slot := &authoritySlot{}
-	slot.view.Store(&authorityView{version: version, roles: roles})
+	slot.view.Store(view)
 	next.authorities[group] = slot
 	next.memberCount += len(detached)
 	published := false
@@ -1667,6 +1706,31 @@ func (registry *StaticRegistry) authoritySlot(group raftmember.GroupKey) *author
 // committed lifecycle cut. Both identities must already be enrolled. Exact
 // reinstall is idempotent; a different live grant always conflicts.
 func (registry *StaticRegistry) InstallTransitionGrant(grant membershipgrant.Grant) error {
+	return registry.InstallTransitionGrantWithCommit(grant, nil)
+}
+
+// InstallTransitionGrantWithCommit validates authority before committing its
+// durable restart evidence, then publishes the grant to transport readers. A
+// failed commit leaves runtime authority unchanged. The callback must not call
+// the registry; exact retries invoke it again to settle unknown durable writes.
+func (registry *StaticRegistry) InstallTransitionGrantWithCommit(grant membershipgrant.Grant, commit func() error) error {
+	return registry.installTransitionGrant(grant, membershipgrant.Grant{}, commit)
+}
+
+// ReplaceTransitionGrantWithCommit advances from one completed lifecycle to
+// the exact current RF3 roster. An intermediate or merely higher-generation
+// grant cannot replace live authority. Persistence and publication share the
+// same serialization boundary as membership changes.
+func (registry *StaticRegistry) ReplaceTransitionGrantWithCommit(expected, grant membershipgrant.Grant, commit func() error) error {
+	if !expected.Valid() || !grant.Valid() || expected.Group != grant.Group ||
+		expected == grant || grant.CatalogGeneration <= expected.CatalogGeneration ||
+		grant.InitialReplicaSetVersion <= expected.InitialReplicaSetVersion {
+		return ErrReplicaSet
+	}
+	return registry.installTransitionGrant(grant, expected, commit)
+}
+
+func (registry *StaticRegistry) installTransitionGrant(grant, expected membershipgrant.Grant, commit func() error) error {
 	if registry == nil || !grant.Valid() {
 		return ErrInvalidMember
 	}
@@ -1712,11 +1776,28 @@ func (registry *StaticRegistry) InstallTransitionGrant(grant membershipgrant.Gra
 	for {
 		current := slot.view.Load()
 		if current.grant == grant {
+			if commit != nil {
+				return commit()
+			}
 			return nil
 		}
-		if current.grant != (membershipgrant.Grant{}) ||
-			!grantFitsCommittedCut(current, grant) || current.promotion != nil {
+		if current.promotion != nil {
 			return ErrReplicaSet
+		}
+		if expected != (membershipgrant.Grant{}) {
+			if current.grant != expected &&
+				!(current.grant == (membershipgrant.Grant{}) && current.revokedGrant == expected) ||
+				current.version <= expected.InitialReplicaSetVersion || !exactCompletedGrantCut(current.roles, expected) ||
+				grant.InitialReplicaSetVersion != current.version || !exactInitialGrantCut(current.roles, grant) {
+				return ErrReplicaSet
+			}
+		} else if current.grant != (membershipgrant.Grant{}) || !grantFitsCommittedCut(current, grant) {
+			return ErrReplicaSet
+		}
+		if commit != nil {
+			if err := commit(); err != nil {
+				return err
+			}
 		}
 		next := *current
 		next.grant = grant
@@ -1848,6 +1929,31 @@ func (registry *StaticRegistry) PublishCommittedAuthority(
 	version uint64,
 	conf *pb.ConfState,
 ) error {
+	return registry.publishCommittedAuthority(group, version, conf, nil)
+}
+
+// PublishCommittedAuthorityWithReplay binds the applied membership cut to the
+// same Runtime's concurrent, read-only durable log capability. Historical
+// configuration entries may then be replayed only when their complete durable
+// contents match; retained-log compaction naturally bounds that evidence.
+func (registry *StaticRegistry) PublishCommittedAuthorityWithReplay(
+	group raftmember.GroupKey,
+	version uint64,
+	conf *pb.ConfState,
+	replay raftmember.CommittedConfigurationReplay,
+) error {
+	if replay == nil {
+		return ErrReplicaSet
+	}
+	return registry.publishCommittedAuthority(group, version, conf, replay)
+}
+
+func (registry *StaticRegistry) publishCommittedAuthority(
+	group raftmember.GroupKey,
+	version uint64,
+	conf *pb.ConfState,
+	replay raftmember.CommittedConfigurationReplay,
+) error {
 	if registry == nil || version == 0 || conf == nil {
 		return ErrReplicaSet
 	}
@@ -1860,6 +1966,11 @@ func (registry *StaticRegistry) PublishCommittedAuthority(
 	current := slot.view.Load()
 	if version == current.version {
 		if confMatchesRoles(conf, current.roles) {
+			if replay != nil && !sameConfigurationReplay(current.replay, replay) {
+				next := *current
+				next.replay = replay
+				slot.view.Store(&next)
+			}
 			return nil
 		}
 		return ErrReplicaSet
@@ -1885,17 +1996,27 @@ func (registry *StaticRegistry) PublishCommittedAuthority(
 		var previous *authorityView
 		var retiredVersion uint64
 		if !removed {
-			previous = &authorityView{version: current.version, roles: current.roles, grant: current.grant}
+			previous = &authorityView{version: current.version, roles: current.roles, grant: current.grant, replay: current.replay}
 		} else {
 			retiredVersion = current.version
 		}
 		next := &authorityView{version: version, roles: roles, grant: current.grant,
 			revokedGrant: current.revokedGrant,
-			previous:     previous, allowPrevious: !removed, retiredVersion: retiredVersion}
+			previous:     previous, allowPrevious: !removed, retiredVersion: retiredVersion, replay: current.replay}
+		if replay != nil {
+			next.replay = replay
+		}
 		if slot.view.CompareAndSwap(current, next) {
 			return nil
 		}
 	}
+}
+
+// Runtime capabilities are stable pointers. Keep their steady-state owner
+// publication allocation-free, while accepting other implementations without
+// ever comparing an interface whose dynamic value is not comparable.
+func sameConfigurationReplay(left, right raftmember.CommittedConfigurationReplay) bool {
+	return right == nil || reflect.TypeOf(right).Comparable() && left == right
 }
 
 func confMatchesRoles(conf *pb.ConfState, roles map[uint64]MemberRole) bool {
@@ -2492,16 +2613,21 @@ func (registry *StaticRegistry) RetireMember(
 		}
 		return nil
 	}
-	if _, dynamic := next.nodes[key]; dynamic {
+	if _, immutable := registry.nodes[key]; immutable {
+		// A certified bootstrap member has an override in next.nodes, but
+		// still occupies its original static slot. Hide the immutable mapping
+		// as well as discarding that override so it cannot reappear.
+		delete(next.nodes, key)
+		delete(next.members, nodeKey{group: proof.Group, node: proof.Node})
+		next.retiredMembers[key] = struct{}{}
+		next.retiredCount++
+	} else if _, dynamic := next.nodes[key]; dynamic {
 		delete(next.nodes, key)
 		delete(next.members, nodeKey{group: proof.Group, node: proof.Node})
 		if next.memberCount <= 0 {
 			return ErrEnrollmentConflict
 		}
 		next.memberCount--
-	} else if _, immutable := registry.nodes[key]; immutable {
-		next.retiredMembers[key] = struct{}{}
-		next.retiredCount++
 	} else {
 		return ErrMemberNotFound
 	}

@@ -173,7 +173,9 @@ func TestEnrollmentControlRoundTripAndRestartReplay(t *testing.T) {
 	server.Conn = serverConn
 	serverDone = make(chan error, 1)
 	go func() { serverDone <- service.Serve(context.Background(), server) }()
-	replay, err := clientControl.ReplayEnrollment(context.Background(), testNode(2), intent)
+	replayIntent := intent
+	replayIntent.Peer.NodeID = NodeID{} // The wire encoder also accepts the Node alias.
+	replay, err := clientControl.ReplayEnrollment(context.Background(), testNode(2), replayIntent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,6 +490,47 @@ func TestEnrollmentRequestCanonicalRoundTrip(t *testing.T) {
 	}
 	if len(raw) > EnrollmentControlMaxRequestBytes {
 		t.Fatalf("request bytes=%d exceed bound=%d", len(raw), EnrollmentControlMaxRequestBytes)
+	}
+}
+
+func TestEnrollmentControlCancellationClosesBlockedResponse(t *testing.T) {
+	group := testGroup(228)
+	domain := TrustDomain{ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation}
+	intent := dynamicPeerIntent(&StaticRegistry{trustDomain: domain}, testNode(4), 228, group, 4, sha256.Sum256([]byte("roster")))
+	intent.DirectoryRevision = 1
+	clientRaw, serverRaw := net.Pipe()
+	defer clientRaw.Close()
+	defer serverRaw.Close()
+	client, err := NewEnrollmentControlClient(EnrollmentControlClientOptions{
+		Opener: enrollmentTestOpener{open: func(context.Context, NodeID) (PeerConnection, error) {
+			return &enrollmentTestConnection{Conn: clientRaw,
+				identity: PeerIdentity{TrustDomain: domain, Node: testNode(2)}, class: TrafficShardControl}, nil
+		}},
+		ReadDeadline: func() time.Time { return time.Now().Add(time.Minute) }, WriteDeadline: enrollmentDeadline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.EnrollMember(ctx, testNode(2), intent)
+		done <- err
+	}()
+	if _, err := OpenEnrollmentRequest(serverRaw); err != nil {
+		t.Fatal(err)
+	}
+	// The peer has the full request and may commit it, but never sends an ACK.
+	// Cancel must release the controller without waiting for its long deadline.
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrEnrollmentControlOutcome) {
+			t.Fatalf("canceled sent request = %v, want outcome unknown", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not close the blocked enrollment stream")
 	}
 }
 

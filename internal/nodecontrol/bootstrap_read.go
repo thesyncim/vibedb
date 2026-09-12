@@ -38,10 +38,16 @@ var (
 )
 
 const (
-	bootstrapReadVersion          = 1
-	bootstrapReadRequestHeader    = 84
-	bootstrapReadResponseHeader   = 64
-	MaxBootstrapReadReplyBytes    = 128 << 10
+	bootstrapReadVersion        = 1
+	bootstrapReadRequestHeader  = 84
+	bootstrapReadResponseHeader = 64
+	// One durable intent (128 KiB), repeated catalog coordinates (<=128 KiB),
+	// requester plus four physical nodes (5 * 32 KiB), and four membership
+	// endpoints fit within 1 MiB. Each endpoint has six 4096-byte strings,
+	// at most six JSON bytes per input byte, plus <2 KiB of identity metadata:
+	// total <=1000 KiB with <24 KiB remaining for fixed route/witness fields.
+	// Catalog endpoint aliases need not equal physical-directory handles.
+	MaxBootstrapReadReplyBytes    = 1 << 20
 	MaxBootstrapGatewaySeeds      = 16
 	bootstrapReadMaxConcurrency   = 64
 	bootstrapReadNonceBytes       = 16
@@ -84,9 +90,16 @@ func (seed BootstrapGatewaySeed) Valid() bool {
 // from being replayed as a metadata read.
 type BootstrapReadOperation uint8
 
-const OpReadOwnEnrollment BootstrapReadOperation = bootstrapReadOperationReadOwn
+const (
+	OpReadOwnEnrollment BootstrapReadOperation = bootstrapReadOperationReadOwn
+	// OpReadOwnEnrollmentRecovery also reads current placement. A completed
+	// enrollment is historical evidence, so restart requires this fresh cut.
+	OpReadOwnEnrollmentRecovery BootstrapReadOperation = 2
+)
 
-func (operation BootstrapReadOperation) valid() bool { return operation == OpReadOwnEnrollment }
+func (operation BootstrapReadOperation) valid() bool {
+	return operation == OpReadOwnEnrollment || operation == OpReadOwnEnrollmentRecovery
+}
 
 // BootstrapReadRequest is fixed width on the wire.  Nonce is generated for
 // every fresh query, including failover to a second configured seed.
@@ -109,33 +122,124 @@ func (request BootstrapReadRequest) valid() bool {
 // directory/catalog cut.  The full GroupEnrollmentIntent is retained so a
 // restart cannot reconstruct a command from endpoint hints.
 type BootstrapReadReply struct {
-	Nonce                     [bootstrapReadNonceBytes]byte `json:"nonce"`
-	Operation                 BootstrapReadOperation        `json:"operation"`
-	PhysicalNode              rafttransport.NodeID          `json:"physical_node"`
-	Incarnation               uint64                        `json:"incarnation"`
-	IntentID                  [32]byte                      `json:"intent_id"`
-	Intent                    gateway.GroupEnrollmentIntent `json:"intent"`
-	IntentDigest              replication.Digest            `json:"intent_digest"`
-	Node                      gateway.NodeRecord            `json:"node"`
-	DirectoryCutRevision      uint64                        `json:"directory_cut_revision"`
-	DirectoryCutDigest        replication.Digest            `json:"directory_cut_digest"`
-	CatalogGeneration         uint64                        `json:"catalog_generation"`
-	CatalogHeadDigest         replication.Digest            `json:"catalog_head_digest"`
-	EnrollmentDirectoryDigest replication.Digest            `json:"enrollment_directory_digest"`
+	Nonce        [bootstrapReadNonceBytes]byte `json:"nonce"`
+	Operation    BootstrapReadOperation        `json:"operation"`
+	PhysicalNode rafttransport.NodeID          `json:"physical_node"`
+	Incarnation  uint64                        `json:"incarnation"`
+	IntentID     [32]byte                      `json:"intent_id"`
+	Intent       gateway.GroupEnrollmentIntent `json:"intent"`
+	IntentDigest replication.Digest            `json:"intent_digest"`
+	// IntentMissing is a recovery-only, stable authenticated absence result.
+	// Live targets retain their enrollment rows; collected historical rows
+	// therefore require no local runtime restoration.
+	IntentMissing             bool               `json:"intent_missing,omitempty"`
+	Node                      gateway.NodeRecord `json:"node"`
+	DirectoryCutRevision      uint64             `json:"directory_cut_revision"`
+	DirectoryCutDigest        replication.Digest `json:"directory_cut_digest"`
+	CatalogGeneration         uint64             `json:"catalog_generation"`
+	CatalogHeadDigest         replication.Digest `json:"catalog_head_digest"`
+	EnrollmentDirectoryDigest replication.Digest `json:"enrollment_directory_digest"`
+	// CurrentRoute is populated only for recovery reads. Nil on a recovery
+	// reply proves this exact allocation is absent from the observed catalog.
+	CurrentRoute *gateway.ReplicatedMembershipRoute `json:"current_route,omitempty"`
+	// CurrentNodes supplies the physical identities for the bounded current
+	// roster in the same order, followed by its optional enrolled target.
+	CurrentNodes []gateway.NodeRecord `json:"current_nodes,omitempty"`
 }
 
 func (reply BootstrapReadReply) valid() bool {
-	return reply.Nonce != ([bootstrapReadNonceBytes]byte{}) && reply.Operation.valid() &&
+	if !(reply.Nonce != ([bootstrapReadNonceBytes]byte{}) && reply.Operation.valid() &&
 		reply.PhysicalNode != (rafttransport.NodeID{}) && reply.Incarnation != 0 &&
-		reply.IntentID != ([32]byte{}) && reply.Intent.Valid() && reply.Intent.IntentID == reply.IntentID &&
-		reply.Intent.Target.Node == reply.PhysicalNode && reply.Intent.Target.NodeIncarnation == reply.Incarnation &&
-		reply.IntentDigest == reply.Intent.Digest() && reply.Node.Valid() &&
+		reply.IntentID != ([32]byte{}) && reply.Node.Valid() &&
 		reply.Node.NodeID == reply.PhysicalNode && reply.Node.Incarnation == reply.Incarnation &&
 		reply.Node.Lifecycle != gateway.NodeDecommissioned && reply.DirectoryCutRevision != 0 &&
 		reply.DirectoryCutDigest != (replication.Digest{}) && reply.CatalogGeneration != 0 &&
 		reply.CatalogHeadDigest != (replication.Digest{}) &&
 		reply.EnrollmentDirectoryDigest != (replication.Digest{}) &&
-		reply.Node.CatalogGeneration <= reply.CatalogGeneration
+		reply.Node.CatalogGeneration <= reply.CatalogGeneration) {
+		return false
+	}
+	if reply.IntentMissing {
+		return reply.Operation == OpReadOwnEnrollmentRecovery && reply.Intent == (gateway.GroupEnrollmentIntent{}) &&
+			reply.IntentDigest == (replication.Digest{}) && reply.CurrentRoute == nil && len(reply.CurrentNodes) == 0
+	}
+	return reply.Intent.Valid() && reply.Intent.State != gateway.EnrollmentCancelled &&
+		reply.Intent.IntentID == reply.IntentID && reply.Intent.Target.Node == reply.PhysicalNode &&
+		reply.Intent.Target.NodeIncarnation == reply.Incarnation && reply.IntentDigest == reply.Intent.Digest() && reply.validRecoveryRoute()
+}
+
+// EnrollmentMissing reports an explicit recovery absence only when the full
+// request, physical identity, and stable directory/catalog witnesses validate.
+// Errors and a zero-value reply never authorize skipping recovery.
+func (reply BootstrapReadReply) EnrollmentMissing() bool {
+	return reply.IntentMissing && reply.valid()
+}
+
+func (reply BootstrapReadReply) validRecoveryRoute() bool {
+	if reply.CurrentRoute == nil {
+		return len(reply.CurrentNodes) == 0
+	}
+	if reply.Operation != OpReadOwnEnrollmentRecovery {
+		return false
+	}
+	route := reply.CurrentRoute.Serving
+	if route.Group != reply.Intent.Group || route.Distribution != reply.Intent.Distribution ||
+		route.Shard != reply.Intent.Shard || route.AllocationGeneration != uint64(reply.Intent.AllocationGeneration) ||
+		!route.Command.Valid() || len(route.Replicas) != gateway.ServingReplicaCount {
+		return false
+	}
+	replicas := slices.Clone(route.Replicas)
+	if reply.CurrentRoute.HasEnrolledTarget {
+		replicas = append(replicas, reply.CurrentRoute.EnrolledTarget)
+	} else if reply.CurrentRoute.EnrolledTarget != (gateway.ReplicatedEndpoint{}) {
+		return false
+	}
+	if len(reply.CurrentNodes) != len(replicas) {
+		return false
+	}
+	for index, replica := range replicas {
+		if replica.Member == 0 || replica.Node == (rafttransport.NodeID{}) || replica.NodeIncarnation == 0 ||
+			replica.StoreID == ([16]byte{}) || replica.Endpoint == "" || replica.NativeEndpoint == "" ||
+			replica.ControlEndpoint == "" {
+			return false
+		}
+		for _, value := range []string{replica.Endpoint, replica.NativeEndpoint, replica.ControlEndpoint, replica.DataAddress, replica.Address, replica.ControlAddress} {
+			if len(value) == 0 || len(value) > gateway.MaxScalingStringBytes {
+				return false
+			}
+		}
+		node := reply.CurrentNodes[index]
+		if !node.Valid() || node.Lifecycle == gateway.NodeDecommissioned || node.NodeID != replica.Node ||
+			node.Incarnation != replica.NodeIncarnation || node.CatalogGeneration > reply.CatalogGeneration ||
+			node.NodeID == reply.PhysicalNode && node != reply.Node ||
+			node.DataAddress != replica.DataAddress ||
+			node.NativeAddress != replica.Address || node.ControlAddress != replica.ControlAddress {
+			return false
+		}
+		for _, prior := range replicas[:index] {
+			if prior.Member == replica.Member || prior.Node == replica.Node {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// TargetServing reports whether this fresh authenticated recovery cut still
+// places the exact enrolled identity in the current serving roster.
+func (reply BootstrapReadReply) TargetServing() bool {
+	if !reply.valid() || reply.Operation != OpReadOwnEnrollmentRecovery || reply.CurrentRoute == nil {
+		return false
+	}
+	target := reply.Intent.Target
+	for _, member := range reply.CurrentRoute.Serving.Replicas {
+		if member.Member == target.Member && member.Node == target.Node && member.NodeIncarnation == target.NodeIncarnation &&
+			member.StoreID == target.StoreID && member.Endpoint == string(target.Endpoint) &&
+			member.NativeEndpoint == string(target.NativeEndpoint) && member.ControlEndpoint == string(target.ControlEndpoint) {
+			return true
+		}
+	}
+	return false
 }
 
 // AppendBootstrapReadRequest appends the fixed request grammar.
@@ -288,6 +392,17 @@ type BootstrapReadAuthority interface {
 	ScanNodeReferences(context.Context, rafttransport.NodeID, uint64) (gateway.NodeReferenceEvidence, error)
 }
 
+type bootstrapRecoveryAuthority interface {
+	ReadReplicatedCatalogHead(context.Context) (*gateway.Snapshot, replication.Digest, error)
+}
+
+// EnrollmentRecoveryReader returns the intent and its current placement from
+// one verified catalog/directory cut, rather than inferring live ownership
+// from the terminal enrollment row.
+type EnrollmentRecoveryReader interface {
+	ReadEnrollmentRecovery(context.Context, [32]byte) (BootstrapReadReply, error)
+}
+
 type BootstrapReadAuthorizeFunc func(rafttransport.PeerIdentity, gateway.NodeRecord) bool
 
 // BootstrapReadAuthenticatedAuthorizeFunc is the dynamic service-directory
@@ -393,16 +508,63 @@ func (service *BootstrapReadService) readStable(
 		return BootstrapReadReply{}, fmt.Errorf("bootstrap initial directory cut: %w", errors.Join(ErrBootstrapReadStale, err))
 	}
 	intent, err := service.authority.ReadEnrollmentIntent(ctx, request.IntentID)
-	if err != nil {
+	// The authority's direct missing sentinel means a committed read found no
+	// row. Joined/wrapped availability or stale errors are not absence proofs.
+	intentMissing := request.Operation == OpReadOwnEnrollmentRecovery && err == gateway.ErrEnrollmentIntentMissing
+	if err != nil && !intentMissing {
 		return BootstrapReadReply{}, fmt.Errorf("bootstrap enrollment lookup: %w", errors.Join(ErrBootstrapReadStale, err))
 	}
-	if !intent.Valid() || intent.State == gateway.EnrollmentCancelled || intent.IntentID != request.IntentID ||
-		intent.Target.Node != request.PhysicalNode || intent.Target.NodeIncarnation != request.Incarnation {
+	if intentMissing {
+		intent = gateway.GroupEnrollmentIntent{}
+	} else if !intent.Valid() || intent.State == gateway.EnrollmentCancelled || intent.IntentID != request.IntentID ||
+		intent.Target.Node != request.PhysicalNode || intent.Target.NodeIncarnation != request.Incarnation ||
+		intent.Group.ClusterID != service.trustDomain.ClusterID || intent.Group.ClusterIncarnation != service.trustDomain.ClusterIncarnation {
 		return BootstrapReadReply{}, fmt.Errorf("bootstrap requested target binding: %w", ErrBootstrapReadStale)
+	}
+	var currentRoute *gateway.ReplicatedMembershipRoute
+	var currentNodes []gateway.NodeRecord
+	var catalogGeneration uint64
+	var catalogDigest replication.Digest
+	if request.Operation == OpReadOwnEnrollmentRecovery {
+		authority, ok := service.authority.(bootstrapRecoveryAuthority)
+		if !ok {
+			return BootstrapReadReply{}, ErrBootstrapReadUnavailable
+		}
+		snapshot, digest, readErr := authority.ReadReplicatedCatalogHead(ctx)
+		if readErr != nil || snapshot == nil || digest == (replication.Digest{}) {
+			return BootstrapReadReply{}, errors.Join(ErrBootstrapReadStale, readErr)
+		}
+		catalogGeneration, catalogDigest = snapshot.Generation(), digest
+		route, found := snapshot.ResolveReplicatedMembershipRoute(intent.Distribution, intent.Shard, nil)
+		if !intentMissing && found && route.Serving.Group == intent.Group && route.Serving.AllocationGeneration == uint64(intent.AllocationGeneration) {
+			currentRoute = &route
+			replicas := slices.Clone(route.Serving.Replicas)
+			if route.HasEnrolledTarget {
+				replicas = append(replicas, route.EnrolledTarget)
+			}
+			for _, replica := range replicas {
+				found := false
+				for _, node := range before.Nodes {
+					if node.NodeID == replica.Node && node.Incarnation == replica.NodeIncarnation {
+						currentNodes = append(currentNodes, node)
+						found = true
+						break
+					}
+				}
+				if !found {
+					return BootstrapReadReply{}, fmt.Errorf("bootstrap current member missing physical identity: %w", ErrBootstrapReadStale)
+				}
+			}
+		}
 	}
 	evidence, err := service.authority.ScanNodeReferences(ctx, request.PhysicalNode, request.Incarnation)
 	if err != nil {
 		return BootstrapReadReply{}, fmt.Errorf("bootstrap reference scan: %w", errors.Join(ErrBootstrapReadStale, err))
+	}
+	if evidence.NodeID != request.PhysicalNode || evidence.Incarnation != request.Incarnation ||
+		evidence.DirectoryRevision != initial.Revision ||
+		request.Operation == OpReadOwnEnrollmentRecovery && (evidence.CatalogGeneration != catalogGeneration || evidence.CatalogHeadDigest != catalogDigest) {
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap reference scan binding: %w", ErrBootstrapReadStale)
 	}
 	after, err := service.authority.ReadNodeDirectoryCut(ctx)
 	if err != nil || !after.Valid() || before.Revision != after.Revision || before.Digest != after.Digest ||
@@ -421,7 +583,12 @@ func (service *BootstrapReadService) readStable(
 	// mixed metadata cut.  The final cut below also detects a concurrent row
 	// mutation that advanced the directory revision after the first scan.
 	finalIntent, err := service.authority.ReadEnrollmentIntent(ctx, request.IntentID)
-	if err != nil || !sameBootstrapReadIntent(finalIntent, intent) || !finalIntent.Valid() ||
+	if intentMissing {
+		if err != gateway.ErrEnrollmentIntentMissing {
+			return BootstrapReadReply{}, fmt.Errorf("bootstrap enrollment absence changed during scan: %w", errors.Join(ErrBootstrapReadStale, err))
+		}
+		finalIntent = gateway.GroupEnrollmentIntent{}
+	} else if err != nil || !sameBootstrapReadIntent(finalIntent, intent) || !finalIntent.Valid() ||
 		finalIntent.State == gateway.EnrollmentCancelled ||
 		finalIntent.Target.Node != request.PhysicalNode ||
 		finalIntent.Target.NodeIncarnation != request.Incarnation {
@@ -446,6 +613,12 @@ func (service *BootstrapReadService) readStable(
 		DirectoryCutDigest: finalCut.Digest, CatalogGeneration: evidence.CatalogGeneration,
 		CatalogHeadDigest:         evidence.CatalogHeadDigest,
 		EnrollmentDirectoryDigest: evidence.EnrollmentDirectoryDigest,
+		CurrentRoute:              currentRoute,
+		CurrentNodes:              currentNodes,
+		IntentMissing:             intentMissing,
+	}
+	if intentMissing {
+		reply.IntentDigest = replication.Digest{}
 	}
 	if !reply.valid() {
 		return BootstrapReadReply{}, fmt.Errorf("bootstrap reply witness invalid: %w", ErrBootstrapReadStale)
@@ -510,11 +683,20 @@ func NewBootstrapReadClient(options BootstrapReadClientOptions) (*BootstrapReadC
 }
 
 func (client *BootstrapReadClient) ReadEnrollmentIntent(ctx context.Context, intentID [32]byte) (gateway.GroupEnrollmentIntent, error) {
+	reply, err := client.read(ctx, intentID, OpReadOwnEnrollment)
+	return reply.Intent, err
+}
+
+func (client *BootstrapReadClient) ReadEnrollmentRecovery(ctx context.Context, intentID [32]byte) (BootstrapReadReply, error) {
+	return client.read(ctx, intentID, OpReadOwnEnrollmentRecovery)
+}
+
+func (client *BootstrapReadClient) read(ctx context.Context, intentID [32]byte, operation BootstrapReadOperation) (BootstrapReadReply, error) {
 	if client == nil || ctx == nil || intentID == ([32]byte{}) {
-		return gateway.GroupEnrollmentIntent{}, ErrBootstrapRead
+		return BootstrapReadReply{}, ErrBootstrapRead
 	}
 	if cause := context.Cause(ctx); cause != nil {
-		return gateway.GroupEnrollmentIntent{}, cause
+		return BootstrapReadReply{}, cause
 	}
 	var last error = ErrBootstrapReadUnavailable
 	for _, seed := range client.seeds {
@@ -535,54 +717,55 @@ func (client *BootstrapReadClient) ReadEnrollmentIntent(ctx context.Context, int
 			last = ErrBootstrapReadUnavailable
 			continue
 		}
-		intent, readErr := client.readOne(ctx, connection, seed, nonce, intentID)
+		reply, readErr := client.readOne(ctx, connection, seed, nonce, intentID, operation)
 		if readErr == nil {
-			return intent, nil
+			return reply, nil
 		}
 		last = readErr
 	}
-	return gateway.GroupEnrollmentIntent{}, last
+	return BootstrapReadReply{}, last
 }
 
 func (client *BootstrapReadClient) readOne(
 	ctx context.Context, connection rafttransport.PeerConnection, seed BootstrapGatewaySeed,
-	nonce [bootstrapReadNonceBytes]byte, intentID [32]byte,
-) (gateway.GroupEnrollmentIntent, error) {
+	nonce [bootstrapReadNonceBytes]byte, intentID [32]byte, operation BootstrapReadOperation,
+) (BootstrapReadReply, error) {
 	defer connection.Close()
 	peer := connection.PeerIdentity()
 	if connection.TrafficClass() != rafttransport.TrafficGatewayControl || peer.Node != seed.NodeID ||
 		peer.TrustDomain != client.trustDomain || replication.Digest(connection.PeerKeyDigest()) != seed.SPKIPinDigest {
-		return gateway.GroupEnrollmentIntent{}, ErrBootstrapReadUnauthorized
+		return BootstrapReadReply{}, ErrBootstrapReadUnauthorized
 	}
-	request := BootstrapReadRequest{Nonce: nonce, Operation: OpReadOwnEnrollment,
+	request := BootstrapReadRequest{Nonce: nonce, Operation: operation,
 		PhysicalNode: client.physicalNode, Incarnation: client.incarnation, IntentID: intentID}
 	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
 	defer stop()
 	if deadline := bootstrapReadBoundedDeadline(ctx, client.writeDeadline()); deadline.IsZero() {
-		return gateway.GroupEnrollmentIntent{}, ErrBootstrapRead
+		return BootstrapReadReply{}, ErrBootstrapRead
 	} else if err := connection.SetWriteDeadline(deadline); err != nil {
-		return gateway.GroupEnrollmentIntent{}, err
+		return BootstrapReadReply{}, err
 	}
 	if err := WriteBootstrapReadRequest(connection, request); err != nil {
-		return gateway.GroupEnrollmentIntent{}, errors.Join(ErrBootstrapReadOutcomeUnknown, err)
+		return BootstrapReadReply{}, errors.Join(ErrBootstrapReadOutcomeUnknown, err)
 	}
 	if deadline := bootstrapReadBoundedDeadline(ctx, client.readDeadline()); deadline.IsZero() {
-		return gateway.GroupEnrollmentIntent{}, ErrBootstrapReadOutcomeUnknown
+		return BootstrapReadReply{}, ErrBootstrapReadOutcomeUnknown
 	} else if err := connection.SetReadDeadline(deadline); err != nil {
-		return gateway.GroupEnrollmentIntent{}, errors.Join(ErrBootstrapReadOutcomeUnknown, err)
+		return BootstrapReadReply{}, errors.Join(ErrBootstrapReadOutcomeUnknown, err)
 	}
 	reply, err := ReadBootstrapReadReply(connection)
 	if reply.Nonce != ([bootstrapReadNonceBytes]byte{}) && reply.Nonce != nonce {
-		return gateway.GroupEnrollmentIntent{}, ErrBootstrapReadConflict
+		return BootstrapReadReply{}, ErrBootstrapReadConflict
 	}
 	if err != nil {
-		return gateway.GroupEnrollmentIntent{}, errors.Join(ErrBootstrapReadOutcomeUnknown, err)
+		return BootstrapReadReply{}, errors.Join(ErrBootstrapReadOutcomeUnknown, err)
 	}
 	if reply.Nonce != nonce || reply.Operation != request.Operation || reply.PhysicalNode != request.PhysicalNode ||
-		reply.Incarnation != request.Incarnation || reply.IntentID != intentID || !reply.valid() {
-		return gateway.GroupEnrollmentIntent{}, ErrBootstrapReadConflict
+		reply.Incarnation != request.Incarnation || reply.IntentID != intentID || !reply.valid() ||
+		!reply.IntentMissing && (reply.Intent.Group.ClusterID != client.trustDomain.ClusterID || reply.Intent.Group.ClusterIncarnation != client.trustDomain.ClusterIncarnation) {
+		return BootstrapReadReply{}, ErrBootstrapReadConflict
 	}
-	return reply.Intent, nil
+	return reply, nil
 }
 
 func bootstrapReadBoundedDeadline(ctx context.Context, configured time.Time) time.Time {

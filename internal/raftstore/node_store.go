@@ -1793,7 +1793,7 @@ func (s *NodeStore) registerGroupLockedMode(descriptor GroupDescriptor, snapshot
 	s.nextLogKey++
 	s.publishCoordinatesLocked(nodeDescriptorGroup, nil, nil)
 	s.publishCoordinatesLocked(descriptor.LogKey, nil, nil)
-	return GroupIncarnation{GroupID: descriptor.LogKey, Incarnation: 1}, nil
+	return GroupIncarnation{GroupID: descriptor.LogKey, Incarnation: incarnation}, nil
 }
 
 func nodeWaveID(ready []NodeReady) seglog.WaveID {
@@ -1866,6 +1866,26 @@ func (v *GroupView) NodeIncarnation() (uint64, error) {
 		return 0, ErrInvalid
 	}
 	return state.NodeIncarnation, nil
+}
+
+// ReadyCursor returns the authenticated persistence sequence for the current
+// incarnation. A recovered runtime that retains that certified incarnation
+// must continue after this cursor instead of reusing ReadyID one.
+func (v *GroupView) ReadyCursor() (incarnation, readyID uint64, err error) {
+	v.store.mu.Lock()
+	defer v.store.mu.Unlock()
+	if err := v.store.usable(); err != nil {
+		return 0, 0, err
+	}
+	state, ok := v.store.engine.Summary(v.group)
+	if !ok || state.NodeIncarnation == 0 {
+		return 0, 0, ErrInvalid
+	}
+	readyID = state.ReadyID
+	if hint, ok := v.store.commitHints[v.group]; ok {
+		readyID = max(readyID, hint.readyID)
+	}
+	return state.NodeIncarnation, readyID, nil
 }
 
 // NodeIdentity returns the immutable physical-node identity authenticated by

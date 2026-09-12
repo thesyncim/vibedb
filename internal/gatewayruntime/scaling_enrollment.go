@@ -168,7 +168,9 @@ func (runtime *ScalingEnrollmentRuntime) BuildEnrollment(
 		return gateway.GroupEnrollmentIntent{}, gateway.ErrScalingIdentity
 	}
 	draft := gateway.GroupEnrollmentIntent{
-		Group: move.Group, Distribution: move.Distribution, Shard: move.Shard,
+		ParentScalingIntentID:  parent.ID,
+		ReservedMigrationBytes: move.MigrationBytes,
+		Group:                  move.Group, Distribution: move.Distribution, Shard: move.Shard,
 		AllocationGeneration: move.AllocationGeneration, CatalogGeneration: snapshot.Generation(),
 		ExpectedCatalogHeadDigest: headDigest, ReplicaOrdinal: move.ReplicaOrdinal,
 		Source: endpointIdentity(source), SnapshotSourceMember: snapshotSourceMember,

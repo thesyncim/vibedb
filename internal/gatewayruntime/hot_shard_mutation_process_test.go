@@ -29,6 +29,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicacontrol"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -52,8 +53,6 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	if testing.Short() {
 		t.Skip("external ten-process RF3 mutation qualification")
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
-	defer cancel()
 	root := t.TempDir()
 	nodes := replicaProcessNodes()
 	groupNodes := [3][5]rafttransport.NodeID{nodes, nodes, nodes}
@@ -285,8 +284,12 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	}
 
 	shardBinary, gatewayBinary := filepath.Join(root, "vibedb-shard"), filepath.Join(root, "vibedb-gateway")
-	replicaProcessBuild(t, ctx, shardBinary, "./cmd/vibedb-shard")
-	replicaProcessBuild(t, ctx, gatewayBinary, "./cmd/vibedb-gateway")
+	replicaProcessBuild(t, t.Context(), shardBinary, "./cmd/vibedb-shard")
+	replicaProcessBuild(t, t.Context(), gatewayBinary, "./cmd/vibedb-gateway")
+	// Keep the process deadline independent of a cold compiler cache. Builds
+	// remain bounded by the test deadline; the live workload retains its limit.
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+	defer cancel()
 	for _, cluster := range clusters {
 		if err = cluster.ReleaseListeners(); err != nil {
 			t.Fatal(err)
@@ -544,6 +547,7 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if final == nil || maximumOperations > 1 {
+		hotMutationMoveDiagnostics(t, profile, routes[0], target)
 		if ids, readErr := catalogAuthority.ReadOperationIDs(ctx); readErr == nil {
 			for _, id := range ids {
 				operation, operationErr := catalogAuthority.ReadOperation(ctx, id)
@@ -739,6 +743,42 @@ func TestGatewayHotShardMutationProcesses(t *testing.T) {
 	t.Logf("write-driven hot move: split=true atomic_relation_index_visibility=true leader_kill=true source_partition=true response_partition=true reopen=true p99=%s split_p99=%s operations=%d pressure_bytes=%d foreground_requests=%d foreground_bytes=%d rss_growth=%d storage_growth=%d planned_storage_growth=%d snapshot_network_growth=%d",
 		p99, splitP99, maximumOperations, len(record.Payload), client.requests, client.bytes,
 		max(finalRSS, baselineRSS)-baselineRSS, storageGrowth, plannedStorageGrowth, snapshotNetworkGrowth)
+}
+
+// Capture the leader's learner progress together with the target's durable
+// state. A controller cursor alone cannot distinguish a disconnected learner
+// from a stale observer or an installed snapshot waiting to apply its tail.
+func hotMutationMoveDiagnostics(t *testing.T, profile *rafttransport.PeerTLS,
+	route gateway.ReplicatedRoute, target gateway.ReplicatedEndpoint,
+) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+	defer cancel()
+	deadline := func() time.Time { return time.Now().Add(time.Second) }
+	endpoints := append(append([]gateway.ReplicatedEndpoint(nil), route.Replicas...), target)
+	opener, err := newGatewayShardControlOpener(profile, deadline,
+		func(ctx context.Context, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", address)
+		}, endpoints, len(endpoints))
+	if err != nil {
+		t.Logf("move diagnostic opener: %v", err)
+		return
+	}
+	client, err := replicacontrol.NewClient(replicacontrol.ClientOptions{
+		Opener: opener, ReadDeadline: deadline, WriteDeadline: deadline,
+	})
+	if err != nil {
+		t.Logf("move diagnostic client: %v", err)
+		return
+	}
+	for _, endpoint := range endpoints {
+		cut, err := client.Observe(ctx, endpoint.Node, replicacontrol.Request{
+			Operation: [32]byte{1}, Step: [32]byte{1}, Group: route.Group, TargetMember: target.Member,
+		})
+		t.Logf("move diagnostic member=%d status=%+v publication=%+v progress=%+v progress-found=%t state-applied=%d state-replica-set=%d snapshot-base=%x err=%v",
+			endpoint.Member, cut.Status, cut.Publication, cut.Progress, cut.ProgressFound,
+			cut.State.Applied, cut.State.ReplicaSetVersion, cut.State.SnapshotBaseDigest, err)
+	}
 }
 
 // The split phase provisions new children on the replacement roster. Preserve

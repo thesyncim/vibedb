@@ -20,6 +20,13 @@ func ReplicatedCatalogHeadDigest(snapshot *Snapshot) (replication.Digest, error)
 	return replication.Digest(sha256.Sum256(raw)), nil
 }
 
+// EnrollmentReceiptMatchesSnapshot verifies that the certified enrolled group
+// is unchanged in an authoritative catalog snapshot. Unrelated publications
+// may advance the global generation without invalidating the group's receipt.
+func EnrollmentReceiptMatchesSnapshot(intent GroupEnrollmentIntent, snapshot *Snapshot) bool {
+	return enrollmentReceiptMatchesCatalog(intent, replicatedCatalogCut{snapshot: snapshot})
+}
+
 // ReadReplicatedCatalogHead reads one authoritative snapshot and returns the
 // digest of the same canonical head bytes. The digest is derived only after
 // the authority has validated its authenticated head/witness cut; callers

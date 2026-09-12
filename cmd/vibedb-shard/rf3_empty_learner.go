@@ -12,16 +12,20 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -157,62 +161,116 @@ func (factory *rf3DynamicLearnerFactory) Register(
 	return nil
 }
 
-// Recover reopens only descriptor-backed enrollments whose current authority
-// still says Enrolled (or Moving).  Reserved/Prepared rows remain cold, and a
-// Complete row is deliberately ignored so an old runtime receipt can never
-// resurrect a retired group.  The descriptor and runtime receipts are
-// evidence for restart repair; the remote reader remains the authority.
+// Recover reopens descriptor-backed enrollments. Completed enrollments need a
+// fresh catalog placement proof: completion means the target joined, while a
+// later move may have removed that same target. Local receipts alone cannot
+// distinguish those cases.
 func (factory *rf3DynamicLearnerFactory) Recover(ctx context.Context) error {
 	if factory == nil || ctx == nil || factory.runtime == nil || factory.runtime.reader == nil {
 		return nodecontrol.ErrControl
 	}
-	entries, err := os.ReadDir(filepath.Join(factory.root, "enrollments"))
+	directory, err := os.Open(filepath.Join(factory.root, "enrollments"))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if len(entries) > maxRF3ManifestGroups {
-		return nodecontrol.ErrBound
-	}
-	for _, entry := range entries {
-		if err = context.Cause(ctx); err != nil {
-			return err
-		}
-		if !entry.IsDir() || len(entry.Name()) != 64 {
-			return nodecontrol.ErrJournalCorrupt
-		}
-		intentRoot := filepath.Join(factory.root, "enrollments", entry.Name())
-		raw, readErr := readRF3BoundedFile(filepath.Join(intentRoot, rf3EnrollmentDescriptorFile), 256<<10)
-		if errors.Is(readErr, os.ErrNotExist) {
-			// Preparation has not crossed the descriptor fence yet.
-			continue
-		}
-		if readErr != nil {
+	defer directory.Close()
+	// Historical reservations may outlive their catalog rows. Bound each
+	// directory batch and the active services, rather than all past moves.
+	for {
+		entries, readErr := directory.ReadDir(maxRF3ManifestGroups)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			return readErr
 		}
-		var descriptorReceipt rf3EnrollmentDescriptorReceipt
-		if readErr = vibejson.Unmarshal(raw, &descriptorReceipt); readErr != nil || descriptorReceipt.Kind != rf3EnrollmentPayloadKind ||
-			len(descriptorReceipt.Descriptor) != snapshottransfer.DescriptorBytes {
-			return errors.Join(nodecontrol.ErrJournalCorrupt, readErr)
+		for _, entry := range entries {
+			if err = factory.recoverEnrollment(ctx, entry); err != nil {
+				return err
+			}
 		}
-		var intentID [32]byte
-		copy(intentID[:], descriptorReceipt.IntentID[:])
-		intent, readIntentErr := factory.runtime.reader.ReadEnrollmentIntent(ctx, intentID)
-		if readIntentErr != nil {
-			return errors.Join(nodecontrol.ErrStale, readIntentErr)
+		if errors.Is(readErr, io.EOF) {
+			return nil
 		}
-		if intent.State < gateway.EnrollmentEnrolled || intent.State == gateway.EnrollmentComplete || intent.Proof == nil {
-			continue
+	}
+}
+
+func (factory *rf3DynamicLearnerFactory) recoverEnrollment(ctx context.Context, entry os.DirEntry) error {
+	var err error
+	if err = context.Cause(ctx); err != nil {
+		return err
+	}
+	if !entry.IsDir() || len(entry.Name()) != 64 {
+		return nodecontrol.ErrJournalCorrupt
+	}
+	intentRoot := filepath.Join(factory.root, "enrollments", entry.Name())
+	raw, readErr := readRF3BoundedFile(filepath.Join(intentRoot, rf3EnrollmentDescriptorFile), 256<<10)
+	if errors.Is(readErr, os.ErrNotExist) {
+		// Preparation has not crossed the descriptor fence yet.
+		return nil
+	}
+	if readErr != nil {
+		return readErr
+	}
+	var descriptorReceipt rf3EnrollmentDescriptorReceipt
+	if readErr = vibejson.Unmarshal(raw, &descriptorReceipt); readErr != nil || descriptorReceipt.Kind != rf3EnrollmentPayloadKind ||
+		len(descriptorReceipt.Descriptor) != snapshottransfer.DescriptorBytes {
+		return errors.Join(nodecontrol.ErrJournalCorrupt, readErr)
+	}
+	var intentID [32]byte
+	copy(intentID[:], descriptorReceipt.IntentID[:])
+	cut, readErr := factory.runtime.reader.ReadEnrollmentRecovery(ctx, intentID)
+	if readErr != nil {
+		return errors.Join(nodecontrol.ErrStale, readErr)
+	}
+	if cut.EnrollmentMissing() {
+		if cut.IntentID != intentID || cut.PhysicalNode != descriptorReceipt.TargetNode || cut.Incarnation != descriptorReceipt.TargetIncarnation {
+			return nodecontrol.ErrStale
 		}
-		descriptor, found, descriptorErr := readRF3EnrollmentDescriptor(intentRoot, intent)
-		if descriptorErr != nil {
-			return descriptorErr
+		// The catalog pins completed enrollments for every live target. A
+		// witnessed absence therefore retires only this old local reservation.
+		return nil
+	}
+	intent := cut.Intent
+	if !intent.Valid() || intent.IntentID != intentID {
+		return nodecontrol.ErrStale
+	}
+	if intent.State < gateway.EnrollmentEnrolled || intent.State > gateway.EnrollmentComplete || intent.Proof == nil {
+		return nil
+	}
+	var recovery *nodecontrol.BootstrapReadReply
+	if intent.State == gateway.EnrollmentComplete {
+		if !cut.TargetServing() {
+			return nil
 		}
-		if !found {
-			return nodecontrol.ErrJournalCorrupt
+		recovery = &cut
+	}
+	descriptor, found, descriptorErr := readRF3EnrollmentDescriptor(intentRoot, intent)
+	if descriptorErr != nil {
+		return descriptorErr
+	}
+	if !found {
+		return nodecontrol.ErrJournalCorrupt
+	}
+	factory.mu.Lock()
+	bounded := len(factory.services) >= maxRF3ManifestGroups && factory.services[intent.Group] == nil
+	factory.mu.Unlock()
+	if bounded {
+		return nodecontrol.ErrBound
+	}
+	var resources *rf3DynamicLearnerService
+	if recovery != nil {
+		// Completed replicas need their retained runtime, not another
+		// bootstrap receiver capable of replaying the original artifact.
+		_, resources, err = factory.openService(ctx, intent, *intent.Proof, descriptor)
+		if err != nil {
+			return err
 		}
+		resources.installer.recovery = recovery
+		factory.mu.Lock()
+		factory.services[intent.Group] = resources
+		factory.mu.Unlock()
+	} else {
 		if err = factory.runtime.receivers.Activate(ctx, intent, *intent.Proof); err != nil {
 			return err
 		}
@@ -220,12 +278,12 @@ func (factory *rf3DynamicLearnerFactory) Recover(ctx context.Context) error {
 			return err
 		}
 		factory.mu.Lock()
-		resources := factory.services[intent.Group]
+		resources = factory.services[intent.Group]
 		factory.mu.Unlock()
-		if resources != nil && resources.installer != nil {
-			if err = resources.installer.RecoverInstalled(ctx, descriptor); err != nil {
-				return err
-			}
+	}
+	if resources != nil && resources.installer != nil {
+		if err = resources.installer.RecoverInstalled(ctx, descriptor); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -375,6 +433,7 @@ type rf3DynamicLearnerInstaller struct {
 	applyIdentity   sqldriver.ReplicatedApplyIdentity
 	staticBootstrap *pb.Snapshot
 	installed       *raftmember.RuntimeIdentity
+	recovery        *nodecontrol.BootstrapReadReply
 }
 
 func (installer *rf3DynamicLearnerInstaller) ObserveInstalled(
@@ -403,6 +462,10 @@ func (installer *rf3DynamicLearnerInstaller) RecoverInstalled(
 	}
 	installer.mu.Lock()
 	defer installer.mu.Unlock()
+	return installer.recoverInstalledLocked(ctx, descriptor)
+}
+
+func (installer *rf3DynamicLearnerInstaller) recoverInstalledLocked(ctx context.Context, descriptor snapshottransfer.Descriptor) error {
 	if installer.installed != nil {
 		if installer.installed.Group == descriptor.Group && installer.installed.MemberID == descriptor.TargetMember &&
 			installer.installed.StoreID == descriptor.TargetStore && installer.installed.NodeIncarnation == descriptor.TargetIncarnation {
@@ -410,68 +473,146 @@ func (installer *rf3DynamicLearnerInstaller) RecoverInstalled(
 		}
 		return nodecontrol.ErrConflict
 	}
-	identity, found, err := readRF3EnrollmentRuntime(installer.reservationRoot, installer.intent, installer.proof, descriptor)
+	runtime, apply, found, err := installer.recoverRuntime(ctx, descriptor)
 	if err != nil || !found {
 		return err
 	}
-	database, err := sqldriver.OpenReplicatedSnapshotTarget(filepath.Join(installer.reservationRoot, "member.vdb"),
-		installer.base, installer.applyIdentity, sqldriver.ReplicatedOpenOptions{
-			WriterLockContext: ctx, WriterLockDeadline: installer.factory.deadline(),
-		})
-	if err != nil {
-		return err
-	}
-	closeDatabase := func(cause error) error { return errors.Join(cause, database.Close()) }
-	apply, applyIdentity, err := database.OpenReplicatedApply(installer.base, installer.staticBootstrap,
-		replicatedApplyOptions(installer.applyIdentity))
-	if err != nil {
-		return closeDatabase(err)
-	}
-	if applyIdentity != installer.applyIdentity {
-		_ = apply.Close()
-		return closeDatabase(nodecontrol.ErrConflict)
-	}
-	group, err := installer.factory.owner.group(installer.base.Binding)
-	if err != nil {
-		return errors.Join(closeDatabase(err), apply.Close())
-	}
-	checkpoint, err := group.Snapshot()
-	if err != nil {
-		_ = apply.Close()
-		return closeDatabase(err)
-	}
-	expectedConfState := &pb.ConfState{Voters: []uint64{
-		installer.spec.InitialVoters[0].MemberID, installer.spec.InitialVoters[1].MemberID,
-		installer.spec.InitialVoters[2].MemberID,
-	}, Learners: []uint64{descriptor.TargetMember}}
-	if checkpoint.GetMetadata() == nil || checkpoint.GetMetadata().GetIndex() != descriptor.SnapshotIndex ||
-		checkpoint.GetMetadata().GetTerm() != descriptor.SnapshotTerm ||
-		!proto.Equal(checkpoint.GetMetadata().GetConfState(), expectedConfState) {
-		_ = apply.Close()
-		return closeDatabase(nodecontrol.ErrStale)
-	}
-	runtime, err := installer.factory.owner.adoptRegistered(group, database, apply)
-	if err != nil {
-		_ = apply.Close()
-		return closeDatabase(err)
-	}
 	actual := runtime.Identity()
-	if actual != identity {
-		_ = runtime.Close()
-		return nodecontrol.ErrConflict
+	grant, _, err := installer.factory.runtime.grants.Register(descriptor.Group, filepath.Join(installer.reservationRoot, "membership-grant"))
+	if err != nil {
+		return errors.Join(err, runtime.Close())
 	}
-	if err = installer.enrollCertifiedRosterPeers(ctx); err != nil {
+	publication, err := runtime.Publication()
+	if err != nil {
+		return errors.Join(err, runtime.Close())
+	}
+	roster, command, err := rf3RecoveredRoster(installer.spec, descriptor, publication, installer.intent.ExpectedCommand, installer.recovery, grant)
+	if err != nil {
+		return errors.Join(err, runtime.Close())
+	}
+	profile, err := apply.CapacityQualificationProfile()
+	if err == nil {
+		command, err = rf3RecoveredCommand(command, profile.Binding.Authority.SchemaGeneration, profile.RelationManifestDigest)
+	}
+	if err != nil {
+		return errors.Join(err, runtime.Close())
+	}
+	// The retained roster supplies historical member mappings needed to
+	// replay an already committed removal. Current placement supplies any
+	// later peers and the current command fence.
+	err = installer.enrollCertifiedRosterPeers(ctx, roster)
+	if installer.recovery != nil {
+		if err == nil {
+			err = installer.enrollRecoveryPeers(ctx)
+		}
+	}
+	if err != nil {
 		_ = runtime.Close()
 		return err
 	}
-	if err = installer.factory.runtime.RegisterExecutionGroup(rf3DynamicRoster(installer.spec, descriptor), raftservice.ExecutionGroup{
-		Runtime: runtime, Identity: actual, Command: installer.intent.ExpectedCommand, Read: apply, Recovery: apply,
-	}); err != nil {
+	if err = installer.factory.runtime.RegisterExecutionGroupWithGrant(roster, raftservice.ExecutionGroup{
+		Runtime: runtime, Identity: actual, Command: command, Read: apply, Recovery: apply,
+	}, grant); err != nil {
 		_ = runtime.Close()
 		return err
 	}
 	installer.installed = &actual
 	return nil
+}
+
+// recoverRuntime uses the authenticated node registration as the installation
+// commit point. The local receipt may be absent if the process died before
+// publication; in that case only the original certified checkpoint can prove
+// the install. A receipt permits later checkpoints, which must never be reset
+// to the snapshot that originally enrolled this member.
+func (installer *rf3DynamicLearnerInstaller) recoverRuntime(
+	ctx context.Context, descriptor snapshottransfer.Descriptor,
+) (*raftmember.Runtime, *sqldriver.ReplicatedApply, bool, error) {
+	identity, receiptFound, err := readRF3EnrollmentRuntime(installer.reservationRoot, installer.intent, installer.proof, descriptor)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("read recovered enrollment receipt: %w", err)
+	}
+	if _, found := installer.factory.owner.store.GroupByID(descriptor.Group.GroupID); !found {
+		if receiptFound || installer.recovery != nil {
+			return nil, nil, false, nodecontrol.ErrJournalCorrupt
+		}
+		return nil, nil, false, nil
+	}
+	group, err := installer.factory.owner.group(installer.base.Binding)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	incarnation, err := group.NodeIncarnation()
+	if err != nil || incarnation != descriptor.TargetIncarnation {
+		return nil, nil, false, errors.Join(nodecontrol.ErrConflict, err)
+	}
+	checkpoint, err := group.Snapshot()
+	if err != nil {
+		return nil, nil, false, err
+	}
+	expectedConfState := &pb.ConfState{Voters: []uint64{
+		installer.spec.InitialVoters[0].MemberID, installer.spec.InitialVoters[1].MemberID,
+		installer.spec.InitialVoters[2].MemberID,
+	}, Learners: []uint64{descriptor.TargetMember}}
+	if !rf3RecoveredCheckpointMatches(checkpoint, descriptor, expectedConfState, receiptFound) {
+		return nil, nil, false, nodecontrol.ErrStale
+	}
+	// Snapshot-target opens are for incomplete transfer staging. Once the
+	// registration is durable the ordinary retained-log opener must recover
+	// SQL progress, including checkpoint rotation and schema settlement.
+	_, _, database, apply, err := openRF3RetainedApply(filepath.Join(installer.reservationRoot, "member.vdb"),
+		group, installer.base, installer.applyIdentity, sqldriver.ReplicatedOpenOptions{
+			WriterLockContext: ctx, WriterLockDeadline: installer.factory.deadline(),
+		})
+	if err != nil {
+		return nil, nil, false, err
+	}
+	runtime, err := installer.factory.owner.adoptRegistered(group, database, apply)
+	if err != nil {
+		if runtime != nil {
+			return nil, nil, false, errors.Join(err, runtime.Close())
+		}
+		return nil, nil, false, errors.Join(err, apply.Close(), database.Close())
+	}
+	actual := runtime.Identity()
+	expectedIdentity := identity
+	// The retained opener authenticates any published schema successor. Its
+	// local generation can still lag the current catalog while Raft catches up;
+	// the enrollment receipt fences the immutable replica identity, not schema.
+	expectedIdentity.RelationManifestDigest = actual.RelationManifestDigest
+	if actual.Group != descriptor.Group || actual.MemberID != descriptor.TargetMember ||
+		actual.StoreID != descriptor.TargetStore || actual.NodeIncarnation != descriptor.TargetIncarnation ||
+		receiptFound && actual != expectedIdentity {
+		return nil, nil, false, errors.Join(nodecontrol.ErrConflict, runtime.Close())
+	}
+	if !receiptFound {
+		if err = persistRF3EnrollmentRuntime(installer.reservationRoot, installer.intent, installer.proof, descriptor, actual); err != nil {
+			return nil, nil, false, errors.Join(fmt.Errorf("persist recovered enrollment receipt: %w", err), runtime.Close())
+		}
+	}
+	return runtime, apply, true, nil
+}
+
+func rf3RecoveredCheckpointMatches(checkpoint *pb.Snapshot, descriptor snapshottransfer.Descriptor, initial *pb.ConfState, receiptFound bool) bool {
+	metadata := checkpoint.GetMetadata()
+	if metadata == nil || metadata.GetConfState() == nil || metadata.GetIndex() < descriptor.SnapshotIndex || metadata.GetTerm() < descriptor.SnapshotTerm {
+		return false
+	}
+	if metadata.GetIndex() == descriptor.SnapshotIndex {
+		return metadata.GetTerm() == descriptor.SnapshotTerm && metadata.GetConfState().Equivalent(initial) == nil
+	}
+	return receiptFound
+}
+
+func rf3RecoveredCommand(command raftservice.CommandFence, schema uint64, manifest replication.Digest) (raftservice.CommandFence, error) {
+	if !command.Valid() || schema == 0 || schema > command.SchemaGeneration || manifest == (replication.Digest{}) ||
+		schema == command.SchemaGeneration && manifest != command.RelationManifestDigest {
+		return command, nodecontrol.ErrStale
+	}
+	// Retain current placement fences, but expose only the schema durably
+	// selected by this replica. The owner advances it after Raft schema replay.
+	command.SchemaGeneration, command.RelationManifestDigest = schema, manifest
+	return command, nil
 }
 
 func (installer *rf3DynamicLearnerInstaller) InstallPublishedLearner(
@@ -482,12 +623,18 @@ func (installer *rf3DynamicLearnerInstaller) InstallPublishedLearner(
 	}
 	installer.mu.Lock()
 	defer installer.mu.Unlock()
-	if installer.installed != nil {
-		return *installer.installed, nil
-	}
 	if descriptor.Group != installer.intent.Group || descriptor.TargetMember != installer.intent.Target.Member ||
 		descriptor.TargetStore != installer.intent.Target.StoreID || descriptor.TargetIncarnation != installer.intent.Target.NodeIncarnation {
 		return raftmember.RuntimeIdentity{}, nodecontrol.ErrStale
+	}
+	if installer.installed != nil {
+		return *installer.installed, nil
+	}
+	if err := installer.recoverInstalledLocked(ctx, descriptor); err != nil {
+		return raftmember.RuntimeIdentity{}, err
+	}
+	if installer.installed != nil {
+		return *installer.installed, nil
 	}
 	planManifest, err := installer.repository.ManifestContext(ctx, descriptor)
 	if err != nil {
@@ -567,21 +714,26 @@ func (installer *rf3DynamicLearnerInstaller) installNode(
 		_ = runtime.Close()
 		return raftmember.RuntimeIdentity{}, nodecontrol.ErrControl
 	}
+	// Persist installation evidence before the runtime can advance its Raft
+	// checkpoint. Recovery can then distinguish a completed install from an
+	// interrupted transfer even if publication or the response fails.
+	if err = persistRF3EnrollmentRuntime(installer.reservationRoot, installer.intent, installer.proof, descriptor, identity); err != nil {
+		_ = runtime.Close()
+		return raftmember.RuntimeIdentity{}, err
+	}
 	if err = installer.enrollCertifiedRosterPeers(ctx); err != nil {
 		_ = runtime.Close()
 		return raftmember.RuntimeIdentity{}, err
 	}
-	if err = installer.factory.runtime.RegisterExecutionGroup(roster, raftservice.ExecutionGroup{
+	grant, _, err := installer.factory.runtime.grants.Register(descriptor.Group, filepath.Join(installer.reservationRoot, "membership-grant"))
+	if err != nil {
+		return raftmember.RuntimeIdentity{}, errors.Join(err, runtime.Close())
+	}
+	if err = installer.factory.runtime.RegisterExecutionGroupWithGrant(roster, raftservice.ExecutionGroup{
 		Runtime: runtime, Identity: identity, Command: installer.intent.ExpectedCommand,
 		Read: apply, Recovery: apply,
-	}); err != nil {
+	}, grant); err != nil {
 		_ = runtime.Close()
-		return raftmember.RuntimeIdentity{}, err
-	}
-	if err = persistRF3EnrollmentRuntime(installer.reservationRoot, installer.intent, installer.proof, descriptor, identity); err != nil {
-		if unregisterErr := installer.factory.runtime.UnregisterExecutionGroup(identity); unregisterErr != nil {
-			return raftmember.RuntimeIdentity{}, errors.Join(err, unregisterErr)
-		}
 		return raftmember.RuntimeIdentity{}, err
 	}
 	return identity, nil
@@ -600,22 +752,158 @@ func rf3DynamicRoster(spec nodecontrol.PreparationSpec, descriptor snapshottrans
 	return roster
 }
 
+func rf3RecoveredRoster(spec nodecontrol.PreparationSpec, descriptor snapshottransfer.Descriptor, publication raftmodel.Publication,
+	command raftservice.CommandFence, cut *nodecontrol.BootstrapReadReply, grant membershipgrant.Grant,
+) ([]rafttransport.Member, raftservice.CommandFence, error) {
+	conf := publication.ConfState
+	if conf == nil || publication.ReplicaSetVersion == 0 || len(conf.VotersOutgoing) != 0 || len(conf.LearnersNext) != 0 || conf.GetAutoLeave() {
+		return nil, command, nodecontrol.ErrStale
+	}
+	roster := rf3DynamicRoster(spec, descriptor)
+	for index := range roster {
+		roster[index].ReplicaSetVersion = publication.ReplicaSetVersion
+		roster[index].Role = rafttransport.MemberEnrolled
+	}
+	if cut != nil {
+		if !cut.TargetServing() {
+			return nil, command, nodecontrol.ErrStale
+		}
+		command = cut.CurrentRoute.Serving.Command
+		members := slices.Clone(cut.CurrentRoute.Serving.Replicas)
+		if cut.CurrentRoute.HasEnrolledTarget {
+			members = append(members, cut.CurrentRoute.EnrolledTarget)
+		}
+		for _, replica := range members {
+			index := slices.IndexFunc(roster, func(member rafttransport.Member) bool { return member.MemberID == replica.Member })
+			if index >= 0 {
+				if roster[index].Node != replica.Node {
+					return nil, command, nodecontrol.ErrConflict
+				}
+				continue
+			}
+			roster = append(roster, rafttransport.Member{Group: descriptor.Group, ReplicaSetVersion: publication.ReplicaSetVersion,
+				MemberID: replica.Member, Node: replica.Node, Role: rafttransport.MemberEnrolled})
+		}
+	}
+	for _, members := range []struct {
+		ids  []uint64
+		role rafttransport.MemberRole
+	}{{conf.Voters, rafttransport.MemberVoter}, {conf.Learners, rafttransport.MemberLearner}} {
+		for _, id := range members.ids {
+			index := slices.IndexFunc(roster, func(member rafttransport.Member) bool { return member.MemberID == id })
+			if index < 0 || roster[index].Role != rafttransport.MemberEnrolled {
+				return nil, command, nodecontrol.ErrConflict
+			}
+			roster[index].Role = members.role
+		}
+	}
+	// The original mappings are a bounded historical proof. Remove mappings
+	// that neither the current route nor a retained grant needs once Raft has
+	// durably stopped referring to them.
+	if cut != nil && grant == (membershipgrant.Grant{}) {
+		roster = slices.DeleteFunc(roster, func(member rafttransport.Member) bool {
+			return member.Role == rafttransport.MemberEnrolled &&
+				!slices.ContainsFunc(cut.CurrentRoute.Serving.Replicas, func(replica gateway.ReplicatedEndpoint) bool { return replica.Member == member.MemberID }) &&
+				(!cut.CurrentRoute.HasEnrolledTarget || cut.CurrentRoute.EnrolledTarget.Member != member.MemberID)
+		})
+	}
+	return roster, command, nil
+}
+
+func (installer *rf3DynamicLearnerInstaller) enrollRecoveryPeers(ctx context.Context) error {
+	if installer.recovery == nil || !installer.recovery.TargetServing() {
+		return nodecontrol.ErrStale
+	}
+	cut := installer.recovery
+	registry := installer.factory.runtime.registry
+	enroller := installer.factory.runtime.peer.Transport()
+	verifier := rafttransport.EnrollmentVerifierFunc(func(intent rafttransport.EnrollmentIntent) error {
+		if intent.Group != (raftmember.GroupKey{}) {
+			return rafttransport.ErrInvalidGroup
+		}
+		for _, node := range cut.CurrentNodes {
+			if node.NodeID == intent.Peer.NodeID && node.Incarnation == intent.Peer.Incarnation &&
+				node.Revision == intent.Peer.Revision && node.DataAddress == intent.Peer.Endpoint &&
+				node.ServiceKeyDigest == intent.Peer.ServiceKeyDigest {
+				return nil
+			}
+		}
+		return nodecontrol.ErrStale
+	})
+	for _, node := range cut.CurrentNodes {
+		if node.NodeID == registry.LocalNode() {
+			continue
+		}
+		intent := rafttransport.EnrollmentIntent{
+			Domain: installer.factory.profile.LocalIdentity().TrustDomain,
+			Digest: rf3EmptyNodePeerEnrollmentDigest(cut.DirectoryCutDigest, node.NodeID),
+			Peer: rafttransport.PhysicalPeer{NodeID: node.NodeID, TrustDomain: installer.factory.profile.LocalIdentity().TrustDomain,
+				Incarnation: node.Incarnation, Revision: node.Revision, ServiceKeyDigest: node.ServiceKeyDigest,
+				Endpoint: node.DataAddress, State: rafttransport.PeerEnrolled}, DirectoryRevision: registry.PeerDirectoryRevision()}
+		if err := rf3EnrollPhysicalPeer(ctx, enroller, registry, intent, verifier); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 type rf3PhysicalPeerEnroller interface {
 	EnrollPeerContext(context.Context, rafttransport.EnrollmentIntent, rafttransport.EnrollmentVerifier) error
 }
 
-func (installer *rf3DynamicLearnerInstaller) enrollCertifiedRosterPeers(ctx context.Context) error {
+// Independent group preparations may certify the same physical peer. Keep
+// its first directory proof when the complete physical record is unchanged;
+// the caller still verifies its own committed preparation or recovery cut,
+// and the enroller still restores the queue before publishing membership.
+func rf3EnrollPhysicalPeer(
+	ctx context.Context,
+	enroller rf3PhysicalPeerEnroller,
+	registry *rafttransport.StaticRegistry,
+	intent rafttransport.EnrollmentIntent,
+	verifier rafttransport.EnrollmentVerifier,
+) error {
+	peer := intent.Peer
+	if existing, err := registry.PhysicalPeer(peer.NodeID); err == nil &&
+		existing.EnrollmentDigest != ([32]byte{}) && existing.NodeID == peer.NodeID &&
+		existing.TrustDomain == peer.TrustDomain && existing.State == peer.State &&
+		existing.Incarnation == peer.Incarnation && existing.Revision == peer.Revision &&
+		existing.ServiceKeyDigest == peer.ServiceKeyDigest && existing.Endpoint == peer.Endpoint {
+		intent.Digest = existing.EnrollmentDigest
+	}
+	return enroller.EnrollPeerContext(ctx, intent, verifier)
+}
+
+func (installer *rf3DynamicLearnerInstaller) enrollCertifiedRosterPeers(ctx context.Context, rosters ...[]rafttransport.Member) error {
 	if installer == nil || installer.factory == nil || installer.factory.runtime == nil ||
-		installer.factory.runtime.peer == nil || installer.factory.profile == nil {
+		installer.factory.runtime.peer == nil || installer.factory.profile == nil || len(rosters) > 1 {
 		return nodecontrol.ErrControl
 	}
-	return rf3EnrollCertifiedRosterPeers(
+	include := func(node rafttransport.NodeID) bool {
+		if installer.recovery != nil {
+			for _, current := range installer.recovery.CurrentNodes {
+				if current.NodeID == node {
+					return false // The authenticated current directory supplies it.
+				}
+			}
+		}
+		if len(rosters) == 0 {
+			return true
+		}
+		for _, member := range rosters[0] {
+			if member.Node == node {
+				return true
+			}
+		}
+		return false
+	}
+	return rf3EnrollCertifiedRosterPeersFiltered(
 		ctx,
 		installer.factory.runtime.peer.Transport(),
 		installer.factory.runtime.registry,
 		installer.spec,
 		installer.intent.ExpectedManifestDigest,
 		installer.factory.profile.LocalIdentity().TrustDomain,
+		include,
 	)
 }
 
@@ -630,6 +918,18 @@ func rf3EnrollCertifiedRosterPeers(
 	spec nodecontrol.PreparationSpec,
 	certified replication.Digest,
 	domain rafttransport.TrustDomain,
+) error {
+	return rf3EnrollCertifiedRosterPeersFiltered(ctx, enroller, registry, spec, certified, domain, nil)
+}
+
+func rf3EnrollCertifiedRosterPeersFiltered(
+	ctx context.Context,
+	enroller rf3PhysicalPeerEnroller,
+	registry *rafttransport.StaticRegistry,
+	spec nodecontrol.PreparationSpec,
+	certified replication.Digest,
+	domain rafttransport.TrustDomain,
+	include func(rafttransport.NodeID) bool,
 ) error {
 	if ctx == nil || enroller == nil || registry == nil || certified == (replication.Digest{}) ||
 		domain == (rafttransport.TrustDomain{}) {
@@ -665,7 +965,7 @@ func rf3EnrollCertifiedRosterPeers(
 		return nodecontrol.ErrConflict
 	})
 	for _, voter := range spec.InitialVoters {
-		if voter.Node == local {
+		if voter.Node == local || include != nil && !include(voter.Node) {
 			continue
 		}
 		if voter.ServiceKeyDigest == (replication.Digest{}) || voter.NodeIncarnation == 0 ||
@@ -684,7 +984,7 @@ func rf3EnrollCertifiedRosterPeers(
 			},
 			DirectoryRevision: registry.PeerDirectoryRevision(),
 		}
-		if err := enroller.EnrollPeerContext(ctx, intent, verifier); err != nil {
+		if err := rf3EnrollPhysicalPeer(ctx, enroller, registry, intent, verifier); err != nil {
 			return fmt.Errorf("RF3 empty-node roster enrollment: %w", err)
 		}
 	}

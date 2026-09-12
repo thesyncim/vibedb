@@ -798,10 +798,14 @@ func (peerTLS *PeerTLS) handshake(
 		_ = raw.Close()
 		return nil, errors.Join(ErrPeerAuthentication, err)
 	}
+	// TLS cancellation alone does not cover the application build preface.
+	// Keep the owned socket cancelable through the complete admission exchange.
+	stopCancellation := context.AfterFunc(ctx, func() { _ = raw.Close() })
+	defer stopCancellation()
 	connection := constructor(raw, config)
 	if err := connection.HandshakeContext(ctx); err != nil {
 		_ = connection.Close()
-		return nil, errors.Join(ErrPeerAuthentication, err)
+		return nil, errors.Join(ErrPeerAuthentication, context.Cause(ctx), err)
 	}
 	state := connection.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
@@ -824,12 +828,22 @@ func (peerTLS *PeerTLS) handshake(
 		capabilities, err = exchangeBuildPreface(connection, role, peerTLS.build)
 		if err != nil {
 			_ = connection.Close()
-			return nil, errors.Join(ErrPeerBuild, err)
+			// Keep the cancellation cause before the socket-close error so
+			// errors.As(net.Error) preserves deadline timeout classification.
+			return nil, errors.Join(ErrPeerBuild, context.Cause(ctx), err)
 		}
 	}
 	if err := connection.SetDeadline(time.Time{}); err != nil {
 		_ = connection.Close()
-		return nil, errors.Join(ErrPeerAuthentication, err)
+		return nil, errors.Join(ErrPeerAuthentication, context.Cause(ctx), err)
+	}
+	// A running cancellation callback may already be closing the connection.
+	// Stop it before transferring ownership and reject a canceled admission,
+	// including cancellation racing the final deadline reset.
+	stopped := stopCancellation()
+	if cause := context.Cause(ctx); !stopped || cause != nil {
+		_ = connection.Close()
+		return nil, errors.Join(ErrPeerAuthentication, cause)
 	}
 	return &authenticatedPeerConnection{
 		Conn: connection, identity: identity, keyDigest: keyDigest,

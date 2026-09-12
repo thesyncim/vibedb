@@ -35,9 +35,9 @@ var (
 )
 
 const (
-	NodeInfoMaxReplyBytes      = 64 << 10
-	NodeInfoMaxEndpointBytes   = 1024
-	NodeInfoMaxConcurrent      = 64
+	NodeInfoMaxReplyBytes       = 64 << 10
+	NodeInfoMaxEndpointBytes    = 1024
+	NodeInfoMaxConcurrent       = 64
 	nodeInfoVersion             = 1
 	nodeInfoRequestHeaderBytes  = 64
 	nodeInfoResponseHeaderBytes = 64
@@ -153,24 +153,24 @@ func (readiness NodeInfoReadiness) ready() bool {
 type NodeInfoObservation struct {
 	Nonce                     [nodeInfoNonceBytes]byte `json:"nonce"`
 	Operation                 NodeInfoOperation        `json:"operation"`
-	NodeID                    rafttransport.NodeID    `json:"node_id"`
-	Incarnation               uint64                  `json:"incarnation"`
-	SPKIPinDigest             replication.Digest      `json:"spki_pin_digest"`
-	Store                     NodeInfoStoreIdentity   `json:"store"`
-	Endpoints                 NodeInfoEndpoints       `json:"endpoints"`
-	Readiness                 NodeInfoReadiness       `json:"readiness"`
-	ServingGroups             uint32                  `json:"serving_groups"`
-	ReservedGroups            uint32                  `json:"reserved_groups"`
-	InventoryRevision         uint64                  `json:"inventory_revision"`
-	ActualCapacity             autosplit.CapacityVector `json:"actual_capacity"`
-	ActualUsage                autosplit.CapacityVector `json:"actual_usage"`
-	DeclaredCapacity           autosplit.CapacityVector `json:"declared_capacity"`
-	ActualMigrationCapacity    uint64                  `json:"actual_migration_capacity"`
-	ActualMigrationUsed        uint64                  `json:"actual_migration_used"`
-	DeclaredMigrationCapacity  uint64                  `json:"declared_migration_capacity"`
-	ActualActiveReceives       uint32                  `json:"actual_active_receives"`
-	DeclaredMaxReceives        uint32                  `json:"declared_max_receives"`
-	ObservationDigest           replication.Digest      `json:"observation_digest"`
+	NodeID                    rafttransport.NodeID     `json:"node_id"`
+	Incarnation               uint64                   `json:"incarnation"`
+	SPKIPinDigest             replication.Digest       `json:"spki_pin_digest"`
+	Store                     NodeInfoStoreIdentity    `json:"store"`
+	Endpoints                 NodeInfoEndpoints        `json:"endpoints"`
+	Readiness                 NodeInfoReadiness        `json:"readiness"`
+	ServingGroups             uint32                   `json:"serving_groups"`
+	ReservedGroups            uint32                   `json:"reserved_groups"`
+	InventoryRevision         uint64                   `json:"inventory_revision"`
+	ActualCapacity            autosplit.CapacityVector `json:"actual_capacity"`
+	ActualUsage               autosplit.CapacityVector `json:"actual_usage"`
+	DeclaredCapacity          autosplit.CapacityVector `json:"declared_capacity"`
+	ActualMigrationCapacity   uint64                   `json:"actual_migration_capacity"`
+	ActualMigrationUsed       uint64                   `json:"actual_migration_used"`
+	DeclaredMigrationCapacity uint64                   `json:"declared_migration_capacity"`
+	ActualActiveReceives      uint32                   `json:"actual_active_receives"`
+	DeclaredMaxReceives       uint32                   `json:"declared_max_receives"`
+	ObservationDigest         replication.Digest       `json:"observation_digest"`
 }
 
 func (observation NodeInfoObservation) valid() bool {
@@ -234,14 +234,14 @@ type NodeInfoStoreFacts struct {
 	ServingGroups             uint32
 	ReservedGroups            uint32
 	InventoryRevision         uint64
-	ActualCapacity             autosplit.CapacityVector
-	ActualUsage                autosplit.CapacityVector
-	DeclaredCapacity           autosplit.CapacityVector
-	ActualMigrationCapacity    uint64
-	ActualMigrationUsed        uint64
-	DeclaredMigrationCapacity  uint64
-	ActualActiveReceives       uint32
-	DeclaredMaxReceives        uint32
+	ActualCapacity            autosplit.CapacityVector
+	ActualUsage               autosplit.CapacityVector
+	DeclaredCapacity          autosplit.CapacityVector
+	ActualMigrationCapacity   uint64
+	ActualMigrationUsed       uint64
+	DeclaredMigrationCapacity uint64
+	ActualActiveReceives      uint32
+	DeclaredMaxReceives       uint32
 }
 
 func (facts NodeInfoStoreFacts) Observation(request NodeInfoRequest) (NodeInfoObservation, error) {
@@ -339,6 +339,8 @@ func (service *NodeInfoService) Serve(ctx context.Context, connection rafttransp
 	}
 	if !observation.valid() || observation.Nonce != request.Nonce || observation.Operation != request.Operation ||
 		observation.NodeID != request.NodeID || observation.Incarnation != request.Incarnation ||
+		observation.Store.ClusterID != service.trustDomain.ClusterID ||
+		observation.Store.ClusterIncarnation != service.trustDomain.ClusterIncarnation ||
 		observation.InventoryRevision < request.MinimumInventoryRevision {
 		return ErrNodeInfoStale
 	}
@@ -405,6 +407,8 @@ func (client *NodeInfoClient) Observe(ctx context.Context, nodeID rafttransport.
 		return NodeInfoObservation{}, ErrNodeInfoUnavailable
 	}
 	defer connection.Close()
+	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stop()
 	peer := connection.PeerIdentity()
 	if connection.TrafficClass() != rafttransport.TrafficShardControl || peer.TrustDomain != client.trustDomain || peer.Node != nodeID {
 		return NodeInfoObservation{}, ErrNodeInfoUnauthorized
@@ -428,6 +432,9 @@ func (client *NodeInfoClient) Observe(ctx context.Context, nodeID rafttransport.
 	}
 	if observation.Nonce != request.Nonce || observation.Operation != request.Operation ||
 		observation.NodeID != nodeID || observation.Incarnation != request.Incarnation ||
+		observation.SPKIPinDigest != replication.Digest(connection.PeerKeyDigest()) ||
+		observation.Store.ClusterID != client.trustDomain.ClusterID ||
+		observation.Store.ClusterIncarnation != client.trustDomain.ClusterIncarnation ||
 		observation.InventoryRevision < request.MinimumInventoryRevision || !observation.valid() {
 		return NodeInfoObservation{}, ErrNodeInfoConflict
 	}

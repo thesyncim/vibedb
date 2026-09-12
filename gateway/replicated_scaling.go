@@ -25,7 +25,7 @@ const (
 	maxEnrollmentRecordBytes       = 128 << 10
 	maxEnrollmentDirectoryBytes    = 256 << 10
 	maxScalingTerminalHistoryBytes = 128 << 10
-	maxEnrollmentHistoryBytes      = 512 << 10
+	maxEnrollmentHistoryBytes      = replication.MaxMutationValueBytes
 	maxScalingTerminalHistory      = MaxScalingIntents
 	maxEnrollmentHistory           = 1024
 	scalingNodeIdentifierBytes     = len("node/") + 32 + 1 + 16
@@ -1385,8 +1385,44 @@ func (authority *ReplicatedCatalogAuthority) PutScalingIntent(ctx context.Contex
 		if len(intent.OutstandingMoves) != 0 && intent.State == ScalingCancelled {
 			return ErrScalingState
 		}
+		if intent.State == ScalingCancelled && len(prior.OutstandingMoves) != 0 {
+			return ErrScalingState
+		}
 	} else if expectedRevision != 0 || intent.Revision != 1 || intent.State != ScalingReserved {
 		return ErrScalingRevision
+	}
+	var terminalEnrollmentFence []NativeMutation
+	if intent.State >= ScalingComplete {
+		// Parent status is only a projection of child work. Even before a
+		// move operation is journaled, a Reserved/Prepared child can own a
+		// physical side effect. Fence the full active directory so child
+		// admission and cancellation cannot both commit from the same cut.
+		enrollmentResult, readErr := authority.readRaw(ctx, enrollmentDirectoryKey, maxEnrollmentDirectoryBytes)
+		if readErr != nil {
+			return readErr
+		}
+		if enrollmentResult.Found {
+			entries, openErr := openScalingIDDirectory(enrollmentResult.Value, enrollmentDirectoryDocumentID[:], maxEnrollmentDirectoryBytes, MaxEnrollmentIntents)
+			if openErr != nil {
+				return openErr
+			}
+			for _, entry := range entries {
+				var id [32]byte
+				copy(id[:], entry.ID)
+				child, readErr := authority.readEnrollmentDirectoryEntry(ctx, id, entry)
+				if readErr != nil {
+					return readErr
+				}
+				if child.ParentScalingIntentID == intent.ID && child.State < EnrollmentComplete {
+					return ErrScalingState
+				}
+			}
+		}
+		empty, appendErr := appendScalingIDDirectory(nil, enrollmentDirectoryDocumentID[:], nil, maxEnrollmentDirectoryBytes)
+		if appendErr != nil {
+			return appendErr
+		}
+		terminalEnrollmentFence = append(terminalEnrollmentFence, scalingPresenceFenceMutation(enrollmentResult, enrollmentDirectoryKey, empty))
 	}
 	var drainNodeResult ReplicatedPointResult
 	var drainNodeKey []byte
@@ -1485,6 +1521,11 @@ func (authority *ReplicatedCatalogAuthority) PutScalingIntent(ctx context.Contex
 		}
 	}
 	mutations = append(mutations, completionFences...)
+	// Scale-in/decommission completion already fences the enrollment directory
+	// as part of its reference evidence. Avoid duplicate mutations for that key.
+	if len(completionFences) == 0 {
+		mutations = append(mutations, terminalEnrollmentFence...)
+	}
 	result, err := authority.session.MutateBatch(ctx, mutations)
 	return scalingMutationError(result, err, authority.session)
 }
@@ -1604,18 +1645,24 @@ func (authority *ReplicatedCatalogAuthority) putEnrollmentIntent(ctx context.Con
 		if intent.State != prior.State && !prior.State.Allows(intent.State) {
 			return ErrScalingState
 		}
-		if prior.PreparationClaim != ([32]byte{}) {
+		if prior.State == EnrollmentReserved && prior.PreparationClaim != ([32]byte{}) {
+			if intent.State == EnrollmentCancelled {
+				// The generic writer must enforce the same cancellation fence as
+				// CancelEnrollmentIntent: a claimed reservation may already have
+				// created a physical artifact whose proof has not been recorded.
+				return ErrScalingState
+			}
 			if intent.State == EnrollmentReserved && intent.PreparationClaim != prior.PreparationClaim {
 				return ErrScalingIdentity
 			}
 			if intent.State == EnrollmentPrepared && intent.PreparationClaim != ([32]byte{}) {
 				return ErrScalingState
 			}
-		} else if intent.State == EnrollmentPrepared ||
-			(intent.State >= EnrollmentEnrolled && intent.State <= EnrollmentComplete) {
+		} else if prior.State == EnrollmentReserved && intent.State == EnrollmentPrepared {
 			// Prepared may only be published after a durable claim.  This closes
 			// the cancellation window between an external Prepare side effect and
-			// its metadata CAS.
+			// its metadata CAS. The claim is consumed by this edge; later states
+			// use the persisted proof and certified receipt as their authority.
 			return ErrScalingState
 		}
 		if prior.State == EnrollmentPrepared && intent.State == EnrollmentEnrolled && !allowReceipt {
@@ -1639,6 +1686,10 @@ func (authority *ReplicatedCatalogAuthority) putEnrollmentIntent(ctx context.Con
 	} else if expectedRevision != 0 || intent.Revision != 1 || intent.State != EnrollmentReserved ||
 		intent.PreparationClaim != ([32]byte{}) {
 		return ErrScalingRevision
+	}
+	parentMutations, err := authority.enrollmentParentMutations(ctx, intent, prior, current.Found)
+	if err != nil {
+		return err
 	}
 	var enrollmentBaseHead, enrollmentBaseWitness ReplicatedPointResult
 	if !current.Found {
@@ -1721,19 +1772,11 @@ func (authority *ReplicatedCatalogAuthority) putEnrollmentIntent(ctx context.Con
 		return err
 	}
 	recordDigest := scalingDigest(recordBytes)
-	var historyResult ReplicatedPointResult
-	var historyEntries []scalingIDDirectoryEntry
-	var historyBytes []byte
-	var evictedHistory scalingIDDirectoryEntry
-	var evictedHistoryFound bool
+	var historyMutations []NativeMutation
 	if intent.State >= EnrollmentComplete {
 		removeScalingDirectoryEntry(&entries, intent.IntentID)
-		historyEntries, historyResult, err = authority.readTerminalHistory(ctx, enrollmentHistoryKey, enrollmentHistoryDocumentID[:], maxEnrollmentHistoryBytes, maxEnrollmentHistory)
-		if err != nil {
-			return err
-		}
-		evictedHistory, evictedHistoryFound = terminalHistoryEntry(&historyEntries, intent.IntentID, intent.Revision, recordDigest, maxEnrollmentHistory)
-		historyBytes, err = appendScalingIDDirectory(nil, enrollmentHistoryDocumentID[:], historyEntries, maxEnrollmentHistoryBytes)
+		historyMutations, err = authority.enrollmentHistoryMutations(ctx, intent, recordDigest,
+			authority.session.bundle.maxMutations-3-len(parentMutations))
 		if err != nil {
 			return err
 		}
@@ -1766,22 +1809,104 @@ func (authority *ReplicatedCatalogAuthority) putEnrollmentIntent(ctx context.Con
 		scalingRecordMutation(current, key, recordBytes),
 		scalingDirectoryMutation(directoryResult, enrollmentDirectoryKey, directoryBytes),
 	)
-	if intent.State >= EnrollmentComplete {
-		mutations = append(mutations, scalingDirectoryMutation(historyResult, enrollmentHistoryKey, historyBytes))
-		if evictedHistoryFound {
-			var evictedID [32]byte
-			copy(evictedID[:], evictedHistory.ID)
-			evictedRaw, readErr := authority.readRaw(ctx, enrollmentIntentKey(evictedID), maxEnrollmentRecordBytes)
-			if readErr != nil || !evictedRaw.Found || scalingDigest(evictedRaw.Value) != replication.Digest(evictedHistory.Digest) {
-				return errors.Join(readErr, ErrReplicatedCatalogConflict)
-			}
-			mutations = append(mutations, NativeMutation{Kind: replication.MutationDeleteDigestEqual,
-				Key: enrollmentIntentKey(evictedID), ExpectedValueLength: uint64(len(evictedRaw.Value)),
-				ExpectedValueDigest: scalingDigest(evictedRaw.Value)})
-		}
-	}
+	mutations = append(mutations, parentMutations...)
+	mutations = append(mutations, historyMutations...)
 	result, err := authority.session.MutateBatch(ctx, mutations)
 	return scalingMutationError(result, err, authority.session)
+}
+
+// enrollmentParentMutations keeps operator progress at the same durable
+// boundary as child work. Terminal-history eviction cannot erase completed
+// progress, and a stale controller cannot admit work after cancellation.
+func (authority *ReplicatedCatalogAuthority) enrollmentParentMutations(ctx context.Context, intent, prior GroupEnrollmentIntent, exists bool) ([]NativeMutation, error) {
+	if intent.ParentScalingIntentID == ([32]byte{}) {
+		return nil, nil
+	}
+	key := scalingIntentKey(intent.ParentScalingIntentID)
+	row, err := authority.readRaw(ctx, key, maxScalingIntentRecordBytes)
+	if err != nil || !row.Found {
+		return nil, errors.Join(err, ErrScalingIntentMissing)
+	}
+	parent, err := openScalingIntentRecord(row.Value, intent.ParentScalingIntentID)
+	if err != nil {
+		return nil, err
+	}
+	if parent.State != ScalingRunning {
+		return nil, ErrScalingState
+	}
+	next := parent
+	changed := false
+	if !exists {
+		if next.PlannedReplicas >= MaxScalingMovesPerIntent || next.PlannedReplicas >= uint32(next.Request.MaxMoves) ||
+			intent.ReservedMigrationBytes > ^uint64(0)-next.AdmittedMigrationBytes {
+			return nil, ErrScalingMetadataBound
+		}
+		if next.Request.MaxMigrationBytes != 0 &&
+			(next.AdmittedMigrationBytes > next.Request.MaxMigrationBytes ||
+				intent.ReservedMigrationBytes > next.Request.MaxMigrationBytes-next.AdmittedMigrationBytes) {
+			return nil, ErrScalingMetadataBound
+		}
+		next.PlannedReplicas++
+		next.AdmittedMigrationBytes += intent.ReservedMigrationBytes
+		changed = true
+	} else if intent.State != prior.State {
+		switch intent.State {
+		case EnrollmentMoving:
+			if slices.Contains(next.OutstandingMoves, intent.MoveOperationID) {
+				return nil, ErrScalingIdentity
+			}
+			next.OutstandingMoves = append(slices.Clone(next.OutstandingMoves), intent.MoveOperationID)
+			slices.SortFunc(next.OutstandingMoves, func(left, right [32]byte) int { return bytes.Compare(left[:], right[:]) })
+			changed = true
+		case EnrollmentComplete:
+			if next.CompletedReplicas >= next.PlannedReplicas {
+				return nil, ErrScalingState
+			}
+			next.CompletedReplicas++
+			next.OutstandingMoves = slices.DeleteFunc(slices.Clone(next.OutstandingMoves), func(id [32]byte) bool { return id == intent.MoveOperationID })
+			changed = true
+		case EnrollmentCancelled:
+			if next.PlannedReplicas <= next.CompletedReplicas || next.AdmittedMigrationBytes < intent.ReservedMigrationBytes {
+				return nil, ErrScalingState
+			}
+			next.PlannedReplicas--
+			next.AdmittedMigrationBytes -= intent.ReservedMigrationBytes
+			changed = true
+		}
+	}
+	if !changed {
+		return []NativeMutation{scalingDirectoryMutation(row, key, row.Value)}, nil
+	}
+	if next.Revision == ^uint64(0) {
+		return nil, ErrScalingMetadataBound
+	}
+	next.Revision++
+	next.DirectoryRevision = next.Revision
+	raw, err := appendScalingIntentRecord(nil, next)
+	if err != nil {
+		return nil, err
+	}
+	directory, err := authority.readRaw(ctx, scalingIntentDirectoryKey, maxScalingIntentDirectoryBytes)
+	if err != nil || !directory.Found {
+		return nil, errors.Join(err, ErrScalingRevision)
+	}
+	entries, err := openScalingIDDirectory(directory.Value, scalingIntentDirectoryDocumentID[:], maxScalingIntentDirectoryBytes, MaxScalingIntents)
+	if err != nil {
+		return nil, err
+	}
+	entry, found := findScalingDirectoryEntry(entries, parent.ID)
+	if !found || entry.Revision != parent.Revision || replication.Digest(entry.Digest) != scalingDigest(row.Value) {
+		return nil, ErrScalingRevision
+	}
+	insertScalingDirectoryEntry(&entries, parent.ID, next.Revision, scalingDigest(raw))
+	directoryBytes, err := appendScalingIDDirectory(nil, scalingIntentDirectoryDocumentID[:], entries, maxScalingIntentDirectoryBytes)
+	if err != nil {
+		return nil, err
+	}
+	return []NativeMutation{
+		scalingRecordMutation(row, key, raw),
+		scalingDirectoryMutation(directory, scalingIntentDirectoryKey, directoryBytes),
+	}, nil
 }
 
 func (authority *ReplicatedCatalogAuthority) SubmitEnrollmentIntent(ctx context.Context, intent GroupEnrollmentIntent) error {

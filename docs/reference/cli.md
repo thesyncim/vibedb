@@ -116,6 +116,12 @@ are rejected by the descriptor decoder and never enter the request envelope.
 revisions, blockers, safe-to-stop, retirement evidence, and migration-budget
 counters.
 
+`--max-moves` and `--max-migration-bytes` limit admission across the entire
+durable rebalance request, including completed moves and controller restarts.
+They do not reset for each planning wave. If the remaining budget cannot admit
+the next move, status retains a budget blocker; it never reports a node safe
+to stop merely because the request reached its limit.
+
 ## `vibedb-shard`
 
 ### `vibedb-shard` commands

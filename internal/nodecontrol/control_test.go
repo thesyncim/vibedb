@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -55,6 +57,7 @@ type testAdopter struct {
 
 func (adopter *testAdopter) Adopt(context.Context, gateway.GroupEnrollmentIntent, gateway.PreparedReplicaProof) error {
 	adopter.adoptCall++
+	adopter.observed = true
 	return nil
 }
 
@@ -296,5 +299,138 @@ func TestFileJournalSurvivesReopenAndRejectsInvalidTransition(t *testing.T) {
 	got, err := reopened.Read(context.Background(), intent.IntentID)
 	if err != nil || got != prepared {
 		t.Fatalf("reopened record=%#v err=%v", got, err)
+	}
+}
+
+func TestPreparedIntentCannotRecreateMissingArtifact(t *testing.T) {
+	payload := []byte(`{"schema":"orders"}`)
+	directory := &testDirectory{intent: testIntent(payload, gateway.EnrollmentPrepared)}
+	preparer := &testPreparer{proof: testProof(directory.intent)}
+	service := newTestService(t, directory, preparer, new(testAdopter), NewMemoryJournal())
+	request, err := NewRequest(PhasePrepare, directory.intent, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := service.Execute(t.Context(), request); !errors.Is(err, ErrNotPrepared) {
+			t.Fatalf("missing committed artifact: %v", err)
+		}
+	}
+	if preparer.prepareCall != 0 {
+		t.Fatalf("recreated committed preparation %d times", preparer.prepareCall)
+	}
+	preparer.observed = true
+	if _, err := service.Execute(t.Context(), request); err != nil {
+		t.Fatalf("recover existing committed artifact: %v", err)
+	}
+}
+
+func TestAdoptedRetryRestoresReceiverAfterProcessRestart(t *testing.T) {
+	payload := []byte(`{"schema":"orders"}`)
+	directory := &testDirectory{intent: testIntent(payload, gateway.EnrollmentEnrolled)}
+	journal := NewMemoryJournal()
+	preparer := &testPreparer{proof: testProof(directory.intent), observed: true}
+	first := newTestService(t, directory, preparer, new(testAdopter), journal)
+	request, err := NewRequest(PhaseAdopt, directory.intent, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := first.Execute(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Durable state is retained while the process-local receiver is lost.
+	restartedAdopter := new(testAdopter)
+	restarted := newTestService(t, directory, preparer, restartedAdopter, journal)
+	for range 2 {
+		after, err := restarted.Execute(t.Context(), request)
+		if err != nil || after != before {
+			t.Fatalf("restart retry changed journal: %+v, %v", after, err)
+		}
+	}
+	if restartedAdopter.adoptCall != 1 || restartedAdopter.observeCall != 2 {
+		t.Fatalf("receiver was not restored exactly once: %+v", restartedAdopter)
+	}
+	directory.intent.State = gateway.EnrollmentComplete
+	directory.intent.MoveOperationID = [32]byte{1}
+	restartedAdopter.observed = false
+	if _, err := restarted.Execute(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if restartedAdopter.adoptCall != 1 || restartedAdopter.observeCall != 2 {
+		t.Fatal("completed intent restored a retired receiver")
+	}
+}
+
+func TestAdoptionRejectsProofDifferentFromCommittedProof(t *testing.T) {
+	payload := []byte(`{"schema":"orders"}`)
+	directory := &testDirectory{intent: testIntent(payload, gateway.EnrollmentEnrolled)}
+	proof := testProof(directory.intent)
+	proof.AppliedIndex++
+	proof.EnrollmentDigest = proof.ComputedEnrollmentDigest()
+	if !proof.Valid() {
+		t.Fatal("fixture proof is invalid")
+	}
+	preparer := &testPreparer{proof: proof, observed: true}
+	adopter := new(testAdopter)
+	service := newTestService(t, directory, preparer, adopter, NewMemoryJournal())
+	request, err := NewRequest(PhaseAdopt, directory.intent, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Execute(t.Context(), request); !errors.Is(err, ErrInvalidProof) {
+		t.Fatalf("mismatched proof accepted: %v", err)
+	}
+	if adopter.adoptCall != 0 {
+		t.Fatal("adoption happened before validating the committed proof")
+	}
+}
+
+func TestClosedFileJournalCannotWriteWithoutLease(t *testing.T) {
+	root := t.TempDir()
+	journal, err := NewFileJournal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := NewFileJournal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	record := Record{IntentID: [32]byte{1}, PreparationDigest: [32]byte{2}, Revision: 1, State: StatePreparing}
+	if err := journal.Publish(t.Context(), 0, record); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("released writer lease allowed publish: %v", err)
+	}
+	if _, err := journal.Read(t.Context(), record.IntentID); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("closed journal allowed read: %v", err)
+	}
+	if err := owner.Publish(t.Context(), 0, record); err != nil {
+		t.Fatalf("current owner cannot publish: %v", err)
+	}
+}
+
+func TestFileJournalRejectsSymlinkRecord(t *testing.T) {
+	journal, err := NewFileJournal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	record := Record{IntentID: [32]byte{1}, PreparationDigest: [32]byte{2}, Revision: 1, State: StatePreparing}
+	if err := journal.Publish(t.Context(), 0, record); err != nil {
+		t.Fatal(err)
+	}
+	path := journal.path(record.IntentID)
+	outside := filepath.Join(t.TempDir(), "record")
+	if err := os.Rename(path, outside); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := journal.Read(t.Context(), record.IntentID); !errors.Is(err, ErrJournalCorrupt) {
+		t.Fatalf("symlink record accepted: %v", err)
 	}
 }

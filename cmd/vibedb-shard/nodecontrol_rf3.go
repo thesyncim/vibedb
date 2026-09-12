@@ -629,7 +629,19 @@ func (adopter *rf3NodeControlAdopter) ObserveAdopted(
 		TargetNodeIncarnation: intent.Target.NodeIncarnation, TargetStoreID: intent.Target.StoreID,
 		ProofDigest: proof.EnrollmentDigest,
 	}
-	return receipt == want, nil
+	if receipt != want {
+		return false, nodecontrol.ErrConflict
+	}
+	// The receipt certifies the durable reservation, while the receiver is a
+	// process-local capability lost on restart. Restore that exact capability
+	// before reporting adoption to a retrying controller.
+	if adopter.ActivateReceiver == nil {
+		return false, nodecontrol.ErrControl
+	}
+	if err = adopter.ActivateReceiver(ctx, intent, proof); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func readRF3EnrollmentReservation(root string) (rf3EnrollmentReservation, bool, error) {

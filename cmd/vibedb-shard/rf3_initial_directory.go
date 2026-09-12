@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibejson"
@@ -35,9 +36,9 @@ func loadRF3InitialNodeDirectory(path string) ([]gateway.NodeRecord, error) {
 	return records, nil
 }
 
-func newRF3ProvisionedRegistry(manifest rf3Manifest, profile *rafttransport.PeerTLS, members []rafttransport.Member, limits rafttransport.Limits) (*rafttransport.StaticRegistry, error) {
+func newRF3ProvisionedRegistry(manifest rf3Manifest, profile *rafttransport.PeerTLS, members []rafttransport.Member, endpoints map[rafttransport.NodeID]string, limits rafttransport.Limits) (*rafttransport.StaticRegistry, error) {
 	if manifest.Gateway == nil || manifest.Gateway.InitialNodeDirectoryPath == "" {
-		return newRF3PinnedStaticRegistry(manifest, profile, members, limits)
+		return newRF3PinnedStaticRegistry(manifest, profile, members, endpoints, limits)
 	}
 	records, err := loadRF3InitialNodeDirectory(manifest.Gateway.InitialNodeDirectoryPath)
 	if err != nil {
@@ -55,7 +56,7 @@ func newRF3ProvisionedRegistry(manifest rf3Manifest, profile *rafttransport.Peer
 
 // Static compositions carry their initial certificate pins in the prepared
 // manifest. Dynamic membership still uses the committed physical directory.
-func newRF3PinnedStaticRegistry(manifest rf3Manifest, profile *rafttransport.PeerTLS, members []rafttransport.Member, limits rafttransport.Limits) (*rafttransport.StaticRegistry, error) {
+func newRF3PinnedStaticRegistry(manifest rf3Manifest, profile *rafttransport.PeerTLS, members []rafttransport.Member, endpoints map[rafttransport.NodeID]string, limits rafttransport.Limits) (*rafttransport.StaticRegistry, error) {
 	if len(manifest.TLS.PeerKeys) == 0 {
 		return nil, fmt.Errorf("%w: initial peer key pins required", errInvalidRF3Manifest)
 	}
@@ -82,7 +83,11 @@ func newRF3PinnedStaticRegistry(manifest rf3Manifest, profile *rafttransport.Pee
 		if !found {
 			return nil, fmt.Errorf("%w: missing member certificate pin", errInvalidRF3Manifest)
 		}
-		peers = append(peers, rafttransport.PhysicalPeer{NodeID: member.Node, TrustDomain: profile.LocalIdentity().TrustDomain, Incarnation: 1, Revision: 1, ServiceKeyDigest: digest, Endpoint: peerAddressForRF3Member(manifest, member.MemberID), State: rafttransport.PeerEnrolled})
+		endpoint := endpoints[member.Node]
+		if endpoint == "" {
+			return nil, fmt.Errorf("%w: missing member peer endpoint", errInvalidRF3Manifest)
+		}
+		peers = append(peers, rafttransport.PhysicalPeer{NodeID: member.Node, TrustDomain: profile.LocalIdentity().TrustDomain, Incarnation: 1, Revision: 1, ServiceKeyDigest: digest, Endpoint: endpoint, State: rafttransport.PeerEnrolled})
 	}
 	return rafttransport.NewStaticRegistryWithDirectory(profile.LocalIdentity().Node, members, peers, 1, limits)
 }

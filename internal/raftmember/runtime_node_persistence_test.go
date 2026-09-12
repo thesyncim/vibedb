@@ -120,8 +120,9 @@ func TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady(t *testing.T) {
 		MaxWaveBytes: 1 << 20, MaxSegmentEvents: 256,
 		RecentWaves: 64, MaxEntriesPerGroup: 64, ReaderSlots: 1, MaxGroups: 8,
 	}
+	nodePath := filepath.Join(t.TempDir(), "node")
 	store, err := raftstore.CreateNodeStore(
-		filepath.Join(t.TempDir(), "node"), node, testWALKey(),
+		nodePath, node, testWALKey(),
 		[]raftstore.NodeBootstrap{{Descriptor: descriptor, Snapshot: bootstrap}}, options,
 	)
 	if err != nil {
@@ -264,13 +265,57 @@ func TestAdoptNodeRuntimeDrivesWorkerFreeDurableReady(t *testing.T) {
 	if _, err = group.LastIndex(); err != nil {
 		t.Fatalf("Runtime closed shared node store: %v", err)
 	}
+	_, previousReady, err := group.ReadyCursor()
+	if err != nil || previousReady == 0 {
+		t.Fatalf("missing persisted Ready cursor: %d %v", previousReady, err)
+	}
+	if err := errors.Join(sequencer.Close(), store.Close()); err != nil {
+		t.Fatal(err)
+	}
+	store, err = raftstore.OpenNodeStore(nodePath, node, testWALKey(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	group = store.Group(1)
+	sequencer, err = raftstore.NewNodeSubmissionSequencer(store, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
 	reopenedDatabase, reopenedApply, err := OpenBoundNodeSQLWithApply(
 		path, group, authority, base, applyIdentity,
 	)
 	if err != nil {
 		t.Fatalf("OpenBoundNodeSQLWithApply: %v", err)
 	}
-	if err = errors.Join(reopenedApply.Close(), reopenedDatabase.Close()); err != nil {
-		t.Fatalf("close node-log restart handles: %v", err)
+	persistence, err = BindNodeRuntimePersistence(store, sequencer, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err = AdoptNodeRuntime(persistence, reopenedDatabase, reopenedApply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	if err := runtime.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	for step := 0; step < 1000; step++ {
+		result, driveErr := runtime.DriveReady(&workspace, func(OutboundMessage) error { return nil }, settleTestApplied)
+		if driveErr != nil {
+			t.Fatalf("recovered DriveReady step %d: %v", step, driveErr)
+		}
+		if runtime.pipelined.nodeSubmission {
+			if _, err := persistence.Wait(); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if !result.Progressed() {
+			break
+		}
+	}
+	if incarnation, ready, err := group.ReadyCursor(); err != nil || incarnation != identity.NodeIncarnation || ready <= previousReady {
+		t.Fatalf("recovered runtime reused its Ready sequence: incarnation=%d ready=%d previous=%d err=%v", incarnation, ready, previousReady, err)
 	}
 }

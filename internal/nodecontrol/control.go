@@ -225,6 +225,19 @@ func (slot *IntentReaderSlot) ReadEnrollmentIntent(
 	return reader.ReadEnrollmentIntent(ctx, intentID)
 }
 
+func (slot *IntentReaderSlot) ReadEnrollmentRecovery(ctx context.Context, intentID [32]byte) (BootstrapReadReply, error) {
+	if slot == nil || ctx == nil {
+		return BootstrapReadReply{}, ErrNotCommitted
+	}
+	slot.mu.RLock()
+	reader, ok := slot.reader.(EnrollmentRecoveryReader)
+	slot.mu.RUnlock()
+	if !ok {
+		return BootstrapReadReply{}, ErrBootstrapReadUnavailable
+	}
+	return reader.ReadEnrollmentRecovery(ctx, intentID)
+}
+
 // Journal makes each state transition durable before returning nil. A missing
 // key must return ErrMissing; a compare-and-swap mismatch must return
 // ErrConflict. Implementations may return an outcome-unknown error, after
@@ -307,7 +320,7 @@ func (service *Service) Metrics() Metrics {
 	if service == nil {
 		return Metrics{}
 	}
-	return Metrics{Requests: service.requests.Load(), Completions: service.completions.Load(), Faults: service.faults.Load()}
+	return Metrics{Requests: service.requests.Load(), Completions: service.completions.Load(), Faults: service.faults.Load(), Inflight: len(service.slots)}
 }
 
 func NewService(options ServiceOptions) (*Service, error) {
@@ -354,7 +367,7 @@ func (service *Service) Serve(ctx context.Context, connection rafttransport.Peer
 		return ErrBound
 	}
 	defer release()
-	if deadline := service.readDeadline(); deadline.IsZero() {
+	if deadline := nodeInfoBoundedDeadline(ctx, service.readDeadline()); deadline.IsZero() {
 		return ErrControl
 	} else if err := connection.SetReadDeadline(deadline); err != nil {
 		return err
@@ -380,7 +393,7 @@ func (service *Service) Serve(ctx context.Context, connection rafttransport.Peer
 		}
 		return errors.Join(err, writeResponseError(connection, err))
 	}
-	if deadline := service.writeDeadline(); deadline.IsZero() {
+	if deadline := nodeInfoBoundedDeadline(ctx, service.writeDeadline()); deadline.IsZero() {
 		return ErrControl
 	} else if err := connection.SetWriteDeadline(deadline); err != nil {
 		return err
@@ -424,6 +437,9 @@ func (service *Service) executeHeld(ctx context.Context, request Request) (Recor
 	stripe := &service.stripes[binary.BigEndian.Uint64(request.IntentID[:8])%uint64(len(service.stripes))]
 	stripe.Lock()
 	defer stripe.Unlock()
+	if cause := context.Cause(ctx); cause != nil {
+		return Record{}, cause
+	}
 
 	intent, err := service.reader.ReadEnrollmentIntent(ctx, request.IntentID)
 	if err != nil {
@@ -500,6 +516,12 @@ func (service *Service) executePrepare(ctx context.Context, request Request, int
 		return Record{}, err
 	}
 	if !found {
+		// Once the directory has committed a proof, this phase can only
+		// recover the corresponding durable artifact. Creating a replacement
+		// here would turn an observation retry into a new preparation.
+		if intent.State != gateway.EnrollmentReserved {
+			return Record{}, ErrNotPrepared
+		}
 		proof, err = service.preparer.Prepare(ctx, intent, request.Payload)
 		if err != nil {
 			return Record{}, err
@@ -562,6 +584,16 @@ func (service *Service) executeAdopt(ctx context.Context, request Request, inten
 	if record.State == StateAdopted {
 		if record.AdoptionDigest != adoptDigest {
 			return Record{}, ErrConflict
+		}
+		// The journal survives process restart; the runtime receiver may not.
+		// Reconcile it under the still-committed grant before acknowledging
+		// an exact retry. Completed intents take the read-only path above.
+		if adopted, observeErr := service.adopter.ObserveAdopted(ctx, intent, record.Proof); observeErr != nil {
+			return Record{}, observeErr
+		} else if !adopted {
+			if err := service.adopter.Adopt(ctx, intent, record.Proof); err != nil {
+				return Record{}, err
+			}
 		}
 		return record, nil
 	}
@@ -643,7 +675,8 @@ func validateRequestIntent(request Request, intent gateway.GroupEnrollmentIntent
 }
 
 func proofMatchesIntent(proof gateway.PreparedReplicaProof, intent gateway.GroupEnrollmentIntent) bool {
-	if !proof.Valid() || proof.IntentID != intent.IntentID || proof.Group != intent.Group ||
+	if !proof.Valid() || intent.Proof != nil && proof != *intent.Proof ||
+		proof.IntentID != intent.IntentID || proof.Group != intent.Group ||
 		proof.Distribution != intent.Distribution || proof.Shard != intent.Shard ||
 		proof.ReplicaOrdinal != intent.ReplicaOrdinal || proof.AllocationGeneration != intent.AllocationGeneration ||
 		proof.CatalogGeneration != intent.CatalogGeneration || proof.TargetMember != intent.Target.Member ||
@@ -988,16 +1021,27 @@ func (journal *FileJournal) Read(ctx context.Context, intentID [32]byte) (Record
 }
 
 func (journal *FileJournal) readLocked(ctx context.Context, intentID [32]byte) (Record, error) {
-	file, err := os.Open(journal.path(intentID))
+	if journal.lock == nil {
+		return Record{}, errors.Join(ErrControl, os.ErrClosed)
+	}
+	path := journal.path(intentID)
+	linkInfo, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return Record{}, ErrMissing
 	}
 	if err != nil {
 		return Record{}, err
 	}
+	if !linkInfo.Mode().IsRegular() {
+		return Record{}, ErrJournalCorrupt
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return Record{}, err
+	}
 	defer file.Close()
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 || info.Size() > MaxJournalBytes {
+	if err != nil || !info.Mode().IsRegular() || !os.SameFile(linkInfo, info) || info.Size() <= 0 || info.Size() > MaxJournalBytes {
 		return Record{}, ErrJournalCorrupt
 	}
 	raw := make([]byte, int(info.Size()))
@@ -1194,7 +1238,7 @@ func (client *Client) Execute(ctx context.Context, target rafttransport.NodeID, 
 	}
 	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
 	defer stop()
-	if deadline := client.writeDeadline(); deadline.IsZero() {
+	if deadline := nodeInfoBoundedDeadline(ctx, client.writeDeadline()); deadline.IsZero() {
 		return Record{}, ErrControl
 	} else if err = connection.SetWriteDeadline(deadline); err != nil {
 		return Record{}, err
@@ -1202,7 +1246,7 @@ func (client *Client) Execute(ctx context.Context, target rafttransport.NodeID, 
 	if err = WriteRequest(connection, request); err != nil {
 		return Record{}, errors.Join(ErrOutcomeUnknown, err)
 	}
-	if deadline := client.readDeadline(); deadline.IsZero() {
+	if deadline := nodeInfoBoundedDeadline(ctx, client.readDeadline()); deadline.IsZero() {
 		return Record{}, ErrOutcomeUnknown
 	} else if err = connection.SetReadDeadline(deadline); err != nil {
 		return Record{}, errors.Join(ErrOutcomeUnknown, err)

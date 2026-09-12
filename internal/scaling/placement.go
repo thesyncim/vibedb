@@ -337,10 +337,14 @@ func Plan(input PlacementInput) (PlacementPlan, error) {
 	})
 	for _, intent := range activeIntents {
 		group := intent.Group
-		if intent.State == gateway.EnrollmentComplete {
-			continue
-		}
 		state.groups[group] = struct{}{}
+		// A durable enrollment occupies its source slot even when its target
+		// fence is stale or missing. Invalid target evidence prevents another
+		// receive there; it does not cancel the enrollment's source work.
+		sourceIndex, sourceFound := nodeByIdentity[nodeIdentity{node: intent.Source.Node, incarnation: intent.Source.NodeIncarnation}]
+		if sourceFound {
+			state.sourceMoves[sourceIndex]++
+		}
 		targetIndex, ok := nodeByIdentity[nodeIdentity{node: intent.Target.Node, incarnation: intent.Target.NodeIncarnation}]
 		if !ok {
 			code := BlockerMissingNode
@@ -356,13 +360,16 @@ func Plan(input PlacementInput) (PlacementPlan, error) {
 			continue
 		}
 		targetNode := nodes[targetIndex]
+		// A reserved copy has already consumed the one-copy empty-node
+		// bootstrap exception, including before physical receive counters rise.
+		freshScaleOutTargets[targetIndex] = false
 		invalidateTarget := func(blocker PlacementBlocker) {
 			addBlocker(&plan, blocker)
 			state.invalidTargets[targetIndex] = blocker
 		}
-		if targetNode.CatalogGeneration != generation || intent.CatalogGeneration != generation {
+		if targetNode.CatalogGeneration != generation || !inFlightMatchesSnapshot(intent, snapshot) {
 			invalidateTarget(PlacementBlocker{
-				Code: BlockerStaleGeneration, Detail: "in-flight enrollment is fenced to another catalog generation",
+				Code: BlockerStaleGeneration, Detail: "in-flight enrollment has no matching group fence in the current catalog cut",
 				Group: intent.Group, Distribution: intent.Distribution, Shard: intent.Shard,
 				ReplicaOrdinal: intent.ReplicaOrdinal, Node: targetNode.NodeID,
 				Revision: targetNode.Revision, TargetNode: targetNode.NodeID,
@@ -387,7 +394,6 @@ func Plan(input PlacementInput) (PlacementPlan, error) {
 			})
 			continue
 		}
-		sourceIndex, sourceFound := nodeByIdentity[nodeIdentity{node: intent.Source.Node, incarnation: intent.Source.NodeIncarnation}]
 		if !sourceFound {
 			code := BlockerMissingNode
 			if _, hasNode := nodeIDs[intent.Source.Node]; hasNode {
@@ -411,7 +417,6 @@ func Plan(input PlacementInput) (PlacementPlan, error) {
 			})
 			continue
 		}
-		state.sourceMoves[sourceIndex]++
 		state.targetMoves[targetIndex]++
 		state.groupTargets[groupNodeKey{group: intent.Group, node: targetIndex}] = struct{}{}
 		if ok, reason := reserveInFlight(&state, targetIndex, targetNode, demand, migrationBytes); !ok {
@@ -515,12 +520,12 @@ func Plan(input PlacementInput) (PlacementPlan, error) {
 	}
 	if len(plan.Moves) != 0 {
 		plan.State = PlacementMoves
-	} else if plan.ConsideredReplicas == 0 && len(plan.Blockers) == 0 ||
-		len(plan.Blockers) != 0 && onlyNoImprovementBlockers(plan.Blockers) {
+	} else if plan.State != PlacementBlocked {
+		// addBlocker records hard failures independently of the diagnostic
+		// output bound. A truncated prefix of no-improvement diagnostics must
+		// never turn incomplete work into a completed scaling operation.
 		plan.State = PlacementNoWork
 		plan.RemainingReplicas = 0
-	} else {
-		plan.State = PlacementBlocked
 	}
 	return plan, nil
 }
@@ -676,10 +681,10 @@ func prepareIntents(input []gateway.GroupEnrollmentIntent) (map[raftmember.Group
 		if !intent.Valid() {
 			return nil, fmt.Errorf("%w: invalid enrollment intent", ErrInvalidPlacementInput)
 		}
-		// Completed rows are durable history, not active reservations. A
-		// directory can retain more than one completed incarnation for a group;
+		// Terminal rows are durable history, not active reservations. A
+		// directory can retain more than one completed or cancelled row for a group;
 		// only the active state participates in admission and uniqueness.
-		if intent.State == gateway.EnrollmentComplete {
+		if intent.State == gateway.EnrollmentComplete || intent.State == gateway.EnrollmentCancelled {
 			continue
 		}
 		if _, duplicate := result[intent.Group]; duplicate {
@@ -688,6 +693,43 @@ func prepareIntents(input []gateway.GroupEnrollmentIntent) (map[raftmember.Group
 		result[intent.Group] = intent
 	}
 	return result, nil
+}
+
+func inFlightMatchesSnapshot(intent gateway.GroupEnrollmentIntent, snapshot *gateway.Snapshot) bool {
+	if intent.CatalogGeneration > snapshot.Generation() {
+		return false
+	}
+	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	route, ok := snapshot.ResolveReplicatedMembershipRoute(intent.Distribution, intent.Shard, replicas[:0])
+	if !ok || route.Serving.Group != intent.Group ||
+		route.Serving.AllocationGeneration != uint64(intent.AllocationGeneration) ||
+		route.Serving.Command != intent.ExpectedCommand || int(intent.ReplicaOrdinal) >= len(route.Serving.Replicas) {
+		return false
+	}
+	source := route.Serving.Replicas[intent.ReplicaOrdinal]
+	if source.Member != intent.Source.Member || source.Node != intent.Source.Node ||
+		source.NodeIncarnation != intent.Source.NodeIncarnation || source.StoreID != intent.Source.StoreID ||
+		source.Endpoint != string(intent.Source.Endpoint) || source.NativeEndpoint != string(intent.Source.NativeEndpoint) ||
+		source.ControlEndpoint != string(intent.Source.ControlEndpoint) {
+		return false
+	}
+	for _, replica := range route.Serving.Replicas {
+		if replica.Member == intent.Target.Member || replica.Node == intent.Target.Node || replica.StoreID == intent.Target.StoreID {
+			return false
+		}
+	}
+	if intent.State == gateway.EnrollmentEnrolled || intent.State == gateway.EnrollmentMoving {
+		// Enrollment itself advances the global head. Its certified descriptor
+		// remains usable through unrelated publications. Once the move changes
+		// this group, keep its target unavailable until terminal reconciliation
+		// rather than charge the old source demand to a changed serving roster.
+		return gateway.EnrollmentReceiptMatchesSnapshot(intent, snapshot)
+	}
+	if route.HasEnrolledTarget {
+		return false
+	}
+	roster, descriptor, ok := gateway.ReplicatedInitialMembershipDigests(snapshot, intent.Group)
+	return ok && roster == intent.ExpectedRosterDigest && descriptor == intent.ExpectedDescriptorDigest
 }
 
 func prepareDrain(
@@ -1014,15 +1056,17 @@ func chooseTarget(
 				}
 				continue
 			}
-			if policy.MaxProjectedPressurePPM != 0 && targetPressure > policy.MaxProjectedPressurePPM {
-				if firstHardBlocker.Code == "" {
-					firstHardBlocker = PlacementBlocker{Code: BlockerTargetPressure, Detail: "projected target pressure exceeds policy", Node: node.NodeID, Revision: node.Revision, TargetNode: node.NodeID}
-				}
-				if firstBlocker.Code == "" {
-					firstBlocker = PlacementBlocker{Code: BlockerTargetPressure, Detail: "projected target pressure exceeds policy", Node: node.NodeID, Revision: node.Revision, TargetNode: node.NodeID}
-				}
-				continue
+		}
+		// Drain and empty-node bootstrap bypass the improving-objective
+		// requirement, but every admission obeys the configured target bound.
+		if policy.MaxProjectedPressurePPM != 0 && targetPressure > policy.MaxProjectedPressurePPM {
+			if firstHardBlocker.Code == "" {
+				firstHardBlocker = PlacementBlocker{Code: BlockerTargetPressure, Detail: "projected target pressure exceeds policy", Node: node.NodeID, Revision: node.Revision, TargetNode: node.NodeID}
 			}
+			if firstBlocker.Code == "" {
+				firstBlocker = PlacementBlocker{Code: BlockerTargetPressure, Detail: "projected target pressure exceeds policy", Node: node.NodeID, Revision: node.Revision, TargetNode: node.NodeID}
+			}
+			continue
 		}
 		if best < 0 || objective < bestObjective || objective == bestObjective &&
 			(targetPressure < bestPressure || targetPressure == bestPressure &&
@@ -1283,11 +1327,11 @@ func addCandidateBlocker(plan *PlacementPlan, candidate placementCandidate, bloc
 }
 
 func addBlocker(plan *PlacementPlan, blocker PlacementBlocker) {
-	if len(plan.Blockers) >= gateway.MaxScalingBlockers {
-		return
-	}
 	if blocker.Code == "" {
 		return
+	}
+	if blocker.Code != BlockerNoImprovement {
+		plan.State = PlacementBlocked
 	}
 	for _, existing := range plan.Blockers {
 		if existing.Code == blocker.Code && existing.Group == blocker.Group &&
@@ -1296,19 +1340,20 @@ func addBlocker(plan *PlacementPlan, blocker PlacementBlocker) {
 			return
 		}
 	}
-	plan.Blockers = append(plan.Blockers, blocker)
-}
-
-func onlyNoImprovementBlockers(blockers []PlacementBlocker) bool {
-	if len(blockers) == 0 {
-		return false
-	}
-	for _, blocker := range blockers {
+	if len(plan.Blockers) >= gateway.MaxScalingBlockers {
 		if blocker.Code != BlockerNoImprovement {
-			return false
+			// Retain an actionable reason when harmless balance diagnostics
+			// have filled the bounded output before a hard failure is found.
+			for index := len(plan.Blockers) - 1; index >= 0; index-- {
+				if plan.Blockers[index].Code == BlockerNoImprovement {
+					plan.Blockers[index] = blocker
+					break
+				}
+			}
 		}
+		return
 	}
-	return true
+	plan.Blockers = append(plan.Blockers, blocker)
 }
 
 func compareGroups(left, right raftmember.GroupKey) int {

@@ -472,7 +472,8 @@ func (authority *ReplicatedCatalogAuthority) readAttested(
 	if err = publish(); err != nil {
 		return ReplicatedCatalogSeedReceipt{}, err
 	}
-	receipt.snapshot = authority.holder.Current()
+	// The holder can advance again while this read publishes. Keep the exact
+	// certified snapshot paired with this receipt's canonical bytes and witness.
 	return receipt, nil
 }
 
@@ -519,7 +520,26 @@ func (authority *ReplicatedCatalogAuthority) prepareReadCatalogCut(
 		}
 		if currentErr == nil && advanceErr == nil {
 			return certified, func() error {
-				return authority.holder.publishNewerChecked(certified)
+				publishErr := authority.holder.publishNewerChecked(certified)
+				if publishErr == nil {
+					return nil
+				}
+				// Two authenticated reads can certify the same next generation
+				// before either publishes. Accept the losing reader only when the
+				// winner installed its exact head; a generation match alone cannot
+				// certify a different catalog image or hide a transition failure.
+				installed := authority.holder.Current()
+				if !errors.Is(publishErr, ErrCatalogGenerationNotNewer) ||
+					installed == nil || installed.Generation() != certified.Generation() {
+					return publishErr
+				}
+				installedRaw, encodeErr := appendReplicatedCatalogDocument(
+					nil, installed, maxReplicatedCatalogBytes,
+				)
+				if encodeErr != nil || !bytes.Equal(installedRaw, raw) {
+					return errors.Join(publishErr, encodeErr, ErrReplicatedCatalogConflict)
+				}
+				return nil
 			}, nil
 		}
 		certified, publish, replacementErr := authority.prepareCertifiedReplicaReplacementRead(

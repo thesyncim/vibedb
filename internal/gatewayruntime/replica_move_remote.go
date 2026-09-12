@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -179,7 +180,13 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 			leader, leaderFound = candidate, true
 			break
 		}
-		observeErrors = errors.Join(observeErrors, observeErr)
+		if observeErr != nil {
+			observeErrors = errors.Join(observeErrors, fmt.Errorf("observe move member %d: %w", endpoint.Member, observeErr))
+		} else {
+			observeErrors = errors.Join(observeErrors, fmt.Errorf("observe move member %d: member=%d leader=%d term=%d replica-set=%d minimum=%d: %w",
+				endpoint.Member, candidate.Status.MemberID, candidate.Status.LeaderID, candidate.Status.Term,
+				candidate.Publication.ReplicaSetVersion, minimumReplicaSet, errGatewayReplicaControl))
+		}
 	}
 	if !leaderFound {
 		return rebalance.ReplicatedMoveCut{}, errors.Join(observeErrors, errGatewayReplicaControl)
@@ -408,7 +415,8 @@ func newGatewayReplicaRemoteClients(
 		return gatewayReplicaMoveControls{}, err
 	}
 	remote := &gatewayReplicaRemoteActions{observer: observations, actions: actions,
-		routes: options.Routes, native: options.Replicated}
+		routes: options.Routes, native: options.Replicated,
+		grants: options.Authority, grantInstaller: grantInstaller}
 	return gatewayReplicaMoveControls{
 		Observer: options.Observer, HealthObservations: observations, Capacity: capacity,
 		GrantInstaller: grantInstaller, Enroller: enroller, Routes: options.Routes,
@@ -938,11 +946,10 @@ func (client gatewayGrantedMembershipClient) ApplyMembership(
 //
 // AddLearner is the one exception: the enrolled target is, by construction,
 // not yet a member of the group when AddLearner is proposed, so it cannot
-// run a membership-grant-control listener or hold group authority to accept
-// an install. Requiring its confirmation before AddLearner can even be
-// proposed would be a permanent deadlock, so AddLearner's install is
-// voters-only; the target's own grant is installed or confirmed by the next
-// membership action once it has caught up and RegisterExecutionGroup has run.
+// hold group authority to accept an install. Requiring its confirmation before
+// AddLearner would deadlock empty-node provisioning, so AddLearner's install is
+// voters-only. The catch-up preflight delivers the target's grant once snapshot
+// bootstrap has registered its execution group, before waiting for replication.
 //
 // Every current voter's own registry independently requires the enrolling
 // target to already be a known member-to-node mapping before it will accept
@@ -1025,8 +1032,8 @@ func installGatewayMembershipGrant(
 	if route.HasEnrolledTarget && kind != raftservice.MembershipAddLearner {
 		// AddLearner cannot install on an in-process empty node: its registry
 		// has no group yet, so every attempt is node-not-found and crowds out
-		// snapshot bootstrap. Cold-bootstrapped targets receive the grant after
-		// RegisterExecutionGroup, on the next membership action.
+		// snapshot bootstrap. The catch-up preflight installs the target grant
+		// after RegisterExecutionGroup; later membership actions reconfirm it.
 		installErr := installer.InstallMembershipGrant(ctx, target.Node, grant)
 		if installErr == nil {
 			targetInstalled = true
@@ -1123,10 +1130,12 @@ type gatewayReplicaActionClient interface {
 // term immediately before constructing the ServingFence; catalog routing
 // metadata alone is deliberately insufficient authority.
 type gatewayReplicaRemoteActions struct {
-	observer gatewayReplicaObservationClient
-	actions  gatewayReplicaActionClient
-	routes   rebalanceexec.MoveRouteResolver
-	native   interface {
+	observer       gatewayReplicaObservationClient
+	actions        gatewayReplicaActionClient
+	routes         rebalanceexec.MoveRouteResolver
+	grants         membershipgrant.Source
+	grantInstaller gatewayMembershipGrantInstaller
+	native         interface {
 		ObserveMembershipLeader(context.Context, gateway.ReplicatedMembershipRoute) (shardservice.ReplicatedMemberState, error)
 	}
 }
@@ -1175,6 +1184,20 @@ func (remote gatewayReplicaRemoteActions) AwaitReplicaMove(
 		}
 		return nil
 	case rebalance.ActionAwaitCatchUp:
+		// A snapshot installs committed membership, but its fresh transport
+		// registry may not retain the grant authorizing historical ConfChange
+		// probes. Deliver that exact grant before waiting for replication;
+		// postponing it until promotion deadlocks a learner whose first append
+		// replays the already committed AddLearner entry. Reinstall is durable
+		// and idempotent, including after a controller or target restart.
+		// Once the target is published as serving, promotion has already
+		// delivered the grant. Final retirement can remove its catalog record;
+		// subsequent ordinary catch-up must not depend on recreating it.
+		if cut.Membership.HasEnrolledTarget {
+			if err := remote.installCatchUpGrant(ctx, plan, cut); err != nil {
+				return err
+			}
+		}
 		leader := gatewayReplicaMoveObservationCandidates(cut.Membership)
 		for _, endpoint := range leader {
 			observation, observeErr := remote.observer.Observe(ctx, endpoint.Node, request)
@@ -1183,12 +1206,35 @@ func (remote gatewayReplicaRemoteActions) AwaitReplicaMove(
 				observation.Progress.Match >= execution.PublicationApplied {
 				return nil
 			}
+			if observeErr == nil && observation.Status.MemberID == observation.Status.LeaderID {
+				err = errors.Join(err, fmt.Errorf("learner %d progress from leader %d: found=%t active=%t match=%d required=%d next=%d pending-snapshot=%d paused=%t: %w",
+					request.TargetMember, observation.Status.MemberID, observation.ProgressFound,
+					observation.Progress.RecentActive, observation.Progress.Match, execution.PublicationApplied,
+					observation.Progress.Next, observation.Progress.PendingSnapshot, observation.Progress.FlowPaused,
+					errGatewayReplicaControl))
+			}
 			err = errors.Join(err, observeErr)
 		}
 		return errors.Join(err, errGatewayReplicaControl)
 	default:
 		return errGatewayReplicaControl
 	}
+}
+
+func (remote gatewayReplicaRemoteActions) installCatchUpGrant(
+	ctx context.Context, plan *rebalance.Plan, cut rebalanceexec.MoveRoute,
+) error {
+	if remote.grants == nil || remote.grantInstaller == nil || plan == nil {
+		return errGatewayReplicaControl
+	}
+	grant, found, err := remote.grants.ReadMembershipGrant(ctx, plan.Group())
+	if err != nil || !found || !grant.Valid() || grant.Group != plan.Group() ||
+		grant.CatalogGeneration != plan.CatalogGeneration() ||
+		grant.SourceMember != plan.RetiringMember() || grant.TargetMember != plan.TargetMember() ||
+		cut.Target.Member != grant.TargetMember || [16]byte(cut.Target.Node) != grant.TargetNode {
+		return errors.Join(err, errGatewayReplicaControl)
+	}
+	return remote.grantInstaller.InstallMembershipGrant(ctx, cut.Target.Node, grant)
 }
 
 func (remote gatewayReplicaRemoteActions) ProposeReplicaMoveOwnership(

@@ -1,6 +1,7 @@
 package scaling
 
 import (
+	"fmt"
 	"math"
 	"reflect"
 	"sort"
@@ -19,6 +20,8 @@ const placementGeneration = 7
 
 type placementFixture struct {
 	snapshot    *gateway.Snapshot
+	config      distribution.ClusterConfig
+	endpoints   map[distribution.EndpointID]string
 	nodes       []gateway.NodeRecord
 	descriptors []gateway.ReplicatedShardDescriptor
 	demands     []ReplicaDemand
@@ -47,6 +50,7 @@ func newPlacementFixture(t *testing.T, shardCount int) placementFixture {
 		replicas := make([]gateway.ReplicatedReplicaDescriptor, gateway.ServingReplicaCount)
 		for ordinal := 0; ordinal < gateway.ServingReplicaCount; ordinal++ {
 			nodeNumber := ordinal + 1
+			storeNumber := 0x20 + shardIndex*gateway.ServingReplicaCount + ordinal
 			data := distribution.EndpointID("data-" + string(rune('0'+nodeNumber)))
 			native := distribution.EndpointID("native-" + string(rune('0'+nodeNumber)))
 			control := distribution.EndpointID("control-" + string(rune('0'+nodeNumber)))
@@ -57,7 +61,7 @@ func newPlacementFixture(t *testing.T, shardCount int) placementFixture {
 			replicas[ordinal] = gateway.ReplicatedReplicaDescriptor{
 				Member:          uint64(nodeNumber),
 				Node:            rafttransport.NodeID{byte(nodeNumber)},
-				StoreID:         [16]byte{byte(0x20 + shardIndex*gateway.ServingReplicaCount + ordinal)},
+				StoreID:         [16]byte{byte(storeNumber), byte(storeNumber >> 8)},
 				NodeIncarnation: 1,
 				Endpoint:        data,
 				NativeEndpoint:  native,
@@ -87,11 +91,12 @@ func newPlacementFixture(t *testing.T, shardCount int) placementFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	config := distribution.ClusterConfig{
+		Distributions: []distribution.DistributionSpec{{Name: "data", Arity: 1, MapperVersion: 1}},
+		Manifests:     []*distribution.Manifest{manifest},
+	}
 	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(
-		distribution.ClusterConfig{
-			Distributions: []distribution.DistributionSpec{{Name: "data", Arity: 1, MapperVersion: 1}},
-			Manifests:     []*distribution.Manifest{manifest},
-		}, endpoints, placementGeneration, nil, nil, descriptors,
+		config, endpoints, placementGeneration, nil, nil, descriptors,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -115,7 +120,7 @@ func newPlacementFixture(t *testing.T, shardCount int) placementFixture {
 			})
 		}
 	}
-	return placementFixture{snapshot: snapshot, nodes: nodes, descriptors: descriptors, demands: demands}
+	return placementFixture{snapshot: snapshot, config: config, endpoints: endpoints, nodes: nodes, descriptors: descriptors, demands: demands}
 }
 
 func placementNode(number int, lifecycle gateway.NodeLifecycle) gateway.NodeRecord {
@@ -185,7 +190,13 @@ func placementIdentity(replica gateway.ReplicatedReplicaDescriptor) gateway.Repl
 	}
 }
 
-func placementInFlightIntent(descriptor gateway.ReplicatedShardDescriptor, target gateway.NodeRecord) gateway.GroupEnrollmentIntent {
+func placementInFlightIntent(t *testing.T, fixture placementFixture, target gateway.NodeRecord) gateway.GroupEnrollmentIntent {
+	t.Helper()
+	descriptor := fixture.descriptors[0]
+	rosterDigest, descriptorDigest, ok := gateway.ReplicatedInitialMembershipDigests(fixture.snapshot, descriptor.Group)
+	if !ok {
+		t.Fatal("fixture group has no membership digests")
+	}
 	source := placementIdentity(descriptor.Replicas[0])
 	targetIdentity := gateway.ReplicaIdentity{
 		Member:          4,
@@ -197,23 +208,24 @@ func placementInFlightIntent(descriptor gateway.ReplicatedShardDescriptor, targe
 		ControlEndpoint: distribution.EndpointID("target-control"),
 	}
 	return gateway.GroupEnrollmentIntent{
-		IntentID:                 [32]byte{0xa1},
-		Group:                    descriptor.Group,
-		Distribution:             descriptor.Distribution,
-		Shard:                    descriptor.Shard,
-		AllocationGeneration:     descriptor.AllocationGeneration,
-		CatalogGeneration:        placementGeneration,
-		ReplicaOrdinal:           0,
-		Source:                   source,
-		SnapshotSourceMember:     source.Member,
-		Target:                   targetIdentity,
-		ExpectedRosterDigest:     replication.Digest{0x71},
-		ExpectedDescriptorDigest: replication.Digest{0x72},
-		ExpectedManifestDigest:   replication.Digest{0x73},
-		ExpectedCommand:          descriptor.Command,
-		TargetNodeRevision:       target.Revision,
-		State:                    gateway.EnrollmentReserved,
-		Revision:                 1,
+		IntentID:                  [32]byte{0xa1},
+		Group:                     descriptor.Group,
+		Distribution:              descriptor.Distribution,
+		Shard:                     descriptor.Shard,
+		AllocationGeneration:      descriptor.AllocationGeneration,
+		CatalogGeneration:         placementGeneration,
+		ExpectedCatalogHeadDigest: replication.Digest{0xc1},
+		ReplicaOrdinal:            0,
+		Source:                    source,
+		SnapshotSourceMember:      source.Member,
+		Target:                    targetIdentity,
+		ExpectedRosterDigest:      rosterDigest,
+		ExpectedDescriptorDigest:  descriptorDigest,
+		ExpectedManifestDigest:    replication.Digest{0x73},
+		ExpectedCommand:           descriptor.Command,
+		TargetNodeRevision:        target.Revision,
+		State:                     gateway.EnrollmentReserved,
+		Revision:                  1,
 	}
 }
 
@@ -436,7 +448,7 @@ func TestPlanReservesMeasuredInFlightTargetBeforeOtherGroups(t *testing.T) {
 		}
 	}
 	request := placementRequest(gateway.ScalingScaleOut, 4)
-	intent := placementInFlightIntent(fixture.descriptors[0], fixture.nodes[3])
+	intent := placementInFlightIntent(t, fixture, fixture.nodes[3])
 	plan, err := Plan(PlacementInput{
 		Snapshot: fixture.snapshot, Nodes: fixture.nodes, Request: request,
 		Demands: fixture.demands, InFlight: []gateway.GroupEnrollmentIntent{intent},
@@ -446,5 +458,241 @@ func TestPlanReservesMeasuredInFlightTargetBeforeOtherGroups(t *testing.T) {
 	}
 	if plan.State != PlacementBlocked || len(plan.Moves) != 0 || !placementBlocker(plan, BlockerTargetCapacity) {
 		t.Fatalf("in-flight target reservation was ignored: %+v", plan)
+	}
+}
+
+func TestPlanCancelledEnrollmentDoesNotReserveGroupOrCapacity(t *testing.T) {
+	fixture := newPlacementFixture(t, 1)
+	request := placementRequest(gateway.ScalingScaleOut, 4)
+	intent := placementInFlightIntent(t, fixture, fixture.nodes[3])
+	intent.State = gateway.EnrollmentCancelled
+	// A cancelled reservation may retain an obsolete target fence. It must
+	// neither invalidate that target nor make the group unavailable.
+	intent.TargetNodeRevision++
+	plan, err := Plan(PlacementInput{
+		Snapshot: fixture.snapshot, Nodes: fixture.nodes, Request: request,
+		Demands: fixture.demands, InFlight: []gateway.GroupEnrollmentIntent{intent},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.State != PlacementMoves || len(plan.Moves) != 1 || len(plan.Blockers) != 0 {
+		t.Fatalf("cancelled enrollment affected placement: %+v", plan)
+	}
+}
+
+func TestPlanInFlightScaleOutTargetAlreadyUsedBootstrapException(t *testing.T) {
+	fixture := newPlacementFixture(t, 2)
+	request := placementRequest(gateway.ScalingScaleOut, 4)
+	intent := placementInFlightIntent(t, fixture, fixture.nodes[3])
+	plan, err := Plan(PlacementInput{
+		Snapshot: fixture.snapshot, Nodes: fixture.nodes, Request: request,
+		Demands: fixture.demands, InFlight: []gateway.GroupEnrollmentIntent{intent},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Moves) != 0 || !placementBlocker(plan, BlockerNoImprovement) {
+		t.Fatalf("in-flight target received another non-improving bootstrap copy: %+v", plan)
+	}
+}
+
+func TestPlanDiagnosticBoundCannotHideIncompleteWork(t *testing.T) {
+	fixture := newPlacementFixture(t, gateway.MaxScalingBlockers/gateway.ServingReplicaCount+2)
+	for index := range fixture.nodes {
+		fixture.nodes[index].Capacity[autosplit.ResourceLiveBytes] = 100_000
+		fixture.nodes[index].Used[autosplit.ResourceLiveBytes] = 10_000
+	}
+	// All measured candidates are balanced and fill the bounded diagnostic
+	// output before the final replica's missing evidence is encountered.
+	fixture.demands = fixture.demands[:len(fixture.demands)-1]
+	request := placementRequest(gateway.ScalingRebalance, 4)
+	plan, err := Plan(PlacementInput{
+		Snapshot: fixture.snapshot, Nodes: fixture.nodes, Request: request, Demands: fixture.demands,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.State != PlacementBlocked || plan.RemainingReplicas == 0 ||
+		len(plan.Blockers) != gateway.MaxScalingBlockers || !placementBlocker(plan, BlockerCapacityEvidence) {
+		t.Fatalf("bounded diagnostics hid incomplete work: state=%v remaining=%d blockers=%d capacityBlocker=%v",
+			plan.State, plan.RemainingReplicas, len(plan.Blockers), placementBlocker(plan, BlockerCapacityEvidence))
+	}
+}
+
+func TestPlanInvalidInFlightTargetStillConsumesSourceConcurrency(t *testing.T) {
+	for _, invalidTarget := range []string{"revision", "generation", "missing"} {
+		t.Run(invalidTarget, func(t *testing.T) {
+			fixture := newPlacementFixture(t, 2)
+			fixture.nodes[0].Lifecycle = gateway.NodeDraining
+			fixture.nodes[0].Used[autosplit.ResourceLiveBytes] = 200
+			request := placementRequest(gateway.ScalingScaleIn, 5)
+			request.Drain = gateway.NodeReference{NodeID: fixture.nodes[0].NodeID, Incarnation: 1}
+			intent := placementInFlightIntent(t, fixture, fixture.nodes[3])
+			switch invalidTarget {
+			case "revision":
+				intent.TargetNodeRevision++
+			case "generation":
+				intent.CatalogGeneration++
+			case "missing":
+				intent.Target.Node = rafttransport.NodeID{6}
+			}
+			policy := DefaultPlacementPolicy()
+			policy.MaxMovesPerSource = 1
+			plan, err := Plan(PlacementInput{
+				Snapshot: fixture.snapshot, Nodes: fixture.nodes, Request: request,
+				Demands: fixture.demands, InFlight: []gateway.GroupEnrollmentIntent{intent}, Policy: policy,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.State != PlacementBlocked || len(plan.Moves) != 0 || !placementBlocker(plan, BlockerConcurrency) {
+				t.Fatalf("invalid target erased active source concurrency: %+v", plan)
+			}
+		})
+	}
+}
+
+func TestPlanTargetPressurePolicyAppliesToEveryScalingMode(t *testing.T) {
+	for _, kind := range []gateway.ScalingKind{
+		gateway.ScalingScaleOut, gateway.ScalingScaleIn, gateway.ScalingDecommission, gateway.ScalingRebalance,
+	} {
+		t.Run(fmt.Sprintf("kind_%d", kind), func(t *testing.T) {
+			fixture := newPlacementFixture(t, 1)
+			for index := range fixture.demands {
+				fixture.demands[index].Demand = placementDemand(900)
+				fixture.demands[index].MigrationBytes = 900
+			}
+			for index := 0; index < gateway.ServingReplicaCount; index++ {
+				fixture.nodes[index].Used[autosplit.ResourceLiveBytes] = 1_000
+			}
+			request := placementRequest(kind, 4)
+			if kind == gateway.ScalingScaleIn || kind == gateway.ScalingDecommission {
+				fixture.nodes[0].Lifecycle = gateway.NodeDraining
+				request.Drain = gateway.NodeReference{NodeID: fixture.nodes[0].NodeID, Incarnation: 1}
+			}
+			input := PlacementInput{Snapshot: fixture.snapshot, Nodes: fixture.nodes, Request: request,
+				Demands: fixture.demands, Policy: DefaultPlacementPolicy()}
+			plan, err := Plan(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.State != PlacementBlocked || len(plan.Moves) != 0 || !placementBlocker(plan, BlockerTargetPressure) {
+				t.Fatalf("target pressure policy was bypassed: %+v", plan)
+			}
+			input.Policy.MaxProjectedPressurePPM = 0
+			plan, err = Plan(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.State != PlacementMoves || len(plan.Moves) != 1 {
+				t.Fatalf("explicitly unconstrained pressure was blocked: %+v", plan)
+			}
+		})
+	}
+}
+
+func placementPreparedProof(intent gateway.GroupEnrollmentIntent) *gateway.PreparedReplicaProof {
+	proof := &gateway.PreparedReplicaProof{
+		IntentID: intent.IntentID, Group: intent.Group, Distribution: intent.Distribution,
+		Shard: intent.Shard, ReplicaOrdinal: intent.ReplicaOrdinal,
+		TargetMember: intent.Target.Member, TargetNode: intent.Target.Node,
+		TargetNodeIncarnation: intent.Target.NodeIncarnation, TargetStoreID: intent.Target.StoreID,
+		TargetEndpoint: intent.Target.Endpoint, TargetNativeEndpoint: intent.Target.NativeEndpoint,
+		TargetControlEndpoint: intent.Target.ControlEndpoint,
+		ExpectedRosterDigest:  intent.ExpectedRosterDigest, ExpectedDescriptorDigest: intent.ExpectedDescriptorDigest,
+		ExpectedManifestDigest: intent.ExpectedManifestDigest, RelationManifestDigest: intent.ExpectedCommand.RelationManifestDigest,
+		DescriptorDigest: intent.ExpectedDescriptorDigest, ManifestDigest: intent.ExpectedManifestDigest,
+		Command: intent.ExpectedCommand, AllocationGeneration: intent.AllocationGeneration,
+		CatalogGeneration: intent.CatalogGeneration, CertifiedDirectoryRevision: intent.TargetNodeRevision,
+	}
+	proof.EnrollmentDigest = proof.ComputedEnrollmentDigest()
+	return proof
+}
+
+func placementAdvanceCatalog(t *testing.T, fixture *placementFixture, generation uint64) {
+	t.Helper()
+	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(
+		fixture.config, fixture.endpoints, generation, nil, nil, fixture.descriptors,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.snapshot = snapshot
+	for index := range fixture.nodes {
+		fixture.nodes[index].CatalogGeneration = generation
+	}
+	for index := range fixture.demands {
+		fixture.demands[index].CatalogGeneration = generation
+	}
+}
+
+func TestPlanInFlightGroupFenceSurvivesUnrelatedCatalogHeads(t *testing.T) {
+	for _, state := range []gateway.EnrollmentState{
+		gateway.EnrollmentReserved, gateway.EnrollmentPrepared, gateway.EnrollmentEnrolled, gateway.EnrollmentMoving,
+	} {
+		t.Run(fmt.Sprintf("state_%d", state), func(t *testing.T) {
+			fixture := newPlacementFixture(t, 2)
+			intent := placementInFlightIntent(t, fixture, fixture.nodes[3])
+			intent.State = state
+			if state >= gateway.EnrollmentPrepared {
+				intent.Proof = placementPreparedProof(intent)
+			}
+			if state >= gateway.EnrollmentEnrolled {
+				fixture.descriptors[0].EnrolledTarget = &gateway.ReplicatedReplicaDescriptor{
+					Member: intent.Target.Member, Node: intent.Target.Node, StoreID: intent.Target.StoreID,
+					NodeIncarnation: intent.Target.NodeIncarnation, Endpoint: intent.Target.Endpoint,
+					NativeEndpoint: intent.Target.NativeEndpoint, ControlEndpoint: intent.Target.ControlEndpoint,
+				}
+				fixture.endpoints[intent.Target.Endpoint] = fixture.nodes[3].DataAddress
+				fixture.endpoints[intent.Target.NativeEndpoint] = fixture.nodes[3].NativeAddress
+				fixture.endpoints[intent.Target.ControlEndpoint] = fixture.nodes[3].ControlAddress
+				placementAdvanceCatalog(t, &fixture, placementGeneration+1)
+				_, descriptorDigest, ok := gateway.ReplicatedInitialMembershipDigests(fixture.snapshot, intent.Group)
+				if !ok {
+					t.Fatal("enrolled group has no descriptor digest")
+				}
+				intent.Receipt = &gateway.CertifiedEnrollmentReceipt{
+					IntentID: intent.IntentID, IntentDigest: intent.Digest(),
+					BaseCatalogGeneration: intent.CatalogGeneration, BaseCatalogHeadDigest: intent.ExpectedCatalogHeadDigest,
+					BaseDescriptorDigest:             intent.ExpectedDescriptorDigest,
+					PublicationPredecessorGeneration: intent.CatalogGeneration,
+					PublicationPredecessorHeadDigest: intent.ExpectedCatalogHeadDigest,
+					EnrolledCatalogGeneration:        fixture.snapshot.Generation(), EnrolledCatalogHeadDigest: replication.Digest{0xc2},
+					EnrolledDescriptorDigest: descriptorDigest, Target: intent.Target,
+					InitialReplicaSetVersion: intent.ExpectedCommand.ReplicaSetVersion,
+					GrantDigest:              replication.Digest{0xf1}, TransitionID: gateway.EnrollmentTransitionDigest(intent),
+				}
+			}
+			if state == gateway.EnrollmentMoving {
+				intent.MoveOperationID = [32]byte{0xf2}
+			}
+			placementAdvanceCatalog(t, &fixture, placementGeneration+2)
+			input := PlacementInput{Snapshot: fixture.snapshot, Nodes: fixture.nodes,
+				Request: placementRequest(gateway.ScalingScaleOut, 5), Demands: fixture.demands,
+				InFlight: []gateway.GroupEnrollmentIntent{intent}}
+			plan, err := Plan(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if placementBlocker(plan, BlockerStaleGeneration) || len(plan.Moves) != 1 {
+				t.Fatalf("unchanged in-flight group was invalidated by an unrelated catalog head: %+v", plan)
+			}
+			if !inFlightMatchesSnapshot(intent, fixture.snapshot) {
+				t.Fatal("matching in-flight fence was rejected")
+			}
+			// An immutable reservation can remain shape-valid even when its
+			// selected source ordinal changes. Its catalog witness cannot.
+			wrongSource := intent
+			wrongSource.ReplicaOrdinal = 1
+			if inFlightMatchesSnapshot(wrongSource, fixture.snapshot) {
+				t.Fatal("in-flight fence accepted a substituted source ordinal")
+			}
+			fixture.descriptors[0].Command.SchemaGeneration++
+			placementAdvanceCatalog(t, &fixture, placementGeneration+3)
+			if inFlightMatchesSnapshot(intent, fixture.snapshot) {
+				t.Fatal("in-flight fence accepted a changed group command")
+			}
+		})
 	}
 }

@@ -493,6 +493,7 @@ type Runtime struct {
 	proposalBatchEntries     int
 	proposalBatchBytes       int64
 	promotionScan            durablePromotionScan
+	configurationReplay      *runtimeConfigurationReplay
 	authority                *runtimeAuthority
 	leaderTransfer           *leaderTransferState
 	leaderTransferSequence   uint64
@@ -1945,6 +1946,9 @@ func (runtime *Runtime) Close() error {
 		return ErrResultSettlementPending
 	}
 	runtime.stopping = true
+	if runtime.configurationReplay != nil {
+		runtime.configurationReplay.closed.Store(true)
+	}
 	var checkpointErr error
 	if runtime.pipelined != nil {
 		runtime.pipelined.stopAppendWorker()

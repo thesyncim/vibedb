@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
@@ -107,6 +108,27 @@ func (runtime *AuthenticatedExecutionPeerRuntime) RegisterExecutionGroup(
 	roster []rafttransport.Member,
 	group ExecutionGroup,
 ) error {
+	return runtime.registerExecutionGroup(roster, group, membershipgrant.Grant{})
+}
+
+// RegisterExecutionGroupWithGrant atomically restores one retained transition
+// grant with its execution group, before the owning lane can process Ready.
+func (runtime *AuthenticatedExecutionPeerRuntime) RegisterExecutionGroupWithGrant(
+	roster []rafttransport.Member,
+	group ExecutionGroup,
+	grant membershipgrant.Grant,
+) error {
+	if !grant.Valid() {
+		return ErrInvalidOwner
+	}
+	return runtime.registerExecutionGroup(roster, group, grant)
+}
+
+func (runtime *AuthenticatedExecutionPeerRuntime) registerExecutionGroup(
+	roster []rafttransport.Member,
+	group ExecutionGroup,
+	grant membershipgrant.Grant,
+) error {
 	if runtime == nil || runtime.registry == nil || runtime.owners == nil ||
 		!validExecutionGroup(group) || len(roster) == 0 {
 		return ErrInvalidOwner
@@ -129,6 +151,9 @@ func (runtime *AuthenticatedExecutionPeerRuntime) RegisterExecutionGroup(
 		return ErrInvalidOwner
 	}
 	return runtime.owners.installGroup(group, func(install func(func()) error) error {
+		if grant != (membershipgrant.Grant{}) {
+			return runtime.registry.InstallGroupWithTransitionGrant(roster, grant, install)
+		}
 		return runtime.registry.InstallGroup(roster, install)
 	})
 }

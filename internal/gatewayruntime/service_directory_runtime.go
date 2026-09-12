@@ -192,6 +192,9 @@ func runtimeServiceDirectoryCut(
 		if binding.Roles&serviceauthz.ServiceRoleGateway != 0 {
 			prior.GatewayIncarnation, prior.SessionID = binding.GatewayIncarnation, binding.SessionID
 			prior.SessionRevision, prior.ParticipantDigest = binding.SessionRevision, binding.ParticipantDigest
+			// The gateway's exact catalog grants belong to the same session
+			// even when its TLS principal also owns the physical storage role.
+			prior.InternalFences = binding.InternalFences
 		}
 	}
 	bindings = merged

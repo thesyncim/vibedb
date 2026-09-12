@@ -194,3 +194,85 @@ func (opener *nodeInfoTestOpener) OpenShardControl(_ context.Context, node raftt
 	go func() { _ = opener.service.Serve(context.Background(), server) }()
 	return client, nil
 }
+
+func TestNodeInfoClientBindsReportedKeyAndStoreToAuthenticatedPeer(t *testing.T) {
+	domain := rafttransport.TrustDomain{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}}
+	request := NodeInfoRequest{Nonce: [nodeInfoNonceBytes]byte{1}, Operation: OpNodeInfo, NodeID: rafttransport.NodeID{1}, Incarnation: 7}
+	for _, field := range []string{"SPKI", "cluster", "cluster incarnation"} {
+		t.Run(field, func(t *testing.T) {
+			opener := preparationSourceOpenerFunc(func(context.Context, rafttransport.NodeID) (rafttransport.PeerConnection, error) {
+				left, right := net.Pipe()
+				t.Cleanup(func() { _ = right.Close() })
+				go func() {
+					defer right.Close()
+					got, err := ReadNodeInfoRequest(right)
+					if err != nil {
+						return
+					}
+					observation := testNodeInfoObservation(got)
+					switch field {
+					case "SPKI":
+						observation.SPKIPinDigest[0]++
+					case "cluster":
+						observation.Store.ClusterID[0]++
+					case "cluster incarnation":
+						observation.Store.ClusterIncarnation[0]++
+					}
+					observation.ObservationDigest = observation.computedDigest()
+					_ = WriteNodeInfoReply(right, observation)
+				}()
+				return &nodeInfoTestConn{Conn: left, identity: rafttransport.PeerIdentity{TrustDomain: domain, Node: request.NodeID}, class: rafttransport.TrafficShardControl}, nil
+			})
+			deadline := func() time.Time { return time.Now().Add(time.Second) }
+			client, err := NewNodeInfoClient(NodeInfoClientOptions{Opener: opener, TrustDomain: domain, ReadDeadline: deadline, WriteDeadline: deadline})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Observe(t.Context(), request.NodeID, request); !errors.Is(err, ErrNodeInfoConflict) {
+				t.Fatalf("substituted %s accepted: %v", field, err)
+			}
+		})
+	}
+}
+
+func TestNodeInfoClientCancellationInterruptsBlockedRead(t *testing.T) {
+	domain := rafttransport.TrustDomain{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}}
+	request := NodeInfoRequest{Nonce: [nodeInfoNonceBytes]byte{1}, Operation: OpNodeInfo, NodeID: rafttransport.NodeID{1}, Incarnation: 7}
+	read := make(chan struct{})
+	opener := preparationSourceOpenerFunc(func(context.Context, rafttransport.NodeID) (rafttransport.PeerConnection, error) {
+		left, right := net.Pipe()
+		t.Cleanup(func() { _ = right.Close() })
+		go func() {
+			if _, err := ReadNodeInfoRequest(right); err == nil {
+				close(read)
+			}
+		}()
+		return &nodeInfoTestConn{Conn: left, identity: rafttransport.PeerIdentity{TrustDomain: domain, Node: request.NodeID}, class: rafttransport.TrafficShardControl}, nil
+	})
+	deadline := func() time.Time { return time.Now().Add(time.Minute) }
+	client, err := NewNodeInfoClient(NodeInfoClientOptions{Opener: opener, TrustDomain: domain, ReadDeadline: deadline, WriteDeadline: deadline})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Observe(ctx, request.NodeID, request)
+		done <- err
+	}()
+	select {
+	case <-read:
+	case <-time.After(time.Second):
+		t.Fatal("node-info request did not reach server")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled node-info read succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("node-info read did not stop on cancellation")
+	}
+}

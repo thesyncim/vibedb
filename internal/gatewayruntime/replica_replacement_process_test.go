@@ -90,8 +90,6 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 			t.Errorf("write replica replacement evidence: %v", err)
 		}
 	}()
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
-	defer cancel()
 	root := t.TempDir()
 	topology, err := rf3testfixture.ReserveProcessCluster()
 	if err != nil {
@@ -303,8 +301,12 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	}
 	shardBinary := filepath.Join(root, "vibedb-shard")
 	gatewayBinary := filepath.Join(root, "vibedb-gateway")
-	replicaProcessBuild(t, ctx, shardBinary, "./cmd/vibedb-shard")
-	replicaProcessBuild(t, ctx, gatewayBinary, "./cmd/vibedb-gateway")
+	replicaProcessBuild(t, t.Context(), shardBinary, "./cmd/vibedb-shard")
+	replicaProcessBuild(t, t.Context(), gatewayBinary, "./cmd/vibedb-gateway")
+	// Keep build-cache and host compilation latency outside the bounded
+	// process recovery window. The enclosing go test timeout bounds setup.
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
 	if err = errors.Join(topology.ReleaseListeners(), gatewayReservation.Close()); err != nil {
 		t.Fatal(err)
 	}
@@ -1105,6 +1107,25 @@ func replicaProcessCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS
 	authenticated, err := serviceauthz.WithAuthority(t.Context(), identity)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Listener readiness precedes the first Raft election. Observe a serving
+	// leader before opening the durable session so a cold start cannot turn a
+	// harmless election window into a failed qualification.
+	ready, cancelReady := context.WithTimeout(authenticated, 10*time.Second)
+	defer cancelReady()
+	for {
+		_, err = executor.ObserveMembershipLeader(ready, gateway.ReplicatedMembershipRoute{Serving: route})
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, gateway.ErrReplicatedLeader) {
+			t.Fatalf("initial catalog leader: %v", err)
+		}
+		select {
+		case <-ready.Done():
+			t.Fatalf("initial catalog election: %v", errors.Join(context.Cause(ready), err))
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 	if _, err = session.Open(authenticated, time.Now().Add(time.Hour).UnixNano()); err != nil {
 		t.Fatal(err)

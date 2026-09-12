@@ -51,6 +51,130 @@ func dynamicPeerIntent(
 
 func allowEnrollment(EnrollmentIntent) error { return nil }
 
+func TestInstallGroupRestoresExactGrantInOnePublication(t *testing.T) {
+	group := testGroup(208)
+	local := testNode(4)
+	grant := replacementTestGrant(group, 1, 4, local, [3]uint64{1, 2, 3})
+	for _, scenario := range []string{"restore", "wrong target", "wrong roster", "wrong authority"} {
+		t.Run(scenario, func(t *testing.T) {
+			registry, err := NewEmptyRegistry(local, TrustDomain{ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation},
+				Limits{MaxGroups: 1, MaxMembers: 4, MaxPeers: 4})
+			if err != nil {
+				t.Fatal(err)
+			}
+			members := []Member{{Group: group, ReplicaSetVersion: 2, MemberID: 4, Node: local, Role: MemberLearner}}
+			for id := byte(1); id <= 3; id++ {
+				peer := testNode(id)
+				if err := registry.EnrollPeer(dynamicPeerIntent(registry, peer, id, raftmember.GroupKey{}, 0, [32]byte{}), EnrollmentVerifierFunc(allowEnrollment)); err != nil {
+					t.Fatal(err)
+				}
+				members = append(members, Member{Group: group, ReplicaSetVersion: 2, MemberID: uint64(id), Node: peer, Role: MemberVoter})
+			}
+			candidate := grant
+			switch scenario {
+			case "wrong target":
+				candidate.TargetNode[0]++
+			case "wrong roster":
+				candidate.InitialRosterDigest[0]++
+			case "wrong authority":
+				members[1].Role = MemberLearner
+			}
+			called := false
+			err = registry.InstallGroupWithTransitionGrant(members, candidate, func(publish func()) error {
+				called = true
+				if _, _, err := registry.CurrentTransitionGrant(group); !errors.Is(err, ErrGroupNotFound) {
+					t.Fatalf("unpublished grant visible: %v", err)
+				}
+				publish()
+				if got, found, err := registry.CurrentTransitionGrant(group); err != nil || !found || got != grant {
+					t.Fatalf("group published without exact grant: found=%t err=%v", found, err)
+				}
+				return nil
+			})
+			if scenario == "restore" {
+				if err != nil || !called {
+					t.Fatalf("atomic restore failed: called=%t err=%v", called, err)
+				}
+			} else if !errors.Is(err, ErrReplicaSet) || called {
+				t.Fatalf("invalid grant reached publication: called=%t err=%v", called, err)
+			}
+		})
+	}
+}
+
+func TestEnrollExistingMemberCertifiesBothRegistryStoragePaths(t *testing.T) {
+	for _, dynamicGroup := range []bool{false, true} {
+		name := "bootstrap"
+		if dynamicGroup {
+			name = "installed"
+		}
+		t.Run(name, func(t *testing.T) {
+			group := testGroup(207)
+			domain := TrustDomain{ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation}
+			local, remote := testNode(1), testNode(2)
+			members := []Member{
+				{Group: group, ReplicaSetVersion: 1, MemberID: 1, Node: local, Role: MemberVoter},
+				{Group: group, ReplicaSetVersion: 1, MemberID: 2, Node: remote, Role: MemberEnrolled},
+			}
+			limits := Limits{MaxGroups: 1, MaxMembers: 2, MaxPeers: 2}
+			var registry *StaticRegistry
+			var err error
+			if dynamicGroup {
+				registry, err = NewEmptyRegistry(local, domain, limits)
+				if err != nil {
+					t.Fatal(err)
+				}
+				peerIntent := dynamicPeerIntent(registry, remote, 1, raftmember.GroupKey{}, 0, [sha256.Size]byte{})
+				if err := registry.EnrollPeer(peerIntent, EnrollmentVerifierFunc(allowEnrollment)); err != nil {
+					t.Fatal(err)
+				}
+				err = registry.InstallGroup(members, func(publish func()) error { publish(); return nil })
+			} else {
+				registry, err = NewStaticRegistry(local, members, limits)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			roster, _ := registry.RosterDigest(group)
+			intent := dynamicPeerIntent(registry, remote, 2, group, 2, roster)
+			beforeRevision := registry.PeerDirectoryRevision()
+			if err := registry.EnrollMember(intent, EnrollmentVerifierFunc(allowEnrollment)); err != nil {
+				t.Fatalf("certify existing member: %v", err)
+			}
+			if registry.PeerDirectoryRevision() != beforeRevision+1 {
+				t.Fatal("certification did not advance directory revision")
+			}
+			if got, want := registry.PeerDirectoryDigest(), physicalPeerDigest(registry.mergedPhysical(registry.dynamic.Load())); got != want {
+				t.Fatalf("directory digest does not describe the certified records: got %x want %x", got, want)
+			}
+			if got := registry.effectiveMemberCount(registry.dynamic.Load()); got != 2 {
+				t.Fatalf("certification changed member count: %d", got)
+			}
+			if err := registry.EnrollMember(intent, EnrollmentVerifierFunc(allowEnrollment)); err != nil {
+				t.Fatalf("certification replay: %v", err)
+			}
+			if registry.PeerDirectoryRevision() != beforeRevision+1 {
+				t.Fatal("idempotent certification advanced directory revision")
+			}
+			if err := registry.RetireMember(MemberRetirementProof{
+				Group: group, MemberID: 2, Node: remote, AuthorityVersion: 1,
+				RosterDigest: roster, DirectoryRevision: registry.PeerDirectoryRevision(),
+			}); err != nil {
+				t.Fatalf("retire certified member: %v", err)
+			}
+			if _, err := registry.Node(group, 2); !errors.Is(err, ErrMemberNotFound) {
+				t.Fatalf("retired mapping remains visible: %v", err)
+			}
+			if got := registry.effectiveMemberCount(registry.dynamic.Load()); got != 1 {
+				t.Fatalf("retirement member count: got %d want 1", got)
+			}
+			if err := registry.EnrollMember(intent, EnrollmentVerifierFunc(allowEnrollment)); err == nil {
+				t.Fatal("obsolete enrollment replay restored a retired mapping")
+			}
+		})
+	}
+}
+
 func TestPhysicalPeerBindingUsesExactLeafKeyDigest(t *testing.T) {
 	group := testGroup(205)
 	domain := TrustDomain{ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation}
@@ -393,6 +517,10 @@ func TestEmptyTransportEnrollsAndRetiresBoundedPeer(t *testing.T) {
 	transportTestEventually(t, transport.Running)
 	remote := testNode(2)
 	intent := dynamicPeerIntent(registry, remote, 2, raftmember.GroupKey{}, 0, [sha256.Size]byte{})
+	// Public enrollment accepts the compatibility spelling and default state;
+	// the queue commit must receive the same normalized record as the registry.
+	intent.Peer.Node, intent.Peer.NodeID = intent.Peer.NodeID, NodeID{}
+	intent.Peer.State, intent.Peer.TrustDomain = 0, TrustDomain{}
 	if err := transport.EnrollPeer(intent, EnrollmentVerifierFunc(allowEnrollment)); err != nil {
 		t.Fatalf("transport EnrollPeer: %v", err)
 	}

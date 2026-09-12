@@ -177,32 +177,15 @@ func OpenPlanIntent(
 	catalog *gateway.Snapshot,
 	publication raftmodel.Publication,
 ) (*Plan, error) {
-	if len(raw) == 0 || len(raw) > MaxPlanIntentBytes || catalog == nil {
+	if catalog == nil {
 		return nil, ErrPlanIntent
 	}
-	var intent persistedPlanIntent
-	if err := vibejson.Unmarshal(raw, &intent); err != nil {
-		return nil, errors.Join(err, ErrPlanIntent)
-	}
-	canonical, err := vibejson.Marshal(&intent)
+	intent, request, err := openPersistedPlanIntent(raw)
 	if err != nil {
-		return nil, errors.Join(err, ErrPlanIntent)
+		return nil, err
 	}
-	canonical, err = vibejson.AppendCanonicalize(nil, canonical)
-	request := openMoveRequest(intent.Request)
-	if err != nil || !bytes.Equal(raw, canonical) || intent.Operation == ([32]byte{}) ||
-		intent.SourceGeneration == 0 || invalidMoveRequest(request) ||
-		len(intent.Certificate) == 0 && intent.Certificate != nil ||
-		len(intent.Transition) > gateway.MaxGroupTransitionIntentBytes {
-		return nil, errors.Join(err, ErrPlanIntent)
-	}
-	var plan *Plan
-	if len(intent.Certificate) == 0 {
-		if catalog.Generation() != intent.SourceGeneration {
-			return nil, ErrPlanIntent
-		}
-		plan, err = PlanReplicaMove(catalog, publication, request)
-	} else {
+	var certificate *replicatedstate.SnapshotBaseCertificate
+	if len(intent.Certificate) != 0 {
 		snapshot := new(pb.Snapshot)
 		if proto.Unmarshal(intent.Certificate, snapshot) != nil {
 			return nil, ErrPlanIntent
@@ -211,19 +194,13 @@ func OpenPlanIntent(
 		if marshalErr != nil || !bytes.Equal(encoded, intent.Certificate) {
 			return nil, errors.Join(marshalErr, ErrPlanIntent)
 		}
-		plan, err = RecoverReplicaMove(catalog, publication, request, snapshot)
+		opened, openErr := replicatedstate.OpenSnapshotBase(snapshot)
+		if openErr != nil {
+			return nil, errors.Join(openErr, ErrPlanIntent)
+		}
+		certificate = &opened
 	}
-	if err == nil && len(intent.FailureAuthority) != 0 {
-		err = restoreFailedReplicaAuthorization(plan, intent.FailureAuthority)
-	}
-	if err != nil || plan == nil || plan.catalogGeneration != intent.SourceGeneration ||
-		[32]byte(plan.OperationID()) != intent.Operation {
-		return nil, errors.Join(err, ErrPlanIntent)
-	}
-	if err = restoreTransitionIntent(plan, intent.Transition); err != nil {
-		return nil, err
-	}
-	return plan, nil
+	return recoverPersistedPlanIntent(intent, request, catalog, publication, certificate)
 }
 
 // OpenReplicaMoveIntent reconstructs the immutable journal intent against one
@@ -245,7 +222,20 @@ func OpenReplicaMoveIntent(
 	if err != nil || len(intent.Certificate) != 0 {
 		return nil, errors.Join(err, ErrPlanIntent)
 	}
+	return recoverPersistedPlanIntent(intent, request, catalog, publication, certificate)
+}
+
+// Both restart formats carry the same operation and transition provenance.
+// Only the source of their authenticated snapshot certificate differs.
+func recoverPersistedPlanIntent(
+	intent persistedPlanIntent,
+	request MoveRequest,
+	catalog *gateway.Snapshot,
+	publication raftmodel.Publication,
+	certificate *replicatedstate.SnapshotBaseCertificate,
+) (*Plan, error) {
 	var plan *Plan
+	var err error
 	if len(intent.Transition) != 0 {
 		plan, err = recoverOwnedReplicaMove(intent, request, catalog, publication, certificate)
 	} else if certificate == nil {

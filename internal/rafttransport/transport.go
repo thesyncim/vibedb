@@ -634,6 +634,11 @@ func (transport *OrdinaryTransport) EnrollPeerContext(
 	if transport == nil || transport.registry == nil {
 		return ErrInvalidTransport
 	}
+	canonical, err := transport.registry.normalizeEnrollment(intent)
+	if err != nil {
+		return err
+	}
+	intent = canonical
 	return transport.registry.EnrollPeerContextWithCommit(ctx, intent, verifier, func() error {
 		return transport.addPeerPrepared(intent.Peer)
 	})
@@ -659,6 +664,11 @@ func (transport *OrdinaryTransport) EnrollMemberContext(
 	if transport == nil || transport.registry == nil {
 		return ErrInvalidTransport
 	}
+	canonical, err := transport.registry.normalizeEnrollment(intent)
+	if err != nil {
+		return err
+	}
+	intent = canonical
 	return transport.registry.EnrollMemberContextWithCommit(ctx, intent, verifier, func() error {
 		return transport.addPeerPrepared(intent.Peer)
 	})

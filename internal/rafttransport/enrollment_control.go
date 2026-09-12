@@ -307,9 +307,16 @@ func (client *EnrollmentControlClient) enrollMemberOnce(
 	target NodeID,
 	intent EnrollmentIntent,
 ) (EnrollmentAck, uint64, error) {
-	if client == nil || ctx == nil || target == (NodeID{}) ||
-		!validEnrollmentWireIntent(intent) {
+	if client == nil || ctx == nil || target == (NodeID{}) {
 		return EnrollmentAck{}, 0, ErrEnrollmentControl
+	}
+	canonical, err := canonicalEnrollmentIntent(intent)
+	if err != nil {
+		return EnrollmentAck{}, 0, err
+	}
+	intent = canonical
+	if err := context.Cause(ctx); err != nil {
+		return EnrollmentAck{}, 0, err
 	}
 	connection, err := client.opener.OpenShardControl(ctx, target)
 	if err != nil {
@@ -322,6 +329,8 @@ func (client *EnrollmentControlClient) enrollMemberOnce(
 		return EnrollmentAck{}, 0, ErrEnrollmentControl
 	}
 	defer connection.Close()
+	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stop()
 	identity := connection.PeerIdentity()
 	if connection.TrafficClass() != TrafficShardControl || identity.Node != target ||
 		identity.TrustDomain != intent.Domain {
@@ -490,10 +499,19 @@ func targetNodes(targets []EnrollmentFanoutTarget) []NodeID {
 // fanout include the local voter using the same ACK and replay semantics as a
 // network client.
 func (registry *StaticRegistry) EnrollmentAck(intent EnrollmentIntent) (EnrollmentAck, error) {
-	if registry == nil || !validEnrollmentWireIntent(intent) ||
-		intent.Domain != registry.TrustDomain() {
+	if registry == nil {
 		return EnrollmentAck{}, ErrEnrollmentControl
 	}
+	canonical, err := canonicalEnrollmentIntent(intent)
+	if err != nil || canonical.Domain != registry.TrustDomain() {
+		return EnrollmentAck{}, ErrEnrollmentControl
+	}
+	intent = canonical
+	// All receipt coordinates must describe the same committed cut. Keeping
+	// this short read under the publication lock prevents a concurrent
+	// enrollment or retirement from mixing its revision with an older digest.
+	registry.dynamicMu.Lock()
+	defer registry.dynamicMu.Unlock()
 	member, err := registry.Member(intent.Group, intent.Peer.NodeID)
 	if err != nil || member != intent.Member.MemberID {
 		return EnrollmentAck{}, ErrEnrollmentControl

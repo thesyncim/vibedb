@@ -2,6 +2,8 @@ package serviceauthz
 
 import (
 	"errors"
+	"runtime"
+	"slices"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -188,6 +190,166 @@ func TestServiceDirectoryGatewaySessionAndDrainingFence(t *testing.T) {
 	}
 	if got := gate.CheckDelegate(peer, 21, fence); got == DecisionAllow {
 		t.Fatal("decommissioned tombstone retained an old service grant")
+	}
+}
+
+func TestServiceDirectoryDrainingRequiresExactCommittedFence(t *testing.T) {
+	peer := serviceDirectoryPeer(10, 11)
+	binding := serviceDirectoryBinding(peer, ServiceRoleGateway, ServiceDraining)
+	mutations := []struct {
+		name string
+		edit func(*ServiceFence)
+	}{
+		{"action", func(f *ServiceFence) { f.Action = ServiceActionGatewayCatalogWrite }},
+		{"operation", func(f *ServiceFence) { f.Operation = ServiceOperationCatalogWrite }},
+		{"group", func(f *ServiceFence) { f.Group.GroupID[0]++ }},
+		{"relation", func(f *ServiceFence) { f.Relation[0]++ }},
+		{"session", func(f *ServiceFence) { f.SessionID[0]++ }},
+		{"session revision", func(f *ServiceFence) { f.SessionRevision++ }},
+		{"intent", func(f *ServiceFence) { f.IntentID[0]++ }},
+		{"digest", func(f *ServiceFence) { f.FenceDigest[0]++ }},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			changed := binding.DrainFence
+			mutation.edit(&changed)
+			// Even an additional committed internal grant must not widen the
+			// one exact continuation selected by the drain fence.
+			cutBinding := binding
+			cutBinding.InternalFences = []ServiceFence{binding.DrainFence, changed}
+			slices.SortFunc(cutBinding.InternalFences, CompareServiceFences)
+			gate, err := NewServiceDirectoryGate(serviceDirectoryCut(1, cutBinding))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gate.CheckDelegate(peer, 21, changed) == DecisionAllow {
+				t.Error("draining delegate admitted a different continuation scope")
+			}
+			request := ServiceRequest{Action: changed.Action, Capability: CapabilityTopology,
+				Operation: changed.Operation, Group: changed.Group, Relation: changed.Relation,
+				SessionID: changed.SessionID, SessionRevision: changed.SessionRevision,
+				IntentID: changed.IntentID, FenceDigest: changed.FenceDigest}
+			if gate.CheckInternal(peer, Authority{Node: peer.Identity.Node, Generation: 21}, request) == DecisionAllow {
+				t.Fatal("draining internal action admitted a different continuation scope")
+			}
+		})
+	}
+}
+
+func TestServiceDirectoryInternalContinuationUsesOneCut(t *testing.T) {
+	peer := serviceDirectoryPeer(40, 41)
+	active := serviceDirectoryBinding(peer, ServiceRoleGateway, ServiceActive)
+	prepared := serviceDirectoryContinuationGrant(peer, active, ContinuationGrantPrepared)
+	scope := FrontendContinuationScopeRecord{Protocol: FrontendScopeNative,
+		Action: FrontendActionGatewayCatalog, Capability: CapabilityTopology,
+		Operation: ServiceOperationCatalogRead, Group: serviceDirectoryGroup(31),
+		Relation: [16]byte{37}, IntentID: [32]byte{38}, FenceDigest: [32]byte{39}}
+	prepared.AllowedScopes = []FrontendContinuationScopeRecord{scope}
+	prepared, err := NewCommittedFrontendContinuationGrant(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeState, err := newDirectoryState(serviceDirectoryCutWithContinuations(1,
+		[]CommittedFrontendContinuationGrant{prepared}, active))
+	if err != nil {
+		t.Fatal(err)
+	}
+	draining := serviceDirectoryBinding(peer, ServiceRoleGateway, ServiceDraining)
+	retired := prepared
+	retired.State = ContinuationGrantRetired
+	retiredState, err := newDirectoryState(serviceDirectoryCutWithContinuations(2,
+		[]CommittedFrontendContinuationGrant{retired}, draining))
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := FrontendContinuationEnvelope{GrantDigest: prepared.GrantDigest,
+		ConnToken: prepared.AcceptedConnectionTokens[0], Scope: scope}
+	authority := Authority{Node: peer.Identity.Node, Generation: 21}
+	gate := new(ServiceDirectoryGate)
+	activeWithFence := active
+	activeWithFence.InternalFences = []ServiceFence{{Action: ServiceActionGatewayCatalogRead,
+		Operation: scope.Operation, Group: scope.Group, Relation: scope.Relation,
+		SessionID: active.SessionID, SessionRevision: active.SessionRevision,
+		IntentID: scope.IntentID, FenceDigest: scope.FenceDigest}}
+	allowedActive, err := newDirectoryState(serviceDirectoryCutWithContinuations(1,
+		[]CommittedFrontendContinuationGrant{prepared}, activeWithFence))
+	if err != nil {
+		t.Fatal(err)
+	}
+	enforcing := prepared
+	enforcing.State = ContinuationGrantEnforcing
+	allowedDraining, err := newDirectoryState(serviceDirectoryCutWithContinuations(2,
+		[]CommittedFrontendContinuationGrant{enforcing}, draining))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []*directoryState{allowedActive, allowedDraining} {
+		gate.current.Store(state)
+		if gate.CheckInternalFrontendContinuation(peer, authority, envelope, scope) != DecisionAllow {
+			t.Fatal("exact internal continuation denied")
+		}
+		forwarded := authority
+		forwarded.Node[0]++
+		if gate.CheckInternalFrontendContinuation(peer, forwarded, envelope, scope) == DecisionAllow {
+			t.Fatal("internal continuation admitted a forwarded authority")
+		}
+		stale := authority
+		stale.Generation++
+		if gate.CheckInternalFrontendContinuation(peer, stale, envelope, scope) == DecisionAllow {
+			t.Fatal("internal continuation admitted a stale policy generation")
+		}
+	}
+	// Neither publication permits this request: Active lacks an InternalFence,
+	// and Draining has a retired grant. Alternate the immutable publications
+	// directly to amplify a mixed-snapshot read without adding timing hooks to
+	// the production gate. Transition validation is tested separately.
+	for _, state := range []*directoryState{activeState, retiredState} {
+		gate.current.Store(state)
+		if gate.CheckInternalFrontendContinuation(peer, authority, envelope, scope) == DecisionAllow {
+			t.Fatal("individual publication authorized the test request")
+		}
+	}
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			gate.current.Store(activeState)
+			runtime.Gosched()
+			gate.current.Store(retiredState)
+			runtime.Gosched()
+		}
+	}()
+	defer func() { close(stop); <-done }()
+	for attempt := 0; attempt < 100000; attempt++ {
+		if gate.CheckInternalFrontendContinuation(peer, authority, envelope, scope) == DecisionAllow {
+			t.Fatal("mixed two denying publications into an allowed request")
+		}
+	}
+}
+
+func TestServiceDirectoryContinuationAdmissionDoesNotRehashGrant(t *testing.T) {
+	peer := serviceDirectoryPeer(40, 41)
+	active := serviceDirectoryBinding(peer, ServiceRoleGateway, ServiceActive)
+	prepared := serviceDirectoryContinuationGrant(peer, active, ContinuationGrantPrepared)
+	gate, err := NewServiceDirectoryGate(serviceDirectoryCutWithContinuations(1,
+		[]CommittedFrontendContinuationGrant{prepared}, active))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := prepared.AllowedScopes[0]
+	envelope := FrontendContinuationEnvelope{GrantDigest: prepared.GrantDigest,
+		ConnToken: prepared.AcceptedConnectionTokens[0], Scope: scope}
+	if allocations := testing.AllocsPerRun(100, func() {
+		if gate.CheckFrontendContinuation(peer, 21, envelope, scope) != DecisionAllow {
+			t.Fatal("committed continuation denied")
+		}
+	}); allocations != 0 {
+		t.Fatalf("continuation admission allocated %g times", allocations)
 	}
 }
 

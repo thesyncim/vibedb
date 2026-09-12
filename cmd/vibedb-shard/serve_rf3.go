@@ -209,7 +209,7 @@ type preparedRF3Set struct {
 	groups           []preparedRF3Group
 	members          []rafttransport.Member
 	remoteNodes      []rafttransport.NodeID
-	dial             rafttransport.RawPeerDialFunc
+	peerEndpoints    map[rafttransport.NodeID]string
 	nativeConfigured bool
 }
 
@@ -405,15 +405,21 @@ func prepareRF3GroupSetOnNode(manifest rf3Manifest, profile *rafttransport.PeerT
 		}
 	}
 	slices.SortFunc(result.remoteNodes, func(a, b rafttransport.NodeID) int { return bytes.Compare(a[:], b[:]) })
-	dialer := net.Dialer{Timeout: rf3NetworkTimeout}
-	result.dial = func(ctx context.Context, node rafttransport.NodeID) (net.Conn, error) {
-		address, found := addresses[node]
-		if !found {
-			return nil, rafttransport.ErrNodeNotFound
-		}
-		return dialer.DialContext(ctx, "tcp", address)
-	}
+	result.peerEndpoints = addresses
 	return result, nil
+}
+
+// Resolve each reconnect against the committed directory, including peers
+// enrolled after this process started. The startup manifest only seeds it.
+func rf3RegistryPeerDialer(registry *rafttransport.StaticRegistry) rafttransport.RawPeerDialFunc {
+	dialer := net.Dialer{Timeout: rf3NetworkTimeout}
+	return func(ctx context.Context, node rafttransport.NodeID) (net.Conn, error) {
+		peer, err := registry.PhysicalPeer(node)
+		if err != nil || peer.State != rafttransport.PeerEnrolled || peer.Endpoint == "" {
+			return nil, rafttransport.ErrPeerUnauthorized
+		}
+		return dialer.DialContext(ctx, "tcp", peer.Endpoint)
+	}
 }
 
 func rf3SplitChildTemplateMatchesRetained(
@@ -614,11 +620,10 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	}
 	first := &preparedSet.groups[0]
 	base := first.base
-	members, remoteNodes, dial := preparedSet.members, preparedSet.remoteNodes, preparedSet.dial
+	members, remoteNodes := preparedSet.members, preparedSet.remoteNodes
 	nativeConfigured := preparedSet.nativeConfigured
-	transportRegistry, err := newRF3ProvisionedRegistry(manifest, profile, members,
-		rafttransport.Limits{MaxGroups: maxRF3ManifestGroups, MaxMembers: maxRF3ManifestGroups * rf3ManifestMembers,
-			MaxPeers: rafttransport.AbsoluteMaxTransportPeers},
+	transportRegistry, err := newRF3ProvisionedRegistry(manifest, profile, members, preparedSet.peerEndpoints,
+		rf3TransportRegistryLimits(),
 	)
 	if err != nil {
 		return closePrepared(fmt.Errorf("%w: transport roster: %v", errRF3Serving, err))
@@ -801,7 +806,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
 	peer, err := raftservice.NewAuthenticatedExecutionPeerRuntime(raftservice.AuthenticatedExecutionPeerOptions{
-		Registry: transportRegistry, TLS: profile, Dial: dial, Listener: peerListener,
+		Registry: transportRegistry, TLS: profile, Dial: rf3RegistryPeerDialer(transportRegistry), Listener: peerListener,
 		HandshakeDeadline: deadline, MaxInboundStreams: 8,
 		Execution: raftservice.ExecutionOptions{
 			Registry: servingRegistry, Lanes: lanes,

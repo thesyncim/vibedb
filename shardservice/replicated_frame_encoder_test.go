@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -223,22 +224,11 @@ func TestReleaseReplicatedBorrowedScratchScrubsBytes(t *testing.T) {
 		scratch.bytes[index] = 0xff
 	}
 	const used = 512
-	releaseReplicatedBorrowedScratch(scratch, used)
-	// releaseReplicatedBorrowedScratch just put this deliberately
-	// half-poisoned object into the shared, process-wide
-	// replicatedBorrowedScratchPool. A real caller's used always covers
-	// everything it wrote, so bytes beyond it are already zero from a prior
-	// release; this test manufactures a beyond-used region that would never
-	// arise in production specifically to check clearing stops at used. Drain
-	// that exact object back out immediately so no other test - or a real
-	// EncodeReplicatedRequestBorrowed call sharing this same pool - can Get()
-	// a still-poisoned scratch and fail to reproduce their own frame's data.
-	defer func() {
-		if drained, ok := replicatedBorrowedScratchPool.Get().(*replicatedBorrowedScratch); ok && drained == scratch {
-			return
-		}
-		t.Fatal("could not drain the poisoned scratch back out of the shared pool")
-	}()
+	// Keep the deliberately poisoned unused region out of the global pool.
+	// This private pool has no borrowers, so inspecting scratch is safe even
+	// when sync.Pool drops the entry instead of retaining it.
+	var pool sync.Pool
+	releaseReplicatedBorrowedScratchTo(scratch, used, &pool)
 	for index, value := range scratch.bytes[:used] {
 		if value != 0 {
 			t.Fatalf("scratch byte %d retained %#x", index, value)

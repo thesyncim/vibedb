@@ -541,7 +541,11 @@ func (proof PreparedReplicaProof) ComputedEnrollmentDigest() replication.Digest 
 // carries both source and target identities so restarts cannot rediscover a
 // different process behind a reused endpoint or member ID.
 type GroupEnrollmentIntent struct {
-	IntentID                  [32]byte
+	IntentID [32]byte
+	// ParentScalingIntentID binds controller-created enrollments to their
+	// durable operator intent. Zero is reserved for standalone enrollments.
+	ParentScalingIntentID     [32]byte
+	ReservedMigrationBytes    uint64
 	Group                     raftmember.GroupKey
 	Distribution              distribution.DistributionName
 	Shard                     distribution.ShardID
@@ -774,17 +778,18 @@ func bytesCompareNode(left, right rafttransport.NodeID) int {
 // evidence are retained alongside progress, so a status read never has to
 // infer safety from a missing process-local queue.
 type ScalingIntent struct {
-	ID                [32]byte
-	Request           ScalingIntentRequest
-	CatalogGeneration uint64
-	Revision          uint64
-	DirectoryRevision uint64
-	State             ScalingIntentState
-	PlannedReplicas   uint32
-	CompletedReplicas uint32
-	OutstandingMoves  [][32]byte
-	Blockers          []ScalingBlocker
-	Evidence          SafeToStopEvidence
+	ID                     [32]byte
+	Request                ScalingIntentRequest
+	CatalogGeneration      uint64
+	Revision               uint64
+	DirectoryRevision      uint64
+	State                  ScalingIntentState
+	AdmittedMigrationBytes uint64
+	PlannedReplicas        uint32
+	CompletedReplicas      uint32
+	OutstandingMoves       [][32]byte
+	Blockers               []ScalingBlocker
+	Evidence               SafeToStopEvidence
 }
 
 type ScalingIntentState uint8

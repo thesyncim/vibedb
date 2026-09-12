@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 type rf3GrantSink struct {
@@ -174,6 +175,116 @@ func TestDurableRF3GrantInstallerFailsClosedOnCorruptionAndWrongTarget(t *testin
 	}
 	if _, err = openDurableRF3GrantInstaller(path, authority); !errors.Is(err, errRF3MembershipGrant) {
 		t.Fatalf("corrupt durable grant = %v", err)
+	}
+}
+
+func TestDurableRF3GrantInstallerCommitsBeforeRuntimeAuthorityAndRollsCompletedGrant(t *testing.T) {
+	for _, revoke := range []bool{false, true} {
+		name := "completed"
+		if revoke {
+			name = "revoked"
+		}
+		t.Run(name, func(t *testing.T) {
+			manifest := serveRF3TestManifest()
+			manifest.EnrolledTarget = serveRF3TestEnrolledTarget()
+			group := serveRF3TestGroup()
+			grant := rf3MembershipGrantFixture(manifest, group, 9)
+			members := rf3GrantTransportMembers(manifest, group, 9, rafttransport.MemberEnrolled)
+			registry, err := rafttransport.NewStaticRegistry(manifest.Members[1].NodeID, members,
+				rafttransport.Limits{MaxGroups: 1, MaxMembers: 4})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(t.TempDir(), "membership-grant")
+			installer, err := openDurableRF3GrantInstaller(path, registry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			crash := errors.New("injected persistence failure")
+			installer.persist = func(string, membershipgrant.Grant) error { return crash }
+			if err = installer.InstallTransitionGrant(grant); !errors.Is(err, crash) {
+				t.Fatalf("initial persistence failure = %v", err)
+			}
+			if current, found, err := registry.CurrentTransitionGrant(group); err != nil || found || current.Valid() {
+				t.Fatalf("uncommitted grant admitted by transport: found=%t err=%v", found, err)
+			}
+			installer.persist = persistRF3MembershipGrant
+			if err = installer.InstallTransitionGrant(grant); err != nil {
+				t.Fatal(err)
+			}
+			next := grant
+			next.TransitionID[0]++
+			next.CatalogGeneration++
+			next.InitialReplicaSetVersion = 12
+			next.InitialVoters = [3]uint64{2, 3, 4}
+			next.InitialRosterDigest = membershipgrant.CertifiedRosterDigest(group, 12, [3]membershipgrant.RosterMember{
+				{Member: 2, Node: [16]byte{2}}, {Member: 3, Node: [16]byte{3}}, {Member: 4, Node: [16]byte{4}},
+			})
+			next.SourceMember, next.TargetMember, next.TargetNode = 2, 1, [16]byte{1}
+			// A greater generation is insufficient while the first move is active.
+			for index, conf := range []*pb.ConfState{
+				{Voters: []uint64{1, 2, 3}},
+				{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}},
+				{Voters: []uint64{1, 2, 3, 4}},
+			} {
+				if index != 0 {
+					if err = registry.PublishCommittedAuthority(group, uint64(9+index), conf); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err = installer.InstallTransitionGrant(next); !errors.Is(err, errRF3MembershipGrant) {
+					t.Fatalf("intermediate cut %d allowed rollover: %v", index, err)
+				}
+			}
+			if err = registry.PublishCommittedAuthority(group, 12, &pb.ConfState{Voters: []uint64{2, 3, 4}}); err != nil {
+				t.Fatal(err)
+			}
+			if revoke {
+				if err = registry.RevokeTransitionGrant(grant); err != nil {
+					t.Fatal(err)
+				}
+			}
+			forged := next
+			forged.InitialRosterDigest[0]++
+			if err = installer.InstallTransitionGrant(forged); !errors.Is(err, errRF3MembershipGrant) {
+				t.Fatalf("foreign next roster accepted: %v", err)
+			}
+			installer.replace = func(path string, expected, replacement membershipgrant.Grant) error {
+				if err := replaceRF3MembershipGrant(path, expected, replacement); err != nil {
+					return err
+				}
+				return crash // The rename survived, but its outcome was unknown.
+			}
+			if err = installer.InstallTransitionGrant(next); !errors.Is(err, crash) {
+				t.Fatalf("unknown rollover outcome = %v", err)
+			}
+			if current, found, err := registry.CurrentTransitionGrant(group); err != nil || found == revoke || !revoke && current != grant {
+				t.Fatalf("failed rollover changed runtime: found=%t grant=%+v err=%v", found, current, err)
+			}
+			installer.replace = nil
+			if err = installer.InstallTransitionGrant(next); err != nil {
+				t.Fatalf("exact retry after unknown rollover: %v", err)
+			}
+			if current, found, err := registry.CurrentTransitionGrant(group); err != nil || !found || current != next {
+				t.Fatalf("next runtime grant: found=%t grant=%+v err=%v", found, current, err)
+			}
+			for index := range members {
+				members[index].ReplicaSetVersion = 12
+				members[index].Role = rafttransport.MemberVoter
+				if members[index].MemberID == 1 {
+					members[index].Role = rafttransport.MemberEnrolled
+				}
+			}
+			reopened, err := rafttransport.NewStaticRegistry(manifest.Members[1].NodeID, members,
+				rafttransport.Limits{MaxGroups: 1, MaxMembers: 4})
+			if err != nil {
+				t.Fatal(err)
+			}
+			recovered, err := openDurableRF3GrantInstaller(path, reopened)
+			if err != nil || recovered.grant != next {
+				t.Fatalf("next grant restart: recovered=%+v err=%v", recovered, err)
+			}
+		})
 	}
 }
 

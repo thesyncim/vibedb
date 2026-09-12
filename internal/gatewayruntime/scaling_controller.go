@@ -360,13 +360,25 @@ func (controller *ScalingController) resumeEnrollments(ctx context.Context, pare
 // each enrollment row is the side-effect boundary; rebuilding this projection
 // on every pass makes a crash between either write resumable.
 func (controller *ScalingController) reconcileIntentProgress(ctx context.Context, parent gateway.ScalingIntent) (*gateway.ScalingIntent, error) {
+	// Child transitions update this row in the same transaction. In particular,
+	// resumeEnrollments may have just completed a move in this pass.
+	current, err := controller.directory.ReadScalingIntent(ctx, parent.ID)
+	if err != nil {
+		return nil, err
+	}
+	parentChanged := current.Revision != parent.Revision
+	parent = current
 	snapshot, err := controller.catalog.Read(ctx)
 	if err != nil || snapshot == nil {
 		return nil, errors.Join(err, errors.New("catalog snapshot unavailable while reconciling scaling progress"))
 	}
 	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
 	seen := make(map[raftmember.GroupKey]struct{}, snapshot.ReplicatedRouteCount())
-	var planned, completed uint32
+	// Completion is counted atomically with the terminal child write. Terminal
+	// enrollment rows leave the active directory and may later be collected;
+	// never reconstruct this durable counter from a bounded history listing.
+	completed := parent.CompletedReplicas
+	planned := completed
 	var outstanding [][32]byte
 	for index := 0; index < snapshot.ReplicatedRouteCount(); index++ {
 		route, ok := snapshot.ReplicatedRouteAt(index, replicas[:0])
@@ -382,7 +394,7 @@ func (controller *ScalingController) reconcileIntentProgress(ctx context.Context
 			return nil, listErr
 		}
 		for _, row := range rows {
-			if row.State < gateway.EnrollmentReserved || row.State == gateway.EnrollmentCancelled ||
+			if row.State < gateway.EnrollmentReserved || row.State >= gateway.EnrollmentComplete ||
 				scalingEnrollmentID(parent.ID, row) != row.IntentID {
 				continue
 			}
@@ -390,10 +402,6 @@ func (controller *ScalingController) reconcileIntentProgress(ctx context.Context
 				return nil, errors.New("scaling enrollment inventory exceeds the parent move bound")
 			}
 			planned++
-			if row.State >= gateway.EnrollmentComplete {
-				completed++
-				continue
-			}
 			if row.MoveOperationID != ([32]byte{}) {
 				outstanding = append(outstanding, row.MoveOperationID)
 			}
@@ -412,6 +420,9 @@ func (controller *ScalingController) reconcileIntentProgress(ctx context.Context
 	})
 	if parent.PlannedReplicas == planned && parent.CompletedReplicas == completed &&
 		slices.Equal(parent.OutstandingMoves, outstanding) {
+		if parentChanged {
+			return &parent, nil
+		}
 		return nil, nil
 	}
 	next := parent
@@ -542,16 +553,8 @@ func (controller *ScalingController) submitEnrollmentMove(ctx context.Context, r
 		return false, errors.Join(err, errors.New("catalog snapshot unavailable while submitting enrolled move"))
 	}
 	membership, found := snapshot.ResolveReplicatedMembershipRoute(row.Distribution, row.Shard, nil)
-	if !found || !membership.HasEnrolledTarget || membership.EnrolledTarget.Member != row.Target.Member ||
-		row.Receipt == nil || !row.Receipt.Valid() || row.Receipt.IntentID != row.IntentID ||
-		row.Receipt.Target != row.Target || row.Receipt.EnrolledCatalogGeneration != snapshot.Generation() ||
-		row.Receipt.EnrolledCatalogHeadDigest == (replication.Digest{}) {
+	if !found || !gateway.EnrollmentReceiptMatchesSnapshot(row, snapshot) {
 		return false, errors.New("enrollment receipt is not present in the current catalog cut")
-	}
-	if membership.EnrolledTarget.Node != row.Target.Node ||
-		membership.EnrolledTarget.NodeIncarnation != row.Target.NodeIncarnation ||
-		membership.EnrolledTarget.StoreID != row.Target.StoreID {
-		return false, errors.New("catalog enrolled target does not match the certified receipt")
 	}
 	request := replicacontrol.Request{Operation: row.IntentID,
 		Step: scalingCapacityStep(row.IntentID, row.Group, row.ReplicaOrdinal), Group: row.Group, TargetMember: row.Target.Member}
@@ -747,6 +750,13 @@ func (controller *ScalingController) completeIntent(ctx context.Context, intent 
 }
 
 func (controller *ScalingController) plan(ctx context.Context, intent gateway.ScalingIntent) (scaling.PlacementPlan, error) {
+	request, budgetErr := scalingRemainingRequest(intent)
+	if budgetErr != nil {
+		// The last permitted move may have completed the operation. Evaluate a
+		// fresh advisory cut so exhaustion does not prevent proving convergence;
+		// the result below must contain no work before it can escape this fence.
+		request = intent.Request
+	}
 	snapshot, err := controller.catalog.Read(ctx)
 	if err != nil || snapshot == nil {
 		return scaling.PlacementPlan{}, errors.Join(err, errors.New("catalog snapshot unavailable"))
@@ -793,7 +803,7 @@ func (controller *ScalingController) plan(ctx context.Context, intent gateway.Sc
 		inflight = append(inflight, rows...)
 	}
 	plan, err := scaling.Plan(scaling.PlacementInput{Snapshot: snapshot, Nodes: nodes,
-		Request: intent.Request, Demands: demands, InFlight: inflight,
+		Request: request, Demands: demands, InFlight: inflight,
 		Policy: scaling.DefaultPlacementPolicy()})
 	if err != nil {
 		return scaling.PlacementPlan{}, err
@@ -816,7 +826,28 @@ func (controller *ScalingController) plan(ctx context.Context, intent gateway.Sc
 			return scaling.PlacementPlan{}, errors.Join(readErr, gateway.ErrScalingRevision)
 		}
 	}
+	if budgetErr != nil && plan.State != scaling.PlacementNoWork {
+		return scaling.PlacementPlan{}, budgetErr
+	}
 	return plan, nil
+}
+
+// Each planning wave consumes the remaining operator budget. Completed child
+// rows may have left the active directory, so the authority's atomic counters
+// remain the admission fence across retries and controller restarts.
+func scalingRemainingRequest(intent gateway.ScalingIntent) (gateway.ScalingIntentRequest, error) {
+	request := intent.Request
+	if intent.PlannedReplicas >= uint32(request.MaxMoves) {
+		return request, fmt.Errorf("%w: scaling intent move budget exhausted", ErrScalingControllerBlocked)
+	}
+	request.MaxMoves -= uint16(intent.PlannedReplicas)
+	if request.MaxMigrationBytes != 0 {
+		if intent.AdmittedMigrationBytes >= request.MaxMigrationBytes {
+			return request, fmt.Errorf("%w: scaling intent migration byte budget exhausted", ErrScalingControllerBlocked)
+		}
+		request.MaxMigrationBytes -= intent.AdmittedMigrationBytes
+	}
+	return request, nil
 }
 
 func (controller *ScalingController) collectCapacity(ctx context.Context, intent gateway.ScalingIntent, snapshot *gateway.Snapshot, nodes []gateway.NodeRecord) ([]scaling.ReplicaDemand, []raftmember.GroupKey, error) {

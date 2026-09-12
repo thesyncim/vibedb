@@ -37,6 +37,7 @@ func TestPublishEnrollmentReceiptUsesAnExactPreparedRowAndAllowsUnrelatedHead(t 
 	if err := authority.PutNode(ctx, targetNode, 1); err != nil {
 		t.Fatal(err)
 	}
+	parent := scalingTestRunningParent(t, authority, targetNode)
 
 	headResult, err := authority.readRaw(ctx, replicatedCatalogHeadKey, maxReplicatedCatalogBytes)
 	if err != nil || !headResult.Found {
@@ -44,7 +45,9 @@ func TestPublishEnrollmentReceiptUsesAnExactPreparedRowAndAllowsUnrelatedHead(t 
 	}
 	intent := GroupEnrollmentIntent{
 		IntentID: [32]byte{0xc1, 0x01}, Group: descriptor.Group,
-		Distribution: descriptor.Distribution, Shard: descriptor.Shard,
+		ParentScalingIntentID:  parent.ID,
+		ReservedMigrationBytes: 7,
+		Distribution:           descriptor.Distribution, Shard: descriptor.Shard,
 		AllocationGeneration: descriptor.AllocationGeneration, CatalogGeneration: current.Generation(),
 		ExpectedCatalogHeadDigest: scalingDigest(headResult.Value), ReplicaOrdinal: 0,
 		Source: ReplicaIdentity{Member: descriptor.Replicas[0].Member, Node: descriptor.Replicas[0].Node,
@@ -63,6 +66,10 @@ func TestPublishEnrollmentReceiptUsesAnExactPreparedRowAndAllowsUnrelatedHead(t 
 	}
 	if err := authority.SubmitEnrollmentIntent(ctx, intent); err != nil {
 		t.Fatalf("reserve enrollment: %v", err)
+	}
+	parent, err = authority.ReadScalingIntent(ctx, parent.ID)
+	if err != nil || parent.PlannedReplicas != 1 || parent.CompletedReplicas != 0 {
+		t.Fatalf("parent after admission=%+v err=%v", parent, err)
 	}
 	reserved, err := authority.ClaimEnrollmentPreparation(ctx, intent.IntentID, intent.Revision)
 	if err != nil {
@@ -124,6 +131,9 @@ func TestPublishEnrollmentReceiptUsesAnExactPreparedRowAndAllowsUnrelatedHead(t 
 	// Advance an unrelated catalog generation without changing the enrolled
 	// group. The durable receipt must remain retryable against that later head.
 	latest := authority.holder.Current()
+	if !EnrollmentReceiptMatchesSnapshot(enrolled, latest) || EnrollmentReceiptMatchesSnapshot(enrolled, current) {
+		t.Fatal("receipt must match its published group and reject the pre-enrollment cut")
+	}
 	persisted := toPersisted(latest)
 	persisted.Generation++
 	if persisted.RequestLedger != nil {
@@ -142,5 +152,58 @@ func TestPublishEnrollmentReceiptUsesAnExactPreparedRowAndAllowsUnrelatedHead(t 
 	}
 	if _, err := authority.PublishEnrollmentReceipt(ctx, prepared); err != nil {
 		t.Fatalf("retry receipt after unrelated catalog head=%v", err)
+	}
+	if !EnrollmentReceiptMatchesSnapshot(enrolled, unrelated) {
+		t.Fatal("unrelated catalog generation invalidated an unchanged enrolled group")
+	}
+	substituted := enrolled
+	substituted.Target.ControlEndpoint = "substituted-control"
+	if EnrollmentReceiptMatchesSnapshot(substituted, unrelated) {
+		t.Fatal("receipt accepted a substituted target identity")
+	}
+	changedGroup, err := decodeSnapshotBytes(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedGroup.replicatedShards[0].command.ReplicaSetVersion++
+	if EnrollmentReceiptMatchesSnapshot(enrolled, changedGroup) {
+		t.Fatal("receipt accepted a changed group descriptor")
+	}
+
+	// The preparation claim is consumed by Reserved -> Prepared. Later
+	// updates rely on the durable proof and receipt and must remain writable
+	// after a restart, without resurrecting that Reserved-only claim.
+	peer := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(authority.holder.Current()), 0xce)
+	moving := enrolled
+	moving.State = EnrollmentMoving
+	moving.MoveOperationID = [32]byte{0xc2}
+	moving.Revision++
+	if err := peer.PutEnrollmentIntent(ctx, moving, enrolled.Revision); err != nil {
+		t.Fatalf("persist moving enrollment after consumed preparation claim: %v", err)
+	}
+	parent, err = authority.ReadScalingIntent(ctx, parent.ID)
+	if err != nil || len(parent.OutstandingMoves) != 1 || parent.OutstandingMoves[0] != moving.MoveOperationID {
+		t.Fatalf("parent after move journal=%+v err=%v", parent, err)
+	}
+	complete := moving
+	complete.State = EnrollmentComplete
+	complete.Revision++
+	if err := authority.PutEnrollmentIntent(ctx, complete, moving.Revision); err != nil {
+		t.Fatalf("complete enrollment after consumed preparation claim: %v", err)
+	}
+	stored, err := peer.ReadEnrollmentIntent(ctx, complete.IntentID)
+	if err != nil || stored.State != EnrollmentComplete || stored.PreparationClaim != ([32]byte{}) {
+		t.Fatalf("completed enrollment=%+v err=%v", stored, err)
+	}
+	parent, err = peer.ReadScalingIntent(ctx, parent.ID)
+	if err != nil || parent.PlannedReplicas != 1 || parent.CompletedReplicas != 1 || parent.AdmittedMigrationBytes != 7 || len(parent.OutstandingMoves) != 0 {
+		t.Fatalf("parent after completion=%+v err=%v", parent, err)
+	}
+	if err := peer.PutEnrollmentIntent(ctx, complete, moving.Revision); err != nil {
+		t.Fatalf("completion retry: %v", err)
+	}
+	retriedParent, err := authority.ReadScalingIntent(ctx, parent.ID)
+	if err != nil || retriedParent.CompletedReplicas != 1 || retriedParent.Revision != parent.Revision {
+		t.Fatalf("completion retry double-counted parent: %+v err=%v", retriedParent, err)
 	}
 }

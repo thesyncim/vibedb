@@ -297,6 +297,13 @@ func TestReplicatedScalingStaleReservationAndAppliedResponseLoss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cancelled := claimed
+	cancelled.State = EnrollmentCancelled
+	cancelled.Revision++
+	cancelled.PreparationClaim = [32]byte{}
+	if err := authority.PutEnrollmentIntent(ctx, cancelled, claimed.Revision); !errors.Is(err, ErrScalingState) {
+		t.Fatalf("generic cancellation discarded an active preparation claim: %v", err)
+	}
 	prepared := claimed
 	prepared.State = EnrollmentPrepared
 	prepared.Revision++
@@ -736,7 +743,7 @@ func TestReplicatedScalingEnrollmentRejectsUnsettledPriorGrant(t *testing.T) {
 		IntentID: [32]byte{0xd1, 0x01}, Group: currentDescriptor.Group,
 		Distribution: currentDescriptor.Distribution, Shard: currentDescriptor.Shard,
 		AllocationGeneration: currentDescriptor.AllocationGeneration,
-		CatalogGeneration: current.Generation(), ExpectedCatalogHeadDigest: scalingDigest(head.Value),
+		CatalogGeneration:    current.Generation(), ExpectedCatalogHeadDigest: scalingDigest(head.Value),
 		ReplicaOrdinal: 0,
 		Source: ReplicaIdentity{Member: source.Member, Node: source.Node, StoreID: source.StoreID,
 			NodeIncarnation: source.NodeIncarnation, Endpoint: source.Endpoint,
@@ -745,10 +752,10 @@ func TestReplicatedScalingEnrollmentRejectsUnsettledPriorGrant(t *testing.T) {
 		Target: ReplicaIdentity{Member: 5, Node: targetNode.NodeID, StoreID: [16]byte{15},
 			NodeIncarnation: targetNode.Incarnation, Endpoint: targetNode.DataEndpoint,
 			NativeEndpoint: targetNode.NativeEndpoint, ControlEndpoint: targetNode.ControlEndpoint},
-		ExpectedRosterDigest: replication.Digest(replicatedCatalogInitialRosterDigest(current, 0)),
+		ExpectedRosterDigest:     replication.Digest(replicatedCatalogInitialRosterDigest(current, 0)),
 		ExpectedDescriptorDigest: replication.Digest(replicatedCatalogInitialDescriptorDigest(current, 0)),
-		ExpectedManifestDigest: replication.Digest(currentDescriptor.Command.RelationManifestDigest),
-		ExpectedCommand: currentDescriptor.Command, TargetNodeRevision: targetNode.Revision,
+		ExpectedManifestDigest:   replication.Digest(currentDescriptor.Command.RelationManifestDigest),
+		ExpectedCommand:          currentDescriptor.Command, TargetNodeRevision: targetNode.Revision,
 		State: EnrollmentReserved, Revision: 1,
 	}
 	if !intent.Valid() {

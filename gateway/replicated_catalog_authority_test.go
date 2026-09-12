@@ -2009,7 +2009,7 @@ func newCatalogAuthorityPeer(t *testing.T, source *ReplicatedCatalogAuthority,
 		Tenant: []byte("control-plane"), ClientID: replication.ID128{clientByte},
 		Resolver:           BaseRelationResolver{Relation: source.relation},
 		ProposalCapability: serviceauthz.CapabilityTopology,
-		MaxRelationBatches: 1, MaxMutations: 4,
+		MaxRelationBatches: 1, MaxMutations: source.session.bundle.maxMutations,
 		InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
 	})
 	if err != nil {

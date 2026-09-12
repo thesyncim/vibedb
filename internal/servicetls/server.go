@@ -159,20 +159,33 @@ func (authorizer *NodeAuthorizer) Merge(nodes []rafttransport.NodeID) error {
 	}
 	authorizer.mu.Lock()
 	defer authorizer.mu.Unlock()
-	if len(authorizer.nodes) > AbsoluteMaxIdentities-len(owned) {
-		return ErrBound
-	}
-	merged := make([]rafttransport.NodeID, 0, len(authorizer.nodes)+len(owned))
-	merged = append(merged, authorizer.nodes...)
-	merged = append(merged, owned...)
-	slices.SortFunc(merged, compareNode)
-	unique := merged[:0]
-	for _, node := range merged {
-		if len(unique) == 0 || unique[len(unique)-1] != node {
-			unique = append(unique, node)
+	// Bound the union, not the sum of the cuts: repeated or overlapping
+	// directory publications must remain valid even at the identity limit.
+	merged := make([]rafttransport.NodeID, 0, min(len(authorizer.nodes)+len(owned), AbsoluteMaxIdentities))
+	left, right := 0, 0
+	for left < len(authorizer.nodes) && right < len(owned) {
+		if len(merged) == AbsoluteMaxIdentities {
+			return ErrBound
+		}
+		switch compareNode(authorizer.nodes[left], owned[right]) {
+		case -1:
+			merged = append(merged, authorizer.nodes[left])
+			left++
+		case 1:
+			merged = append(merged, owned[right])
+			right++
+		default:
+			merged = append(merged, authorizer.nodes[left])
+			left++
+			right++
 		}
 	}
-	authorizer.nodes = unique
+	if len(authorizer.nodes)-left+len(owned)-right > AbsoluteMaxIdentities-len(merged) {
+		return ErrBound
+	}
+	merged = append(merged, authorizer.nodes[left:]...)
+	merged = append(merged, owned[right:]...)
+	authorizer.nodes = merged
 	return nil
 }
 
@@ -358,12 +371,16 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener, limits L
 		}
 		return ErrInvalidProfile
 	}
+	// Listener failure is also a shutdown: cancel established handlers and
+	// pending handshakes before waiting for them to release their slots.
+	ctx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(ctx, func() { _ = listener.Close() })
 	defer stop()
 	connectionSlots := make(chan struct{}, limits.MaxConnections)
 	handshakeSlots := make(chan struct{}, limits.MaxHandshakes)
 	var workers sync.WaitGroup
 	defer func() {
+		cancel()
 		_ = listener.Close()
 		workers.Wait()
 	}()

@@ -80,16 +80,15 @@ var replicatedBorrowedScratchPool = sync.Pool{
 }
 
 func releaseReplicatedBorrowedScratch(scratch *replicatedBorrowedScratch, used int) {
+	releaseReplicatedBorrowedScratchTo(scratch, used, &replicatedBorrowedScratchPool)
+}
+
+func releaseReplicatedBorrowedScratchTo(scratch *replicatedBorrowedScratch, used int, pool *sync.Pool) {
 	if scratch == nil {
 		return
 	}
-	if used > len(scratch.bytes) {
-		used = len(scratch.bytes)
-	}
-	if used > 0 {
-		clear(scratch.bytes[:used])
-	}
-	replicatedBorrowedScratchPool.Put(scratch)
+	clear(scratch.bytes[:min(max(used, 0), len(scratch.bytes))])
+	pool.Put(scratch)
 }
 
 // DecodeReplicatedSQLRequest validates the complete nested frame length against

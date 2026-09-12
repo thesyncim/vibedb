@@ -373,7 +373,7 @@ func ExecuteReplicatedMoveStep(
 		execution = replicaMoveExecution(operation, record.IntentDigest, plan, cut, action)
 	}
 	if err = executor.ExecuteReplicaMove(ctx, operation, plan, execution); err != nil {
-		return action, err
+		return action, fmt.Errorf("rebalance: execute %s for group %x: %w", action.Kind, plan.Group().GroupID, err)
 	}
 	next := record
 	next.Revision++

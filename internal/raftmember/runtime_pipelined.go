@@ -333,6 +333,16 @@ func newPipelinedRuntime(runtime *Runtime) (*pipelinedRuntime, error) {
 		appendTerm: hard.GetTerm(), appendVote: hard.GetVote(), appendCommit: commit,
 		durableTerm: hard.GetTerm(), durableVote: hard.GetVote(),
 	}
+	if runtime.nodePersistence != nil {
+		incarnation, readyID, err := runtime.nodePersistence.stable.ReadyCursor()
+		if err != nil || incarnation != runtime.identity.NodeIncarnation {
+			return nil, errors.Join(ErrNodePersistenceBinding, err)
+		}
+		// A dynamically installed replica keeps the physical incarnation
+		// certified by the directory on restart. Its append sequence therefore
+		// resumes after the authenticated cursor instead of restarting at one.
+		p.appendReadyID, p.appendProcessedID = readyID, readyID
+	}
 	if runtime.nodePersistence == nil {
 		p.workerWake = make(chan struct{}, 1)
 		p.resultSpace = make(chan struct{}, 1)

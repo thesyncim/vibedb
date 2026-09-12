@@ -635,7 +635,7 @@ func (gate *ServiceDirectoryGate) CheckDelegate(
 	case ServiceDraining:
 		if continuation.validShape() && continuation.SessionID == binding.SessionID &&
 			continuation.SessionRevision == binding.SessionRevision &&
-			continuation.FenceDigest == binding.DrainFenceDigest {
+			sameServiceFence(continuation, binding.DrainFence) {
 			return DecisionAllow
 		}
 		return DecisionDenyCapability
@@ -686,7 +686,16 @@ func (gate *ServiceDirectoryGate) CheckInternal(
 	peer AuthenticatedPeer, authority Authority, request ServiceRequest,
 ) DecisionCode {
 	state, binding, ok := gate.lookup(peer)
-	if !ok || !authority.Valid() || authority.Node != peer.Identity.Node ||
+	if !ok {
+		return DecisionDenyNoPrincipal
+	}
+	return state.checkInternal(binding, peer, authority, request)
+}
+
+func (state directoryState) checkInternal(
+	binding ServiceBinding, peer AuthenticatedPeer, authority Authority, request ServiceRequest,
+) DecisionCode {
+	if !authority.Valid() || authority.Node != peer.Identity.Node ||
 		authority.Generation != state.cut.PolicyGeneration {
 		return DecisionDenyNoPrincipal
 	}
@@ -716,7 +725,7 @@ func (gate *ServiceDirectoryGate) CheckInternal(
 		if request.SessionID != binding.SessionID || request.SessionRevision != binding.SessionRevision {
 			return DecisionDenyCapability
 		}
-		if binding.Lifecycle == ServiceDraining && request.FenceDigest != binding.DrainFenceDigest {
+		if binding.Lifecycle == ServiceDraining && !sameServiceFence(request.fence(), binding.DrainFence) {
 			return DecisionDenyCapability
 		}
 	}
