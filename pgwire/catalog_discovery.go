@@ -1,7 +1,6 @@
 package pgwire
 
 import (
-	"context"
 	_ "embed"
 	"encoding/json"
 	"strconv"
@@ -377,7 +376,7 @@ func (s *session) executeDiscovery(q *discoveryQuery, args []any) (*fixedResult,
 			return nil, newError(sqlstateInvalidParameterValue, "metadata arguments do not match the discovery contract")
 		}
 	}
-	tables, err := s.sql.Tables(context.Background())
+	tables, err := s.sql.Tables(s.operationContext())
 	if err != nil {
 		return nil, err
 	}

@@ -45,18 +45,42 @@ func (source gatewayTestGrantSource) ReadMembershipGrant(
 }
 
 type gatewayTestGrantInstaller struct {
-	nodes  []rafttransport.NodeID
-	failAt int
+	nodes    []rafttransport.NodeID
+	failAt   int
+	failFrom int
 }
 
 func (installer *gatewayTestGrantInstaller) InstallMembershipGrant(
 	_ context.Context, node rafttransport.NodeID, _ membershipgrant.Grant,
 ) error {
 	installer.nodes = append(installer.nodes, node)
-	if installer.failAt != 0 && len(installer.nodes) == installer.failAt {
+	position := len(installer.nodes)
+	if installer.failAt != 0 && position == installer.failAt ||
+		installer.failFrom != 0 && position >= installer.failFrom {
 		return errors.New("injected install failure")
 	}
 	return nil
+}
+
+type gatewayTestNodeRecordReader struct{ records []gateway.NodeRecord }
+
+func (reader gatewayTestNodeRecordReader) ListNodes(context.Context) ([]gateway.NodeRecord, error) {
+	return reader.records, nil
+}
+
+type gatewayTestEnrollmentInstaller struct {
+	nodes  []rafttransport.NodeID
+	failAt int
+}
+
+func (installer *gatewayTestEnrollmentInstaller) EnrollMember(
+	_ context.Context, node rafttransport.NodeID, _ rafttransport.EnrollmentIntent,
+) (rafttransport.EnrollmentAck, error) {
+	installer.nodes = append(installer.nodes, node)
+	if installer.failAt != 0 && len(installer.nodes) == installer.failAt {
+		return rafttransport.EnrollmentAck{}, errors.New("injected enrollment failure")
+	}
+	return rafttransport.EnrollmentAck{}, nil
 }
 
 type gatewayTestMembershipApplier struct{ calls int }
@@ -72,14 +96,27 @@ func TestGatewayGrantedMembershipInstallsEveryPeerBeforeProposal(t *testing.T) {
 	grant, route, request := gatewayMembershipFixture()
 	installer := new(gatewayTestGrantInstaller)
 	applier := new(gatewayTestMembershipApplier)
+	nodes := gatewayTestNodeRecordReader{records: []gateway.NodeRecord{
+		{NodeID: rafttransport.NodeID(grant.TargetNode), Incarnation: 1, Revision: 1,
+			DataAddress: "127.0.0.1:1", Lifecycle: gateway.NodeActive},
+	}}
+	enroller := new(gatewayTestEnrollmentInstaller)
 	client := gatewayGrantedMembershipClient{grants: gatewayTestGrantSource{grant},
-		installer: installer, applier: applier}
+		installer: installer, applier: applier, nodes: nodes, enroller: enroller}
 	if _, err := client.ApplyMembership(t.Context(), route, request); err != nil {
 		t.Fatal(err)
 	}
-	want := []rafttransport.NodeID{{1}, {2}, {3}, {4}}
+	// AddLearner is voters-only: the enrolled empty target has no group
+	// authority yet. The target becomes a known peer via the enrollment
+	// fanout checked separately below, and receives the grant on the next
+	// membership action after RegisterExecutionGroup.
+	want := []rafttransport.NodeID{{1}, {2}, {3}}
 	if !slices.Equal(installer.nodes, want) || applier.calls != 1 {
 		t.Fatalf("installed=%v apply=%d", installer.nodes, applier.calls)
+	}
+	wantEnrolled := []rafttransport.NodeID{{1}, {2}, {3}}
+	if !slices.Equal(enroller.nodes, wantEnrolled) {
+		t.Fatalf("enrolled=%v", enroller.nodes)
 	}
 	installer.nodes = nil
 	installer.failAt = 3
@@ -87,9 +124,23 @@ func TestGatewayGrantedMembershipInstallsEveryPeerBeforeProposal(t *testing.T) {
 		t.Fatalf("one failed voter err=%v apply=%d", err, applier.calls)
 	}
 	installer.nodes = nil
-	installer.failAt = 4
+	installer.failAt = 0
+	installer.failFrom = 2
 	if _, err := client.ApplyMembership(t.Context(), route, request); err == nil || applier.calls != 2 {
-		t.Fatalf("missing target grant err=%v apply=%d", err, applier.calls)
+		t.Fatalf("quorum not reached but proposal still applied err=%v apply=%d", err, applier.calls)
+	}
+	enroller.nodes = nil
+	enroller.failAt = 1
+	installer.nodes = nil
+	installer.failAt = 0
+	installer.failFrom = 0
+	if _, err := client.ApplyMembership(t.Context(), route, request); err != nil || applier.calls != 3 {
+		t.Fatalf("retiring replica enrollment is optional err=%v apply=%d enrolled=%v", err, applier.calls, enroller.nodes)
+	}
+	enroller.nodes = nil
+	enroller.failAt = 3
+	if _, err := client.ApplyMembership(t.Context(), route, request); err == nil || applier.calls != 3 {
+		t.Fatalf("snapshot donor enrollment skipped err=%v apply=%d enrolled=%v", err, applier.calls, enroller.nodes)
 	}
 }
 
@@ -335,5 +386,35 @@ func TestGatewayShardControlOpenerBoundsAndReleasesAuthenticatedStreams(t *testi
 	if failed == nil || !failed.closed.Load() || len(opener.slots) != 0 {
 		t.Fatalf("failed TLS transport retained: connection=%v closed=%t slots=%d",
 			failed, failed != nil && failed.closed.Load(), len(opener.slots))
+	}
+}
+
+func TestGatewaySnapshotBootstrapIgnoresShortRPCDeadline(t *testing.T) {
+	parent, stopParent := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer stopParent()
+	ctx, cancel := gatewaySnapshotBootstrapContext(parent)
+	defer cancel()
+	time.Sleep(50 * time.Millisecond)
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("parent RPC deadline cancelled snapshot bootstrap: %v", err)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || time.Until(deadline) < time.Minute {
+		t.Fatalf("snapshot bootstrap deadline=%v remaining=%v ok=%v", deadline, time.Until(deadline), ok)
+	}
+}
+
+func TestGatewaySnapshotBootstrapStopsOnParentCancel(t *testing.T) {
+	parent, stopParent := context.WithCancel(t.Context())
+	ctx, cancel := gatewaySnapshotBootstrapContext(parent)
+	defer cancel()
+	stopParent()
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("cause=%v err=%v", context.Cause(ctx), ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled parent did not stop snapshot bootstrap")
 	}
 }

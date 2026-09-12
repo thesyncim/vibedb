@@ -66,9 +66,21 @@ func WaitWithTimer(ctx context.Context, delay time.Duration, wake <-chan struct{
 // TLS dialer closes every returned connection that fails authentication.
 type RawPeerDialFunc func(ctx context.Context, node NodeID) (net.Conn, error)
 
+// RawPeerEndpointDialFunc opens one raw stream using an address from the
+// authenticated physical-peer directory.  The node identity is still passed
+// separately and must match the TLS leaf certificate.
+type RawPeerEndpointDialFunc func(ctx context.Context, node NodeID, endpoint string) (net.Conn, error)
+
 // OrdinaryDialer opens only the ordinary Raft traffic class.
 type OrdinaryDialer interface {
 	DialOrdinary(ctx context.Context, node NodeID) (PeerConnection, error)
+}
+
+// OrdinaryEndpointDialer is optional.  When implemented, transport resolves
+// the address from its current physical-peer directory on each reconnect;
+// callers that already resolve NodeID externally may keep OrdinaryDialer.
+type OrdinaryEndpointDialer interface {
+	DialOrdinaryEndpoint(ctx context.Context, node NodeID, endpoint string) (PeerConnection, error)
 }
 
 // SnapshotStreamOpener is the separate capability reserved for snapshot data.
@@ -82,6 +94,7 @@ type SnapshotStreamOpener interface {
 type TLSOrdinaryDialer struct {
 	TLS               *PeerTLS
 	Dial              RawPeerDialFunc
+	DialEndpoint      RawPeerEndpointDialFunc
 	HandshakeDeadline DeadlineFunc
 }
 
@@ -105,6 +118,33 @@ func (dialer TLSOrdinaryDialer) DialOrdinary(
 	return dialer.TLS.Client(
 		ctx, raw, node, TrafficOrdinary, dialer.HandshakeDeadline,
 	)
+}
+
+// DialOrdinaryEndpoint implements OrdinaryEndpointDialer when the caller
+// supplied an address-aware raw connector.  It falls back to the existing
+// NodeID resolver so adding a directory does not force a deployment change.
+func (dialer TLSOrdinaryDialer) DialOrdinaryEndpoint(
+	ctx context.Context,
+	node NodeID,
+	endpoint string,
+) (PeerConnection, error) {
+	if dialer.DialEndpoint == nil {
+		return dialer.DialOrdinary(ctx, node)
+	}
+	if ctx == nil || dialer.TLS == nil || node == (NodeID{}) || endpoint == "" {
+		return nil, ErrInvalidTransport
+	}
+	raw, err := dialer.DialEndpoint(ctx, node, endpoint)
+	if err != nil {
+		if raw != nil {
+			_ = raw.Close()
+		}
+		return nil, err
+	}
+	if raw == nil {
+		return nil, ErrInvalidTransport
+	}
+	return dialer.TLS.Client(ctx, raw, node, TrafficOrdinary, dialer.HandshakeDeadline)
 }
 
 // TLSSnapshotStreamOpener authenticates a distinct raw connector as snapshot
@@ -216,6 +256,11 @@ func (receiver *OrdinaryReceiver) Serve(
 		_ = connection.Close()
 		return ErrInvalidTransport
 	}
+	if err := receiver.registry.VerifyPeerConnectionBinding(connection); err != nil &&
+		!errors.Is(err, ErrPeerUnauthorized) {
+		_ = connection.Close()
+		return err
+	}
 	defer connection.Close()
 	stopCancellation := context.AfterFunc(ctx, func() { _ = connection.Close() })
 	defer stopCancellation()
@@ -230,6 +275,14 @@ func (receiver *OrdinaryReceiver) Serve(
 			return ErrInvalidTransport
 		}
 		if err := connection.SetReadDeadline(deadline); err != nil {
+			return err
+		}
+		// A PeerConnection may be held by a pooled service adapter while the
+		// control directory rotates a node's certificate. Revalidate the leaf
+		// binding for every frame so an already-open stream cannot outlive the
+		// committed physical incarnation.
+		if err := receiver.registry.VerifyPeerConnectionBinding(connection); err != nil &&
+			!errors.Is(err, ErrPeerUnauthorized) {
 			return err
 		}
 		read, err := io.ReadFull(connection, header[:])

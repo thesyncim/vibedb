@@ -202,6 +202,7 @@ type ownerRequest struct {
 	install             ExecutionGroup
 	pointReadSlot       *pointReadViewSlot
 	publish             func()
+	registryChange      func(func(func()) error) error
 	database            *sqldriver.Database
 	apply               *sqldriver.ReplicatedApply
 	schemaSQL           sqldriver.ReplicatedShardStoreIdentity
@@ -838,6 +839,18 @@ type MembershipAuthority interface {
 	PublishCommittedAuthority(raftmember.GroupKey, uint64, *pb.ConfState) error
 	PublishDurablePromotion(raftmember.GroupKey, raftmember.DurablePromotionProof) error
 	ClearDurablePromotion(raftmember.GroupKey) error
+}
+
+// Configuration replay is optional for hosts and authority implementations
+// that retain the original membership-publication contract.
+type configurationReplayHost interface {
+	ConfigurationReplay(raftmember.GroupKey) (raftmember.CommittedConfigurationReplay, error)
+}
+
+type configurationReplayAuthority interface {
+	PublishCommittedAuthorityWithReplay(
+		raftmember.GroupKey, uint64, *pb.ConfState, raftmember.CommittedConfigurationReplay,
+	) error
 }
 
 type ownerMember struct {
@@ -1554,9 +1567,28 @@ func (owner *Owner) syncMembershipAuthority(group raftmember.GroupKey) error {
 	if err != nil {
 		return err
 	}
-	if err := owner.authority.PublishCommittedAuthority(
-		group, publication.ReplicaSetVersion, publication.ConfState,
-	); err != nil {
+	replayHost, hasReplayHost := owner.host.(configurationReplayHost)
+	replayAuthority, hasReplayAuthority := owner.authority.(configurationReplayAuthority)
+	if hasReplayHost && hasReplayAuthority {
+		replay, replayErr := replayHost.ConfigurationReplay(group)
+		if replayErr != nil {
+			return replayErr
+		}
+		if replay != nil {
+			err = replayAuthority.PublishCommittedAuthorityWithReplay(
+				group, publication.ReplicaSetVersion, publication.ConfState, replay,
+			)
+		} else {
+			err = owner.authority.PublishCommittedAuthority(
+				group, publication.ReplicaSetVersion, publication.ConfState,
+			)
+		}
+	} else {
+		err = owner.authority.PublishCommittedAuthority(
+			group, publication.ReplicaSetVersion, publication.ConfState,
+		)
+	}
+	if err != nil {
 		return err
 	}
 	grant, grantFound, err := owner.authority.CurrentTransitionGrant(group)
@@ -1786,11 +1818,13 @@ func (owner *Owner) handle(request ownerRequest) error {
 	case requestReplicaRetirement:
 		reply.err = owner.retireReplica(request)
 	case requestInstallExecutionGroup:
-		reply.err = owner.installExecutionGroupNow(request.install, request.pointReadSlot, request.publish)
+		reply.err = request.registryChange(func(publish func()) error {
+			return owner.installExecutionGroupNow(request.install, request.pointReadSlot, publish)
+		})
 	case requestRemoveExecutionGroup:
-		reply.err = owner.removeExecutionGroupNow(
-			request.group, request.install.Identity, request.publish,
-		)
+		reply.err = request.registryChange(func(withdraw func()) error {
+			return owner.removeExecutionGroupNow(request.group, request.install.Identity, withdraw)
+		})
 	case requestObserveSchemaTransition:
 		_, reply.committed, reply.err = owner.host.ObserveSchemaTransition(
 			request.group, request.data,
@@ -2141,8 +2175,8 @@ func validExecutionGroup(group ExecutionGroup) bool {
 // enqueued it waits for the serialized owner even if a caller would otherwise
 // abandon its context; returning outcome-unknown here could leak an adopted
 // Runtime whose ownership the caller still believes it retains.
-func (owner *Owner) installExecutionGroup(group ExecutionGroup, pointReadSlot *pointReadViewSlot, publish func()) error {
-	if owner == nil || publish == nil || !validExecutionGroup(group) {
+func (owner *Owner) installExecutionGroup(group ExecutionGroup, pointReadSlot *pointReadViewSlot, change func(func(func()) error) error) error {
+	if owner == nil || change == nil || !validExecutionGroup(group) {
 		return ErrInvalidOwner
 	}
 	if pointReadSlot == nil {
@@ -2151,7 +2185,7 @@ func (owner *Owner) installExecutionGroup(group ExecutionGroup, pointReadSlot *p
 	reply := make(chan ownerReply, 1)
 	if err := owner.publish(ownerRequest{
 		kind: requestInstallExecutionGroup, group: group.Identity.Group,
-		install: group, pointReadSlot: pointReadSlot, publish: publish, reply: reply,
+		install: group, pointReadSlot: pointReadSlot, registryChange: change, reply: reply,
 	}); err != nil {
 		return err
 	}
@@ -2180,15 +2214,15 @@ func (owner *Owner) installExecutionGroupNow(group ExecutionGroup, pointReadSlot
 	return nil
 }
 
-func (owner *Owner) removeExecutionGroup(identity raftmember.RuntimeIdentity, withdraw func()) error {
+func (owner *Owner) removeExecutionGroup(identity raftmember.RuntimeIdentity, change func(func(func()) error) error) error {
 	group := identity.Group
-	if owner == nil || group == (raftmember.GroupKey{}) || withdraw == nil {
+	if owner == nil || group == (raftmember.GroupKey{}) || change == nil {
 		return ErrInvalidOwner
 	}
 	reply := make(chan ownerReply, 1)
 	if err := owner.publish(ownerRequest{
 		kind: requestRemoveExecutionGroup, group: group,
-		install: ExecutionGroup{Identity: identity}, publish: withdraw, reply: reply,
+		install: ExecutionGroup{Identity: identity}, registryChange: change, reply: reply,
 	}); err != nil {
 		return err
 	}
@@ -3741,6 +3775,24 @@ func (owner *Owner) notifyTransfer() {
 	}
 }
 
+// enqueueDefinite honors cancellation before admission, then waits for the
+// serialized owner's result. Local control operations that close or adopt SQL
+// handles must not return an unknown outcome after changing handle ownership.
+func (owner *Owner) enqueueDefinite(ctx context.Context, request ownerRequest) error {
+	if ctx == nil {
+		return ErrInvalidOwner
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	request.reply = make(chan ownerReply, 1)
+	if err := owner.publish(request); err != nil {
+		return err
+	}
+	result := <-request.reply
+	return result.err
+}
+
 func (owner *Owner) enqueue(ctx context.Context, request ownerRequest) (ownerReply, error) {
 	if ctx == nil {
 		return ownerReply{}, ErrInvalidOwner
@@ -4112,6 +4164,7 @@ func (owner *Owner) ObserveSchemaTransition(
 // QuiesceSchemaGeneration fences new reads and proposals after the ordered
 // schema transition has settled, drains every escaped read pin, and releases
 // only this group's SQL generation while retaining its live Raft member.
+// Once admitted, it waits for the owner to finish even if ctx is canceled.
 func (owner *Owner) QuiesceSchemaGeneration(
 	ctx context.Context,
 	fence ServingFence,
@@ -4122,16 +4175,16 @@ func (owner *Owner) QuiesceSchemaGeneration(
 		return ErrInvalidOwner
 	}
 	owned := append([]byte(nil), command...)
-	_, err := owner.enqueue(ctx, ownerRequest{
+	return owner.enqueueDefinite(ctx, ownerRequest{
 		kind: requestQuiesceSchemaGeneration, group: fence.Group, fence: fence,
-		data: owned, bytes: int64(len(owned)), reply: make(chan ownerReply, 1),
+		data: owned, bytes: int64(len(owned)),
 	})
-	return err
 }
 
 // QuiesceCommittedSchemaGeneration uses the exact applied schema envelope as
 // local generation authority. Unlike a serving Probe, it never asks the
 // intentionally fenced source state machine for a post-transition snapshot.
+// Once admitted, it waits for the owner to finish even if ctx is canceled.
 func (owner *Owner) QuiesceCommittedSchemaGeneration(
 	ctx context.Context, group raftmember.GroupKey, command []byte,
 ) error {
@@ -4140,11 +4193,10 @@ func (owner *Owner) QuiesceCommittedSchemaGeneration(
 		return ErrInvalidOwner
 	}
 	owned := append([]byte(nil), command...)
-	_, err := owner.enqueue(ctx, ownerRequest{
+	return owner.enqueueDefinite(ctx, ownerRequest{
 		kind: requestQuiesceSchemaGeneration, group: group, data: owned,
-		bytes: int64(len(owned)), reply: make(chan ownerReply, 1),
+		bytes: int64(len(owned)),
 	})
-	return err
 }
 
 func (owner *Owner) FenceCommittedSchemaGeneration(
@@ -4163,6 +4215,8 @@ func (owner *Owner) FenceCommittedSchemaGeneration(
 // InstallSchemaGeneration publishes target SQL handles into one already
 // quiesced group. Success resumes the same Raft member with a new serving
 // generation; failure transfers no ownership and leaves the group fenced.
+// Cancellation is honored before admission. Once admitted, this waits for the
+// owner's definite result so the caller cannot close handles adopted later.
 func (owner *Owner) InstallSchemaGeneration(
 	ctx context.Context,
 	group raftmember.GroupKey,
@@ -4175,12 +4229,10 @@ func (owner *Owner) InstallSchemaGeneration(
 		database == nil || apply == nil {
 		return ErrInvalidOwner
 	}
-	_, err := owner.enqueue(ctx, ownerRequest{
+	return owner.enqueueDefinite(ctx, ownerRequest{
 		kind: requestInstallSchemaGeneration, group: group,
 		database: database, apply: apply, schemaSQL: expectedSQL, schemaApply: expectedApply,
-		reply: make(chan ownerReply, 1),
 	})
-	return err
 }
 
 // RetireReplicaSource permanently fences the local member before removing its

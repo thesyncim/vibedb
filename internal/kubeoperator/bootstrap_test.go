@@ -2,8 +2,14 @@ package kubeoperator
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
+	"fmt"
+	"github.com/thesyncim/vibedb/gateway"
 	"os"
 	"path/filepath"
 	"strings"
@@ -93,6 +99,7 @@ func TestBootstrapCreatesCanonicalResumableRF3Authority(t *testing.T) {
 		!bytes.Contains(first.Bytes(), []byte("name: vibedb-qualification-client-tls")) {
 		t.Fatalf("bootstrap result=%+v bytes=%d", result, first.Len())
 	}
+	verifyBootstrapProvisioning(t, first.Bytes())
 	seen := map[string]struct{}{result.GatewayNodeID: {}, result.ClientNodeID: {}}
 	for _, node := range result.ShardNodeIDs {
 		if len(node) != 32 {
@@ -259,4 +266,84 @@ func TestBootstrapRejectsUnsafeAuthorityDirectory(t *testing.T) {
 			t.Fatalf("symlink err=%v", err)
 		}
 	})
+}
+
+func verifyBootstrapProvisioning(t *testing.T, bundle []byte) {
+	t.Helper()
+	documents := make(map[string][]byte)
+	for _, line := range strings.Split(string(bundle), "\n") {
+		if !strings.HasPrefix(line, "  ") {
+			continue
+		}
+		key, value, ok := strings.Cut(strings.TrimSpace(line), ": ")
+		if !ok {
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(value)
+		if err == nil {
+			documents[key] = raw
+		}
+	}
+	var directory []gateway.NodeRecord
+	if err := vibejson.Unmarshal(documents["initial-node-directory.vibejson"], &directory); err != nil || len(directory) != 9 {
+		t.Fatalf("initial directory: %d records: %v", len(directory), err)
+	}
+	for _, record := range directory {
+		if !record.Valid() {
+			t.Fatal("invalid generated directory record")
+		}
+	}
+	catalogPath := filepath.Join(t.TempDir(), "catalog.vibejson")
+	if err := os.WriteFile(catalogPath, documents["cluster.vibejson"], 0600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := gateway.LoadSnapshot(catalogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, descriptor := range snapshot.ReplicatedShardDescriptors() {
+		for _, replica := range descriptor.Replicas {
+			found := false
+			for _, record := range directory {
+				if record.NodeID == replica.Node {
+					found = record.Incarnation == replica.NodeIncarnation && record.DataEndpoint == replica.Endpoint && record.NativeEndpoint == replica.NativeEndpoint && record.ControlEndpoint == replica.ControlEndpoint
+				}
+			}
+			if !found {
+				t.Fatal("directory and serving catalog identify different physical endpoints")
+			}
+		}
+	}
+	for _, role := range []string{"catalog", "ledger", "data"} {
+		for member := 0; member < 3; member++ {
+			var manifest bootstrapPrepare
+			if err := vibejson.Unmarshal(documents[fmt.Sprintf("%s-%d.vibejson", role, member)], &manifest); err != nil {
+				t.Fatal(err)
+			}
+			if len(manifest.TLS.PeerKeys) != 3 {
+				t.Fatal("missing initial certificate pins")
+			}
+			for _, peer := range manifest.Members {
+				certPEM := documents[fmt.Sprintf("%s-%d-cert.pem", role, peer.MemberID-1)]
+				block, _ := pem.Decode(certPEM)
+				if block == nil {
+					t.Fatal("missing peer certificate")
+				}
+				certificate, err := x509.ParseCertificate(block.Bytes)
+				if err != nil {
+					t.Fatal(err)
+				}
+				digest := sha256.Sum256(certificate.RawSubjectPublicKeyInfo)
+				found := false
+				for _, pin := range manifest.TLS.PeerKeys {
+					if pin.NodeID == peer.NodeID {
+						found = pin.KeyDigest == hex.EncodeToString(digest[:])
+					}
+				}
+				if !found {
+					t.Fatal("manifest pin does not match the issued peer certificate")
+				}
+			}
+		}
+	}
 }

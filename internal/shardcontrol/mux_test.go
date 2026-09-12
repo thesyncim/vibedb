@@ -34,6 +34,7 @@ type testConnection struct {
 func (connection *testConnection) PeerIdentity() rafttransport.PeerIdentity {
 	return rafttransport.PeerIdentity{}
 }
+func (*testConnection) PeerKeyDigest() [32]byte                             { return [32]byte{} }
 func (connection *testConnection) TrafficClass() rafttransport.TrafficClass { return connection.class }
 
 func TestMuxDispatchesAndReplaysExactDiscriminator(t *testing.T) {

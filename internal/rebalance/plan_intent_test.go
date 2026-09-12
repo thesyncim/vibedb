@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestPlanIntentCanonicalRestartRoundTripAndBounds(t *testing.T) {
@@ -187,6 +188,82 @@ func TestReplicaMoveJournalRetainsRetiringReplicaAcrossBothCatalogCuts(t *testin
 				raftmodel.Publication{Applied: 11, ReplicaSetVersion: 11, ConfState: bound.removedConf},
 				certificate); !errors.Is(openErr, ErrPlanIntent) {
 				t.Fatalf("invalid old/forged identity error = %v", openErr)
+			}
+		})
+	}
+}
+
+func TestOwnedPlanIntentRecoversAcrossUnrelatedHeadPublications(t *testing.T) {
+	cut := failedReplicaEnrolledTestCut(t)
+	planned, err := PlanFailedReplicaReplacement(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := AppendPlanIntent(nil, cut.Catalog, planned.Plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanced := advanceOwnedTestHead(t, cut.Catalog, cut.Catalog.Generation()+10)
+	for name, conf := range map[string]*pb.ConfState{
+		"before learner admission": planned.Plan.initialConf,
+		"after learner admission":  planned.Plan.learnerConf,
+	} {
+		t.Run(name, func(t *testing.T) {
+			publication := raftmodel.Publication{Applied: 40, ReplicaSetVersion: 40, ConfState: conf}
+			recovered, err := OpenPlanIntent(raw, advanced, publication)
+			if err != nil {
+				t.Fatalf("unrelated catalog publication stranded full restart image: %v", err)
+			}
+			if recovered.OperationID() != planned.Operation || recovered.CatalogGeneration() != cut.Catalog.Generation() {
+				t.Fatal("recovery changed immutable operation provenance")
+			}
+			if !bytes.Equal(recovered.failureAuthorization, planned.Plan.failureAuthorization) {
+				t.Fatal("recovery dropped failed replica authorization")
+			}
+			reencoded, err := AppendPlanIntent(nil, advanced, recovered)
+			if err != nil || !bytes.Equal(raw, reencoded) {
+				t.Fatalf("canonical full restart image changed: %v", err)
+			}
+		})
+	}
+}
+
+func TestOwnedReplicaMoveIntentRejectsUnrelatedSnapshotAndRegressedPublication(t *testing.T) {
+	cut := failedReplicaEnrolledTestCut(t)
+	planned, err := PlanFailedReplicaReplacement(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := bindMoveTestPlan(planned.Plan)
+	base := replicatedstate.SnapshotBaseCertificate{
+		Manifest: replicatedstate.SnapshotArtifactManifest{State: bound.baseState},
+		Digest:   bound.baseDigest,
+	}
+	publication := raftmodel.Publication{Applied: 40, ReplicaSetVersion: 40, ConfState: planned.Plan.learnerConf}
+	for name, change := range map[string]func(*replicatedstate.SnapshotBaseCertificate, *raftmodel.Publication){
+		"previous learner": func(certificate *replicatedstate.SnapshotBaseCertificate, _ *raftmodel.Publication) {
+			certificate.Manifest.State.ConfState.Learners = []uint64{planned.Plan.TargetMember() + 1}
+		},
+		"different group": func(certificate *replicatedstate.SnapshotBaseCertificate, _ *raftmodel.Publication) {
+			certificate.Manifest.State.Binding.GroupID[0] ^= 1
+		},
+		"different source fence": func(certificate *replicatedstate.SnapshotBaseCertificate, _ *raftmodel.Publication) {
+			certificate.Manifest.State.Binding.RouteGeneration++
+		},
+		"publication precedes snapshot": func(_ *replicatedstate.SnapshotBaseCertificate, publication *raftmodel.Publication) {
+			publication.Applied = bound.baseState.Applied - 1
+			publication.ReplicaSetVersion = bound.baseState.ReplicaSetVersion
+		},
+		"replica set precedes snapshot": func(_ *replicatedstate.SnapshotBaseCertificate, publication *raftmodel.Publication) {
+			publication.ReplicaSetVersion = bound.baseState.ReplicaSetVersion - 1
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			certificate, observed := base, publication
+			certificate.Manifest.State.ConfState = proto.Clone(base.Manifest.State.ConfState).(*pb.ConfState)
+			change(&certificate, &observed)
+			if _, err := OpenReplicaMoveIntent(planned.Intent, cut.Catalog, observed, &certificate); !errors.Is(err, ErrPlanIntent) {
+				t.Fatalf("invalid recovery certificate accepted: %v", err)
 			}
 		})
 	}

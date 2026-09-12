@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
@@ -22,6 +24,55 @@ import (
 )
 
 var errGatewayReplicaControl = errors.New("vibedb-gateway: invalid replica control configuration")
+
+// gatewayReplicaSnapshotTimeout bounds learner snapshot bootstrap. Generic
+// replica-control RPCs, including source-export prepare, stay on the short
+// manifest read timeout so a down peer cannot stall health/observe rounds or
+// hot-split p99 for minutes.
+const gatewayReplicaSnapshotTimeout = 2 * time.Minute
+
+func gatewayReplicaSnapshotDeadline() time.Time {
+	return time.Now().Add(gatewayReplicaSnapshotTimeout)
+}
+
+// gatewaySnapshotBootstrapContext keeps learner install on the snapshot budget
+// even when the replica-move controller inherited a short RPC deadline. Process
+// shutdown still cancels the attempt.
+func gatewaySnapshotBootstrapContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		return nil, func() {}
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), gatewayReplicaSnapshotTimeout)
+	stop := context.AfterFunc(parent, func() {
+		if errors.Is(context.Cause(parent), context.Canceled) {
+			cancel()
+		}
+	})
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+type gatewaySnapshotBootstrapClient struct {
+	inner *snapshottransfer.BootstrapControlClient
+}
+
+func (client gatewaySnapshotBootstrapClient) Execute(
+	ctx context.Context,
+	target rafttransport.NodeID,
+	request snapshottransfer.BootstrapRequest,
+) (snapshottransfer.BootstrapRecord, error) {
+	if client.inner == nil {
+		return snapshottransfer.BootstrapRecord{}, snapshottransfer.ErrBootstrapControl
+	}
+	if ctx == nil {
+		return client.inner.Execute(ctx, target, request)
+	}
+	ctx, cancel := gatewaySnapshotBootstrapContext(ctx)
+	defer cancel()
+	return client.inner.Execute(ctx, target, request)
+}
 
 type gatewayReplicaRemoteClientOptions struct {
 	Opener        *gatewayShardControlOpener
@@ -80,21 +131,26 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 	}
 	var request rebalance.MoveRequest
 	var sourceGeneration uint64
+	var transitionKey gateway.GroupTransitionKey
 	if initial != nil {
 		if initial.OperationID() != operation {
 			return rebalance.ReplicatedMoveCut{}, errGatewayReplicaControl
 		}
 		request, sourceGeneration = initial.Request(), initial.CatalogGeneration()
+		if intent, ok := initial.TransitionIntent(); ok {
+			transitionKey = intent.Key
+		}
 	} else {
 		identity, err := rebalance.InspectReplicaMoveIntent(record.Intent)
 		if err != nil || identity.Operation != operation {
 			return rebalance.ReplicatedMoveCut{}, errors.Join(err, errGatewayReplicaControl)
 		}
 		request, sourceGeneration = identity.Request, identity.SourceGeneration
+		transitionKey = identity.TransitionKey
 	}
 	catalog, err := observer.authority.Read(ctx)
 	if err != nil || catalog == nil || catalog.Generation() < sourceGeneration ||
-		catalog.Generation() > sourceGeneration+2 {
+		(!transitionKey.Valid() && catalog.Generation() > sourceGeneration+2) {
 		return rebalance.ReplicatedMoveCut{}, errors.Join(err, errGatewayReplicaControl)
 	}
 	route, err := resolveGatewayReplicaMoveRoute(catalog, request)
@@ -124,7 +180,13 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 			leader, leaderFound = candidate, true
 			break
 		}
-		observeErrors = errors.Join(observeErrors, observeErr)
+		if observeErr != nil {
+			observeErrors = errors.Join(observeErrors, fmt.Errorf("observe move member %d: %w", endpoint.Member, observeErr))
+		} else {
+			observeErrors = errors.Join(observeErrors, fmt.Errorf("observe move member %d: member=%d leader=%d term=%d replica-set=%d minimum=%d: %w",
+				endpoint.Member, candidate.Status.MemberID, candidate.Status.LeaderID, candidate.Status.Term,
+				candidate.Publication.ReplicaSetVersion, minimumReplicaSet, errGatewayReplicaControl))
+		}
 	}
 	if !leaderFound {
 		return rebalance.ReplicatedMoveCut{}, errors.Join(observeErrors, errGatewayReplicaControl)
@@ -138,6 +200,17 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 		TargetStatus: target.Status, TargetState: target.State,
 		TargetProgress: leader.Progress, ProgressFound: leader.ProgressFound,
 	}}
+	if transitionKey.Valid() {
+		reader, ok := observer.authority.(gateway.GroupTransitionReceiptReader)
+		if !ok {
+			return rebalance.ReplicatedMoveCut{}, gateway.ErrGroupTransition
+		}
+		receipt, found, err := reader.ReadGroupPublicationReceipt(ctx, transitionKey)
+		if err != nil {
+			return rebalance.ReplicatedMoveCut{}, err
+		}
+		cut.TransitionReceipt, cut.TransitionReceiptFound = receipt, found
+	}
 	if target.SnapshotBase != nil {
 		cut.SnapshotBase = target.SnapshotBase
 	} else {
@@ -155,12 +228,24 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 			cut.DrainedCatalogGeneration = catalog.Generation()
 		}
 	}
-	if catalog.Generation() == sourceGeneration+2 {
+	if (!transitionKey.Valid() && catalog.Generation() == sourceGeneration+2) || (cut.TransitionReceiptFound && cut.TransitionReceipt.Phase >= gateway.TransitionPhasePostRemove) {
 		_, grantFound, grantErr := observer.authority.ReadMembershipGrant(ctx, request.Group)
 		if grantErr != nil {
 			return rebalance.ReplicatedMoveCut{}, grantErr
 		}
 		cut.RetiringReplicaRetired = !grantFound
+		if !grantFound && transitionKey.Valid() {
+			reader, ok := observer.authority.(interface {
+				DistributionTransitionReleased(context.Context, gateway.GroupTransitionKey) (bool, error)
+			})
+			if !ok {
+				return rebalance.ReplicatedMoveCut{}, gateway.ErrGroupTransition
+			}
+			cut.RetiringReplicaRetired, grantErr = reader.DistributionTransitionReleased(ctx, transitionKey)
+			if grantErr != nil {
+				return rebalance.ReplicatedMoveCut{}, grantErr
+			}
+		}
 	}
 	return cut, nil
 }
@@ -282,6 +367,13 @@ func newGatewayReplicaRemoteClients(
 	if err != nil {
 		return gatewayReplicaMoveControls{}, err
 	}
+	capacity, err := replicacontrol.NewCapacityClient(replicacontrol.ClientOptions{
+		Opener: options.Opener, ReadDeadline: options.ReadDeadline,
+		WriteDeadline: options.WriteDeadline,
+	})
+	if err != nil {
+		return gatewayReplicaMoveControls{}, err
+	}
 	if options.Routes == nil {
 		options.Routes = gatewayReplicaMoveRouteResolver{catalog: options.Authority, observer: observations}
 	}
@@ -304,8 +396,8 @@ func newGatewayReplicaRemoteClients(
 		return gatewayReplicaMoveControls{}, err
 	}
 	bootstrap, err := snapshottransfer.NewBootstrapControlClient(snapshottransfer.BootstrapControlClientOptions{
-		Opener: options.Opener, ReadDeadline: options.ReadDeadline,
-		WriteDeadline: options.WriteDeadline,
+		Opener: options.Opener, ReadDeadline: gatewayReplicaSnapshotDeadline,
+		WriteDeadline: gatewayReplicaSnapshotDeadline,
 	})
 	if err != nil {
 		return gatewayReplicaMoveControls{}, err
@@ -316,14 +408,23 @@ func newGatewayReplicaRemoteClients(
 	if err != nil {
 		return gatewayReplicaMoveControls{}, err
 	}
+	enroller, err := rafttransport.NewEnrollmentControlClient(rafttransport.EnrollmentControlClientOptions{
+		Opener: options.Opener, ReadDeadline: options.ReadDeadline, WriteDeadline: options.WriteDeadline,
+	})
+	if err != nil {
+		return gatewayReplicaMoveControls{}, err
+	}
 	remote := &gatewayReplicaRemoteActions{observer: observations, actions: actions,
-		routes: options.Routes, native: options.Replicated}
+		routes: options.Routes, native: options.Replicated,
+		grants: options.Authority, grantInstaller: grantInstaller}
 	return gatewayReplicaMoveControls{
-		Observer: options.Observer, HealthObservations: observations,
-		GrantInstaller: grantInstaller, Routes: options.Routes,
+		Observer: options.Observer, HealthObservations: observations, Capacity: capacity,
+		GrantInstaller: grantInstaller, Enroller: enroller, Routes: options.Routes,
 		Membership: gatewayGrantedMembershipClient{grants: options.Authority,
-			installer: grantInstaller, applier: options.Replicated},
-		Snapshots: source, Bootstrap: bootstrap, Awaiter: remote, Ownership: remote,
+			installer: grantInstaller, applier: options.Replicated,
+			nodes: options.Authority, enroller: enroller},
+		Snapshots: source, Bootstrap: gatewaySnapshotBootstrapClient{inner: bootstrap},
+		Awaiter: remote, Ownership: remote,
 		Drainer: options.Drainer, Retirement: remote,
 	}, nil
 }
@@ -333,11 +434,20 @@ func newGatewayReplicaRemoteClients(
 // construction and the semaphore is held until the authenticated stream is
 // closed, so stalled peers cannot evade the configured connection bound.
 type gatewayShardControlOpener struct {
+	mu        sync.RWMutex
 	tls       *rafttransport.PeerTLS
 	deadline  rafttransport.DeadlineFunc
 	dial      func(context.Context, string) (net.Conn, error)
 	addresses map[rafttransport.NodeID]string
+	members   map[gatewayReplicaControlIdentity]string
+	current   map[rafttransport.NodeID]uint64
+	revision  uint64
 	slots     chan struct{}
+}
+
+type gatewayReplicaControlIdentity struct {
+	node        rafttransport.NodeID
+	incarnation uint64
 }
 
 func newGatewayShardControlOpener(
@@ -352,6 +462,8 @@ func newGatewayShardControlOpener(
 		return nil, errGatewayReplicaControl
 	}
 	addresses := make(map[rafttransport.NodeID]string, len(endpoints))
+	members := make(map[gatewayReplicaControlIdentity]string, len(endpoints))
+	current := make(map[rafttransport.NodeID]uint64, len(endpoints))
 	for _, endpoint := range endpoints {
 		if endpoint.Node == (rafttransport.NodeID{}) || endpoint.ControlAddress == "" {
 			return nil, errGatewayReplicaControl
@@ -360,9 +472,86 @@ func newGatewayShardControlOpener(
 			return nil, errGatewayReplicaControl
 		}
 		addresses[endpoint.Node] = endpoint.ControlAddress
+		if endpoint.NodeIncarnation == 0 {
+			continue
+		}
+		identity := gatewayReplicaControlIdentity{node: endpoint.Node, incarnation: endpoint.NodeIncarnation}
+		if prior, found := members[identity]; found && prior != endpoint.ControlAddress {
+			return nil, errGatewayReplicaControl
+		}
+		members[identity] = endpoint.ControlAddress
+		current[endpoint.Node] = endpoint.NodeIncarnation
 	}
 	return &gatewayShardControlOpener{tls: tls, deadline: deadline, dial: dial,
-		addresses: addresses, slots: make(chan struct{}, maxConnections)}, nil
+		addresses: addresses, members: members, current: current, revision: 1,
+		slots: make(chan struct{}, maxConnections)}, nil
+}
+
+// Update installs a newer certified shard-control directory. Endpoint
+// identities are keyed by node incarnation and old addresses are retained so
+// an in-flight drain or replay can still reach its captured participant. A
+// changed address for an existing identity is rejected rather than silently
+// retargeting an authenticated command.
+func (opener *gatewayShardControlOpener) Update(
+	revision uint64, endpoints []gateway.ReplicatedEndpoint,
+) error {
+	if opener == nil || revision == 0 || len(endpoints) == 0 {
+		return errGatewayReplicaControl
+	}
+	opener.mu.Lock()
+	defer opener.mu.Unlock()
+	if revision < opener.revision {
+		return errGatewayReplicaControl
+	}
+	if revision == opener.revision {
+		for _, endpoint := range endpoints {
+			if endpoint.NodeIncarnation == 0 {
+				if address, found := opener.addresses[endpoint.Node]; !found || address != endpoint.ControlAddress {
+					return errGatewayReplicaControl
+				}
+				continue
+			}
+			identity := gatewayReplicaControlIdentity{node: endpoint.Node, incarnation: endpoint.NodeIncarnation}
+			if address, found := opener.members[identity]; !found || address != endpoint.ControlAddress {
+				return errGatewayReplicaControl
+			}
+		}
+		return nil
+	}
+	for _, endpoint := range endpoints {
+		if endpoint.Node == (rafttransport.NodeID{}) || endpoint.ControlAddress == "" {
+			return errGatewayReplicaControl
+		}
+		if endpoint.NodeIncarnation == 0 {
+			if address, found := opener.addresses[endpoint.Node]; found && address != endpoint.ControlAddress {
+				return errGatewayReplicaControl
+			}
+			continue
+		}
+		identity := gatewayReplicaControlIdentity{node: endpoint.Node, incarnation: endpoint.NodeIncarnation}
+		if prior, found := opener.members[identity]; found && prior != endpoint.ControlAddress {
+			return errGatewayReplicaControl
+		}
+		opener.members[identity] = endpoint.ControlAddress
+		if current, found := opener.current[endpoint.Node]; !found || endpoint.NodeIncarnation >= current {
+			// The exact identity map above is authoritative. The node map is a
+			// fallback for older control clients and follows the newest
+			// incarnation monotonically.
+			opener.addresses[endpoint.Node] = endpoint.ControlAddress
+			opener.current[endpoint.Node] = endpoint.NodeIncarnation
+		}
+	}
+	opener.revision = revision
+	return nil
+}
+
+func (opener *gatewayShardControlOpener) DirectoryRevision() uint64 {
+	if opener == nil {
+		return 0
+	}
+	opener.mu.RLock()
+	defer opener.mu.RUnlock()
+	return opener.revision
 }
 
 func (opener *gatewayShardControlOpener) OpenShardControl(
@@ -371,7 +560,9 @@ func (opener *gatewayShardControlOpener) OpenShardControl(
 	if opener == nil || ctx == nil || node == (rafttransport.NodeID{}) {
 		return nil, errGatewayReplicaControl
 	}
+	opener.mu.RLock()
 	address, found := opener.addresses[node]
+	opener.mu.RUnlock()
 	if !found {
 		return nil, errGatewayReplicaControl
 	}
@@ -405,6 +596,52 @@ func (opener *gatewayShardControlOpener) OpenShardControl(
 	}}, nil
 }
 
+func (opener *gatewayShardControlOpener) OpenShardControlEndpoint(
+	ctx context.Context, endpoint gateway.ReplicatedEndpoint,
+) (rafttransport.PeerConnection, error) {
+	if opener == nil || endpoint.Node == (rafttransport.NodeID{}) || endpoint.NodeIncarnation == 0 || ctx == nil {
+		return nil, errGatewayReplicaControl
+	}
+	opener.mu.RLock()
+	address, found := opener.members[gatewayReplicaControlIdentity{
+		node: endpoint.Node, incarnation: endpoint.NodeIncarnation,
+	}]
+	opener.mu.RUnlock()
+	if !found || address != endpoint.ControlAddress {
+		return nil, errGatewayReplicaControl
+	}
+	return opener.openShardControlAt(ctx, endpoint.Node, address)
+}
+
+func (opener *gatewayShardControlOpener) openShardControlAt(
+	ctx context.Context, node rafttransport.NodeID, address string,
+) (rafttransport.PeerConnection, error) {
+	select {
+	case opener.slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	}
+	raw, err := opener.dial(ctx, address)
+	if err != nil || raw == nil {
+		<-opener.slots
+		if raw != nil {
+			_ = raw.Close()
+		}
+		return nil, errors.Join(err, errGatewayReplicaControl)
+	}
+	connection, err := opener.tls.Client(
+		ctx, raw, node, rafttransport.TrafficShardControl, opener.deadline,
+	)
+	if err != nil {
+		_ = raw.Close()
+		<-opener.slots
+		return nil, err
+	}
+	return &gatewayBoundedPeerConnection{PeerConnection: connection, release: func() {
+		<-opener.slots
+	}}, nil
+}
+
 type gatewayBoundedPeerConnection struct {
 	rafttransport.PeerConnection
 	once    sync.Once
@@ -417,10 +654,14 @@ type gatewayControlEndpoint struct {
 }
 
 type gatewayClusterControlOpener struct {
+	mu        sync.RWMutex
 	tls       *rafttransport.PeerTLS
 	deadline  rafttransport.DeadlineFunc
 	dial      func(context.Context, string) (net.Conn, error)
 	addresses map[rafttransport.NodeID]string
+	members   map[gateway.ClusterCatalogDrainMember]string
+	current   map[rafttransport.NodeID]uint64
+	revision  uint64
 	slots     chan struct{}
 }
 
@@ -436,6 +677,8 @@ func newGatewayClusterControlOpener(
 		return nil, errGatewayReplicaControl
 	}
 	addresses := make(map[rafttransport.NodeID]string, len(endpoints))
+	members := make(map[gateway.ClusterCatalogDrainMember]string, len(endpoints))
+	current := make(map[rafttransport.NodeID]uint64, len(endpoints))
 	for _, endpoint := range endpoints {
 		if endpoint.Member.Node == (rafttransport.NodeID{}) || endpoint.Member.Incarnation == 0 ||
 			endpoint.Address == "" {
@@ -445,9 +688,64 @@ func newGatewayClusterControlOpener(
 			return nil, errGatewayReplicaControl
 		}
 		addresses[endpoint.Member.Node] = endpoint.Address
+		members[endpoint.Member] = endpoint.Address
+		current[endpoint.Member.Node] = endpoint.Member.Incarnation
 	}
 	return &gatewayClusterControlOpener{tls: tls.WithLocalGatewayControlConnections(), deadline: deadline, dial: dial,
-		addresses: addresses, slots: make(chan struct{}, maxConnections)}, nil
+		addresses: addresses, members: members, current: current, revision: 1,
+		slots: make(chan struct{}, maxConnections)}, nil
+}
+
+// Update installs a newer gateway-control directory. Historical member
+// identities remain addressable for an immutable drain fence even when they
+// disappear from the latest catalog cut. Address substitution for an existing
+// incarnation is rejected.
+func (opener *gatewayClusterControlOpener) Update(
+	revision uint64, endpoints []gatewayControlEndpoint,
+) error {
+	if opener == nil || revision == 0 || len(endpoints) == 0 {
+		return errGatewayReplicaControl
+	}
+	opener.mu.Lock()
+	defer opener.mu.Unlock()
+	if revision < opener.revision {
+		return errGatewayReplicaControl
+	}
+	for _, endpoint := range endpoints {
+		if endpoint.Member.Node == (rafttransport.NodeID{}) || endpoint.Member.Incarnation == 0 || endpoint.Address == "" {
+			return errGatewayReplicaControl
+		}
+		if prior, found := opener.members[endpoint.Member]; found && prior != endpoint.Address {
+			return errGatewayReplicaControl
+		}
+		if revision == opener.revision {
+			if _, found := opener.members[endpoint.Member]; !found {
+				return errGatewayReplicaControl
+			}
+			continue
+		}
+	}
+	if revision == opener.revision {
+		return nil
+	}
+	for _, endpoint := range endpoints {
+		opener.members[endpoint.Member] = endpoint.Address
+		if current, found := opener.current[endpoint.Member.Node]; !found || endpoint.Member.Incarnation >= current {
+			opener.addresses[endpoint.Member.Node] = endpoint.Address
+			opener.current[endpoint.Member.Node] = endpoint.Member.Incarnation
+		}
+	}
+	opener.revision = revision
+	return nil
+}
+
+func (opener *gatewayClusterControlOpener) DirectoryRevision() uint64 {
+	if opener == nil {
+		return 0
+	}
+	opener.mu.RLock()
+	defer opener.mu.RUnlock()
+	return opener.revision
 }
 
 func (opener *gatewayClusterControlOpener) OpenGatewayControl(
@@ -456,7 +754,9 @@ func (opener *gatewayClusterControlOpener) OpenGatewayControl(
 	if opener == nil || ctx == nil || node == (rafttransport.NodeID{}) {
 		return nil, errGatewayReplicaControl
 	}
+	opener.mu.RLock()
 	address, found := opener.addresses[node]
+	opener.mu.RUnlock()
 	if !found {
 		return nil, errGatewayReplicaControl
 	}
@@ -477,6 +777,48 @@ func (opener *gatewayClusterControlOpener) OpenGatewayControl(
 		ctx, raw, node, rafttransport.TrafficGatewayControl, opener.deadline,
 	)
 	if err != nil {
+		_ = raw.Close()
+		<-opener.slots
+		return nil, err
+	}
+	return &gatewayBoundedPeerConnection{PeerConnection: connection, release: func() {
+		<-opener.slots
+	}}, nil
+}
+
+// OpenGatewayControlMember selects the exact node incarnation captured by a
+// drain fence. It is intentionally an additive seam beside the legacy node
+// lookup used by older control clients.
+func (opener *gatewayClusterControlOpener) OpenGatewayControlMember(
+	ctx context.Context, member gateway.ClusterCatalogDrainMember,
+) (rafttransport.PeerConnection, error) {
+	if opener == nil || ctx == nil || member.Node == (rafttransport.NodeID{}) || member.Incarnation == 0 {
+		return nil, errGatewayReplicaControl
+	}
+	opener.mu.RLock()
+	address, found := opener.members[member]
+	opener.mu.RUnlock()
+	if !found {
+		return nil, errGatewayReplicaControl
+	}
+	select {
+	case opener.slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	}
+	raw, err := opener.dial(ctx, address)
+	if err != nil || raw == nil {
+		<-opener.slots
+		if raw != nil {
+			_ = raw.Close()
+		}
+		return nil, errors.Join(err, errGatewayReplicaControl)
+	}
+	connection, err := opener.tls.Client(
+		ctx, raw, member.Node, rafttransport.TrafficGatewayControl, opener.deadline,
+	)
+	if err != nil {
+		_ = raw.Close()
 		<-opener.slots
 		return nil, err
 	}
@@ -493,27 +835,42 @@ func newGatewayClusterDrainCertifier(
 	endpoints []gatewayControlEndpoint,
 	maxConcurrent int,
 ) (*gateway.ClusterCatalogDrainCoordinator, error) {
+	coordinator, _, err := newGatewayClusterDrainCertifierWithOpener(
+		trust, tls, handshake, readDeadline, writeDeadline, dial, endpoints, maxConcurrent,
+	)
+	return coordinator, err
+}
+
+func newGatewayClusterDrainCertifierWithOpener(
+	trust rafttransport.TrustDomain,
+	tls *rafttransport.PeerTLS,
+	handshake, readDeadline, writeDeadline rafttransport.DeadlineFunc,
+	dial func(context.Context, string) (net.Conn, error),
+	endpoints []gatewayControlEndpoint,
+	maxConcurrent int,
+) (*gateway.ClusterCatalogDrainCoordinator, *gatewayClusterControlOpener, error) {
 	if len(endpoints) == 0 {
-		return nil, errGatewayReplicaControl
+		return nil, nil, errGatewayReplicaControl
 	}
 	opener, err := newGatewayClusterControlOpener(
 		tls, handshake, dial, endpoints, maxConcurrent,
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	client, err := gateway.NewClusterCatalogDrainClient(gateway.ClusterCatalogDrainClientOptions{
 		Opener: opener, ReadDeadline: readDeadline, WriteDeadline: writeDeadline,
 		MaxConcurrent: maxConcurrent,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	members := make([]gateway.ClusterCatalogDrainMember, len(endpoints))
 	for index := range endpoints {
 		members[index] = endpoints[index].Member
 	}
-	return gateway.NewClusterCatalogDrainCoordinator(trust, members, client)
+	coordinator, err := gateway.NewClusterCatalogDrainCoordinator(trust, members, client)
+	return coordinator, opener, err
 }
 
 func (connection *gatewayBoundedPeerConnection) Close() error {
@@ -524,6 +881,21 @@ func (connection *gatewayBoundedPeerConnection) Close() error {
 
 type gatewayMembershipGrantInstaller interface {
 	InstallMembershipGrant(context.Context, rafttransport.NodeID, membershipgrant.Grant) error
+}
+
+// gatewayNodeRecordReader resolves the catalog-committed physical identity
+// (service key, endpoint, incarnation) an AddLearner enrollment certifies to
+// every current voter. It is deliberately narrow: only ListNodes, the same
+// bounded read the physical-scaling controller already performs.
+type gatewayNodeRecordReader interface {
+	ListNodes(context.Context) ([]gateway.NodeRecord, error)
+}
+
+// gatewayMembershipEnrollmentInstaller publishes one certified physical-peer
+// enrollment on a single current voter, ahead of the membership grant that
+// references the enrolling node.
+type gatewayMembershipEnrollmentInstaller interface {
+	EnrollMember(context.Context, rafttransport.NodeID, rafttransport.EnrollmentIntent) (rafttransport.EnrollmentAck, error)
 }
 
 type gatewayMembershipApplier interface {
@@ -540,6 +912,8 @@ type gatewayGrantedMembershipClient struct {
 	grants    membershipgrant.Source
 	installer gatewayMembershipGrantInstaller
 	applier   gatewayMembershipApplier
+	nodes     gatewayNodeRecordReader
+	enroller  gatewayMembershipEnrollmentInstaller
 }
 
 func (client gatewayGrantedMembershipClient) ApplyMembership(
@@ -557,7 +931,9 @@ func (client gatewayGrantedMembershipClient) ApplyMembership(
 		grant.SourceMember != request.SourceMember || grant.TargetMember != request.TargetMember {
 		return gateway.ReplicatedMembershipResult{}, errors.Join(err, errGatewayReplicaControl)
 	}
-	if err = installGatewayMembershipGrant(ctx, route, grant, client.installer); err != nil {
+	if err = installGatewayMembershipGrant(
+		ctx, route, grant, client.installer, request.Kind, client.nodes, client.enroller,
+	); err != nil {
 		return gateway.ReplicatedMembershipResult{}, err
 	}
 	return client.applier.ApplyMembership(ctx, route, request)
@@ -567,11 +943,30 @@ func (client gatewayGrantedMembershipClient) ApplyMembership(
 // reachable voter quorum and the exact enrolled target. It always attempts
 // every current voter so a certified failed-replica replacement can tolerate
 // the absent source without silently reducing the quorum requirement.
+//
+// AddLearner is the one exception: the enrolled target is, by construction,
+// not yet a member of the group when AddLearner is proposed, so it cannot
+// hold group authority to accept an install. Requiring its confirmation before
+// AddLearner would deadlock empty-node provisioning, so AddLearner's install is
+// voters-only. The catch-up preflight delivers the target's grant once snapshot
+// bootstrap has registered its execution group, before waiting for replication.
+//
+// Every current voter's own registry independently requires the enrolling
+// target to already be a known member-to-node mapping before it will accept
+// a grant naming that target (StaticRegistry.InstallTransitionGrant rejects
+// an unenrolled target). For AddLearner specifically that fact does not yet
+// exist anywhere: the target has never belonged to this group. This function
+// therefore certifies and fans out that one physical-peer enrollment to every
+// voter first, deriving it from the same catalog NodeRecord and grant the
+// membership-grant install itself already trusts, before attempting install.
 func installGatewayMembershipGrant(
 	ctx context.Context,
 	route gateway.ReplicatedMembershipRoute,
 	grant membershipgrant.Grant,
 	installer gatewayMembershipGrantInstaller,
+	kind raftservice.MembershipKind,
+	nodes gatewayNodeRecordReader,
+	enroller gatewayMembershipEnrollmentInstaller,
 ) error {
 	if ctx == nil || installer == nil || route.Serving.Group != grant.Group ||
 		len(route.Serving.Replicas) != gateway.ServingReplicaCount {
@@ -588,8 +983,42 @@ func installGatewayMembershipGrant(
 	if target.Member != grant.TargetMember || [16]byte(target.Node) != grant.TargetNode {
 		return errGatewayReplicaControl
 	}
+	if kind == raftservice.MembershipAddLearner {
+		if nodes == nil || enroller == nil {
+			return errGatewayReplicaControl
+		}
+		intent, err := buildGatewayEnrollmentIntent(ctx, nodes, grant, route.Serving.Replicas)
+		if err != nil {
+			return errors.Join(err, errGatewayReplicaControl)
+		}
+		var enrollErrors error
+		enrolledVoters := 0
+		requiredVoters := 0
+		requiredEnrolled := 0
+		for _, endpoint := range route.Serving.Replicas {
+			optional := endpoint.Member == grant.SourceMember
+			if !optional {
+				requiredVoters++
+			}
+			if _, err := enroller.EnrollMember(ctx, endpoint.Node, intent); err != nil {
+				enrollErrors = errors.Join(enrollErrors, err)
+				continue
+			}
+			enrolledVoters++
+			if !optional {
+				requiredEnrolled++
+			}
+		}
+		// The retiring replica may be down. Every other current voter must
+		// admit the learner, including the snapshot donor whose TLS allowlist
+		// is updated only by this Merge.
+		if enrolledVoters < gateway.ServingReplicaCount/2+1 ||
+			requiredVoters == 0 || requiredEnrolled != requiredVoters {
+			return errors.Join(enrollErrors, errGatewayReplicaControl)
+		}
+	}
 	installedVoters := 0
-	targetInstalled := false
+	targetInstalled := kind == raftservice.MembershipAddLearner
 	var installErrors error
 	for _, endpoint := range route.Serving.Replicas {
 		installErr := installer.InstallMembershipGrant(ctx, endpoint.Node, grant)
@@ -600,7 +1029,11 @@ func installGatewayMembershipGrant(
 			installErrors = errors.Join(installErrors, installErr)
 		}
 	}
-	if route.HasEnrolledTarget {
+	if route.HasEnrolledTarget && kind != raftservice.MembershipAddLearner {
+		// AddLearner cannot install on an in-process empty node: its registry
+		// has no group yet, so every attempt is node-not-found and crowds out
+		// snapshot bootstrap. The catch-up preflight installs the target grant
+		// after RegisterExecutionGroup; later membership actions reconfirm it.
 		installErr := installer.InstallMembershipGrant(ctx, target.Node, grant)
 		if installErr == nil {
 			targetInstalled = true
@@ -612,6 +1045,72 @@ func installGatewayMembershipGrant(
 		return errors.Join(installErrors, errGatewayReplicaControl)
 	}
 	return nil
+}
+
+// gatewayEnrollmentDirectoryRevision is only a starting guess: StaticRegistry
+// initializes a voter's peer-directory fencing revision to 1, so this is
+// correct without a remote read for a voter's first enrollment ever (e.g. a
+// 3-to-4-to-3 scale). A voter that has already committed a later enrollment -
+// the ordinary case once a cluster has more than one group - rejects this
+// guess, and rafttransport.EnrollmentControlClient.EnrollMember retries once
+// using the current revision the rejection itself reports back.
+const gatewayEnrollmentDirectoryRevision = 1
+
+// buildGatewayEnrollmentIntent derives the one certified physical-peer
+// enrollment intent an AddLearner fanout sends to every current voter, from
+// the same catalog NodeRecord and membership grant the install step already
+// trusts. It scans the bounded node directory once, without an intermediate
+// index, since MaxScalingNodes keeps that walk cheap relative to the network
+// round trip it prepares for.
+func buildGatewayEnrollmentIntent(
+	ctx context.Context, nodes gatewayNodeRecordReader, grant membershipgrant.Grant,
+	voters []gateway.ReplicatedEndpoint,
+) (rafttransport.EnrollmentIntent, error) {
+	rosterMembers := make([]rafttransport.Member, len(voters))
+	for index, voter := range voters {
+		rosterMembers[index] = rafttransport.Member{
+			Group: grant.Group, ReplicaSetVersion: grant.InitialReplicaSetVersion,
+			MemberID: voter.Member, Node: rafttransport.NodeID(voter.Node), Role: rafttransport.MemberVoter,
+		}
+	}
+	rosterDigest, err := rafttransport.StableRosterDigest(rosterMembers)
+	if err != nil {
+		return rafttransport.EnrollmentIntent{}, err
+	}
+	records, err := nodes.ListNodes(ctx)
+	if err != nil {
+		return rafttransport.EnrollmentIntent{}, err
+	}
+	targetNode := rafttransport.NodeID(grant.TargetNode)
+	var record gateway.NodeRecord
+	found := false
+	for index := range records {
+		if records[index].NodeID == targetNode {
+			record, found = records[index], true
+			break
+		}
+	}
+	if !found || record.Lifecycle != gateway.NodeActive {
+		return rafttransport.EnrollmentIntent{}, errGatewayReplicaControl
+	}
+	domain := rafttransport.TrustDomain{
+		ClusterID: grant.Group.ClusterID, ClusterIncarnation: grant.Group.ClusterIncarnation,
+	}
+	peer := rafttransport.PhysicalPeer{
+		NodeID: record.NodeID, TrustDomain: domain,
+		Incarnation: record.Incarnation, Revision: record.Revision,
+		ServiceKeyDigest: [32]byte(record.ServiceKeyDigest), Endpoint: record.DataAddress,
+		State: rafttransport.PeerEnrolled,
+	}
+	member := rafttransport.Member{
+		Group: grant.Group, ReplicaSetVersion: grant.InitialReplicaSetVersion,
+		MemberID: grant.TargetMember, Node: targetNode, Role: rafttransport.MemberEnrolled,
+	}
+	return rafttransport.EnrollmentIntent{
+		Digest: grant.Digest(), Domain: domain, Peer: peer, Group: grant.Group, Member: member,
+		ExpectedRosterDigest: rosterDigest,
+		DirectoryRevision:    gatewayEnrollmentDirectoryRevision,
+	}, nil
 }
 
 type gatewayReplicaObservationClient interface {
@@ -631,10 +1130,12 @@ type gatewayReplicaActionClient interface {
 // term immediately before constructing the ServingFence; catalog routing
 // metadata alone is deliberately insufficient authority.
 type gatewayReplicaRemoteActions struct {
-	observer gatewayReplicaObservationClient
-	actions  gatewayReplicaActionClient
-	routes   rebalanceexec.MoveRouteResolver
-	native   interface {
+	observer       gatewayReplicaObservationClient
+	actions        gatewayReplicaActionClient
+	routes         rebalanceexec.MoveRouteResolver
+	grants         membershipgrant.Source
+	grantInstaller gatewayMembershipGrantInstaller
+	native         interface {
 		ObserveMembershipLeader(context.Context, gateway.ReplicatedMembershipRoute) (shardservice.ReplicatedMemberState, error)
 	}
 }
@@ -652,9 +1153,17 @@ func (remote gatewayReplicaRemoteActions) AwaitReplicaMove(
 	if err != nil {
 		return err
 	}
+	// No ExpectedReplicaSetVersion here: every case below is a passive status
+	// or progress poll, not a membership command, and none of them read the
+	// server's staleness comparison back. An unrelated concurrent action on
+	// this same group can legitimately advance its replica-set version many
+	// times while this await is outstanding; fencing on the version this
+	// action was originally journaled against would reject every poll with
+	// ErrStale forever once that happens, since the live version can never
+	// regress back to match. Mirrors ObserveReplicaMove's own status poll,
+	// which already leaves this field zero for the same reason.
 	request := replicacontrol.Request{Operation: [32]byte(operation), Step: execution.Proof,
-		Group: plan.Group(), TargetMember: plan.TargetMember(),
-		ExpectedReplicaSetVersion: execution.PublicationReplicaSet}
+		Group: plan.Group(), TargetMember: plan.TargetMember()}
 	switch execution.Action.Kind {
 	case rebalance.ActionAwaitLeader:
 		for _, endpoint := range gatewayReplicaMoveObservationCandidates(cut.Membership) {
@@ -675,6 +1184,20 @@ func (remote gatewayReplicaRemoteActions) AwaitReplicaMove(
 		}
 		return nil
 	case rebalance.ActionAwaitCatchUp:
+		// A snapshot installs committed membership, but its fresh transport
+		// registry may not retain the grant authorizing historical ConfChange
+		// probes. Deliver that exact grant before waiting for replication;
+		// postponing it until promotion deadlocks a learner whose first append
+		// replays the already committed AddLearner entry. Reinstall is durable
+		// and idempotent, including after a controller or target restart.
+		// Once the target is published as serving, promotion has already
+		// delivered the grant. Final retirement can remove its catalog record;
+		// subsequent ordinary catch-up must not depend on recreating it.
+		if cut.Membership.HasEnrolledTarget {
+			if err := remote.installCatchUpGrant(ctx, plan, cut); err != nil {
+				return err
+			}
+		}
 		leader := gatewayReplicaMoveObservationCandidates(cut.Membership)
 		for _, endpoint := range leader {
 			observation, observeErr := remote.observer.Observe(ctx, endpoint.Node, request)
@@ -683,12 +1206,35 @@ func (remote gatewayReplicaRemoteActions) AwaitReplicaMove(
 				observation.Progress.Match >= execution.PublicationApplied {
 				return nil
 			}
+			if observeErr == nil && observation.Status.MemberID == observation.Status.LeaderID {
+				err = errors.Join(err, fmt.Errorf("learner %d progress from leader %d: found=%t active=%t match=%d required=%d next=%d pending-snapshot=%d paused=%t: %w",
+					request.TargetMember, observation.Status.MemberID, observation.ProgressFound,
+					observation.Progress.RecentActive, observation.Progress.Match, execution.PublicationApplied,
+					observation.Progress.Next, observation.Progress.PendingSnapshot, observation.Progress.FlowPaused,
+					errGatewayReplicaControl))
+			}
 			err = errors.Join(err, observeErr)
 		}
 		return errors.Join(err, errGatewayReplicaControl)
 	default:
 		return errGatewayReplicaControl
 	}
+}
+
+func (remote gatewayReplicaRemoteActions) installCatchUpGrant(
+	ctx context.Context, plan *rebalance.Plan, cut rebalanceexec.MoveRoute,
+) error {
+	if remote.grants == nil || remote.grantInstaller == nil || plan == nil {
+		return errGatewayReplicaControl
+	}
+	grant, found, err := remote.grants.ReadMembershipGrant(ctx, plan.Group())
+	if err != nil || !found || !grant.Valid() || grant.Group != plan.Group() ||
+		grant.CatalogGeneration != plan.CatalogGeneration() ||
+		grant.SourceMember != plan.RetiringMember() || grant.TargetMember != plan.TargetMember() ||
+		cut.Target.Member != grant.TargetMember || [16]byte(cut.Target.Node) != grant.TargetNode {
+		return errors.Join(err, errGatewayReplicaControl)
+	}
+	return remote.grantInstaller.InstallMembershipGrant(ctx, cut.Target.Node, grant)
 }
 
 func (remote gatewayReplicaRemoteActions) ProposeReplicaMoveOwnership(

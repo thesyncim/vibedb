@@ -220,7 +220,7 @@ func (server *ReplicatedServer) ServeAuthenticated(ctx context.Context, listener
 			defer capability.release(connection)
 			defer connection.Close()
 			if err := server.serveReplicatedConn(ctx, connection,
-				connection.PeerIdentity().Node, true); err != nil && context.Cause(ctx) == nil {
+				connection.PeerIdentity().Node, true, servicePeerFromConnection(connection)); err != nil && context.Cause(ctx) == nil {
 				server.failed.Add(1)
 			}
 		}(raw)

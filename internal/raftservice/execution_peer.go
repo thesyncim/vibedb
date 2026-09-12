@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
@@ -87,6 +88,17 @@ func NewAuthenticatedExecutionPeerRuntime(options AuthenticatedExecutionPeerOpti
 	}, nil
 }
 
+// Transport exposes the peer's shared ordinary transport. A control-plane
+// service that must be constructed before this runtime exists (its routes
+// are wired ahead of the peer so the control listener can start) attaches to
+// it here once built, rather than through the constructor.
+func (runtime *AuthenticatedExecutionPeerRuntime) Transport() *rafttransport.OrdinaryTransport {
+	if runtime == nil {
+		return nil
+	}
+	return runtime.transport
+}
+
 // RegisterExecutionGroup atomically makes one adopted Runtime visible to the
 // deterministic execution lane and ordinary transport. The transport roster
 // is published from inside the serialized lane after Host ownership and
@@ -95,6 +107,27 @@ func NewAuthenticatedExecutionPeerRuntime(options AuthenticatedExecutionPeerOpti
 func (runtime *AuthenticatedExecutionPeerRuntime) RegisterExecutionGroup(
 	roster []rafttransport.Member,
 	group ExecutionGroup,
+) error {
+	return runtime.registerExecutionGroup(roster, group, membershipgrant.Grant{})
+}
+
+// RegisterExecutionGroupWithGrant atomically restores one retained transition
+// grant with its execution group, before the owning lane can process Ready.
+func (runtime *AuthenticatedExecutionPeerRuntime) RegisterExecutionGroupWithGrant(
+	roster []rafttransport.Member,
+	group ExecutionGroup,
+	grant membershipgrant.Grant,
+) error {
+	if !grant.Valid() {
+		return ErrInvalidOwner
+	}
+	return runtime.registerExecutionGroup(roster, group, grant)
+}
+
+func (runtime *AuthenticatedExecutionPeerRuntime) registerExecutionGroup(
+	roster []rafttransport.Member,
+	group ExecutionGroup,
+	grant membershipgrant.Grant,
 ) error {
 	if runtime == nil || runtime.registry == nil || runtime.owners == nil ||
 		!validExecutionGroup(group) || len(roster) == 0 {
@@ -117,8 +150,11 @@ func (runtime *AuthenticatedExecutionPeerRuntime) RegisterExecutionGroup(
 	if !found {
 		return ErrInvalidOwner
 	}
-	return runtime.registry.InstallGroup(roster, func(publish func()) error {
-		return runtime.owners.installGroup(group, publish)
+	return runtime.owners.installGroup(group, func(install func(func()) error) error {
+		if grant != (membershipgrant.Grant{}) {
+			return runtime.registry.InstallGroupWithTransitionGrant(roster, grant, install)
+		}
+		return runtime.registry.InstallGroup(roster, install)
 	})
 }
 
@@ -132,8 +168,8 @@ func (runtime *AuthenticatedExecutionPeerRuntime) UnregisterExecutionGroup(
 		identity.Group == (raftmember.GroupKey{}) {
 		return ErrInvalidOwner
 	}
-	return runtime.registry.RemoveGroup(identity.Group, func(withdraw func()) error {
-		return runtime.owners.removeGroup(identity, withdraw)
+	return runtime.owners.removeGroup(identity, func(remove func(func()) error) error {
+		return runtime.registry.RemoveGroup(identity.Group, remove)
 	})
 }
 

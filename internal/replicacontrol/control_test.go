@@ -40,6 +40,7 @@ type testConnection struct {
 func (connection *testConnection) PeerIdentity() rafttransport.PeerIdentity {
 	return connection.identity
 }
+func (*testConnection) PeerKeyDigest() [32]byte { return [32]byte{} }
 func (connection *testConnection) TrafficClass() rafttransport.TrafficClass {
 	return connection.class
 }
@@ -389,7 +390,10 @@ func TestHealthServiceUsesAuthorizedHealthObserverOnly(t *testing.T) {
 		{name: "wrong group", calls: 1, want: ErrStale, mutate: func(observer *healthControlObserver, _ *rafttransport.PeerIdentity) {
 			observer.cut.Identity.Group.GroupID[0]++
 		}},
-		{name: "stale version", calls: 1, want: ErrStale, mutate: func(observer *healthControlObserver, _ *rafttransport.PeerIdentity) {
+		{name: "regressed version", calls: 1, want: ErrStale, mutate: func(observer *healthControlObserver, _ *rafttransport.PeerIdentity) {
+			observer.cut.Publication.ReplicaSetVersion--
+		}},
+		{name: "advanced version", calls: 1, mutate: func(observer *healthControlObserver, _ *rafttransport.PeerIdentity) {
 			observer.cut.Publication.ReplicaSetVersion++
 		}},
 		{name: "denied principal", deny: true, want: ErrUnauthorized},

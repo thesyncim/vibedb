@@ -564,6 +564,10 @@ func newMultiGroupRF3ClusterWithWALOptions(
 		cluster.listeners[member] = listener
 		cluster.network.addresses[member] = listener.Addr().String()
 	}
+	for member := range nodes {
+		registries[nodes[member]] = pinnedPeerTestRegistry(t, nodes[member], members, rafttransport.Limits{MaxGroups: cluster.groupCount, MaxMembers: len(members)}, peerTLS[:])
+	}
+
 	deadline := func() time.Time { return time.Now().Add(10 * time.Second) }
 
 	for member := 0; member < multiGroupRF3Voters; member++ {
@@ -1595,4 +1599,17 @@ func assertMultiGroupRF3Trace(
 		t.Fatalf("proposal trace hidden=%d commit-success=%d commit-failures=%d trace=%+v",
 			hidden, commitSuccess, commitFailures, trace)
 	}
+}
+
+func pinnedPeerTestRegistry(t testing.TB, local rafttransport.NodeID, members []rafttransport.Member, limits rafttransport.Limits, profiles []*rafttransport.PeerTLS) *rafttransport.StaticRegistry {
+	t.Helper()
+	peers := make([]rafttransport.PhysicalPeer, len(profiles))
+	for index, profile := range profiles {
+		peers[index] = rafttransport.PhysicalPeer{NodeID: profile.LocalIdentity().Node, TrustDomain: profile.LocalIdentity().TrustDomain, Incarnation: 1, Revision: 1, ServiceKeyDigest: profile.LocalServiceKeyDigest(), State: rafttransport.PeerEnrolled}
+	}
+	registry, err := rafttransport.NewStaticRegistryWithDirectory(local, members, peers, 1, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return registry
 }

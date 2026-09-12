@@ -78,6 +78,15 @@ func TestNodeStoreRegistrationRetryOfInitialGroup(t *testing.T) {
 				t.Fatalf("reopen=%t snapshot=%t retry=%+v syncs=%d err=%v", reopen, withSnapshot, got, syncs, err)
 			}
 		}
+		// A controller-directed install must still match its exact committed
+		// incarnation; the ordinary descriptor retry above grants no bypass.
+		if _, err := store.registerGroupLockedAt(descriptor, snapshot, 1); !errors.Is(err, ErrRetryConflict) {
+			t.Fatalf("dynamic install accepted initial incarnation zero: %v", err)
+		}
+		if _, err := store.registerGroupLockedAt(descriptor, snapshot, 0); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("dynamic install accepted zero request: %v", err)
+		}
+
 		conflict := proto.Clone(snapshot).(*pb.Snapshot)
 		conflict.Data = append(conflict.Data, 'x')
 		if _, err := store.RegisterGroupWithSnapshot(descriptor, conflict); !errors.Is(err, ErrRetryConflict) {
@@ -358,5 +367,57 @@ func TestNodeSubmissionSnapshotRegistrationOrdersBeforeFirstReady(t *testing.T) 
 	}
 	if control.snapshot != nil {
 		t.Fatal("reused Ready cell retained bootstrap snapshot")
+	}
+}
+
+func TestNodeSubmissionSnapshotRegistrationPreservesCertifiedIncarnation(t *testing.T) {
+	store, dir, options := registrationTestStore(t)
+	descriptor, snapshot := testGroupDescriptor(2), nodeSnapshot(2, 41, 7)
+	const incarnation = uint64(7)
+	for _, reopen := range []bool{false, true} {
+		if reopen {
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			store, err = OpenNodeStore(dir, testNodeIdentity(), testKey(), options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+		}
+		sequencer, err := NewNodeSubmissionSequencer(store, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, requested := range []uint64{incarnation, incarnation, incarnation + 1} {
+			var submission Submission
+			if err := submission.Initialize(); err != nil {
+				t.Fatal(err)
+			}
+			if err := submission.PrepareRegisterGroupWithSnapshotAt(descriptor, snapshot, requested); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sequencer.TrySubmit(&submission); err != nil {
+				t.Fatal(err)
+			}
+			_, waitErr := submission.Wait()
+			if requested != incarnation {
+				if !errors.Is(waitErr, ErrRetryConflict) {
+					t.Fatalf("conflicting incarnation: %v", waitErr)
+				}
+				continue
+			}
+			registered, got, ok := submission.RegisteredGroup()
+			if waitErr != nil || !ok || registered.LogKey != 2 || got != (GroupIncarnation{GroupID: 2, Incarnation: incarnation}) {
+				t.Fatalf("reopen=%t registered=%+v incarnation=%+v ok=%t err=%v", reopen, registered, got, ok, waitErr)
+			}
+			if persisted, err := store.Group(2).NodeIncarnation(); err != nil || persisted != incarnation {
+				t.Fatalf("persisted incarnation=%d err=%v", persisted, err)
+			}
+		}
+		if err := sequencer.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

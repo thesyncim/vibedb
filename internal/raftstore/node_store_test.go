@@ -732,3 +732,35 @@ func TestNodeStoreCheckpointUnknownLogSyncRecoversReference(t *testing.T) {
 		t.Fatalf("recovered checkpoint = %#v, %v", got, err)
 	}
 }
+
+func TestNodeStoreEmptyReopenThenEnroll(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "node")
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 64, RecentWaves: 16, MaxEntriesPerGroup: 16, ReaderSlots: 1}
+	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), nil, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenNodeStore(dir, testNodeIdentity(), testKey(), options)
+	if err != nil {
+		t.Fatalf("reopen prepared empty node: %v", err)
+	}
+	descriptor := testGroupDescriptor(10)
+	if _, err := store.RegisterGroupWithSnapshot(descriptor, nodeSnapshot(10, 1, 1)); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenNodeStore(dir, testNodeIdentity(), testKey(), options)
+	if err != nil {
+		t.Fatalf("reopen enrolled node: %v", err)
+	}
+	defer store.Close()
+	if _, found := store.GroupByID(descriptor.GroupID); !found {
+		t.Fatal("enrolled group was not recovered")
+	}
+}

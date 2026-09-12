@@ -68,7 +68,13 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	var measurements replicaProcessMeasurements
 	defer func() {
 		result := "pass"
-		if t.Failed() {
+		if t.Skipped() {
+			// t.Skip invokes runtime.Goexit after running defers. A skipped
+			// durable qualification must never leave a pass-shaped evidence
+			// record behind for CI or an operator to mistake for execution.
+			result = "skip"
+			phase = "skipped"
+		} else if t.Failed() {
 			result = "fail"
 		}
 		raw := fmt.Appendf(nil,
@@ -84,8 +90,6 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 			t.Errorf("write replica replacement evidence: %v", err)
 		}
 	}()
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
-	defer cancel()
 	root := t.TempDir()
 	topology, err := rf3testfixture.ReserveProcessCluster()
 	if err != nil {
@@ -297,8 +301,12 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	}
 	shardBinary := filepath.Join(root, "vibedb-shard")
 	gatewayBinary := filepath.Join(root, "vibedb-gateway")
-	replicaProcessBuild(t, ctx, shardBinary, "./cmd/vibedb-shard")
-	replicaProcessBuild(t, ctx, gatewayBinary, "./cmd/vibedb-gateway")
+	replicaProcessBuild(t, t.Context(), shardBinary, "./cmd/vibedb-shard")
+	replicaProcessBuild(t, t.Context(), gatewayBinary, "./cmd/vibedb-gateway")
+	// Keep build-cache and host compilation latency outside the bounded
+	// process recovery window. The enclosing go test timeout bounds setup.
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
 	if err = errors.Join(topology.ReleaseListeners(), gatewayReservation.Close()); err != nil {
 		t.Fatal(err)
 	}
@@ -351,6 +359,28 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	defer closeCatalogAuthority()
 	if err = catalogAuthority.Publish(ctx, 0, snapshot); err != nil {
 		t.Fatalf("publish immutable catalog genesis through RF3: %v", err)
+	}
+	var directory []gateway.NodeRecord
+	for member := 0; member < 4; member++ {
+		credential := credentials[member]
+		peerProfile, err := servicetls.LoadProfile(credential.Certificate, credential.Key, roots, rf3testfixture.ProcessIdentityOID, time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		address := listeners[member]
+		directory = append(directory, gateway.NodeRecord{NodeID: nodes[member], Incarnation: 1,
+			ServiceKeyDigest: replication.Digest(peerProfile.LocalServiceKeyDigest()),
+			DataEndpoint:     distribution.EndpointID(address.Peer), NativeEndpoint: distribution.EndpointID(address.Native), ControlEndpoint: distribution.EndpointID(address.Control),
+			DataAddress: address.Peer, NativeAddress: address.Native, ControlAddress: address.Control,
+			Roles:         gateway.NodeRoleStorage | gateway.NodeRoleControl | gateway.NodeRoleCatalog,
+			FailureDomain: fmt.Sprintf("member-%d", member), Lifecycle: gateway.NodeActive, Revision: 1, CatalogGeneration: snapshot.Generation()})
+	}
+	directory[0].Roles |= gateway.NodeRoleGateway
+	directory[0].GatewayEndpoint, directory[0].GatewayAddress = "gateway-control", gatewayControl
+	directory[0].Gateway = gateway.GatewayIdentity{NodeID: profile.LocalIdentity().Node, Incarnation: 1,
+		ServiceKeyDigest: replication.Digest(profile.LocalServiceKeyDigest()), ServiceID: [16]byte{1}, SessionID: [16]byte{2}, SessionRevision: 1, ParticipantDigest: replication.Digest{3}}
+	if err := catalogAuthority.BootstrapNodeDirectory(ctx, directory); err != nil {
+		t.Fatalf("bootstrap physical directory: %v", err)
 	}
 	replicaProcessPublishAbandonment(t, ctx, catalogAuthority, snapshot.Generation(), firstAbandonment)
 	gatewayProcess := replicaProcessGateway(gatewayBinary, catalogPath, gatewayNative,
@@ -419,6 +449,14 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	baselineHealth := make(map[raftmember.GroupKey]uint64, len(groups))
+	for _, group := range groups {
+		revision, readErr := catalogAuthority.ReadReplicaHealthRevision(ctx, group, 1)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		baselineHealth[group] = revision
+	}
 	started := time.Now()
 	if err = voters[0].Kill(ctx); err != nil {
 		t.Fatal(err)
@@ -446,27 +484,25 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	sourceReady := false
 	var sourceRestarted time.Time
 	groupCompletion := make(map[raftmember.GroupKey]time.Duration, 2)
-	routeRestarts := 0
 	for {
 		if err = ctx.Err(); err != nil {
 			t.Fatalf("replacement timeout: %v\ngateway:\n%s\ntarget:\n%s",
 				err, gatewayProcess.Diagnostics(), coldTarget.Diagnostics())
 		}
 		if gatewayProcess.PID() == 0 {
-			if routeRestarts >= 2 || !strings.Contains(gatewayProcess.Diagnostics(), gateway.ErrReplicatedCatalogRouteRestartRequired.Error()) {
-				t.Fatalf("unexpected controller exit: %v\n%s", gatewayProcess.WaitError(), gatewayProcess.Diagnostics())
-			}
-			routeRestarts++
-			if err = gatewayProcess.Start(); err != nil {
-				t.Fatal(err)
-			}
-			if err = gatewayProcess.WaitReady(ctx, "vibedb-gateway serving catalog generation"); err != nil {
-				t.Fatalf("catalog self-move supervisor restart: %v\n%s", err, gatewayProcess.Diagnostics())
-			}
+			t.Fatalf("controller exited during live catalog session handoff: %v\n%s", gatewayProcess.WaitError(), gatewayProcess.Diagnostics())
 		}
-		if measurements.failoverMillis == 0 &&
-			strings.Contains(gatewayProcess.Diagnostics(), "revision controller published") {
-			measurements.failoverMillis = uint64(time.Since(started).Milliseconds())
+
+		if measurements.failoverMillis == 0 {
+			// A controller restart discards its log buffer. Read the committed
+			// health revision so failover evidence survives that restart.
+			for _, group := range groups {
+				status, readErr := catalogAuthority.ReadReplicaHealthRevisionStatus(ctx, group, 1)
+				if readErr == nil && status.Revision > baselineHealth[group] && !status.Healthy && status.SuspectNode == nodes[0] {
+					measurements.failoverMillis = uint64(time.Since(started).Milliseconds())
+					break
+				}
+			}
 		}
 		if measurements.admissionMillis == 0 {
 			// Observe the atomic directory cut before reading the catalog head.
@@ -520,8 +556,18 @@ func TestGatewayAutomaticReplicaReplacementProcesses(t *testing.T) {
 	if !restartedSource {
 		t.Fatal("retired source was not reopened for cleanup")
 	}
-	if routeRestarts != 2 {
-		t.Fatalf("catalog self-move route handoffs=%d want=2", routeRestarts)
+	handoff, found, handoffErr := loadCatalogSessionHandoff(catalogSessionHandoffPath(filepath.Join(root, "gateway-session")))
+	if handoffErr != nil || !found || handoff.Phase != catalogSessionHandoffComplete || !catalogSessionHandoffPathsValid(handoff, filepath.Join(root, "gateway-session")) {
+		t.Fatalf("live catalog handoff not durably complete: %+v found=%t err=%v", handoff, found, handoffErr)
+	}
+	settled, settleErr := catalogAuthority.Read(ctx)
+	if settleErr != nil {
+		t.Fatal(settleErr)
+	}
+	settledRoute := catalogRouteSeedRoute(t, settled)
+	binding, bindingErr := gateway.NativeSessionJournalBinding(settledRoute, string(settledRoute.Distribution), string(settledRoute.Shard), []byte{replicatedCatalogControllerTenant}, 1, serviceauthz.CapabilityTopology)
+	if bindingErr != nil || binding != handoff.NextBinding || handoff.NextGeneration > settled.Generation() {
+		t.Fatalf("live handoff differs from final catalog route: binding=%x handoff=%+v err=%v", binding, handoff, bindingErr)
 	}
 	if measurements.admissionMillis == 0 {
 		t.Fatal("two-group move set was never atomically discoverable")
@@ -1049,8 +1095,8 @@ func replicaProcessCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS
 		t.Fatal(err)
 	}
 	session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{Executor: executor,
-		CatalogBootstrap: snapshot,
-		Route:            route, Distribution: string(route.Distribution), Shard: string(route.Shard),
+		CatalogBootstrap: snapshot, MaxMutations: 6,
+		Route: route, Distribution: string(route.Distribution), Shard: string(route.Shard),
 		Tenant: []byte{1}, ClientID: replication.ID128{0xc1}, RetryHome: replication.RetryHome{0xd1},
 		Resolver: gateway.BaseRelationResolver{Relation: 1}, Journal: journal,
 		ProposalCapability: serviceauthz.CapabilityTopology})
@@ -1061,6 +1107,25 @@ func replicaProcessCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS
 	authenticated, err := serviceauthz.WithAuthority(t.Context(), identity)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Listener readiness precedes the first Raft election. Observe a serving
+	// leader before opening the durable session so a cold start cannot turn a
+	// harmless election window into a failed qualification.
+	ready, cancelReady := context.WithTimeout(authenticated, 10*time.Second)
+	defer cancelReady()
+	for {
+		_, err = executor.ObserveMembershipLeader(ready, gateway.ReplicatedMembershipRoute{Serving: route})
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, gateway.ErrReplicatedLeader) {
+			t.Fatalf("initial catalog leader: %v", err)
+		}
+		select {
+		case <-ready.Done():
+			t.Fatalf("initial catalog election: %v", errors.Join(context.Cause(ready), err))
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 	if _, err = session.Open(authenticated, time.Now().Add(time.Hour).UnixNano()); err != nil {
 		t.Fatal(err)

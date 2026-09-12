@@ -146,7 +146,7 @@ func TestOpenReplicatedMoveExecutionUsesFullBaseDigest(t *testing.T) {
 		plan.OperationID(), unbound.IntentDigest, plan, cut, action, replicaMoveCursorExecuting,
 	)
 	bound := bindMoveTestPlan(plan)
-	if execution, ok := OpenReplicatedMoveExecution(unbound, bound); !ok ||
+	if execution, ok := OpenReplicatedMoveExecution(unbound, bound, cut); !ok ||
 		execution.SnapshotBaseDigest != ([32]byte{}) {
 		t.Fatalf("historical unbound witness accepted=%t execution=%+v", ok, execution)
 	}
@@ -164,10 +164,75 @@ func TestOpenReplicatedMoveExecutionUsesFullBaseDigest(t *testing.T) {
 	if boundRecord.Cursor[7] != 0 {
 		t.Fatalf("test digest low-word is not zero: cursor=%v", boundRecord.Cursor)
 	}
-	execution, ok := OpenReplicatedMoveExecution(boundRecord, bound)
+	execution, ok := OpenReplicatedMoveExecution(boundRecord, bound, cut)
 	if !ok || execution.SnapshotBaseDigest != bound.baseDigest {
 		t.Fatalf("zero-prefix bound witness accepted=%t execution=%+v want_digest=%x",
 			ok, execution, bound.baseDigest)
+	}
+}
+
+// TestOpenReplicatedMoveExecutionRestoresTransitionReceiptDigest exercises
+// recovering an action that is already mid-execution (the retry path any
+// crash or network partition takes) once its predecessor receipt has since
+// become observable. TransitionReceiptDigest is documented as "zero only for
+// the first publication of an operation" - it must not stay frozen at the
+// stale, receipt-not-yet-found observation an earlier attempt saw.
+func TestOpenReplicatedMoveExecutionRestoresTransitionReceiptDigest(t *testing.T) {
+	plan, catalog := moveTestPlan(t)
+	cut := ReplicatedMoveCut{Observation: Observation{
+		Catalog: catalog,
+		Publication: raftmodel.Publication{
+			Applied: 5, ReplicaSetVersion: 4, ConfState: plan.initialConf,
+		},
+		LeaderStatus: leaderStatus(1, 5),
+	}}
+	action := Action{Kind: ActionAddLearner, Member: plan.TargetMember()}
+	intent, err := AppendReplicaMoveIntent(nil, catalog, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := newReplicaMoveRecord(plan.OperationID(), catalog.Generation(), intent, plan, cut, action)
+	record.State = gateway.ReplicatedOperationRunning
+	record.Cursor, record.Proof = replicaMoveActionWitness(
+		plan.OperationID(), record.IntentDigest, plan, cut, action, replicaMoveCursorExecuting,
+	)
+
+	// No receipt observed yet: the digest stays zero, matching a first
+	// publication.
+	execution, ok := OpenReplicatedMoveExecution(record, plan, cut)
+	if !ok || execution.TransitionReceiptDigest != ([32]byte{}) {
+		t.Fatalf("execution=%+v accepted=%t, want zero TransitionReceiptDigest with no receipt observed",
+			execution, ok)
+	}
+
+	// The predecessor receipt becomes observable on a later recovery of this
+	// exact same journaled action.
+	receipt := gateway.GroupPublicationReceipt{
+		Key: gateway.GroupTransitionKey{
+			OperationID: [32]byte(plan.OperationID()), Distribution: "catalog", Shard: "controlplane",
+			Group: plan.Group(), SourceAllocationGeneration: 1,
+			SourceDescriptorDigest: [32]byte{1}, SourceCommandFenceDigest: [32]byte{2},
+		},
+		Phase: gateway.TransitionPhasePreRemove,
+		PredecessorGroupDigest: [32]byte{3}, PredecessorHeadGeneration: 1, PredecessorHeadDigest: [32]byte{4},
+		PredecessorGroupGeneration: 1, PredecessorGroupHeadDigest: [32]byte{5},
+		PredecessorRosterDigest: [32]byte{6}, PredecessorRouteDigest: [32]byte{7},
+		CommittedHeadGeneration: 2, CommittedHeadDigest: [32]byte{8}, CommittedGroupGeneration: 2,
+		CommittedGroupDigest: [32]byte{9}, CommittedRosterDigest: [32]byte{10}, CommittedRouteDigest: [32]byte{11},
+		CommittedCommandFenceDigest: [32]byte{12}, CommittedDistributionVersion: 1,
+		SourceRouteDigest: [32]byte{13}, SourceRosterDigest: [32]byte{14},
+	}
+	if !receipt.Valid() {
+		t.Fatalf("test receipt is not valid: %+v", receipt)
+	}
+	wantDigest, err := receipt.ReceiptDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cut.TransitionReceipt, cut.TransitionReceiptFound = receipt, true
+	execution, ok = OpenReplicatedMoveExecution(record, plan, cut)
+	if !ok || execution.TransitionReceiptDigest != wantDigest {
+		t.Fatalf("execution=%+v accepted=%t, want TransitionReceiptDigest=%x", execution, ok, wantDigest)
 	}
 }
 

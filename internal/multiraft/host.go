@@ -256,6 +256,10 @@ type snapshotBaseRuntime interface {
 	SnapshotBaseCertificate() (replicatedstate.SnapshotBaseCertificate, error)
 }
 
+type configurationReplayRuntime interface {
+	ConfigurationReplay() (raftmember.CommittedConfigurationReplay, error)
+}
+
 type schemaGenerationRuntime interface {
 	QuiesceSQLGeneration() error
 	InstallSQLGeneration(
@@ -1344,6 +1348,21 @@ func (host *Host) Publication(key raftmember.GroupKey) (raftmodel.Publication, e
 		return raftmodel.Publication{}, err
 	}
 	return group.runtime.Publication()
+}
+
+// ConfigurationReplay obtains the group's durable configuration replay
+// capability while the caller owns the Host. The capability may subsequently
+// verify entries independently of the Runtime's serialized execution.
+func (host *Host) ConfigurationReplay(key raftmember.GroupKey) (raftmember.CommittedConfigurationReplay, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return nil, err
+	}
+	source, ok := group.runtime.(configurationReplayRuntime)
+	if !ok {
+		return nil, nil
+	}
+	return source.ConfigurationReplay()
 }
 
 // DurablePromotion returns the exact bounded durable-log witness for an

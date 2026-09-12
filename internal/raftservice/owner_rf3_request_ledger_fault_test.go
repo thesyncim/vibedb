@@ -26,10 +26,13 @@ func TestTwoGatewayDurableSQLRF3RecoversUnfinishedWaveWithDefaultPinSpan(t *test
 		waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[group].key)
 	}
 	fixture := multiGroupRF3DurableCatalog(t, cluster)
-	gatewayA := newMultiGroupRF3DurableGateway(t, cluster, fixture.Snapshot, fixture.AckKey,
-		serviceauthz.Authority{Node: [16]byte{0xa2}, Generation: 1})
-	gatewayB := newMultiGroupRF3DurableGateway(t, cluster, fixture.Snapshot, fixture.AckKey,
-		serviceauthz.Authority{Node: [16]byte{0xb2}, Generation: 1})
+	// Permit bounded production-style leader rediscovery during the many real
+	// quorum rounds. The armed lost caller stays disconnected across every
+	// attempt, so ordinary election retries cannot hide the intended fault.
+	gatewayA := newMultiGroupRF3DurableGatewayWithAttempts(t, cluster, fixture.Snapshot, fixture.AckKey,
+		serviceauthz.Authority{Node: [16]byte{0xa2}, Generation: 1}, 16)
+	gatewayB := newMultiGroupRF3DurableGatewayWithAttempts(t, cluster, fixture.Snapshot, fixture.AckKey,
+		serviceauthz.Authority{Node: [16]byte{0xb2}, Generation: 1}, 16)
 	tenant := []byte("tenant")
 	key := requestledger.RequestKey{
 		Scope: requestledger.ScopeAuthenticated, TenantDigest: requestledger.Digest(sha256.Sum256(tenant)),
@@ -60,11 +63,26 @@ func TestTwoGatewayDurableSQLRF3RecoversUnfinishedWaveWithDefaultPinSpan(t *test
 		{SQL: `INSERT INTO orders_b VALUES (?)`, Class: gateway.ClassInteractive,
 			Params: []shardservice.Param{shardservice.DocumentParam(`{"id":"unfinished-b","group":1}`)}},
 	}
+	// A lawful election can also occur during the many durable recovery
+	// rounds. Resume only that explicit availability failure with the exact
+	// same request identity and queries, under the original bounded context.
+	// The injected disconnected caller must return immediately, and every
+	// other error remains a test failure.
+	execute := func(client multiGroupRF3DurableGateway, removed map[int]bool) (gateway.DurableSQLRequestResult, error) {
+		for {
+			result, err := client.sql.Execute(ctx, key, tenant, queries)
+			if !errors.Is(err, gateway.ErrReplicatedLeader) || client.client.callerDisconnected() || ctx.Err() != nil {
+				return result, err
+			}
+			waitRequestLedgerRF3GroupsReady(t, ctx, cluster, removed)
+		}
+	}
 	// Lose the caller after pin acquisition and durable route intent, before a
 	// terminal result exists. The replacement has a distinct controller and no
 	// copy of the old gateway's journals. No unrelated workload advances leases.
+	waitRequestLedgerRF3GroupsReady(t, ctx, cluster, nil)
 	gatewayA.client.armLostResponse(requestledger.OperationRecordRoutePinAcquiredPutPending)
-	_, err = gatewayA.sql.Execute(ctx, key, tenant, queries)
+	_, err = execute(gatewayA, nil)
 	if err == nil || !gatewayA.client.callerDisconnected() {
 		gatewayA.client.logRecentSettlements(t)
 		t.Fatalf("did not lose unfinished caller: %v", err)
@@ -77,13 +95,14 @@ func TestTwoGatewayDurableSQLRF3RecoversUnfinishedWaveWithDefaultPinSpan(t *test
 		}
 		waitRF3Leader(t, ctx, cluster.owners[:], removed, cluster.groups[group].key)
 	}
+	waitRequestLedgerRF3GroupsReady(t, ctx, cluster, removed)
 	head, err := gatewayB.ledger.ReadRow(ctx, home, gateway.DurableRequestLifecycleRead{
 		Key: key, Kind: replicatedstate.RequestLedgerReadHead, MinimumApplied: 1,
 	})
 	if err != nil || !head.Found || head.Head.Phase != requestledger.PhaseSealed {
 		t.Fatalf("fault must leave a sealed unfinished request: %+v err=%v", head, err)
 	}
-	recovered, err := gatewayB.sql.Execute(ctx, key, tenant, queries)
+	recovered, err := execute(gatewayB, removed)
 	if err != nil || recovered.Result == nil || recovered.TerminalRevision == 0 ||
 		recovered.Result.RowsAffected != 2 || recovered.Result.ShardsFanned != 2 {
 		gatewayB.client.logRecentSettlements(t)
@@ -93,6 +112,59 @@ func TestTwoGatewayDurableSQLRF3RecoversUnfinishedWaveWithDefaultPinSpan(t *test
 	if err != nil || !found || replayed.ResultDigest != recovered.ResultDigest || replayed.AckToken != recovered.AckToken {
 		t.Fatalf("replacement exact terminal replay=%+v found=%t err=%v", replayed, found, err)
 	}
+}
+
+// The gateway is intended to lose the explicitly selected committed response.
+// A status-only election observation can precede the
+// leader's first committed entry reaching the other voters, particularly
+// while strict-allocation tests compete for disk time. Verify every group in
+// one readiness pass so an unrelated startup election cannot consume the
+// caller before its armed fault. This advances no request or lease state.
+func waitRequestLedgerRF3GroupsReady(t testing.TB, ctx context.Context, cluster *multiGroupTransactionRF3Cluster, removed map[int]bool) {
+	t.Helper()
+	for ctx.Err() == nil {
+		var leaders [multiGroupRF3MaxGroups]int
+		var terms [multiGroupRF3MaxGroups]uint64
+		ready := true
+		for group := range cluster.groupCount {
+			key := cluster.groups[group].key
+			leader := waitRF3Leader(t, ctx, cluster.owners[:], removed, key)
+			state, err := cluster.owners[leader].Probe(ctx, key)
+			if err != nil || state.Status.LeaderID != state.Status.MemberID || state.Status.Commit <= 1 {
+				ready = false
+				break
+			}
+			leaders[group], terms[group] = leader, state.Status.Term
+			for member, owner := range cluster.owners {
+				if removed[member] {
+					continue
+				}
+				voter, err := owner.Probe(ctx, key)
+				if err != nil || voter.Status.LeaderID != state.Status.MemberID ||
+					voter.Status.Term != state.Status.Term || voter.Status.Applied < state.Status.Commit {
+					ready = false
+					break
+				}
+			}
+			if !ready {
+				break
+			}
+		}
+		if ready {
+			for group := range cluster.groupCount {
+				state, err := cluster.owners[leaders[group]].Probe(ctx, cluster.groups[group].key)
+				if err != nil || state.Status.MemberID != state.Status.LeaderID || state.Status.Term != terms[group] {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("request-ledger RF3 group readiness: %v", context.Cause(ctx))
 }
 
 func TestRequestLedgerRF3LostCallerStaysDisconnectedAcrossRetries(t *testing.T) {

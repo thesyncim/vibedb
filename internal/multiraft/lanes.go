@@ -298,6 +298,12 @@ func (lane *ExecutionLane) Publication(key raftmember.GroupKey) (raftmodel.Publi
 	}
 	return lane.set.Publication(key)
 }
+func (lane *ExecutionLane) ConfigurationReplay(key raftmember.GroupKey) (raftmember.CommittedConfigurationReplay, error) {
+	if err := lane.accepts(key); err != nil {
+		return nil, err
+	}
+	return lane.set.ConfigurationReplay(key)
+}
 func (lane *ExecutionLane) Status(key raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
 	if err := lane.accepts(key); err != nil {
 		return raftmember.RuntimeStatus{}, err
@@ -863,6 +869,27 @@ func (set *ExecutionLanes) Publication(key raftmember.GroupKey) (raftmodel.Publi
 		return raftmodel.Publication{}, ErrHostClosed
 	}
 	result, err := lane.host.Publication(key)
+	if err != nil {
+		lane.counters.rejected++
+	}
+	return result, err
+}
+
+// ConfigurationReplay serializes capability acquisition with the owning lane.
+// Entry verification through the returned capability does not acquire the lane.
+func (set *ExecutionLanes) ConfigurationReplay(key raftmember.GroupKey) (raftmember.CommittedConfigurationReplay, error) {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return nil, err
+	}
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	lane.counters.calls++
+	if set.state.Load() != executionLanesOpen {
+		lane.counters.rejected++
+		return nil, ErrHostClosed
+	}
+	result, err := lane.host.ConfigurationReplay(key)
 	if err != nil {
 		lane.counters.rejected++
 	}

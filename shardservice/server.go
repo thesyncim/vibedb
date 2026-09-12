@@ -357,6 +357,30 @@ func (s *Server) ServeAuthorizedConn(connection rafttransport.PeerConnection,
 	s.serveAdmittedAuthorized(connection, connection.PeerIdentity().Node, gate, audit)
 }
 
+// ServeAuthorizedConnWithDirectory is the directory-aware gateway-to-shard
+// boundary. The TLS transport supplies the verified service key digest; the
+// committed directory gates the authenticated gateway before the existing
+// operator/user Policy checks forwarded authority. A managed forwarded
+// principal remains subject to the directory lifecycle, so a retired service
+// cannot be resurrected by an older static Policy entry.
+func (s *Server) ServeAuthorizedConnWithDirectory(connection rafttransport.PeerConnection,
+	gate *serviceauthz.Gate, directory *serviceauthz.ServiceDirectoryGate,
+	audit serviceauthz.AuditSink) {
+	if connection == nil || gate == nil || directory == nil ||
+		connection.TrafficClass() != rafttransport.TrafficShardSQL {
+		if connection != nil {
+			_ = connection.Close()
+		}
+		return
+	}
+	if !s.admitConnection(connection) {
+		_ = connection.Close()
+		return
+	}
+	s.serveAdmittedAuthorizedDirectory(connection, connection.PeerIdentity().Node,
+		gate, directory, servicePeerFromConnection(connection), audit)
+}
+
 // serveAdmitted runs an admitted connection and reports its terminal error only
 // after every resource and shutdown-accounting entry is released, so OnError may
 // reentrantly call Close.
@@ -369,7 +393,16 @@ func (s *Server) serveAdmitted(conn net.Conn) {
 
 func (s *Server) serveAdmittedAuthorized(conn net.Conn, peer rafttransport.NodeID,
 	gate *serviceauthz.Gate, audit serviceauthz.AuditSink) {
-	err := s.serveConn(conn, peer, gate, audit)
+	err := s.serveConnWithDirectory(conn, peer, gate, nil, serviceauthz.AuthenticatedPeer{}, audit)
+	if err != nil && s.opts.OnError != nil {
+		s.opts.OnError(err)
+	}
+}
+
+func (s *Server) serveAdmittedAuthorizedDirectory(conn net.Conn, peer rafttransport.NodeID,
+	gate *serviceauthz.Gate, directory *serviceauthz.ServiceDirectoryGate,
+	servicePeer serviceauthz.AuthenticatedPeer, audit serviceauthz.AuditSink) {
+	err := s.serveConnWithDirectory(conn, peer, gate, directory, servicePeer, audit)
 	if err != nil && s.opts.OnError != nil {
 		s.opts.OnError(err)
 	}
@@ -377,12 +410,19 @@ func (s *Server) serveAdmittedAuthorized(conn net.Conn, peer rafttransport.NodeI
 
 func (s *Server) serveConn(nc net.Conn, peer rafttransport.NodeID,
 	gate *serviceauthz.Gate, audit serviceauthz.AuditSink) error {
+	return s.serveConnWithDirectory(nc, peer, gate, nil, serviceauthz.AuthenticatedPeer{}, audit)
+}
+
+func (s *Server) serveConnWithDirectory(nc net.Conn, peer rafttransport.NodeID,
+	gate *serviceauthz.Gate, directory *serviceauthz.ServiceDirectoryGate,
+	servicePeer serviceauthz.AuthenticatedPeer, audit serviceauthz.AuditSink) error {
 	// Done was added by admitConnection. Declare it before the resource defers
 	// so LIFO ordering removes and closes the connection first.
 	defer s.wg.Done()
 	defer s.releaseConnection(nc)
 	defer nc.Close()
-	c := &shardConn{server: s, nc: nc, peer: peer, authorization: gate, audit: audit}
+	c := &shardConn{server: s, nc: nc, peer: peer, servicePeer: servicePeer,
+		directory: directory, authorization: gate, audit: audit}
 	defer func() {
 		if c.sess != nil {
 			_ = c.sess.Close()

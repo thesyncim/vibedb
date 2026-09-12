@@ -404,11 +404,13 @@ func TestRecoveryCumulativeDiskBoundFailsWithoutWrap(t *testing.T) {
 
 type testPeerConn struct {
 	net.Conn
-	identity rafttransport.PeerIdentity
-	class    rafttransport.TrafficClass
+	identity  rafttransport.PeerIdentity
+	keyDigest [sha256.Size]byte
+	class     rafttransport.TrafficClass
 }
 
 func (c *testPeerConn) PeerIdentity() rafttransport.PeerIdentity { return c.identity }
+func (c *testPeerConn) PeerKeyDigest() [sha256.Size]byte         { return c.keyDigest }
 func (c *testPeerConn) TrafficClass() rafttransport.TrafficClass { return c.class }
 
 type cutConn struct {

@@ -3,12 +3,47 @@ package pgwire
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/query"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
+
+type frontendContextTestProvider struct {
+	credential serviceauthz.FrontendContinuationCredential
+}
+
+func (provider frontendContextTestProvider) FrontendContinuationCredential(
+	token serviceauthz.FrontendConnToken, scope serviceauthz.FrontendContinuationScope,
+) (serviceauthz.FrontendContinuationCredential, bool) {
+	credential := provider.credential
+	return credential, credential.ConnToken == token && credential.Protocol == scope && credential.Valid()
+}
+
+type frontendContextTestConn struct {
+	net.Conn
+	context context.Context
+}
+
+func (conn *frontendContextTestConn) FrontendConnectionContext(context.Context) context.Context {
+	return conn.context
+}
+
+type frontendContextRecordingBackend struct {
+	embeddedBackend
+	mu       sync.Mutex
+	contexts []context.Context
+}
+
+func (backend *frontendContextRecordingBackend) NewSession(ctx context.Context, identity SessionIdentity) (BackendSession, error) {
+	backend.mu.Lock()
+	backend.contexts = append(backend.contexts, ctx)
+	backend.mu.Unlock()
+	return backend.embeddedBackend.NewSession(ctx, identity)
+}
 
 type recordingBackend struct {
 	embeddedBackend
@@ -66,6 +101,44 @@ func TestExecutionBackendReceivesAuthenticatedIdentityAndCloses(t *testing.T) {
 	if backend.closed != 1 {
 		t.Fatalf("closed sessions = %d", backend.closed)
 	}
+}
+
+func TestExecutionBackendRetainsFrontendContinuationCredential(t *testing.T) {
+	var token serviceauthz.FrontendConnToken
+	token[0] = 3
+	var digest [32]byte
+	digest[0] = 4
+	provider := frontendContextTestProvider{credential: serviceauthz.FrontendContinuationCredential{
+		GrantDigest: digest, ConnToken: token, Protocol: serviceauthz.FrontendScopePostgreSQL,
+	}}
+	base, err := serviceauthz.WithFrontendConnection(context.Background(), token,
+		serviceauthz.FrontendScopePostgreSQL, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &frontendContextRecordingBackend{embeddedBackend: embeddedBackend{testDatabase(t, "users", corpus)}}
+	server, err := NewServerWithBackend(backend, Options{Auth: Trust(), Database: "app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	serverConn, clientConn := net.Pipe()
+	go server.ServeConn(&frontendContextTestConn{Conn: serverConn, context: base})
+	client := newTestClient(t, clientConn)
+	client.startup(map[string]string{"user": "tester", "database": "app"})
+	backend.mu.Lock()
+	if len(backend.contexts) != 1 {
+		backend.mu.Unlock()
+		t.Fatalf("backend contexts = %d, want one", len(backend.contexts))
+	}
+	credential, ok := serviceauthz.FrontendContinuationFromContext(backend.contexts[0])
+	backend.mu.Unlock()
+	if !ok || credential != provider.credential {
+		t.Fatalf("backend credential = %+v, ok=%v; want %+v", credential, ok, provider.credential)
+	}
+	client.terminate()
+	client.drainWrites()
+	_ = clientConn.Close()
 }
 
 func TestExecutionBackendRejectsInvalidComposition(t *testing.T) {

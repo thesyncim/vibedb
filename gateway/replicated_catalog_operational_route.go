@@ -3,6 +3,8 @@ package gateway
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -43,13 +45,31 @@ func (executor *ReplicatedExecutor) catalogOperationalRoute(ctx context.Context,
 	}
 	for attempt := 0; ; attempt++ {
 		route, err := executor.catalogOperationalRouteOnce(ctx, bootstrap, snapshot)
-		if err == nil || !errors.Is(err, errReplicatedLeaderUnobserved) || attempt+1 >= executor.maxAttempts {
+		if err == nil || !retryCatalogDiscovery(err) || attempt+1 >= executor.maxAttempts {
 			return route, err
 		}
 		if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
 			return ReplicatedRoute{}, errors.Join(err, waitErr)
 		}
 	}
+}
+
+func retryCatalogDiscovery(err error) bool {
+	// Each failed transport checkout is discarded by the authenticated pool.
+	// All three retained streams can have expired while the catalog was idle,
+	// so a sweep consisting entirely of EOFs must be allowed to dial afresh.
+	// Keep identity, command-fence and authorization failures terminal even
+	// when another candidate in the same sweep has a transport failure.
+	if !errors.Is(err, ErrReplicatedLeader) || errors.Is(err, ErrReplicatedRoute) ||
+		errors.Is(err, ErrReplicatedUnauthorized) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, errReplicatedLeaderUnobserved) || errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError)
 }
 
 func (executor *ReplicatedExecutor) catalogOperationalRouteOnce(ctx context.Context, bootstrap ReplicatedRoute,

@@ -85,6 +85,10 @@ func newTransactionRF3Cluster(t testing.TB) *transactionRF3Cluster {
 		listeners[index] = listener
 		addresses[nodes[index]] = listener.Addr().String()
 	}
+	for index := range voters {
+		registries[nodes[index]] = pinnedPeerTestRegistry(t, nodes[index], members[:], rafttransport.Limits{MaxGroups: 1, MaxMembers: voters}, peerTLS[:])
+	}
+
 	dial := func(ctx context.Context, node rafttransport.NodeID) (net.Conn, error) {
 		address, ok := addresses[node]
 		if !ok {

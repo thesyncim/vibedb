@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/shardservice"
 )
@@ -110,6 +111,45 @@ func TestMembershipGrantClientFailsClosedBeforeApply(t *testing.T) {
 	bad.EnrolledTarget.Node = bad.Serving.Replicas[0].Node
 	if _, err = client.ApplyMembership(context.Background(), bad, request); !errors.Is(err, ErrMembershipGrantInstall) {
 		t.Fatalf("duplicate route err=%v", err)
+	}
+}
+
+// TestMembershipGrantClientAddLearnerExcludesEnrolledTarget verifies the
+// AddLearner fanout never waits on the enrolled target: a brand-new physical
+// node has no group authority and cannot run a membership-grant-control
+// listener until after this exact AddLearner is admitted, so requiring its
+// confirmation first would deadlock permanently.
+func TestMembershipGrantClientAddLearnerExcludesEnrolledTarget(t *testing.T) {
+	route, grant, request := membershipGrantFanoutFixture()
+	request.Kind = raftservice.MembershipAddLearner
+	release := make(chan struct{})
+	close(release)
+	installer := &fanoutMembershipInstaller{
+		started: make(chan rafttransport.NodeID, MembershipGrantFanout), release: release,
+	}
+	applier := new(fanoutMembershipApplier)
+	client, err := NewMembershipGrantClient(grant, installer, applier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.ApplyMembership(context.Background(), route, request); err != nil {
+		t.Fatal(err)
+	}
+	close(installer.started)
+	seen := make(map[rafttransport.NodeID]struct{}, gateway.ServingReplicaCount)
+	for node := range installer.started {
+		seen[node] = struct{}{}
+	}
+	if len(seen) != gateway.ServingReplicaCount {
+		t.Fatalf("AddLearner fanout = %d nodes, want %d (voters only)", len(seen), gateway.ServingReplicaCount)
+	}
+	if _, installed := seen[route.EnrolledTarget.Node]; installed {
+		t.Fatal("AddLearner fanout installed a grant on the not-yet-enrolled target")
+	}
+	for _, replica := range route.Serving.Replicas {
+		if _, installed := seen[replica.Node]; !installed {
+			t.Fatalf("AddLearner fanout skipped voter %x", replica.Node)
+		}
 	}
 }
 

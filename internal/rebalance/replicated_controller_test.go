@@ -454,23 +454,23 @@ func TestOpenReplicatedMoveExecutionRequiresJournaledProof(t *testing.T) {
 		LeaderStatus: leaderStatus(1, 5)}}
 	action := Action{Kind: ActionAddLearner, Member: plan.TargetMember()}
 	record := newReplicaMoveRecord(plan.OperationID(), catalog.Generation(), intent, plan, cut, action)
-	if _, ok := OpenReplicatedMoveExecution(record, plan); ok {
+	if _, ok := OpenReplicatedMoveExecution(record, plan, cut); ok {
 		t.Fatal("planned action accepted")
 	}
 	record.State = gateway.ReplicatedOperationRunning
 	record.Cursor, record.Proof = replicaMoveActionWitness(plan.OperationID(), record.IntentDigest, plan, cut, action, replicaMoveCursorExecuting)
-	if execution, ok := OpenReplicatedMoveExecution(record, plan); !ok || execution.Action != action || execution.PublicationApplied != 5 {
+	if execution, ok := OpenReplicatedMoveExecution(record, plan, cut); !ok || execution.Action != action || execution.PublicationApplied != 5 {
 		t.Fatalf("journaled execution=%+v accepted=%t", execution, ok)
 	}
 	for index := range record.Cursor {
 		changed := record
 		changed.Cursor[index]++
-		if _, ok := OpenReplicatedMoveExecution(changed, plan); ok {
+		if _, ok := OpenReplicatedMoveExecution(changed, plan, cut); ok {
 			t.Fatalf("changed cursor %d accepted", index)
 		}
 	}
 	record.Proof[0]++
-	if _, ok := OpenReplicatedMoveExecution(record, plan); ok {
+	if _, ok := OpenReplicatedMoveExecution(record, plan, cut); ok {
 		t.Fatal("forged proof accepted")
 	}
 }
@@ -532,4 +532,32 @@ func TestReplicatedMoveControllerJournalsPostRemoveFenceRefresh(t *testing.T) {
 
 func raftMemberStatus(member, applied uint64) raftmember.RuntimeStatus {
 	return raftmember.RuntimeStatus{MemberID: member, Applied: applied}
+}
+
+func TestReplicatedMoveResumesAdmittedLearnerAfterPartition(t *testing.T) {
+	for _, badProof := range []bool{false, true} {
+		plan, catalog := moveTestPlan(t)
+		observer := &fixedMoveObserver{cut: ReplicatedMoveCut{Observation: Observation{Catalog: catalog, Publication: raftmodel.Publication{Applied: 5, ReplicaSetVersion: 4, ConfState: plan.initialConf}, LeaderStatus: leaderStatus(1, 5)}}}
+		record, err := PrepareReplicatedMoveRecord(t.Context(), plan, observer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if badProof {
+			record.Proof[0]++
+		}
+		journal := &memoryMoveJournal{record: record, present: true}
+		observer.cut.Publication = raftmodel.Publication{Applied: 7, ReplicaSetVersion: 6, ConfState: plan.learnerConf}
+		observer.cut.LeaderStatus = leaderStatus(1, 7)
+		executor := &moveActionExecutor{journal: journal}
+		action, err := ExecuteReplicatedMoveStep(t.Context(), plan.OperationID(), nil, journal, observer, executor)
+		if badProof {
+			if err == nil || len(executor.calls) != 0 || journal.record.Revision != record.Revision {
+				t.Fatal("untrusted learner witness accepted")
+			}
+			continue
+		}
+		if err != nil || action.Kind != ActionCreateSnapshotBase || len(executor.calls) != 1 || executor.calls[0].Kind == ActionAddLearner {
+			t.Fatalf("observed learner remained stranded: action=%+v calls=%+v err=%v", action, executor.calls, err)
+		}
+	}
 }

@@ -3,6 +3,7 @@ package rafttransport
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -75,6 +76,14 @@ func TestOrdinaryReceiverServeTLSAuthenticatesBeforeDelivery(t *testing.T) {
 	serverIdentity := PeerIdentity{TrustDomain: domain, Node: registry.LocalNode()}
 	clientTLS := newPeerTLSTestProfile(t, authority, clientIdentity)
 	serverTLS := newPeerTLSTestProfile(t, authority, serverIdentity)
+	// The legacy static test roster starts with logical principals only. Bind
+	// those records to the actual leaf keys before exercising TLS admission.
+	registry.physical[sender.LocalNode()] = PhysicalPeer{
+		NodeID: sender.LocalNode(), Node: sender.LocalNode(),
+		TrustDomain: registry.TrustDomain(), Incarnation: 1, Revision: 1,
+		ServiceKeyDigest: clientTLS.LocalPeerKeyDigest(), State: PeerEnrolled,
+	}
+	registry.peerDigest = physicalPeerDigest(registry.physical)
 	message := frameTestMessage(pb.MsgHeartbeat, from, to)
 	frame := frameTestEncode(t, sender, group, message)
 	stream, err := appendStreamRecord(nil, frame)
@@ -178,6 +187,47 @@ func TestOrdinaryReceiverRejectsCrossDomainConnectionBeforeRead(t *testing.T) {
 	connection.mu.Unlock()
 	if !closed {
 		t.Fatal("cross-domain connection was not closed")
+	}
+}
+
+func TestOrdinaryReceiverRechecksPeerKeyOnEveryPooledFrame(t *testing.T) {
+	group := testGroup(116)
+	sender, registry, from, to := frameTestRegistries(t, 2, group)
+	key := sha256.Sum256([]byte("stream-key-v1"))
+	rotated := sha256.Sum256([]byte("stream-key-v2"))
+	remote := sender.LocalNode()
+	registry.physical[remote] = PhysicalPeer{
+		NodeID: remote, Node: remote, TrustDomain: registry.TrustDomain(),
+		Incarnation: 1, Revision: 1, ServiceKeyDigest: key, State: PeerEnrolled,
+	}
+	registry.peerDigest = physicalPeerDigest(registry.physical)
+	message := frameTestMessage(pb.MsgHeartbeat, from, to)
+	frame := frameTestEncode(t, sender, group, message)
+	stream, err := appendStreamRecord(nil, frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err = appendStreamRecord(stream, frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var delivered atomic.Uint32
+	receiver := newStreamTestReceiver(t, registry, func(context.Context, Inbound) error {
+		if delivered.Add(1) == 1 {
+			peer := registry.physical[remote]
+			peer.ServiceKeyDigest = rotated
+			registry.physical[remote] = peer
+			registry.peerDigest = physicalPeerDigest(registry.physical)
+		}
+		return nil
+	})
+	connection := newStreamTestConnection(testPeerIdentity(registry, remote), stream)
+	connection.keyDigest = key
+	if err := receiver.Serve(context.Background(), connection); !errors.Is(err, ErrPeerKeyMismatch) {
+		t.Fatalf("second frame error = %v, want ErrPeerKeyMismatch", err)
+	}
+	if delivered.Load() != 1 {
+		t.Fatalf("delivered frames = %d, want 1", delivered.Load())
 	}
 }
 
@@ -333,10 +383,11 @@ func newStreamTestReceiver(
 }
 
 type streamTestConnection struct {
-	identity PeerIdentity
-	class    TrafficClass
-	reader   *bytes.Reader
-	maxRead  int
+	identity  PeerIdentity
+	keyDigest [sha256.Size]byte
+	class     TrafficClass
+	reader    *bytes.Reader
+	maxRead   int
 
 	mu        sync.Mutex
 	closed    bool
@@ -352,6 +403,9 @@ func newStreamTestConnection(identity PeerIdentity, stream []byte) *streamTestCo
 
 func (connection *streamTestConnection) PeerIdentity() PeerIdentity {
 	return connection.identity
+}
+func (connection *streamTestConnection) PeerKeyDigest() [sha256.Size]byte {
+	return connection.keyDigest
 }
 func (connection *streamTestConnection) TrafficClass() TrafficClass {
 	return connection.class
@@ -388,6 +442,9 @@ type streamAuthenticatedConnection struct {
 
 func (connection *streamAuthenticatedConnection) PeerIdentity() PeerIdentity {
 	return connection.identity
+}
+func (connection *streamAuthenticatedConnection) PeerKeyDigest() [sha256.Size]byte {
+	return [sha256.Size]byte{}
 }
 func (connection *streamAuthenticatedConnection) TrafficClass() TrafficClass {
 	return connection.class

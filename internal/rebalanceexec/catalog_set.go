@@ -21,6 +21,11 @@ type catalogSetAuthority interface {
 // a process-local batch. All targets keep their ordinary per-group Raft
 // and action proofs; only the shared catalog publication is combined.
 func (executor *Executor) executeCatalogSet(ctx context.Context, operation rebalance.OperationID, plan *rebalance.Plan, postRemove bool) (bool, error) {
+	// Owned moves publish their own exact receipt. The legacy combined head
+	// publication does not carry those receipts and must not bypass that path.
+	if _, owned := plan.TransitionKey(); owned {
+		return false, nil
+	}
 	if executor.options.Directory == nil || executor.options.Observer == nil {
 		return false, nil
 	}
@@ -85,7 +90,7 @@ func (executor *Executor) executeCatalogSet(ctx context.Context, operation rebal
 		if action.Kind != want {
 			return true, fmt.Errorf("%w: group=%x action=%s expected=%s", ErrAwaitMoveSet, sibling.Group().GroupID, action.Kind, want)
 		}
-		execution, ok := rebalance.OpenReplicatedMoveExecution(record, sibling)
+		execution, ok := rebalance.OpenReplicatedMoveExecution(record, sibling, cut)
 		if !ok || execution.Action != action || cut.Publication.ReplicaSetVersion != execution.PublicationReplicaSet || cut.Publication.Applied < execution.PublicationApplied {
 			return true, fmt.Errorf("%w: group=%x execution_valid=%t action=%v observed_action=%v replica_set=%d/%d applied=%d/%d", ErrAwaitMoveSet, sibling.Group().GroupID, ok, execution.Action, action, execution.PublicationReplicaSet, cut.Publication.ReplicaSetVersion, execution.PublicationApplied, cut.Publication.Applied)
 		}

@@ -36,6 +36,7 @@ type rf3SchemaArtifactSource interface {
 }
 
 type rf3SchemaGeneration struct {
+	manifest rf3Manifest
 	mu       sync.Mutex
 	identity raftmember.RuntimeIdentity
 	path     string
@@ -98,7 +99,7 @@ func newRF3SchemaActivator(
 		if identities[i].Group != group {
 			return nil, errRF3Serving
 		}
-		result.groups[group] = &rf3SchemaGeneration{identity: identities[i], path: item.manifest.SQL.Path,
+		result.groups[group] = &rf3SchemaGeneration{manifest: item.manifest, identity: identities[i], path: item.manifest.SQL.Path,
 			wal: item.recoveryLog(), base: item.base.Clone(), applyID: item.applyIdentity,
 			apply: item.apply}
 	}

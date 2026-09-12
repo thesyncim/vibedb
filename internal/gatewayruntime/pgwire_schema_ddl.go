@@ -37,6 +37,7 @@ type gatewaySchemaDDLRuntime struct {
 	resumer   gatewaySchemaDDLBuildResumer
 	journal   string
 	principal serviceauthz.Authority
+	refresh   func(context.Context) error
 	mu        sync.Mutex
 }
 
@@ -172,9 +173,9 @@ func (r *gatewaySchemaDDLRuntime) drainProof(ctx context.Context, result gateway
 func newGatewaySchemaDDLRuntime(authority *gateway.ReplicatedCatalogAuthority,
 	executor *gateway.ReplicatedExecutor, opener *gatewayShardControlOpener,
 	readDeadline, writeDeadline rafttransport.DeadlineFunc, journal string,
-	principal serviceauthz.Authority,
+	principal serviceauthz.Authority, refresh func(context.Context) error,
 ) (*gatewaySchemaDDLRuntime, error) {
-	if authority == nil || executor == nil || opener == nil || journal == "" {
+	if authority == nil || executor == nil || opener == nil || journal == "" || refresh == nil {
 		return nil, gateway.ErrSchemaRollout
 	}
 	client, err := schemainstall.NewClient(schemainstall.ClientOptions{
@@ -184,7 +185,32 @@ func newGatewaySchemaDDLRuntime(authority *gateway.ReplicatedCatalogAuthority,
 		return nil, err
 	}
 	return &gatewaySchemaDDLRuntime{authority: authority, executor: executor,
-		client: client, builder: client, resumer: client, journal: journal, principal: principal}, nil
+		client: client, builder: client, resumer: client, journal: journal, principal: principal,
+		refresh: refresh}, nil
+}
+
+// retryDirectoryAuthorization retries only a definite pre-admission refusal.
+// A catalog advance reaches each physical node's service-directory observer
+// independently; no proposal can have been admitted when authorization fails.
+func (r *gatewaySchemaDDLRuntime) retryDirectoryAuthorization(
+	ctx context.Context, attempt func() error,
+) error {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		err := attempt()
+		if !errors.Is(err, gateway.ErrReplicatedUnauthorized) || r == nil || r.refresh == nil {
+			return err
+		}
+		if refreshErr := r.refresh(ctx); refreshErr != nil {
+			return errors.Join(err, refreshErr)
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Join(err, context.Cause(ctx))
+		case <-ticker.C:
+		}
+	}
 }
 
 // buildOrResume closes the stateless-coordinator cut between durable replica
@@ -401,7 +427,10 @@ func (r *gatewaySchemaDDLRuntime) openGateSession(ctx context.Context,
 		}
 	}
 	if !session.Status().Active {
-		if _, err := session.Open(ctx, time.Now().Add(2*time.Minute).UnixNano()); err != nil {
+		if err := r.retryDirectoryAuthorization(ctx, func() error {
+			_, openErr := session.Open(ctx, time.Now().Add(2*time.Minute).UnixNano())
+			return openErr
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -433,7 +462,10 @@ func (r *gatewaySchemaDDLRuntime) acquireGate(ctx context.Context,
 	}
 	command := routegate.Command{Operation: routegate.OperationBeginExclusive,
 		Epoch: observed.Status.Epoch, Identity: identity, Binding: binding}
-	if _, err = session.RouteGate(ctx, command); err != nil {
+	if err = r.retryDirectoryAuthorization(ctx, func() error {
+		_, routeErr := session.RouteGate(ctx, command)
+		return routeErr
+	}); err != nil {
 		return gatewaySchemaDDLGate{}, err
 	}
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -506,7 +538,10 @@ func (r *gatewaySchemaDDLRuntime) releaseCompletedSchemaGate(ctx context.Context
 		}
 		command := routegate.Command{Operation: routegate.OperationReleaseExclusive,
 			Epoch: drain.Epoch, Identity: identity, Binding: binding}
-		_, releaseErr := session.RouteGate(ctx, command)
+		releaseErr := r.retryDirectoryAuthorization(ctx, func() error {
+			_, routeErr := session.RouteGate(ctx, command)
+			return routeErr
+		})
 		return true, errors.Join(releaseErr, session.RetireReleaseAndDestroy(ctx))
 	}
 	return false, nil
@@ -534,7 +569,10 @@ func (r *gatewaySchemaDDLRuntime) releaseGate(ctx context.Context,
 	}
 	command := routegate.Command{Operation: routegate.OperationReleaseExclusive,
 		Epoch: observed.Status.Epoch, Identity: gate.identity, Binding: gate.binding}
-	_, releaseErr := session.RouteGate(ctx, command)
+	releaseErr := r.retryDirectoryAuthorization(ctx, func() error {
+		_, routeErr := session.RouteGate(ctx, command)
+		return routeErr
+	})
 	return errors.Join(releaseErr, session.RetireReleaseAndDestroy(ctx))
 }
 

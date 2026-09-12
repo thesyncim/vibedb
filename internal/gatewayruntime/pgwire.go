@@ -2,6 +2,7 @@ package gatewayruntime
 
 import (
 	"context"
+	"errors"
 	"net"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -11,6 +12,14 @@ import (
 )
 
 func startGatewayPostgreSQL(ctx context.Context, address string, executor *gateway.Executor, authority serviceauthz.Authority, write func(context.Context, serviceauthz.Authority, gateway.Query) (*gateway.Result, error), logf func(string, ...any), ddl ...func(context.Context, serviceauthz.Authority, string) error) (*pgwire.Server, error) {
+	return startGatewayPostgreSQLWithFrontend(ctx, address, executor, authority, write, logf, nil, ddl...)
+}
+
+// startGatewayPostgreSQLWithFrontend keeps the public PostgreSQL listener
+// behind the same admission fence as the native frontend. The wrapper owns
+// only token admission; pgwire remains the authority for exact connection and
+// SQL-session counts.
+func startGatewayPostgreSQLWithFrontend(ctx context.Context, address string, executor *gateway.Executor, authority serviceauthz.Authority, write func(context.Context, serviceauthz.Authority, gateway.Query) (*gateway.Result, error), logf func(string, ...any), frontend *frontendAdmission, ddl ...func(context.Context, serviceauthz.Authority, string) error) (*pgwire.Server, error) {
 	if err := requireLoopbackListen(address); err != nil {
 		return nil, err
 	}
@@ -34,9 +43,13 @@ func startGatewayPostgreSQL(ctx context.Context, address string, executor *gatew
 		_ = server.Close()
 		return nil, err
 	}
+	if frontend != nil {
+		listener = &frontendPGAdmissionListener{Listener: listener, frontend: frontend}
+	}
 	go func() { <-ctx.Done(); _ = server.Close() }()
 	go func() {
-		if err := server.Serve(listener); err != nil && ctx.Err() == nil {
+		if err := server.Serve(listener); err != nil && ctx.Err() == nil &&
+			!errors.Is(err, pgwire.ErrServerDraining) {
 			logf("gateway: PostgreSQL stopped: %v", err)
 		}
 	}()

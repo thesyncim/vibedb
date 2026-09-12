@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/executionpin"
@@ -69,6 +70,26 @@ const (
 )
 
 var ErrReplicatedWire = errors.New("shardservice: invalid replicated native frame")
+
+type replicatedBorrowedScratch struct {
+	bytes [replicatedBorrowedCoalesceBytes]byte
+}
+
+var replicatedBorrowedScratchPool = sync.Pool{
+	New: func() any { return new(replicatedBorrowedScratch) },
+}
+
+func releaseReplicatedBorrowedScratch(scratch *replicatedBorrowedScratch, used int) {
+	releaseReplicatedBorrowedScratchTo(scratch, used, &replicatedBorrowedScratchPool)
+}
+
+func releaseReplicatedBorrowedScratchTo(scratch *replicatedBorrowedScratch, used int, pool *sync.Pool) {
+	if scratch == nil {
+		return
+	}
+	clear(scratch.bytes[:min(max(used, 0), len(scratch.bytes))])
+	pool.Put(scratch)
+}
 
 // DecodeReplicatedSQLRequest validates the complete nested frame length against
 // its admitted outer payload before the general SQL decoder allocates a body.
@@ -167,18 +188,22 @@ type ReplicatedFence struct {
 // ReplicatedRequest carries an exact canonical command or asks for a live
 // serving handshake. Command aliases the decoded frame and is capacity-clamped.
 type ReplicatedRequest struct {
-	Operation         ReplicatedOperation
-	Authority         serviceauthz.Authority
-	Capability        serviceauthz.Capability
-	Fence             ReplicatedFence
-	Command           []byte
-	Membership        ReplicatedMembershipRequest
-	Relation          replication.RelationID
-	Key               []byte
-	MinimumApplied    uint64
-	MaxValueBytes     uint32
-	BatchRead         []byte
-	Query             []byte
+	Operation      ReplicatedOperation
+	Authority      serviceauthz.Authority
+	Capability     serviceauthz.Capability
+	Fence          ReplicatedFence
+	Command        []byte
+	Membership     ReplicatedMembershipRequest
+	Relation       replication.RelationID
+	Key            []byte
+	MinimumApplied uint64
+	MaxValueBytes  uint32
+	BatchRead      []byte
+	Query          []byte
+	// Continuation is an outer, connection-bound drain proof. It never
+	// changes the inner command/query bytes and is omitted on the ordinary
+	// Active path.
+	Continuation      *serviceauthz.FrontendContinuationEnvelope
 	TransactionRead   ReplicatedTransactionReadRequest
 	RequestLedgerRead ReplicatedRequestLedgerReadRequest
 	ExecutionPinRead  ReplicatedExecutionPinReadRequest
@@ -329,6 +354,9 @@ func (f *FrameEncoder) EncodeReplicatedRequest(w io.Writer, request *ReplicatedR
 	case ReplicatedExecutionPinRead:
 		encodeReplicatedExecutionPinRead(&e, request.ExecutionPinRead)
 	}
+	if request.Continuation != nil {
+		encodeFrontendContinuation(&e, request.Continuation)
+	}
 	if e.err != nil {
 		return e.err
 	}
@@ -413,6 +441,9 @@ func ReplicatedRequestFrameBytes(request *ReplicatedRequest) (int, error) {
 			return 0, err
 		}
 	}
+	if err := add(frontendContinuationTailBytes(request)); err != nil {
+		return 0, err
+	}
 	return total + 5, nil
 }
 
@@ -438,11 +469,12 @@ func ValidateReplicatedResponse(response *ReplicatedResponse) error {
 	return nil
 }
 
-// EncodeReplicatedRequestBorrowed emits a small complete frame from a fresh
-// arena in one Write. Larger requests borrow the immutable command or point
-// key as a second scatter buffer, avoiding a payload-sized userspace copy on
-// every retry. Persistent streams should use a FrameEncoder to reuse its
-// arena; this convenience function remains one-shot.
+// EncodeReplicatedRequestBorrowed emits the fixed request prefix and borrows
+// the immutable command or point key as a second buffer. Small payload-bearing
+// frames use a bounded cleared scratch so a TLS stream sees one Write; larger
+// frames retain the scatter/writev path without a payload-sized userspace copy.
+// Payload-free frames instead reuse a per-connection FrameEncoder arena,
+// cleared before every reuse so no prior request's bytes linger in it.
 func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) error {
 	return (&FrameEncoder{}).EncodeReplicatedRequestBorrowed(w, request)
 }
@@ -456,27 +488,43 @@ func (f *FrameEncoder) EncodeReplicatedRequestBorrowed(w io.Writer, request *Rep
 	if w == nil || !validReplicatedRequest(request) {
 		return ErrReplicatedWire
 	}
-	payloadHint := 0
-	if request.Operation == ReplicatedMembership {
-		payloadHint = 65
+	var payload []byte
+	switch request.Operation {
+	case ReplicatedPropose:
+		payload = request.Command
+	case ReplicatedReadLeader, ReplicatedReadFollower:
+		payload = request.Key
+	case ReplicatedReadBatchLeader:
+		payload = request.BatchRead
+	case ReplicatedQueryLeader:
+		payload = request.Query
 	}
-	e := newFrameEncoder(f.arena, payloadHint)
-	defer func() {
-		clear(e.b)
-		f.arena = keepFrameArena(e.b)
-	}()
+	var scratch *replicatedBorrowedScratch
+	var e encbuf
+	if len(payload) != 0 {
+		scratch = replicatedBorrowedScratchPool.Get().(*replicatedBorrowedScratch)
+		e = encbuf{b: scratch.bytes[:5]}
+	} else {
+		payloadHint := 0
+		if request.Operation == ReplicatedMembership {
+			payloadHint = 65
+		}
+		e = newFrameEncoder(f.arena, payloadHint)
+		defer func() {
+			clear(e.b)
+			f.arena = keepFrameArena(e.b)
+		}()
+	}
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
 	e.b = append(e.b, request.Authority.Node[:]...)
 	e.u64(request.Authority.Generation)
 	e.u64(uint64(request.Capability))
 	encodeReplicatedFence(&e, request.Fence)
-	var payload []byte
 	tag := byte(tagReplicatedRequest)
 	switch request.Operation {
 	case ReplicatedProbe:
 	case ReplicatedPropose:
-		payload = request.Command
 		e.u32(uint32(len(payload)))
 	case ReplicatedMembership:
 		e.u32(0)
@@ -486,16 +534,13 @@ func (f *FrameEncoder) EncodeReplicatedRequestBorrowed(w io.Writer, request *Rep
 		e.u8(uint8(request.Relation))
 		e.u64(request.MinimumApplied)
 		e.u32(request.MaxValueBytes)
-		payload = request.Key
 		e.u32(uint32(len(payload)))
 	case ReplicatedReadBatchLeader:
 		e.u64(request.MinimumApplied)
 		e.u32(request.MaxValueBytes)
-		payload = request.BatchRead
 		e.u32(uint32(len(payload)))
 	case ReplicatedQueryLeader:
 		e.u32(request.MaxValueBytes)
-		payload = request.Query
 		e.u32(uint32(len(payload)))
 	case ReplicatedTransactionRead:
 		encodeReplicatedTransactionRead(&e, request.TransactionRead)
@@ -510,15 +555,21 @@ func (f *FrameEncoder) EncodeReplicatedRequestBorrowed(w io.Writer, request *Rep
 		encodeReplicatedExecutionPinRead(&e, request.ExecutionPinRead)
 		tag = tagReplicatedExecutionPinRead
 	}
-	total := len(e.b) + len(payload)
-	if e.err != nil || total-5 > maxFrameBody {
+	var continuation encbuf
+	if request.Continuation != nil {
+		encodeFrontendContinuation(&continuation, request.Continuation)
+	}
+	if e.err != nil || continuation.err != nil || len(e.b)+len(payload)+len(continuation.b)-5 > maxFrameBody {
+		releaseReplicatedBorrowedScratch(scratch, len(e.b))
 		return errFrameTooLarge
 	}
 	e.b[0] = tag
-	binary.BigEndian.PutUint32(e.b[1:5], uint32(total-1))
-	if total <= replicatedBorrowedCoalesceBytes {
+	binary.BigEndian.PutUint32(e.b[1:5], uint32(len(e.b)+len(payload)+len(continuation.b)-1))
+	if scratch != nil && len(e.b)+len(payload)+len(continuation.b) <= replicatedBorrowedCoalesceBytes {
 		e.b = append(e.b, payload...)
+		e.b = append(e.b, continuation.b...)
 		written, err := w.Write(e.b)
+		releaseReplicatedBorrowedScratch(scratch, len(e.b))
 		if err == nil && written != len(e.b) {
 			return io.ErrShortWrite
 		}
@@ -528,8 +579,12 @@ func (f *FrameEncoder) EncodeReplicatedRequestBorrowed(w io.Writer, request *Rep
 	if len(payload) != 0 {
 		buffers = append(buffers, payload)
 	}
+	if len(continuation.b) != 0 {
+		buffers = append(buffers, continuation.b)
+	}
 	written, err := buffers.WriteTo(w)
-	if err == nil && written != int64(total) {
+	releaseReplicatedBorrowedScratch(scratch, len(e.b))
+	if err == nil && written != int64(len(e.b)+len(payload)+len(continuation.b)) {
 		return io.ErrShortWrite
 	}
 	return err
@@ -594,6 +649,13 @@ func decodeReplicatedRequest(
 	case ReplicatedExecutionPinRead:
 		request.ExecutionPinRead = decodeReplicatedExecutionPinRead(&d)
 	}
+	if len(d.b) != 0 {
+		if len(d.b) != continuationEnvelopeBytes {
+			d.fail(ErrInvalidFrontendContinuationEnvelope)
+		} else {
+			request.Continuation = decodeFrontendContinuation(&d)
+		}
+	}
 	if err := d.end(); err != nil {
 		if budget != nil {
 			budget.release(charged)
@@ -631,7 +693,7 @@ func readReplicatedRequestFrame(
 	size := int(length) - 4
 	switch tag {
 	case tagReplicatedMembershipRequest:
-		if size != replicatedMembershipRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedMembershipRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -656,7 +718,7 @@ func readReplicatedRequestFrame(
 		}
 		return body, charged, tag, nil
 	case tagReplicatedTransactionRead:
-		if size != replicatedTransactionReadRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedTransactionReadRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -681,7 +743,7 @@ func readReplicatedRequestFrame(
 		}
 		return body, charged, tag, nil
 	case tagReplicatedRequestLedgerRead:
-		if size != replicatedRequestLedgerReadRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedRequestLedgerReadRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -706,7 +768,7 @@ func readReplicatedRequestFrame(
 		}
 		return body, charged, tag, nil
 	case tagReplicatedRouteGateRead:
-		if size != replicatedRouteGateReadRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedRouteGateReadRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -731,7 +793,7 @@ func readReplicatedRequestFrame(
 		}
 		return body, charged, tag, nil
 	case tagReplicatedExecutionPinRead:
-		if size != replicatedExecutionPinReadRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedExecutionPinReadRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -777,6 +839,10 @@ func readReplicatedRequestFrame(
 		return nil, 0, tag, err
 	}
 	return body, charged, tag, nil
+}
+
+func validContinuationBodySize(size, base int) bool {
+	return size == base || size == base+continuationEnvelopeBytes
 }
 
 // EncodeReplicatedResponse emits one canonical typed native response.
@@ -1127,6 +1193,16 @@ func validReplicatedFence(fence ReplicatedFence, exact bool) bool {
 func validReplicatedRequest(request *ReplicatedRequest) bool {
 	if request == nil {
 		return false
+	}
+	if request.Continuation != nil {
+		if !request.Continuation.Valid() {
+			return false
+		}
+		scope, ok := FrontendContinuationScopeForReplicatedRequestWithProtocol(request,
+			request.Continuation.Scope.Protocol)
+		if !ok || !sameFrontendContinuationScope(scope, request.Continuation.Scope) {
+			return false
+		}
 	}
 	if request.Operation != ReplicatedQueryLeader && len(request.Query) != 0 {
 		return false

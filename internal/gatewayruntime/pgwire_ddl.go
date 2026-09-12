@@ -23,6 +23,7 @@ import (
 func newGatewayDevDDL(socket string, authority *gateway.ReplicatedCatalogAuthority,
 	schema *gatewaySchemaDDLRuntime,
 	registerSource func(*gateway.Snapshot, gatewaySplitSource) error,
+	refreshDirectory func(context.Context) error,
 	loggers ...func(string, ...any),
 ) func(context.Context, serviceauthz.Authority, string) error {
 	var mu sync.Mutex
@@ -127,9 +128,15 @@ func newGatewayDevDDL(socket string, authority *gateway.ReplicatedCatalogAuthori
 				return err
 			}
 		}
-		return registerGatewayDevTable(ctx, func(ctx context.Context) error {
+		if err := registerGatewayDevTable(ctx, func(ctx context.Context) error {
 			return authority.RegisterProvisionedTable(ctx, addition)
-		}, loggers...)
+		}, loggers...); err != nil {
+			return err
+		}
+		if refreshDirectory == nil {
+			return errGatewayControlDirectory
+		}
+		return refreshDirectory(ctx)
 	}
 }
 

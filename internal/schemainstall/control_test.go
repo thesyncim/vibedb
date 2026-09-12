@@ -19,6 +19,7 @@ type schemaPeerConnection struct {
 func (connection *schemaPeerConnection) PeerIdentity() rafttransport.PeerIdentity {
 	return connection.identity
 }
+func (*schemaPeerConnection) PeerKeyDigest() [32]byte { return [32]byte{} }
 func (*schemaPeerConnection) TrafficClass() rafttransport.TrafficClass {
 	return rafttransport.TrafficShardControl
 }
