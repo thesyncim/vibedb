@@ -234,11 +234,11 @@ func rf3CapacityRecoveryLogBytes(log rf3RecoveryLog) (uint64, replicacontrol.Cap
 		if value == nil {
 			return 0, 0, replicacontrol.ErrCapacityUnavailable
 		}
-		bound, err := value.CapacityReservationBytes()
+		metrics, err := value.LiveMetrics()
 		if err != nil {
 			return 0, 0, errors.Join(replicacontrol.ErrCapacityUnavailable, err)
 		}
-		return bound, replicacontrol.CapacityDemandConservative, nil
+		return metrics.LiveBytes, replicacontrol.CapacityDemandMeasured, nil
 	default:
 		return 0, 0, replicacontrol.ErrCapacityUnavailable
 	}

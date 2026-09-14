@@ -50,6 +50,39 @@ func (v *GroupView) CapacityReservationBytes() (uint64, error) {
 	return v.store.bounds.maxEntriesPerGroup * perEntry, nil
 }
 
+// LiveMetrics returns the current logical retention of this group in the
+// shared node log. Unlike CapacityReservationBytes, this is the bytes a
+// group copy needs to transfer: one fixed entry header plus each entry's
+// authenticated payload. Shared encrypted extents are charged to each group
+// by payload rather than charging the complete node-log reservation.
+func (v *GroupView) LiveMetrics() (Metrics, error) {
+	if v == nil || v.store == nil {
+		return Metrics{}, ErrInvalid
+	}
+	v.store.mu.Lock()
+	defer v.store.mu.Unlock()
+	if err := v.store.usable(); err != nil {
+		return Metrics{}, err
+	}
+	state, ok := v.store.engine.Group(v.group)
+	if !ok {
+		return Metrics{}, ErrInvalid
+	}
+	var live uint64
+	for _, entry := range state.Entries {
+		const entryHeaderBytes = uint64(32)
+		if live > math.MaxUint64-entryHeaderBytes {
+			return Metrics{}, ErrBounds
+		}
+		live += entryHeaderBytes
+		if entry.DataBytes > math.MaxUint64-live {
+			return Metrics{}, ErrBounds
+		}
+		live += entry.DataBytes
+	}
+	return Metrics{LiveBytes: live, Entries: uint64(len(state.Entries))}, nil
+}
+
 func checkedCapacityAdd(left, right uint64) (uint64, bool) {
 	if right > math.MaxUint64-left {
 		return math.MaxUint64, true

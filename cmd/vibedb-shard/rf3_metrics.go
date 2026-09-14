@@ -119,14 +119,22 @@ func addRF3GroupStageMetrics(result *servicemetrics.StageMetricsSnapshot, apply 
 		result.PhysicalCheckpoints = rf3MetricsAdd(result.PhysicalCheckpoints, stats.PhysicalCheckpoints)
 		result.CheckpointBarrierSyncs = rf3MetricsAdd(result.CheckpointBarrierSyncs, stats.BarrierSyncs)
 	}
-	// Legacy group WALs expose exact counters. A node GroupView exposes only
-	// conservative reservation bounds, which must not be reported as live
-	// bytes or counted once per group as physical WAL synchronization work.
+	// Legacy group WALs expose exact counters. A node GroupView exposes the
+	// same logical live-byte view through LiveMetrics; its separate physical
+	// reservation remains a node-wide capacity ceiling and is not counted here.
 	if source, ok := log.(interface{ Metrics() raftstore.Metrics }); ok {
 		wal := source.Metrics()
 		result.WALLiveBytes = rf3MetricsAdd(result.WALLiveBytes, wal.LiveBytes)
 		result.WALEntries = rf3MetricsAdd(result.WALEntries, wal.Entries)
 		result.WALSyncs = rf3MetricsAdd(result.WALSyncs, wal.Syncs)
+	} else if source, ok := log.(interface {
+		LiveMetrics() (raftstore.Metrics, error)
+	}); ok {
+		if wal, err := source.LiveMetrics(); err == nil {
+			result.WALLiveBytes = rf3MetricsAdd(result.WALLiveBytes, wal.LiveBytes)
+			result.WALEntries = rf3MetricsAdd(result.WALEntries, wal.Entries)
+			result.WALSyncs = rf3MetricsAdd(result.WALSyncs, wal.Syncs)
+		}
 	}
 }
 

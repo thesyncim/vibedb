@@ -470,6 +470,41 @@ func TestNodeStoreSharedBoundedExtentsRotateReopen(t *testing.T) {
 	}
 }
 
+func TestGroupViewLiveMetricsAreSeparateFromReservation(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "node")
+	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 64, RecentWaves: 16, MaxEntriesPerGroup: 16, ReaderSlots: 1, MaxGroups: 8}
+	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)}}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.BeginIncarnations([]uint64{1}); err != nil {
+		t.Fatal(err)
+	}
+	payload := "live-group-payload"
+	if err = store.Group(1).Persist(raftmodel.PersistBatch{
+		NodeIncarnation: 1, ReadyID: 1, MustSync: true,
+		Entries:   []*pb.Entry{typedEntry(2, 2, pb.EntryNormal, payload)},
+		HardState: hard(2, 2),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metrics, err := store.Group(1).LiveMetrics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics.LiveBytes != 32+uint64(len(payload)) || metrics.Entries != 1 {
+		t.Fatalf("live metrics=%+v, want bytes=%d entries=1", metrics, 32+len(payload))
+	}
+	reservation, err := store.Group(1).CapacityReservationBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reservation <= metrics.LiveBytes {
+		t.Fatalf("reservation=%d must exceed live bytes=%d", reservation, metrics.LiveBytes)
+	}
+}
+
 func TestNodeStoreEmptyAndOversizeExtentPacking(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "node")
 	options := NodeStoreOptions{MaxWaveBytes: 1 << 20, MaxSegmentEvents: 32, RecentWaves: 16, MaxEntriesPerGroup: 16, ReaderSlots: 1}
