@@ -37,6 +37,39 @@ func testGroupTransitionIntent(t *testing.T, current *Snapshot, source Replicate
 	return intent
 }
 
+func TestBuildGroupOwnedShardTransitionReplacesNonFirstRouteLeader(t *testing.T) {
+	_, _, current := newCatalogAuthorityFixtureWithDescriptor(t, func(source *ReplicatedShardDescriptor) {
+		source.LogicalSchemaDigest = [32]byte{0x93}
+	})
+	source := current.ReplicatedShardDescriptors()[0]
+	_, _, target, command := testCertifiedReplicaReplacement(t, current, source)
+	retiring := source.Replicas[1].Member
+	intent := testGroupTransitionIntent(t, current, source, target, retiring)
+
+	next, err := BuildGroupOwnedShardTransition(current, intent, TransitionPhasePreRemove, target, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, found := next.Manifest(source.Distribution)
+	if !found {
+		t.Fatal("transition manifest missing")
+	}
+	ordinal, _ := manifestShardOrdinal(manifest, source.Shard)
+	if leader, ok := manifest.ShardLeaderAt(ordinal, 0); !ok || leader != "ep-a" {
+		t.Fatalf("leader 0 = %q, %v", leader, ok)
+	}
+	if leader, ok := manifest.ShardLeaderAt(ordinal, 1); !ok || leader != target.Endpoint {
+		t.Fatalf("leader 1 = %q, %v", leader, ok)
+	}
+	if leader, ok := manifest.ShardLeaderAt(ordinal, 2); !ok || leader != "ep-d" {
+		t.Fatalf("leader 2 = %q, %v", leader, ok)
+	}
+	descriptor := next.ReplicatedShardDescriptors()[0]
+	if descriptor.Replicas[1] != target || descriptor.Replicas[0] != source.Replicas[0] || descriptor.Replicas[2] != source.Replicas[2] {
+		t.Fatalf("transition roster = %+v", descriptor.Replicas)
+	}
+}
+
 func TestGroupTransitionReceiptAtomicRecoveryAndOwnerFence(t *testing.T) {
 	authority, client, current := newCatalogAuthorityFixtureWithDescriptor(t, func(source *ReplicatedShardDescriptor) { source.LogicalSchemaDigest = [32]byte{0x93} })
 	observer := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x92)
@@ -80,6 +113,15 @@ func TestGroupTransitionReceiptAtomicRecoveryAndOwnerFence(t *testing.T) {
 	receipt, found, err := observer.ReadGroupPublicationReceipt(ctx, intent.Key)
 	if err != nil || !found || receipt.CommittedHeadGeneration != next.Generation() {
 		t.Fatalf("durable receipt=%+v %t %v", receipt, found, err)
+	}
+	recoveredIntent, recoveredReceipt, operationReceiptFound, err := observer.ReadGroupPublicationReceiptForOperation(
+		ctx, intent.Key.OperationID, intent.Key.Group,
+	)
+	if err != nil || !operationReceiptFound || recoveredIntent.Key != intent.Key || recoveredReceipt != receipt {
+		t.Fatalf("operation-scoped receipt=%+v %+v %t %v", recoveredIntent.Key, recoveredReceipt, operationReceiptFound, err)
+	}
+	if _, _, operationReceiptFound, err := observer.ReadGroupPublicationReceiptForOperation(ctx, [32]byte{0x92}, intent.Key.Group); err != nil || operationReceiptFound {
+		t.Fatalf("foreign operation receipt=%t err=%v", operationReceiptFound, err)
 	}
 	refreshed, err := observer.Read(ctx)
 	if err != nil || refreshed.Generation() != receipt.CommittedHeadGeneration {

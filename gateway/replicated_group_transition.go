@@ -8,6 +8,7 @@ import (
 	"errors"
 
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -149,6 +150,26 @@ func (authority *ReplicatedCatalogAuthority) ReadGroupPublicationReceipt(ctx con
 		return GroupPublicationReceipt{}, false, err
 	}
 	return record.Receipt, true, nil
+}
+
+// ReadGroupPublicationReceiptForOperation recovers a transition by its stable
+// move operation ID and group. The move-rec key is group-scoped, so the stored
+// intent is returned as well; callers must compare that full intent with their
+// own immutable enrollment before accepting the receipt.
+func (authority *ReplicatedCatalogAuthority) ReadGroupPublicationReceiptForOperation(
+	ctx context.Context, operation [32]byte, group raftmember.GroupKey,
+) (GroupTransitionIntent, GroupPublicationReceipt, bool, error) {
+	if authority == nil || ctx == nil || operation == ([32]byte{}) || !validTransitionGroup(group) {
+		return GroupTransitionIntent{}, GroupPublicationReceipt{}, false, ErrGroupTransition
+	}
+	record, result, err := authority.readTransitionRecord(ctx, GroupTransitionKey{Group: group})
+	if err != nil || !result.Found {
+		return GroupTransitionIntent{}, GroupPublicationReceipt{}, false, err
+	}
+	if record.Intent.Key.OperationID != operation || record.Intent.Key.Group != group {
+		return GroupTransitionIntent{}, GroupPublicationReceipt{}, false, nil
+	}
+	return record.Intent, record.Receipt, true, nil
 }
 
 func (authority *ReplicatedCatalogAuthority) ReleaseDistributionTransition(ctx context.Context, lease GroupTransitionOwnerLease, receipt GroupPublicationReceipt) error {

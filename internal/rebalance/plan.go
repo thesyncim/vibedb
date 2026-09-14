@@ -815,14 +815,17 @@ func targetManifestForMove(
 		return nil, ErrInvalidPlan
 	}
 	source, _ := sourceManifest.ShardMetadataAt(ordinal)
-	if source.Epoch == ^distribution.OwnershipEpoch(0) ||
-		!unambiguousManifestMoveLeaders(
-			sourceManifest, ordinal, source.LeaderCount, request.Source, request.Target,
-		) {
+	if source.Epoch == ^distribution.OwnershipEpoch(0) {
+		return nil, ErrInvalidPlan
+	}
+	leader, ok := manifestMoveLeaderIndex(
+		sourceManifest, ordinal, source.LeaderCount, request.Source, request.Target,
+	)
+	if !ok {
 		return nil, ErrInvalidPlan
 	}
 	target, err := sourceManifest.ReplaceShardLeader(
-		ordinal, sourceManifest.Version()+1, 0, request.Target, source.Epoch+1,
+		ordinal, sourceManifest.Version()+1, leader, request.Target, source.Epoch+1,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidPlan, err)
@@ -843,13 +846,17 @@ func sourceManifestForRecovery(
 		return nil, ErrTopologyConflict
 	}
 	target, _ := targetManifest.ShardMetadataAt(ordinal)
-	if target.Epoch == 0 || !unambiguousManifestMoveLeaders(
+	if target.Epoch == 0 {
+		return nil, ErrTopologyConflict
+	}
+	leader, ok := manifestMoveLeaderIndex(
 		targetManifest, ordinal, target.LeaderCount, request.Target, request.Source,
-	) {
+	)
+	if !ok {
 		return nil, ErrTopologyConflict
 	}
 	source, err := targetManifest.ReplaceShardLeader(
-		ordinal, targetManifest.Version()-1, 0, request.Source, target.Epoch-1,
+		ordinal, targetManifest.Version()-1, leader, request.Source, target.Epoch-1,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrTopologyConflict, err)
@@ -857,27 +864,34 @@ func sourceManifestForRecovery(
 	return source, nil
 }
 
-func unambiguousManifestMoveLeaders(
+func manifestMoveLeaderIndex(
 	manifest *distribution.Manifest,
 	shard, count int,
 	first, excluded distribution.EndpointID,
-) bool {
+) (int, bool) {
 	if count == 0 {
-		return false
+		return -1, false
 	}
+	found := -1
 	for index := 0; index < count; index++ {
 		leader, ok := manifest.ShardLeaderAt(shard, index)
-		if !ok || leader == "" || leader == excluded || index == 0 && leader != first {
-			return false
+		if !ok || leader == "" || leader == excluded {
+			return -1, false
+		}
+		if leader == first {
+			if found >= 0 {
+				return -1, false
+			}
+			found = index
 		}
 		for prior := 0; prior < index; prior++ {
 			priorLeader, _ := manifest.ShardLeaderAt(shard, prior)
 			if priorLeader == leader {
-				return false
+				return -1, false
 			}
 		}
 	}
-	return true
+	return found, found >= 0
 }
 
 func simpleConfState(conf *pb.ConfState, lastIndex uint64) error {

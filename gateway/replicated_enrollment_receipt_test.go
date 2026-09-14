@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/replication"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -206,4 +207,179 @@ func TestPublishEnrollmentReceiptUsesAnExactPreparedRowAndAllowsUnrelatedHead(t 
 	if err != nil || retriedParent.CompletedReplicas != 1 || retriedParent.Revision != parent.Revision {
 		t.Fatalf("completion retry double-counted parent: %+v err=%v", retriedParent, err)
 	}
+}
+
+func TestEnrollmentMoveMatchesSnapshotRequiresPostRemoveIdentity(t *testing.T) {
+	authority, _, enrolled := enrollmentMoveFixture(t)
+	moving := enrolled
+	moving.State = EnrollmentMoving
+	moving.Revision++
+	moving.MoveOperationID = [32]byte{0xd3}
+	if EnrollmentMoveMatchesSnapshot(moving, authority.holder.Current()) {
+		t.Fatal("a catalog cut without a retained transition receipt must not prove a completed move")
+	}
+
+	transition, publication, final := publishEnrollmentMoveTransition(t, authority, moving)
+	if !EnrollmentMoveMatchesSnapshotWithReceipt(moving, final, transition, publication) {
+		t.Fatalf("exact post-remove target cut must prove a collected move: transition=%+v publication=%+v", transition.Key, publication)
+	}
+	later := enrollmentMoveNextHead(t, final)
+	if !EnrollmentMoveMatchesSnapshotWithReceipt(moving, later, transition, publication) {
+		t.Fatal("an unrelated later catalog head must preserve the exact transition proof")
+	}
+
+	descriptors := later.ReplicatedShardDescriptors()
+	descriptors[0].Command.ReplicaSetVersion--
+	regressed, err := enrollmentMoveSnapshotWithDescriptors(later, descriptors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if EnrollmentMoveMatchesSnapshotWithReceipt(moving, regressed, transition, publication) {
+		t.Fatal("pre-remove replica-set fence must not prove completion")
+	}
+	descriptors[0].Command.ReplicaSetVersion = later.ReplicatedShardDescriptors()[0].Command.ReplicaSetVersion + 1
+	ahead, err := enrollmentMoveSnapshotWithDescriptors(later, descriptors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if EnrollmentMoveMatchesSnapshotWithReceipt(moving, ahead, transition, publication) {
+		t.Fatal("unrelated later replica-set fence must not prove completion")
+	}
+	wrong := publication
+	wrong.Key.OperationID[0]++
+	if EnrollmentMoveMatchesSnapshotWithReceipt(moving, later, transition, wrong) {
+		t.Fatal("a receipt for a different move must not prove completion")
+	}
+}
+
+func publishEnrollmentMoveTransition(
+	t *testing.T, authority *ReplicatedCatalogAuthority, moving GroupEnrollmentIntent,
+) (GroupTransitionIntent, GroupPublicationReceipt, *Snapshot) {
+	t.Helper()
+	current := authority.holder.Current()
+	descriptors := current.ReplicatedShardDescriptors()
+	if len(descriptors) != 1 {
+		t.Fatalf("descriptors=%d, want one", len(descriptors))
+	}
+	source := descriptors[0]
+	// The enrollment fixture intentionally uses a metadata-light descriptor.
+	// Fill the transition-only provenance fields in the detached source copy;
+	// the final catalog cut remains built from the authority's actual snapshot.
+	source.LogicalSchemaDigest = [32]byte{0x31}
+	source.RangeIdentity = [32]byte{0x32}
+	source.LineageDigest = [32]byte{0x33}
+	source.ForwardingRuleDigest = [32]byte{0x34}
+	target := enrollmentTargetDescriptor(moving.Target)
+	transition := testGroupTransitionIntent(t, current, source, target, moving.Source.Member)
+	transition.Key.OperationID = moving.MoveOperationID
+	if !transition.Valid() {
+		t.Fatalf("move transition fixture is invalid: key=%+v source=%+v replacement=%+v", transition.Key, transition.SourceDescriptor, transition.Replacement)
+	}
+	final := enrollmentMoveFinalSnapshot(t, current, moving)
+	descriptor := final.ReplicatedShardDescriptors()[0]
+	headDigest, err := CatalogSnapshotDigest(final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, ok := final.Manifest(moving.Distribution)
+	if !ok {
+		t.Fatal("final manifest missing")
+	}
+	publication := GroupPublicationReceipt{
+		Key: transition.Key, Phase: TransitionPhasePostRemove,
+		PredecessorReceiptDigest:     [32]byte{0x35},
+		PredecessorHeadGeneration:    current.Generation() + 1,
+		PredecessorHeadDigest:        [32]byte{0x36},
+		PredecessorGroupGeneration:   current.Generation() + 1,
+		PredecessorGroupHeadDigest:   [32]byte{0x37},
+		PredecessorGroupDigest:       [32]byte{0x38},
+		PredecessorRosterDigest:      [32]byte{0x39},
+		PredecessorRouteDigest:       [32]byte{0x3a},
+		CommittedHeadGeneration:      final.Generation(),
+		CommittedHeadDigest:          headDigest,
+		CommittedGroupGeneration:     final.Generation(),
+		CommittedGroupDigest:         DigestReplicatedShardDescriptor(descriptor),
+		CommittedRosterDigest:        DigestReplicaRoster(descriptor.Replicas),
+		CommittedRouteDigest:         DigestRouteFor(final, moving.Distribution, moving.Shard),
+		CommittedCommandFenceDigest:  DigestCommandFence(descriptor.Command),
+		CommittedDistributionVersion: manifest.Version(),
+		SourceRouteDigest:            transition.SourceRouteDigest,
+		SourceRosterDigest:           transition.SourceRosterDigest,
+	}
+	if !publication.Valid() {
+		t.Fatal("move publication fixture is invalid")
+	}
+	return transition, publication, final
+}
+
+func enrollmentMoveFinalSnapshot(t *testing.T, current *Snapshot, intent GroupEnrollmentIntent) *Snapshot {
+	t.Helper()
+	descriptors := current.ReplicatedShardDescriptors()
+	if len(descriptors) != 1 {
+		t.Fatalf("descriptors=%d, want one", len(descriptors))
+	}
+	descriptor := &descriptors[0]
+	target := ReplicatedReplicaDescriptor{Member: intent.Target.Member, Node: intent.Target.Node,
+		StoreID: intent.Target.StoreID, NodeIncarnation: intent.Target.NodeIncarnation,
+		Endpoint: intent.Target.Endpoint, NativeEndpoint: intent.Target.NativeEndpoint,
+		ControlEndpoint: intent.Target.ControlEndpoint}
+	found := false
+	for index := range descriptor.Replicas {
+		if descriptor.Replicas[index].Member == intent.Source.Member {
+			descriptor.Replicas[index] = target
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("source replica missing from enrolled cut")
+	}
+	descriptor.EnrolledTarget = nil
+	descriptor.Command.ReplicaSetVersion = intent.ExpectedCommand.ReplicaSetVersion + 3
+	descriptor.Command.OwnershipEpoch = intent.ExpectedCommand.OwnershipEpoch + 1
+	descriptor.Command.RoutingVersion = intent.ExpectedCommand.RoutingVersion + 1
+	descriptor.Command.RouteGeneration = intent.ExpectedCommand.RouteGeneration + 1
+	manifest, ok := current.Manifest(intent.Distribution)
+	if !ok {
+		t.Fatal("distribution manifest missing")
+	}
+	ordinal, _ := manifestShardOrdinal(manifest, intent.Shard)
+	if ordinal < 0 {
+		t.Fatal("shard manifest missing")
+	}
+	replaced, err := manifest.ReplaceShardLeader(ordinal, distribution.RoutingVersion(intent.ExpectedCommand.RoutingVersion+1), 0,
+		intent.Target.Endpoint, distribution.OwnershipEpoch(intent.ExpectedCommand.OwnershipEpoch+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := cloneConfig(current.config)
+	for index := range config.Manifests {
+		if config.Manifests[index].Distribution() == intent.Distribution {
+			config.Manifests[index] = replaced
+		}
+	}
+	final, err := NewSnapshotWithReplicatedTableMetadata(config, current.endpoints,
+		current.Generation()+2, current.indexDescriptors(), current.statistics.Descriptors(), descriptors,
+		current.replicatedTableProfiles(), current.ReplicatedTableDeclarations())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return final
+}
+
+func enrollmentMoveSnapshotWithDescriptors(current *Snapshot, descriptors []ReplicatedShardDescriptor) (*Snapshot, error) {
+	return NewSnapshotWithReplicatedTableMetadata(cloneConfig(current.config), current.endpoints, current.Generation(),
+		current.indexDescriptors(), current.statistics.Descriptors(), descriptors, current.replicatedTableProfiles(),
+		current.ReplicatedTableDeclarations())
+}
+
+func enrollmentMoveNextHead(t *testing.T, current *Snapshot) *Snapshot {
+	t.Helper()
+	final, err := NewSnapshotWithReplicatedTableMetadata(cloneConfig(current.config), current.endpoints,
+		current.Generation()+1, current.indexDescriptors(), current.statistics.Descriptors(),
+		current.ReplicatedShardDescriptors(), current.replicatedTableProfiles(), current.ReplicatedTableDeclarations())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return final
 }

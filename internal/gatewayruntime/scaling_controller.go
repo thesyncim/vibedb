@@ -530,7 +530,25 @@ func (controller *ScalingController) resumeEnrollment(ctx context.Context, row g
 			return false, nil
 		}
 		record, err := reader.ReadOperation(ctx, row.MoveOperationID)
-		if err != nil || record.State != gateway.ReplicatedOperationComplete {
+		if errors.Is(err, gateway.ErrReplicatedOperationMissing) {
+			// Completed move records are collected immediately after their
+			// terminal journal write. A missing record is therefore retryable
+			// only when the authoritative catalog and the retained transition
+			// receipt prove the exact post-remove target/source and ownership
+			// fences for this enrollment.
+			snapshot, readErr := controller.catalog.Read(ctx)
+			reader, readerOK := controller.catalog.(gateway.GroupTransitionOperationReader)
+			if readErr != nil || !readerOK {
+				return false, errors.Join(err, readErr, gateway.ErrGroupTransition)
+			}
+			transition, publication, found, receiptErr := reader.ReadGroupPublicationReceiptForOperation(
+				ctx, row.MoveOperationID, row.Group,
+			)
+			if readErr != nil || receiptErr != nil || !found ||
+				!gateway.EnrollmentMoveMatchesSnapshotWithReceipt(row, snapshot, transition, publication) {
+				return false, errors.Join(err, readErr, receiptErr, gateway.ErrGroupTransition)
+			}
+		} else if err != nil || record.State != gateway.ReplicatedOperationComplete {
 			return false, err
 		}
 		current, err := controller.directory.ReadEnrollmentIntent(ctx, row.IntentID)

@@ -213,6 +213,15 @@ type GroupTransitionReceiptReader interface {
 	ReadGroupPublicationReceipt(context.Context, GroupTransitionKey) (GroupPublicationReceipt, bool, error)
 }
 
+// GroupTransitionOperationReader is the restart seam for callers that retain
+// only the move operation ID. The operation directory may already have been
+// collected, but the latest group transition record remains durable so a
+// caller can recover the exact immutable source intent together with its
+// authority-produced receipt.
+type GroupTransitionOperationReader interface {
+	ReadGroupPublicationReceiptForOperation(context.Context, [32]byte, raftmember.GroupKey) (GroupTransitionIntent, GroupPublicationReceipt, bool, error)
+}
+
 // AppendGroupTransitionIntent appends the canonical bounded intent encoding.
 func AppendGroupTransitionIntent(dst []byte, intent GroupTransitionIntent) ([]byte, error) {
 	if !intent.Valid() {
@@ -356,6 +365,9 @@ func BuildGroupOwnedShardTransition(
 	}
 	descriptors := current.replicatedDescriptors()
 	changed := false
+	var sourceRouteIndex = -1
+	var sourceRouteEndpoint distribution.EndpointID
+	var sourceRouteSource ReplicatedReplicaDescriptor
 	for index := range descriptors {
 		descriptor := &descriptors[index]
 		if descriptor.Group != intent.Key.Group {
@@ -380,19 +392,33 @@ func BuildGroupOwnedShardTransition(
 				return nil, ErrGroupTransition
 			}
 			source := descriptor.Replicas[changedOrdinal]
+			sourceRouteSource = source
+			for routeIndex, endpoint := range intent.SourceRoute {
+				if endpoint != source.Endpoint && endpoint != source.NativeEndpoint && endpoint != source.ControlEndpoint {
+					continue
+				}
+				if sourceRouteIndex >= 0 {
+					return nil, ErrGroupTransition
+				}
+				sourceRouteIndex = routeIndex
+				sourceRouteEndpoint = endpoint
+			}
+			if sourceRouteIndex < 0 {
+				return nil, ErrGroupTransition
+			}
 			descriptor.Replicas[changedOrdinal] = replacement
 			descriptor.EnrolledTarget = nil
 			// Route leaders can deliberately use NativeEndpoint. Preserve the
 			// chosen alias while replacing the same ordered source position.
-			if source.Endpoint == intent.SourceRoute[0] {
+			if source.Endpoint == sourceRouteEndpoint {
 				// public route alias
-			} else if source.NativeEndpoint == intent.SourceRoute[0] {
+			} else if source.NativeEndpoint == sourceRouteEndpoint {
 				replacementEndpoint := replacement.NativeEndpoint
 				if replacementEndpoint == "" {
 					return nil, ErrGroupTransition
 				}
 				descriptor.Replicas[changedOrdinal].Endpoint = replacementEndpoint
-			} else if source.ControlEndpoint == intent.SourceRoute[0] {
+			} else if source.ControlEndpoint == sourceRouteEndpoint {
 				descriptor.Replicas[changedOrdinal].Endpoint = replacement.ControlEndpoint
 			} else {
 				return nil, ErrGroupTransition
@@ -430,22 +456,25 @@ func BuildGroupOwnedShardTransition(
 		if !found || len(intent.SourceRoute) != metadata.LeaderCount || metadata.Epoch == ^distribution.OwnershipEpoch(0) {
 			return nil, ErrGroupTransition
 		}
-		leader, found := manifest.ShardLeaderAt(ordinal, 0)
-		if !found || leader != intent.SourceRoute[0] {
+		for routeIndex, expected := range intent.SourceRoute {
+			leader, routeFound := manifest.ShardLeaderAt(ordinal, routeIndex)
+			if !routeFound || leader != expected {
+				return nil, ErrGroupTransition
+			}
+		}
+		if sourceRouteIndex < 0 || sourceRouteIndex >= metadata.LeaderCount {
 			return nil, ErrGroupTransition
 		}
 		targetEndpoint := replacement.Endpoint
-		if len(intent.SourceRoute) > 0 {
-			if len(intent.SourceDescriptor.Replicas) == metadata.LeaderCount &&
-				intent.SourceDescriptor.Replicas[0].NativeEndpoint == intent.SourceRoute[0] {
-				targetEndpoint = replacement.NativeEndpoint
-			} else if len(intent.SourceDescriptor.Replicas) == metadata.LeaderCount &&
-				intent.SourceDescriptor.Replicas[0].ControlEndpoint == intent.SourceRoute[0] {
-				targetEndpoint = replacement.ControlEndpoint
-			}
+		if sourceRouteEndpoint == sourceRouteSource.NativeEndpoint {
+			targetEndpoint = replacement.NativeEndpoint
+		} else if sourceRouteEndpoint == sourceRouteSource.ControlEndpoint {
+			targetEndpoint = replacement.ControlEndpoint
+		} else if sourceRouteEndpoint != sourceRouteSource.Endpoint {
+			return nil, ErrGroupTransition
 		}
 		var err error
-		nextManifest, err = manifest.ReplaceShardLeader(ordinal, intent.TargetDistributionVersion, 0, targetEndpoint, metadata.Epoch+1)
+		nextManifest, err = manifest.ReplaceShardLeader(ordinal, intent.TargetDistributionVersion, sourceRouteIndex, targetEndpoint, metadata.Epoch+1)
 		if err != nil {
 			return nil, errors.Join(err, ErrGroupTransition)
 		}

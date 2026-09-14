@@ -865,11 +865,13 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 			t.Fatalf("target %d empty manifest: %v", index+1, err)
 		}
 	}
+	physical := startSeamlessScalePhysicalCluster(t, ctx, shardBinary, cluster)
+	// Keep target ports reserved while the initial physical cluster starts so
+	// its independently allocated listeners cannot reuse an empty target's
+	// address before that target is launched in a later cycle.
 	if err := listenerReservation.Close(); err != nil {
 		t.Fatalf("release empty-node listener reservations: %v", err)
 	}
-
-	physical := startSeamlessScalePhysicalCluster(t, ctx, shardBinary, cluster)
 	t.Cleanup(func() {
 		if !t.Failed() {
 			return
