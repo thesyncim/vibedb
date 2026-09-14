@@ -56,7 +56,9 @@ func (function openerFunc) OpenShardControl(
 func TestCodecRoundTripIsCanonicalBoundedAndStrict(t *testing.T) {
 	request, cut := controlFixture()
 	observation := Observation{Request: request, Publication: cut.Publication,
-		Status: cut.Status, Progress: cut.TargetProgress, ProgressFound: true, State: cut.State}
+		Status: cut.Status, StoreID: cut.Identity.StoreID,
+		NodeIncarnation: cut.Identity.NodeIncarnation, Progress: cut.TargetProgress,
+		ProgressFound: true, State: cut.State}
 	requestBytes, err := AppendRequest(nil, request)
 	if err != nil || len(requestBytes) != RequestBytes {
 		t.Fatalf("request bytes=%d err=%v", len(requestBytes), err)
@@ -71,6 +73,7 @@ func TestCodecRoundTripIsCanonicalBoundedAndStrict(t *testing.T) {
 	}
 	opened, err := OpenResponse(encoded)
 	if err != nil || opened.Request != request || opened.Status != observation.Status ||
+		opened.StoreID != cut.Identity.StoreID || opened.NodeIncarnation != cut.Identity.NodeIncarnation ||
 		opened.Progress != observation.Progress || !opened.ProgressFound ||
 		!proto.Equal(opened.State.ConfState, observation.State.ConfState) ||
 		opened.State.Applied != observation.State.Applied {
@@ -241,8 +244,12 @@ func controlFixture() (Request, raftservice.ReplicaObservation) {
 	status := raftmember.RuntimeStatus{MemberID: 2, LeaderID: 2, Term: 4, Commit: state.Applied,
 		Applied: state.Applied, CheckpointApplied: state.Applied, RaftState: raft.StateLeader}
 	progress := raftmodel.MemberProgress{Match: status.Commit, Next: status.Commit + 1, RecentActive: true}
-	return request, raftservice.ReplicaObservation{Publication: publication, Status: status,
-		TargetProgress: progress, ProgressFound: true, State: state}
+	return request, raftservice.ReplicaObservation{Identity: raftmember.RuntimeIdentity{
+		Group: group, Distribution: state.Binding.Distribution, Shard: state.Binding.Shard,
+		AllocationGeneration: state.Binding.AllocationGeneration, MemberID: status.MemberID,
+		StoreID: id(3), NodeIncarnation: 4, RelationManifestDigest: digest},
+		Publication: publication, Status: status, TargetProgress: progress,
+		ProgressFound: true, State: state}
 }
 
 func TestHealthCodecIsFixedStrictAndDistinctFromFullCut(t *testing.T) {
@@ -294,7 +301,8 @@ func TestHealthCodecIsFixedStrictAndDistinctFromFullCut(t *testing.T) {
 	}
 	fullRequest, fullCut := controlFixture()
 	full, err := AppendResponse(nil, Observation{Request: fullRequest,
-		Publication: fullCut.Publication, Status: fullCut.Status, Progress: fullCut.TargetProgress,
+		Publication: fullCut.Publication, Status: fullCut.Status, StoreID: fullCut.Identity.StoreID,
+		NodeIncarnation: fullCut.Identity.NodeIncarnation, Progress: fullCut.TargetProgress,
 		ProgressFound: true, State: fullCut.State})
 	if err != nil {
 		t.Fatal(err)

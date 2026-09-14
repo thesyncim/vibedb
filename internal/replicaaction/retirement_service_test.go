@@ -181,6 +181,94 @@ func TestRetirementServiceDoesNotCrossUncertainJournalBoundaries(t *testing.T) {
 	}
 }
 
+func TestRetirementServiceRebindsNewerSourceIncarnationAfterStaleRetry(t *testing.T) {
+	journal, err := OpenFileJournal(t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	request := retirementServiceRequest(t, "127.0.0.1:1234")
+	validations := 0
+	retirements := 0
+	owner := &retirementBoundaryOwner{
+		validate: func(_ context.Context, retirement raftservice.ReplicaRetirementRequest) error {
+			validations++
+			if validations == 1 {
+				return raftservice.ErrServingFence
+			}
+			if retirement.Fence.NodeIncarnation != request.Fence.NodeIncarnation+1 {
+				t.Fatalf("retry fence incarnation=%d", retirement.Fence.NodeIncarnation)
+			}
+			return nil
+		},
+		retire: func(_ context.Context, retirement raftservice.ReplicaRetirementRequest) error {
+			if !retirement.Authorized {
+				t.Fatal("successful retry reached close without durable authorization")
+			}
+			retirements++
+			return nil
+		},
+	}
+	service := testService(t, journal, owner)
+	service.retirementProof = func(context.Context, Request) (raftservice.ReplicaRetirementProof, error) {
+		return raftservice.ReplicaRetirementProof{}, nil
+	}
+	if _, err := service.Execute(t.Context(), request); !errors.Is(err, raftservice.ErrServingFence) {
+		t.Fatalf("initial stale retirement err=%v", err)
+	}
+	retry := request
+	retry.Fence.NodeIncarnation++
+	retry.Command, err = EncodeRetirementLocators([]RetirementLocator{{Member: retry.TargetMember, Address: "127.0.0.1:4321"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := service.Execute(t.Context(), retry)
+	if err != nil || record.State != Complete || record.Revision != 3 || validations != 2 || retirements != 1 {
+		t.Fatalf("refreshed retry record=%+v validations=%d retirements=%d err=%v", record, validations, retirements, err)
+	}
+	stored, err := journal.ReadReplicaAction(t.Context(), request.Operation, request.Kind)
+	if err != nil || stored.Request.Fence.NodeIncarnation != retry.Fence.NodeIncarnation {
+		t.Fatalf("stored refreshed fence=%+v err=%v", stored.Request.Fence, err)
+	}
+}
+
+func TestRetirementServiceRejectsOlderOrForeignSourceIdentityRetry(t *testing.T) {
+	for name, mutate := range map[string]func(*Request){
+		"older incarnation": func(request *Request) { request.Fence.NodeIncarnation = 1 },
+		"foreign store":     func(request *Request) { request.Fence.StoreID[0]++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			journal, err := OpenFileJournal(t.TempDir(), 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer journal.Close()
+			request := retirementServiceRequest(t, "127.0.0.1:1234")
+			validations := 0
+			owner := &retirementBoundaryOwner{validate: func(context.Context, raftservice.ReplicaRetirementRequest) error {
+				validations++
+				return raftservice.ErrServingFence
+			}}
+			service := testService(t, journal, owner)
+			service.retirementProof = func(context.Context, Request) (raftservice.ReplicaRetirementProof, error) {
+				return raftservice.ReplicaRetirementProof{}, nil
+			}
+			if _, err := service.Execute(t.Context(), request); !errors.Is(err, raftservice.ErrServingFence) {
+				t.Fatalf("initial stale retirement err=%v", err)
+			}
+			retry := request
+			retry.Fence.NodeIncarnation++
+			mutate(&retry)
+			if _, err := service.Execute(t.Context(), retry); !errors.Is(err, ErrConflict) {
+				t.Fatalf("mismatched retry err=%v", err)
+			}
+			if validations != 1 {
+				t.Fatalf("mismatched retry reached owner validations=%d", validations)
+			}
+		})
+	}
+}
+
 func TestRetirementServiceRunningMissingSourceIsNotCompletionProof(t *testing.T) {
 	journal, err := OpenFileJournal(t.TempDir(), 1)
 	if err != nil {

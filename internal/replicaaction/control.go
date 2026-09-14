@@ -282,8 +282,24 @@ func (service *Service) Execute(ctx context.Context, request Request) (Record, e
 func (service *Service) loadOrCreate(ctx context.Context, request Request) (Record, error) {
 	record, err := service.journal.ReadReplicaAction(ctx, request.Operation, request.Kind)
 	if err == nil {
-		if !validRecord(record) || !equalRequest(record.Request, request) {
+		if !validRecord(record) {
 			return Record{}, ErrConflict
+		}
+		if !equalRequest(record.Request, request) {
+			// The source group can be adopted again with a higher runtime
+			// incarnation while its operation journal survives the process
+			// restart. Rebind only source-retirement records for the same
+			// persistent store and immutable operation identity; the owner still
+			// validates the fresh fence before any close. Older, foreign, or
+			// otherwise changed requests remain conflicts.
+			if record.Request.Kind != SourceRetirement ||
+				!restartRetirementRequest(record.Request, request) {
+				return Record{}, ErrConflict
+			}
+			if record.State == Complete {
+				return record, nil
+			}
+			record.Request = cloneRequest(request)
 		}
 		return record, nil
 	}
@@ -411,6 +427,23 @@ func equalRequest(a, b Request) bool {
 	return a.Operation == b.Operation && a.Step == b.Step && a.Kind == b.Kind &&
 		a.Fence == b.Fence && a.SourceMember == b.SourceMember &&
 		a.TargetMember == b.TargetMember && (a.Kind == SourceRetirement || bytes.Equal(a.Command, b.Command))
+}
+
+// restartRetirementRequest permits one monotonic source-runtime incarnation
+// refresh for a still-running or authorized retirement. The fence's store,
+// group, command, term, and operation participants stay fixed; only the
+// source NodeIncarnation may advance. This makes a retry after a source
+// restart idempotent without accepting an ABA identity or changing action
+// authority.
+func restartRetirementRequest(a, b Request) bool {
+	if a.Kind != SourceRetirement || b.Kind != SourceRetirement ||
+		a.Fence.NodeIncarnation >= b.Fence.NodeIncarnation {
+		return false
+	}
+	left, right := a, b
+	left.Fence.NodeIncarnation = 0
+	right.Fence.NodeIncarnation = 0
+	return equalRequest(left, right)
 }
 func equalRecord(a, b Record) bool {
 	return a.Revision == b.Revision && a.State == b.State && equalRequest(a.Request, b.Request)

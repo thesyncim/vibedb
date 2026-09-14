@@ -1300,7 +1300,7 @@ func (remote gatewayReplicaRemoteActions) RetireReplicaSource(
 			return errors.Join(errGatewayReplicaControl, err)
 		}
 	}
-	return remote.actions.Execute(ctx, request.Source.Node, replicaaction.Request{
+	action := replicaaction.Request{
 		Operation: request.Operation, Step: request.Step, Kind: replicaaction.SourceRetirement,
 		Fence: raftservice.ServingFence{Group: request.Group,
 			AllocationGeneration: request.AllocationGeneration, Command: request.Command,
@@ -1308,7 +1308,37 @@ func (remote gatewayReplicaRemoteActions) RetireReplicaSource(
 			StoreID:  request.Source.StoreID, NodeIncarnation: request.Source.NodeIncarnation,
 			Term: request.Term},
 		SourceMember: request.Source.Member, TargetMember: request.Target.Member, Command: command,
+	}
+	err := remote.actions.Execute(ctx, request.Source.Node, action)
+	if err == nil || !errors.Is(err, replicaaction.ErrOutcomeUnknown) || remote.observer == nil {
+		return err
+	}
+	// A source restart advances its per-group runtime incarnation while the
+	// catalog still retains the pre-restart endpoint. The first exact action
+	// attempt is deliberate: a completed source may already be serving the
+	// retired-control mux, which can settle that durable tombstone without a
+	// live observation. Refresh only after an unknown attempt, and retry once
+	// with an authenticated cut from the source itself.
+	observation, observeErr := remote.observer.Observe(ctx, request.Source.Node, replicacontrol.Request{
+		Operation: request.Operation, Step: request.Step, Group: request.Group,
+		TargetMember: request.Target.Member, ExpectedReplicaSetVersion: request.Command.ReplicaSetVersion,
 	})
+	if observeErr != nil {
+		return errors.Join(err, observeErr)
+	}
+	binding := observation.State.Binding
+	if observation.Status.MemberID != request.Source.Member ||
+		observation.StoreID != request.Source.StoreID ||
+		observation.NodeIncarnation <= request.Source.NodeIncarnation ||
+		observation.Publication.ReplicaSetVersion != request.Command.ReplicaSetVersion ||
+		binding.ClusterID != request.Group.ClusterID || binding.ClusterIncarnation != request.Group.ClusterIncarnation ||
+		binding.TopologyRecoveryEpoch != request.Group.TopologyRecoveryEpoch ||
+		binding.ShardIncarnation != request.Group.ShardIncarnation || binding.GroupID != request.Group.GroupID ||
+		binding.AllocationGeneration != request.AllocationGeneration {
+		return errors.Join(err, rebalanceexec.ErrExecutionFence)
+	}
+	action.Fence.NodeIncarnation = observation.NodeIncarnation
+	return remote.actions.Execute(ctx, request.Source.Node, action)
 }
 
 // These tiny decoders use the canonical replicated-state grammar rather than

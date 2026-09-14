@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalance"
@@ -198,6 +199,8 @@ type gatewayTestActionClient struct {
 	node    rafttransport.NodeID
 	request replicaaction.Request
 	err     error
+	calls   int
+	queued  []error
 }
 
 type gatewayTestMembershipLeader struct {
@@ -211,10 +214,16 @@ func (client gatewayTestMembershipLeader) ObserveMembershipLeader(context.Contex
 func (client *gatewayTestActionClient) Execute(
 	_ context.Context, node rafttransport.NodeID, request replicaaction.Request,
 ) error {
+	client.calls++
 	if _, err := replicaaction.AppendRequest(nil, request); err != nil {
 		return err
 	}
 	client.node, client.request = node, request
+	if len(client.queued) != 0 {
+		err := client.queued[0]
+		client.queued = client.queued[1:]
+		return err
+	}
 	return client.err
 }
 
@@ -292,6 +301,69 @@ func TestGatewayReplicaRemoteActionsBuildExactOwnershipAndRetirementFences(t *te
 		t.Fatalf("retirement discovery locators=%+v err=%v", locators, locatorErr)
 	}
 
+}
+
+func TestGatewayRetirementRefreshesSourceOnlyAfterUnknownAction(t *testing.T) {
+	group := raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
+	store := [16]byte{9}
+	command := raftservice.CommandFence{ReplicaSetVersion: 11, ActivePolicyGeneration: 2,
+		ProtectionEpoch: 3, OwnershipEpoch: 4, SchemaGeneration: 5, RoutingVersion: 6,
+		RouteGeneration: 7, RelationManifestDigest: [32]byte{8}}
+	source := gateway.ReplicatedEndpoint{Member: 1, Node: [16]byte{1}, StoreID: store, NodeIncarnation: 1}
+	target := gateway.ReplicatedEndpoint{Member: 4, Node: [16]byte{4}}
+	state := replicatedstate.State{Binding: replicatedstate.Binding{
+		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch, ShardIncarnation: group.ShardIncarnation,
+		GroupID: group.GroupID, AllocationGeneration: 6,
+	}}
+	observation := replicacontrol.Observation{Status: raftmember.RuntimeStatus{MemberID: source.Member},
+		StoreID: store, NodeIncarnation: 2,
+		Publication: raftmodel.Publication{ReplicaSetVersion: command.ReplicaSetVersion}, State: state}
+	actions := &gatewayTestActionClient{queued: []error{replicaaction.ErrOutcomeUnknown}}
+	remote := gatewayReplicaRemoteActions{actions: actions,
+		observer: gatewayTestObservationClient{observation: observation}}
+	request := rebalanceexec.SourceRetirementRequest{Operation: rebalance.OperationID{10}, Step: [32]byte{11},
+		Group: group, AllocationGeneration: state.Binding.AllocationGeneration, Command: command,
+		Source: source, Target: target, Term: 12}
+	if err := remote.RetireReplicaSource(t.Context(), request); err != nil {
+		t.Fatalf("newer source incarnation retry: %v", err)
+	}
+	if actions.calls != 2 || actions.request.Fence.NodeIncarnation != observation.NodeIncarnation {
+		t.Fatalf("action calls=%d final fence incarnation=%d", actions.calls, actions.request.Fence.NodeIncarnation)
+	}
+
+	for name, mutate := range map[string]func(*replicacontrol.Observation){
+		"foreign store":     func(candidate *replicacontrol.Observation) { candidate.StoreID[0]++ },
+		"older incarnation": func(candidate *replicacontrol.Observation) { candidate.NodeIncarnation = source.NodeIncarnation },
+		"wrong member":      func(candidate *replicacontrol.Observation) { candidate.Status.MemberID++ },
+		"wrong publication": func(candidate *replicacontrol.Observation) { candidate.Publication.ReplicaSetVersion++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := observation
+			mutate(&candidate)
+			candidateActions := &gatewayTestActionClient{queued: []error{replicaaction.ErrOutcomeUnknown}}
+			candidateRemote := gatewayReplicaRemoteActions{actions: candidateActions,
+				observer: gatewayTestObservationClient{observation: candidate}}
+			if err := candidateRemote.RetireReplicaSource(t.Context(), request); !errors.Is(err, rebalanceexec.ErrExecutionFence) {
+				t.Fatalf("mismatched source identity err=%v", err)
+			}
+			if candidateActions.calls != 1 {
+				t.Fatalf("mismatched source retried action calls=%d", candidateActions.calls)
+			}
+		})
+	}
+
+	// A source that already completed retirement may expose only the retired
+	// control mux, which has no observation handler. The exact first action
+	// attempt must still settle its durable completion.
+	completed := &gatewayTestActionClient{}
+	if err := (gatewayReplicaRemoteActions{actions: completed}).RetireReplicaSource(t.Context(), request); err != nil {
+		t.Fatalf("completed source replay: %v", err)
+	}
+	if completed.calls != 1 {
+		t.Fatalf("completed source replay calls=%d", completed.calls)
+	}
 }
 
 func TestGatewayShardControlOpenerBoundsAndReleasesAuthenticatedStreams(t *testing.T) {

@@ -124,7 +124,9 @@ func (journal *FileJournal) PublishReplicaAction(ctx context.Context, expected u
 	}
 	if expected == ^uint64(0) || record.Revision != expected+1 ||
 		!found && (record.State != Running || record.Revision != 1) ||
-		found && (!equalRequest(current.Request, record.Request) || !replicaActionJournalTransition(current, record)) {
+		found && ((!equalRequest(current.Request, record.Request) &&
+			!restartRetirementRequest(current.Request, record.Request)) ||
+			!replicaActionJournalTransition(current, record)) {
 		return ErrConflict
 	}
 	if !found && len(journal.records) == journal.maxRecords {
