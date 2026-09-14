@@ -37,8 +37,12 @@ func loadRF3InitialNodeDirectory(path string) ([]gateway.NodeRecord, error) {
 }
 
 func newRF3ProvisionedRegistry(manifest rf3Manifest, profile *rafttransport.PeerTLS, members []rafttransport.Member, endpoints map[rafttransport.NodeID]string, limits rafttransport.Limits) (*rafttransport.StaticRegistry, error) {
+	return newRF3ProvisionedRegistryWithPeers(manifest, profile, members, endpoints, limits, nil)
+}
+
+func newRF3ProvisionedRegistryWithPeers(manifest rf3Manifest, profile *rafttransport.PeerTLS, members []rafttransport.Member, endpoints map[rafttransport.NodeID]string, limits rafttransport.Limits, enrolledPeers []rafttransport.PhysicalPeer) (*rafttransport.StaticRegistry, error) {
 	if manifest.Gateway == nil || manifest.Gateway.InitialNodeDirectoryPath == "" {
-		return newRF3PinnedStaticRegistry(manifest, profile, members, endpoints, limits)
+		return newRF3PinnedStaticRegistryWithPeers(manifest, profile, members, endpoints, limits, enrolledPeers)
 	}
 	records, err := loadRF3InitialNodeDirectory(manifest.Gateway.InitialNodeDirectoryPath)
 	if err != nil {
@@ -51,12 +55,20 @@ func newRF3ProvisionedRegistry(manifest rf3Manifest, profile *rafttransport.Peer
 		}
 		peers = append(peers, rafttransport.PhysicalPeer{NodeID: record.NodeID, TrustDomain: profile.LocalIdentity().TrustDomain, Incarnation: record.Incarnation, Revision: record.Revision, ServiceKeyDigest: [32]byte(record.ServiceKeyDigest), Endpoint: record.DataAddress, State: rafttransport.PeerEnrolled})
 	}
+	peers, err = appendRF3EnrolledPeers(peers, enrolledPeers, profile.LocalIdentity().TrustDomain)
+	if err != nil {
+		return nil, err
+	}
 	return rafttransport.NewStaticRegistryWithDirectory(profile.LocalIdentity().Node, members, peers, 1, limits)
 }
 
 // Static compositions carry their initial certificate pins in the prepared
 // manifest. Dynamic membership still uses the committed physical directory.
 func newRF3PinnedStaticRegistry(manifest rf3Manifest, profile *rafttransport.PeerTLS, members []rafttransport.Member, endpoints map[rafttransport.NodeID]string, limits rafttransport.Limits) (*rafttransport.StaticRegistry, error) {
+	return newRF3PinnedStaticRegistryWithPeers(manifest, profile, members, endpoints, limits, nil)
+}
+
+func newRF3PinnedStaticRegistryWithPeers(manifest rf3Manifest, profile *rafttransport.PeerTLS, members []rafttransport.Member, endpoints map[rafttransport.NodeID]string, limits rafttransport.Limits, enrolledPeers []rafttransport.PhysicalPeer) (*rafttransport.StaticRegistry, error) {
 	if len(manifest.TLS.PeerKeys) == 0 {
 		return nil, fmt.Errorf("%w: initial peer key pins required", errInvalidRF3Manifest)
 	}
@@ -72,6 +84,19 @@ func newRF3PinnedStaticRegistry(manifest rf3Manifest, profile *rafttransport.Pee
 	if pins[profile.LocalIdentity().Node] != profile.LocalServiceKeyDigest() {
 		return nil, fmt.Errorf("%w: prepared local certificate pin", errInvalidRF3Manifest)
 	}
+	dynamic := make(map[rafttransport.NodeID]rafttransport.PhysicalPeer, len(enrolledPeers))
+	for _, peer := range enrolledPeers {
+		if peer.NodeID == (rafttransport.NodeID{}) || peer.NodeID != peer.Node ||
+			peer.TrustDomain != profile.LocalIdentity().TrustDomain || peer.Incarnation == 0 ||
+			peer.Revision == 0 || peer.ServiceKeyDigest == ([32]byte{}) || peer.Endpoint == "" ||
+			peer.Endpoint != peer.Address || peer.State != rafttransport.PeerEnrolled {
+			return nil, fmt.Errorf("%w: invalid enrolled peer receipt", errInvalidRF3Manifest)
+		}
+		if prior, found := dynamic[peer.NodeID]; found && !sameRF3PhysicalPeerIdentity(prior, peer) {
+			return nil, fmt.Errorf("%w: conflicting enrolled peer receipt", errInvalidRF3Manifest)
+		}
+		dynamic[peer.NodeID] = peer
+	}
 	peers := make([]rafttransport.PhysicalPeer, 0, len(members))
 	seen := make(map[rafttransport.NodeID]bool, len(members))
 	for _, member := range members {
@@ -80,14 +105,53 @@ func newRF3PinnedStaticRegistry(manifest rf3Manifest, profile *rafttransport.Pee
 		}
 		seen[member.Node] = true
 		digest, found := pins[member.Node]
-		if !found {
+		peer, dynamicFound := dynamic[member.Node]
+		if !found && !dynamicFound {
 			return nil, fmt.Errorf("%w: missing member certificate pin", errInvalidRF3Manifest)
+		}
+		if dynamicFound {
+			if found && digest != peer.ServiceKeyDigest {
+				return nil, fmt.Errorf("%w: enrolled peer certificate pin differs from manifest", errInvalidRF3Manifest)
+			}
+			peers = append(peers, peer)
+			continue
 		}
 		endpoint := endpoints[member.Node]
 		if endpoint == "" {
 			return nil, fmt.Errorf("%w: missing member peer endpoint", errInvalidRF3Manifest)
 		}
-		peers = append(peers, rafttransport.PhysicalPeer{NodeID: member.Node, TrustDomain: profile.LocalIdentity().TrustDomain, Incarnation: 1, Revision: 1, ServiceKeyDigest: digest, Endpoint: endpoint, State: rafttransport.PeerEnrolled})
+		peers = append(peers, rafttransport.PhysicalPeer{NodeID: member.Node, Node: member.Node, TrustDomain: profile.LocalIdentity().TrustDomain, Incarnation: 1, Revision: 1, ServiceKeyDigest: digest, Endpoint: endpoint, Address: endpoint, State: rafttransport.PeerEnrolled})
+	}
+	peers, err := appendRF3EnrolledPeers(peers, enrolledPeers, profile.LocalIdentity().TrustDomain)
+	if err != nil {
+		return nil, err
 	}
 	return rafttransport.NewStaticRegistryWithDirectory(profile.LocalIdentity().Node, members, peers, 1, limits)
+}
+
+func appendRF3EnrolledPeers(peers, enrolled []rafttransport.PhysicalPeer, domain rafttransport.TrustDomain) ([]rafttransport.PhysicalPeer, error) {
+	seen := make(map[rafttransport.NodeID]rafttransport.PhysicalPeer, len(peers)+len(enrolled))
+	for _, peer := range peers {
+		if prior, found := seen[peer.NodeID]; found && !sameRF3PhysicalPeerIdentity(prior, peer) {
+			return nil, fmt.Errorf("%w: conflicting physical peer", errInvalidRF3Manifest)
+		}
+		seen[peer.NodeID] = peer
+	}
+	for _, peer := range enrolled {
+		if peer.NodeID == (rafttransport.NodeID{}) || peer.NodeID != peer.Node ||
+			peer.TrustDomain != domain || peer.Incarnation == 0 || peer.Revision == 0 ||
+			peer.ServiceKeyDigest == ([32]byte{}) || peer.Endpoint == "" || peer.Endpoint != peer.Address ||
+			peer.State != rafttransport.PeerEnrolled {
+			return nil, fmt.Errorf("%w: invalid enrolled peer receipt", errInvalidRF3Manifest)
+		}
+		if prior, found := seen[peer.NodeID]; found {
+			if !sameRF3PhysicalPeerIdentity(prior, peer) {
+				return nil, fmt.Errorf("%w: enrolled peer differs from bootstrap directory", errInvalidRF3Manifest)
+			}
+			continue
+		}
+		seen[peer.NodeID] = peer
+		peers = append(peers, peer)
+	}
+	return peers, nil
 }

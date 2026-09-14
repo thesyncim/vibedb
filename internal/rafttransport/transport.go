@@ -661,6 +661,20 @@ func (transport *OrdinaryTransport) EnrollMemberContext(
 	intent EnrollmentIntent,
 	verifier EnrollmentVerifier,
 ) error {
+	return transport.EnrollMemberContextWithCommit(ctx, intent, verifier, nil)
+}
+
+// EnrollMemberContextWithCommit enrolls one existing-group member and runs
+// commit after the transport queue is prepared but before the registry
+// publishes its new directory cut. The hook is used by serving processes to
+// persist an authenticated endpoint receipt against the pre-enrollment roster
+// before the enrollment becomes visible to ordinary traffic.
+func (transport *OrdinaryTransport) EnrollMemberContextWithCommit(
+	ctx context.Context,
+	intent EnrollmentIntent,
+	verifier EnrollmentVerifier,
+	commit func() error,
+) error {
 	if transport == nil || transport.registry == nil {
 		return ErrInvalidTransport
 	}
@@ -670,7 +684,13 @@ func (transport *OrdinaryTransport) EnrollMemberContext(
 	}
 	intent = canonical
 	return transport.registry.EnrollMemberContextWithCommit(ctx, intent, verifier, func() error {
-		return transport.addPeerPrepared(intent.Peer)
+		if err := transport.addPeerPrepared(intent.Peer); err != nil {
+			return err
+		}
+		if commit != nil {
+			return commit()
+		}
+		return nil
 	})
 }
 

@@ -48,8 +48,9 @@ func (provider distributedMetricsTestProvider) GroupProgressMetrics(group raftme
 }
 
 type distributedMetricsTestOpener struct {
-	service *servicemetrics.Service
-	peer    rafttransport.PeerIdentity
+	service       *servicemetrics.Service
+	peer          rafttransport.PeerIdentity
+	endpointCalls *[]ReplicatedEndpoint
 }
 
 func (opener distributedMetricsTestOpener) OpenShardControl(context.Context, rafttransport.NodeID) (rafttransport.PeerConnection, error) {
@@ -58,6 +59,16 @@ func (opener distributedMetricsTestOpener) OpenShardControl(context.Context, raf
 		_ = opener.service.Serve(context.Background(), &distributedMetricsTestConnection{Conn: server, peer: opener.peer})
 	}()
 	return &distributedMetricsTestConnection{Conn: client}, nil
+}
+
+func (opener distributedMetricsTestOpener) OpenShardControlEndpoint(ctx context.Context, endpoint ReplicatedEndpoint) (rafttransport.PeerConnection, error) {
+	if endpoint.Node == (rafttransport.NodeID{}) || endpoint.NodeIncarnation == 0 || endpoint.ControlAddress == "" {
+		return nil, ErrDistributedMetrics
+	}
+	if opener.endpointCalls != nil {
+		*opener.endpointCalls = append(*opener.endpointCalls, endpoint)
+	}
+	return opener.OpenShardControl(ctx, endpoint.Node)
 }
 
 func TestDistributedMetricsAuthenticatedExactGroupRefresh(t *testing.T) {
@@ -135,6 +146,87 @@ func TestDistributedMetricsBudgetCountsOneAuthenticatedNodeAggregate(t *testing.
 		if samples[index].Budget != (servicemetrics.MigrationBudgetSnapshot{}) {
 			t.Fatalf("group sample %d carried node budget: %+v", index, samples[index].Budget)
 		}
+	}
+}
+
+func TestDistributedMetricsAddsCurrentTargetBudgetWithoutManifestMutation(t *testing.T) {
+	group := raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
+	source := ReplicatedEndpoint{Member: 7, Node: rafttransport.NodeID{6}, NodeIncarnation: 11, ControlAddress: "source-control"}
+	target := ReplicatedEndpoint{Node: rafttransport.NodeID{8}, NodeIncarnation: 22, ControlAddress: "target-control"}
+	peer := rafttransport.PeerIdentity{Node: rafttransport.NodeID{9}}
+	wantBudget := servicemetrics.MigrationBudgetSnapshot{ThrottledCalls: 17, ThrottledBytes: 18, PeakActive: 2, MaxActive: 3}
+	service, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
+		Provider:     distributedMetricsTestProvider{identity: raftmember.RuntimeIdentity{Group: group, MemberID: source.Member}, budget: wantBudget},
+		Authorize:    func(identity rafttransport.PeerIdentity) bool { return identity == peer },
+		ReadDeadline: func() time.Time { return time.Now().Add(time.Second) }, WriteDeadline: func() time.Time { return time.Now().Add(time.Second) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := make([]ReplicatedEndpoint, 0, 4)
+	metrics, err := NewDistributedMetrics(distributedMetricsTestOpener{service: service, peer: peer, endpointCalls: &calls}, []ReplicatedRoute{
+		{Group: group, Replicas: []ReplicatedEndpoint{source}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics.Len() != 2 {
+		t.Fatalf("initial metrics samples=%d, want group plus source aggregate", metrics.Len())
+	}
+	if err := metrics.RefreshOne(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
+	before, err := metrics.Aggregate()
+	if err != nil || before.Budget != wantBudget {
+		t.Fatalf("before target aggregate=%+v err=%v", before, err)
+	}
+
+	if err := metrics.UpdateNodeAggregates([]ReplicatedEndpoint{source, target, target}); err != nil {
+		t.Fatalf("register current authenticated directory: %v", err)
+	}
+	if metrics.Len() != 3 {
+		t.Fatalf("updated metrics samples=%d, want group plus two current aggregates", metrics.Len())
+	}
+	for index := range metrics.Len() {
+		if err := metrics.RefreshOne(t.Context(), index); err != nil {
+			t.Fatalf("refresh sample %d: %v", index, err)
+		}
+	}
+	_, after, err := metrics.SnapshotInto(make([]DistributedMetricsSample, 0, metrics.Len()))
+	if err != nil || after.Budget.ThrottledCalls != wantBudget.ThrottledCalls*2 ||
+		after.Budget.ThrottledBytes != wantBudget.ThrottledBytes*2 || after.Budget.PeakActive != wantBudget.PeakActive ||
+		after.Budget.MaxActive != wantBudget.MaxActive {
+		t.Fatalf("after target aggregate=%+v err=%v", after, err)
+	}
+	foundTarget := false
+	for index := range metrics.Len() {
+		sample, sampleErr := metrics.SnapshotAt(index)
+		if sampleErr != nil {
+			t.Fatal(sampleErr)
+		}
+		if sample.Node == target.Node {
+			foundTarget = sample.NodeAggregate && sample.Budget == wantBudget
+		}
+	}
+	if !foundTarget {
+		t.Fatalf("target aggregate budget was not visible: calls=%+v", calls)
+	}
+	if len(calls) != 3 || calls[2] != target {
+		t.Fatalf("endpoint calls=%+v, want source then source/target exact identities", calls)
+	}
+
+	if err := metrics.UpdateNodeAggregates([]ReplicatedEndpoint{source}); err != nil {
+		t.Fatalf("prune stale target: %v", err)
+	}
+	if metrics.Len() != 2 {
+		t.Fatalf("pruned metrics samples=%d, want 2", metrics.Len())
+	}
+	if err := metrics.UpdateNodeAggregates([]ReplicatedEndpoint{source, target}); err != nil {
+		t.Fatalf("re-add target identity: %v", err)
+	}
+	if metrics.Len() != 3 || len(metrics.slots) != 3 {
+		t.Fatalf("re-added metrics len=%d backing slots=%d, want 3/3", metrics.Len(), len(metrics.slots))
 	}
 }
 

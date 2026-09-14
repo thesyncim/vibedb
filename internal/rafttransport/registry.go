@@ -180,6 +180,11 @@ type EnrollmentIntent struct {
 	Member               Member
 	ExpectedRosterDigest [sha256.Size]byte
 	DirectoryRevision    uint64
+	// Grant carries the exact catalog transition authority that certified this
+	// enrollment.  It is optional for the low-level registry API and legacy
+	// physical-only callers, but the RF3 serving callback requires it before
+	// publishing a durable enrollment receipt.
+	Grant membershipgrant.Grant
 }
 
 // PeerEnrollment is an alternate name for the leaf intent used by node
@@ -2787,6 +2792,24 @@ func (registry *StaticRegistry) rosterDigest(group raftmember.GroupKey) ([sha256
 // role and must not be used in place of Current ConfState authority.
 func (registry *StaticRegistry) RosterDigest(group raftmember.GroupKey) ([sha256.Size]byte, bool) {
 	return registry.rosterDigest(group)
+}
+
+// AcceptsRosterDigest reports whether digest names the current roster or the
+// one bounded adjacent handoff cut retained while an exact enrollment replay
+// is still draining. Callers must authenticate the endpoints and bind the
+// intent separately; this method only exposes the registry's accepted cuts.
+func (registry *StaticRegistry) AcceptsRosterDigest(
+	group raftmember.GroupKey,
+	digest [sha256.Size]byte,
+) bool {
+	if registry == nil || digest == ([sha256.Size]byte{}) {
+		return false
+	}
+	if current, found := registry.rosterDigest(group); found && current == digest {
+		return true
+	}
+	view := registry.dynamic.Load()
+	return view != nil && view.legacyDigests[group] == digest
 }
 
 // outboundRosterDigest chooses the handoff digest for an already-authorized

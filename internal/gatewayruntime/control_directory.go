@@ -199,6 +199,29 @@ func controlDirectoryNodes(
 	return result
 }
 
+// controlDirectoryMetricEndpoints projects only the current authenticated
+// physical-node records into the exact endpoint identity used by metrics.
+// Historical shard endpoints remain available for retirement fences, but
+// must not contribute a second node aggregate or stale migration budget.
+func controlDirectoryMetricEndpoints(
+	directory *gateway.ReplicatedControlDirectory,
+) []gateway.ReplicatedEndpoint {
+	if directory == nil {
+		return nil
+	}
+	nodes := directory.Nodes()
+	result := make([]gateway.ReplicatedEndpoint, 0, len(nodes))
+	for _, node := range nodes {
+		if node.NodeID == (rafttransport.NodeID{}) || node.Incarnation == 0 || node.ControlAddress == "" {
+			continue
+		}
+		result = append(result, gateway.ReplicatedEndpoint{
+			Node: node.NodeID, NodeIncarnation: node.Incarnation, ControlAddress: node.ControlAddress,
+		})
+	}
+	return result
+}
+
 func controlDirectoryGatewayNodes(
 	directory *gateway.ReplicatedControlDirectory,
 ) []rafttransport.NodeID {
@@ -284,6 +307,11 @@ func (runtime *Runtime) applyLiveControlDirectory(
 	if runtime.controlOpener != nil {
 		if err := runtime.controlOpener.Update(cut.Revision, directory.ShardControlEndpoints()); err != nil {
 			return fmt.Errorf("update shard control directory: %w", err)
+		}
+	}
+	if runtime.distributedMetrics != nil {
+		if err := runtime.distributedMetrics.UpdateNodeAggregates(controlDirectoryMetricEndpoints(directory)); err != nil {
+			return fmt.Errorf("update distributed metrics node directory: %w", err)
 		}
 	}
 	currentGateways := controlDirectoryGatewayEndpoints(directory)

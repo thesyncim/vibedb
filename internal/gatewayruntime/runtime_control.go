@@ -100,6 +100,9 @@ func (runtime *Runtime) openReplicaControl() error {
 			return fmt.Errorf("open distributed metrics: %w", err)
 		}
 		if runtime.distributedMetrics != nil {
+			if err := runtime.distributedMetrics.UpdateNodeAggregates(controlDirectoryMetricEndpoints(runtime.controlDirectory)); err != nil {
+				return fmt.Errorf("add control-directory metric nodes: %w", err)
+			}
 			runtime.distributedMetricsConcurrency = min(runtime.distributedMetrics.Len(), int(manifest.Bounds.MaxConnections), 64)
 		}
 		runtime.clusterControlBackend, err = newScalingOperatorBackend(runtime.authority, runtime.authority, runtime.authority)
@@ -135,6 +138,9 @@ func (runtime *Runtime) openReplicaControl() error {
 		return fmt.Errorf("open distributed metrics: %w", err)
 	}
 	if runtime.distributedMetrics != nil {
+		if err := runtime.distributedMetrics.UpdateNodeAggregates(controlDirectoryMetricEndpoints(runtime.controlDirectory)); err != nil {
+			return fmt.Errorf("add control-directory metric nodes: %w", err)
+		}
 		runtime.distributedMetricsConcurrency = min(runtime.distributedMetrics.Len(), int(manifest.Bounds.MaxConnections), 64)
 	}
 	trust := profile.LocalIdentity().TrustDomain

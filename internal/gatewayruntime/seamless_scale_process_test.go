@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/clustercontrol"
+	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -1009,23 +1010,70 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 			duplicateStable = false
 			t.Fatalf("cycle %d duplicate join changed operation: first=%+v duplicate=%+v", cycle+1, join, joinDuplicate)
 		}
-		var joinFinal clustercontrol.Response
+		var joinPacingResponse, joinFinal clustercontrol.Response
+		joinPacingObserved := false
+		if err := waitSeamlessScaleOperation(ctx, vibedbBinary, profilePath, join.OperationID, func(response clustercontrol.Response) bool {
+			joinFinal = response
+			if seamlessScalePacingObserved(response) {
+				joinPacingResponse = response
+				joinPacingObserved = true
+				return true
+			}
+			return seamlessScaleTerminalSuccess(response)
+		}); err != nil {
+			t.Fatalf("cycle %d join did not reach pacing or completion: %v", cycle+1, err)
+		}
+		if !joinPacingObserved {
+			t.Fatalf("cycle %d enrollment move never exposed positive pacing in an active move phase: final=%+v", cycle+1, joinFinal)
+		}
+		applicationMoved = maxUint32(applicationMoved, joinPacingResponse.ApplicationGroupsMoved)
+		internalMoved = maxUint32(internalMoved, joinPacingResponse.InternalGroupsMoved)
+		aggregateBudget.ThrottledCalls = maxUint64(aggregateBudget.ThrottledCalls, joinPacingResponse.Budget.ThrottledCalls)
+		aggregateBudget.ThrottledBytes = maxUint64(aggregateBudget.ThrottledBytes, joinPacingResponse.Budget.ThrottledBytes)
+		aggregateBudget.PeakActive = maxUint64(aggregateBudget.PeakActive, uint64(joinPacingResponse.Budget.PeakActive))
+		aggregateBudget.MaxActive = maxUint64(aggregateBudget.MaxActive, uint64(joinPacingResponse.Budget.MaxActive))
+		physicalPeak = maxInt(physicalPeak, countSeamlessScaleServingNodes(joinPacingResponse))
+		t.Logf("scale cycle %d enrollment pacing observed: operation=%s throttled_calls=%d throttled_bytes=%d", cycle+1,
+			join.OperationID, joinPacingResponse.Budget.ThrottledCalls, joinPacingResponse.Budget.ThrottledBytes)
+
+		if err := targetProcesses[cycle].Restart(ctx); err != nil {
+			t.Fatalf("cycle %d restart target during enrollment migration: %v", cycle+1, err)
+		}
+		anyTargetRestarted = true
+		if cycle == 0 {
+			// Node zero is the controller owner for this direct process set.
+			// Restarting this process exercises durable operation recovery while
+			// the two survivor frontends and their sessions remain connected.
+			if err := physical.Restart(ctx, 0); err != nil {
+				t.Fatalf("cycle %d restart controller owner during enrollment migration: %v", cycle+1, err)
+			}
+			controllerRestarted = true
+		}
+		postRestartStatus, err := runSeamlessScaleCLIForPoll(ctx, vibedbBinary, profilePath, join.OperationID)
+		if err != nil {
+			t.Fatalf("cycle %d post-restart durable enrollment status: %v", cycle+1, err)
+		}
+		if postRestartStatus.Phase == "" || postRestartStatus.Budget == nil ||
+			postRestartStatus.State == "failed" || postRestartStatus.OperationID != join.OperationID {
+			t.Fatalf("cycle %d post-restart enrollment status is not an operation proof: %+v", cycle+1, postRestartStatus)
+		}
+		postRestartProof = true
 		if err := waitSeamlessScaleOperation(ctx, vibedbBinary, profilePath, join.OperationID, func(response clustercontrol.Response) bool {
 			joinFinal = response
 			return seamlessScaleTerminalSuccess(response)
 		}); err != nil {
-			t.Fatalf("cycle %d join did not complete: %v", cycle+1, err)
+			t.Fatalf("cycle %d join did not complete after restart: %v", cycle+1, err)
 		}
+		applicationMoved = maxUint32(applicationMoved, joinFinal.ApplicationGroupsMoved)
+		internalMoved = maxUint32(internalMoved, joinFinal.InternalGroupsMoved)
 		physicalPeak = maxInt(physicalPeak, countSeamlessScaleServingNodes(joinFinal))
-		t.Logf("scale cycle %d join complete: operation=%s", cycle+1, join.OperationID)
+		t.Logf("scale cycle %d join complete after restart: operation=%s", cycle+1, join.OperationID)
 
 		rebalanceRequestID := mustSeamlessScaleRequestID(t)
 		rebalance := runSeamlessScaleCLI(t, ctx, vibedbBinary, "rebalance", profilePath,
 			"--request-id", rebalanceRequestID, "--desired-node-count", "4", "--max-moves", "32",
-			// The canonical empty-node fixture's 2 MiB network burst is below
-			// the seeded multi-table payload, so this real move must exercise
-			// durable node-wide pacing before it can complete. The intent bound
-			// remains high enough to avoid truncating the migration.
+			// The join above is the required real migration wave. Rebalance may
+			// legitimately find no work once the newly enrolled target is balanced.
 			"--max-migration-bytes", strconv.FormatUint(64<<20, 10), "--hysteresis-ppm", "1",
 			"--wait", seamlessScaleOperationWait.String())
 		if !rebalance.OK || rebalance.OperationID == "" {
@@ -1039,56 +1087,6 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 			duplicateStable = false
 			t.Fatalf("cycle %d duplicate rebalance changed operation: first=%+v duplicate=%+v", cycle+1, rebalance, rebalanceDuplicate)
 		}
-
-		var pacingResponse clustercontrol.Response
-		if err := waitSeamlessScaleOperation(ctx, vibedbBinary, profilePath, rebalance.OperationID, func(response clustercontrol.Response) bool {
-			pacingResponse = response
-			if response.State == "complete" || response.State == "completed" || response.State == "succeeded" || response.State == "failed" {
-				return false
-			}
-			// A cumulative moved counter is not proof that this status sample
-			// belongs to the live migration wave. Require the durable enrollment
-			// phase itself to expose the move/copy state while the operation is
-			// still running, so pacing cannot be observed only after completion.
-			phase := strings.ToLower(response.Phase)
-			activeMovePhase := strings.Contains(phase, "move") || strings.Contains(phase, "copy")
-			return response.Budget != nil && response.Budget.ThrottledCalls != 0 &&
-				response.Budget.ThrottledBytes != 0 && response.Phase != "" && activeMovePhase
-		}); err != nil {
-			t.Fatalf("cycle %d migration never exposed positive pacing in an active move phase: %v", cycle+1, err)
-		}
-		applicationMoved = maxUint32(applicationMoved, pacingResponse.ApplicationGroupsMoved)
-		internalMoved = maxUint32(internalMoved, pacingResponse.InternalGroupsMoved)
-		aggregateBudget.ThrottledCalls = maxUint64(aggregateBudget.ThrottledCalls, pacingResponse.Budget.ThrottledCalls)
-		aggregateBudget.ThrottledBytes = maxUint64(aggregateBudget.ThrottledBytes, pacingResponse.Budget.ThrottledBytes)
-		aggregateBudget.PeakActive = maxUint64(aggregateBudget.PeakActive, uint64(pacingResponse.Budget.PeakActive))
-		aggregateBudget.MaxActive = maxUint64(aggregateBudget.MaxActive, uint64(pacingResponse.Budget.MaxActive))
-		physicalPeak = maxInt(physicalPeak, countSeamlessScaleServingNodes(pacingResponse))
-		t.Logf("scale cycle %d migration pacing observed: operation=%s throttled_calls=%d throttled_bytes=%d", cycle+1,
-			rebalance.OperationID, pacingResponse.Budget.ThrottledCalls, pacingResponse.Budget.ThrottledBytes)
-
-		if err := targetProcesses[cycle].Restart(ctx); err != nil {
-			t.Fatalf("cycle %d restart target during migration: %v", cycle+1, err)
-		}
-		anyTargetRestarted = true
-		if cycle == 0 {
-			// Node zero is the controller owner for this direct process set.
-			// Restarting this process exercises durable operation recovery while
-			// the two survivor frontends and their sessions remain connected.
-			if err := physical.Restart(ctx, 0); err != nil {
-				t.Fatalf("cycle %d restart controller owner during migration: %v", cycle+1, err)
-			}
-			controllerRestarted = true
-		}
-		postRestartStatus, err := runSeamlessScaleCLIForPoll(ctx, vibedbBinary, profilePath, rebalance.OperationID)
-		if err != nil {
-			t.Fatalf("cycle %d post-restart durable status: %v", cycle+1, err)
-		}
-		if postRestartStatus.Phase == "" || postRestartStatus.Budget == nil ||
-			postRestartStatus.State == "failed" || postRestartStatus.OperationID != rebalance.OperationID {
-			t.Fatalf("cycle %d post-restart status is not an operation proof: %+v", cycle+1, postRestartStatus)
-		}
-		postRestartProof = true
 
 		var rebalanceFinal clustercontrol.Response
 		if err := waitSeamlessScaleOperation(ctx, vibedbBinary, profilePath, rebalance.OperationID, func(response clustercontrol.Response) bool {
@@ -1475,11 +1473,17 @@ func buildSeamlessScaleEmptyPreparation(sourceManifest, targetRoot, targetCertif
 	key := raftstore.Key{ID: source.NodeLog.KeyID, Wrapped: []byte("seamless-scale-fixture-key")}
 	defer clear(key.Material[:])
 	copy(key.Material[:], material)
+	// Keep the target's transfer budget bounded for this fixture so the real
+	// enrollment wave crosses the pacing path without changing production
+	// defaults or migration admission limits.
+	migrationBudget := migrationbudget.DefaultConfig()
+	migrationBudget.NetworkSend = migrationbudget.RateLimit{BytesPerSecond: 256 << 10, BurstBytes: 64 << 10}
+	migrationBudget.NetworkReceive = migrationbudget.RateLimit{BytesPerSecond: 256 << 10, BurstBytes: 64 << 10}
 	options := rf3testfixture.EmptyNodeOptions{Root: targetRoot, NodeIncarnation: 1, Key: key,
 		NodeStore: source.NodeLog.Options, Listeners: rf3testfixture.ProcessListeners{
 			Peer: listeners["peer"], Native: listeners["native"], Snapshot: listeners["snapshot"], Control: listeners["control"],
 		}, Credential: rf3testfixture.Credential{Certificate: targetCertificate, Key: targetKey}, Roots: roots,
-		AuthorizationPolicy: policy, GrantNodes: grantNodes, GatewaySeeds: gatewaySeeds}
+		AuthorizationPolicy: policy, GrantNodes: grantNodes, GatewaySeeds: gatewaySeeds, MigrationBudget: &migrationBudget}
 	return rf3testfixture.EmptyNodePreparationManifest(options, targetNodeKey)
 }
 
@@ -1822,6 +1826,38 @@ func seamlessScaleTerminalSuccess(response clustercontrol.Response) bool {
 		(response.State == "complete" || response.State == "completed" || response.State == "succeeded")
 }
 
+func seamlessScalePacingObserved(response clustercontrol.Response) bool {
+	if response.Budget == nil || response.Budget.ThrottledCalls == 0 || response.Budget.ThrottledBytes == 0 ||
+		seamlessScaleTerminalSuccess(response) {
+		return false
+	}
+	switch strings.ToLower(response.Phase) {
+	case "moving", "copying":
+		return true
+	default:
+		return false
+	}
+}
+
+func TestSeamlessScalePacingObservedRequiresActiveCanonicalPhase(t *testing.T) {
+	positive := clustercontrol.Response{OK: true, OperationID: "operation", State: "running", Phase: "moving",
+		Budget: &clustercontrol.BudgetStatus{ThrottledCalls: 1, ThrottledBytes: 1}}
+	if !seamlessScalePacingObserved(positive) {
+		t.Fatal("active moving response with positive budget was rejected")
+	}
+	for name, response := range map[string]clustercontrol.Response{
+		"completed": {OK: true, OperationID: "operation", State: "complete", Phase: "moving",
+			Budget: &clustercontrol.BudgetStatus{ThrottledCalls: 1, ThrottledBytes: 1}},
+		"noncanonical phase": {OK: true, OperationID: "operation", State: "running", Phase: "move",
+			Budget: &clustercontrol.BudgetStatus{ThrottledCalls: 1, ThrottledBytes: 1}},
+		"zero budget": {OK: true, OperationID: "operation", State: "running", Phase: "moving"},
+	} {
+		if seamlessScalePacingObserved(response) {
+			t.Fatalf("%s response incorrectly proved active pacing", name)
+		}
+	}
+}
+
 func runSeamlessScaleCommand(ctx context.Context, binary string, args ...string) int {
 	command := exec.CommandContext(ctx, binary, args...)
 	command.Stdout = os.Stdout
@@ -1881,7 +1917,12 @@ func pollSeamlessScaleStatus(ctx context.Context, binary, profile, operationID s
 				prior = state
 			}
 		} else {
-			state := fmt.Sprintf("state=%s phase=%s blockers=%+v", response.State, response.Phase, response.Blockers)
+			budget := "nil"
+			if response.Budget != nil {
+				budget = fmt.Sprintf("calls=%d bytes=%d peak=%d max=%d", response.Budget.ThrottledCalls,
+					response.Budget.ThrottledBytes, response.Budget.PeakActive, response.Budget.MaxActive)
+			}
+			state := fmt.Sprintf("state=%s phase=%s budget={%s} blockers=%+v", response.State, response.Phase, budget, response.Blockers)
 			if state != prior {
 				fmt.Printf("scale operation %s: %s\n", operationID, state)
 				prior = state
@@ -2097,15 +2138,27 @@ func (process *seamlessScaleNodeProcess) Restart(ctx context.Context) error {
 	}
 	process.command, process.exited = command, make(chan struct{})
 	go func() { _ = command.Wait(); close(process.exited) }()
-	return process.ready(ctx, process.manifest)
+	if err := process.ready(ctx, process.manifest); err != nil {
+		state := "running"
+		if command.ProcessState != nil {
+			state = command.ProcessState.String()
+		}
+		return fmt.Errorf("restart readiness: %w (process=%s diagnostics=%q)", err, state, process.diagnostic.String())
+	}
+	return nil
 }
 
 func waitSeamlessScaleManifestGateway(ctx context.Context, manifestPath string) error {
 	deadline := time.Now().Add(30 * time.Second)
+	var lastAddress string
+	var lastReadErr, lastDialErr error
 	for time.Now().Before(deadline) {
 		address, err := readSeamlessScaleGatewayAddress(manifestPath)
+		lastReadErr = err
 		if err == nil {
+			lastAddress = address
 			connection, dialErr := (&net.Dialer{Timeout: 500 * time.Millisecond}).DialContext(ctx, "tcp", address)
+			lastDialErr = dialErr
 			if dialErr == nil {
 				_ = connection.Close()
 				return nil
@@ -2117,7 +2170,8 @@ func waitSeamlessScaleManifestGateway(ctx context.Context, manifestPath string) 
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
-	return errors.New("empty node gateway did not become reachable")
+	return fmt.Errorf("empty node gateway did not become reachable at %q (read=%v dial=%v)",
+		lastAddress, lastReadErr, lastDialErr)
 }
 
 func readSeamlessScaleGatewayAddress(path string) (string, error) {

@@ -1108,8 +1108,8 @@ func buildGatewayEnrollmentIntent(
 	}
 	return rafttransport.EnrollmentIntent{
 		Digest: grant.Digest(), Domain: domain, Peer: peer, Group: grant.Group, Member: member,
-		ExpectedRosterDigest: rosterDigest,
-		DirectoryRevision:    gatewayEnrollmentDirectoryRevision,
+		ExpectedRosterDigest: rosterDigest, Grant: grant,
+		DirectoryRevision: gatewayEnrollmentDirectoryRevision,
 	}, nil
 }
 

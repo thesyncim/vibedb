@@ -207,6 +207,7 @@ type preparedRF3Set struct {
 	members          []rafttransport.Member
 	remoteNodes      []rafttransport.NodeID
 	peerEndpoints    map[rafttransport.NodeID]string
+	enrolledPeers    []rafttransport.PhysicalPeer
 	nativeConfigured bool
 }
 
@@ -244,6 +245,10 @@ func prepareRF3GroupSetOnNode(manifest rf3Manifest, profile *rafttransport.PeerT
 }
 
 func prepareRF3GroupSetOnNodeWithRetirements(manifest rf3Manifest, profile *rafttransport.PeerTLS, opening sqldriver.ReplicatedOpenOptions, nodeOwner *rf3NodeOwner, retirements []replicaaction.Record, inventory ...*rf3AdoptedGroupInventory) (preparedRF3Set, error) {
+	return prepareRF3GroupSetOnNodeWithRetirementsAndPeers(manifest, profile, opening, nodeOwner, retirements, nil, inventory...)
+}
+
+func prepareRF3GroupSetOnNodeWithRetirementsAndPeers(manifest rf3Manifest, profile *rafttransport.PeerTLS, opening sqldriver.ReplicatedOpenOptions, nodeOwner *rf3NodeOwner, retirements []replicaaction.Record, enrollmentPeers []rf3EnrollmentPeerReceipt, inventory ...*rf3AdoptedGroupInventory) (preparedRF3Set, error) {
 	var result preparedRF3Set
 	if (manifest.NodeLog != nil) != (nodeOwner != nil) {
 		return result, errInvalidRF3Manifest
@@ -266,7 +271,7 @@ func prepareRF3GroupSetOnNodeWithRetirements(manifest rf3Manifest, profile *raft
 		}
 	}
 	result.groups = make([]preparedRF3Group, 0, len(bundles))
-	result.members = make([]rafttransport.Member, 0, len(bundles)*rf3ManifestMembers)
+	result.members = make([]rafttransport.Member, 0, len(bundles)*(rf3ManifestMembers+1))
 	seen := make(map[raftmember.GroupKey]struct{}, len(bundles))
 	addresses := make(map[rafttransport.NodeID]string, rf3ManifestMembers)
 	for index, bundle := range bundles {
@@ -389,16 +394,39 @@ func prepareRF3GroupSetOnNodeWithRetirements(manifest rf3Manifest, profile *raft
 		if err = rejectRF3UnappliedMembership(log, item.publication.Applied); err != nil {
 			return result, closePreparedRF3Groups(append(result.groups, item), err)
 		}
-		roster, _, _, native, err := buildRF3Roster(single, group, base.Binding.MemberID, item.publication)
+		dynamicTarget, dynamicPeer, dynamicErr := rf3DynamicEnrollmentTarget(single, group, item.publication, enrollmentPeers)
+		if dynamicErr != nil {
+			return result, closePreparedRF3Groups(append(result.groups, item), dynamicErr)
+		}
+		roster, _, _, native, err := buildRF3RosterWithEnrolledTarget(single, group, base.Binding.MemberID, item.publication, dynamicTarget)
 		if err != nil {
 			return result, closePreparedRF3Groups(append(result.groups, item), err)
 		}
 		for _, member := range roster {
 			address := peerAddressForRF3Member(single, member.MemberID)
+			if dynamicTarget != nil && member.MemberID == dynamicTarget.MemberID {
+				address = dynamicTarget.PeerAddress
+			}
 			if prior, found := addresses[member.Node]; found && prior != address {
 				return result, closePreparedRF3Groups(append(result.groups, item), fmt.Errorf("%w: node address differs across groups", errRF3Serving))
 			}
 			addresses[member.Node] = address
+		}
+		if dynamicTarget != nil {
+			duplicate := false
+			for _, enrolled := range result.enrolledPeers {
+				if enrolled.NodeID != dynamicPeer.NodeID {
+					continue
+				}
+				if !sameRF3PhysicalPeerIdentity(enrolled, dynamicPeer) {
+					return result, closePreparedRF3Groups(append(result.groups, item), fmt.Errorf("%w: enrolled peer identity differs across groups", errRF3Serving))
+				}
+				duplicate = true
+				break
+			}
+			if !duplicate {
+				result.enrolledPeers = append(result.enrolledPeers, dynamicPeer)
+			}
 		}
 		result.groups = append(result.groups, item)
 		result.members = append(result.members, roster...)
@@ -627,7 +655,15 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, nodeOwner.Close()) }()
-	preparedSet, err := prepareRF3GroupSetOnNodeWithRetirements(manifest, profile, opening, nodeOwner, retirements, adoptedInventory)
+	enrollmentPeerStore, err := openRF3EnrollmentPeerStore(manifest.ReplicaControl.SourceDataRoot)
+	if err != nil {
+		return err
+	}
+	var enrollmentPeers []rf3EnrollmentPeerReceipt
+	if enrollmentPeerStore != nil {
+		enrollmentPeers = enrollmentPeerStore.snapshot()
+	}
+	preparedSet, err := prepareRF3GroupSetOnNodeWithRetirementsAndPeers(manifest, profile, opening, nodeOwner, retirements, enrollmentPeers, adoptedInventory)
 	if err != nil {
 		return err
 	}
@@ -649,8 +685,8 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	base := first.base
 	members, remoteNodes := preparedSet.members, preparedSet.remoteNodes
 	nativeConfigured := preparedSet.nativeConfigured
-	transportRegistry, err := newRF3ProvisionedRegistry(manifest, profile, members, preparedSet.peerEndpoints,
-		rf3TransportRegistryLimits(),
+	transportRegistry, err := newRF3ProvisionedRegistryWithPeers(manifest, profile, members, preparedSet.peerEndpoints,
+		rf3TransportRegistryLimits(), preparedSet.enrolledPeers,
 	)
 	if err != nil {
 		return closePrepared(fmt.Errorf("%w: transport roster: %v", errRF3Serving, err))
@@ -670,6 +706,15 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	var snapshotAuthorizer *servicetls.NodeAuthorizer
 	enrollmentControl, err := newRF3EnrollmentControlService(transportRegistry, policy, deadline,
 		func(intent rafttransport.EnrollmentIntent) error {
+			if enrollmentPeerStore == nil {
+				return errRF3Serving
+			}
+			if err := validateRF3EnrollmentGrant(transportRegistry, intent); err != nil {
+				return errors.Join(errRF3Serving, err)
+			}
+			if err := enrollmentPeerStore.record(intent, intent.Grant); err != nil {
+				return err
+			}
 			if snapshotAuthorizer == nil {
 				return errRF3Serving
 			}
@@ -1985,6 +2030,16 @@ func buildRF3Roster(
 	localMember uint64,
 	publication raftmodel.Publication,
 ) ([]rafttransport.Member, []rafttransport.NodeID, rafttransport.RawPeerDialFunc, bool, error) {
+	return buildRF3RosterWithEnrolledTarget(manifest, group, localMember, publication, nil)
+}
+
+func buildRF3RosterWithEnrolledTarget(
+	manifest rf3Manifest,
+	group raftmember.GroupKey,
+	localMember uint64,
+	publication raftmodel.Publication,
+	dynamicTarget *rf3ManifestEnrolledTarget,
+) ([]rafttransport.Member, []rafttransport.NodeID, rafttransport.RawPeerDialFunc, bool, error) {
 	conf := publication.ConfState
 	if publication.ReplicaSetVersion == 0 ||
 		raftmodel.ValidateConfState(conf, publication.ReplicaSetVersion) != nil ||
@@ -1992,14 +2047,21 @@ func buildRF3Roster(
 		return nil, nil, nil, false, fmt.Errorf("%w: unsupported durable membership cut", errRF3Serving)
 	}
 	voters, learners := conf.GetVoters(), conf.GetLearners()
+	target := manifest.EnrolledTarget
+	if dynamicTarget != nil {
+		if target != nil && *target != *dynamicTarget {
+			return nil, nil, nil, false, fmt.Errorf("%w: enrolled target differs from durable endpoint receipt", errRF3Serving)
+		}
+		target = dynamicTarget
+	}
 	configured := make([]rf3ManifestMember, 0, rf3ManifestMembers+1)
 	configured = append(configured, manifest.memberRoster()...)
-	if target := manifest.EnrolledTarget; target != nil {
+	if target != nil {
 		configured = append(configured, rf3ManifestMember{
 			MemberID: target.MemberID, NodeID: target.NodeID, PeerAddress: target.PeerAddress,
 		})
 	}
-	if !supportedRF3MembershipCut(manifest, voters, learners) {
+	if !supportedRF3MembershipCutWithTarget(manifest, target, voters, learners) {
 		return nil, nil, nil, false, fmt.Errorf("%w: durable membership differs from enrolled roster", errRF3Serving)
 	}
 	members := make([]rafttransport.Member, len(configured))
@@ -2024,8 +2086,7 @@ func buildRF3Roster(
 		if configured.MemberID == localMember {
 			localFound = true
 			localNativeAuthorized = role == rafttransport.MemberVoter ||
-				manifest.EnrolledTarget != nil &&
-					configured.MemberID == manifest.EnrolledTarget.MemberID
+				target != nil && configured.MemberID == target.MemberID
 		} else {
 			remote = append(remote, configured.NodeID)
 		}
@@ -2049,17 +2110,25 @@ func supportedRF3MembershipCut(
 	manifest rf3Manifest,
 	voters, learners []uint64,
 ) bool {
+	return supportedRF3MembershipCutWithTarget(manifest, manifest.EnrolledTarget, voters, learners)
+}
+
+func supportedRF3MembershipCutWithTarget(
+	manifest rf3Manifest,
+	target *rf3ManifestEnrolledTarget,
+	voters, learners []uint64,
+) bool {
 	base := make([]uint64, len(manifest.memberRoster()))
 	for index, member := range manifest.memberRoster() {
 		base[index] = member.MemberID
 	}
 	if manifest.DevelopmentOnly {
-		return manifest.EnrolledTarget == nil && len(learners) == 0 && slices.Equal(voters, base)
+		return target == nil && len(learners) == 0 && slices.Equal(voters, base)
 	}
 	if len(base) != rf3ManifestMembers {
 		return false
 	}
-	if target := manifest.EnrolledTarget; target != nil {
+	if target != nil {
 		if len(learners) == 1 && learners[0] == target.MemberID && slices.Equal(voters, base) {
 			return true
 		}

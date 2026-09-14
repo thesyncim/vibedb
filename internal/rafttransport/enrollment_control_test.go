@@ -124,6 +124,9 @@ func TestEnrollmentControlRoundTripAndRestartReplay(t *testing.T) {
 		Conn: serverConn, identity: PeerIdentity{TrustDomain: domain, Node: testNode(1)},
 		key: serverKey.ServiceKeyDigest, class: TrafficShardControl,
 	}
+	var callbackRoster [sha256.Size]byte
+	var callbackRosterFound bool
+	var callbackAttempts int
 	service, err := NewEnrollmentControlService(EnrollmentControlServiceOptions{
 		Registry: target, Transport: targetTransport, Verifier: EnrollmentVerifierFunc(allowEnrollment),
 		Authorize: func(_ context.Context, connection PeerConnection, _ EnrollmentIntent) error {
@@ -131,6 +134,14 @@ func TestEnrollmentControlRoundTripAndRestartReplay(t *testing.T) {
 				return ErrEnrollmentControlUnauthorized
 			}
 			return target.VerifyPeerConnectionBinding(connection)
+		},
+		OnEnrolled: func(EnrollmentIntent) error {
+			callbackAttempts++
+			callbackRoster, callbackRosterFound = target.RosterDigest(group)
+			if callbackAttempts == 1 {
+				return errors.New("persist receipt failed")
+			}
+			return nil
 		},
 		ReadDeadline: enrollmentDeadline, WriteDeadline: enrollmentDeadline,
 	})
@@ -148,12 +159,41 @@ func TestEnrollmentControlRoundTripAndRestartReplay(t *testing.T) {
 	}
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- service.Serve(context.Background(), server) }()
+	if _, err := clientControl.EnrollMember(context.Background(), testNode(2), intent); !errors.Is(err, ErrEnrollmentControlOutcome) {
+		t.Fatalf("failed enrollment returned %v, want ErrEnrollmentControlOutcome", err)
+	}
+	if err := <-serverDone; !errors.Is(err, ErrEnrollmentControlOutcome) {
+		t.Fatalf("failed enrollment Serve returned %v, want ErrEnrollmentControlOutcome", err)
+	}
+	if callbackAttempts != 1 || !callbackRosterFound || callbackRoster != roster {
+		t.Fatalf("failed enrollment callback observed wrong pre-enrollment roster: attempts=%d found=%v callback=%x initial=%x", callbackAttempts, callbackRosterFound, callbackRoster, roster)
+	}
+	if published, found := target.RosterDigest(group); !found || published != roster {
+		t.Fatalf("failed receipt persistence published roster: found=%v published=%x initial=%x", found, published, roster)
+	}
+	if _, err := target.Role(group, 4); !errors.Is(err, ErrMemberNotFound) {
+		t.Fatalf("failed receipt persistence published member authority: %v", err)
+	}
+
+	// Retrying the exact intent after the callback's persistence failure must
+	// reuse the prepared queue, publish once, and return the committed ACK.
+	clientConn, serverConn = net.Pipe()
+	client.Conn = clientConn
+	server.Conn = serverConn
+	serverDone = make(chan error, 1)
+	go func() { serverDone <- service.Serve(context.Background(), server) }()
 	ack, err := clientControl.EnrollMember(context.Background(), testNode(2), intent)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := <-serverDone; err != nil {
 		t.Fatal(err)
+	}
+	if callbackAttempts != 2 || !callbackRosterFound || callbackRoster != roster {
+		t.Fatalf("successful enrollment callback observed wrong pre-enrollment roster: attempts=%d found=%v callback=%x initial=%x", callbackAttempts, callbackRosterFound, callbackRoster, roster)
+	}
+	if published, found := target.RosterDigest(group); !found || published == roster {
+		t.Fatalf("successful enrollment did not publish a new roster: found=%v published=%x initial=%x", found, published, roster)
 	}
 	if ack.IntentDigest != intent.Digest || ack.MemberID != 4 || ack.Node != testNode(4) {
 		t.Fatalf("unexpected enrollment ACK: %+v", ack)

@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 )
@@ -44,10 +45,16 @@ const (
 	// The discriminator is consumed by shardcontrol.Mux and replayed to the
 	// handler.  It is separate from nodecontrol, membership grants, and
 	// snapshot bootstrap so a listener never guesses a request grammar.
+	// enrollmentGrantBytes is the canonical fixed encoding of one
+	// membershipgrant.Grant. A zero grant keeps low-level physical-only and
+	// legacy in-memory callers source compatible; RF3 group enrollment callers
+	// populate it so the serving callback can persist the exact authority before
+	// returning its ACK.
+	enrollmentGrantBytes = 232
 	// requestHeaderBytes includes the discriminator, version/flags, endpoint
 	// length, and every fixed intent coordinate. The endpoint bytes follow it.
 	enrollmentRequestHeaderBytes = 8 + 1 + 1 + 2 + 2 +
-		32 + 32 + 16 + 8 + 8 + 32 + 1 + 72 + 8 + 8 + 16 + 1 + 32 + 8
+		32 + 32 + 16 + 8 + 8 + 32 + 1 + 72 + 8 + 8 + 16 + 1 + 32 + 8 + enrollmentGrantBytes
 	enrollmentAckBytes = 8 + 1 + 1 + 2 + 32 + 72 + 8 + 8 + 16 + 32 + 32
 
 	// EnrollmentControlMaxRequestBytes includes the bounded endpoint. It is
@@ -109,7 +116,8 @@ type EnrollmentControlServiceOptions struct {
 	Verifier  EnrollmentVerifier
 	Authorize EnrollmentControlAuthorizer
 	// OnEnrolled updates dependent physical-identity admission such as the
-	// snapshot TLS listener after the registry commit and before ACK.
+	// snapshot TLS listener after the transport queue is prepared and before
+	// the registry publishes its new directory cut or the service sends ACK.
 	OnEnrolled    func(EnrollmentIntent) error
 	ReadDeadline  DeadlineFunc
 	WriteDeadline DeadlineFunc
@@ -196,12 +204,23 @@ func (service *EnrollmentControlService) Serve(
 	if err = service.authorize(ctx, connection, intent); err != nil {
 		return errors.Join(ErrEnrollmentControlUnauthorized, err)
 	}
+	var onEnrolledErr error
+	commit := func() error {
+		if service.onEnrolled == nil {
+			return nil
+		}
+		onEnrolledErr = service.onEnrolled(intent)
+		return onEnrolledErr
+	}
 	if transport := service.transport.Load(); transport != nil {
-		err = transport.EnrollMemberContext(ctx, intent, service.verifier)
+		err = transport.EnrollMemberContextWithCommit(ctx, intent, service.verifier, commit)
 	} else {
-		err = service.registry.EnrollMemberContext(ctx, intent, service.verifier)
+		err = service.registry.EnrollMemberContextWithCommit(ctx, intent, service.verifier, commit)
 	}
 	if err != nil {
+		if onEnrolledErr != nil {
+			return errors.Join(ErrEnrollmentControlOutcome, onEnrolledErr)
+		}
 		if errors.Is(err, ErrPeerConflict) {
 			// Best-effort: a corrected retry is only possible if this frame
 			// makes it out before the deadline. Either way the original
@@ -213,11 +232,6 @@ func (service *EnrollmentControlService) Serve(
 			}
 		}
 		return err
-	}
-	if service.onEnrolled != nil {
-		if err = service.onEnrolled(intent); err != nil {
-			return errors.Join(ErrEnrollmentControlOutcome, err)
-		}
 	}
 	ack, err := service.registry.EnrollmentAck(intent)
 	if err != nil {
@@ -600,8 +614,80 @@ func AppendEnrollmentRequest(dst []byte, intent EnrollmentIntent) ([]byte, error
 	offset += 32
 	binary.BigEndian.PutUint64(b[offset:offset+8], intent.DirectoryRevision)
 	offset += 8
+	appendEnrollmentGrant(b[offset:offset+enrollmentGrantBytes], intent.Grant)
+	offset += enrollmentGrantBytes
 	copy(b[offset:], endpoint)
 	return dst, nil
+}
+
+// appendEnrollmentGrant writes the canonical fixed grant representation. The
+// zero value is deliberately encodable for low-level callers that use the
+// registry without the RF3 catalog authority; serving callbacks require a
+// valid grant before they persist an RF3 receipt.
+func appendEnrollmentGrant(dst []byte, grant membershipgrant.Grant) {
+	if len(dst) < enrollmentGrantBytes {
+		return
+	}
+	clear(dst[:enrollmentGrantBytes])
+	if grant == (membershipgrant.Grant{}) {
+		return
+	}
+	offset := 0
+	appendGroupKey(dst[offset:offset+72], grant.Group)
+	offset += 72
+	copy(dst[offset:offset+16], grant.TransitionID[:])
+	offset += 16
+	binary.BigEndian.PutUint64(dst[offset:offset+8], grant.MetadataEpoch)
+	offset += 8
+	binary.BigEndian.PutUint64(dst[offset:offset+8], grant.CatalogGeneration)
+	offset += 8
+	binary.BigEndian.PutUint64(dst[offset:offset+8], grant.InitialReplicaSetVersion)
+	offset += 8
+	for _, voter := range grant.InitialVoters {
+		binary.BigEndian.PutUint64(dst[offset:offset+8], voter)
+		offset += 8
+	}
+	copy(dst[offset:offset+32], grant.InitialRosterDigest[:])
+	offset += 32
+	copy(dst[offset:offset+32], grant.InitialDescriptorDigest[:])
+	offset += 32
+	binary.BigEndian.PutUint64(dst[offset:offset+8], grant.SourceMember)
+	offset += 8
+	binary.BigEndian.PutUint64(dst[offset:offset+8], grant.TargetMember)
+	offset += 8
+	copy(dst[offset:offset+16], grant.TargetNode[:])
+}
+
+func openEnrollmentGrant(src []byte) membershipgrant.Grant {
+	if len(src) != enrollmentGrantBytes {
+		return membershipgrant.Grant{}
+	}
+	var grant membershipgrant.Grant
+	offset := 0
+	grant.Group = openGroupKey(src[offset : offset+72])
+	offset += 72
+	copy(grant.TransitionID[:], src[offset:offset+16])
+	offset += 16
+	grant.MetadataEpoch = binary.BigEndian.Uint64(src[offset : offset+8])
+	offset += 8
+	grant.CatalogGeneration = binary.BigEndian.Uint64(src[offset : offset+8])
+	offset += 8
+	grant.InitialReplicaSetVersion = binary.BigEndian.Uint64(src[offset : offset+8])
+	offset += 8
+	for index := range grant.InitialVoters {
+		grant.InitialVoters[index] = binary.BigEndian.Uint64(src[offset : offset+8])
+		offset += 8
+	}
+	copy(grant.InitialRosterDigest[:], src[offset:offset+32])
+	offset += 32
+	copy(grant.InitialDescriptorDigest[:], src[offset:offset+32])
+	offset += 32
+	grant.SourceMember = binary.BigEndian.Uint64(src[offset : offset+8])
+	offset += 8
+	grant.TargetMember = binary.BigEndian.Uint64(src[offset : offset+8])
+	offset += 8
+	copy(grant.TargetNode[:], src[offset:offset+16])
+	return grant
 }
 
 // OpenEnrollmentRequest reads a complete bounded request from a connection or
@@ -660,6 +746,8 @@ func OpenEnrollmentRequest(reader io.Reader) (EnrollmentIntent, error) {
 	copy(intent.ExpectedRosterDigest[:], header[offset:offset+32])
 	offset += 32
 	intent.DirectoryRevision = binary.BigEndian.Uint64(header[offset : offset+8])
+	offset += 8
+	intent.Grant = openEnrollmentGrant(header[offset : offset+enrollmentGrantBytes])
 	intent.Peer.TrustDomain = intent.Domain
 	intent.Peer.Endpoint = string(endpoint)
 	intent.Peer.Address = intent.Peer.Endpoint
@@ -806,6 +894,14 @@ func canonicalEnrollmentIntent(intent EnrollmentIntent) (EnrollmentIntent, error
 		return EnrollmentIntent{}, ErrEnrollmentControl
 	}
 	if err := validateMember(intent.Member); err != nil {
+		return EnrollmentIntent{}, ErrEnrollmentControl
+	}
+	if intent.Grant != (membershipgrant.Grant{}) &&
+		(!intent.Grant.Valid() || intent.Grant.Group != intent.Group ||
+			intent.Grant.Digest() != intent.Digest ||
+			intent.Grant.InitialReplicaSetVersion != intent.Member.ReplicaSetVersion ||
+			intent.Grant.TargetMember != intent.Member.MemberID ||
+			[16]byte(intent.Grant.TargetNode) != intent.Peer.NodeID) {
 		return EnrollmentIntent{}, ErrEnrollmentControl
 	}
 	peer.EnrollmentDigest = intent.Digest

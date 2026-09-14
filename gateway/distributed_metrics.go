@@ -22,6 +22,14 @@ type DistributedMetricsOpen interface {
 	OpenShardControl(context.Context, rafttransport.NodeID) (rafttransport.PeerConnection, error)
 }
 
+// DistributedMetricsEndpointOpen is implemented by openers that retain the
+// authenticated directory identity, rather than resolving a node ID through
+// a mutable address map.  It lets node aggregates prove that a sample came
+// from the exact current incarnation that registered the slot.
+type DistributedMetricsEndpointOpen interface {
+	OpenShardControlEndpoint(context.Context, ReplicatedEndpoint) (rafttransport.PeerConnection, error)
+}
+
 type DistributedMetricsSample struct {
 	Group         raftmember.GroupKey
 	Member        uint64
@@ -45,22 +53,31 @@ type DistributedMetricsAggregate struct {
 }
 
 type distributedMetricsSlot struct {
-	group         raftmember.GroupKey
-	member        uint64
-	node          rafttransport.NodeID
-	seq           atomic.Uint64
-	refreshing    atomic.Bool
-	values        [9]atomic.Uint64
-	stages        [27]atomic.Uint64
-	budget        [4]atomic.Uint64
-	nodeAggregate bool
-	reads         atomic.Uint64
-	faults        atomic.Uint64
+	group           raftmember.GroupKey
+	member          uint64
+	node            rafttransport.NodeID
+	nodeIncarnation uint64
+	controlAddress  string
+	seq             atomic.Uint64
+	refreshing      atomic.Bool
+	values          [9]atomic.Uint64
+	stages          [27]atomic.Uint64
+	budget          [4]atomic.Uint64
+	nodeAggregate   bool
+	reads           atomic.Uint64
+	faults          atomic.Uint64
 }
 
 type DistributedMetrics struct {
 	opener DistributedMetricsOpen
+	mu     sync.RWMutex
 	slots  []distributedMetricsSlot
+	active []int
+}
+
+type distributedMetricsNodeIdentity struct {
+	node        rafttransport.NodeID
+	incarnation uint64
 }
 
 // NewDistributedMetrics fixes the complete group/member directory once. The
@@ -77,18 +94,22 @@ func NewDistributedMetrics(opener DistributedMetricsOpen, routes []ReplicatedRou
 		}
 		count += len(route.Replicas)
 	}
-	nodes := make([]rafttransport.NodeID, 0, count)
+	nodes := make([]distributedMetricsNodeIdentity, 0, count)
 	for _, route := range routes {
 		for _, endpoint := range route.Replicas {
+			if endpoint.Node == (rafttransport.NodeID{}) {
+				return nil, ErrDistributedMetrics
+			}
+			identity := distributedMetricsNodeIdentity{node: endpoint.Node, incarnation: endpoint.NodeIncarnation}
 			found := false
 			for _, node := range nodes {
-				if node == endpoint.Node {
+				if node == identity {
 					found = true
 					break
 				}
 			}
 			if !found {
-				nodes = append(nodes, endpoint.Node)
+				nodes = append(nodes, identity)
 			}
 		}
 	}
@@ -109,12 +130,19 @@ func NewDistributedMetrics(opener DistributedMetricsOpen, routes []ReplicatedRou
 			}
 			metrics.slots[index].group, metrics.slots[index].member, metrics.slots[index].node =
 				route.Group, endpoint.Member, endpoint.Node
+			metrics.slots[index].nodeIncarnation, metrics.slots[index].controlAddress =
+				endpoint.NodeIncarnation, endpoint.ControlAddress
 			index++
 		}
 	}
 	for _, node := range nodes {
-		metrics.slots[index].node, metrics.slots[index].nodeAggregate = node, true
+		metrics.slots[index].node, metrics.slots[index].nodeIncarnation,
+			metrics.slots[index].nodeAggregate = node.node, node.incarnation, true
 		index++
+	}
+	metrics.active = make([]int, len(metrics.slots))
+	for index := range metrics.active {
+		metrics.active[index] = index
 	}
 	return metrics, nil
 }
@@ -123,32 +151,137 @@ func (metrics *DistributedMetrics) Len() int {
 	if metrics == nil {
 		return 0
 	}
-	return len(metrics.slots)
+	metrics.mu.RLock()
+	defer metrics.mu.RUnlock()
+	return len(metrics.active)
+}
+
+// UpdateNodeAggregates replaces the node-aggregate directory with the current
+// authenticated control-directory cut. A gateway's initial catalog can be
+// smaller than the live control directory while an empty target is joining,
+// so node-wide metrics must grow with that directory rather than silently
+// omitting the target's authenticated budget. Repeated registrations are
+// idempotent for an exact node/incarnation identity; stale identities are
+// removed from the active view while their bounded cache remains reusable.
+func (metrics *DistributedMetrics) UpdateNodeAggregates(endpoints []ReplicatedEndpoint) error {
+	if metrics == nil {
+		return ErrDistributedMetrics
+	}
+	unique := make([]ReplicatedEndpoint, 0, len(endpoints))
+	seen := make(map[distributedMetricsNodeIdentity]int, len(endpoints))
+	for _, endpoint := range endpoints {
+		if endpoint.Node == (rafttransport.NodeID{}) || endpoint.NodeIncarnation == 0 || endpoint.ControlAddress == "" {
+			return ErrDistributedMetrics
+		}
+		identity := distributedMetricsNodeIdentity{node: endpoint.Node, incarnation: endpoint.NodeIncarnation}
+		if prior, found := seen[identity]; found {
+			if unique[prior].ControlAddress != endpoint.ControlAddress {
+				return ErrDistributedMetrics
+			}
+			continue
+		}
+		seen[identity] = len(unique)
+		unique = append(unique, endpoint)
+	}
+	if len(unique) > AbsoluteMaxDistributedMetricSamples {
+		return ErrDistributedMetrics
+	}
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	missing := 0
+	indices := make(map[distributedMetricsNodeIdentity]int, len(unique))
+	for index := range metrics.slots {
+		slot := &metrics.slots[index]
+		if !slot.nodeAggregate {
+			continue
+		}
+		identity := distributedMetricsNodeIdentity{node: slot.node, incarnation: slot.nodeIncarnation}
+		if _, found := indices[identity]; !found {
+			indices[identity] = index
+		}
+	}
+	for _, endpoint := range unique {
+		identity := distributedMetricsNodeIdentity{node: endpoint.Node, incarnation: endpoint.NodeIncarnation}
+		if index, found := indices[identity]; found {
+			if address := metrics.slots[index].controlAddress; address != "" && address != endpoint.ControlAddress {
+				return ErrDistributedMetrics
+			}
+			continue
+		}
+		missing++
+	}
+	if len(metrics.slots) > AbsoluteMaxDistributedMetricSamples ||
+		missing > AbsoluteMaxDistributedMetricSamples-len(metrics.slots) {
+		return ErrDistributedMetrics
+	}
+	for _, endpoint := range unique {
+		identity := distributedMetricsNodeIdentity{node: endpoint.Node, incarnation: endpoint.NodeIncarnation}
+		index, found := indices[identity]
+		if !found {
+			index = len(metrics.slots)
+			metrics.slots = append(metrics.slots, distributedMetricsSlot{
+				node: endpoint.Node, nodeIncarnation: endpoint.NodeIncarnation,
+				controlAddress: endpoint.ControlAddress, nodeAggregate: true,
+			})
+			indices[identity] = index
+			continue
+		}
+		if metrics.slots[index].controlAddress == "" {
+			metrics.slots[index].controlAddress = endpoint.ControlAddress
+		}
+	}
+	active := make([]int, 0, len(metrics.slots))
+	for index := range metrics.slots {
+		if !metrics.slots[index].nodeAggregate {
+			active = append(active, index)
+		}
+	}
+	for _, endpoint := range unique {
+		identity := distributedMetricsNodeIdentity{node: endpoint.Node, incarnation: endpoint.NodeIncarnation}
+		active = append(active, indices[identity])
+	}
+	metrics.active = active
+	return nil
 }
 
 // RefreshOne performs one authenticated fixed-width exchange. Publication is
 // a seqlock write; readers never observe fields from two remote cuts.
 func (metrics *DistributedMetrics) RefreshOne(ctx context.Context, index int) error {
-	if metrics == nil || ctx == nil || index < 0 || index >= len(metrics.slots) {
+	if metrics == nil || ctx == nil {
 		return ErrDistributedMetrics
 	}
-	slot := &metrics.slots[index]
+	metrics.mu.RLock()
+	if index < 0 || index >= len(metrics.active) {
+		metrics.mu.RUnlock()
+		return ErrDistributedMetrics
+	}
+	slot := &metrics.slots[metrics.active[index]]
+	node, nodeIncarnation, controlAddress := slot.node, slot.nodeIncarnation, slot.controlAddress
+	group, member, nodeAggregate := slot.group, slot.member, slot.nodeAggregate
+	metrics.mu.RUnlock()
 	if !slot.refreshing.CompareAndSwap(false, true) {
 		return ErrDistributedMetrics
 	}
 	defer slot.refreshing.Store(false)
 	client := servicemetrics.Client{Open: func(openCtx context.Context) (rafttransport.PeerConnection, error) {
-		return metrics.opener.OpenShardControl(openCtx, slot.node)
+		if nodeIncarnation != 0 && controlAddress != "" {
+			if opener, ok := metrics.opener.(DistributedMetricsEndpointOpen); ok {
+				return opener.OpenShardControlEndpoint(openCtx, ReplicatedEndpoint{
+					Node: node, NodeIncarnation: nodeIncarnation, ControlAddress: controlAddress,
+				})
+			}
+		}
+		return metrics.opener.OpenShardControl(openCtx, node)
 	}}
 	var snapshot servicemetrics.Snapshot
 	var err error
-	if slot.nodeAggregate {
+	if nodeAggregate {
 		snapshot, err = client.ReadNode(ctx)
 	} else {
-		snapshot, err = client.ReadGroup(ctx, slot.group)
+		snapshot, err = client.ReadGroup(ctx, group)
 	}
 	slot.reads.Add(1)
-	if err != nil || snapshot.Group != slot.group || snapshot.Member != slot.member {
+	if err != nil || snapshot.Group != group || snapshot.Member != member {
 		slot.faults.Add(1)
 		return errors.Join(ErrDistributedMetrics, err)
 	}
@@ -185,7 +318,7 @@ func (metrics *DistributedMetrics) RefreshOne(ctx context.Context, index int) er
 // nodes consume only their worker and the configured shard-control deadline;
 // no goroutine is created per sample or interval.
 func (metrics *DistributedMetrics) RunRefresh(ctx context.Context, interval time.Duration, concurrency int) error {
-	if metrics == nil || ctx == nil || interval <= 0 || concurrency <= 0 || concurrency > len(metrics.slots) {
+	if metrics == nil || ctx == nil || interval <= 0 || concurrency <= 0 || concurrency > metrics.Len() {
 		return ErrDistributedMetrics
 	}
 	type job struct {
@@ -206,15 +339,16 @@ func (metrics *DistributedMetrics) RunRefresh(ctx context.Context, interval time
 	}
 	defer func() { close(jobs); workers.Wait() }()
 	refresh := func() bool {
+		count := metrics.Len()
 		var done sync.WaitGroup
-		done.Add(len(metrics.slots))
-		for index := range metrics.slots {
+		done.Add(count)
+		for index := 0; index < count; index++ {
 			select {
 			case jobs <- job{index: index, done: &done}:
 			case <-ctx.Done():
 				// Balance work that was never submitted before joining submitted
 				// jobs; workers observe the same cancellation through RefreshOne.
-				for unsent := index; unsent < len(metrics.slots); unsent++ {
+				for unsent := index; unsent < count; unsent++ {
 					done.Done()
 				}
 				done.Wait()
@@ -244,12 +378,16 @@ func (metrics *DistributedMetrics) RunRefresh(ctx context.Context, interval time
 // SnapshotInto copies the current cache into caller-owned memory and computes
 // a saturating aggregate. It allocates nothing and performs bounded work.
 func (metrics *DistributedMetrics) SnapshotInto(dst []DistributedMetricsSample) ([]DistributedMetricsSample, DistributedMetricsAggregate, error) {
-	if metrics == nil || cap(dst) < len(metrics.slots) {
+	if metrics == nil {
 		return dst[:0], DistributedMetricsAggregate{}, ErrDistributedMetrics
 	}
-	dst = dst[:len(metrics.slots)]
+	count := metrics.Len()
+	if cap(dst) < count {
+		return dst[:0], DistributedMetricsAggregate{}, ErrDistributedMetrics
+	}
+	dst = dst[:count]
 	aggregate := DistributedMetricsAggregate{Samples: uint64(len(dst))}
-	for index := range metrics.slots {
+	for index := 0; index < count; index++ {
 		sample, values, stageValues, budgetValues, err := metrics.snapshotAt(index)
 		if err != nil {
 			return dst[:index], aggregate, ErrDistributedMetrics
@@ -295,8 +433,9 @@ func (metrics *DistributedMetrics) Aggregate() (DistributedMetricsAggregate, err
 	if metrics == nil {
 		return DistributedMetricsAggregate{}, ErrDistributedMetrics
 	}
-	aggregate := DistributedMetricsAggregate{Samples: uint64(len(metrics.slots))}
-	for index := range metrics.slots {
+	count := metrics.Len()
+	aggregate := DistributedMetricsAggregate{Samples: uint64(count)}
+	for index := 0; index < count; index++ {
 		sample, values, stageValues, budgetValues, err := metrics.snapshotAt(index)
 		if err != nil {
 			return DistributedMetricsAggregate{}, err
@@ -329,10 +468,17 @@ func (metrics *DistributedMetrics) Aggregate() (DistributedMetricsAggregate, err
 }
 
 func (metrics *DistributedMetrics) snapshotAt(index int) (DistributedMetricsSample, [9]uint64, [27]uint64, [4]uint64, error) {
-	if metrics == nil || index < 0 || index >= len(metrics.slots) {
+	if metrics == nil {
 		return DistributedMetricsSample{}, [9]uint64{}, [27]uint64{}, [4]uint64{}, ErrDistributedMetrics
 	}
-	slot := &metrics.slots[index]
+	metrics.mu.RLock()
+	if index < 0 || index >= len(metrics.active) {
+		metrics.mu.RUnlock()
+		return DistributedMetricsSample{}, [9]uint64{}, [27]uint64{}, [4]uint64{}, ErrDistributedMetrics
+	}
+	slot := &metrics.slots[metrics.active[index]]
+	group, member, node, nodeAggregate := slot.group, slot.member, slot.node, slot.nodeAggregate
+	metrics.mu.RUnlock()
 	var values [9]uint64
 	var stages [27]uint64
 	var budget [4]uint64
@@ -353,8 +499,8 @@ func (metrics *DistributedMetrics) snapshotAt(index int) (DistributedMetricsSamp
 		if slot.seq.Load() != before {
 			continue
 		}
-		return DistributedMetricsSample{Group: slot.group, Member: slot.member, Node: slot.node,
-			NodeAggregate: slot.nodeAggregate, Reads: slot.reads.Load(), Faults: slot.faults.Load(),
+		return DistributedMetricsSample{Group: group, Member: member, Node: node,
+			NodeAggregate: nodeAggregate, Reads: slot.reads.Load(), Faults: slot.faults.Load(),
 			Cut:    raftservice.ProgressMetricsSnapshot{ProposalCommands: values[0], ProposalBytes: values[1], AppliedEntries: values[2], ReadyPersisted: values[3], SnapshotsFinished: values[4], ReadCompletions: values[5], Faults: values[6], CommitAdvancements: values[7], CommittedEntries: values[8]},
 			Stages: servicemetrics.StageMetricsSnapshot{CheckpointApplied: stages[0], Checkpoints: stages[1], PhysicalCheckpoints: stages[2], CheckpointBarrierSyncs: stages[3], WALLiveBytes: stages[4], WALEntries: stages[5], WALSyncs: stages[6], BackupRequests: stages[7], BackupFaults: stages[8], BackupLogicalBytes: stages[9], BackupScanBytes: stages[10], SnapshotTransferChunks: stages[11], SnapshotTransferBytes: stages[12], SnapshotResidentBytes: stages[13], ReplicaActionRequests: stages[14], ReplicaActionCompletions: stages[15], ReplicaActionFaults: stages[16], SplitControlRequests: stages[17], SplitControlCompletions: stages[18], SplitControlFaults: stages[19], BootstrapRequests: stages[20], BootstrapChunks: stages[21], BootstrapBytes: stages[22], BootstrapCompletions: stages[23], BootstrapFaults: stages[24], BootstrapResidentBytes: stages[25], BootstrapInflight: stages[26]},
 			Budget: servicemetrics.MigrationBudgetSnapshot{ThrottledCalls: budget[0], ThrottledBytes: budget[1], PeakActive: budget[2], MaxActive: budget[3]},

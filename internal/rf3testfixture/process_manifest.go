@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -80,6 +81,9 @@ type EmptyNodeOptions struct {
 	AuthorizationPolicy string
 	GrantNodes          []rafttransport.NodeID
 	GatewaySeeds        []nodecontrol.BootstrapGatewaySeed
+	// MigrationBudget overrides only the prepared empty node's physical
+	// transfer budget. A nil value keeps the canonical shipped defaults.
+	MigrationBudget *migrationbudget.Config
 }
 
 // PreparedEmptyNode is the durable input consumed by
@@ -178,17 +182,19 @@ func EmptyNodePreparationManifest(options EmptyNodeOptions, keyMaterialPath stri
 		grants[index] = emptyNodeGrant{NodeID: fmt.Sprintf("%x", node), Actions: ^uint16(0)}
 	}
 	root := filepath.Clean(options.Root)
+	migrationConfig := migrationbudget.DefaultConfig()
+	if options.MigrationBudget != nil {
+		migrationConfig = *options.MigrationBudget
+	}
+	if err := migrationConfig.Validate(); err != nil {
+		return nil, fmt.Errorf("rf3 process fixture: invalid migration budget: %w", err)
+	}
 	control := emptyNodeReplicaControl{
 		ActionJournalPath: filepath.Join(root, "replica-actions"), MaxActionRecords: 4096,
 		SourceDataRoot: root, SourceJournalPath: filepath.Join(root, "source-exports"), MaxSourceRecords: 4096,
 		SourceRepositoryPath: filepath.Join(root, "source-artifacts"), MaxSourceArtifacts: 8, MaxSourceConcurrent: 2,
 		MaxSourceArtifactBytes: 1 << 30, MaxSourceDiskBytes: 4 << 30, SourceChunkBytes: 1 << 20,
-		Migration: emptyNodeMigration{MaxActive: 2,
-			CPU:            emptyNodeRateLimit{BytesPerSecond: 64 << 20, BurstBytes: 4 << 20},
-			DiskRead:       emptyNodeRateLimit{BytesPerSecond: 64 << 20, BurstBytes: 4 << 20},
-			DiskWrite:      emptyNodeRateLimit{BytesPerSecond: 64 << 20, BurstBytes: 4 << 20},
-			NetworkSend:    emptyNodeRateLimit{BytesPerSecond: 32 << 20, BurstBytes: 2 << 20},
-			NetworkReceive: emptyNodeRateLimit{BytesPerSecond: 32 << 20, BurstBytes: 2 << 20}},
+		Migration: emptyNodeMigrationFromConfig(migrationConfig),
 	}
 	services := emptyNodeServices{
 		NodeIncarnation: options.NodeIncarnation, Listeners: options.Listeners,
@@ -211,6 +217,17 @@ func EmptyNodePreparationManifest(options EmptyNodeOptions, keyMaterialPath stri
 		Services: services, Groups: []struct{}{},
 	}
 	return vibejson.Marshal(&manifest)
+}
+
+func emptyNodeMigrationFromConfig(config migrationbudget.Config) emptyNodeMigration {
+	return emptyNodeMigration{
+		MaxActive:      config.MaxActive,
+		CPU:            emptyNodeRateLimit{BytesPerSecond: config.CPU.BytesPerSecond, BurstBytes: config.CPU.BurstBytes},
+		DiskRead:       emptyNodeRateLimit{BytesPerSecond: config.DiskRead.BytesPerSecond, BurstBytes: config.DiskRead.BurstBytes},
+		DiskWrite:      emptyNodeRateLimit{BytesPerSecond: config.DiskWrite.BytesPerSecond, BurstBytes: config.DiskWrite.BurstBytes},
+		NetworkSend:    emptyNodeRateLimit{BytesPerSecond: config.NetworkSend.BytesPerSecond, BurstBytes: config.NetworkSend.BurstBytes},
+		NetworkReceive: emptyNodeRateLimit{BytesPerSecond: config.NetworkReceive.BytesPerSecond, BurstBytes: config.NetworkReceive.BurstBytes},
+	}
 }
 
 // PrepareEmptyNode writes the exact canonical input and its local key source.
