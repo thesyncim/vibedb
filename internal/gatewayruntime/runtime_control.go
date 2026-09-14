@@ -68,11 +68,6 @@ func (runtime *Runtime) openReplicaControl() error {
 	if err := runtime.openSourceTopologyService(manifest); err != nil {
 		return err
 	}
-	if config.ControlParticipantOnly {
-		runtime.clusterControlBackend, err = newScalingOperatorBackend(runtime.authority, runtime.authority, runtime.authority)
-		return err
-	}
-
 	handshakeDeadline := servicetls.FixedDeadline(config.TLSHandshakeTimeout)
 	readDeadline := servicetls.FixedDeadline(time.Duration(manifest.Bounds.ReadTimeout) * time.Millisecond)
 	writeDeadline := servicetls.FixedDeadline(time.Duration(manifest.Bounds.WriteTimeout) * time.Millisecond)
@@ -95,6 +90,24 @@ func (runtime *Runtime) openReplicaControl() error {
 	runtime.controlHandshakeDeadline = handshakeDeadline
 	runtime.controlReadDeadline = readDeadline
 	runtime.controlWriteDeadline = writeDeadline
+	if config.ControlParticipantOnly {
+		// Participants do not run the scaling controller, but their operator
+		// endpoint can still be the status reader. Keep the same authenticated
+		// node aggregate available there so status does not silently discard
+		// pacing evidence when a client is connected to a participant gateway.
+		runtime.distributedMetrics, err = newGatewayDistributedMetrics(runtime.holder.Current(), shardOpener)
+		if err != nil {
+			return fmt.Errorf("open distributed metrics: %w", err)
+		}
+		if runtime.distributedMetrics != nil {
+			runtime.distributedMetricsConcurrency = min(runtime.distributedMetrics.Len(), int(manifest.Bounds.MaxConnections), 64)
+		}
+		runtime.clusterControlBackend, err = newScalingOperatorBackend(runtime.authority, runtime.authority, runtime.authority)
+		if err == nil {
+			runtime.clusterControlBackend.distributedMetrics = runtime.distributedMetrics
+		}
+		return err
+	}
 	if runtime.config.ScalingReadiness == nil {
 		infoClient, infoErr := nodecontrol.NewNodeInfoClient(nodecontrol.NodeInfoClientOptions{Opener: shardOpener, TrustDomain: profile.LocalIdentity().TrustDomain, ReadDeadline: readDeadline, WriteDeadline: writeDeadline})
 		if infoErr != nil {
