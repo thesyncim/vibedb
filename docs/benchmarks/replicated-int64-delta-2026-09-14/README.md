@@ -10,21 +10,26 @@ unchanged keys and values retain their original JSON bytes. The existing
 digest-guarded materialization path remains the fallback for every unsupported
 statement shape.
 
-The candidate was measured as the working tree on top of
-`df5c0637375a89e0b51a48ba76961521cca309bb` (PR #236), so the source revision
-is shared with the baseline but the candidate includes the uncommitted JID1
-files shown in this change. The benchmark uses the same durable settings,
-schema, fixture, and client workload for both builds.
+The production candidate is `aa25f6e0d` on top of the clean PR #236 revision
+`df5c0637375a89e0b51a48ba76961521cca309bb`; the clean baseline is that latter
+revision. The long production trials were first measured from the equivalent
+candidate working tree before the JID1 commit, and the retry-to-completion
+trials used `aa25f6e0d`. The benchmark uses the same durable settings, schema,
+fixture, and client workload for both builds. The benchmark-only workload and
+reporting additions are recorded in each campaign's `source.patch`.
 
 ## Matched SQL results
 
 The runner used one Linux arm64 container with 12 CPUs and 24 GiB, CRDB
 v26.3.1 at its pinned image digest, three CRDB nodes, and VibeDB RF3 (three
-catalog, three ledger, and three data nodes). Each engine was stopped before
-the other engine started; the runner removed its container and volume after
-each campaign. Both engines used 8,192 rows, `update_existing`, eight clients,
-5,000 warmups, 50,000 measured operations, and three repetitions. Every trial
-returned `verified=true` with zero operation errors.
+catalog, three ledger, and three data logical Raft members). With `--node-log`,
+those nine VibeDB members run in three `vibedb-shard serve-node` physical
+processes, each with its embedded frontend; the gateway is not a ninth
+process. Each engine was stopped before the other engine started; the runner
+removed its container and volume after each campaign. Both engines used 8,192
+rows, `update_existing`, eight clients, 5,000 warmups, 50,000 measured
+operations, and three repetitions. Every trial returned `verified=true` with
+zero operation errors.
 
 VibeDB-first, 50,000-operation trials:
 
@@ -74,15 +79,110 @@ CODEX_AGENT_ID=write_validation \
 
 The reverse-order check uses `--order crdb-first` with the same arguments.
 
+## High-contention point increments
+
+The checked-in `rf3-sqlbench` harness has an explicit `update_hot` workload.
+All eight clients increment the same existing primary-key row. The operation
+stream uses no retries by default: `successful_ops_per_second` counts only
+completed operations and `Errors` remains visible. A separate atomic success
+count updates the final verification oracle after the concurrent phase, so a
+failed transaction cannot be counted as a write.
+
+The 10,000-operation no-retry confirmation used 8,192 rows, 1,000 warmups,
+eight clients, three repetitions, and the same RF3/durability settings as the
+uniform run. The VibeDB-first order completed all candidate trials, while the
+baseline stopped after its second trial encountered one SQLSTATE 40001:
+
+| engine/build | trial 1 | trial 2 | trial 3 | completed median |
+| --- | ---: | ---: | ---: | ---: |
+| VibeDB baseline | 334.166 | 315.332 (9,999; 1 error) | — | — |
+| VibeDB JID1 | 2,015.431 | 2,222.487 | 2,408.554 | 2,222.487 |
+| CRDB baseline control | 774.119 | 427.343 | 771.947 | 771.947 |
+| CRDB JID1 control | 650.415 | 451.504 | 388.999 | 451.504 |
+
+The reverse CRDB-first order retained the same behavior: JID1 VibeDB measured
+1,782.836, 2,035.283, and 2,605.994 ops/s, while the baseline stopped after
+175.279 ops/s with 9,999 successes and one 40001. Its CRDB controls measured
+316.877, 374.488, and 392.032 ops/s; JID1's controls measured 678.928,
+772.920, and 795.762 ops/s. The baseline failure was a transaction conflict,
+and the verification pass itself succeeded; `verified=false` reflected the
+nonzero error count.
+
+For a fair completed-write comparison, `--retry-transient` retries only
+SQLSTATE 40001 and 40P01, up to 64 extra attempts with a bounded 100 µs to
+2 ms delay. The same policy is applied to both engines, and the report keeps
+`successful_ops`, `attempts`, `transient_retries`, `errors`, and independent
+`expected_hot_scores`/`observed_hot_scores` fields. The 10,000-operation,
+1,000-warmup, three-repetition VibeDB-first run completed every logical write
+with matching independent oracles:
+
+| engine/build | trial 1 | trial 2 | trial 3 | median |
+| --- | ---: | ---: | ---: | ---: |
+| VibeDB baseline | 102.274 (10,002/2) | 101.365 (10,001/1) | 135.598 (10,000/0) | 102.274 |
+| VibeDB JID1 | 1,884.631 (10,000/0) | 2,187.210 (10,000/0) | 1,924.273 (10,000/0) | 1,924.273 |
+| CRDB baseline control | 187.220 (10,000/0) | 242.400 (10,000/0) | 224.184 (10,000/0) | 224.184 |
+| CRDB JID1 control | 223.540 (10,000/0) | 319.309 (10,000/0) | 226.191 (10,000/0) | 226.191 |
+
+Each parenthesized pair is `attempts/transient_retries`; every row had zero
+final errors, 10,000 successful logical operations, `verified=true`, and an
+expected score equal to the independently read score (11,000, 22,000, and
+33,000 after the three repetitions). The JID1 median is 18.81× the baseline
+median for this fixed-key, retry-to-completion workload. Its per-trial
+p50/p95/p99 latencies were 3.384/9.767/15.666 ms, 2.708/10.859/20.824 ms,
+and 2.735/15.866/23.212 ms; baseline p50/p95/p99 were
+31.635/304.787/640.846 ms, 32.638/278.151/572.551 ms, and
+24.279/204.828/443.473 ms. The CRDB controls were stable in this matched
+run (baseline median 224.184, candidate median 226.191 ops/s).
+
+The earlier 2,000-operation pilot was 21.36× (2,128.621 versus 99.635
+ops/s), but the longer run is the headline because it reports every logical
+write, retries, and an independent final counter. The uniform workload remains
+the broader end-to-end comparison at 2.80× median throughput. These results
+support a scoped 10× improvement for eligible hot integer point updates, not a
+universal 10× claim across arbitrary writes.
+
+The retry-mode campaigns were reproduced with:
+
+```sh
+PATH=/private/tmp/vibedb-go-shim:$PATH \
+CODEX_AGENT_ID=write_validation \
+/Users/thesyncim/.codex/bin/project-env python3 scripts/bench/run-crdb-sql-comparison.py /new/evidence/path \
+  --node-log --rows 8192 --operations 10000 --scans 1000 \
+  --warmup 1000 --repetitions 3 --clients 8 \
+  --workloads update_hot --retry-transient --order vibedb-first --timeout 30m
+```
+
+## Runtime allocation diagnostic
+
+The default runner leaves Go's process setting unchanged. A temporary wrapper
+ran the same 20,000-operation C8 workload with `GOMAXPROCS=4` for each VibeDB
+physical process, each CRDB process, and the benchmark client. The three VibeDB
+and three CRDB process counts make this an equal 12-process-CPU allocation;
+the wrapper did not change production code or durability settings.
+
+The two VibeDB baseline trials at that setting were 2,066.183 and 2,023.425
+ops/s; the JID1 trials were 1,956.066 and 1,872.762 ops/s. Their two-trial
+midpoints were 2,044.804 and 1,914.414 ops/s, so this short pair did not show
+an additional JID1 gain under the tuned setting. The matching CRDB controls
+were 1,894.317 and 1,856.834 ops/s for the baseline campaign and 4,244.673
+and 4,040.010 for the JID1 campaign. A same-size default baseline control
+measured 1,173.590 and 1,031.736 ops/s (midpoint 1,102.663), which is a useful
+oversubscription diagnostic but is too short and variable to turn into a
+universal deployment claim. The JID1 SQL result above therefore retains the
+unchanged-default, long-run comparison.
+
 ## What the optimization supports
 
 JID1 is selected only for one direct, primary-key point UPDATE with a single
 top-level declared JSON `INTEGER` assignment. The expression must be an exact
 closed `column + integer` or `column - integer` operation, including a bound
-integer parameter; primary-key updates, indexed-table mutations, RETURNING,
-multiple assignments, nested paths, and other expressions use the existing
-path. SQL integer aliases collapse to the repository's JSON integer type and
-use exact signed int64 arithmetic.
+integer parameter; primary-key assignments, maintained global indexes,
+RETURNING, multiple assignments, nested paths, and other expressions use the
+existing path. Local index maintenance still runs through the normal apply
+pipeline. SQL integer aliases collapse to the repository's JSON integer type
+and use exact signed int64 arithmetic. That type accepts only exponent-free
+JSON integer spellings, so `1.0` and `1e0` remain on the existing invalid-value
+path just as they do for a materialized `INTEGER` update.
 
 At apply time a missing target row remains a zero-row update. A missing or JSON
 null current value propagates JSON null, and normal schema validation preserves
@@ -94,11 +194,14 @@ new preimage-dependent digest. Tests also cover preservation of unrelated
 fields, concurrent same-key increments, and reopen/replay.
 
 JID1 is mutation kind 10 and is included in the authenticated apply-contract
-digest. An existing durable cluster must upgrade all replicas and complete the
-repository's authenticated apply-contract/schema transition before enabling
-JID1. An old binary rejects the new descriptor; this is an explicit deployment
-compatibility requirement, not an assumed mixed-version capability. Existing
-mutation kinds and their replay behavior are unchanged.
+digest. `Machine.Open` compares the persisted contract digest with the local
+prepared contract, so a cluster cannot emit or apply JID1 under an old
+contract. An existing durable cluster must upgrade all replicas and complete
+the repository's authenticated apply-contract/schema transition before
+enabling JID1; that transition binds the old and new contract digests to the
+membership witness, authorization digest, and catalog CAS. An old binary
+rejects the new descriptor. Existing mutation kinds and their replay behavior
+are unchanged.
 
 ## Remaining write cost
 
@@ -118,10 +221,13 @@ All Go commands used `/Users/thesyncim/.codex/bin/project-env`:
 CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test ./gateway ./internal/replication ./internal/replicatedstate -count=1 -timeout=20m
 CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test -race ./gateway -run 'TestPreparedDirectIntegerUpdate|TestDurableSQLSingleTargetFastPathSkipsLedgerAndReplaysExactly|TestReplicatedDirectMutationIsOneProposalWithCrossGatewayExactRetry|TestReplicatedDirectInt64DeltaConcurrentSameKeyIncrements' -count=1 -timeout=15m
 CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test -race ./internal/replication ./internal/replicatedstate -run 'TestJSONInt64Delta|TestMaterializeJSONInt64Delta|TestGolden|TestApplyContract|TestTransition' -count=1 -timeout=15m
+CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test ./integration/pgclient/cmd/rf3-sqlbench -count=1 -timeout=15m
 ```
 
 The first command passed gateway (84.413s), replication (0.520s), and
 replicatedstate (104.734s). Both race-focused commands passed, as did the
-dedicated concurrent same-key test in normal and race modes. The SQL-path
-tests prove JID1 was decoded from the actual direct proposal and that replay
-uses JID1 again; planner-only coverage is not the performance evidence.
+dedicated concurrent same-key test in normal and race modes. The SQL benchmark
+package test passed after adding the retry policy, hot-key workload, and
+independent final-score fields. The SQL-path tests prove JID1 was decoded from
+the actual direct proposal and that replay uses JID1 again; planner-only
+coverage is not the performance evidence.

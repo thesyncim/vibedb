@@ -46,6 +46,8 @@ def main():
     parser.add_argument("--clients", default="1,8")
     parser.add_argument("--workloads", default="point_hit,point_miss,range_64,group_16,update_existing",
                         help="comma-separated rf3-sqlbench workloads")
+    parser.add_argument("--retry-transient", action="store_true",
+                        help="retry SQLSTATE 40001/40P01 operations with the benchmark's bounded policy")
     parser.add_argument("--order", choices=["vibedb-first", "crdb-first"], default="vibedb-first")
     args = parser.parse_args()
     dest = args.output.resolve()
@@ -156,6 +158,7 @@ def main():
                     "-indexes", args.indexes, "-shared-bytes", str(args.shared_bytes),
                     "-shared-cardinality", str(args.shared_cardinality),
                     "-payload-mode", args.payload_mode, "-timeout", args.timeout,
+                    "-retry-transient=true" if args.retry_transient else "-retry-transient=false",
                     f"-verify-every-trial={'true' if args.verify_every_trial else 'false'}",
                     "-output", f"/evidence/{engine}.json", stdout=log, stderr=subprocess.STDOUT, check=False)
                 failures[engine] = completed.returncode

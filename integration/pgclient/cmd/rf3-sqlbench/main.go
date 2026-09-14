@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -36,6 +38,7 @@ type config struct {
 	payloadMode                                  string
 	timeout                                      time.Duration
 	sharedBytes, sharedCardinality               int
+	retryTransient                               bool
 }
 type sample struct {
 	Client        int    `json:"client"`
@@ -56,6 +59,11 @@ type result struct {
 	Repetition            int                `json:"repetition"`
 	Operations            int                `json:"operations"`
 	Errors                int                `json:"errors"`
+	SuccessfulOps         int                `json:"successful_ops"`
+	Attempts              int                `json:"attempts"`
+	TransientRetries      int                `json:"transient_retries"`
+	ExpectedHotScores     []int              `json:"expected_hot_scores,omitempty"`
+	ObservedHotScores     []int              `json:"observed_hot_scores,omitempty"`
 	ElapsedNS             int64              `json:"elapsed_ns"`
 	MeasurementStartedUTC string             `json:"measurement_started_utc"`
 	Throughput            float64            `json:"successful_ops_per_second"`
@@ -101,6 +109,7 @@ type configRecord struct {
 	PayloadMode                                                         string
 	Timeout                                                             string
 	SharedBytes, SharedCardinality                                      int
+	RetryTransient                                                      bool
 }
 
 const defaultTable = "rf3_sql_bench"
@@ -133,6 +142,7 @@ func main() {
 	flag.IntVar(&c.physicalNodes, "physical-nodes", 0, "reported physical-node count for matrix metadata; does not alter routing")
 	flag.BoolVar(&c.requireExistingTables, "require-existing-tables", false, "fail if a requested table was not provisioned before setup")
 	flag.BoolVar(&c.verifyEveryTrial, "verify-every-trial", true, "verify every row after each trial; false verifies before and after the full run (each operation is always checked)")
+	flag.BoolVar(&c.retryTransient, "retry-transient", false, "retry SQLSTATE 40001/40P01 operations up to a bounded limit; report retries separately")
 	flag.StringVar(&c.urls, "urls", "", "comma-separated PostgreSQL URLs; clients use endpoint client index modulo this list")
 	flag.StringVar(&c.diagnosticTargets, "diagnostic-targets", "", "ready candidate PID/node/snapshot bindings for untimed acknowledged diagnostic brackets")
 	flag.StringVar(&c.recoveryOracle, "recovery-oracle", "", "export final expected rows to a new file; phase recovery reads this file")
@@ -192,7 +202,7 @@ func run(c config) (runErr error) {
 			}
 		}
 	}
-	r := report{SchemaVersion: 2, Status: "incomplete", Results: []result{}, VerificationError: "benchmark did not finish", Config: configRecord{SeedBatch: c.seedBatch, VerifyEveryTrial: c.verifyEveryTrial, Engine: c.engine, Rows: c.rows, PayloadBytes: len(payload), PayloadMode: c.payloadMode, Operations: c.operations, ScanOperations: c.scans, Warmup: c.warmup, Repetitions: c.repetitions, Clients: c.clients, Protocol: "extended unnamed parse/bind/execute; text parameters/results; one autocommit statement per operation", Tables: tables, Workloads: workloads, GroupDistribution: c.groupDistribution, SkewPercent: c.skewPercent, PhysicalNodes: c.physicalNodes, EndpointCount: len(endpointLabels), EndpointRouting: "round-robin-per-client", Indexes: c.indexes, Timeout: c.timeout.String(), SharedBytes: c.sharedBytes, SharedCardinality: c.sharedCardinality}, Started: time.Now().UTC().Format(time.RFC3339Nano)}
+	r := report{SchemaVersion: 2, Status: "incomplete", Results: []result{}, VerificationError: "benchmark did not finish", Config: configRecord{SeedBatch: c.seedBatch, VerifyEveryTrial: c.verifyEveryTrial, Engine: c.engine, Rows: c.rows, PayloadBytes: len(payload), PayloadMode: c.payloadMode, Operations: c.operations, ScanOperations: c.scans, Warmup: c.warmup, Repetitions: c.repetitions, Clients: c.clients, Protocol: "extended unnamed parse/bind/execute; text parameters/results; one autocommit statement per operation", Tables: tables, Workloads: workloads, GroupDistribution: c.groupDistribution, SkewPercent: c.skewPercent, PhysicalNodes: c.physicalNodes, EndpointCount: len(endpointLabels), EndpointRouting: "round-robin-per-client", Indexes: c.indexes, Timeout: c.timeout.String(), SharedBytes: c.sharedBytes, SharedCardinality: c.sharedCardinality, RetryTransient: c.retryTransient}, Started: time.Now().UTC().Format(time.RFC3339Nano)}
 	r.Config.DiagnosticMode = "none"
 	r.Config.KeySelection = "splitmix64-independent-with-replacement-v1"
 	if c.diagnosticTargets != "" {
@@ -310,8 +320,15 @@ func run(c config) (runErr error) {
 				if verifyThisTrial {
 					verifyErr = verify(ctx, admin, c, tables, scores)
 				}
+				if workload == "update_hot" && verifyErr == nil {
+					out.ExpectedHotScores = make([]int, len(scores))
+					for group := range scores {
+						out.ExpectedHotScores[group] = scores[group][0]
+					}
+					out.ObservedHotScores, verifyErr = readHotScores(ctx, admin, c, tables)
+				}
 				out.Verified = verifyThisTrial && verifyErr == nil && out.Errors == 0
-				r.Results[len(r.Results)-1].Verified = out.Verified
+				r.Results[len(r.Results)-1] = out
 				fmt.Fprintf(os.Stderr, "%s %s c=%d rep=%d %.1f ops/s p99=%.3fms errors=%d verified=%v\n", c.engine, workload, n, rep, out.Throughput, float64(out.P99)/1e6, out.Errors, out.Verified)
 				if verifyErr != nil {
 					return verifyErr
@@ -439,7 +456,7 @@ func parseWorkloads(raw string) ([]string, error) {
 	}
 	allowed := map[string]struct{}{
 		"point_hit": {}, "point_miss": {}, "range_32": {}, "range_64": {}, "range_256": {}, "group_16": {},
-		"update_existing": {}, "mixed_read_update": {}, "update_uniform": {}, "mixed_uniform": {},
+		"update_existing": {}, "update_hot": {}, "mixed_read_update": {}, "update_uniform": {}, "mixed_uniform": {},
 	}
 	workloads := make([]string, 0, len(strings.Split(raw, ",")))
 	seen := make(map[string]struct{}, len(allowed))
@@ -570,6 +587,51 @@ func operationFor(workload string, ordinal int) string {
 		return "update_existing"
 	}
 	return workload
+}
+
+// A PostgreSQL serialization or deadlock retry is safe only after the server
+// has aborted the failed transaction. Keep the benchmark policy explicit and
+// bounded so a pathological engine cannot turn one logical operation into an
+// unbounded run. The same policy is applied to both engines when enabled.
+const maxTransientRetries = 64
+
+func isTransientRetry(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "40001" || pgErr.Code == "40P01"
+}
+
+func waitTransientRetry(ctx context.Context, retry int) error {
+	// A small linear delay lets an in-flight conflicting transaction release its
+	// lock while keeping retry policy deterministic and bounded across engines.
+	delay := time.Duration(100+min(retry, 19)*100) * time.Microsecond
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func executeWithTransientRetry(ctx context.Context, enabled bool, operation func() error) (int, error) {
+	retries := 0
+	for {
+		err := operation()
+		if err == nil {
+			return retries, nil
+		}
+		if !enabled || !isTransientRetry(err) || retries >= maxTransientRetries {
+			return retries, err
+		}
+		retries++
+		if err := waitTransientRetry(ctx, retries); err != nil {
+			return retries, err
+		}
+	}
 }
 
 func setup(ctx context.Context, conn *pgconn.PgConn, c config, tables []string) error {
@@ -739,6 +801,26 @@ func verify(ctx context.Context, conn *pgconn.PgConn, c config, tables []string,
 	}
 	return nil
 }
+
+func readHotScores(ctx context.Context, conn *pgconn.PgConn, c config, tables []string) ([]int, error) {
+	observed := make([]int, len(tables))
+	for group, table := range tables {
+		res := conn.ExecParams(ctx, "SELECT score FROM "+table+" WHERE id=$1", [][]byte{[]byte(key(0))}, []uint32{25}, nil, nil).Read()
+		if res.Err != nil {
+			return nil, fmt.Errorf("read hot oracle %s: %w", table, res.Err)
+		}
+		if len(res.Rows) != 1 || len(res.Rows[0]) != 1 {
+			return nil, fmt.Errorf("hot oracle row shape for %s", table)
+		}
+		value, err := strconv.Atoi(string(res.Rows[0][0]))
+		if err != nil {
+			return nil, fmt.Errorf("hot oracle score for %s: %w", table, err)
+		}
+		observed[group] = value
+	}
+	return observed, nil
+}
+
 func trial(ctx context.Context, c config, workload string, clients, rep, count int, tables []string, scores [][]int, endpoints []string) (result, error) {
 	if len(endpoints) == 0 {
 		return result{}, fmt.Errorf("PostgreSQL endpoint list must not be empty")
@@ -748,6 +830,12 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 		rangeRows, _ = strconv.Atoi(strings.TrimPrefix(workload, "range_"))
 	}
 	out := result{Engine: c.engine, Workload: workload, Clients: clients, Repetition: rep, Operations: count, Samples: make([]sample, count)}
+	var hotCounts []atomic.Int64
+	var attempts atomic.Int64
+	var transientRetries atomic.Int64
+	if workload == "update_hot" {
+		hotCounts = make([]atomic.Int64, len(tables))
+	}
 	connections := make([]*pgconn.PgConn, clients)
 	defer func() {
 		for _, p := range connections {
@@ -786,6 +874,13 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 			sql = "SELECT bucket,COUNT(*),SUM(score) FROM " + table + " GROUP BY bucket ORDER BY bucket"
 		case "update_existing":
 			id = client
+			sql = "UPDATE " + table + " SET score=score+1 WHERE id=$1"
+			params = [][]byte{[]byte(key(id))}
+		case "update_hot":
+			// Every client targets the same existing row. This intentionally
+			// exposes optimistic preimage conflicts in the baseline path while
+			// keeping the SQL expression eligible for the atomic delta path.
+			id = 0
 			sql = "UPDATE " + table + " SET score=score+1 WHERE id=$1"
 			params = [][]byte{[]byte(key(id))}
 		case "update_uniform":
@@ -864,6 +959,11 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 				return fmt.Errorf("update affected %d", res.CommandTag.RowsAffected())
 			}
 			scores[group][id]++
+		case "update_hot":
+			if res.CommandTag.RowsAffected() != 1 {
+				return fmt.Errorf("hot update affected %d", res.CommandTag.RowsAffected())
+			}
+			hotCounts[group].Add(1)
 		case "update_uniform":
 			if res.CommandTag.RowsAffected() != 1 {
 				return fmt.Errorf("uniform update affected %d", res.CommandTag.RowsAffected())
@@ -905,7 +1005,9 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 	for i := 0; i < c.warmup; i++ {
 		client := i % clients
 		group := groupFor(c, len(tables), i)
-		if e := operation(connections[client], client, i); e != nil {
+		if _, e := executeWithTransientRetry(ctx, c.retryTransient, func() error {
+			return operation(connections[client], client, i)
+		}); e != nil {
 			// Keep the established workload prefix for existing consumers while
 			// retaining the exact first failing warmup location. This is the
 			// boundary needed to correlate a client error with per-group Raft
@@ -934,7 +1036,11 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 			<-start
 			for ordinal := client; ordinal < count; ordinal += clients {
 				operationStart := time.Now()
-				err := operation(connections[client], client, ordinal)
+				retries, err := executeWithTransientRetry(ctx, c.retryTransient, func() error {
+					return operation(connections[client], client, ordinal)
+				})
+				attempts.Add(int64(retries + 1))
+				transientRetries.Add(int64(retries))
 				operationEnd := time.Now()
 				group := groupFor(c, len(tables), ordinal)
 				s := sample{Client: client, Ordinal: ordinal, NS: operationEnd.Sub(operationStart).Nanoseconds(), StartOffsetNS: operationStart.Sub(measurementStart).Nanoseconds(), Group: group, Table: tables[group], Endpoint: client % len(endpoints), Operation: operationFor(workload, ordinal)}
@@ -952,6 +1058,9 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 	measurementStart = time.Now()
 	close(start)
 	wg.Wait()
+	for group := range hotCounts {
+		scores[group][0] += int(hotCounts[group].Load())
+	}
 	out.ElapsedNS = time.Since(measurementStart).Nanoseconds()
 	// Formatting the wall-clock anchor after the measured work avoids adding
 	// RFC3339 formatting to any operation's critical path. The monotonic
@@ -973,9 +1082,12 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 		}
 		latencies = append(latencies, s.NS)
 	}
+	out.SuccessfulOps = count - out.Errors
+	out.Attempts = int(attempts.Load())
+	out.TransientRetries = int(transientRetries.Load())
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	percentile := func(q float64) int64 { return latencies[int(math.Ceil(float64(len(latencies))*q))-1] }
 	out.P50, out.P95, out.P99 = percentile(.5), percentile(.95), percentile(.99)
-	out.Throughput = float64(count-out.Errors) / (float64(out.ElapsedNS) / 1e9)
+	out.Throughput = float64(out.SuccessfulOps) / (float64(out.ElapsedNS) / 1e9)
 	return out, diagnosticErr
 }

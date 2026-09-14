@@ -169,3 +169,24 @@ func TestMaterializeJSONInt64DeltaMatchesCanonicalPointUpdate(t *testing.T) {
 		t.Fatalf("dynamic lost unrelated fields: %s", dynamic)
 	}
 }
+
+func TestMaterializeJSONInt64DeltaMatchesNullableMissingAndIntegerSpellingRules(t *testing.T) {
+	descriptor, err := replication.AppendJSONInt64Delta(nil, "score", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, code := materializeJSONInt64Delta([]byte(`{"keep":"x"}`), descriptor, 1024)
+	if code != ResultApplied || string(updated) != `{"keep":"x","score":null}` {
+		t.Fatalf("missing nullable field update=%s code=%d", updated, code)
+	}
+	for _, spelling := range []string{"1.0", "1e0"} {
+		t.Run(spelling, func(t *testing.T) {
+			updated, code := materializeJSONInt64Delta(
+				[]byte(`{"keep":"x","score":`+spelling+`}`), descriptor, 1024,
+			)
+			if code != ResultInvalidDocument || updated != nil {
+				t.Fatalf("spelling %s update=%s code=%d", spelling, updated, code)
+			}
+		})
+	}
+}
