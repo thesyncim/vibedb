@@ -64,6 +64,10 @@ type replicatedSQLBoundStatement struct {
 	// inline would tax every single-statement write lowering.
 	updateExec      *query.Exec
 	conflictProgram []byte
+	// int64Delta is a JID1 operation descriptor for the prepared direct lane.
+	// It is populated only when the exact point UPDATE can execute atomically at
+	// the replicated apply index, so no gateway preimage is retained or read.
+	int64Delta []byte
 }
 
 type replicatedSQLMutationIdentity struct {
@@ -297,8 +301,14 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			// lowering without binding INSERT, DELETE or indexed UPDATE twice.
 			preimageMode = replicatedSQLLinearizablePreimage
 		}
+		if preimageMode == replicatedSQLCommittedLeaderPreimage {
+			statements[index].int64Delta, _ = preparedDirectInt64Delta(
+				snapshot, &statements[index], tableProfile,
+			)
+		}
 		var conflictParameterTypes []query.ParameterType
-		if hasComputedUpdateAssignments(&prepared.statement) || hasConflictExpressions(&prepared.statement) {
+		if (hasComputedUpdateAssignments(&prepared.statement) && len(statements[index].int64Delta) == 0) ||
+			hasConflictExpressions(&prepared.statement) {
 			parameterTypes, typeErr := postgresQueryParameterTypes(
 				queries[index].ParamTypes, prepared.params,
 			)
@@ -846,6 +856,9 @@ func replicatedSQLMutationInput(
 		scalar, ok := replicatedSQLExactConstraint(bound.constraints)
 		if !ok || ordinal != 0 {
 			return distribution.Scalar{}, nil, 0, ErrReplicatedSQLTransactionUnsupported
+		}
+		if len(statement.int64Delta) != 0 {
+			return scalar, statement.int64Delta, replication.MutationJSONInt64Delta, nil
 		}
 		return scalar, bound.updateDoc, replication.MutationPutPresent, nil
 	case sqlast.KindDelete:

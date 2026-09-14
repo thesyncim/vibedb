@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 // This adapter bypasses Raft only: session admission, durable apply, result
 // lookup, wire grammars, and restart all use their production implementations.
 type routeSessionMachineClient struct {
+	mu           sync.Mutex
 	machine      *replicatedstate.Machine
 	batched      bool
 	state        shardservice.ReplicatedMemberState
@@ -33,6 +35,8 @@ type routeSessionMachineClient struct {
 }
 
 func (client *routeSessionMachineClient) DoReplicated(_ context.Context, endpoint ReplicatedEndpoint, request *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	var frame bytes.Buffer
 	if err := shardservice.EncodeReplicatedRequest(&frame, request); err != nil {
 		return nil, err

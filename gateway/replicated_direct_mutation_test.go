@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -110,5 +111,84 @@ func TestReplicatedDirectMutationIsOneProposalWithCrossGatewayExactRetry(t *test
 	if !errors.Is(err, ErrReplicatedTransactionConflict) || stale.Committed ||
 		stale.ResultCode != replicatedstate.ResultTransactionConflict || client.state.Applied != 6 {
 		t.Fatalf("stale direct=%+v applied=%d err=%v", stale, client.state.Applied, err)
+	}
+}
+
+func TestReplicatedDirectInt64DeltaConcurrentSameKeyIncrements(t *testing.T) {
+	route, client, _ := newRouteSessionMachine(t)
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := serviceauthz.WithAuthority(
+		t.Context(), serviceauthz.Authority{Node: [16]byte{7}, Generation: 1},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenant := []byte("concurrent-delta-tenant")
+	baseKey := requestledger.RequestKey{
+		Scope:        requestledger.ScopeAuthenticated,
+		TenantDigest: requestledger.Digest(sha256.Sum256(tenant)),
+		Principal:    requestledger.PrincipalID{0x51}, Request: requestledger.RequestID{0x61},
+		IssuerEpoch: 7, IssuerSequence: 1, IssuerLane: requestledger.IssuerLane{0x71},
+	}
+	target := ReplicatedTransactionTarget{
+		Route: route, BucketBits: 8,
+		IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}},
+		Batches: []replication.RelationMutationBatch{{
+			Relation: 1, Mutations: []replication.Mutation{{
+				Kind: replication.MutationPutAbsentOrEqual, Key: []byte("counter"),
+				Value: []byte(`{"id":"counter","score":0,"keep":"x"}`),
+			}},
+		}},
+	}
+	seed := ReplicatedDirectMutation{
+		Key: baseKey, RequestDigest: replication.Digest{0x81}, Tenant: tenant, Target: target,
+	}
+	if result, err := executor.DirectMutate(ctx, seed); err != nil || !result.Committed {
+		t.Fatalf("seed result=%+v err=%v", result, err)
+	}
+	descriptor, err := replication.AppendJSONInt64Delta(nil, "score", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const increments = 16
+	errs := make(chan error, increments)
+	for i := 0; i < increments; i++ {
+		i := i
+		go func() {
+			request := baseKey
+			request.Request[0] = byte(0x62 + i)
+			request.IssuerLane[0] = byte(0x72 + i)
+			request.IssuerSequence = 1
+			mutation := replication.Mutation{
+				Kind: replication.MutationJSONInt64Delta, Key: []byte("counter"),
+				Value: descriptor,
+			}
+			requestDigest := replication.Digest{byte(0x91 + i)}
+			requestTarget := target
+			requestTarget.Batches = []replication.RelationMutationBatch{{
+				Relation: 1, Mutations: []replication.Mutation{mutation},
+			}}
+			result, callErr := executor.DirectMutate(ctx, ReplicatedDirectMutation{
+				Key: request, RequestDigest: requestDigest, Tenant: tenant, Target: requestTarget,
+			})
+			if callErr != nil || !result.Committed || result.AffectedRows != 1 {
+				errs <- fmt.Errorf("increment %d result=%+v err=%v", i, result, callErr)
+				return
+			}
+			errs <- nil
+		}()
+	}
+	for i := 0; i < increments; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	stored, err := client.machine.PointReadInto(1, []byte("counter"), client.state.Applied, replication.MaxMutationValueBytes, nil)
+	if err != nil || !stored.Found || !bytes.Contains(stored.Value, []byte(`"score":16`)) ||
+		!bytes.Contains(stored.Value, []byte(`"keep":"x"`)) {
+		t.Fatalf("concurrent counter=%q found=%v applied=%d err=%v", stored.Value, stored.Found, client.state.Applied, err)
 	}
 }
