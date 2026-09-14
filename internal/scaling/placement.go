@@ -452,6 +452,16 @@ func Plan(input PlacementInput) (PlacementPlan, error) {
 			plan.RemainingReplicas++
 			continue
 		}
+		// Scale-out adds one serving copy for every requested target. Once the
+		// current route already serves every requested target, this group's
+		// durable move is complete. Do not feed its old source replicas back
+		// through chooseTarget: memberOnRoute would report the completed target
+		// as a hard blocker and an exhausted-budget intent could never reach its
+		// terminal completion proof.
+		if input.Request.Kind == gateway.ScalingScaleOut &&
+			scaleOutTargetsSatisfied(candidate.route, input.Request.Targets) {
+			continue
+		}
 		if _, found := state.groups[candidate.route.Group]; found {
 			addCandidateBlocker(&plan, *candidate, PlacementBlocker{
 				Code: BlockerConcurrentGroup, Detail: "group already has an in-flight or selected enrollment",
@@ -1306,6 +1316,25 @@ func memberOnRoute(route gateway.ReplicatedRoute, node rafttransport.NodeID) boo
 		}
 	}
 	return false
+}
+
+func scaleOutTargetsSatisfied(route gateway.ReplicatedRoute, targets []gateway.NodeReference) bool {
+	if len(targets) == 0 {
+		return false
+	}
+	for _, target := range targets {
+		found := false
+		for _, replica := range route.Replicas {
+			if replica.Node == target.NodeID && replica.NodeIncarnation == target.Incarnation {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func strictImprovement(before, after, threshold uint64) bool {

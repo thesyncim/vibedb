@@ -304,6 +304,54 @@ func TestPlanScaleOutUsesActiveEmptyTargetAndMeasuredColdDemand(t *testing.T) {
 	}
 }
 
+func TestPlanScaleOutCompletedTargetIsNoWork(t *testing.T) {
+	fixture := newPlacementFixture(t, 1)
+	target := fixture.nodes[3]
+	targetReplica := gateway.ReplicatedReplicaDescriptor{
+		Member:          4,
+		Node:            target.NodeID,
+		StoreID:         [16]byte{0xf4},
+		NodeIncarnation: target.Incarnation,
+		Endpoint:        target.DataEndpoint,
+		NativeEndpoint:  target.NativeEndpoint,
+		ControlEndpoint: target.ControlEndpoint,
+	}
+	fixture.descriptors[0].Replicas[0] = targetReplica
+	fixture.endpoints[target.DataEndpoint] = target.DataAddress
+	fixture.endpoints[target.NativeEndpoint] = target.NativeAddress
+	fixture.endpoints[target.ControlEndpoint] = target.ControlAddress
+	manifest, err := fixture.config.Manifests[0].ReplaceShardLeader(
+		0, fixture.config.Manifests[0].Version()+1, 0, target.DataEndpoint, 1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.config.Manifests[0] = manifest
+	fixture.snapshot, err = gateway.NewSnapshotWithReplicatedMetadata(
+		fixture.config, fixture.endpoints, placementGeneration+1, nil, nil, fixture.descriptors,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range fixture.nodes {
+		fixture.nodes[index].CatalogGeneration = placementGeneration + 1
+	}
+	for index := range fixture.demands {
+		fixture.demands[index].CatalogGeneration = placementGeneration + 1
+	}
+
+	plan, err := Plan(PlacementInput{
+		Snapshot: fixture.snapshot, Nodes: fixture.nodes,
+		Request: placementRequest(gateway.ScalingScaleOut, 4), Demands: fixture.demands,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.State != PlacementNoWork || plan.HasMoves() || plan.RemainingReplicas != 0 {
+		t.Fatalf("completed scale-out target was planned again: %+v", plan)
+	}
+}
+
 func TestPlanRequiresGenerationFencedStorageEvidence(t *testing.T) {
 	fixture := newPlacementFixture(t, 1)
 	request := placementRequest(gateway.ScalingScaleOut, 4)
