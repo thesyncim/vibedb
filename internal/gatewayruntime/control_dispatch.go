@@ -7,6 +7,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/splitcontroller"
 )
 
 // prefixedPeerConnection puts the discriminator bytes back in front of the
@@ -55,6 +56,13 @@ func (runtime *Runtime) serveGatewayControlConnection(
 			return nodecontrol.ErrBootstrapReadUnavailable
 		}
 		return runtime.bootstrapReadService.Serve(ctx, wrapped)
+	}
+	sourceDiscriminator := splitcontroller.SourceTopologyRequestDiscriminator()
+	if bytes.Equal(discriminator[:], sourceDiscriminator[:]) {
+		if runtime.sourceTopologyService == nil {
+			return errGatewayControlDirectory
+		}
+		return runtime.sourceTopologyService.Serve(ctx, wrapped)
 	}
 	if runtime.controlService == nil {
 		return errGatewayControlDirectory

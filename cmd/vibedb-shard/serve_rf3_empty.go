@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/clusterbackup"
+	"github.com/thesyncim/vibedb/internal/clusterbackupservice"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/multiraft"
@@ -20,12 +22,15 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicaaction"
 	"github.com/thesyncim/vibedb/internal/replicacontrol"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/internal/servicemetrics"
 	"github.com/thesyncim/vibedb/internal/servicetls"
-	"github.com/thesyncim/vibedb/internal/shardcontrol"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
+	"github.com/thesyncim/vibedb/internal/splitcontroller"
 	"github.com/thesyncim/vibedb/shardservice"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 // rf3EmptyNodeRuntime is the live process boundary retained by an empty node.
@@ -35,15 +40,19 @@ import (
 // empty at construction; a committed-directory bootstrap adapter must attach
 // it after authenticating a seed and the node's exact Joining record.
 type rf3EmptyNodeRuntime struct {
-	peer      *raftservice.AuthenticatedExecutionPeerRuntime
-	registry  *rafttransport.StaticRegistry
-	lanes     *multiraft.ExecutionLanes
-	serving   *raftserve.Registry
-	reader    *nodecontrol.IntentReaderSlot
-	receivers *rf3DynamicBootstrapRegistry
-	learner   *rf3DynamicLearnerFactory
-	grants    *rf3DynamicGrantRouter
-	controlMu sync.Mutex
+	peer          *raftservice.AuthenticatedExecutionPeerRuntime
+	registry      *rafttransport.StaticRegistry
+	lanes         *multiraft.ExecutionLanes
+	serving       *raftserve.Registry
+	reader        *nodecontrol.IntentReaderSlot
+	receivers     *rf3DynamicBootstrapRegistry
+	learner       *rf3DynamicLearnerFactory
+	grants        *rf3DynamicGrantRouter
+	schemas       *rf3SchemaActivator
+	donors        *rf3DynamicDonorServices
+	native        *rf3NativeAuthorities
+	actionJournal *replicaaction.FileJournal
+	controlMu     sync.Mutex
 	// servingGroups is separate from transport membership. A group becomes
 	// native-serving only after the certified snapshot installer calls
 	// RegisterExecutionGroup; an empty process therefore remains fail-closed.
@@ -91,6 +100,14 @@ func (runtime *rf3EmptyNodeRuntime) UnregisterExecutionGroup(identity raftmember
 	if err := runtime.peer.UnregisterExecutionGroup(identity); err != nil {
 		return err
 	}
+	var cleanup error
+	cleanup = errors.Join(cleanup, runtime.native.unregisterDynamic(identity))
+	if runtime.donors != nil {
+		cleanup = errors.Join(cleanup, runtime.donors.Unregister(identity))
+	}
+	if runtime.schemas != nil {
+		cleanup = errors.Join(cleanup, runtime.schemas.UnregisterDynamic(identity))
+	}
 	if runtime.servingGroups != nil {
 		for {
 			count := runtime.servingGroups.Load()
@@ -99,7 +116,7 @@ func (runtime *rf3EmptyNodeRuntime) UnregisterExecutionGroup(identity raftmember
 			}
 		}
 	}
-	return nil
+	return cleanup
 }
 
 func (runtime *rf3EmptyNodeRuntime) nativeServing() bool {
@@ -179,15 +196,18 @@ func servePreparedRF3EmptyNode(
 	controlTLS *servicetls.Server,
 	_ *shardservice.ReplicatedServerTLS,
 	nodeOwner *rf3NodeOwner,
-	_ *rf3AdoptedGroupInventory,
+	adoptedInventory *rf3AdoptedGroupInventory,
 	migrationBudget *migrationbudget.Budget,
+	actionJournal *replicaaction.FileJournal,
+	prepared *preparedRF3Set,
 ) (resultErr error) {
 	if parent == nil || listen == nil || profile == nil || policy == nil || gate == nil ||
-		controlTLS == nil || nodeOwner == nil || manifest.NodeLog == nil ||
+		controlTLS == nil || nodeOwner == nil || adoptedInventory == nil || actionJournal == nil || prepared == nil || manifest.NodeLog == nil ||
 		manifest.NodeIncarnation == 0 || len(manifest.groupBundles()) != 0 ||
 		embeddedGateway != nil || !validRF3ExecutionLanes(executionLaneCount) {
 		return errRF3Serving
 	}
+	defer func() { resultErr = closePreparedRF3Groups(prepared.groups, resultErr) }()
 	if cause := context.Cause(parent); cause != nil {
 		return componentShutdownError(cause)
 	}
@@ -265,14 +285,29 @@ func servePreparedRF3EmptyNode(
 		return errors.Join(raftservice.ErrInvalidOwner, lanes.Close(), servingRegistry.Close())
 	}
 	var servingGroups atomic.Int64
-	capacityProvider, err := replicacontrol.NewCapacityProvider(replicacontrol.CapacitySourceDirectory{
-		Sources: func(context.Context) ([]replicacontrol.CapacitySource, error) {
-			return nil, replicacontrol.ErrCapacityUnavailable
-		},
-		Node: func(context.Context) (replicacontrol.NodeCapacity, error) {
-			return replicacontrol.NodeCapacity{}, replicacontrol.ErrCapacityUnavailable
-		},
-	})
+	schemas, err := newRF3SchemaActivator(peer.Owners(), nil, nil)
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	schemaServices, err := newRF3SchemaControlServices(schemas, transportRegistry, policy, manifest.ReplicaControl.SourceDataRoot)
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	defer func() { resultErr = errors.Join(resultErr, schemaServices.Close()) }()
+	donors, err := newRF3DynamicDonorServices(schemas, transportRegistry, policy, manifest, migrationBudget, deadline)
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	defer func() { resultErr = errors.Join(resultErr, donors.Close()) }()
+	var capacityRevision atomic.Uint64
+	capacityDirectory, err := newRF3CapacitySourceDirectory(schemas, nil, nil,
+		func(ctx context.Context, request replicacontrol.CapacityRequest, samples []replicacontrol.CapacitySourceSample) (replicacontrol.NodeCapacity, error) {
+			return RF3CapacityNodeFromOwner(ctx, nodeOwner, manifest.NodeIncarnation, migrationBudget, &capacityRevision, request, samples)
+		})
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	capacityProvider, err := replicacontrol.NewCapacityProvider(capacityDirectory)
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
@@ -290,11 +325,19 @@ func servePreparedRF3EmptyNode(
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
+	nativeAuthorities, err := newRF3NativeAuthorities(transportRegistry, gate, nil, nil, nil)
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	nativeAuthorities.adopted = adoptedInventory
 	if err = nativeServer.BindAuthorization(gate, nil); err == nil {
-		err = nativeServer.BindServingAuthority(func(raftservice.ServingState) bool { return servingGroups.Load() > 0 })
+		err = nativeServer.BindServingAuthority(nativeAuthorities.serving)
 	}
 	if err == nil {
-		err = nativeServer.BindTransitionalServingAuthority(func(raftservice.ServingState, *shardservice.ReplicatedRequest) bool { return false })
+		err = nativeServer.BindConcurrentServingAuthority(nativeAuthorities.serving)
+	}
+	if err == nil {
+		err = nativeServer.BindTransitionalServingAuthority(nativeAuthorities.transitional)
 	}
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
@@ -348,6 +391,8 @@ func servePreparedRF3EmptyNode(
 	// beside the certified reservation so restart can restore historical
 	// configuration replay authority atomically with the recovered group.
 	grantRouter := newRF3DynamicGrantRouter(transportRegistry)
+	runtime := &rf3EmptyNodeRuntime{native: nativeAuthorities, peer: peer, registry: transportRegistry, lanes: lanes,
+		serving: servingRegistry, reader: reader, receivers: receivers, grants: grantRouter, schemas: schemas, donors: donors, actionJournal: actionJournal, servingGroups: &servingGroups}
 	membershipControl, err := shardservice.NewMembershipGrantControlService(
 		grantRouter, policy, deadline, deadline,
 	)
@@ -355,36 +400,113 @@ func servePreparedRF3EmptyNode(
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
 	observationControl, err := replicacontrol.NewService(replicacontrol.ServiceOptions{
-		Observer:     peer.Owners(),
-		Authorize:    rf3ReplicaObservationAuthorizer(transportRegistry, policy),
-		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 32,
+		Observer:               peer.Owners(),
+		AuthorizeAuthenticated: rf3AuthenticatedReplicaObservationAuthorizer(transportRegistry, policy),
+		ReadDeadline:           deadline, WriteDeadline: deadline, MaxConcurrent: 32,
 	})
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
-	controlMux, err := shardcontrol.New(
-		shardcontrol.Route{Discriminator: nodecontrol.NodeInfoRequestDiscriminator(), Handler: nodeInfo},
-		shardcontrol.Route{Discriminator: nodecontrol.RequestDiscriminator(), Handler: controlService},
-		shardcontrol.Route{Discriminator: snapshottransfer.BootstrapRequestDiscriminator(), Handler: receivers},
-		shardcontrol.Route{Discriminator: replicacontrol.RequestDiscriminator(), Handler: observationControl},
-		shardcontrol.Route{Discriminator: replicacontrol.CapacityRequestDiscriminator(), Handler: capacityControl},
-		shardcontrol.Route{Discriminator: shardservice.MembershipGrantRequestDiscriminator(), Handler: membershipControl},
-	)
+	actionControl, err := newRF3ReplicaActionControl(actionJournal, peer.Owners(), transportRegistry, policy, deadline,
+		profile, rf3ReplicaRetirementCleanup(schemas, donors, &servingGroups, nativeAuthorities))
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
-	snapshotMux, err := newRF3SnapshotMux(rf3RejectRF3Handler{}, nil)
+	backupControl, err := clusterbackupservice.New(clusterbackupservice.Options{
+		Owner: peer.Owners(),
+		Authorize: func(identity rafttransport.PeerIdentity, request clusterbackup.LiveRequest) bool {
+			member, err := transportRegistry.LocalMember(request.Group)
+			return err == nil && member == request.SourceMember &&
+				policy.Check(identity.Node, serviceauthz.CapabilityBackup) == serviceauthz.DecisionAllow
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline,
+		ChunkBytes: int(manifest.ReplicaControl.SourceChunkBytes), MaxConcurrent: manifest.ReplicaControl.MaxSourceConcurrent,
+	})
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	metricsProvider := &rf3MetricsProvider{owners: peer.Owners(), schemas: schemas, backup: backupControl, action: actionControl}
+	metricsControl, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
+		Provider: metricsProvider,
+		Authorize: func(identity rafttransport.PeerIdentity) bool {
+			return policy.Check(identity.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline,
+	})
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	snapshotAuthorizer := mustRF3NodeAuthorizer(rf3ControlPeerNodes(manifest, policy.NodesWith(serviceauthz.CapabilityMembership)))
+	enrollmentControl, err := newRF3EnrollmentControlService(transportRegistry, policy, deadline,
+		func(intent rafttransport.EnrollmentIntent) error {
+			return snapshotAuthorizer.Merge([]rafttransport.NodeID{intent.Peer.NodeID})
+		})
+	if err == nil {
+		err = enrollmentControl.AttachTransport(peer.Transport())
+	}
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	children, err := newRF3DynamicChildResources(manifest, nodeOwner, schemas, peer.Owners(), transportRegistry, adoptedInventory.templates)
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	childPreparer, err := newRF3GroupChildPreparer(manifest, local.Node,
+		peerListener.Addr(), nativeListener.Addr(), controlListener.Addr(), snapshotListener.Addr(), children)
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	defer func() { resultErr = errors.Join(resultErr, childPreparer.Close()) }()
+	childPreparer.inventory = adoptedInventory
+	if err = adoptedInventory.checkCapacity(childPreparer.slots); err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	concurrency := min(manifest.SplitControl.operationLimit(), 8)
+	childPrepareControl, err := splitcontroller.NewChildPrepareService(splitcontroller.ChildPrepareServiceOptions{
+		Preparer: childPreparer,
+		Authorize: func(identity rafttransport.PeerIdentity, request splitcontroller.ChildPreparation) bool {
+			return request.ReplicaTarget().Node == local.Node && policy.Check(identity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
+		}, ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: concurrency,
+		MaxInflightBytes: uint64(splitcontroller.MaxChildPrepareWireBytes) * uint64(concurrency),
+	})
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	splitRuntime, err := newRF3SplitServingRuntime(rf3SplitServingOptions{
+		manifest: manifest, schemas: schemas, nodeOwner: nodeOwner, children: children,
+		owners: peer.Owners(), registrar: runtime, profile: profile, policy: policy, deadline: deadline,
+		registry: transportRegistry, childPreparer: childPreparer, inventory: adoptedInventory,
+		topologyActions: func(identity raftmember.RuntimeIdentity, lease *splitcontroller.RuntimeStoreLease, apply *sqldriver.ReplicatedApply) (rf3SplitTopologyActions, error) {
+			return newRF3ProxiedSplitTopologyActions(profile, serviceauthz.Authority{Node: local.Node, Generation: policy.Generation()}, manifest.GatewaySeeds, identity, lease, apply)
+		},
+	})
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	defer func() { resultErr = errors.Join(resultErr, splitRuntime.Close()) }()
+	metricsProvider.split = splitRuntime.action
+	controlMux, err := (rf3ControlServices{
+		membership: membershipControl, observation: observationControl, metrics: metricsControl,
+		capacity: capacityControl, action: actionControl, backup: backupControl, enrollment: enrollmentControl,
+		schema: schemaServices.install, schemaBuild: schemaServices.build,
+		source: donors.Control, preparation: donors.Preparation,
+		split: splitRuntime.action, planObservation: splitRuntime.observation.service, admission: splitRuntime.admission,
+		tail: splitRuntime.tail, terminal: splitRuntime.terminal, childPrepare: childPrepareControl,
+		nodeInfo: nodeInfo, nodeControl: controlService, bootstrap: receivers,
+	}).mux()
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	snapshotMux, err := newRF3SnapshotMux(donors.Data, splitRuntime.artifact)
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
 	snapshotTLS, err := servicetls.NewServer(profile, rafttransport.TrafficSnapshot,
-		mustRF3NodeAuthorizer(rf3ControlPeerNodes(manifest, policy.NodesWith(serviceauthz.CapabilityMembership))))
+		snapshotAuthorizer)
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
 
-	runtime := &rf3EmptyNodeRuntime{peer: peer, registry: transportRegistry, lanes: lanes,
-		serving: servingRegistry, reader: reader, receivers: receivers, grants: grantRouter, servingGroups: &servingGroups}
 	learner, err := newRF3DynamicLearnerFactory(runtime, nodeOwner, manifest, profile, policy, gate, migrationBudget, deadline)
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
@@ -421,7 +543,10 @@ func servePreparedRF3EmptyNode(
 	// owners, which must be running first. Native and control listeners stay
 	// closed to requests until this startup recovery has finished.
 	recoveryCtx, cancelRecovery := context.WithTimeout(parent, rf3NetworkTimeout)
-	recoveryErr := learner.Recover(recoveryCtx)
+	recoveryErr := recoverRF3EmptySplitChildren(recoveryCtx, runtime, prepared, adoptedInventory, profile)
+	if recoveryErr == nil {
+		recoveryErr = learner.Recover(recoveryCtx)
+	}
 	cancelRecovery()
 	if recoveryErr != nil {
 		// The peer now owns recovered runtimes and its listener. Join it before
@@ -506,6 +631,8 @@ func servePreparedRF3EmptyNode(
 		primary = errors.Join(primary, componentShutdownError(<-controlDone))
 		controlFinished = true
 	}
+	primary = errors.Join(primary, splitRuntime.Close())
+	splitRuntime = nil
 	stopPeer(context.Canceled)
 	if !peerFinished {
 		primary = errors.Join(primary, componentShutdownError(<-peerDone))

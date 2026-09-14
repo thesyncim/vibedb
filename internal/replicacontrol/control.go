@@ -95,32 +95,35 @@ type HealthObserver interface {
 }
 
 type AuthorizeFunc func(rafttransport.PeerIdentity, Request) bool
+type AuthenticatedAuthorizeFunc func(rafttransport.PeerBinding, Request) bool
 
 type ServiceOptions struct {
-	Observer      Observer
-	Authorize     AuthorizeFunc
-	ReadDeadline  rafttransport.DeadlineFunc
-	WriteDeadline rafttransport.DeadlineFunc
-	MaxConcurrent int
+	Observer               Observer
+	Authorize              AuthorizeFunc
+	AuthorizeAuthenticated AuthenticatedAuthorizeFunc
+	ReadDeadline           rafttransport.DeadlineFunc
+	WriteDeadline          rafttransport.DeadlineFunc
+	MaxConcurrent          int
 }
 
 type Service struct {
-	observer      Observer
-	authorize     AuthorizeFunc
-	readDeadline  rafttransport.DeadlineFunc
-	writeDeadline rafttransport.DeadlineFunc
-	slots         chan struct{}
-	stripes       []sync.Mutex
+	observer               Observer
+	authorize              AuthorizeFunc
+	authorizeAuthenticated AuthenticatedAuthorizeFunc
+	readDeadline           rafttransport.DeadlineFunc
+	writeDeadline          rafttransport.DeadlineFunc
+	slots                  chan struct{}
+	stripes                []sync.Mutex
 }
 
 func NewService(options ServiceOptions) (*Service, error) {
-	if options.Observer == nil || options.Authorize == nil || options.ReadDeadline == nil ||
+	if options.Observer == nil || (options.Authorize == nil && options.AuthorizeAuthenticated == nil) || options.ReadDeadline == nil ||
 		options.WriteDeadline == nil || options.MaxConcurrent <= 0 ||
 		options.MaxConcurrent > AbsoluteMaxConcurrentObservers {
 		return nil, ErrControl
 	}
 	return &Service{
-		observer: options.Observer, authorize: options.Authorize,
+		observer: options.Observer, authorize: options.Authorize, authorizeAuthenticated: options.AuthorizeAuthenticated,
 		readDeadline: options.ReadDeadline, writeDeadline: options.WriteDeadline,
 		slots:   make(chan struct{}, options.MaxConcurrent),
 		stripes: make([]sync.Mutex, options.MaxConcurrent),
@@ -177,7 +180,13 @@ func (service *Service) serveRequest(ctx context.Context, connection rafttranspo
 	wantDomain := rafttransport.TrustDomain{
 		ClusterID: request.Group.ClusterID, ClusterIncarnation: request.Group.ClusterIncarnation,
 	}
-	if peer.TrustDomain != wantDomain || !service.authorize(peer, request) {
+	authorized := false
+	if service.authorizeAuthenticated != nil {
+		authorized = service.authorizeAuthenticated(rafttransport.PeerBinding{Identity: peer, ServiceKeyDigest: connection.PeerKeyDigest()}, request)
+	} else if service.authorize != nil {
+		authorized = service.authorize(peer, request)
+	}
+	if peer.TrustDomain != wantDomain || !authorized {
 		return ErrUnauthorized
 	}
 	select {

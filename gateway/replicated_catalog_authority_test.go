@@ -1598,26 +1598,32 @@ func catalogCompletionResponse(
 }
 
 func (client *catalogAuthorityClient) apply(command replication.CommandView) uint32 {
+	// Match the state machine's transactional batch: a later failed CAS
+	// must not expose any earlier mutation from this command.
+	staged := make(map[string][]byte, len(client.rows))
+	for key, value := range client.rows {
+		staged[key] = value
+	}
 	relations := command.RelationBatches()
 	for relations.Next() {
 		mutations := relations.Batch().Mutations()
 		for mutations.Next() {
 			mutation := mutations.Mutation()
 			key := string(mutation.Key)
-			current, found := client.rows[key]
+			current, found := staged[key]
 			switch mutation.Kind {
 			case replication.MutationPutAbsentOrEqual:
 				if found && !bytes.Equal(current, mutation.Value) {
 					return replicatedstate.ResultIndexConflict
 				}
-				client.rows[key] = append([]byte(nil), mutation.Value...)
+				staged[key] = append([]byte(nil), mutation.Value...)
 			case replication.MutationPutDigestEqual:
 				digest := sha256.Sum256(current)
 				if !found || uint64(len(current)) != mutation.ExpectedValueLength ||
 					replication.Digest(digest) != mutation.ExpectedValueDigest {
 					return replicatedstate.ResultIndexConflict
 				}
-				client.rows[key] = append([]byte(nil), mutation.Value...)
+				staged[key] = append([]byte(nil), mutation.Value...)
 			case replication.MutationDeleteDigestEqual:
 				if !found {
 					continue
@@ -1627,12 +1633,13 @@ func (client *catalogAuthorityClient) apply(command replication.CommandView) uin
 					replication.Digest(digest) != mutation.ExpectedValueDigest {
 					return replicatedstate.ResultIndexConflict
 				}
-				delete(client.rows, key)
+				delete(staged, key)
 			default:
 				return replicatedstate.ResultInvalidDocument
 			}
 		}
 	}
+	client.rows = staged
 	return replicatedstate.ResultApplied
 }
 

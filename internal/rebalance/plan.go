@@ -142,6 +142,14 @@ func PlanReplicaMove(
 		return nil, err
 	}
 	plan.installTransitionIntent(current)
+	if !plan.transitionReady {
+		for _, descriptor := range current.ReplicatedShardDescriptors() {
+			if descriptor.Group == request.Group && descriptor.Distribution == request.Distribution &&
+				descriptor.Shard == request.Shard && descriptor.EnrolledTarget != nil {
+				return nil, fmt.Errorf("%w: enrolled group %x lacks valid owned transition metadata", ErrInvalidPlan, request.Group.GroupID)
+			}
+		}
+	}
 	return plan, nil
 }
 
@@ -423,7 +431,7 @@ func recoverReplicaMoveCertificate(
 			}
 		}
 	default:
-		return nil, ErrTopologyConflict
+		return nil, fmt.Errorf("%w: legacy move has no owned transition for catalog head %d and snapshot route generation %d", ErrTopologyConflict, current.Generation(), state.Binding.RouteGeneration)
 	}
 	if err != nil {
 		return nil, err

@@ -1590,6 +1590,12 @@ func (authority *ReplicatedCatalogAuthority) PutEnrollmentIntent(ctx context.Con
 }
 
 func (authority *ReplicatedCatalogAuthority) putEnrollmentIntent(ctx context.Context, intent GroupEnrollmentIntent, expectedRevision uint64, allowReceipt bool) error {
+	return authority.putEnrollmentIntentWithMove(ctx, intent, expectedRevision, allowReceipt, nil, nil)
+}
+
+func (authority *ReplicatedCatalogAuthority) putEnrollmentIntentWithMove(ctx context.Context, intent GroupEnrollmentIntent,
+	expectedRevision uint64, allowReceipt bool, move *ReplicatedOperationRecord, expectedOperations [][32]byte,
+) error {
 	if authority == nil || authority.session == nil || ctx == nil || !intent.Valid() {
 		return ErrInvalidScalingMetadata
 	}
@@ -1615,6 +1621,13 @@ func (authority *ReplicatedCatalogAuthority) putEnrollmentIntent(ctx context.Con
 		prior, err = openEnrollmentIntentRecord(current.Value, intent.IntentID)
 		if err != nil {
 			return err
+		}
+		if move != nil && prior.Revision >= intent.Revision &&
+			(prior.State == EnrollmentMoving || prior.State == EnrollmentComplete) &&
+			prior.MoveOperationID == move.ID && prior.Digest() == intent.Digest() &&
+			prior.Proof != nil && intent.Proof != nil && *prior.Proof == *intent.Proof &&
+			prior.Receipt != nil && intent.Receipt != nil && *prior.Receipt == *intent.Receipt {
+			return authority.validateAdmittedEnrollmentMove(ctx, *move)
 		}
 		if revisionRetryMatches(expectedRevision, intent.Revision) {
 			// A create retry may carry the caller's pre-admission zero head
@@ -1686,6 +1699,26 @@ func (authority *ReplicatedCatalogAuthority) putEnrollmentIntent(ctx context.Con
 	} else if expectedRevision != 0 || intent.Revision != 1 || intent.State != EnrollmentReserved ||
 		intent.PreparationClaim != ([32]byte{}) {
 		return ErrScalingRevision
+	}
+	var moveMutations []NativeMutation
+	if move != nil {
+		if !current.Found || prior.State != EnrollmentEnrolled {
+			return ErrScalingState
+		}
+		cut, cutErr := authority.readCatalogCut(ctx)
+		if cutErr != nil || !enrollmentReceiptMatchesCatalog(prior, cut) || cut.snapshot.Generation() != move.CatalogGeneration {
+			return errors.Join(cutErr, ErrReplicatedCatalogConflict)
+		}
+		moveMutations, err = authority.prepareOperationAdmission(ctx, []ReplicatedOperationRecord{*move}, expectedOperations, true)
+		if err != nil {
+			return err
+		}
+		moveMutations = append(moveMutations,
+			NativeMutation{Kind: replication.MutationPutDigestEqual, Key: replicatedCatalogHeadKey,
+				Value: cut.head, ExpectedValueLength: uint64(len(cut.head)), ExpectedValueDigest: scalingDigest(cut.head)},
+			NativeMutation{Kind: replication.MutationPutDigestEqual, Key: replicatedCatalogHeadWitnessKey,
+				Value: cut.witness, ExpectedValueLength: uint64(len(cut.witness)), ExpectedValueDigest: scalingDigest(cut.witness)},
+		)
 	}
 	parentMutations, err := authority.enrollmentParentMutations(ctx, intent, prior, current.Found)
 	if err != nil {
@@ -1811,6 +1844,7 @@ func (authority *ReplicatedCatalogAuthority) putEnrollmentIntent(ctx context.Con
 	)
 	mutations = append(mutations, parentMutations...)
 	mutations = append(mutations, historyMutations...)
+	mutations = append(mutations, moveMutations...)
 	result, err := authority.session.MutateBatch(ctx, mutations)
 	return scalingMutationError(result, err, authority.session)
 }

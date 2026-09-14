@@ -20,6 +20,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
+	"github.com/thesyncim/vibedb/internal/splitcontroller"
 )
 
 // SemanticTransport is the transport-neutral RF3 boundary used by an
@@ -206,6 +207,7 @@ type Runtime struct {
 	controlAuthorizer             *servicetls.NodeAuthorizer
 	controlService                *gateway.ClusterCatalogDrainControlService
 	bootstrapReadService          *nodecontrol.BootstrapReadService
+	sourceTopologyService         *splitcontroller.SourceTopologyService
 	controlOpener                 *gatewayShardControlOpener
 	clusterControlOpener          *gatewayClusterControlOpener
 	drainCoordinator              *gateway.ClusterCatalogDrainCoordinator

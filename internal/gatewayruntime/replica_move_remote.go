@@ -1288,6 +1288,18 @@ func (remote gatewayReplicaRemoteActions) RetireReplicaSource(
 		request.Source.Member == 0 || request.Target.Member == 0 {
 		return errGatewayReplicaControl
 	}
+	var command []byte
+	if len(request.Survivors) != 0 {
+		locators := make([]replicaaction.RetirementLocator, 0, len(request.Survivors))
+		for _, survivor := range request.Survivors {
+			locators = append(locators, replicaaction.RetirementLocator{Member: survivor.Member, Address: survivor.ControlAddress})
+		}
+		var err error
+		command, err = replicaaction.EncodeRetirementLocators(locators)
+		if err != nil {
+			return errors.Join(errGatewayReplicaControl, err)
+		}
+	}
 	return remote.actions.Execute(ctx, request.Source.Node, replicaaction.Request{
 		Operation: request.Operation, Step: request.Step, Kind: replicaaction.SourceRetirement,
 		Fence: raftservice.ServingFence{Group: request.Group,
@@ -1295,7 +1307,7 @@ func (remote gatewayReplicaRemoteActions) RetireReplicaSource(
 			MemberID: request.Source.Member,
 			StoreID:  request.Source.StoreID, NodeIncarnation: request.Source.NodeIncarnation,
 			Term: request.Term},
-		SourceMember: request.Source.Member, TargetMember: request.Target.Member,
+		SourceMember: request.Source.Member, TargetMember: request.Target.Member, Command: command,
 	})
 }
 

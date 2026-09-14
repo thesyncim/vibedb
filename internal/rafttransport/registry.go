@@ -2728,6 +2728,22 @@ func (registry *StaticRegistry) ReplicaSetVersion(
 	return view.version, true
 }
 
+// ReplicaSetVoterCount reads the voter count and version from the same
+// committed authority cut. Bootstrap member mappings can retain removed
+// replicas and omit later replacements, so they cannot supply this count.
+func (registry *StaticRegistry) ReplicaSetVoterCount(group raftmember.GroupKey) (version uint64, voters int, found bool) {
+	view, ok := registry.currentAuthority(group)
+	if !ok {
+		return 0, 0, false
+	}
+	for _, role := range view.roles {
+		if role == MemberVoter {
+			voters++
+		}
+	}
+	return view.version, voters, true
+}
+
 // Member returns the member hosted by node in group.
 func (registry *StaticRegistry) Member(group raftmember.GroupKey, node NodeID) (uint64, error) {
 	if registry == nil {

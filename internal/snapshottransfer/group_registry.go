@@ -18,8 +18,11 @@ type GroupDataService struct {
 }
 
 type GroupDataRegistryOptions struct {
-	Registry         *rafttransport.StaticRegistry
-	Services         []GroupDataService
+	Registry *rafttransport.StaticRegistry
+	Services []GroupDataService
+	// Resolve supplies the current bounded hosted-group inventory. It is
+	// mutually exclusive with Services and must be safe for concurrent use.
+	Resolve          func(raftmember.GroupKey) *Service
 	ReadDeadline     rafttransport.DeadlineFunc
 	MaxConnections   int
 	MaxInflightBytes int64
@@ -32,6 +35,7 @@ type GroupDataRegistryOptions struct {
 type GroupDataRegistry struct {
 	registry     *rafttransport.StaticRegistry
 	services     map[raftmember.GroupKey]*Service
+	resolve      func(raftmember.GroupKey) *Service
 	readDeadline rafttransport.DeadlineFunc
 	slots        chan struct{}
 	maxInflight  int64
@@ -39,7 +43,9 @@ type GroupDataRegistry struct {
 }
 
 func NewGroupDataRegistry(options GroupDataRegistryOptions) (*GroupDataRegistry, error) {
-	if options.Registry == nil || options.ReadDeadline == nil || len(options.Services) == 0 ||
+	if options.Registry == nil || options.ReadDeadline == nil ||
+		(len(options.Services) == 0 && options.Resolve == nil) ||
+		(len(options.Services) != 0 && options.Resolve != nil) ||
 		len(options.Services) > AbsoluteMaxGroupServices || options.MaxConnections <= 0 ||
 		options.MaxConnections > 4096 || options.MaxInflightBytes <= 0 ||
 		options.MaxInflightBytes > int64(AbsoluteMaxChunkBytes)*int64(options.MaxConnections) {
@@ -59,7 +65,7 @@ func NewGroupDataRegistry(options GroupDataRegistryOptions) (*GroupDataRegistry,
 		}
 		services[entry.Group] = entry.Service
 	}
-	return &GroupDataRegistry{registry: options.Registry, services: services,
+	return &GroupDataRegistry{registry: options.Registry, services: services, resolve: options.Resolve,
 		readDeadline: options.ReadDeadline, slots: make(chan struct{}, options.MaxConnections),
 		maxInflight: options.MaxInflightBytes}, nil
 }
@@ -105,8 +111,16 @@ func (registry *GroupDataRegistry) Serve(
 		_ = connection.Close()
 		return err
 	}
+	if member, err := registry.registry.LocalMember(descriptor.Group); err != nil || member != descriptor.SourceMember {
+		_ = connection.Close()
+		return ErrStaleFence
+	}
 	service := registry.services[descriptor.Group]
-	if service == nil {
+	if registry.resolve != nil {
+		service = registry.resolve(descriptor.Group)
+	}
+	if service == nil || service.registry == nil ||
+		service.registry.TrustDomain() != registry.registry.TrustDomain() {
 		_ = connection.Close()
 		return ErrStaleFence
 	}
@@ -131,8 +145,11 @@ type GroupSourceControlService struct {
 }
 
 type GroupSourceControlRegistryOptions struct {
-	Registry       *rafttransport.StaticRegistry
-	Services       []GroupSourceControlService
+	Registry *rafttransport.StaticRegistry
+	Services []GroupSourceControlService
+	// Resolve supplies the current bounded hosted-group inventory. It is
+	// mutually exclusive with Services and must be safe for concurrent use.
+	Resolve        func(raftmember.GroupKey) *SourceControlService
 	ReadDeadline   rafttransport.DeadlineFunc
 	MaxConnections int
 }
@@ -143,6 +160,7 @@ type GroupSourceControlRegistryOptions struct {
 type GroupSourceControlRegistry struct {
 	registry     *rafttransport.StaticRegistry
 	services     map[raftmember.GroupKey]*SourceControlService
+	resolve      func(raftmember.GroupKey) *SourceControlService
 	readDeadline rafttransport.DeadlineFunc
 	slots        chan struct{}
 }
@@ -150,7 +168,9 @@ type GroupSourceControlRegistry struct {
 func NewGroupSourceControlRegistry(
 	options GroupSourceControlRegistryOptions,
 ) (*GroupSourceControlRegistry, error) {
-	if options.Registry == nil || options.ReadDeadline == nil || len(options.Services) == 0 ||
+	if options.Registry == nil || options.ReadDeadline == nil ||
+		(len(options.Services) == 0 && options.Resolve == nil) ||
+		(len(options.Services) != 0 && options.Resolve != nil) ||
 		len(options.Services) > AbsoluteMaxGroupServices || options.MaxConnections <= 0 ||
 		options.MaxConnections > AbsoluteMaxSourceConcurrency {
 		return nil, ErrSourceControl
@@ -168,7 +188,7 @@ func NewGroupSourceControlRegistry(
 		}
 		services[entry.Group] = entry.Service
 	}
-	return &GroupSourceControlRegistry{registry: options.Registry, services: services,
+	return &GroupSourceControlRegistry{registry: options.Registry, services: services, resolve: options.Resolve,
 		readDeadline: options.ReadDeadline, slots: make(chan struct{}, options.MaxConnections)}, nil
 }
 
@@ -205,7 +225,14 @@ func (registry *GroupSourceControlRegistry) Serve(
 	if err != nil {
 		return err
 	}
+	localMember, err := registry.registry.LocalMember(request.Group)
+	if err != nil || localMember != request.SourceMember {
+		return ErrSourceUnauthorized
+	}
 	service := registry.services[request.Group]
+	if registry.resolve != nil {
+		service = registry.resolve(request.Group)
+	}
 	if service == nil {
 		return ErrSourceUnauthorized
 	}
@@ -213,10 +240,6 @@ func (registry *GroupSourceControlRegistry) Serve(
 	// the learner receiving the artifact. The selected service authenticates
 	// that actor and the exact source/target request before journal access.
 	// Snapshot data access independently remains bound to the target member.
-	localMember, err := registry.registry.LocalMember(request.Group)
-	if err != nil || localMember != request.SourceMember {
-		return ErrSourceUnauthorized
-	}
 	if command == sourceControlAbandon {
 		var witnessRaw [AbandonmentWitnessBytes]byte
 		if _, err = io.ReadFull(connection, witnessRaw[:]); err != nil {

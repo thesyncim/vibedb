@@ -184,9 +184,17 @@ func ExecuteReplicatedMoveStep(
 			action.ReplicaSetVersion != cut.Publication.ReplicaSetVersion {
 		return Action{}, ErrReplicatedMove
 	}
+	if record.CatalogGeneration < plan.CatalogGeneration() || record.CatalogGeneration > cut.Catalog.Generation() {
+		return Action{}, fmt.Errorf("%w: journal catalog head %d is outside source %d and current %d", ErrReplicatedMove, record.CatalogGeneration, plan.CatalogGeneration(), cut.Catalog.Generation())
+	}
+	// Reconcile has authenticated this move's exact descriptor, route, and
+	// membership (or its committed publication receipt). An owned transition
+	// can therefore retain its execution witness while another group advances
+	// the shared head. Legacy plans still require the same catalog generation.
+	catalogEvidenceOK := record.CatalogGeneration == cut.Catalog.Generation() || plan.transitionReady
 	if record.State == gateway.ReplicatedOperationComplete {
-		if action.Kind != ActionComplete || !replicaMoveRecordMatches(
-			record, operation, plan, cut, action, replicaMoveCursorApplied,
+		if action.Kind != ActionComplete || !catalogEvidenceOK || !replicaMoveCompletedRecordMatches(
+			record, operation, plan, cut,
 		) {
 			return Action{}, fmt.Errorf("%w: completed record differs from current action %d", ErrReplicatedMove, action.Kind)
 		}
@@ -216,7 +224,7 @@ func ExecuteReplicatedMoveStep(
 		(record.State == gateway.ReplicatedOperationPlanned && record.Cursor[3] == replicaMoveCursorReady ||
 			record.State == gateway.ReplicatedOperationRunning && record.Cursor[3] == replicaMoveCursorExecuting) &&
 		sameReplicaMoveAction(record.Cursor, replicaMoveActionCursor(action, record.Cursor[3], plan, cut)) {
-		if (!plan.transitionReady && record.CatalogGeneration != cut.Catalog.Generation()) ||
+		if !catalogEvidenceOK ||
 			record.Cursor[4] != cut.Publication.ReplicaSetVersion ||
 			record.Cursor[5] > cut.Publication.Applied || record.Cursor[6] > cut.LeaderStatus.Term ||
 			record.Proof != replicaMoveActionProof(operation, record.IntentDigest, recordBaseDigest, record.Cursor) {
@@ -240,7 +248,7 @@ func ExecuteReplicatedMoveStep(
 		record.Cursor[3] == replicaMoveCursorExecuting &&
 		record.Cursor[5] <= cut.Publication.Applied &&
 		record.Cursor[6] <= cut.LeaderStatus.Term &&
-		record.CatalogGeneration == cut.Catalog.Generation() &&
+		catalogEvidenceOK &&
 		record.Cursor[4] == cut.Publication.ReplicaSetVersion &&
 		recordBaseOK && recordBaseDigest == replicaMovePlanBaseDigest(plan)
 	sameAction := sameReplicaMoveAction(record.Cursor, wanted)
@@ -302,7 +310,7 @@ func ExecuteReplicatedMoveStep(
 		refreshPlanned := record.State == gateway.ReplicatedOperationPlanned &&
 			record.Cursor[3] == replicaMoveCursorReady &&
 			(sameReplicaMoveAction(record.Cursor, wanted) || passiveReplicaMoveAction(ActionKind(record.Cursor[0])) || learnerObserved) &&
-			record.CatalogGeneration == cut.Catalog.Generation() &&
+			catalogEvidenceOK &&
 			(record.Cursor[4] == cut.Publication.ReplicaSetVersion || learnerObserved) &&
 			record.Cursor[5] <= cut.Publication.Applied && record.Cursor[6] <= cut.LeaderStatus.Term &&
 			record.Proof == replicaMoveActionProof(operation, record.IntentDigest, recordBaseDigest, record.Cursor)
@@ -449,18 +457,25 @@ func validReplicaMoveRecord(record gateway.ReplicatedOperationRecord, operation 
 	return record.Proof != ([32]byte{})
 }
 
-func replicaMoveRecordMatches(
+func replicaMoveCompletedRecordMatches(
 	record gateway.ReplicatedOperationRecord,
 	operation OperationID,
 	plan *Plan,
 	cut ReplicatedMoveCut,
-	action Action,
-	phase uint64,
 ) bool {
-	cursor, proof := replicaMoveActionWitness(
-		operation, record.IntentDigest, plan, cut, action, phase,
-	)
-	return record.Cursor == cursor && record.Proof == proof
+	base, ok := replicaMoveRecordBaseDigest(record, plan)
+	if !ok || base != replicaMovePlanBaseDigest(plan) || record.Proof != replicaMoveActionProof(
+		operation, record.IntentDigest, base, record.Cursor,
+	) {
+		return false
+	}
+	cursor := replicaMoveActionCursor(Action{Kind: ActionComplete}, replicaMoveCursorApplied, plan, cut)
+	// Completion is already durable. New writes or an election may advance the
+	// terminal group's observation before journal deletion is retried, while
+	// Reconcile still proves the exact final membership and retired source.
+	return sameReplicaMoveAction(record.Cursor, cursor) && record.Cursor[3] == cursor[3] &&
+		record.Cursor[4] == cursor[4] && record.Cursor[5] <= cursor[5] &&
+		record.Cursor[6] <= cursor[6] && record.Cursor[7] == cursor[7]
 }
 
 func replicaMoveRecordBaseDigest(

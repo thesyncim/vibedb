@@ -468,6 +468,8 @@ func testReplicatedHealthSnapshot(t testing.TB) (*gateway.Snapshot, rebalance.Fa
 		Distribution: "data", Shard: "all", Group: group, AllocationGeneration: 11,
 		RangeIdentity: [32]byte{2}, LineageDigest: [32]byte{3},
 		ForwardingRuleDigest: [32]byte{4},
+		LogicalSchemaDigest:  [32]byte{5},
+		RequestLedgerRanges:  []gateway.DurableRequestLedgerRangeDescriptor{{Identity: [32]byte{6}}},
 		Command: raftservice.CommandFence{ReplicaSetVersion: 7, OwnershipEpoch: 13,
 			RoutingVersion: 7, RouteGeneration: 9, ActivePolicyGeneration: 1,
 			ProtectionEpoch: 1, SchemaGeneration: 1, RelationManifestDigest: [32]byte{1}},

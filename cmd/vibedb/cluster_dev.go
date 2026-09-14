@@ -59,6 +59,7 @@ const (
 	devClusterPhysicalNodes6                                   = 6
 	devClusterOID                                              = "1.3.6.1.4.1.32473.1.1"
 	devReadyTimeout                                            = 30 * time.Second
+	devStartupWriterLockWait                                   = 2 * time.Second
 	devChildDiagnosticBytes                                    = 64 << 10
 	devChildLogDrainTimeout                                    = 250 * time.Millisecond
 	devChildReadyMarkerBytes                                   = 256
@@ -416,12 +417,13 @@ type devReplicaSplitTemplate struct {
 }
 
 type devPreparedRoute struct {
-	leaders          []distribution.EndpointID
-	replicas         []gateway.ReplicatedReplicaDescriptor
-	digest           [sha256.Size]byte
-	applyDigest      [sha256.Size]byte
-	schemaGeneration uint64
-	table            gateway.ReplicatedTableProfile
+	leaders             []distribution.EndpointID
+	replicas            []gateway.ReplicatedReplicaDescriptor
+	digest              [sha256.Size]byte
+	applyDigest         [sha256.Size]byte
+	logicalSchemaDigest replication.Digest
+	schemaGeneration    uint64
+	table               gateway.ReplicatedTableProfile
 }
 
 type devPrepareManifest struct {
@@ -1180,7 +1182,7 @@ func matchesExistingDevRoute(
 		route.Command.OwnershipEpoch != 1 ||
 		route.Command.SchemaGeneration != prepared.schemaGeneration ||
 		route.Command.RelationManifestDigest != prepared.digest ||
-		route.LogicalSchemaDigest != prepared.table.LogicalSchemaDigest ||
+		route.LogicalSchemaDigest != prepared.logicalSchemaDigest ||
 		route.Command.RoutingVersion != 1 || route.Command.RouteGeneration != 1 {
 		return false
 	}
@@ -1224,6 +1226,12 @@ func inspectDevPreparedRoute(
 		leaders:  make([]distribution.EndpointID, len(members)),
 		replicas: make([]gateway.ReplicatedReplicaDescriptor, len(members)),
 	}
+	// Cold supervisor validation opens the same SQL collections as serving
+	// startup. A killed io_uring owner can retain kernel file references after
+	// reaping, so share one bounded lock-admission deadline across this route.
+	// Only lock acquisition waits; schema validation and recovery run once.
+	opening := sqldriver.ReplicatedOpenOptions{WriterLockContext: context.Background(),
+		WriterLockDeadline: time.Now().Add(devStartupWriterLockWait)}
 	for index, member := range members {
 		prefix := fmt.Sprintf("%s-member-%d", role, index+1)
 		result.leaders[index] = distribution.EndpointID(prefix)
@@ -1257,7 +1265,7 @@ func inspectDevPreparedRoute(
 		}
 		profile, machineDigest, profileErr := readDevReplicatedTableProfile(
 			member, distributionName, shard, table, primaryKey, group,
-			requestLedgerIdentity, image,
+			requestLedgerIdentity, image, opening,
 		)
 		if profileErr != nil {
 			return devPreparedRoute{}, profileErr
@@ -1266,12 +1274,16 @@ func inspectDevPreparedRoute(
 			result.digest = machineDigest
 			result.applyDigest = image.ApplyProfileDigest
 			result.schemaGeneration = image.SchemaGeneration
+			// Private catalog and ledger tables still need their portable schema
+			// identity for durable group transitions and snapshot recovery.
+			result.logicalSchemaDigest = profile.LogicalSchemaDigest
 			if publishTable {
 				result.table = profile
 			}
 		} else if result.digest != machineDigest ||
 			result.applyDigest != image.ApplyProfileDigest ||
 			result.schemaGeneration != image.SchemaGeneration ||
+			result.logicalSchemaDigest != profile.LogicalSchemaDigest ||
 			publishTable && result.table != profile {
 			return devPreparedRoute{}, errDevCluster
 		}
@@ -1364,9 +1376,9 @@ func newDevCatalogSnapshot(
 		},
 		endpoints, 1, nil, nil,
 		[]gateway.ReplicatedShardDescriptor{
-			{Distribution: gateway.ReplicatedCatalogDistribution, Shard: gateway.ReplicatedCatalogShard, Group: catalogGroup, AllocationGeneration: 1, Command: command(catalogRoute), RangeIdentity: catalogRange, LineageDigest: catalogLineage, ForwardingRuleDigest: catalogForwarding, Replicas: catalogRoute.replicas},
-			{Distribution: devLedgerDistribution, Shard: devLedgerShard, Group: ledgerGroup, AllocationGeneration: 1, Command: command(ledgerRoute), RangeIdentity: ledgerRange, LineageDigest: ledgerLineage, ForwardingRuleDigest: ledgerForwarding, RequestLedgerRanges: []gateway.DurableRequestLedgerRangeDescriptor{{Identity: ledgerHomeIdentity}}, Replicas: ledgerRoute.replicas},
-			{Distribution: devDataDistribution, Shard: devDataShard, Group: dataGroup, AllocationGeneration: 1, Command: command(dataRoute), LogicalSchemaDigest: dataRoute.table.LogicalSchemaDigest, RangeIdentity: dataRange, LineageDigest: dataLineage, ForwardingRuleDigest: dataForwarding, Replicas: dataRoute.replicas},
+			{Distribution: gateway.ReplicatedCatalogDistribution, Shard: gateway.ReplicatedCatalogShard, Group: catalogGroup, AllocationGeneration: 1, Command: command(catalogRoute), LogicalSchemaDigest: catalogRoute.logicalSchemaDigest, RangeIdentity: catalogRange, LineageDigest: catalogLineage, ForwardingRuleDigest: catalogForwarding, Replicas: catalogRoute.replicas},
+			{Distribution: devLedgerDistribution, Shard: devLedgerShard, Group: ledgerGroup, AllocationGeneration: 1, Command: command(ledgerRoute), LogicalSchemaDigest: ledgerRoute.logicalSchemaDigest, RangeIdentity: ledgerRange, LineageDigest: ledgerLineage, ForwardingRuleDigest: ledgerForwarding, RequestLedgerRanges: []gateway.DurableRequestLedgerRangeDescriptor{{Identity: ledgerHomeIdentity}}, Replicas: ledgerRoute.replicas},
+			{Distribution: devDataDistribution, Shard: devDataShard, Group: dataGroup, AllocationGeneration: 1, Command: command(dataRoute), LogicalSchemaDigest: dataRoute.logicalSchemaDigest, RangeIdentity: dataRange, LineageDigest: dataLineage, ForwardingRuleDigest: dataForwarding, Replicas: dataRoute.replicas},
 		},
 		[]gateway.ReplicatedTableProfile{dataRoute.table},
 	)
@@ -1380,6 +1392,7 @@ func readDevReplicatedTableProfile(
 	group raftmember.GroupKey,
 	requestLedgerIdentity replication.Digest,
 	image sqldriver.ReplicatedSchemaCatalogImage,
+	opening ...sqldriver.ReplicatedOpenOptions,
 ) (gateway.ReplicatedTableProfile, [32]byte, error) {
 	root := devMemberRoot(member)
 	identityRaw, err := readDevFile(filepath.Join(root, "sql-identity.vibejson"), 1<<20)
@@ -1452,7 +1465,7 @@ func readDevReplicatedTableProfile(
 		return gateway.ReplicatedTableProfile{}, [32]byte{}, errDevCluster
 	}
 	database, err := sqldriver.OpenReplicatedShardStoreWithApply(
-		filepath.Join(root, "member.vdb"), identity, apply,
+		filepath.Join(root, "member.vdb"), identity, apply, opening...,
 	)
 	if err != nil {
 		return gateway.ReplicatedTableProfile{}, [32]byte{}, errors.Join(errDevCluster, err)

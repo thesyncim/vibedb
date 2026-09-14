@@ -1026,6 +1026,12 @@ type EnrollmentReceiptPublisher interface {
 	PublishEnrollmentReceipt(context.Context, GroupEnrollmentIntent) (GroupEnrollmentIntent, error)
 }
 
+// EnrollmentMoveAdmitter atomically links a prepared move to its enrolled
+// parent before the move becomes discoverable by an executor.
+type EnrollmentMoveAdmitter interface {
+	AdmitEnrollmentMove(context.Context, GroupEnrollmentIntent, uint64, ReplicatedOperationRecord, [][32]byte) error
+}
+
 // NodeProvisioner is implemented by nodecontrol.  It receives only the
 // catalog-derived intent and must return a proof with matching identities and
 // digests; caller-provided endpoint descriptors are never authority.

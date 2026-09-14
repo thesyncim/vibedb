@@ -1433,21 +1433,47 @@ func (authority *ReplicatedCatalogAuthority) submitOperations(
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}
+	mutations, err := authority.prepareOperationAdmission(ctx, ordered, expected, checkDirectory)
+	if err != nil {
+		return err
+	}
+	result, err := authority.session.MutateBatch(ctx, mutations)
+	if err != nil {
+		if authority.session.Status().Pending {
+			return errors.Join(ErrReplicatedCatalogPending, err)
+		}
+		return err
+	}
+	if result.Completion.ResultCode == replicatedstate.ResultIndexConflict {
+		return ErrReplicatedCatalogConflict
+	}
+	if result.Completion.ResultCode != replicatedstate.ResultApplied {
+		return ErrReplicatedCatalog
+	}
+	return nil
+}
+
+// prepareOperationAdmission builds a directory-fenced admission batch while
+// authority.mu is held. It is shared with enrollment handoff so the move and
+// its parent reference become visible at the same durable boundary.
+func (authority *ReplicatedCatalogAuthority) prepareOperationAdmission(
+	ctx context.Context, ordered []ReplicatedOperationRecord, expected [][32]byte, checkDirectory bool,
+) ([]NativeMutation, error) {
 	directoryResult, err := authority.readRaw(
 		ctx, replicatedOperationDirectoryKey[:], maxReplicatedOperationDirectoryBytes,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var ids [][32]byte
 	if directoryResult.Found {
 		ids, err = openReplicatedOperationDirectory(directoryResult.Value)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if checkDirectory && !slices.Equal(ids, expected) {
-		return ErrReplicatedCatalogConflict
+		return nil, ErrReplicatedCatalogConflict
 	}
 	for _, record := range ordered {
 		position := 0
@@ -1456,7 +1482,7 @@ func (authority *ReplicatedCatalogAuthority) submitOperations(
 		}
 		if position == len(ids) || ids[position] != record.ID {
 			if len(ids) == maxReplicatedOperations {
-				return ErrReplicatedCatalog
+				return nil, ErrReplicatedCatalog
 			}
 			ids = append(ids, [32]byte{})
 			copy(ids[position+1:], ids[position:])
@@ -1468,14 +1494,14 @@ func (authority *ReplicatedCatalogAuthority) submitOperations(
 	for index, record := range ordered {
 		authority.scratch, err = appendReplicatedOperation(authority.scratch, record)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		ends[index] = len(authority.scratch)
 	}
 	recordBytes := len(authority.scratch)
 	authority.scratch, err = appendReplicatedOperationDirectory(authority.scratch, ids)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	directoryBytes := authority.scratch[recordBytes:]
 	directoryMutation := NativeMutation{
@@ -1497,20 +1523,7 @@ func (authority *ReplicatedCatalogAuthority) submitOperations(
 		start = ends[index]
 	}
 	mutations = append(mutations, directoryMutation)
-	result, err := authority.session.MutateBatch(ctx, mutations)
-	if err != nil {
-		if authority.session.Status().Pending {
-			return errors.Join(ErrReplicatedCatalogPending, err)
-		}
-		return err
-	}
-	if result.Completion.ResultCode == replicatedstate.ResultIndexConflict {
-		return ErrReplicatedCatalogConflict
-	}
-	if result.Completion.ResultCode != replicatedstate.ResultApplied {
-		return ErrReplicatedCatalog
-	}
-	return nil
+	return mutations, nil
 }
 
 // PublishOperation creates revision one idempotently or CAS-replaces exactly

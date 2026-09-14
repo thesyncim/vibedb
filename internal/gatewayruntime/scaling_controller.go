@@ -127,6 +127,11 @@ func NewScalingController(options ScalingControllerOptions) (*ScalingController,
 	if _, ok := options.Writer.(gateway.EnrollmentReceiptPublisher); !ok {
 		return nil, fmt.Errorf("%w: enrollment receipt publisher is unavailable", ErrScalingControllerConfig)
 	}
+	if options.Moves != nil {
+		if _, ok := options.Writer.(gateway.EnrollmentMoveAdmitter); !ok {
+			return nil, fmt.Errorf("%w: atomic enrollment move admission is unavailable", ErrScalingControllerConfig)
+		}
+	}
 	if options.Interval <= 0 {
 		options.Interval = time.Second
 	}
@@ -586,7 +591,8 @@ func (controller *ScalingController) submitEnrollmentMove(ctx context.Context, r
 	if err != nil {
 		return false, err
 	}
-	if _, err = controller.moves.Submit(ctx, plan); err != nil {
+	move, operations, err := controller.moves.Prepare(ctx, plan)
+	if err != nil {
 		return false, err
 	}
 	current, err := controller.directory.ReadEnrollmentIntent(ctx, row.IntentID)
@@ -597,7 +603,11 @@ func (controller *ScalingController) submitEnrollmentMove(ctx context.Context, r
 	next.State = gateway.EnrollmentMoving
 	next.Revision++
 	next.MoveOperationID = [32]byte(plan.OperationID())
-	if err = controller.writer.PutEnrollmentIntent(ctx, next, current.Revision); err != nil {
+	admitter, ok := controller.writer.(gateway.EnrollmentMoveAdmitter)
+	if !ok {
+		return false, ErrScalingControllerConfig
+	}
+	if err = admitter.AdmitEnrollmentMove(ctx, next, current.Revision, move, operations); err != nil {
 		return false, err
 	}
 	return true, nil

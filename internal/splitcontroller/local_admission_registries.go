@@ -112,7 +112,21 @@ func NewLocalPlanAdmissionRegistries(
 	maxPreparedChildren int,
 	authority RuntimeTerminalAuthority,
 ) (*LocalPlanAdmissionRegistries, error) {
-	if node == (rafttransport.NodeID{}) || len(retained) == 0 ||
+	if len(retained) == 0 {
+		return nil, ErrPlanAdmission
+	}
+	return newLocalPlanAdmissionRegistries(node, retained, maxPreparedChildren, authority)
+}
+
+// NewEmptyLocalPlanAdmissionRegistries retains only physical-node bounds.
+// Hosted sources and certified children must be registered before any plan
+// can resolve a local runtime store.
+func NewEmptyLocalPlanAdmissionRegistries(node rafttransport.NodeID, maxPreparedChildren int, authority RuntimeTerminalAuthority) (*LocalPlanAdmissionRegistries, error) {
+	return newLocalPlanAdmissionRegistries(node, nil, maxPreparedChildren, authority)
+}
+
+func newLocalPlanAdmissionRegistries(node rafttransport.NodeID, retained []RetainedPlanRuntimeRegistry, maxPreparedChildren int, authority RuntimeTerminalAuthority) (*LocalPlanAdmissionRegistries, error) {
+	if node == (rafttransport.NodeID{}) ||
 		len(retained) > AbsoluteMaxLocalPlanAdmissionStores || maxPreparedChildren <= 0 ||
 		maxPreparedChildren > AbsoluteMaxShardActionGrants {
 		return nil, ErrPlanAdmission

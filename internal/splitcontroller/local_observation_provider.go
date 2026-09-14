@@ -117,6 +117,16 @@ func NewLocalPlanObservationProvider(
 	}, nil
 }
 
+// NewEmptyLocalPlanObservationProvider starts a bounded physical-node observer
+// without assigning it a group. Certified hosted groups are registered later;
+// requests remain unauthorized until that exact registration succeeds.
+func NewEmptyLocalPlanObservationProvider(owners LocalObservationOwner) (*LocalPlanObservationProvider, error) {
+	if owners == nil {
+		return nil, ErrPlanObservation
+	}
+	return &LocalPlanObservationProvider{owners: owners, limit: MaxPlanObservationEndpoints}, nil
+}
+
 // RegisterGroups publishes exact, already-admitted child identities to the
 // observation service. It is bounded by the same endpoint ceiling as the wire
 // protocol and is idempotent for byte-identical bindings. A different binding
@@ -181,13 +191,16 @@ func (provider *LocalPlanObservationProvider) RefreshRetainedGroup(group LocalOb
 	}
 	prior := provider.groups[index]
 	a, b := prior.Command, group.Command
-	if prior.Identity != group.Identity || prior.Registry != group.Registry || a.RelationManifestDigest != b.RelationManifestDigest ||
+	before, after := prior.Identity, group.Identity
+	before.RelationManifestDigest, after.RelationManifestDigest = [32]byte{}, [32]byte{}
+	if before != after || prior.Registry != group.Registry ||
+		a.RelationManifestDigest != b.RelationManifestDigest && b.SchemaGeneration <= a.SchemaGeneration ||
+		group.Identity.RelationManifestDigest != b.RelationManifestDigest ||
 		b.ReplicaSetVersion < a.ReplicaSetVersion || b.ActivePolicyGeneration < a.ActivePolicyGeneration || b.ProtectionEpoch < a.ProtectionEpoch ||
 		b.OwnershipEpoch < a.OwnershipEpoch || b.SchemaGeneration < a.SchemaGeneration || b.RoutingVersion < a.RoutingVersion || b.RouteGeneration < a.RouteGeneration {
 		return ErrPlanObservation
 	}
-	prior.Command = group.Command
-	provider.groups[index] = prior
+	provider.groups[index] = group
 	return nil
 }
 

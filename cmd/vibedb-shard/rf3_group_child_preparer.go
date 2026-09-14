@@ -16,13 +16,17 @@ import (
 // One process-wide admission bound covers all group-local templates. A
 // catalog operation may not be relabelled onto another group's disk roots.
 type rf3GroupChildPreparer struct {
-	mu        sync.Mutex
-	manifest  rf3Manifest
-	preparers []*rf3ChildPreparer
-	slots     [maxRF3SplitChildOperations]rf3GroupChildPrepareSlot
-	store     *rf3ChildAdmissionStore
-	inflight  [maxRF3SplitChildOperations]int
-	inventory *rf3AdoptedGroupInventory
+	mu                              sync.Mutex
+	manifest                        rf3Manifest
+	preparers                       []*rf3ChildPreparer
+	dynamic                         *rf3DynamicChildResources
+	local                           rafttransport.NodeID
+	peer, native, control, snapshot net.Addr
+	dynamicPreparers                [maxRF3SplitChildOperations][autosplit.MaxSplitChildren]*rf3ChildPreparer
+	slots                           [maxRF3SplitChildOperations]rf3GroupChildPrepareSlot
+	store                           *rf3ChildAdmissionStore
+	inflight                        [maxRF3SplitChildOperations]int
+	inventory                       *rf3AdoptedGroupInventory
 }
 
 type rf3GroupChildPrepareSlot struct {
@@ -35,13 +39,20 @@ type rf3GroupChildPrepareSlot struct {
 func newRF3GroupChildPreparer(
 	manifest rf3Manifest, local rafttransport.NodeID,
 	peer, native, control, snapshot net.Addr,
+	dynamic ...*rf3DynamicChildResources,
 ) (*rf3GroupChildPreparer, error) {
 	limit := manifest.SplitControl.operationLimit()
 	groups := manifest.groupBundles()
-	if limit <= 0 || limit > maxRF3SplitChildOperations || len(groups) == 0 || len(groups) > maxRF3ManifestGroups {
+	if limit <= 0 || limit > maxRF3SplitChildOperations || len(groups) > maxRF3ManifestGroups ||
+		len(dynamic) > 1 || len(groups) == 0 && (len(dynamic) == 0 || dynamic[0] == nil) ||
+		local == (rafttransport.NodeID{}) || peer == nil || native == nil || control == nil || snapshot == nil {
 		return nil, errRF3Serving
 	}
-	result := &rf3GroupChildPreparer{manifest: manifest, preparers: make([]*rf3ChildPreparer, len(groups))}
+	result := &rf3GroupChildPreparer{manifest: manifest, preparers: make([]*rf3ChildPreparer, len(groups)),
+		local: local, peer: peer, native: native, control: control, snapshot: snapshot}
+	if len(dynamic) == 1 {
+		result.dynamic = dynamic[0]
+	}
 	for index, group := range groups {
 		if group.ChildRegistry.MaxOperations > limit {
 			return nil, errRF3Serving
@@ -60,8 +71,32 @@ func newRF3GroupChildPreparer(
 	if err != nil {
 		return nil, err
 	}
-	for _, slot := range result.slots {
+	for slotIndex, slot := range result.slots {
 		if slot.operation == ([32]byte{}) {
+			continue
+		}
+		if slot.group == rf3DynamicTemplateSlot {
+			for child, certificate := range slot.certificates {
+				if certificate == ([32]byte{}) {
+					continue
+				}
+				resources, found, readErr := result.dynamic.ReadResources(slot.operation, uint8(child))
+				if readErr != nil || !found || resources.PreparationDigest != slot.requests[child] ||
+					resources.Preparation.ReplicaTarget().CertificateDigest != certificate {
+					_ = result.Close()
+					return nil, errors.Join(errRF3Serving, readErr)
+				}
+				prepared, prepareErr := result.newDynamicPreparer(resources.Registry)
+				if prepareErr != nil {
+					_ = result.Close()
+					return nil, prepareErr
+				}
+				if _, prepareErr = prepared.registry.acquire(slot.operation, uint8(child)); prepareErr != nil {
+					_ = result.Close()
+					return nil, prepareErr
+				}
+				result.dynamicPreparers[slotIndex][child] = prepared
+			}
 			continue
 		}
 		if slot.group < 0 || slot.group >= len(result.preparers) {
@@ -101,24 +136,54 @@ func (preparer *rf3GroupChildPreparer) PrepareChild(
 	}
 	target := preparation.ReplicaTarget()
 	operation := [32]byte(preparation.OperationID())
-	index, registry, ok := rf3SplitChildRegistryForTarget(preparer.manifest, operation, preparation.Child(), target)
-	if !ok {
-		return splitcontroller.ChildPrepareReceipt{}, splitcontroller.ErrChildPreparation
-	}
-	paths, err := registry.childPaths(operation, preparation.Child())
-	if err != nil || !preparer.preparers[index].matchesLocalTarget(target, paths) {
-		return splitcontroller.ChildPrepareReceipt{}, splitcontroller.ErrChildPreparation
-	}
 	request, err := splitcontroller.ChildPreparationDigest(preparation)
 	if err != nil {
 		return splitcontroller.ChildPrepareReceipt{}, err
+	}
+	index, registry, ok := rf3SplitChildRegistryForTarget(preparer.manifest, operation, preparation.Child(), target)
+	var selected *rf3ChildPreparer
+	if ok && preparer.dynamic == nil {
+		selected = preparer.preparers[index]
+	} else {
+		if target.Node != preparer.local || target.PeerAddress != preparer.peer.String() ||
+			target.NativeAddress != preparer.native.String() || target.ControlAddress != preparer.control.String() ||
+			target.SnapshotAddress != preparer.snapshot.String() {
+			return splitcontroller.ChildPrepareReceipt{}, splitcontroller.ErrChildPreparation
+		}
+		// Check the process-wide bound before publishing a durable dynamic
+		// template. Rejected excess operations must not leave new disk records.
+		if err := preparer.preflightDynamicAdmission(operation, int(preparation.Child()), target.CertificateDigest, request); err != nil {
+			return splitcontroller.ChildPrepareReceipt{}, err
+		}
+		resources, resolveErr := preparer.dynamic.PrepareResources(ctx, preparation)
+		if resolveErr != nil {
+			return splitcontroller.ChildPrepareReceipt{}, resolveErr
+		}
+		index, registry = resources.Slot, resources.Registry
+		if index != rf3DynamicTemplateSlot {
+			return splitcontroller.ChildPrepareReceipt{}, splitcontroller.ErrChildPreparation
+		}
+		var prepareErr error
+		selected, prepareErr = preparer.newDynamicPreparer(registry)
+		if prepareErr != nil {
+			return splitcontroller.ChildPrepareReceipt{}, prepareErr
+		}
+	}
+	paths, err := registry.childPaths(operation, preparation.Child())
+	if err != nil || !selected.matchesLocalTarget(target, paths) {
+		return splitcontroller.ChildPrepareReceipt{}, splitcontroller.ErrChildPreparation
 	}
 	previous := preparer.slots
 	slot, err := preparer.reserve(operation, index, int(preparation.Child()), target.CertificateDigest, request)
 	if err != nil {
 		return splitcontroller.ChildPrepareReceipt{}, err
 	}
-	_, registryErr := preparer.preparers[index].registry.acquire(operation, preparation.Child())
+	if index == rf3DynamicTemplateSlot {
+		if prior := preparer.dynamicPreparers[slot][preparation.Child()]; prior != nil {
+			selected = prior
+		}
+	}
+	_, registryErr := selected.registry.acquire(operation, preparation.Child())
 	if registryErr != nil {
 		if previous != preparer.slots {
 			if err := preparer.store.save(previous); err != nil {
@@ -138,26 +203,93 @@ func (preparer *rf3GroupChildPreparer) PrepareChild(
 			preparer.slots = previous
 		}
 		if previous[slot].operation == ([32]byte{}) {
-			preparer.preparers[index].registry.release(operation)
+			selected.registry.release(operation)
 		}
 		return splitcontroller.ChildPrepareReceipt{}, cause
+	}
+	if index == rf3DynamicTemplateSlot {
+		preparer.dynamicPreparers[slot][preparation.Child()] = selected
 	}
 	preparer.inflight[slot]++
 	preparer.mu.Unlock()
 	locked = false
 	defer func() { preparer.mu.Lock(); preparer.inflight[slot]--; preparer.mu.Unlock() }()
-	return preparer.preparers[index].PrepareChild(ctx, preparation)
+	return selected.PrepareChild(ctx, preparation)
+}
+
+func (preparer *rf3GroupChildPreparer) preflightDynamicAdmission(operation [32]byte, child int, certificate, request [32]byte) error {
+	if preparer.store == nil || preparer.store.failed || preparer.store.root == nil {
+		return errRF3Serving
+	}
+	if operation == ([32]byte{}) || child < 0 || child >= autosplit.MaxSplitChildren ||
+		certificate == ([32]byte{}) || request == ([32]byte{}) || preparer.dynamic == nil {
+		return splitcontroller.ErrChildPreparation
+	}
+	empty := -1
+	for index := 0; index < preparer.manifest.SplitControl.operationLimit(); index++ {
+		slot := preparer.slots[index]
+		if slot.operation == operation {
+			if slot.group != rf3DynamicTemplateSlot || slot.certificates[child] != ([32]byte{}) &&
+				(slot.certificates[child] != certificate || slot.requests[child] != request) {
+				return splitcontroller.ErrChildPreparation
+			}
+			empty = index
+			break
+		}
+		if empty < 0 && slot.operation == ([32]byte{}) {
+			empty = index
+		}
+	}
+	if empty < 0 {
+		return errRF3SplitChildRegistryBound
+	}
+	if preparer.slots[empty].operation == ([32]byte{}) {
+		if err := preparer.checkPriorPreparation(operation, rf3DynamicTemplateSlot); err != nil {
+			return err
+		}
+	}
+	next := preparer.slots
+	next[empty].operation, next[empty].group = operation, rf3DynamicTemplateSlot
+	next[empty].certificates[child], next[empty].requests[child] = certificate, request
+	return preparer.inventory.checkCapacity(next)
+}
+
+func (preparer *rf3GroupChildPreparer) newDynamicPreparer(template rf3ManifestSplitChildRegistry) (*rf3ChildPreparer, error) {
+	registry, err := newRF3SplitChildPathRegistry(template)
+	if err != nil {
+		return nil, err
+	}
+	return newRF3ChildPreparer(registry, preparer.local, preparer.peer, preparer.native, preparer.control, preparer.snapshot)
+}
+
+func (preparer *rf3GroupChildPreparer) registryForChild(group int, operation [32]byte, child uint8) (rf3ManifestSplitChildRegistry, error) {
+	if group == rf3DynamicTemplateSlot {
+		resources, found, err := preparer.dynamic.ReadResources(operation, child)
+		if err != nil || !found {
+			return rf3ManifestSplitChildRegistry{}, errors.Join(splitcontroller.ErrChildPreparation, err)
+		}
+		return resources.Registry, nil
+	}
+	groups := preparer.manifest.groupBundles()
+	if group < 0 || group >= len(groups) {
+		return rf3ManifestSplitChildRegistry{}, splitcontroller.ErrChildPreparation
+	}
+	return groups[group].ChildRegistry, nil
 }
 
 func (preparer *rf3GroupChildPreparer) reserve(operation [32]byte, group, child int, certificate, request [32]byte) (int, error) {
 	if preparer.store == nil || preparer.store.failed || preparer.store.root == nil {
 		return 0, errRF3Serving
 	}
-	if operation == ([32]byte{}) || group < 0 || group >= len(preparer.preparers) ||
+	if operation == ([32]byte{}) || group < 0 || group >= len(preparer.preparers) && (group != rf3DynamicTemplateSlot || preparer.dynamic == nil) ||
 		child < 0 || child >= autosplit.MaxSplitChildren || certificate == ([32]byte{}) || request == ([32]byte{}) {
 		return 0, splitcontroller.ErrChildPreparation
 	}
-	paths, err := preparer.manifest.groupBundles()[group].ChildRegistry.childPaths(operation, uint8(child))
+	registry, err := preparer.registryForChild(group, operation, uint8(child))
+	if err != nil {
+		return 0, err
+	}
+	paths, err := registry.childPaths(operation, uint8(child))
 	if err != nil {
 		return 0, err
 	}
@@ -266,6 +398,26 @@ func (preparer *rf3GroupChildPreparer) checkPriorPreparation(operation [32]byte,
 			}
 		}
 	}
+	for child := uint8(0); child < autosplit.MaxSplitChildren; child++ {
+		resources, found, err := preparer.dynamic.ReadResources(operation, child)
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		if group != rf3DynamicTemplateSlot {
+			return splitcontroller.ErrChildPreparation
+		}
+		paths, err := resources.Registry.childPaths(operation, child)
+		if err != nil {
+			return err
+		}
+		terminal, err := splitcontroller.HasBoundRuntimeTerminalWitness(paths.Root, splitcontroller.OperationID(operation))
+		if err != nil || terminal {
+			return errors.Join(splitcontroller.ErrRuntimeTerminal, err)
+		}
+	}
 	return nil
 }
 
@@ -276,7 +428,11 @@ func (preparer *rf3GroupChildPreparer) slotTerminal(slot rf3GroupChildPrepareSlo
 			continue
 		}
 		found = true
-		paths, err := preparer.manifest.groupBundles()[slot.group].ChildRegistry.childPaths(slot.operation, uint8(child))
+		registry, err := preparer.registryForChild(slot.group, slot.operation, uint8(child))
+		if err != nil {
+			return false, err
+		}
+		paths, err := registry.childPaths(slot.operation, uint8(child))
 		if err != nil {
 			return false, err
 		}
@@ -316,7 +472,16 @@ func (preparer *rf3GroupChildPreparer) recoverTerminal() error {
 	}
 	for index, slot := range preparer.slots {
 		if slot.operation != ([32]byte{}) && next[index].operation == ([32]byte{}) {
-			preparer.preparers[slot.group].registry.release(slot.operation)
+			if slot.group == rf3DynamicTemplateSlot {
+				for child, prepared := range preparer.dynamicPreparers[index] {
+					if prepared != nil {
+						prepared.registry.release(slot.operation)
+						preparer.dynamicPreparers[index][child] = nil
+					}
+				}
+			} else {
+				preparer.preparers[slot.group].registry.release(slot.operation)
+			}
 		}
 	}
 	preparer.slots = next

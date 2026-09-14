@@ -140,6 +140,7 @@ const (
 	requestOwnershipTransition
 	requestSchemaTransition
 	requestReplicaRetirement
+	requestValidateReplicaRetirement
 	requestInstallExecutionGroup
 	requestRemoveExecutionGroup
 	requestObserveSchemaTransition
@@ -179,34 +180,36 @@ type transferDelivery struct {
 }
 
 type ownerRequest struct {
-	kind                requestKind
-	group               raftmember.GroupKey
-	data                []byte
-	fence               ServingFence
-	inbound             rafttransport.Inbound
-	reply               chan ownerReply
-	bytes               int64
-	async               bool
-	delivery            *proposalDelivery
-	transferDelivery    *transferDelivery
-	authorize           ProposalAuthorization
-	authorityToken      raftauthority.AuthorityToken
-	authorityGeneration *ownerGeneration
-	authorityPermit     *servingFencePermit
-	membership          MembershipRequest
-	read                readRequest
-	targetMember        uint64
-	operation           [32]byte
-	step                [32]byte
-	sourceMember        uint64
-	install             ExecutionGroup
-	pointReadSlot       *pointReadViewSlot
-	publish             func()
-	registryChange      func(func(func()) error) error
-	database            *sqldriver.Database
-	apply               *sqldriver.ReplicatedApply
-	schemaSQL           sqldriver.ReplicatedShardStoreIdentity
-	schemaApply         sqldriver.ReplicatedApplyIdentity
+	kind                 requestKind
+	group                raftmember.GroupKey
+	data                 []byte
+	fence                ServingFence
+	inbound              rafttransport.Inbound
+	reply                chan ownerReply
+	bytes                int64
+	async                bool
+	delivery             *proposalDelivery
+	transferDelivery     *transferDelivery
+	authorize            ProposalAuthorization
+	authorityToken       raftauthority.AuthorityToken
+	authorityGeneration  *ownerGeneration
+	authorityPermit      *servingFencePermit
+	membership           MembershipRequest
+	read                 readRequest
+	targetMember         uint64
+	operation            [32]byte
+	step                 [32]byte
+	sourceMember         uint64
+	retirementProof      *ReplicaRetirementProof
+	retirementAuthorized bool
+	install              ExecutionGroup
+	pointReadSlot        *pointReadViewSlot
+	publish              func()
+	registryChange       func(func(func()) error) error
+	database             *sqldriver.Database
+	apply                *sqldriver.ReplicatedApply
+	schemaSQL            sqldriver.ReplicatedShardStoreIdentity
+	schemaApply          sqldriver.ReplicatedApplyIdentity
 }
 
 type ownerReply struct {
@@ -883,16 +886,21 @@ type ownershipProposal struct {
 
 // ReplicaRetirementRequest is the exact final local-source fence for one
 // replicated replica move. Operation and Step bind the call to its durable
-// controller journal; the Owner independently proves that SourceMember is no
-// longer a voter and no longer the current leader before closing the Runtime.
-// TargetMember remains the replacement identity bound by the grant. No caller
-// receives raw Host access.
+// controller journal. The Owner validates either its exact local final state
+// or an independently observed committed removal bound to the retained grant,
+// then closes only the exact installed source identity. No caller receives raw
+// Host access.
 type ReplicaRetirementRequest struct {
 	Operation    [32]byte
 	Step         [32]byte
 	Fence        ServingFence
 	SourceMember uint64
 	TargetMember uint64
+	Proof        *ReplicaRetirementProof
+	// Authorized is set only by the local source service after its exact
+	// proof-validated retirement fence has been durably journaled. It is not
+	// accepted from the network request.
+	Authorized bool
 }
 
 type MembershipKind uint8
@@ -1817,6 +1825,8 @@ func (owner *Owner) handle(request ownerRequest) error {
 		reply.err = owner.applySchemaTransition(request.fence, request.data)
 	case requestReplicaRetirement:
 		reply.err = owner.retireReplica(request)
+	case requestValidateReplicaRetirement:
+		reply.err = owner.validateReplicaRetirement(request)
 	case requestInstallExecutionGroup:
 		reply.err = request.registryChange(func(publish func()) error {
 			return owner.installExecutionGroupNow(request.install, request.pointReadSlot, publish)
@@ -2571,10 +2581,13 @@ func schemaTransitionMatchesFence(
 		from.RouteGeneration == fence.Command.RouteGeneration
 }
 
-func (owner *Owner) retireReplica(request ownerRequest) error {
+func (owner *Owner) validateReplicaRetirement(request ownerRequest) error {
 	member, found := owner.members[request.group]
 	if !found {
 		return multiraft.ErrGroupNotFound
+	}
+	if request.retirementProof != nil || request.retirementAuthorized {
+		return owner.validateProvenReplicaRetirement(request, member)
 	}
 	// Applied ownership/membership changes can precede the next observation
 	// RPC. Refresh from the same serialized durable cut used below; requiring
@@ -2615,10 +2628,18 @@ func (owner *Owner) retireReplica(request ownerRequest) error {
 	if pending := owner.pendingTransfers[request.group]; pending != nil {
 		return multiraft.ErrGroupBusy
 	}
+	return nil
+}
+
+func (owner *Owner) retireReplica(request ownerRequest) error {
+	if err := owner.validateReplicaRetirement(request); err != nil {
+		return err
+	}
+	member := owner.members[request.group]
 	owner.revokeServingFencePermit(request.group)
 	member.retiring = true
 	owner.storeOwnerMember(request.group, member)
-	if err = owner.host.Remove(request.group); err != nil {
+	if err := owner.host.Remove(request.group); err != nil {
 		return err
 	}
 	delete(owner.members, request.group)
@@ -4238,7 +4259,8 @@ func (owner *Owner) InstallSchemaGeneration(
 // RetireReplicaSource permanently fences the local member before removing its
 // quiescent Runtime through the sole Host owner. ErrGroupBusy is retryable; the
 // serving fence remains latched while the lane drains. ErrGroupNotFound is
-// settled only by a caller that already durably journaled this exact request.
+// settled only by a caller that durably journaled verified authorization for
+// this exact request before closing the source.
 func (owner *Owner) RetireReplicaSource(
 	ctx context.Context,
 	request ReplicaRetirementRequest,
@@ -4251,10 +4273,15 @@ func (owner *Owner) RetireReplicaSource(
 	if cause := context.Cause(ctx); cause != nil {
 		return cause
 	}
+	var proof *ReplicaRetirementProof
+	if request.Proof != nil {
+		copied := *request.Proof
+		proof = &copied
+	}
 	_, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestReplicaRetirement, group: request.Fence.Group, fence: request.Fence,
 		operation: request.Operation, step: request.Step, sourceMember: request.SourceMember,
-		targetMember: request.TargetMember, reply: make(chan ownerReply, 1),
+		targetMember: request.TargetMember, retirementProof: proof, retirementAuthorized: request.Authorized, reply: make(chan ownerReply, 1),
 	})
 	if err != nil && context.Cause(ctx) != nil {
 		return errors.Join(ErrOutcomeUnknown, err)

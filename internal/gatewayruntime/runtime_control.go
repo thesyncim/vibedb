@@ -65,6 +65,9 @@ func (runtime *Runtime) openReplicaControl() error {
 	if err := runtime.openCatalogDrainService(manifest, runtime.authority); err != nil {
 		return err
 	}
+	if err := runtime.openSourceTopologyService(manifest); err != nil {
+		return err
+	}
 	if config.ControlParticipantOnly {
 		runtime.clusterControlBackend, err = newScalingOperatorBackend(runtime.authority, runtime.authority, runtime.authority)
 		return err

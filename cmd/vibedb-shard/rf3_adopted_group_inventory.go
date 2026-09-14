@@ -37,6 +37,7 @@ type rf3AdoptedGroupInventory struct {
 	manifest       rf3Manifest
 	root           *os.Root
 	lock           *os.File
+	templates      *rf3DynamicChildTemplateCatalog
 	entries        [maxRF3ManifestGroups]rf3AdoptedGroupEntry
 	failed         bool
 	runtimes       map[raftmember.GroupKey]rf3AdoptedRuntime
@@ -71,6 +72,10 @@ func openRF3AdoptedGroupInventory(manifest rf3Manifest) (*rf3AdoptedGroupInvento
 		return fail(err)
 	}
 	if err = storeio.LockWriter(result.lock); err != nil {
+		return fail(err)
+	}
+	result.templates, err = openRF3DynamicChildTemplateCatalog(manifest)
+	if err != nil {
 		return fail(err)
 	}
 	info, err = root.Lstat("adopted-groups.state")
@@ -142,8 +147,15 @@ func (inventory *rf3AdoptedGroupInventory) validEntry(entry rf3AdoptedGroupEntry
 	if entry.operation == ([32]byte{}) {
 		return entry == (rf3AdoptedGroupEntry{})
 	}
-	return entry.receipt != ([32]byte{}) && entry.plan != ([32]byte{}) && entry.certificate != ([32]byte{}) &&
-		entry.cutover != ([32]byte{}) && entry.group < uint64(len(inventory.manifest.groupBundles())) && entry.child < autosplit.MaxSplitChildren
+	if entry.receipt == ([32]byte{}) || entry.plan == ([32]byte{}) || entry.certificate == ([32]byte{}) ||
+		entry.cutover == ([32]byte{}) || entry.child >= autosplit.MaxSplitChildren {
+		return false
+	}
+	if entry.group == rf3DynamicTemplateSlot {
+		resources, found, err := inventory.templates.Read(entry.operation, uint8(entry.child))
+		return err == nil && found && resources.Preparation.ReplicaTarget().CertificateDigest == entry.certificate
+	}
+	return entry.group < uint64(len(inventory.manifest.groupBundles()))
 }
 
 func (inventory *rf3AdoptedGroupInventory) liveCount() int {
@@ -216,8 +228,12 @@ func (inventory *rf3AdoptedGroupInventory) Close() error {
 	defer inventory.mu.Unlock()
 	inventory.nativeChildren.Store(nil)
 	var err error
+	if inventory.templates != nil {
+		err = inventory.templates.Close()
+		inventory.templates = nil
+	}
 	if inventory.lock != nil {
-		err = errors.Join(storeio.UnlockWriter(inventory.lock), inventory.lock.Close())
+		err = errors.Join(err, storeio.UnlockWriter(inventory.lock), inventory.lock.Close())
 		inventory.lock = nil
 	}
 	if inventory.root != nil {
@@ -240,7 +256,23 @@ func (inventory *rf3AdoptedGroupInventory) CheckpointChildAdoption(ctx context.C
 		return errRF3Serving
 	}
 	target := proof.ReplicaTarget()
-	index, registry, found := rf3SplitChildRegistryForTarget(inventory.manifest, [32]byte(proof.OperationID()), proof.Child(), target)
+	var index int
+	var registry rf3ManifestSplitChildRegistry
+	var found bool
+	// A committed dynamic template also supersedes an old startup template
+	// whose paths still match after the source roster or schema has changed.
+	if inventory.templates != nil {
+		resources, resolved, err := inventory.templates.Resolve([32]byte(proof.OperationID()), proof.Child(), target)
+		if err != nil {
+			return err
+		}
+		if resolved {
+			index, registry, found = resources.Slot, resources.Registry, true
+		}
+	}
+	if !found {
+		index, registry, found = rf3SplitChildRegistryForTarget(inventory.manifest, [32]byte(proof.OperationID()), proof.Child(), target)
+	}
 	if !found || proof.PlanDigest() == ([32]byte{}) || proof.CutoverDigest() == ([32]byte{}) {
 		return errRF3Serving
 	}
@@ -253,8 +285,15 @@ func (inventory *rf3AdoptedGroupInventory) CheckpointChildAdoption(ctx context.C
 		receipt.Target.CertificateDigest != target.CertificateDigest || !receipt.Target.SQL.Equal(target.SQL) {
 		return errors.Join(errRF3Serving, err)
 	}
+	if index == rf3DynamicTemplateSlot {
+		resources, found, err := inventory.templates.Resolve([32]byte(proof.OperationID()), proof.Child(), target)
+		if err != nil || !found || resources.PreparationDigest != receipt.RequestDigest {
+			return errors.Join(errRF3Serving, err)
+		}
+	}
 	identity := prepared.Runtime.Identity()
-	if identity.Group != groupFromBinding(target.SQL.Binding) || identity.MemberID != target.Member || identity.StoreID != target.StoreID {
+	if identity.Group != groupFromBinding(target.SQL.Binding) || identity.MemberID != target.Member || identity.StoreID != target.StoreID ||
+		target.NodeIncarnation != 0 && identity.NodeIncarnation != target.NodeIncarnation {
 		return errRF3Serving
 	}
 	entry := rf3AdoptedGroupEntry{operation: [32]byte(proof.OperationID()), receipt: receipt.ReceiptDigest,

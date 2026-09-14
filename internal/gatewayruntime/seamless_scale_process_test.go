@@ -941,6 +941,8 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 	}
 	calibratedRate := calibrateSeamlessScaleRate(t, workload, ctx)
 	baseline := workload.WindowSet(ctx, seamlessScalePhaseBaseline, 5, seamlessScaleWindowDuration, calibratedRate)
+	t.Logf("scale baseline complete: rate=%d scheduled=%d completed=%d errors=%d missed=%d p99=%s", calibratedRate,
+		baseline.Scheduled, baseline.Completed, baseline.Errors, baseline.Missed, time.Duration(baseline.P99NS))
 
 	// The actor starts before the first enrollment and runs until the third
 	// retired process has stopped. Every retained during sample is assigned by
@@ -1013,6 +1015,7 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 			t.Fatalf("cycle %d join did not complete: %v", cycle+1, err)
 		}
 		physicalPeak = maxInt(physicalPeak, countSeamlessScaleServingNodes(joinFinal))
+		t.Logf("scale cycle %d join complete: operation=%s", cycle+1, join.OperationID)
 
 		rebalanceRequestID := mustSeamlessScaleRequestID(t)
 		rebalance := runSeamlessScaleCLI(t, ctx, vibedbBinary, "rebalance", profilePath,
@@ -1059,6 +1062,8 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 		aggregateBudget.PeakActive = maxUint64(aggregateBudget.PeakActive, uint64(pacingResponse.Budget.PeakActive))
 		aggregateBudget.MaxActive = maxUint64(aggregateBudget.MaxActive, uint64(pacingResponse.Budget.MaxActive))
 		physicalPeak = maxInt(physicalPeak, countSeamlessScaleServingNodes(pacingResponse))
+		t.Logf("scale cycle %d migration pacing observed: operation=%s throttled_calls=%d throttled_bytes=%d", cycle+1,
+			rebalance.OperationID, pacingResponse.Budget.ThrottledCalls, pacingResponse.Budget.ThrottledBytes)
 
 		if err := targetProcesses[cycle].Restart(ctx); err != nil {
 			t.Fatalf("cycle %d restart target during migration: %v", cycle+1, err)
@@ -1093,6 +1098,7 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 		applicationMoved = maxUint32(applicationMoved, rebalanceFinal.ApplicationGroupsMoved)
 		internalMoved = maxUint32(internalMoved, rebalanceFinal.InternalGroupsMoved)
 		physicalPeak = maxInt(physicalPeak, countSeamlessScaleServingNodes(rebalanceFinal))
+		t.Logf("scale cycle %d rebalance complete after restart: operation=%s", cycle+1, rebalance.OperationID)
 
 		retireID := target.NodeID
 		if cycle == 0 {
@@ -1181,6 +1187,7 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 		}
 		physicalPeak = maxInt(physicalPeak, countSeamlessScaleServingNodes(finalNodesResponse))
 		completedCycles++
+		t.Logf("scale cycle %d decommission complete: node=%s operation=%s", cycle+1, retireIDText, retire.OperationID)
 	}
 
 	close(duringStop)

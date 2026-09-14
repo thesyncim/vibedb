@@ -453,6 +453,7 @@ func (runtime *ShardActionRuntimeDispatcher) ExecuteWitnessedAction(
 	if !ok {
 		return ErrRemoteExecution
 	}
+	ctx = context.WithValue(ctx, sourceTopologyStepKey{}, SourceTopologyStep{Operation: operation, PlanDigest: request.PlanDigest, Step: request.Step, ExecutionRevision: payload.ExecutionRevision})
 	if err := executor.ExecuteAuthorizedSplitAction(ctx, grant.Plan, observed, action); err != nil {
 		return fmt.Errorf("splitcontroller: execute authorized action %d: %w", action.Kind, err)
 	}

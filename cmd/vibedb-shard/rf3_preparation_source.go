@@ -131,14 +131,24 @@ func newRF3PreparationSource(schemas *rf3SchemaActivator, registry *rafttranspor
 		// template at ChildRegistry.StaticBootstrapPath is a different
 		// identity (vibedb-rf3-split-child-bootstrap) and cannot
 		// authenticate a live snapshot artifact.
-		bootstrap, err := readRF3BoundedFile(
-			filepath.Join(state.manifest.Route.MemberRoot, "node-bootstrap.pb"),
-			nodecontrol.MaxSourceBootstrapBytes,
-		)
+		var bootstrap []byte
+		if state.preparation != nil {
+			// The certified enrollment retains the original Raft bootstrap
+			// envelope. An adopted replica has no static node-bootstrap file.
+			bootstrap = state.preparation.SourceBootstrap
+		} else {
+			bootstrap, err = readRF3BoundedFile(
+				filepath.Join(state.manifest.Route.MemberRoot, "node-bootstrap.pb"),
+				nodecontrol.MaxSourceBootstrapBytes,
+			)
+		}
 		if err != nil {
 			return nil, err
 		}
-		apply := state.applyID
+		apply, err := state.apply.Identity()
+		if err != nil {
+			return nil, err
+		}
 		wal := template.WAL.Options
 		indexes := make([]nodecontrol.PreparationGlobalIndex, len(template.GlobalIndexes))
 		for i, index := range template.GlobalIndexes {

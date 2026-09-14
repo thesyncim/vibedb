@@ -71,7 +71,7 @@ func recoverOwnedReplicaMove(intent persistedPlanIntent, request MoveRequest, cu
 	initial.Learners = removeMember(initial.Learners, request.TargetMember)
 	plan, err := newPlan(request, intent.SourceGeneration, source, target, initial, validationIndex)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("rebuild owned source membership at applied %d: %w", validationIndex, err)
 	}
 	// The caller restores failure authorization and verifies the final operation
 	// hash before binding this same persisted transition through its strict API.
@@ -79,11 +79,11 @@ func recoverOwnedReplicaMove(intent persistedPlanIntent, request MoveRequest, cu
 	if certificate != nil {
 		plan, err = bindCertificate(plan, *certificate)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("bind owned snapshot for group %x at route generation %d: %w", request.Group.GroupID, certificate.Manifest.State.Binding.RouteGeneration, err)
 		}
 	}
 	if _, err := plan.membershipStage(publication.ConfState); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("owned membership at applied %d replica set %d has voters %v learners %v; retiring %d donor %d target %d: %w", publication.Applied, publication.ReplicaSetVersion, publication.ConfState.GetVoters(), publication.ConfState.GetLearners(), request.RetiringMember, request.SnapshotSourceMember, request.TargetMember, err)
 	}
 	return plan, nil
 }

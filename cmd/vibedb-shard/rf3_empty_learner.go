@@ -42,17 +42,18 @@ import (
 const rf3DynamicRepositoryMaxBytes = uint64(1) << 50
 
 type rf3DynamicLearnerFactory struct {
-	mu       sync.Mutex
-	runtime  *rf3EmptyNodeRuntime
-	owner    *rf3NodeOwner
-	root     string
-	profile  *rafttransport.PeerTLS
-	policy   *serviceauthz.Policy
-	gate     *serviceauthz.Gate
-	budget   *migrationbudget.Budget
-	deadline rafttransport.DeadlineFunc
-	services map[raftmember.GroupKey]*rf3DynamicLearnerService
-	closed   bool
+	mu          sync.Mutex
+	runtime     *rf3EmptyNodeRuntime
+	owner       *rf3NodeOwner
+	root        string
+	profile     *rafttransport.PeerTLS
+	incarnation uint64
+	policy      *serviceauthz.Policy
+	gate        *serviceauthz.Gate
+	budget      *migrationbudget.Budget
+	deadline    rafttransport.DeadlineFunc
+	services    map[raftmember.GroupKey]*rf3DynamicLearnerService
+	closed      bool
 }
 
 type rf3DynamicLearnerService struct {
@@ -70,13 +71,13 @@ func newRF3DynamicLearnerFactory(
 	profile *rafttransport.PeerTLS, policy *serviceauthz.Policy, gate *serviceauthz.Gate,
 	budget *migrationbudget.Budget, deadline rafttransport.DeadlineFunc,
 ) (*rf3DynamicLearnerFactory, error) {
-	if runtime == nil || owner == nil || manifest.ReplicaControl.SourceDataRoot == "" ||
+	if runtime == nil || runtime.actionJournal == nil || owner == nil || manifest.ReplicaControl.SourceDataRoot == "" ||
 		profile == nil || policy == nil || gate == nil || budget == nil || deadline == nil {
 		return nil, nodecontrol.ErrControl
 	}
 	return &rf3DynamicLearnerFactory{
 		runtime: runtime, owner: owner, root: manifest.ReplicaControl.SourceDataRoot,
-		profile: profile, policy: policy, gate: gate, budget: budget, deadline: deadline,
+		profile: profile, incarnation: manifest.NodeIncarnation, policy: policy, gate: gate, budget: budget, deadline: deadline,
 		services: make(map[raftmember.GroupKey]*rf3DynamicLearnerService),
 	}, nil
 }
@@ -115,6 +116,11 @@ func (factory *rf3DynamicLearnerFactory) Register(
 		descriptor.Group != intent.Group || descriptor.TargetMember != intent.Target.Member ||
 		descriptor.TargetStore != intent.Target.StoreID || descriptor.TargetIncarnation != intent.Target.NodeIncarnation {
 		return nodecontrol.ErrInvalidProof
+	}
+	if retired, err := factory.sourceRetired(ctx, intent); err != nil {
+		return err
+	} else if retired {
+		return nodecontrol.ErrConflict
 	}
 	factory.mu.Lock()
 	if factory.closed {
@@ -234,6 +240,11 @@ func (factory *rf3DynamicLearnerFactory) recoverEnrollment(ctx context.Context, 
 	intent := cut.Intent
 	if !intent.Valid() || intent.IntentID != intentID {
 		return nodecontrol.ErrStale
+	}
+	if retired, err := factory.sourceRetired(ctx, intent); err != nil {
+		return err
+	} else if retired {
+		return nil
 	}
 	if intent.State < gateway.EnrollmentEnrolled || intent.State > gateway.EnrollmentComplete || intent.Proof == nil {
 		return nil
@@ -466,6 +477,11 @@ func (installer *rf3DynamicLearnerInstaller) RecoverInstalled(
 }
 
 func (installer *rf3DynamicLearnerInstaller) recoverInstalledLocked(ctx context.Context, descriptor snapshottransfer.Descriptor) error {
+	if retired, err := installer.factory.sourceRetired(ctx, installer.intent); err != nil {
+		return err
+	} else if retired {
+		return nodecontrol.ErrConflict
+	}
 	if installer.installed != nil {
 		if installer.installed.Group == descriptor.Group && installer.installed.MemberID == descriptor.TargetMember &&
 			installer.installed.StoreID == descriptor.TargetStore && installer.installed.NodeIncarnation == descriptor.TargetIncarnation {
@@ -510,11 +526,14 @@ func (installer *rf3DynamicLearnerInstaller) recoverInstalledLocked(ctx context.
 		_ = runtime.Close()
 		return err
 	}
+	rollbackServices, err := installer.registerDonorServices(actual, apply)
+	if err != nil {
+		return errors.Join(err, runtime.Close())
+	}
 	if err = installer.factory.runtime.RegisterExecutionGroupWithGrant(roster, raftservice.ExecutionGroup{
 		Runtime: runtime, Identity: actual, Command: command, Read: apply, Recovery: apply,
 	}, grant); err != nil {
-		_ = runtime.Close()
-		return err
+		return errors.Join(err, rollbackServices(), runtime.Close())
 	}
 	installer.installed = &actual
 	return nil
@@ -627,6 +646,11 @@ func (installer *rf3DynamicLearnerInstaller) InstallPublishedLearner(
 		descriptor.TargetStore != installer.intent.Target.StoreID || descriptor.TargetIncarnation != installer.intent.Target.NodeIncarnation {
 		return raftmember.RuntimeIdentity{}, nodecontrol.ErrStale
 	}
+	if retired, err := installer.factory.sourceRetired(ctx, installer.intent); err != nil {
+		return raftmember.RuntimeIdentity{}, err
+	} else if retired {
+		return raftmember.RuntimeIdentity{}, nodecontrol.ErrConflict
+	}
 	if installer.installed != nil {
 		return *installer.installed, nil
 	}
@@ -729,12 +753,15 @@ func (installer *rf3DynamicLearnerInstaller) installNode(
 	if err != nil {
 		return raftmember.RuntimeIdentity{}, errors.Join(err, runtime.Close())
 	}
+	rollbackServices, err := installer.registerDonorServices(identity, apply)
+	if err != nil {
+		return raftmember.RuntimeIdentity{}, errors.Join(err, runtime.Close())
+	}
 	if err = installer.factory.runtime.RegisterExecutionGroupWithGrant(roster, raftservice.ExecutionGroup{
 		Runtime: runtime, Identity: identity, Command: installer.intent.ExpectedCommand,
 		Read: apply, Recovery: apply,
 	}, grant); err != nil {
-		_ = runtime.Close()
-		return raftmember.RuntimeIdentity{}, err
+		return raftmember.RuntimeIdentity{}, errors.Join(err, rollbackServices(), runtime.Close())
 	}
 	return identity, nil
 }
@@ -831,16 +858,17 @@ func (installer *rf3DynamicLearnerInstaller) enrollRecoveryPeers(ctx context.Con
 		return nodecontrol.ErrStale
 	})
 	for _, node := range cut.CurrentNodes {
-		if node.NodeID == registry.LocalNode() {
-			continue
-		}
 		intent := rafttransport.EnrollmentIntent{
 			Domain: installer.factory.profile.LocalIdentity().TrustDomain,
 			Digest: rf3EmptyNodePeerEnrollmentDigest(cut.DirectoryCutDigest, node.NodeID),
 			Peer: rafttransport.PhysicalPeer{NodeID: node.NodeID, TrustDomain: installer.factory.profile.LocalIdentity().TrustDomain,
 				Incarnation: node.Incarnation, Revision: node.Revision, ServiceKeyDigest: node.ServiceKeyDigest,
 				Endpoint: node.DataAddress, State: rafttransport.PeerEnrolled}, DirectoryRevision: registry.PeerDirectoryRevision()}
-		if err := rf3EnrollPhysicalPeer(ctx, enroller, registry, intent, verifier); err != nil {
+		if node.NodeID == registry.LocalNode() {
+			if err := registry.BindLocalPeerContext(ctx, intent, installer.factory.profile, installer.factory.incarnation, verifier); err != nil {
+				return err
+			}
+		} else if err := rf3EnrollPhysicalPeer(ctx, enroller, registry, intent, verifier); err != nil {
 			return err
 		}
 	}
@@ -895,6 +923,13 @@ func (installer *rf3DynamicLearnerInstaller) enrollCertifiedRosterPeers(ctx cont
 			}
 		}
 		return false
+	}
+	// A current recovery directory supersedes the original target revision.
+	// Fresh installation binds only the source-certified target identity.
+	if installer.recovery == nil {
+		if err := installer.bindCertifiedLocalPeer(ctx); err != nil {
+			return err
+		}
 	}
 	return rf3EnrollCertifiedRosterPeersFiltered(
 		ctx,

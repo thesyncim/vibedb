@@ -34,7 +34,7 @@ var (
 const (
 	requestHeaderBytes    = 328
 	ResponseBytes         = 96
-	MaxRequestBytes       = requestHeaderBytes + replicatedstate.MaxOwnershipTransitionBytes
+	MaxRequestBytes       = requestHeaderBytes + max(replicatedstate.MaxOwnershipTransitionBytes, MaxRetirementLocatorBytes)
 	AbsoluteMaxConcurrent = 256
 )
 
@@ -57,6 +57,9 @@ type State uint8
 const (
 	Running State = iota + 1
 	Complete
+	// RetirementAuthorized is a durable local tombstone admitted only after
+	// independent committed-removal proof and serialized local validation.
+	RetirementAuthorized
 )
 
 type Request struct {
@@ -91,12 +94,14 @@ type Owner interface {
 type AuthorizeFunc func(rafttransport.PeerIdentity, Request) bool
 
 type Options struct {
-	Journal       Journal
-	Owner         Owner
-	Authorize     AuthorizeFunc
-	ReadDeadline  rafttransport.DeadlineFunc
-	WriteDeadline rafttransport.DeadlineFunc
-	MaxConcurrent int
+	Journal         Journal
+	Owner           Owner
+	Authorize       AuthorizeFunc
+	ReadDeadline    rafttransport.DeadlineFunc
+	WriteDeadline   rafttransport.DeadlineFunc
+	MaxConcurrent   int
+	RetirementProof func(context.Context, Request) (raftservice.ReplicaRetirementProof, error)
+	Retired         func(context.Context, Request) error
 }
 
 type Service struct {
@@ -107,6 +112,8 @@ type Service struct {
 	slots                         chan struct{}
 	stripes                       []sync.Mutex
 	requests, completions, faults atomic.Uint64
+	retirementProof               func(context.Context, Request) (raftservice.ReplicaRetirementProof, error)
+	retired                       func(context.Context, Request) error
 }
 
 type Metrics struct{ Requests, Completions, Faults uint64 }
@@ -125,6 +132,7 @@ func NewService(options Options) (*Service, error) {
 		return nil, ErrControl
 	}
 	return &Service{journal: options.Journal, owner: options.Owner, authorize: options.Authorize,
+		retirementProof: options.RetirementProof, retired: options.Retired,
 		readDeadline: options.ReadDeadline, writeDeadline: options.WriteDeadline,
 		slots: make(chan struct{}, options.MaxConcurrent), stripes: make([]sync.Mutex, options.MaxConcurrent)}, nil
 }
@@ -215,13 +223,49 @@ func (service *Service) Execute(ctx context.Context, request Request) (Record, e
 			}
 		}
 	case SourceRetirement:
-		err = service.owner.RetireReplicaSource(ctx, raftservice.ReplicaRetirementRequest{
+		retirement := raftservice.ReplicaRetirementRequest{
 			Operation: request.Operation, Step: request.Step, Fence: request.Fence,
-			SourceMember: request.SourceMember, TargetMember: request.TargetMember})
-		// The exact Running journal was durable before the call. A missing group
-		// therefore proves this same retirement crossed the local close boundary.
-		if err != nil && !errors.Is(err, multiraft.ErrGroupNotFound) {
+			SourceMember: request.SourceMember, TargetMember: request.TargetMember,
+			Authorized: record.State == RetirementAuthorized}
+		if !retirement.Authorized {
+			validator, ok := service.owner.(interface {
+				ValidateReplicaRetirement(context.Context, raftservice.ReplicaRetirementRequest) error
+			})
+			if !ok {
+				return Record{}, ErrControl
+			}
+			if len(request.Command) != 0 {
+				if service.retirementProof == nil {
+					return Record{}, ErrControl
+				}
+				proof, proofErr := service.retirementProof(ctx, request)
+				if proofErr != nil {
+					return Record{}, proofErr
+				}
+				retirement.Proof = &proof
+			}
+			if err = validator.ValidateReplicaRetirement(ctx, retirement); err != nil {
+				return Record{}, err
+			}
+			authorized := record
+			authorized.Revision++
+			authorized.State = RetirementAuthorized
+			if err = service.publishExact(ctx, record.Revision, authorized); err != nil {
+				return Record{}, err
+			}
+			record = authorized
+			retirement.Authorized = true
+		}
+		err = service.owner.RetireReplicaSource(ctx, retirement)
+		// Only the validated durable tombstone proves an absent source is safe.
+		// A Running record alone can precede rejection of an invalid request.
+		if err != nil && !(retirement.Authorized && errors.Is(err, multiraft.ErrGroupNotFound)) {
 			return Record{}, err
+		}
+		if service.retired != nil {
+			if err = service.retired(ctx, request); err != nil {
+				return Record{}, err
+			}
 		}
 	default:
 		return Record{}, ErrControl
@@ -323,7 +367,8 @@ func validRequest(request Request) bool {
 			transition.TargetMember == request.TargetMember &&
 			transitionMatchesFence(transition, request.Fence)
 	case SourceRetirement:
-		return len(request.Command) == 0 && request.Fence.MemberID == request.SourceMember
+		_, err := OpenRetirementLocators(request.Command)
+		return (len(request.Command) == 0 || err == nil) && request.Fence.MemberID == request.SourceMember
 	default:
 		return false
 	}
@@ -355,7 +400,8 @@ func transitionMatchesFence(
 }
 
 func validRecord(record Record) bool {
-	return record.Revision != 0 && record.State >= Running && record.State <= Complete && validRequest(record.Request)
+	return record.Revision != 0 && (record.State == Running || record.State == Complete ||
+		record.State == RetirementAuthorized && record.Request.Kind == SourceRetirement && record.Revision >= 2) && validRequest(record.Request)
 }
 func cloneRequest(request Request) Request {
 	request.Command = append([]byte(nil), request.Command...)
@@ -364,7 +410,7 @@ func cloneRequest(request Request) Request {
 func equalRequest(a, b Request) bool {
 	return a.Operation == b.Operation && a.Step == b.Step && a.Kind == b.Kind &&
 		a.Fence == b.Fence && a.SourceMember == b.SourceMember &&
-		a.TargetMember == b.TargetMember && bytes.Equal(a.Command, b.Command)
+		a.TargetMember == b.TargetMember && (a.Kind == SourceRetirement || bytes.Equal(a.Command, b.Command))
 }
 func equalRecord(a, b Record) bool {
 	return a.Revision == b.Revision && a.State == b.State && equalRequest(a.Request, b.Request)
@@ -440,7 +486,7 @@ func ReadRequest(reader io.Reader) (Request, error) {
 		return Request{}, err
 	}
 	size := int(binary.LittleEndian.Uint32(header[320:324]))
-	if size < 0 || size > replicatedstate.MaxOwnershipTransitionBytes {
+	if size < 0 || size > MaxRequestBytes-requestHeaderBytes {
 		return Request{}, ErrBound
 	}
 	raw := make([]byte, requestHeaderBytes+size)
@@ -549,4 +595,10 @@ func replicaActionJournalKey(operation [32]byte, kind Kind) [32]byte {
 	copy(input[:32], operation[:])
 	input[32] = byte(kind)
 	return sha256.Sum256(input[:])
+}
+
+// SameRequestAuthority excludes retirement discovery addresses from identity.
+// Addresses are independently authenticated routing hints, refreshed on retry.
+func SameRequestAuthority(a, b Request) bool {
+	return validRequest(a) && validRequest(b) && equalRequest(a, b)
 }

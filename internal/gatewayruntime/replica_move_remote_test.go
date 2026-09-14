@@ -279,6 +279,7 @@ func TestGatewayReplicaRemoteActionsBuildExactOwnershipAndRetirementFences(t *te
 	if err = remote.RetireReplicaSource(t.Context(), rebalanceexec.SourceRetirementRequest{
 		Operation: [32]byte(operation), Step: step, Group: route.Serving.Group,
 		AllocationGeneration: 5, Command: commandFence, Source: source, Target: target, Term: 22,
+		Survivors: []gateway.ReplicatedEndpoint{{Member: 4, ControlAddress: "127.0.0.1:14004"}, {Member: 2, ControlAddress: "127.0.0.1:14002"}, {Member: 3, ControlAddress: "127.0.0.1:14003"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -286,6 +287,11 @@ func TestGatewayReplicaRemoteActionsBuildExactOwnershipAndRetirementFences(t *te
 		actions.request.Fence.Command != commandFence || actions.request.Fence.Term != 22 {
 		t.Fatalf("retirement request=%+v node=%x", actions.request, actions.node)
 	}
+	locators, locatorErr := replicaaction.OpenRetirementLocators(actions.request.Command)
+	if locatorErr != nil || len(locators) != 3 || locators[0].Member != 2 || locators[1].Member != 3 || locators[2].Member != 4 || locators[2].Address != "127.0.0.1:14004" {
+		t.Fatalf("retirement discovery locators=%+v err=%v", locators, locatorErr)
+	}
+
 }
 
 func TestGatewayShardControlOpenerBoundsAndReleasesAuthenticatedStreams(t *testing.T) {

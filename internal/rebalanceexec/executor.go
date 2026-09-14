@@ -131,6 +131,7 @@ type CatalogDrainCertifier interface {
 }
 
 type SourceRetirementRequest struct {
+	Survivors            []gateway.ReplicatedEndpoint
 	Operation            [32]byte
 	Step                 [32]byte
 	Group                raftmember.GroupKey
@@ -571,6 +572,7 @@ func (executor *Executor) executeRetirement(
 			AllocationGeneration: cut.Membership.Serving.AllocationGeneration,
 			Command:              cut.Command,
 			Source:               cut.Retiring, Target: cut.Target, Term: execution.LeaderTerm,
+			Survivors: cut.Membership.Serving.Replicas,
 		})
 		if err != nil {
 			return err
