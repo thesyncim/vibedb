@@ -3,12 +3,22 @@ package raftservice
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 )
+
+// retirementFenceFailure keeps the public stale-fence sentinel intact while
+// retaining the first exact local mismatch in control-service diagnostics.
+// A retirement proof is security-sensitive, so callers must continue to
+// reject every mismatch; the context is only evidence for operators and
+// tests, never an authorization decision.
+func retirementFenceFailure(format string, args ...any) error {
+	return fmt.Errorf("%w: "+format, append([]any{ErrServingFence}, args...)...)
+}
 
 // ReplicaRetirementProof is detached evidence fetched independently by the
 // source control service from a mutually authenticated surviving member. No
@@ -55,44 +65,86 @@ func NewReplicaRetirementProof(request ReplicaRetirementRequest, grant membershi
 
 func (owner *Owner) validateProvenReplicaRetirement(request ownerRequest, member ownerMember) error {
 	fence := request.fence
-	if request.operation == ([32]byte{}) || request.step == ([32]byte{}) ||
-		request.sourceMember == 0 || request.targetMember == 0 || request.sourceMember == request.targetMember ||
-		member.identity.Group != fence.Group || member.identity.AllocationGeneration != fence.AllocationGeneration ||
-		member.identity.MemberID != request.sourceMember || fence.MemberID != request.sourceMember ||
-		member.identity.StoreID != fence.StoreID || member.identity.NodeIncarnation != fence.NodeIncarnation ||
-		(member.command.SchemaGeneration == fence.Command.SchemaGeneration && member.command.RelationManifestDigest != fence.Command.RelationManifestDigest) || !fence.Command.Valid() {
-		return ErrServingFence
+	switch {
+	case request.operation == ([32]byte{}):
+		return retirementFenceFailure("operation is zero")
+	case request.step == ([32]byte{}):
+		return retirementFenceFailure("step is zero")
+	case request.sourceMember == 0 || request.targetMember == 0 || request.sourceMember == request.targetMember:
+		return retirementFenceFailure("source/target member identity is invalid")
+	case member.identity.Group != fence.Group:
+		return retirementFenceFailure("source group identity differs from fence")
+	case member.identity.AllocationGeneration != fence.AllocationGeneration:
+		return retirementFenceFailure("source allocation differs from fence")
+	case member.identity.MemberID != request.sourceMember || fence.MemberID != request.sourceMember:
+		return retirementFenceFailure("source member differs from fence")
+	case member.identity.StoreID != fence.StoreID:
+		return retirementFenceFailure("source store differs from fence")
+	case member.identity.NodeIncarnation != fence.NodeIncarnation:
+		return retirementFenceFailure("source node incarnation differs from fence")
+	case member.command.SchemaGeneration == fence.Command.SchemaGeneration && member.command.RelationManifestDigest != fence.Command.RelationManifestDigest:
+		return retirementFenceFailure("source relation manifest differs from fence at schema %d", fence.Command.SchemaGeneration)
+	case !fence.Command.Valid():
+		return retirementFenceFailure("command fence is invalid")
 	}
 	publication, err := owner.host.Publication(request.group)
 	if err != nil || publication.ReplicaSetVersion > fence.Command.ReplicaSetVersion {
-		return errors.Join(err, ErrServingFence)
+		return errors.Join(err, retirementFenceFailure("publication version=%d exceeds fence version=%d", publication.ReplicaSetVersion, fence.Command.ReplicaSetVersion))
 	}
 	state, err := owner.host.SnapshotState(request.group)
 	if err != nil {
 		return err
 	}
 	b := state.Binding
-	if b.ClusterID != fence.Group.ClusterID || b.ClusterIncarnation != fence.Group.ClusterIncarnation ||
-		b.TopologyRecoveryEpoch != fence.Group.TopologyRecoveryEpoch || b.ShardIncarnation != fence.Group.ShardIncarnation ||
-		b.GroupID != fence.Group.GroupID || b.AllocationGeneration != fence.AllocationGeneration ||
-		b.Distribution != string(member.identity.Distribution) || b.Shard != string(member.identity.Shard) ||
-		b.ActivePolicyGeneration > fence.Command.ActivePolicyGeneration || b.ProtectionEpoch > fence.Command.ProtectionEpoch ||
-		b.SchemaGeneration > fence.Command.SchemaGeneration || b.OwnershipEpoch > fence.Command.OwnershipEpoch ||
-		b.RoutingVersion > fence.Command.RoutingVersion || b.RouteGeneration > fence.Command.RouteGeneration ||
-		state.ReplicaSetVersion > fence.Command.ReplicaSetVersion {
-		return ErrServingFence
+	switch {
+	case b.ClusterID != fence.Group.ClusterID || b.ClusterIncarnation != fence.Group.ClusterIncarnation:
+		return retirementFenceFailure("source snapshot cluster identity differs from fence")
+	case b.TopologyRecoveryEpoch != fence.Group.TopologyRecoveryEpoch:
+		return retirementFenceFailure("source snapshot topology epoch differs from fence")
+	case b.ShardIncarnation != fence.Group.ShardIncarnation || b.GroupID != fence.Group.GroupID:
+		return retirementFenceFailure("source snapshot shard/group identity differs from fence")
+	case b.AllocationGeneration != fence.AllocationGeneration:
+		return retirementFenceFailure("source snapshot allocation differs from fence")
+	case b.Distribution != string(member.identity.Distribution) || b.Shard != string(member.identity.Shard):
+		return retirementFenceFailure("source snapshot distribution/shard differs from identity")
+	case b.ActivePolicyGeneration > fence.Command.ActivePolicyGeneration:
+		return retirementFenceFailure("source snapshot policy=%d exceeds fence=%d", b.ActivePolicyGeneration, fence.Command.ActivePolicyGeneration)
+	case b.ProtectionEpoch > fence.Command.ProtectionEpoch:
+		return retirementFenceFailure("source snapshot protection=%d exceeds fence=%d", b.ProtectionEpoch, fence.Command.ProtectionEpoch)
+	case b.SchemaGeneration > fence.Command.SchemaGeneration:
+		return retirementFenceFailure("source snapshot schema=%d exceeds fence=%d", b.SchemaGeneration, fence.Command.SchemaGeneration)
+	case b.OwnershipEpoch > fence.Command.OwnershipEpoch:
+		return retirementFenceFailure("source snapshot ownership=%d exceeds fence=%d", b.OwnershipEpoch, fence.Command.OwnershipEpoch)
+	case b.RoutingVersion > fence.Command.RoutingVersion:
+		return retirementFenceFailure("source snapshot routing=%d exceeds fence=%d", b.RoutingVersion, fence.Command.RoutingVersion)
+	case b.RouteGeneration > fence.Command.RouteGeneration:
+		return retirementFenceFailure("source snapshot route=%d exceeds fence=%d", b.RouteGeneration, fence.Command.RouteGeneration)
+	case state.ReplicaSetVersion > fence.Command.ReplicaSetVersion:
+		return retirementFenceFailure("source snapshot replica-set=%d exceeds fence=%d", state.ReplicaSetVersion, fence.Command.ReplicaSetVersion)
 	}
 	if !request.retirementAuthorized {
 		proof := request.retirementProof
-		if proof == nil || proof.fence != fence || proof.applied < fence.Command.ReplicaSetVersion ||
-			proof.term < fence.Term || proof.grant.SourceMember != request.sourceMember || proof.grant.TargetMember != request.targetMember ||
-			proof.binding.Distribution != b.Distribution || proof.binding.Shard != b.Shard || proof.binding.OwnedRange != b.OwnedRange ||
-			owner.authority == nil {
-			return ErrServingFence
+		switch {
+		case proof == nil:
+			return retirementFenceFailure("retirement proof is missing")
+		case proof.fence != fence:
+			return retirementFenceFailure("retirement proof fence differs from source fence")
+		case proof.applied < fence.Command.ReplicaSetVersion:
+			return retirementFenceFailure("retirement proof applied=%d precedes fence replica-set=%d", proof.applied, fence.Command.ReplicaSetVersion)
+		case proof.term < fence.Term:
+			return retirementFenceFailure("retirement proof term=%d precedes fence term=%d", proof.term, fence.Term)
+		case proof.grant.SourceMember != request.sourceMember || proof.grant.TargetMember != request.targetMember:
+			return retirementFenceFailure("retirement proof source/target differs from request")
+		case proof.binding.Distribution != b.Distribution || proof.binding.Shard != b.Shard:
+			return retirementFenceFailure("retirement proof distribution/shard differs from source")
+		case proof.binding.OwnedRange != b.OwnedRange:
+			return retirementFenceFailure("retirement proof owned range differs from source")
+		case owner.authority == nil:
+			return retirementFenceFailure("retirement proof has no membership authority")
 		}
 		grant, found, grantErr := owner.authority.CurrentTransitionGrant(request.group)
 		if grantErr != nil || !found || grant != proof.grant {
-			return errors.Join(grantErr, ErrMembershipUnauthorized)
+			return errors.Join(grantErr, retirementFenceFailure("retirement proof grant is not current"), ErrMembershipUnauthorized)
 		}
 	}
 	// A removed replica can campaign into a higher isolated term. That cannot
