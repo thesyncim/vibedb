@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	RequestBytes  = 80
-	ResponseBytes = 408
+	RequestBytes        = 80
+	metricsPayloadBytes = 408
+	ResponseBytes       = metricsPayloadBytes + sha256.Size
 )
 
 var (
@@ -43,6 +44,17 @@ type Snapshot struct {
 	Member  uint64
 	Metrics raftservice.ProgressMetricsSnapshot
 	Stages  StageMetricsSnapshot
+	Budget  MigrationBudgetSnapshot
+}
+
+// MigrationBudgetSnapshot is the compact node-wide pacing cut carried by the
+// aggregate metrics request. Group requests deliberately return a zero value.
+// Counters are monotonic for one physical process incarnation.
+type MigrationBudgetSnapshot struct {
+	ThrottledCalls uint64
+	ThrottledBytes uint64
+	PeakActive     uint64
+	MaxActive      uint64
 }
 
 type StageMetricsSnapshot struct {
@@ -57,6 +69,10 @@ type StageMetricsSnapshot struct {
 }
 
 type StageProvider interface{ StageMetrics() StageMetricsSnapshot }
+
+type BudgetProvider interface {
+	MigrationBudgetMetrics() MigrationBudgetSnapshot
+}
 
 type AuthorizeFunc func(rafttransport.PeerIdentity) bool
 
@@ -105,6 +121,9 @@ func (service *Service) Serve(ctx context.Context, connection rafttransport.Peer
 		if provider, ok := service.options.Provider.(StageProvider); ok {
 			snapshot.Stages = provider.StageMetrics()
 		}
+		if provider, ok := service.options.Provider.(BudgetProvider); ok {
+			snapshot.Budget = provider.MigrationBudgetMetrics()
+		}
 	} else {
 		provider, ok := service.options.Provider.(GroupProvider)
 		if !ok {
@@ -149,14 +168,19 @@ func appendResponse(snapshot Snapshot) (response [ResponseBytes]byte) {
 	for index, value := range stageValues {
 		binary.BigEndian.PutUint64(response[160+index*8:168+index*8], value)
 	}
-	digest := sha256.Sum256(response[:376])
-	copy(response[376:], digest[:])
+	budgetValues := [...]uint64{snapshot.Budget.ThrottledCalls, snapshot.Budget.ThrottledBytes,
+		snapshot.Budget.PeakActive, snapshot.Budget.MaxActive}
+	for index, value := range budgetValues {
+		binary.BigEndian.PutUint64(response[376+index*8:384+index*8], value)
+	}
+	digest := sha256.Sum256(response[:metricsPayloadBytes])
+	copy(response[metricsPayloadBytes:], digest[:])
 	return response
 }
 
 func OpenResponse(response []byte) (Snapshot, error) {
 	if len(response) != ResponseBytes || responseMagic != [8]byte(response[:8]) ||
-		sha256.Sum256(response[:376]) != [sha256.Size]byte(response[376:]) {
+		sha256.Sum256(response[:metricsPayloadBytes]) != [sha256.Size]byte(response[metricsPayloadBytes:]) {
 		return Snapshot{}, ErrMetrics
 	}
 	group := openGroup(response[8:80])
@@ -172,6 +196,10 @@ func OpenResponse(response []byte) (Snapshot, error) {
 	for index := range stageValues {
 		stageValues[index] = binary.BigEndian.Uint64(response[160+index*8 : 168+index*8])
 	}
+	budgetValues := [4]uint64{}
+	for index := range budgetValues {
+		budgetValues[index] = binary.BigEndian.Uint64(response[376+index*8 : 384+index*8])
+	}
 	return Snapshot{Group: group, Member: member, Metrics: raftservice.ProgressMetricsSnapshot{ProposalCommands: values[0], ProposalBytes: values[1],
 		AppliedEntries: values[2], ReadyPersisted: values[3], SnapshotsFinished: values[4],
 		ReadCompletions: values[5], Faults: values[6], CommitAdvancements: values[7], CommittedEntries: values[8]}, Stages: StageMetricsSnapshot{
@@ -183,7 +211,7 @@ func OpenResponse(response []byte) (Snapshot, error) {
 		SplitControlRequests: stageValues[17], SplitControlCompletions: stageValues[18], SplitControlFaults: stageValues[19],
 		BootstrapRequests: stageValues[20], BootstrapChunks: stageValues[21], BootstrapBytes: stageValues[22],
 		BootstrapCompletions: stageValues[23], BootstrapFaults: stageValues[24], BootstrapResidentBytes: stageValues[25], BootstrapInflight: stageValues[26],
-	}}, nil
+	}, Budget: MigrationBudgetSnapshot{ThrottledCalls: budgetValues[0], ThrottledBytes: budgetValues[1], PeakActive: budgetValues[2], MaxActive: budgetValues[3]}}, nil
 }
 
 type Client struct {

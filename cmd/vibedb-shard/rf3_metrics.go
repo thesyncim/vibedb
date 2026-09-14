@@ -4,6 +4,7 @@ import (
 	"math"
 
 	"github.com/thesyncim/vibedb/internal/clusterbackupservice"
+	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
@@ -24,6 +25,7 @@ type rf3MetricsProvider struct {
 	action  *replicaaction.Service
 	data    []snapshottransfer.GroupDataService
 	split   *splitcontroller.ControlService
+	budget  *migrationbudget.Budget
 }
 
 type coldRF3MetricsProvider struct{ groups []*preparedColdRF3Group }
@@ -52,6 +54,20 @@ func (provider *rf3MetricsProvider) ProgressMetrics() raftservice.ProgressMetric
 
 func (provider *rf3MetricsProvider) GroupProgressMetrics(group raftmember.GroupKey) (raftmember.RuntimeIdentity, raftservice.ProgressMetricsSnapshot, bool) {
 	return provider.owners.GroupProgressMetrics(group)
+}
+
+func (provider *rf3MetricsProvider) MigrationBudgetMetrics() servicemetrics.MigrationBudgetSnapshot {
+	metrics := provider.budget.Metrics()
+	throttledCalls := uint64(0)
+	throttledBytes := uint64(0)
+	for _, resource := range [...]migrationbudget.ResourceMetrics{
+		metrics.CPU, metrics.DiskRead, metrics.DiskWrite, metrics.NetworkSend, metrics.NetworkReceive,
+	} {
+		throttledCalls = rf3MetricsAdd(throttledCalls, resource.ThrottleEvents)
+		throttledBytes = rf3MetricsAdd(throttledBytes, resource.ThrottledBytes)
+	}
+	return servicemetrics.MigrationBudgetSnapshot{ThrottledCalls: throttledCalls,
+		ThrottledBytes: throttledBytes, PeakActive: uint64(max(metrics.PeakActive, 0)), MaxActive: uint64(max(metrics.ActiveCapacity, 0))}
 }
 
 func (provider *rf3MetricsProvider) StageMetrics() servicemetrics.StageMetricsSnapshot {

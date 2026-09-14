@@ -315,6 +315,7 @@ type Budget struct {
 	networkReceive tokenBucket
 
 	waiting        atomic.Int64
+	peakActive     atomic.Uint64
 	acquires       atomic.Uint64
 	cancellations  atomic.Uint64
 	releases       atomic.Uint64
@@ -541,6 +542,7 @@ func (budget *Budget) Acquire(ctx context.Context) (*Lease, error) {
 		select {
 		case budget.active <- struct{}{}:
 			budget.waiting.Add(-1)
+			budget.updatePeakActive()
 			if err := ctx.Err(); err != nil {
 				<-budget.active
 				budget.cancellations.Add(1)
@@ -574,6 +576,16 @@ func (budget *Budget) Acquire(ctx context.Context) (*Lease, error) {
 		case <-budget.closed:
 			budget.waiting.Add(-1)
 			return nil, ErrClosed
+		}
+	}
+}
+
+func (budget *Budget) updatePeakActive() {
+	current := uint64(len(budget.active))
+	for {
+		prior := budget.peakActive.Load()
+		if current <= prior || budget.peakActive.CompareAndSwap(prior, current) {
+			return
 		}
 	}
 }
@@ -834,6 +846,7 @@ func (budget *Budget) consumeChunkWithPressure(ctx context.Context, cost Cost, w
 type Metrics struct {
 	Active                     int
 	ActiveCapacity             int
+	PeakActive                 int
 	Waiting                    int
 	Acquires                   uint64
 	Cancellations              uint64
@@ -865,6 +878,7 @@ type Metrics struct {
 type ResourceMetrics struct {
 	ConsumedBytes               uint64
 	ThrottleEvents              uint64
+	ThrottledBytes              uint64
 	ThrottledNanos              uint64
 	AvailableBytes              uint64
 	RateBytesPerSecond          uint64
@@ -881,7 +895,8 @@ func (budget *Budget) Metrics() Metrics {
 	}
 	result := Metrics{
 		Active: len(budget.active), ActiveCapacity: cap(budget.active),
-		Waiting: int(maxInt64(budget.waiting.Load())), Acquires: budget.acquires.Load(),
+		PeakActive: int(budget.peakActive.Load()),
+		Waiting:    int(maxInt64(budget.waiting.Load())), Acquires: budget.acquires.Load(),
 		Cancellations: budget.cancellations.Load(), Releases: budget.releases.Load(),
 		ConsumeCalls: budget.consumeCalls.Load(), ConsumeErrors: budget.consumeErrors.Load(),
 		BufferWaiters:  int(maxInt64(budget.bufferWaiters.Load())),
@@ -918,6 +933,7 @@ type tokenBucket struct {
 	last      time.Time
 	consumed  atomic.Uint64
 	throttle  atomic.Uint64
+	throttled atomic.Uint64
 	waitNanos atomic.Uint64
 }
 
@@ -1001,6 +1017,7 @@ func (bucket *tokenBucket) takeChunk(ctx context.Context, amount uint64, budget 
 		timer := budget.clock.NewTimer(delay)
 		select {
 		case <-timer.C():
+			bucket.throttled.Add(amount)
 			bucket.waitNanos.Add(durationNanosSince(started, budget.clock.Now()))
 		case <-ctx.Done():
 			if !timer.Stop() {
@@ -1065,6 +1082,7 @@ func (bucket *tokenBucket) takePart(ctx context.Context, amount uint64, budget *
 		timer := budget.clock.NewTimer(delay)
 		select {
 		case <-timer.C():
+			bucket.throttled.Add(amount)
 			bucket.waitNanos.Add(durationNanosSince(started, budget.clock.Now()))
 		case <-ctx.Done():
 			if !timer.Stop() {
@@ -1102,6 +1120,7 @@ func (bucket *tokenBucket) metrics(now time.Time) ResourceMetrics {
 	result := ResourceMetrics{
 		ConsumedBytes:      bucket.consumed.Load(),
 		ThrottleEvents:     bucket.throttle.Load(),
+		ThrottledBytes:     bucket.throttled.Load(),
 		ThrottledNanos:     bucket.waitNanos.Load(),
 		AvailableBytes:     uint64(maxFloat(bucket.tokens)),
 		RateBytesPerSecond: bucket.rate, BurstBytes: bucket.burst,

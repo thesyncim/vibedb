@@ -1148,7 +1148,8 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	defer func() { resultErr = errors.Join(resultErr, splitRuntime.Close()) }()
 	metricsControl, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
 		Provider: &rf3MetricsProvider{owners: peer.Owners(), schemas: schemaActivator,
-			backup: backupControl, action: actionControl, data: dataServices, split: splitRuntime.action},
+			backup: backupControl, action: actionControl, data: dataServices, split: splitRuntime.action,
+			budget: migrationBudget},
 		Authorize: func(identity rafttransport.PeerIdentity) bool {
 			return policy.Check(identity.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow
 		},

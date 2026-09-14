@@ -425,7 +425,8 @@ func servePreparedRF3EmptyNode(
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
-	metricsProvider := &rf3MetricsProvider{owners: peer.Owners(), schemas: schemas, backup: backupControl, action: actionControl}
+	metricsProvider := &rf3MetricsProvider{owners: peer.Owners(), schemas: schemas, backup: backupControl, action: actionControl,
+		budget: migrationBudget}
 	metricsControl, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
 		Provider: metricsProvider,
 		Authorize: func(identity rafttransport.PeerIdentity) bool {

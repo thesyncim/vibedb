@@ -380,7 +380,7 @@ func (response Response) Valid() bool {
 			return false
 		}
 	}
-	if response.Budget != nil && response.Budget.MaxActive == 0 {
+	if response.Budget != nil && (response.Budget.MaxActive == 0 || response.Budget.PeakActive > response.Budget.MaxActive) {
 		return false
 	}
 	return true

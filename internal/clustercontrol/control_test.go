@@ -124,6 +124,11 @@ func TestResponseRoundTripCarriesSafeToStopProofAndBudget(t *testing.T) {
 	if _, err := EncodeResponse(failed); !errors.Is(err, ErrInvalidResponse) {
 		t.Fatalf("oversized error accepted: %v", err)
 	}
+	invalidBudget := response
+	invalidBudget.Budget = &BudgetStatus{PeakActive: 3, MaxActive: 2}
+	if _, err := EncodeResponse(invalidBudget); !errors.Is(err, ErrInvalidResponse) {
+		t.Fatalf("peak active above configured capacity accepted: %v", err)
+	}
 }
 
 func TestProfileIsCanonicalAndBounded(t *testing.T) {

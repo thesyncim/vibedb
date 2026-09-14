@@ -34,9 +34,10 @@ var (
 // either represented by a durable ScalingIntent or returns an error before
 // the operation ID is exposed.
 type ScalingOperatorBackend struct {
-	directory gateway.DirectoryReader
-	writer    gateway.DirectoryWriter
-	catalog   scalingCatalogReader
+	directory          gateway.DirectoryReader
+	writer             gateway.DirectoryWriter
+	catalog            scalingCatalogReader
+	distributedMetrics *gateway.DistributedMetrics
 }
 
 func NewScalingOperatorBackend(controller *ScalingController) (*ScalingOperatorBackend, error) {
@@ -285,6 +286,7 @@ func (backend *ScalingOperatorBackend) observeOnce(ctx context.Context, response
 	response.Blockers = backend.clusterBlockers(ctx, intent, intent.Blockers)
 	response.Evidence = clusterEvidence(intent.Evidence)
 	response.SafeToStop = intent.Evidence.SafeToStop()
+	response.Budget = backend.budgetStatus()
 	progress, progressErr := backend.progress(ctx, intent)
 	if progressErr != nil {
 		response.Error = boundedClusterControlError(progressErr)
@@ -331,6 +333,19 @@ func (backend *ScalingOperatorBackend) observeOnce(ctx context.Context, response
 		}
 	}
 	return response
+}
+
+func (backend *ScalingOperatorBackend) budgetStatus() *clustercontrol.BudgetStatus {
+	if backend == nil || backend.distributedMetrics == nil {
+		return nil
+	}
+	aggregate, err := backend.distributedMetrics.Aggregate()
+	if err != nil || aggregate.Budget.MaxActive == 0 {
+		return nil
+	}
+	return &clustercontrol.BudgetStatus{ThrottledCalls: aggregate.Budget.ThrottledCalls,
+		ThrottledBytes: aggregate.Budget.ThrottledBytes, PeakActive: uint32(aggregate.Budget.PeakActive),
+		MaxActive: uint32(aggregate.Budget.MaxActive)}
 }
 
 type clusterControlProgress struct {

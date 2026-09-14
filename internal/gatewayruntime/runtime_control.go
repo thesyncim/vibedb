@@ -230,6 +230,7 @@ func (runtime *Runtime) openReplicaControl() error {
 		if scalingErr != nil {
 			return fmt.Errorf("open cluster control backend: %w", scalingErr)
 		}
+		runtime.clusterControlBackend.distributedMetrics = runtime.distributedMetrics
 	}
 	return nil
 }
