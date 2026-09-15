@@ -772,6 +772,14 @@ func TestOrdinaryTransportReconnectUsesInjectedBackoffAndRetainsFrame(t *testing
 	if stats.DialAttempts != 3 || stats.DialFailures != 2 || stats.Connections != 1 {
 		t.Fatalf("reconnect stats = %+v", stats)
 	}
+	failure := stats.LastFailure
+	if failure.Node != fixture.remote[0].Node || failure.Phase != peerFailurePhaseDial ||
+		failure.Cause != "closed-pipe" || failure.Group != fixture.group ||
+		failure.From != fixture.local.MemberID || failure.To != fixture.remote[0].MemberID ||
+		failure.Version != 1 || failure.Kind != "ordinary" || failure.MessageType != int32(pb.MsgHeartbeat) ||
+		failure.Index != 9 || failure.Term != 5 {
+		t.Fatalf("dial failure snapshot = %+v", failure)
+	}
 	delayMu.Lock()
 	gotDelays := append([]time.Duration(nil), delays...)
 	delayMu.Unlock()
@@ -822,6 +830,14 @@ func TestOrdinaryTransportHandlesPartialWritesAndRetriesFailedWrite(t *testing.T
 	stats, _ := transport.Stats(fixture.remote[0].Node)
 	if stats.WriteFailures != 1 || stats.Connections != 2 {
 		t.Fatalf("write retry stats = %+v", stats)
+	}
+	failure := stats.LastFailure
+	if failure.Node != fixture.remote[0].Node || failure.Phase != peerFailurePhaseWrite ||
+		failure.Cause != "unexpected-eof" || failure.Group != fixture.group ||
+		failure.From != fixture.local.MemberID || failure.To != fixture.remote[0].MemberID ||
+		failure.Version != 1 || failure.Kind != "ordinary" || failure.MessageType != int32(pb.MsgHeartbeat) ||
+		failure.Index != 17 || failure.Term != 5 {
+		t.Fatalf("write failure snapshot = %+v", failure)
 	}
 	if len(failed.writtenBytes()) != failed.failAfter {
 		t.Fatalf("failed stream bytes = %d, want %d", len(failed.writtenBytes()), failed.failAfter)

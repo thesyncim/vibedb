@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"io"
 	"math"
 	"math/bits"
 	"sync"
@@ -342,6 +343,7 @@ type ordinaryPeer struct {
 	connections   atomic.Uint64
 	sentFrames    atomic.Uint64
 	sentBytes     atomic.Uint64
+	lastFailure   PeerFailure
 }
 
 const (
@@ -1030,6 +1032,7 @@ func (transport *OrdinaryTransport) runPeer(peer *ordinaryPeer) {
 	var connection PeerConnection
 	var stopConnection func() bool
 	var connectionDone <-chan struct{}
+	var connectionReadErr error
 	failures := uint32(0)
 	closeConnection := func() {
 		if stopConnection != nil {
@@ -1053,6 +1056,9 @@ func (transport *OrdinaryTransport) runPeer(peer *ordinaryPeer) {
 		}
 		select {
 		case <-connectionDone:
+			if context.Cause(peer.ctx) == nil {
+				transport.recordPeerFailure(peer, peerFailurePhaseRead, nil, connectionReadErr)
+			}
 			closeConnection()
 			failures = saturatingIncrement(failures)
 		default:
@@ -1082,6 +1088,10 @@ func (transport *OrdinaryTransport) runPeer(peer *ordinaryPeer) {
 			peer.dialAttempts.Add(1)
 			physical, physicalErr := transport.registry.PhysicalPeer(peer.node)
 			if physicalErr != nil || physical.State != PeerEnrolled {
+				if physicalErr == nil {
+					physicalErr = ErrPeerRetired
+				}
+				transport.recordPeerFailure(peer, peerFailurePhaseDirectory, nil, physicalErr)
 				return
 			}
 			candidate, err := transport.dialOrdinary(peer.ctx, peer.node, physical.Endpoint)
@@ -1089,12 +1099,29 @@ func (transport *OrdinaryTransport) runPeer(peer *ordinaryPeer) {
 			if candidate != nil {
 				identity = candidate.PeerIdentity()
 			}
-			if err != nil || candidate == nil || !validPeerIdentity(identity) ||
+			bindingErr := error(nil)
+			if candidate != nil {
+				bindingErr = transport.registry.VerifyPeerConnectionBinding(candidate)
+			}
+			invalidCandidate := err != nil || candidate == nil || !validPeerIdentity(identity) ||
 				identity.Node != peer.node ||
 				identity.TrustDomain != transport.registry.TrustDomain() ||
 				!transport.registry.IsPeerEnrolled(identity.Node) ||
 				candidate.TrafficClass() != TrafficOrdinary ||
-				transport.registry.VerifyPeerConnectionBinding(candidate) != nil {
+				bindingErr != nil
+			if invalidCandidate {
+				failureErr := err
+				if failureErr == nil {
+					switch {
+					case candidate == nil:
+						failureErr = ErrInvalidTransport
+					case bindingErr != nil:
+						failureErr = bindingErr
+					default:
+						failureErr = ErrPeerUnauthorized
+					}
+				}
+				transport.recordPeerFailure(peer, peerFailurePhaseDial, nil, failureErr)
 				if candidate != nil {
 					_ = candidate.Close()
 				}
@@ -1111,6 +1138,7 @@ func (transport *OrdinaryTransport) runPeer(peer *ordinaryPeer) {
 			)
 			done := make(chan struct{})
 			connectionDone = done
+			connectionReadErr = nil
 			go func() {
 				defer close(done)
 				// Ordinary streams are unidirectional. Read the unused return
@@ -1120,6 +1148,10 @@ func (transport *OrdinaryTransport) runPeer(peer *ordinaryPeer) {
 				for {
 					n, err := active.Read(unexpected[:])
 					if n != 0 || err != nil {
+						if err == nil {
+							err = io.ErrUnexpectedEOF
+						}
+						connectionReadErr = err
 						_ = active.Close()
 						return
 					}
@@ -1149,6 +1181,11 @@ func (transport *OrdinaryTransport) runPeer(peer *ordinaryPeer) {
 			transport.registry.VerifyPeerConnectionBinding(connection) != nil ||
 			physical.ServiceKeyDigest != ([sha256.Size]byte{}) &&
 				connection.PeerKeyDigest() != physical.ServiceKeyDigest {
+			failureErr := physicalErr
+			if failureErr == nil {
+				failureErr = ErrPeerUnauthorized
+			}
+			transport.recordPeerFailure(peer, peerFailurePhaseWrite, batch, failureErr)
 			transport.releasePeerBatch(peer)
 			closeConnection()
 			failures = saturatingIncrement(failures)
@@ -1163,6 +1200,9 @@ func (transport *OrdinaryTransport) runPeer(peer *ordinaryPeer) {
 		writeErr := connection.SetWriteDeadline(deadline)
 		if writeErr == nil {
 			writeErr = writeFull(connection, batch)
+		}
+		if writeErr != nil {
+			transport.recordPeerFailure(peer, peerFailurePhaseWrite, batch, writeErr)
 		}
 		transport.releasePeerBatch(peer)
 		if writeErr != nil {
@@ -1388,6 +1428,7 @@ type PeerStats struct {
 	Connections    uint64
 	SentFrames     uint64
 	SentBytes      uint64
+	LastFailure    PeerFailure
 }
 
 // Stats reports one configured peer without allocating.
@@ -1403,6 +1444,7 @@ func (transport *OrdinaryTransport) Stats(node NodeID) (PeerStats, error) {
 	}
 	queuedFrames, queuedBytes := peer.count, peer.bytes
 	reservedFrames, reservedBytes := peer.reservedFrames, peer.reservedBytes
+	lastFailure := peer.lastFailure
 	transport.mu.Unlock()
 	return PeerStats{
 		QueuedFrames: queuedFrames, QueuedBytes: queuedBytes,
@@ -1410,6 +1452,7 @@ func (transport *OrdinaryTransport) Stats(node NodeID) (PeerStats, error) {
 		DialAttempts: peer.dialAttempts.Load(), DialFailures: peer.dialFailures.Load(),
 		WriteFailures: peer.writeFailures.Load(), Connections: peer.connections.Load(),
 		SentFrames: peer.sentFrames.Load(), SentBytes: peer.sentBytes.Load(),
+		LastFailure: lastFailure,
 	}, nil
 }
 

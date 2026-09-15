@@ -27,6 +27,11 @@ type rf3NodeOwner struct {
 	pressureStop     chan struct{}
 	pressureDone     chan struct{}
 	pressureStopOnce sync.Once
+	// transportFailures is a bounded SIGUSR1 diagnostic source installed only
+	// after the authenticated peer runtime and physical directory are ready.
+	// It is kept as a callback so the node owner remains independent of the
+	// runtime's transport lifecycle during startup and teardown.
+	transportFailures func() []rf3DiagnosticTransportFailure
 }
 
 // bindEmptyRuntime is the process-local handoff used by a bootstrap-directory

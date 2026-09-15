@@ -909,6 +909,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
+	bindRF3TransportFailureDiagnostics(nodeOwner, peer, transportRegistry)
 	// An assembly error after ownership transfer must close every runtime even
 	// when the listeners never start. Normal serving takes over this join below.
 	peerStarted := false

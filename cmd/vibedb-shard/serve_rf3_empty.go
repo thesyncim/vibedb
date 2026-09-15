@@ -287,6 +287,7 @@ func servePreparedRF3EmptyNode(
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
+	bindRF3TransportFailureDiagnostics(nodeOwner, peer, transportRegistry)
 	if peer.Owners() == nil {
 		return errors.Join(raftservice.ErrInvalidOwner, lanes.Close(), servingRegistry.Close())
 	}
