@@ -1139,9 +1139,33 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 			t.Fatalf("cycle %d decommission response=%+v", cycle+1, retire)
 		}
 		if cycle == 0 {
+			// The decommission proof may spend several minutes draining real
+			// replicas. Keep the witness active while that proof runs so an
+			// idle frontend connection cannot disappear before the controller
+			// observes its authenticated session blocker. The query is issued
+			// from the status predicate, which also keeps the witness check in
+			// the same polling timeline as the blocker assertion.
+			var witnessLastProbe time.Time
+			var witnessProbeErr error
 			blocked, err = pollSeamlessScaleStatus(ctx, vibedbBinary, profilePath, retire.OperationID, func(response clustercontrol.Response) bool {
+				if witnessProbeErr != nil {
+					return true
+				}
+				if witnessLastProbe.IsZero() || time.Since(witnessLastProbe) >= 5*time.Second {
+					witnessLastProbe = time.Now()
+					probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+					probe, probeErr := fusedDDLWireQuery(probeCtx, retiringSQL, "SELECT 1", false)
+					cancel()
+					if probeErr != nil || probe.code != "" || len(probe.rows) != 1 || len(probe.rows[0]) != 1 || probe.rows[0][0] != "1" {
+						witnessProbeErr = fmt.Errorf("retiring SQL witness keepalive: result=%+v err=%v", probe, probeErr)
+						return true
+					}
+				}
 				return !response.SafeToStop && hasSeamlessScaleSessionBlocker(response, retireIDText, retireIncarnation)
 			})
+			if witnessProbeErr != nil {
+				err = witnessProbeErr
+			}
 			if err != nil || !blocked {
 				t.Fatalf("cycle %d did not expose exact live frontend-session blocker: %v", cycle+1, err)
 			}
