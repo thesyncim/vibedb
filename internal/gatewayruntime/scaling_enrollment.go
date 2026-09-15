@@ -43,6 +43,11 @@ type ScalingEnrollmentRuntime struct {
 	provisioner gateway.NodeProvisioner
 }
 
+type scalingSnapshotBinding struct {
+	controlAddress  string
+	snapshotAddress string
+}
+
 // NewScalingEnrollmentRuntime constructs the authenticated target provisioner
 // and source-certified enrollment builder as one unit. Requiring the source
 // and transport together prevents a runtime from accidentally installing a
@@ -329,13 +334,15 @@ func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener,
 	if len(manifest.Shards) == 0 || len(manifest.Shards) != len(manifest.SplitSnapshots) {
 		return errScalingEnrollmentUnavailable
 	}
-	snapshotAddresses := make(map[rafttransport.NodeID]string, len(manifest.Shards))
+	snapshotAddresses := make(map[rafttransport.NodeID]scalingSnapshotBinding, len(manifest.Shards))
 	for index, shard := range manifest.Shards {
 		address := manifest.SplitSnapshots[index]
 		if shard.Node == (rafttransport.NodeID{}) || !validGatewayReplicaAddress(address) {
 			return errScalingEnrollmentUnavailable
 		}
-		snapshotAddresses[shard.Node] = address
+		snapshotAddresses[shard.Node] = scalingSnapshotBinding{
+			controlAddress: shard.ControlAddress, snapshotAddress: address,
+		}
 	}
 	source := func(ctx context.Context, intent gateway.GroupEnrollmentIntent) ([]byte, error) {
 		var voters [3]nodecontrol.PreparationMember
@@ -351,15 +358,21 @@ func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener,
 				return nil, errScalingEnrollmentDrift
 			}
 			for i, member := range route.Replicas {
-				snapshotAddress := snapshotAddresses[member.Node]
-				if snapshotAddress == "" {
-					return nil, errScalingEnrollmentDrift
-				}
 				record, err := runtime.authority.ReadNode(ctx, member.Node, member.NodeIncarnation)
 				if err != nil {
 					return nil, err
 				}
-				voters[i], err = certifiedPreparationMember(member, record, snapshotAddress)
+				snapshotAddress, err := preparationSnapshotAddress(snapshotAddresses, member, record)
+				if err != nil {
+					return nil, err
+				}
+				allowDraining := member.Member == intent.Source.Member &&
+					member.Node == intent.Source.Node && member.StoreID == intent.Source.StoreID &&
+					member.NodeIncarnation == intent.Source.NodeIncarnation &&
+					member.Endpoint == string(intent.Source.Endpoint) &&
+					member.NativeEndpoint == string(intent.Source.NativeEndpoint) &&
+					member.ControlEndpoint == string(intent.Source.ControlEndpoint)
+				voters[i], err = certifiedPreparationMember(member, record, snapshotAddress, allowDraining)
 				if err != nil {
 					return nil, err
 				}
@@ -376,7 +389,7 @@ func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener,
 				Endpoint: string(node.DataEndpoint), DataAddress: node.DataAddress,
 				NativeEndpoint: string(node.NativeEndpoint), Address: node.NativeAddress,
 				ControlEndpoint: string(node.ControlEndpoint), ControlAddress: node.ControlAddress,
-			}, node, "")
+			}, node, "", false)
 			if err != nil {
 				return nil, err
 			}
@@ -394,12 +407,16 @@ func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener,
 }
 
 func certifiedPreparationMember(
-	replica gateway.ReplicatedEndpoint, record gateway.NodeRecord, snapshotAddress string,
+	replica gateway.ReplicatedEndpoint, record gateway.NodeRecord, snapshotAddress string, allowDraining bool,
 ) (nodecontrol.PreparationMember, error) {
 	if record.NodeID != replica.Node || record.Incarnation != replica.NodeIncarnation ||
-		record.Lifecycle != gateway.NodeActive || record.ServiceKeyDigest == (replication.Digest{}) ||
+		(record.Lifecycle != gateway.NodeActive && !(allowDraining && record.Lifecycle == gateway.NodeDraining)) ||
+		record.ServiceKeyDigest == (replication.Digest{}) ||
 		record.Revision == 0 || replica.Member == 0 || replica.DataAddress == "" ||
-		record.DataAddress != replica.DataAddress {
+		record.DataAddress != replica.DataAddress || record.DataEndpoint != distribution.EndpointID(replica.Endpoint) ||
+		record.NativeEndpoint != distribution.EndpointID(replica.NativeEndpoint) ||
+		record.ControlEndpoint != distribution.EndpointID(replica.ControlEndpoint) ||
+		record.NativeAddress != replica.Address || record.ControlAddress != replica.ControlAddress {
 		return nodecontrol.PreparationMember{}, errScalingEnrollmentDrift
 	}
 	return nodecontrol.PreparationMember{
@@ -412,4 +429,36 @@ func certifiedPreparationMember(
 		ServiceKeyDigest: record.ServiceKeyDigest, NodeIncarnation: record.Incarnation,
 		NodeRevision: record.Revision,
 	}, nil
+}
+
+// preparationSnapshotAddress selects a snapshot listener from the current
+// authenticated node directory. Dynamically enrolled nodes carry the value
+// learned from their authenticated NodeInfo promotion; the static manifest is
+// retained only for an exact original control endpoint. A missing or foreign
+// binding is a hard drift error rather than an invitation to reuse a peer or
+// native address.
+func preparationSnapshotAddress(
+	static map[rafttransport.NodeID]scalingSnapshotBinding, replica gateway.ReplicatedEndpoint, record gateway.NodeRecord,
+) (string, error) {
+	if record.NodeID != replica.Node || record.Incarnation != replica.NodeIncarnation ||
+		record.ServiceKeyDigest == (replication.Digest{}) || record.Revision == 0 ||
+		record.DataEndpoint != distribution.EndpointID(replica.Endpoint) ||
+		record.NativeEndpoint != distribution.EndpointID(replica.NativeEndpoint) ||
+		record.ControlEndpoint != distribution.EndpointID(replica.ControlEndpoint) ||
+		record.DataAddress != replica.DataAddress || record.NativeAddress != replica.Address ||
+		record.ControlAddress != replica.ControlAddress {
+		return "", errScalingEnrollmentDrift
+	}
+	if record.SnapshotAddress != "" {
+		if !validGatewayReplicaAddress(record.SnapshotAddress) {
+			return "", errScalingEnrollmentDrift
+		}
+		return record.SnapshotAddress, nil
+	}
+	binding, found := static[replica.Node]
+	if !found || binding.controlAddress == "" || binding.controlAddress != replica.ControlAddress ||
+		!validGatewayReplicaAddress(binding.snapshotAddress) {
+		return "", errScalingEnrollmentDrift
+	}
+	return binding.snapshotAddress, nil
 }

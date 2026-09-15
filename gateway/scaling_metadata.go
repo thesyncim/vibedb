@@ -7,6 +7,7 @@ package gateway
 // authority.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -110,15 +111,21 @@ type GatewayIdentity struct {
 // are catalog handles; their addresses are included in the same record so a
 // directory read is a complete, revision-fenced participant cut.
 type NodeRecord struct {
-	NodeID                          rafttransport.NodeID
-	Incarnation                     uint64
-	ServiceKeyDigest                replication.Digest
-	DataEndpoint                    distribution.EndpointID
-	NativeEndpoint                  distribution.EndpointID
-	ControlEndpoint                 distribution.EndpointID
-	GatewayEndpoint                 distribution.EndpointID
-	DataAddress                     string
-	NativeAddress                   string
+	NodeID           rafttransport.NodeID
+	Incarnation      uint64
+	ServiceKeyDigest replication.Digest
+	DataEndpoint     distribution.EndpointID
+	NativeEndpoint   distribution.EndpointID
+	ControlEndpoint  distribution.EndpointID
+	GatewayEndpoint  distribution.EndpointID
+	DataAddress      string
+	NativeAddress    string
+	// SnapshotAddress is the authenticated physical snapshot listener learned
+	// from NodeInfo when a joining node is promoted. It is optional for the
+	// original static directory, whose manifest supplies the bootstrap seed;
+	// dynamically enrolled voters must retain it here so a later enrollment can
+	// use their snapshot service after a gateway restart.
+	SnapshotAddress                 string `json:"snapshot_address,omitempty"`
 	ControlAddress                  string
 	GatewayAddress                  string
 	FailureDomain                   string
@@ -149,11 +156,15 @@ func (record NodeRecord) Valid() bool {
 	for _, value := range []string{
 		string(record.DataEndpoint), string(record.NativeEndpoint), string(record.ControlEndpoint),
 		string(record.GatewayEndpoint), record.DataAddress, record.NativeAddress,
+		record.SnapshotAddress,
 		record.ControlAddress, record.GatewayAddress,
 	} {
 		if len(value) > MaxScalingStringBytes {
 			return false
 		}
+	}
+	if record.SnapshotAddress != "" && bytes.IndexByte([]byte(record.SnapshotAddress), 0) >= 0 {
+		return false
 	}
 	if record.DataEndpoint == "" || record.NativeEndpoint == "" || record.ControlEndpoint == "" ||
 		record.DataAddress == "" || record.NativeAddress == "" || record.ControlAddress == "" ||
@@ -1060,13 +1071,20 @@ func validateNodeTransition(previous, next NodeRecord) error {
 		!previous.Lifecycle.Allows(next.Lifecycle) {
 		return ErrScalingState
 	}
-	if !sameNodeIdentity(previous, next) {
+	if !sameNodeIdentity(previous, next) &&
+		!(previous.Lifecycle == NodeJoining && next.Lifecycle == NodeActive &&
+			previous.SnapshotAddress == "" && next.SnapshotAddress != "" &&
+			sameNodeIdentityExceptSnapshot(previous, next)) {
 		return ErrScalingIdentity
 	}
 	return nil
 }
 
 func sameNodeIdentity(left, right NodeRecord) bool {
+	return sameNodeIdentityExceptSnapshot(left, right) && left.SnapshotAddress == right.SnapshotAddress
+}
+
+func sameNodeIdentityExceptSnapshot(left, right NodeRecord) bool {
 	return left.NodeID == right.NodeID && left.Incarnation == right.Incarnation &&
 		left.ServiceKeyDigest == right.ServiceKeyDigest &&
 		left.DataEndpoint == right.DataEndpoint && left.NativeEndpoint == right.NativeEndpoint &&

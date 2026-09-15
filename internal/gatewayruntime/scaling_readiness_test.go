@@ -53,6 +53,7 @@ func TestScalingReadinessBindsIdentityAndCopiesMeasuredCapacity(t *testing.T) {
 				t.Fatal(err)
 			}
 			expected := node
+			expected.SnapshotAddress = "localhost:4"
 			expected.Capacity[autosplit.ResourceLiveBytes] = 100
 			expected.MigrationCapacity = 100
 			expected.MaxReceives = 2

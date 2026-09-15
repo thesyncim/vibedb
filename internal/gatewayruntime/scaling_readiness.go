@@ -34,6 +34,11 @@ func (reader scalingNodeReadiness) VerifyNode(ctx context.Context, node gateway.
 	}
 	node.Capacity = observed.ActualCapacity
 	node.Used = observed.ActualUsage
+	// SnapshotAddress is a physical listener coordinate, not part of the
+	// operator's join descriptor. Persist the authenticated NodeInfo value with
+	// the promotion so later source preparation can reach a dynamically joined
+	// voter after the static bootstrap manifest has been exhausted.
+	node.SnapshotAddress = observed.Endpoints.Snapshot
 	node.MigrationCapacity = observed.ActualMigrationCapacity
 	node.MigrationUsed = observed.ActualMigrationUsed
 	node.MaxReceives = observed.DeclaredMaxReceives

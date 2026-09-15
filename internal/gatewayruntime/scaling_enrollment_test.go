@@ -148,3 +148,49 @@ func TestScalingEnrollmentChoosesDistinctDeterministicSnapshotSource(t *testing.
 		t.Fatalf("reordered enrollment changed immutable digest: %x/%x", first.Digest(), second.Digest())
 	}
 }
+
+func TestPreparationSnapshotAddressUsesAuthenticatedDirectoryBinding(t *testing.T) {
+	record := gateway.NodeRecord{
+		NodeID:           rafttransport.NodeID{4},
+		Incarnation:      2,
+		ServiceKeyDigest: replication.Digest{4},
+		DataEndpoint:     "peer-4", NativeEndpoint: "native-4", ControlEndpoint: "control-4",
+		DataAddress: "127.0.0.1:7401", NativeAddress: "127.0.0.1:7402",
+		ControlAddress: "127.0.0.1:7403", SnapshotAddress: "127.0.0.1:7404",
+		FailureDomain: "zone-4", Roles: gateway.NodeRoleStorage,
+		Lifecycle: gateway.NodeActive, Revision: 9, CatalogGeneration: 5,
+	}
+	replica := gateway.ReplicatedEndpoint{Member: 4, Node: record.NodeID, NodeIncarnation: record.Incarnation,
+		Endpoint: "peer-4", DataAddress: record.DataAddress, NativeEndpoint: "native-4", Address: record.NativeAddress,
+		ControlEndpoint: "control-4", ControlAddress: record.ControlAddress}
+	if !record.Valid() {
+		t.Fatal("dynamic directory record fixture is invalid")
+	}
+	if got, err := preparationSnapshotAddress(nil, replica, record); err != nil || got != record.SnapshotAddress {
+		t.Fatalf("authenticated dynamic snapshot endpoint got=%q err=%v", got, err)
+	}
+
+	missing := record
+	missing.SnapshotAddress = ""
+	if got, err := preparationSnapshotAddress(nil, replica, missing); err == nil || got != "" {
+		t.Fatalf("missing dynamic snapshot endpoint accepted: got=%q err=%v", got, err)
+	}
+	foreign := record
+	foreign.NodeID = rafttransport.NodeID{5}
+	if got, err := preparationSnapshotAddress(nil, replica, foreign); err == nil || got != "" {
+		t.Fatalf("foreign dynamic directory identity accepted: got=%q err=%v", got, err)
+	}
+
+	static := map[rafttransport.NodeID]scalingSnapshotBinding{
+		record.NodeID: {controlAddress: record.ControlAddress, snapshotAddress: "127.0.0.1:7504"},
+	}
+	if got, err := preparationSnapshotAddress(static, replica, missing); err != nil || got != "127.0.0.1:7504" {
+		t.Fatalf("valid static fallback got=%q err=%v", got, err)
+	}
+	foreignStatic := map[rafttransport.NodeID]scalingSnapshotBinding{
+		record.NodeID: {controlAddress: "127.0.0.1:7599", snapshotAddress: "127.0.0.1:7504"},
+	}
+	if got, err := preparationSnapshotAddress(foreignStatic, replica, missing); err == nil || got != "" {
+		t.Fatalf("foreign static control binding accepted: got=%q err=%v", got, err)
+	}
+}

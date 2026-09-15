@@ -87,6 +87,16 @@ func TestScalingMetadataCanonicalRecordsAndBoundedKeys(t *testing.T) {
 	if err != nil || opened != record {
 		t.Fatalf("canonical node record opened as %+v with err=%v", opened, err)
 	}
+	withSnapshot := record
+	withSnapshot.SnapshotAddress = "127.0.0.1:9001"
+	withSnapshotRaw, err := appendScalingNodeRecord(nil, withSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withSnapshotOpened, err := openScalingNodeRecord(withSnapshotRaw, record.NodeID, record.Incarnation)
+	if err != nil || withSnapshotOpened != withSnapshot {
+		t.Fatalf("snapshot endpoint was not durably round-tripped: %+v with err=%v", withSnapshotOpened, err)
+	}
 	if _, err = openScalingNodeRecord(append(bytes.Clone(raw), 'x'), record.NodeID, record.Incarnation); err == nil ||
 		(!errors.Is(err, ErrInvalidScalingMetadata) && !errors.Is(err, ErrReplicatedCatalog)) {
 		t.Fatalf("trailing bytes accepted by node record envelope: %v", err)
@@ -151,6 +161,28 @@ func TestScalingStateMachinesRejectTerminalCreationAndGenericRetirement(t *testi
 	record.Lifecycle = NodeJoining
 	if !record.Valid() {
 		t.Fatal("joining node fixture is invalid")
+	}
+}
+
+func TestNodeSnapshotAddressPromotionBindsTheExistingPhysicalIdentity(t *testing.T) {
+	joining := scalingTestNodeRecord([16]byte{0x31}, 1, NodeJoining, 1)
+	active := joining
+	active.Lifecycle = NodeActive
+	active.Revision++
+	active.SnapshotAddress = "127.0.0.1:9001"
+	if err := validateNodeTransition(joining, active); err != nil {
+		t.Fatalf("authenticated snapshot endpoint promotion rejected: %v", err)
+	}
+	changed := active
+	changed.DataAddress = "127.0.0.1:9999"
+	if err := validateNodeTransition(joining, changed); !errors.Is(err, ErrScalingIdentity) {
+		t.Fatalf("snapshot fill masked a physical identity substitution: %v", err)
+	}
+	replaced := active
+	replaced.SnapshotAddress = "127.0.0.1:9002"
+	replaced.Revision++
+	if err := validateNodeTransition(active, replaced); !errors.Is(err, ErrScalingIdentity) {
+		t.Fatalf("active snapshot endpoint was replaceable: %v", err)
 	}
 }
 
