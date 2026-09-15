@@ -795,11 +795,10 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 			return
 		}
 		if path := os.Getenv(seamlessScaleFailureEnvironment); path != "" {
-			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-				t.Logf("preserve failed scale state parent: %v", err)
-			} else if err := os.Rename(root, path); err != nil {
+			if err := copySeamlessScaleFailureTree(root, path); err != nil {
 				t.Logf("preserve failed scale state: %v", err)
 			} else {
+				_ = os.RemoveAll(root)
 				t.Logf("preserved failed scale state: %s", path)
 				return
 			}
@@ -1285,6 +1284,50 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 	} else {
 		t.Logf("scale evidence: %+v", evidence)
 	}
+}
+
+func copySeamlessScaleFailureTree(source, destination string) error {
+	if _, err := os.Stat(destination); err == nil {
+		return fmt.Errorf("destination already exists: %s", destination)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return err
+	}
+	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, relative)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return os.MkdirAll(target, info.Mode().Perm())
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("unsupported failure artifact %s", path)
+		}
+		input, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		output, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+		if err != nil {
+			_ = input.Close()
+			return err
+		}
+		_, copyErr := io.Copy(output, input)
+		closeOutputErr := output.Close()
+		closeInputErr := input.Close()
+		return errors.Join(copyErr, closeOutputErr, closeInputErr)
+	})
 }
 
 func writeSeamlessScaleSchemas(root string) error {
