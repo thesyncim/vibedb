@@ -325,6 +325,12 @@ func (backend *ScalingOperatorBackend) observeOnce(ctx context.Context, response
 					response.Blockers = append(response.Blockers,
 						backend.clusterBlockersForReference(intent, blockersFromEvidence(evidence), node.NodeID, node.Incarnation)...)
 				}
+				// A terminal decommission proof is a fresh authoritative cut. An
+				// older controller blocker must not remain attached to the
+				// operator response after that cut has established safe-to-stop.
+				if response.SafeToStop && evidence.ZeroAllReferences() {
+					response.Blockers = nil
+				}
 			}
 			if intent.Request.Kind == gateway.ScalingDecommission {
 				response.State = lifecycleName(node.Lifecycle)
