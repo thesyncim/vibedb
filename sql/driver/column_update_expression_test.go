@@ -217,7 +217,7 @@ func TestIntegerUpdatePreservesArbitraryWidthValuesAndBoundDelta(t *testing.T) {
 	if err := db.QueryRow(`
 		UPDATE update_expression_integer_width
 		SET score = score + ? WHERE id = ? RETURNING score, keep`,
-		math.MinInt64, "bound-delta",
+		int64(math.MinInt64), "bound-delta",
 	).Scan(&score, &keep); err != nil {
 		t.Fatal(err)
 	}
