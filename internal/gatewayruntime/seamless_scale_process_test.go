@@ -2141,6 +2141,7 @@ type seamlessScaleNodeProcess struct {
 	exited     chan struct{}
 	manifest   string
 	ready      func(context.Context, string) error
+	instance   uint64
 }
 
 type seamlessScalePhysicalCluster struct {
@@ -2208,6 +2209,7 @@ func launchSeamlessScaleNode(t *testing.T, binary, manifest string, ready func(c
 	process.command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	process.command.WaitDelay = 2 * time.Second
 	process.command.Stdout, process.command.Stderr = process.diagnostic, process.diagnostic
+	process.markInstance()
 	if err := process.command.Start(); err != nil {
 		t.Fatalf("start empty target: %v", err)
 	}
@@ -2252,6 +2254,7 @@ func (process *seamlessScaleNodeProcess) Restart(ctx context.Context) error {
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.WaitDelay = 2 * time.Second
 	command.Stdout, command.Stderr = process.diagnostic, process.diagnostic
+	process.markInstance()
 	if err := command.Start(); err != nil {
 		return err
 	}
@@ -2265,6 +2268,11 @@ func (process *seamlessScaleNodeProcess) Restart(ctx context.Context) error {
 		return fmt.Errorf("restart readiness: %w (process=%s diagnostics=%q)", err, state, process.diagnostic.String())
 	}
 	return nil
+}
+
+func (process *seamlessScaleNodeProcess) markInstance() {
+	process.instance++
+	fmt.Fprintf(process.diagnostic, "RF3 process instance=%d starting\n", process.instance)
 }
 
 func waitSeamlessScaleManifestGateway(ctx context.Context, manifestPath string) error {

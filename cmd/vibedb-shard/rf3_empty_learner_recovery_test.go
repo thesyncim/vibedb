@@ -101,13 +101,14 @@ func (rf3EnrollmentRecoveryReadFunc) ReadEnrollmentIntent(context.Context, [32]b
 
 func TestRF3DynamicLearnerRecoverySkipsOnlyCertifiedMissingHistory(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		count  int
-		change func(*nodecontrol.BootstrapReadReply) error
-		want   error
+		name     string
+		count    int
+		attempts int
+		change   func(*nodecontrol.BootstrapReadReply) error
+		want     error
 	}{
 		{name: "more retired reservations than live capacity", count: maxRF3ManifestGroups + 1},
-		{name: "reader unavailable", count: 1, change: func(*nodecontrol.BootstrapReadReply) error { return nodecontrol.ErrBootstrapReadUnavailable }, want: nodecontrol.ErrBootstrapReadUnavailable},
+		{name: "reader unavailable", count: 1, attempts: rf3EnrollmentRecoveryAttempts, change: func(*nodecontrol.BootstrapReadReply) error { return nodecontrol.ErrBootstrapReadUnavailable }, want: nodecontrol.ErrBootstrapReadUnavailable},
 		{name: "missing witnesses", count: 1, change: func(reply *nodecontrol.BootstrapReadReply) error {
 			reply.CatalogHeadDigest = replication.Digest{}
 			return nil
@@ -157,14 +158,97 @@ func TestRF3DynamicLearnerRecoverySkipsOnlyCertifiedMissingHistory(t *testing.T)
 			if err := factory.Recover(t.Context()); !errors.Is(err, test.want) {
 				t.Fatalf("recovery=%v want=%v", err, test.want)
 			}
-			if calls != test.count {
-				t.Fatalf("read calls=%d want=%d", calls, test.count)
+			wantCalls := test.count
+			if test.attempts != 0 {
+				wantCalls *= test.attempts
+			}
+			if calls != wantCalls {
+				t.Fatalf("read calls=%d want=%d", calls, wantCalls)
 			}
 			entries, err := os.ReadDir(filepath.Join(root, "enrollments"))
 			if err != nil || len(entries) != test.count {
 				t.Fatalf("retained artifacts=%d err=%v", len(entries), err)
 			}
 		})
+	}
+}
+
+func TestRF3DynamicLearnerRecoveryRetriesTransientBootstrapRead(t *testing.T) {
+	root := t.TempDir()
+	intent := rf3RecoveryEnrollmentIntent()
+	proof := rf3ReservationProof(intent)
+	intent.Proof = &proof
+	reservation := rf3EnrollmentReservationPath(root, intent.IntentID)
+	if err := os.MkdirAll(reservation, 0700); err != nil {
+		t.Fatal(err)
+	}
+	descriptor := snapshottransfer.Descriptor{Group: intent.Group, SourceMember: 1, TargetMember: 4, TargetStore: intent.Target.StoreID, TargetIncarnation: 1, SchemaGeneration: 1, ReplicaSetVersion: 1, SnapshotIndex: 1, SnapshotTerm: 1, Lineage: [32]byte{1}, ArtifactHash: [32]byte{2}, ArtifactBytes: 4096, ChunkBytes: 4096}
+	if err := persistRF3EnrollmentDescriptor(reservation, intent, descriptor); err != nil {
+		t.Fatal(err)
+	}
+	node := gateway.NodeRecord{NodeID: intent.Target.Node, Incarnation: 1, ServiceKeyDigest: replication.Digest{1},
+		DataEndpoint: intent.Target.Endpoint, NativeEndpoint: intent.Target.NativeEndpoint, ControlEndpoint: intent.Target.ControlEndpoint,
+		DataAddress: string(intent.Target.Endpoint), NativeAddress: string(intent.Target.NativeEndpoint), ControlAddress: string(intent.Target.ControlEndpoint),
+		FailureDomain: "test", Roles: gateway.NodeRoleStorage, Lifecycle: gateway.NodeActive, Revision: 1, CatalogGeneration: 1}
+	reply := nodecontrol.BootstrapReadReply{Nonce: [16]byte{1}, Operation: nodecontrol.OpReadOwnEnrollmentRecovery,
+		PhysicalNode: node.NodeID, Incarnation: node.Incarnation, IntentID: intent.IntentID, IntentMissing: true, Node: node,
+		DirectoryCutRevision: 1, DirectoryCutDigest: replication.Digest{1}, CatalogGeneration: 1,
+		CatalogHeadDigest: replication.Digest{2}, EnrollmentDirectoryDigest: replication.Digest{3}}
+	calls := 0
+	slot := new(nodecontrol.IntentReaderSlot)
+	if err := slot.Set(rf3EnrollmentRecoveryReadFunc(func(_ context.Context, id [32]byte) (nodecontrol.BootstrapReadReply, error) {
+		calls++
+		if id != intent.IntentID {
+			t.Fatalf("read intent=%x want=%x", id, intent.IntentID)
+		}
+		if calls == 1 {
+			return nodecontrol.BootstrapReadReply{}, nodecontrol.ErrBootstrapReadUnavailable
+		}
+		return reply, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	factory := &rf3DynamicLearnerFactory{root: root, runtime: &rf3EmptyNodeRuntime{reader: slot}}
+	if err := factory.Recover(t.Context()); err != nil {
+		t.Fatalf("transient bootstrap read prevented recovery: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("read calls=%d want=2", calls)
+	}
+}
+
+func TestRF3DynamicLearnerRecoveryDoesNotRetryDefinitiveReadFailure(t *testing.T) {
+	calls := 0
+	slot := new(nodecontrol.IntentReaderSlot)
+	if err := slot.Set(rf3EnrollmentRecoveryReadFunc(func(context.Context, [32]byte) (nodecontrol.BootstrapReadReply, error) {
+		calls++
+		return nodecontrol.BootstrapReadReply{}, nodecontrol.ErrBootstrapReadStale
+	})); err != nil {
+		t.Fatal(err)
+	}
+	factory := &rf3DynamicLearnerFactory{runtime: &rf3EmptyNodeRuntime{reader: slot}}
+	_, err := factory.readEnrollmentRecovery(t.Context(), [32]byte{1})
+	if !errors.Is(err, nodecontrol.ErrBootstrapReadStale) || calls != 1 {
+		t.Fatalf("definitive read failure retried or changed: err=%v calls=%d", err, calls)
+	}
+}
+
+func TestRF3DynamicLearnerRecoveryStopsOnContextCancellation(t *testing.T) {
+	calls := 0
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	slot := new(nodecontrol.IntentReaderSlot)
+	if err := slot.Set(rf3EnrollmentRecoveryReadFunc(func(context.Context, [32]byte) (nodecontrol.BootstrapReadReply, error) {
+		calls++
+		cancel()
+		return nodecontrol.BootstrapReadReply{}, nodecontrol.ErrBootstrapReadUnavailable
+	})); err != nil {
+		t.Fatal(err)
+	}
+	factory := &rf3DynamicLearnerFactory{runtime: &rf3EmptyNodeRuntime{reader: slot}}
+	_, err := factory.readEnrollmentRecovery(ctx, [32]byte{1})
+	if !errors.Is(err, context.Canceled) || calls != 1 {
+		t.Fatalf("cancellation was retried or changed: err=%v calls=%d", err, calls)
 	}
 }
 

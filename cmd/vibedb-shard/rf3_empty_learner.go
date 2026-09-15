@@ -39,7 +39,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const rf3DynamicRepositoryMaxBytes = uint64(1) << 50
+const (
+	rf3DynamicRepositoryMaxBytes        = uint64(1) << 50
+	rf3EnrollmentRecoveryAttempts       = 3
+	rf3EnrollmentRecoveryAttemptTimeout = rf3NetworkTimeout / 4
+	rf3EnrollmentRecoveryRetryDelay     = 25 * time.Millisecond
+)
 
 type rf3DynamicLearnerFactory struct {
 	mu          sync.Mutex
@@ -201,6 +206,56 @@ func (factory *rf3DynamicLearnerFactory) Recover(ctx context.Context) error {
 	}
 }
 
+// readEnrollmentRecovery keeps startup bounded while allowing a gateway to
+// become available after the empty node has started its authenticated peer.
+// Only transport/uncommitted outcomes are retried. A reply that is
+// authenticated but conflicts with the requested enrollment remains a hard
+// stale failure and is never retried into serving authority.
+func (factory *rf3DynamicLearnerFactory) readEnrollmentRecovery(
+	ctx context.Context, intentID [32]byte,
+) (nodecontrol.BootstrapReadReply, error) {
+	var last error
+	for attempt := 0; attempt < rf3EnrollmentRecoveryAttempts; attempt++ {
+		if err := context.Cause(ctx); err != nil {
+			return nodecontrol.BootstrapReadReply{}, err
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, rf3EnrollmentRecoveryAttemptTimeout)
+		cut, err := factory.runtime.reader.ReadEnrollmentRecovery(attemptCtx, intentID)
+		cancel()
+		if err == nil {
+			return cut, nil
+		}
+		if cause := context.Cause(ctx); cause != nil {
+			return nodecontrol.BootstrapReadReply{}, cause
+		}
+		last = err
+		if !retryableRF3EnrollmentRecoveryError(err) || attempt+1 == rf3EnrollmentRecoveryAttempts {
+			return nodecontrol.BootstrapReadReply{}, err
+		}
+		timer := time.NewTimer(rf3EnrollmentRecoveryRetryDelay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nodecontrol.BootstrapReadReply{}, context.Cause(ctx)
+		case <-timer.C:
+		}
+	}
+	return nodecontrol.BootstrapReadReply{}, last
+}
+
+func retryableRF3EnrollmentRecoveryError(err error) bool {
+	if err == nil || errors.Is(err, nodecontrol.ErrBootstrapReadUnauthorized) ||
+		errors.Is(err, nodecontrol.ErrBootstrapReadConflict) ||
+		errors.Is(err, nodecontrol.ErrBootstrapReadStale) ||
+		errors.Is(err, nodecontrol.ErrBootstrapReadRetired) {
+		return false
+	}
+	return errors.Is(err, nodecontrol.ErrBootstrapReadUnavailable) ||
+		errors.Is(err, nodecontrol.ErrBootstrapReadOutcomeUnknown)
+}
+
 func (factory *rf3DynamicLearnerFactory) recoverEnrollment(ctx context.Context, entry os.DirEntry) error {
 	var err error
 	if err = context.Cause(ctx); err != nil {
@@ -225,8 +280,14 @@ func (factory *rf3DynamicLearnerFactory) recoverEnrollment(ctx context.Context, 
 	}
 	var intentID [32]byte
 	copy(intentID[:], descriptorReceipt.IntentID[:])
-	cut, readErr := factory.runtime.reader.ReadEnrollmentRecovery(ctx, intentID)
+	cut, readErr := factory.readEnrollmentRecovery(ctx, intentID)
 	if readErr != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
+		}
+		if retryableRF3EnrollmentRecoveryError(readErr) {
+			return readErr
+		}
 		return errors.Join(nodecontrol.ErrStale, readErr)
 	}
 	if cut.EnrollmentMissing() {
