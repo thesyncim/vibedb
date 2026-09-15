@@ -67,11 +67,14 @@ median between the VibeDB-first baseline and candidate campaigns.
 
 JID2 uses a bounded descriptor for one primary-key point UPDATE containing
 independent assignments such as `SET score=score+1,counter=counter+1`. The
-benchmark adds `counter` only for this workload, initializes it from the same
-independent oracle as `score`, and checks both columns after every trial. The
-apply path uses one `vibejson.ParseOptions(... ZeroCopy:true)` pass over the
-source object, builds both replacement values before publishing the row, and
-retains JID1 for the single-assignment case.
+benchmark adds `counter` only for this workload, initializes both counters to
+the same deterministic starting value, and checks both columns after every
+trial. The expected values come from successful writes, independently of the
+final database read; because both fields receive the same delta, the verifier
+uses that one expected-value array for both columns. The apply path uses one
+`vibejson.ParseOptions(... ZeroCopy:true)` pass over the source object, builds
+both replacement values before publishing the row, and retains JID1 for the
+single-assignment case.
 
 The matched campaign used source `825620ffd` plus the JID2 working-tree patch
 (the candidate `source.patch` records the exact bytes), and a detached
@@ -79,7 +82,7 @@ The matched campaign used source `825620ffd` plus the JID2 working-tree patch
 8,192 rows, 1,000 warmups, 10,000 measured C8 operations, three repetitions,
 RF3/durable settings, and zero transient-retry allowance. Every trial had
 10,000 successes, zero errors, `verified=true`, and matching score/counter
-oracles.
+checks against the successful-write oracle.
 
 VibeDB-first:
 
@@ -160,10 +163,10 @@ nonzero error count.
 For a fair completed-write comparison, `--retry-transient` retries only
 SQLSTATE 40001 and 40P01, up to 64 extra attempts with a bounded 100 µs to
 2 ms delay. The same policy is applied to both engines, and the report keeps
-`successful_ops`, `attempts`, `transient_retries`, `errors`, and independent
+`successful_ops`, `attempts`, `transient_retries`, `errors`, and the
 `expected_hot_scores`/`observed_hot_scores` fields. The 10,000-operation,
 1,000-warmup, three-repetition VibeDB-first run completed every logical write
-with matching independent oracles:
+with matching score and counter checks against the successful-write oracle:
 
 | engine/build | trial 1 | trial 2 | trial 3 | median |
 | --- | ---: | ---: | ---: | ---: |
@@ -204,8 +207,11 @@ CODEX_AGENT_ID=write_validation \
 The corresponding two-counter contention workload was `update_multi_hot`.
 With 8,192 rows, 1,000 warmups, 10,000 measured C8 operations, three
 repetitions, and the same bounded retry-to-completion policy, all trials
-completed 10,000 logical writes with matching independent score/counter
-oracles:
+completed 10,000 logical writes with matching score/counter checks against the
+successful-write oracle. The report's archived hot fields contain the expected
+and observed `score` values; the full verification query checks `counter` too
+using the same expected-value array because both fields start and advance
+identically:
 
 | engine/build | trial 1 | trial 2 | trial 3 | median |
 | --- | ---: | ---: | ---: | ---: |
@@ -312,6 +318,6 @@ including malformed framing, simultaneous application, exact wide integers,
 reopen/replay, and the direct executor, passed after the extension; the race
 suite also covered concurrent same-key JID1 and JID2 increments. The SQL
 benchmark package test passed after adding the two-counter workloads and
-independent score/counter verification. The SQL-path tests prove JID2 was
+score/counter verification against the successful-write oracle. The SQL-path tests prove JID2 was
 decoded from the actual direct proposal with zero preimage reads; planner-only
 coverage is not the performance evidence.
