@@ -345,7 +345,9 @@ func appendCommittedRF3ReadAuthorityChange(
 	}
 	previousTerm, err := item.nodeLog.Term(status.Commit)
 	if err != nil {
-		t.Fatal(err)
+		first, firstErr := item.nodeLog.FirstIndex()
+		last, lastErr := item.nodeLog.LastIndex()
+		t.Fatalf("term at commit unavailable: commit=%d applied=%d term=%d first=%d last=%d termErr=%v firstErr=%v lastErr=%v", status.Commit, status.Applied, status.Term, first, last, err, firstErr, lastErr)
 	}
 	entryIndex := status.Commit + 1
 	entryTerm := status.Term
