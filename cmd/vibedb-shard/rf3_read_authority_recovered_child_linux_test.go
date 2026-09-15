@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 type rf3RecoveredReadAuthorityFixture struct {
@@ -279,4 +280,99 @@ func TestRF3ReadAuthorityRecoveredChildSelectionDoesNotHideOrdinaryRosterMismatc
 			t.Fatalf("group %d marker after ordinary mismatch = %v, want absent", index, err)
 		}
 	}
+}
+
+func TestRF3ReadAuthoritySkipsAuthenticatedPostRemoveRoster(t *testing.T) {
+	fixture := newRF3RecoveredReadAuthorityFixture(t)
+	item := &fixture.prepared.groups[0]
+	runtime := fixture.runtimes[0]
+	appendCommittedRF3ReadAuthorityChange(t, item, runtime, pb.ConfChangeAddNode, 4)
+	appendCommittedRF3ReadAuthorityChange(t, item, runtime, pb.ConfChangeRemoveNode, 1)
+	publication, err := runtime.Publication()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := publication.ConfState.GetVoters(); len(got) != 3 || got[0] != 2 || got[1] != 3 || got[2] != 4 {
+		t.Fatalf("post-remove publication voters = %v, want [2 3 4]", got)
+	}
+	item.readAuthorityDynamicMember = 4
+	policy, err := fixture.manifest.ReadAuthority.rf3Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	skip, retired, err := rf3ReadAuthorityDynamicCut(*item, runtime, policy)
+	if err != nil || !skip || !retired {
+		t.Fatalf("authenticated post-remove cut = skip=%t retired=%t err=%v, want true/true", skip, retired, err)
+	}
+	if _, err := os.Stat(rf3ReadAuthorityMarkerPath(item.manifest.Route.MemberRoot)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired local marker before startup = %v, want absent", err)
+	}
+	cache, evidence, err := configureRF3ReadAuthorities(
+		fixture.manifest, fixture.prepared.groups, fixture.runtimes,
+		fixture.profile, fixture.authz, fixture.profile.LocalIdentity().Node,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cache == nil {
+		t.Fatal("surviving group authority cache is nil")
+	}
+	t.Cleanup(func() { _ = cache.Close() })
+	if _, ok := cache.RegistrationFor(runtime.Identity().Group, runtime.Identity().AllocationGeneration); ok {
+		t.Fatal("retired local group remained registered in authority cache")
+	}
+	if got := evidence[0].Status; got != raftmember.ReadAuthorityEvidenceDisabled {
+		t.Fatalf("retired local startup evidence status = %v, want disabled", got)
+	}
+	if got := fixture.runtimes[0].ReadAuthorityEvidence().Status; got != raftmember.ReadAuthorityEvidenceDisabled {
+		t.Fatalf("retired local runtime status = %v, want disabled", got)
+	}
+	if _, err := os.Stat(rf3ReadAuthorityMarkerPath(item.manifest.Route.MemberRoot)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired local marker after startup = %v, want absent", err)
+	}
+	if got := evidence[1].Status; got != raftmember.ReadAuthorityEvidenceConfigured {
+		t.Fatalf("surviving group startup evidence status = %v, want configured", got)
+	}
+}
+
+func appendCommittedRF3ReadAuthorityChange(
+	t testing.TB, item *preparedRF3Group, runtime *raftmember.Runtime, changeType pb.ConfChangeType, member uint64,
+) {
+	t.Helper()
+	status, err := runtime.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousTerm, err := item.nodeLog.Term(status.Commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entryIndex := status.Commit + 1
+	entryTerm := status.Term
+	node := member
+	_, encoded, err := pb.MarshalConfChange(&pb.ConfChange{
+		Type: changeType.Enum(), NodeId: &node,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	from, to, term, index, logTerm, commit := uint64(2), status.MemberID, entryTerm, status.Commit, previousTerm, entryIndex
+	if err := runtime.StepMessage(&pb.Message{
+		Type: pb.MsgApp.Enum(), From: &from, To: &to, Term: &term,
+		Index: &index, LogTerm: &logTerm, Commit: &commit,
+		Entries: []*pb.Entry{{Type: pb.EntryConfChange.Enum(), Index: &entryIndex, Term: &entryTerm, Data: encoded}},
+	}); err != nil {
+		t.Fatalf("step committed membership change %d/%d: %v", changeType, member, err)
+	}
+	var workspace raftmember.ReadyWorkspace
+	for step := 0; step < 100; step++ {
+		result, err := runtime.DriveReady(&workspace, func(raftmember.OutboundMessage) error { return nil }, nil)
+		if err != nil {
+			t.Fatalf("drive committed membership change %d/%d step %d: %v", changeType, member, step, err)
+		}
+		if !result.Progressed() {
+			return
+		}
+	}
+	t.Fatalf("membership change %d/%d did not settle", changeType, member)
 }

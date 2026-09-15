@@ -200,6 +200,13 @@ type preparedRF3Group struct {
 	// receipt-bound identities. It therefore retains its pre-restart
 	// ReadIndex-only status.
 	adoptedChild bool
+	// readAuthorityDynamicMember is set only after preparation reconstructs a
+	// dynamic member from an authenticated durable enrollment receipt. A
+	// changed stable voter cut must not restore the static read-authority
+	// policy: the receipt proves the new transport roster, while the marker is
+	// still bound to the old policy. The Runtime remains prepared so retired
+	// control replay can drain.
+	readAuthorityDynamicMember uint64
 }
 
 type preparedRF3Set struct {
@@ -397,6 +404,9 @@ func prepareRF3GroupSetOnNodeWithRetirementsAndPeers(manifest rf3Manifest, profi
 		dynamicTarget, dynamicPeer, dynamicErr := rf3DynamicEnrollmentTarget(single, group, item.publication, enrollmentPeers)
 		if dynamicErr != nil {
 			return result, closePreparedRF3Groups(append(result.groups, item), dynamicErr)
+		}
+		if dynamicTarget != nil {
+			item.readAuthorityDynamicMember = dynamicTarget.MemberID
 		}
 		roster, _, _, native, err := buildRF3RosterWithEnrolledTarget(single, group, base.Binding.MemberID, item.publication, dynamicTarget)
 		if err != nil {
