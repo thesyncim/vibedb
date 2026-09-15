@@ -352,12 +352,6 @@ func (manifest gatewayReplicaControlManifest) ValidateCatalog(snapshot *gateway.
 				return err
 			}
 		}
-		if descriptor.EnrolledTarget != nil {
-			if err := validateGatewayReplicaCatalogEndpoint(snapshot, addresses,
-				*descriptor.EnrolledTarget); err != nil {
-				return err
-			}
-		}
 	}
 	return nil
 }
