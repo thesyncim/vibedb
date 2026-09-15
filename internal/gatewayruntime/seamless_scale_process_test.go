@@ -1564,8 +1564,10 @@ func buildSeamlessScaleEmptyPreparation(sourceManifest, targetRoot, targetCertif
 	// enrollment wave crosses the pacing path without changing production
 	// defaults or migration admission limits.
 	migrationBudget := migrationbudget.DefaultConfig()
-	migrationBudget.NetworkSend = migrationbudget.RateLimit{BytesPerSecond: 256 << 10, BurstBytes: 64 << 10}
-	migrationBudget.NetworkReceive = migrationbudget.RateLimit{BytesPerSecond: 256 << 10, BurstBytes: 64 << 10}
+	// Keep the burst small enough to expose real pacing while leaving the
+	// two-minute per-snapshot RPC enough time for the seeded artifact.
+	migrationBudget.NetworkSend = migrationbudget.RateLimit{BytesPerSecond: 2 << 20, BurstBytes: 64 << 10}
+	migrationBudget.NetworkReceive = migrationbudget.RateLimit{BytesPerSecond: 2 << 20, BurstBytes: 64 << 10}
 	options := rf3testfixture.EmptyNodeOptions{Root: targetRoot, NodeIncarnation: 1, Key: key,
 		NodeStore: source.NodeLog.Options, Listeners: rf3testfixture.ProcessListeners{
 			Peer: listeners["peer"], Native: listeners["native"], Snapshot: listeners["snapshot"], Control: listeners["control"],
