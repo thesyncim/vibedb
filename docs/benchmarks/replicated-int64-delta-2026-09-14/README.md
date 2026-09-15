@@ -180,15 +180,19 @@ integer parameter; primary-key assignments, maintained global indexes,
 RETURNING, multiple assignments, nested paths, and other expressions use the
 existing path. Local index maintenance still runs through the normal apply
 pipeline. SQL integer aliases collapse to the repository's JSON integer type
-and use exact signed int64 arithmetic. That type accepts only exponent-free
-JSON integer spellings, so `1.0` and `1e0` remain on the existing invalid-value
-path just as they do for a materialized `INTEGER` update.
+and carry a signed int64 delta. The stored value and result retain the
+repository's exact arbitrary-width JSON integer semantics, including values
+beyond int64; only exponent-free JSON integer spellings are accepted, so
+`1.0` and `1e0` remain on the existing invalid-value path just as they do for
+a materialized `INTEGER` update.
 
 At apply time a missing target row remains a zero-row update. A missing or JSON
 null current value propagates JSON null, and normal schema validation preserves
-NOT NULL behavior. Overflow and invalid stored values produce the existing
-deterministic invalid-document result while the Raft log advances. A repeated
-request reuses the original JID1 command and does not increment twice; gateway
+NOT NULL behavior. Malformed or non-integer stored values produce the existing
+deterministic invalid-document result while the Raft log advances; valid
+arithmetic results that exceed int64 remain exact until the normal
+document-size bound is reached. A repeated request reuses the original JID1
+command and does not increment twice; gateway
 replanning after restart reconstructs that same command instead of creating a
 new preimage-dependent digest. Tests also cover preservation of unrelated
 fields, concurrent same-key increments, and reopen/replay.

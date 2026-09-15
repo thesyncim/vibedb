@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 
@@ -169,6 +170,60 @@ func TestUpdateExpressionsExactArithmeticAndAtomicErrors(t *testing.T) {
 			t.Fatalf("unexpected trailing verification row or error: %v", rows.Err())
 		}
 	})
+}
+
+func TestIntegerUpdatePreservesArbitraryWidthValuesAndBoundDelta(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`
+		CREATE TABLE update_expression_integer_width (
+			id STRING PRIMARY KEY,
+			score INTEGER NOT NULL,
+			keep STRING NOT NULL
+		)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO update_expression_integer_width VALUES (?), (?), (?), (?), (?)`,
+		`{"id":"positive-max","score":9223372036854775807,"keep":"max"}`,
+		`{"id":"negative-min","score":-9223372036854775808,"keep":"min"}`,
+		`{"id":"positive-wide","score":9223372036854775808,"keep":"wide-positive"}`,
+		`{"id":"negative-wide","score":-9223372036854775809,"keep":"wide-negative"}`,
+		`{"id":"bound-delta","score":0,"keep":"bound"}`,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, update := range []struct {
+		id, expression, wantScore, wantKeep string
+	}{
+		{id: "positive-max", expression: "score + 1", wantScore: "9223372036854775808", wantKeep: "max"},
+		{id: "negative-min", expression: "score - 1", wantScore: "-9223372036854775809", wantKeep: "min"},
+		{id: "positive-wide", expression: "score - 1", wantScore: "9223372036854775807", wantKeep: "wide-positive"},
+		{id: "negative-wide", expression: "score + 1", wantScore: "-9223372036854775808", wantKeep: "wide-negative"},
+	} {
+		var score, keep string
+		if err := db.QueryRow(
+			`UPDATE update_expression_integer_width SET score = `+update.expression+
+				` WHERE id = ? RETURNING score, keep`, update.id,
+		).Scan(&score, &keep); err != nil {
+			t.Fatalf("%s update: %v", update.id, err)
+		}
+		if score != update.wantScore || keep != update.wantKeep {
+			t.Fatalf("%s result = (%q,%q), want (%q,%q)",
+				update.id, score, keep, update.wantScore, update.wantKeep)
+		}
+	}
+
+	var score, keep string
+	if err := db.QueryRow(`
+		UPDATE update_expression_integer_width
+		SET score = score + ? WHERE id = ? RETURNING score, keep`,
+		math.MinInt64, "bound-delta",
+	).Scan(&score, &keep); err != nil {
+		t.Fatal(err)
+	}
+	if score != "-9223372036854775808" || keep != "bound" {
+		t.Fatalf("MinInt64 delta result = (%q,%q), want (-9223372036854775808,bound)", score, keep)
+	}
 }
 
 func TestCanonicalComputedInteger(t *testing.T) {

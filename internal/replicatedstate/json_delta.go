@@ -3,6 +3,7 @@ package replicatedstate
 import (
 	"bytes"
 	"math"
+	"math/big"
 	"strconv"
 
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -12,10 +13,10 @@ import (
 // materializeJSONInt64Delta evaluates a JID1 operation against the row read
 // from the apply snapshot. It returns a normal JSON document for the existing
 // schema, index, ownership, and data-chain validation pipeline. A malformed
-// descriptor, non-integer current value, arithmetic overflow, or non-object
-// row is a deterministic invalid-document result; transaction apply converts
-// that caller-data result into its normal abort vote while still advancing the
-// Raft log.
+// descriptor, non-integer current value, or non-object row is a deterministic
+// invalid-document result; exponent-free integers are evaluated exactly even
+// when they exceed int64. Transaction apply converts that caller-data result
+// into its normal abort vote while still advancing the Raft log.
 func materializeJSONInt64Delta(
 	document, descriptor []byte, maxBytes int,
 ) ([]byte, uint32) {
@@ -50,22 +51,17 @@ func materializeJSONInt64Delta(
 	}
 
 	newValue := []byte("null")
-	var number [20]byte
 	if currentValue != nil {
 		raw := vibejson.RawValue{Src: currentValue}
 		if raw.IsNull() {
 			// SQL NULL arithmetic remains NULL. The regular final schema
 			// validator decides whether this column permits NULL.
 		} else {
-			current, currentOK := raw.Int64()
-			if !currentOK {
+			var number [20]byte
+			newValue, ok = appendJSONIntegerDelta(number[:0], currentValue, delta)
+			if !ok {
 				return nil, ResultInvalidDocument
 			}
-			next, nextOK := addInt64Delta(current, delta)
-			if !nextOK {
-				return nil, ResultInvalidDocument
-			}
-			newValue = strconv.AppendInt(number[:0], next, 10)
 		}
 	}
 
@@ -162,6 +158,54 @@ func addInt64Delta(current, delta int64) (int64, bool) {
 		return 0, false
 	}
 	return current + delta, true
+}
+
+// appendJSONIntegerDelta appends the exact result of adding delta to one
+// exponent-free JSON integer. The usual int64 case stays allocation-free; a
+// wider valid SchemaInteger value takes the exact big.Int fallback so INTEGER
+// retains its repository-wide arbitrary-precision JSON semantics.
+func appendJSONIntegerDelta(dst, current []byte, delta int64) ([]byte, bool) {
+	if value, ok := (vibejson.RawValue{Src: current}).Int64(); ok {
+		next, ok := addInt64Delta(value, delta)
+		if !ok {
+			// A result outside int64 is still a valid JSON INTEGER. Fall through
+			// to the exact-width path instead of rejecting it.
+			return appendBigJSONIntegerDelta(dst, current, delta)
+		}
+		return strconv.AppendInt(dst, next, 10), true
+	}
+	return appendBigJSONIntegerDelta(dst, current, delta)
+}
+
+func appendBigJSONIntegerDelta(dst, current []byte, delta int64) ([]byte, bool) {
+	if !jsonIntegerSpelling(current) {
+		return nil, false
+	}
+	value, ok := new(big.Int).SetString(string(current), 10)
+	if !ok {
+		return nil, false
+	}
+	value.Add(value, big.NewInt(delta))
+	return value.Append(dst, 10), true
+}
+
+func jsonIntegerSpelling(value []byte) bool {
+	if len(value) == 0 {
+		return false
+	}
+	start := 0
+	if value[0] == '-' {
+		start = 1
+	}
+	if start == len(value) {
+		return false
+	}
+	for _, char := range value[start:] {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func jsonDeltaAddSize(total *int, add, max int) bool {

@@ -218,11 +218,11 @@ func TestReplicatedDigestGoldenVectors(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertDigestHex(t, "apply contract", contract,
-		"6d60e84f1e81bd67a5694ebd59bae5f7cc96651df92b15691777a6eb777f382d")
+		"0914340572a774d21c3df927e0868969a476e25b8dee29383ab5bb1aabdd36f2")
 	assertDigestHex(t, "data-chain seed", seed,
-		"4522f1930a5c024c911981a2ed1c9dca557773e929e1e7cb37e929c11607cbf9")
+		"f90224cbe537ee1613a4f34be9496db005c4993c378f62ee037c97b035e3337d")
 	assertDigestHex(t, "data-chain transition", transition,
-		"764b86ac657520cce4a63384ca4e9b02bbf71bf19a61dd5d7229f302da3bca8b")
+		"ace2987f46183656498ee22ba34456c7d3b9ac8a6820aeee8e1f315a34aef6cd")
 }
 
 func deriveBundleContractForTest(manifest [sha256.Size]byte, maxSessions uint64,
