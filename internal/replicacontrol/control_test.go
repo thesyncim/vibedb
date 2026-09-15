@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -213,6 +214,46 @@ func TestServiceRejectsWrongTrafficAndStaleReplicaSetBeforeResponse(t *testing.T
 		t.Fatalf("stale replica set err=%v", err)
 	}
 	_ = left.Close()
+}
+
+func TestServiceUnauthorizedAdmissionIncludesCorrelationContext(t *testing.T) {
+	request, cut := controlFixture()
+	domain := rafttransport.TrustDomain{ClusterID: request.Group.ClusterID,
+		ClusterIncarnation: request.Group.ClusterIncarnation}
+	deadline := func() time.Time { return time.Now().Add(time.Second) }
+	service, err := NewService(ServiceOptions{
+		Observer: observerFunc(func(context.Context, raftmember.GroupKey, uint64) (raftservice.ReplicaObservation, error) {
+			return cut, nil
+		}),
+		AuthorizeAuthenticated: func(rafttransport.PeerBinding, Request) bool { return false },
+		ReadDeadline:           deadline, WriteDeadline: deadline, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, right := net.Pipe()
+	defer left.Close()
+	server := &testConnection{Conn: right,
+		identity: rafttransport.PeerIdentity{TrustDomain: domain, Node: rafttransport.NodeID{9}},
+		class:    rafttransport.TrafficShardControl}
+	done := make(chan error, 1)
+	go func() { done <- service.Serve(context.Background(), server) }()
+	if err := WriteRequest(left, request); err != nil {
+		t.Fatal(err)
+	}
+	serveErr := <-done
+	if !errors.Is(serveErr, ErrUnauthorized) {
+		t.Fatalf("admission error=%v, want ErrUnauthorized", serveErr)
+	}
+	for _, field := range []string{
+		"group=", "target_member=2", "peer_node=", "domain_match=true",
+		"key_present=false", "authorized=false", "expected_replica_set=17",
+		"operation_set=true", "step_set=true", "health_only=false",
+	} {
+		if !strings.Contains(serveErr.Error(), field) {
+			t.Fatalf("admission error=%q missing %q", serveErr, field)
+		}
+	}
 }
 
 func controlFixture() (Request, raftservice.ReplicaObservation) {

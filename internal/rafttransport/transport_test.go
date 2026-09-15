@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -229,6 +230,32 @@ func TestOrdinaryTransportFailsFastAtPerPeerAndGlobalBounds(t *testing.T) {
 	}
 	if frames, _ := transport.GlobalQueueStats(); frames != 3 {
 		t.Fatalf("global frames = %d, want 3", frames)
+	}
+}
+
+func TestOrdinaryTransportSendErrorIncludesSafeOutboundContext(t *testing.T) {
+	fixture := newTransportTestFixture(t)
+	transport, err := NewOrdinaryTransport(transportTestOptions(fixture, ordinaryDialFunc(func(context.Context, NodeID) (PeerConnection, error) {
+		return nil, io.ErrClosedPipe
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel, done := runTransportTest(t, transport)
+	defer stopTransportTest(t, transport, cancel, done)
+	outbound := fixture.outbound(0, 7)
+	outbound.Message.To = frameU64(outbound.Message.GetTo() + 1)
+	err = transport.Send(outbound)
+	if !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("send error=%v, want ErrInvalidFrame", err)
+	}
+	for _, field := range []string{
+		"group=", "from=13", "to=11", "kind=ordinary", "message_type=8",
+		"index=7", "term=5",
+	} {
+		if !strings.Contains(err.Error(), field) {
+			t.Fatalf("send error=%q missing %q", err, field)
+		}
 	}
 }
 

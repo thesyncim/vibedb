@@ -865,24 +865,24 @@ func (transport *OrdinaryTransport) Send(outbound raftmember.OutboundMessage) er
 		if errors.Is(err, errRetiredOutboundDestination) || errors.Is(err, errRetiredOutboundSource) {
 			return nil // Committed removal canceled this queued ordinary packet.
 		}
-		return err
+		return outboundFailure(outbound, err)
 	}
 	wireBytes := plan.frameSize + StreamRecordHeaderBytes
 	if wireBytes > transport.coalesce.MaxBytes {
-		return ErrFrameTooLarge
+		return outboundFailure(outbound, ErrFrameTooLarge)
 	}
 	ownedSize, _, _ := framedFrameCapacity(plan.frameSize, transport.frames.retain)
 	peer, err := transport.reserveOutbound(plan, ownedSize)
 	if err != nil {
-		return err
+		return outboundFailure(outbound, err)
 	}
 	storage, err := transport.frames.getFramed(plan.frameSize)
 	if err != nil {
 		transport.unwindReservation(peer, ownedSize)
 		if !errors.Is(err, ErrTransportClosed) && !errors.Is(err, ErrBackpressure) {
-			transport.cancel(err)
+			transport.cancel(outboundFailure(outbound, err))
 		}
-		return err
+		return outboundFailure(outbound, err)
 	}
 	if transport.beforeEncode != nil {
 		transport.beforeEncode()
@@ -891,21 +891,22 @@ func (transport *OrdinaryTransport) Send(outbound raftmember.OutboundMessage) er
 	if err != nil {
 		transport.unwindReservation(peer, ownedSize)
 		transport.frames.put(storage)
-		return err
+		return outboundFailure(outbound, err)
 	}
 	storage.bytes = frame
 	if len(storage.record) < StreamRecordHeaderBytes+plan.frameSize {
 		transport.unwindReservation(peer, ownedSize)
 		transport.frames.put(storage)
-		transport.cancel(ErrInvalidTransport)
-		return ErrInvalidTransport
+		err := outboundFailure(outbound, ErrInvalidTransport)
+		transport.cancel(err)
+		return err
 	}
 	binary.BigEndian.PutUint32(
 		storage.record[:StreamRecordHeaderBytes], uint32(plan.frameSize),
 	)
 	if err := transport.publishReservation(peer, storage, plan.frameSize, ownedSize); err != nil {
 		transport.frames.put(storage)
-		return err
+		return outboundFailure(outbound, err)
 	}
 	peer.notify()
 	return nil

@@ -75,6 +75,10 @@ func (runtime *rf3EmptyNodeRuntime) RegisterExecutionGroupWithGrant(
 	if runtime == nil || runtime.peer == nil {
 		return raftservice.ErrInvalidOwner
 	}
+	servingBefore := int64(0)
+	if runtime.servingGroups != nil {
+		servingBefore = runtime.servingGroups.Load()
+	}
 	var err error
 	if grant != (membershipgrant.Grant{}) {
 		err = runtime.peer.RegisterExecutionGroupWithGrant(roster, group, grant)
@@ -82,7 +86,9 @@ func (runtime *rf3EmptyNodeRuntime) RegisterExecutionGroupWithGrant(
 		err = runtime.peer.RegisterExecutionGroup(roster, group)
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("rf3 empty-node group activation failed group=%x member=%d node_incarnation=%d roster_members=%d serving_groups=%d: %w",
+			group.Identity.Group.GroupID, group.Identity.MemberID, group.Identity.NodeIncarnation,
+			len(roster), servingBefore, err)
 	}
 	if runtime.servingGroups != nil {
 		runtime.servingGroups.Add(1)

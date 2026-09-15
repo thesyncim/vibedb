@@ -186,13 +186,14 @@ func (service *Service) serveRequest(ctx context.Context, connection rafttranspo
 		ClusterID: request.Group.ClusterID, ClusterIncarnation: request.Group.ClusterIncarnation,
 	}
 	authorized := false
+	binding := rafttransport.PeerBinding{Identity: peer, ServiceKeyDigest: connection.PeerKeyDigest()}
 	if service.authorizeAuthenticated != nil {
-		authorized = service.authorizeAuthenticated(rafttransport.PeerBinding{Identity: peer, ServiceKeyDigest: connection.PeerKeyDigest()}, request)
+		authorized = service.authorizeAuthenticated(binding, request)
 	} else if service.authorize != nil {
 		authorized = service.authorize(peer, request)
 	}
 	if peer.TrustDomain != wantDomain || !authorized {
-		return ErrUnauthorized
+		return observationAdmissionFailure(binding, wantDomain, request, authorized)
 	}
 	select {
 	case service.slots <- struct{}{}:
@@ -258,6 +259,22 @@ func (service *Service) serveRequest(ctx context.Context, connection rafttranspo
 		return err
 	}
 	return WriteResponse(connection, observation)
+}
+
+// observationAdmissionFailure keeps a rejected control request correlated to
+// its authenticated stream and fence without exposing a key, grant, or
+// payload. The authorization decision itself remains unchanged by this
+// diagnostic wrapper.
+func observationAdmissionFailure(
+	binding rafttransport.PeerBinding,
+	wantDomain rafttransport.TrustDomain,
+	request Request,
+	authorized bool,
+) error {
+	return fmt.Errorf("%w: group=%x target_member=%d peer_node=%x domain_match=%t key_present=%t authorized=%t expected_replica_set=%d operation_set=%t step_set=%t health_only=%t",
+		ErrUnauthorized, request.Group.GroupID, request.TargetMember, binding.Identity.Node,
+		binding.Identity.TrustDomain == wantDomain, binding.ServiceKeyDigest != ([32]byte{}), authorized,
+		request.ExpectedReplicaSetVersion, request.Operation != ([32]byte{}), request.Step != ([32]byte{}), request.HealthOnly)
 }
 
 func AppendRequest(dst []byte, request Request) ([]byte, error) {
