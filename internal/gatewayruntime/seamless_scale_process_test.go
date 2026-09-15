@@ -1225,7 +1225,8 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 		}
 		finalNodesResponse = runSeamlessScaleCLI(t, ctx, vibedbBinary, "nodes", profilePath)
 		if !finalNodesResponse.OK || countSeamlessScaleServingNodes(finalNodesResponse) != 3 ||
-			hasSeamlessScaleNode(finalNodesResponse, retireID) {
+			hasSeamlessScaleServingNode(finalNodesResponse, retireID) ||
+			!validSeamlessScaleRetiredTombstone(finalNodesResponse, retireID, retireIncarnation) {
 			t.Fatalf("cycle %d post-stop topology=%+v", cycle+1, finalNodesResponse)
 		}
 		physicalPeak = maxInt(physicalPeak, countSeamlessScaleServingNodes(finalNodesResponse))
@@ -1889,6 +1890,68 @@ func hasSeamlessScaleNode(response clustercontrol.Response, nodeID rafttransport
 		}
 	}
 	return false
+}
+
+func hasSeamlessScaleServingNode(response clustercontrol.Response, nodeID rafttransport.NodeID) bool {
+	want := hex.EncodeToString(nodeID[:])
+	for _, node := range response.Nodes {
+		if node.NodeID != want {
+			continue
+		}
+		switch strings.ToLower(node.Lifecycle) {
+		case "retiring", "draining", "decommissioning", "decommissioned", "retired":
+			continue
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// The nodes command retains a decommissioned record as a durable tombstone.
+// A stopped target is therefore absent from the serving set while its
+// terminal record, when present, must retain the exact incarnation and proof.
+func validSeamlessScaleRetiredTombstone(response clustercontrol.Response, nodeID rafttransport.NodeID, incarnation uint64) bool {
+	want := hex.EncodeToString(nodeID[:])
+	for _, node := range response.Nodes {
+		if node.NodeID != want {
+			continue
+		}
+		if strings.ToLower(node.Lifecycle) != "decommissioned" || node.Incarnation != incarnation || !node.SafeToStop {
+			return false
+		}
+	}
+	return true
+}
+
+func TestSeamlessScalePostStopTopologyAcceptsTerminalTombstone(t *testing.T) {
+	nodeID := mustSeamlessScaleNodeID(t, "11111111111111111111111111111111")
+	active := clustercontrol.NodeStatus{NodeID: hex.EncodeToString(nodeID[:]), Incarnation: 7, Lifecycle: "active"}
+	valid := clustercontrol.NodeStatus{NodeID: hex.EncodeToString(nodeID[:]), Incarnation: 7, Lifecycle: "decommissioned", SafeToStop: true}
+	for _, test := range []struct {
+		name    string
+		node    clustercontrol.NodeStatus
+		valid   bool
+		serving bool
+	}{
+		{name: "active retired node is serving", node: active, valid: false, serving: true},
+		{name: "unsafe terminal tombstone is rejected", node: clustercontrol.NodeStatus{NodeID: active.NodeID, Incarnation: 7, Lifecycle: "decommissioned"}, valid: false},
+		{name: "wrong incarnation tombstone is rejected", node: clustercontrol.NodeStatus{NodeID: active.NodeID, Incarnation: 8, Lifecycle: "decommissioned", SafeToStop: true}, valid: false},
+		{name: "safe terminal tombstone is allowed", node: valid, valid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := clustercontrol.Response{OK: true, Nodes: []clustercontrol.NodeStatus{test.node}}
+			if got := validSeamlessScaleRetiredTombstone(response, nodeID, 7); got != test.valid {
+				t.Fatalf("valid tombstone=%v, want %v: response=%+v", got, test.valid, response)
+			}
+			if got := hasSeamlessScaleServingNode(response, nodeID); got != test.serving {
+				t.Fatalf("serving=%v, want %v: response=%+v", got, test.serving, response)
+			}
+		})
+	}
+	if !validSeamlessScaleRetiredTombstone(clustercontrol.Response{OK: true}, nodeID, 7) {
+		t.Fatal("absent terminal tombstone should be allowed for a compacted node response")
+	}
 }
 
 func hasSeamlessScaleSessionBlocker(response clustercontrol.Response, nodeID string, incarnation uint64) bool {
