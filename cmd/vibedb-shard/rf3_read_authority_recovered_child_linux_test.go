@@ -379,6 +379,11 @@ func appendCommittedRF3ReadAuthorityChange(
 		if err != nil {
 			t.Fatalf("drive committed membership change %d/%d step %d: %v", changeType, member, step, err)
 		}
+		if step == 0 {
+			status, statusErr := runtime.Status()
+			publication, publicationErr := runtime.Publication()
+			t.Logf("membership change %d/%d first drive kind=%v status=%+v publication=%+v statusErr=%v publicationErr=%v", changeType, member, result.Kind, status, publication, statusErr, publicationErr)
+		}
 		if !result.Progressed() {
 			return
 		}
