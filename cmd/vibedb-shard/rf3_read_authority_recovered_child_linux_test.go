@@ -343,13 +343,20 @@ func appendCommittedRF3ReadAuthorityChange(
 	if err != nil {
 		t.Fatal(err)
 	}
-	previousTerm, err := item.nodeLog.Term(status.Commit)
+	// The shared node log may expose a commit-only hint beyond its durable
+	// last index while the recovered Runtime still publishes the checkpoint.
+	// Append against the applied checkpoint and use its snapshot term when the
+	// checkpoint has already been compacted from the entry log.
+	previousIndex := status.Applied
+	previousTerm, err := item.nodeLog.Term(previousIndex)
 	if err != nil {
-		first, firstErr := item.nodeLog.FirstIndex()
-		last, lastErr := item.nodeLog.LastIndex()
-		t.Fatalf("term at commit unavailable: commit=%d applied=%d term=%d first=%d last=%d termErr=%v firstErr=%v lastErr=%v", status.Commit, status.Applied, status.Term, first, last, err, firstErr, lastErr)
+		snapshot, snapshotErr := item.nodeLog.Snapshot()
+		if snapshotErr != nil || snapshot.GetMetadata().GetIndex() != previousIndex {
+			t.Fatalf("term at applied checkpoint unavailable: commit=%d applied=%d term=%d termErr=%v snapshot=%v snapshotErr=%v", status.Commit, status.Applied, status.Term, err, snapshot.GetMetadata(), snapshotErr)
+		}
+		previousTerm = snapshot.GetMetadata().GetTerm()
 	}
-	entryIndex := status.Commit + 1
+	entryIndex := previousIndex + 1
 	entryTerm := status.Term
 	node := member
 	_, encoded, err := pb.MarshalConfChange(&pb.ConfChange{
@@ -358,7 +365,7 @@ func appendCommittedRF3ReadAuthorityChange(
 	if err != nil {
 		t.Fatal(err)
 	}
-	from, to, term, index, logTerm, commit := uint64(2), status.MemberID, entryTerm, status.Commit, previousTerm, entryIndex
+	from, to, term, index, logTerm, commit := uint64(2), status.MemberID, entryTerm, previousIndex, previousTerm, entryIndex
 	if err := runtime.StepMessage(&pb.Message{
 		Type: pb.MsgApp.Enum(), From: &from, To: &to, Term: &term,
 		Index: &index, LogTerm: &logTerm, Commit: &commit,
