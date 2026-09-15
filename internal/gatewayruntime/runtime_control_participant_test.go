@@ -5,17 +5,22 @@ import (
 	"context"
 	"encoding/asn1"
 	"errors"
+	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/shardservice"
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 func runtimeControlTLSFixture(t *testing.T, entries []serviceauthz.Entry) ([]*rafttransport.PeerTLS, *serviceauthz.Policy) {
@@ -69,6 +74,104 @@ func runtimeParticipantForTest(t *testing.T, profile *rafttransport.PeerTLS, pol
 	runtime.config.TLSProfile, runtime.config.Authorization = profile, policy
 	runtime.config.InternalAuthority = serviceauthz.Authority{Node: profile.LocalIdentity().Node, Generation: policy.Generation()}
 	return runtime
+}
+
+type participantControlDirectoryFixture struct {
+	gateway.DirectoryReader
+	cut gateway.NodeDirectoryCut
+}
+
+func (fixture participantControlDirectoryFixture) ReadNodeDirectoryCut(context.Context) (gateway.NodeDirectoryCut, error) {
+	return fixture.cut, nil
+}
+
+func (fixture participantControlDirectoryFixture) CatalogServiceFences(context.Context) ([]serviceauthz.ServiceFence, uint64, error) {
+	return nil, fixture.cut.CatalogGeneration, nil
+}
+
+// TestOpenReplicaControlParticipantInitializesGatewayControlOpener exercises
+// the real participant-only startup branch. The opener must be constructed
+// from the authenticated manifest before that branch returns; injecting one
+// into Runtime would miss the wiring regression that caused remote scans to
+// fail during decommission.
+func TestOpenReplicaControlParticipantInitializesGatewayControlOpener(t *testing.T) {
+	profiles, policy := runtimeControlTLSFixture(t, []serviceauthz.Entry{
+		{Node: rafttransport.NodeID{11}, Capabilities: serviceauthz.AllCapabilities},
+		{Node: rafttransport.NodeID{21}, Capabilities: serviceauthz.AllCapabilities},
+	})
+	snapshot := catalogRouteSeedSnapshot(t, 1, "127.0.0.1:7101")
+	local := profiles[0].LocalIdentity().Node
+	physical := profiles[1].LocalIdentity().Node
+	controlAddress := "127.0.0.1:0"
+	record := gateway.NodeRecord{
+		NodeID: physical, Incarnation: 1,
+		ServiceKeyDigest: replication.Digest(profiles[1].LocalServiceKeyDigest()),
+		DataEndpoint:     "physical-data", NativeEndpoint: "physical-native", ControlEndpoint: "physical-control",
+		GatewayEndpoint: "physical-gateway", DataAddress: "127.0.0.1:7401", NativeAddress: "127.0.0.1:7402",
+		ControlAddress: "127.0.0.1:7403", GatewayAddress: controlAddress, FailureDomain: "worker",
+		Roles: gateway.NodeRoleStorage | gateway.NodeRoleGateway, Lifecycle: gateway.NodeActive,
+		Revision: 1, CatalogGeneration: snapshot.Generation(),
+		Gateway: gateway.GatewayIdentity{NodeID: local, Incarnation: 1,
+			ServiceKeyDigest: replication.Digest(profiles[0].LocalServiceKeyDigest()), ServiceID: [16]byte{1},
+			SessionID: [16]byte{2}, SessionRevision: 1, ParticipantDigest: replication.Digest{3}},
+	}
+	if !record.Valid() {
+		t.Fatal("participant directory fixture is invalid")
+	}
+	directory := participantControlDirectoryFixture{cut: gateway.NodeDirectoryCut{
+		Revision: 1, Digest: replication.Digest{4}, CatalogGeneration: snapshot.Generation(), Nodes: []gateway.NodeRecord{record},
+	}}
+	manifest := persistedGatewayReplicaControlManifest{
+		Generation:   1,
+		LocalGateway: persistedGatewayControlEndpoint{Node: fmt.Sprintf("%x", local), Incarnation: 1, ControlAddress: controlAddress},
+		TLS: persistedGatewayReplicaTLS{Certificate: "/tls/cert", Key: "/tls/key", Roots: "/tls/roots",
+			IdentityOID: "1.2.3.4", AuthorizationPolicy: "/tls/policy"},
+		Bounds: persistedGatewayReplicaBounds{MaxConnections: 8, MaxHandshakes: 4, MaxConcurrentDrains: 2,
+			ControllerInterval: 100, ReadTimeout: 1000, WriteTimeout: 1000},
+		GatewayEndpoints: []persistedGatewayControlEndpoint{{Node: fmt.Sprintf("%x", local), Incarnation: 1, ControlAddress: controlAddress}},
+	}
+	for index, replica := range snapshot.ReplicatedShardDescriptors()[0].Replicas {
+		address, err := snapshot.Address(replica.ControlEndpoint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manifest.ShardEndpoints = append(manifest.ShardEndpoints, persistedGatewayShardControlEndpoint{
+			Node: fmt.Sprintf("%x", replica.Node), ControlAddress: address,
+			SplitSnapshotAddress: fmt.Sprintf("127.0.0.1:%d", 7501+index),
+		})
+	}
+	raw, err := vibejson.Marshal(&manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(t.TempDir(), "replica-control.vibejson")
+	if err := os.WriteFile(manifestPath, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime := &Runtime{
+		config: Config{ControlParticipantOnly: true, ReplicaControlManifestPath: manifestPath,
+			TLSProfile: profiles[0], Authorization: policy, InternalAuthority: serviceauthz.Authority{Node: local, Generation: policy.Generation()},
+			TLSCertificate: "/tls/cert", TLSKey: "/tls/key", TLSRoots: "/tls/roots", TLSIdentityOID: "1.2.3.4",
+			AuthorizationPolicy: "/tls/policy", TLSHandshakeTimeout: time.Second, ControlDirectory: directory,
+			Transport: new(sourceTopologyTestNative)},
+		ctx: ctx, cancel: cancel, holder: gateway.NewCatalogHolder(snapshot),
+		authority: &gateway.ReplicatedCatalogAuthority{}, frontend: newFrontendAdmission(FrontendDrainIdentity{}, false, false),
+		ready: make(chan struct{}), serveDone: make(chan struct{}), drainDone: make(chan struct{}),
+	}
+	defer runtime.Close()
+	if err := runtime.openReplicaControl(); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.clusterControlOpener == nil || runtime.clusterControlOpener.DirectoryRevision() != 1 {
+		t.Fatal("participant startup did not retain authenticated gateway control opener")
+	}
+	if runtime.drainCoordinator == nil {
+		t.Fatal("participant startup did not retain catalog drain coordinator")
+	}
+	if runtime.replicaControllersDone != nil || runtime.splitControllerDone != nil || runtime.hotShardDone != nil {
+		t.Fatal("participant startup started an autonomous controller")
+	}
 }
 
 func TestRuntimeParticipantDrainWaitsForNonControllerRead(t *testing.T) {

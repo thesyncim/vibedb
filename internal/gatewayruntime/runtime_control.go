@@ -90,6 +90,27 @@ func (runtime *Runtime) openReplicaControl() error {
 	runtime.controlHandshakeDeadline = handshakeDeadline
 	runtime.controlReadDeadline = readDeadline
 	runtime.controlWriteDeadline = writeDeadline
+	// Participant-only gateways do not run replica controllers, but their
+	// catalog authority may still need to collect an authenticated live
+	// participant cut from another gateway while an operator drains a node.
+	// Build the exact-incarnation gateway-control opener before the early return
+	// so the participant scanner has the same endpoint and key fences as the
+	// controller-enabled runtime.
+	trust := profile.LocalIdentity().TrustDomain
+	gatewayEndpoints := manifest.Gateways
+	if runtime.controlDirectory != nil {
+		gatewayEndpoints = mergeGatewayControlEndpoints(
+			gatewayEndpoints, controlDirectoryGatewayEndpoints(runtime.controlDirectory),
+		)
+	}
+	drainer, clusterOpener, err := newGatewayClusterDrainCertifierWithOpener(
+		trust, profile, handshakeDeadline, readDeadline, writeDeadline, dial,
+		gatewayEndpoints, int(manifest.Bounds.MaxConcurrentDrains),
+	)
+	if err != nil {
+		return fmt.Errorf("open catalog drain certifier: %w", err)
+	}
+	runtime.clusterControlOpener, runtime.drainCoordinator = clusterOpener, drainer
 	if config.ControlParticipantOnly {
 		// Participants do not run the scaling controller, but their operator
 		// endpoint can still be the status reader. Keep the same authenticated
@@ -143,21 +164,6 @@ func (runtime *Runtime) openReplicaControl() error {
 		}
 		runtime.distributedMetricsConcurrency = min(runtime.distributedMetrics.Len(), int(manifest.Bounds.MaxConnections), 64)
 	}
-	trust := profile.LocalIdentity().TrustDomain
-	gatewayEndpoints := manifest.Gateways
-	if runtime.controlDirectory != nil {
-		gatewayEndpoints = mergeGatewayControlEndpoints(
-			gatewayEndpoints, controlDirectoryGatewayEndpoints(runtime.controlDirectory),
-		)
-	}
-	drainer, clusterOpener, err := newGatewayClusterDrainCertifierWithOpener(
-		trust, profile, handshakeDeadline, readDeadline, writeDeadline, dial,
-		gatewayEndpoints, int(manifest.Bounds.MaxConcurrentDrains),
-	)
-	if err != nil {
-		return fmt.Errorf("open catalog drain certifier: %w", err)
-	}
-	runtime.clusterControlOpener, runtime.drainCoordinator = clusterOpener, drainer
 	runtime.splitRuntime, err = newGatewayServingSplitRuntime(gatewayServingSplitOptions{
 		catalog: runtime.authority, drain: drainer, opener: shardOpener, tls: profile,
 		shards: manifest.Shards, dial: dial, handshake: handshakeDeadline,
