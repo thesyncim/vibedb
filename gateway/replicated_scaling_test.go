@@ -925,8 +925,11 @@ func TestReplicatedScalingFrontendProofBlocksAndThenAllowsRetirement(t *testing.
 	}
 	scanner.evidence = GatewayParticipantEvidence{
 		NodeID: joining.NodeID, Incarnation: joining.Incarnation,
-		ServiceKeyDigest: joining.ServiceKeyDigest, ServiceID: joining.Gateway.ServiceID,
-		SessionID: joining.Gateway.SessionID, SessionRevision: joining.Gateway.SessionRevision,
+		ServiceKeyDigest: joining.ServiceKeyDigest, NodeRevision: joining.Revision,
+		CatalogGeneration: joining.CatalogGeneration, ServiceID: joining.Gateway.ServiceID,
+		GatewayNodeID: joining.Gateway.NodeID, GatewayIncarnation: joining.Gateway.Incarnation,
+		GatewayServiceKeyDigest: joining.Gateway.ServiceKeyDigest,
+		SessionID:               joining.Gateway.SessionID, SessionRevision: joining.Gateway.SessionRevision,
 		ParticipantDigest: joining.Gateway.ParticipantDigest,
 		DirectoryRevision: 1, Active: true, Digest: replication.Digest{0x95},
 	}
@@ -948,6 +951,7 @@ func TestReplicatedScalingFrontendProofBlocksAndThenAllowsRetirement(t *testing.
 	if err := authority.PutNode(ctx, draining, 2); err != nil {
 		t.Fatal(err)
 	}
+	scanner.evidence.NodeRevision = draining.Revision
 	if !scanner.evidence.ValidFor(draining) {
 		t.Fatalf("frontend proof fixture does not bind to the persisted node: evidence=%+v node=%+v", scanner.evidence, draining)
 	}
@@ -971,7 +975,24 @@ func TestReplicatedScalingFrontendProofBlocksAndThenAllowsRetirement(t *testing.
 	if evidence.GatewayParticipantRefs != 0 || !evidence.ZeroAllReferences() {
 		t.Fatalf("inactive frontend proof did not clear references: %+v", evidence)
 	}
-	if err := authority.RetireNode(ctx, active.NodeID, active.Incarnation, draining.Revision, evidence); err != nil {
+	changed := draining
+	changed.Revision++
+	if err := authority.PutNode(ctx, changed, draining.Revision); err != nil {
+		t.Fatalf("publish concurrent node revision: %v", err)
+	}
+	if err := authority.RetireNode(ctx, active.NodeID, active.Incarnation, draining.Revision, evidence); !errors.Is(err, ErrScalingRevision) {
+		t.Fatalf("stale frontend proof crossed a concurrent node revision: %v", err)
+	}
+	scanner.evidence.NodeRevision = changed.Revision
+	evidence, err = authority.ScanNodeReferences(ctx, active.NodeID, active.Incarnation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := authority.ScanNodeReferences(ctx, active.NodeID, active.Incarnation)
+	if err != nil || !sameNodeReferenceEvidence(fresh, evidence) {
+		t.Fatalf("frontend proof changed between scans: evidence=%+v fresh=%+v err=%v", evidence, fresh, err)
+	}
+	if err := authority.RetireNode(ctx, active.NodeID, active.Incarnation, changed.Revision, evidence); err != nil {
 		t.Fatal(err)
 	}
 	retired, err := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x98).ReadNode(ctx, active.NodeID, active.Incarnation)

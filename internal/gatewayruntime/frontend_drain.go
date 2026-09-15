@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 
@@ -16,22 +17,27 @@ import (
 )
 
 // FrontendDrainIdentity is the immutable participant identity carried by a
-// frontend admission acknowledgement. The directory and catalog revisions
-// are deliberately separate: a process restart may retain the same physical
-// node while publishing a new gateway session, and a lifecycle CAS may move
-// without changing the catalog generation.
+// frontend admission acknowledgement. Physical and gateway identities are
+// deliberately separate: a process restart may retain the same physical node
+// while publishing a new gateway session, and a lifecycle CAS may move without
+// changing the catalog generation.
 type FrontendDrainIdentity struct {
-	NodeID            rafttransport.NodeID
-	Incarnation       uint64
-	SessionID         [16]byte
-	SessionRevision   uint64
-	NodeRevision      uint64
-	CatalogGeneration uint64
-	DirectoryRevision uint64
+	NodeID                  rafttransport.NodeID
+	Incarnation             uint64
+	GatewayNodeID           rafttransport.NodeID
+	GatewayIncarnation      uint64
+	GatewayServiceKeyDigest replication.Digest
+	SessionID               [16]byte
+	SessionRevision         uint64
+	NodeRevision            uint64
+	CatalogGeneration       uint64
+	DirectoryRevision       uint64
 }
 
 func (identity FrontendDrainIdentity) Valid() bool {
 	return identity.NodeID != (rafttransport.NodeID{}) && identity.Incarnation != 0 &&
+		identity.GatewayNodeID != (rafttransport.NodeID{}) && identity.GatewayIncarnation != 0 &&
+		identity.GatewayServiceKeyDigest != (replication.Digest{}) &&
 		identity.SessionID != ([16]byte{}) && identity.SessionRevision != 0 &&
 		identity.NodeRevision != 0 && identity.CatalogGeneration != 0 &&
 		identity.DirectoryRevision != 0
@@ -167,8 +173,12 @@ func (runtime *Runtime) syncFrontendDrainFromDirectoryWithAdmission(
 		return false
 	}
 	var gatewayNode rafttransport.NodeID
+	var gatewayServiceKey replication.Digest
+	haveGatewayServiceKey := false
 	if runtime.config.TLSProfile != nil {
 		gatewayNode = runtime.config.TLSProfile.LocalIdentity().Node
+		gatewayServiceKey = replication.Digest(runtime.config.TLSProfile.LocalServiceKeyDigest())
+		haveGatewayServiceKey = gatewayServiceKey != (replication.Digest{})
 	}
 	if gatewayNode == (rafttransport.NodeID{}) {
 		gatewayNode = runtime.config.InternalAuthority.Node
@@ -177,17 +187,29 @@ func (runtime *Runtime) syncFrontendDrainFromDirectoryWithAdmission(
 		return false
 	}
 	for _, record := range nodes {
-		if !record.Valid() || record.Gateway.NodeID != gatewayNode {
+		if !record.Valid() || record.Gateway.NodeID != gatewayNode ||
+			haveGatewayServiceKey && record.Gateway.ServiceKeyDigest != gatewayServiceKey {
 			continue
 		}
 		identity := FrontendDrainIdentity{
 			NodeID: record.NodeID, Incarnation: record.Incarnation,
-			SessionID: record.Gateway.SessionID, SessionRevision: record.Gateway.SessionRevision,
+			GatewayNodeID: record.Gateway.NodeID, GatewayIncarnation: record.Gateway.Incarnation,
+			GatewayServiceKeyDigest: record.Gateway.ServiceKeyDigest,
+			SessionID:               record.Gateway.SessionID, SessionRevision: record.Gateway.SessionRevision,
 			NodeRevision: record.Revision, CatalogGeneration: record.CatalogGeneration,
 			DirectoryRevision: directoryRevision,
 		}
 		runtime.frontend.mu.Lock()
 		wasDraining := runtime.frontend.draining
+		priorIdentity := runtime.frontend.identity
+		if priorIdentity.GatewayNodeID != (rafttransport.NodeID{}) &&
+			(priorIdentity.NodeID != identity.NodeID || priorIdentity.Incarnation != identity.Incarnation ||
+				priorIdentity.GatewayNodeID != identity.GatewayNodeID ||
+				priorIdentity.GatewayIncarnation != identity.GatewayIncarnation ||
+				priorIdentity.GatewayServiceKeyDigest != identity.GatewayServiceKeyDigest) {
+			runtime.frontend.mu.Unlock()
+			continue
+		}
 		runtime.frontend.identity = identity
 		if record.Lifecycle >= gateway.NodeDraining && !wasDraining {
 			runtime.frontend.draining = true
@@ -238,25 +260,60 @@ func (runtime *Runtime) ScanGatewayParticipant(
 		return gateway.GatewayParticipantEvidence{}, ctx.Err()
 	default:
 	}
+	profile := runtime.config.TLSProfile
+	if profile == nil {
+		return gateway.GatewayParticipantEvidence{}, fmt.Errorf(
+			"%w: no authenticated gateway TLS profile", gateway.ErrScalingRevision,
+		)
+	}
+	authenticatedGatewayNode := profile.LocalIdentity().Node
+	authenticatedGatewayKey := replication.Digest(profile.LocalServiceKeyDigest())
+	if authenticatedGatewayNode != record.Gateway.NodeID ||
+		authenticatedGatewayKey == (replication.Digest{}) ||
+		authenticatedGatewayKey != record.Gateway.ServiceKeyDigest {
+		return gateway.GatewayParticipantEvidence{}, fmt.Errorf(
+			"%w: gateway TLS identity node=%s key=%x; directory gateway node=%s key=%x",
+			gateway.ErrScalingRevision, authenticatedGatewayNode, authenticatedGatewayKey,
+			record.Gateway.NodeID, record.Gateway.ServiceKeyDigest,
+		)
+	}
 	ack := runtime.FrontendDrainStatus()
 	identity := ack.Identity
 	if identity.NodeID != record.NodeID || identity.Incarnation != record.Incarnation ||
+		identity.GatewayNodeID != record.Gateway.NodeID ||
+		identity.GatewayIncarnation != record.Gateway.Incarnation ||
+		identity.GatewayServiceKeyDigest != record.Gateway.ServiceKeyDigest ||
 		identity.SessionID != record.Gateway.SessionID ||
 		identity.SessionRevision != record.Gateway.SessionRevision ||
 		identity.NodeRevision != record.Revision ||
 		identity.CatalogGeneration != record.CatalogGeneration {
-		return gateway.GatewayParticipantEvidence{}, gateway.ErrScalingRevision
+		return gateway.GatewayParticipantEvidence{}, fmt.Errorf(
+			"%w: frontend identity node=%s/%d gateway=%s/%d key=%x session=%x/%d revision=%d generation=%d; directory node=%s/%d gateway=%s/%d key=%x session=%x/%d revision=%d generation=%d",
+			gateway.ErrScalingRevision,
+			identity.NodeID, identity.Incarnation, identity.GatewayNodeID, identity.GatewayIncarnation,
+			identity.GatewayServiceKeyDigest, identity.SessionID, identity.SessionRevision,
+			identity.NodeRevision, identity.CatalogGeneration,
+			record.NodeID, record.Incarnation, record.Gateway.NodeID, record.Gateway.Incarnation,
+			record.Gateway.ServiceKeyDigest, record.Gateway.SessionID, record.Gateway.SessionRevision,
+			record.Revision, record.CatalogGeneration,
+		)
 	}
 	if identity.DirectoryRevision == 0 {
-		return gateway.GatewayParticipantEvidence{}, gateway.ErrScalingRevision
+		return gateway.GatewayParticipantEvidence{}, fmt.Errorf(
+			"%w: frontend identity has no directory revision (node=%s/%d)",
+			gateway.ErrScalingRevision, identity.NodeID, identity.Incarnation,
+		)
 	}
 	active := !ack.AdmissionDrained || ack.ActiveNativeConnections != 0 ||
 		ack.ActiveNativeSessions != 0 || ack.ActivePGConnections != 0 || ack.ActivePGSessions != 0
 	return gateway.GatewayParticipantEvidence{
 		NodeID: record.NodeID, Incarnation: record.Incarnation,
 		ServiceKeyDigest: record.ServiceKeyDigest,
-		ServiceID:        record.Gateway.ServiceID,
-		SessionID:        identity.SessionID, SessionRevision: identity.SessionRevision,
+		NodeRevision:     record.Revision, CatalogGeneration: record.CatalogGeneration,
+		GatewayNodeID: record.Gateway.NodeID, GatewayIncarnation: record.Gateway.Incarnation,
+		GatewayServiceKeyDigest: record.Gateway.ServiceKeyDigest,
+		ServiceID:               record.Gateway.ServiceID,
+		SessionID:               identity.SessionID, SessionRevision: identity.SessionRevision,
 		ParticipantDigest: record.Gateway.ParticipantDigest,
 		DirectoryRevision: identity.DirectoryRevision, Active: active,
 		Digest: frontendDrainDigest(ack),
@@ -270,6 +327,10 @@ func frontendDrainDigest(ack FrontendDrainAck) (digest replication.Digest) {
 	var scalar [8]byte
 	binary.LittleEndian.PutUint64(scalar[:], ack.Identity.Incarnation)
 	_, _ = hash.Write(scalar[:])
+	_, _ = hash.Write(ack.Identity.GatewayNodeID[:])
+	binary.LittleEndian.PutUint64(scalar[:], ack.Identity.GatewayIncarnation)
+	_, _ = hash.Write(scalar[:])
+	_, _ = hash.Write(ack.Identity.GatewayServiceKeyDigest[:])
 	_, _ = hash.Write(ack.Identity.SessionID[:])
 	binary.LittleEndian.PutUint64(scalar[:], ack.Identity.SessionRevision)
 	_, _ = hash.Write(scalar[:])

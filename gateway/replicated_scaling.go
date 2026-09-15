@@ -911,6 +911,16 @@ func (authority *ReplicatedCatalogAuthority) ScanNodeReferences(ctx context.Cont
 					evidence.GatewayParticipantRefs++
 				}
 				hash.Write(participant.ServiceKeyDigest[:])
+				var participantNodeRevision [8]byte
+				binary.LittleEndian.PutUint64(participantNodeRevision[:], participant.NodeRevision)
+				hash.Write(participantNodeRevision[:])
+				binary.LittleEndian.PutUint64(participantNodeRevision[:], participant.CatalogGeneration)
+				hash.Write(participantNodeRevision[:])
+				hash.Write(participant.GatewayNodeID[:])
+				var gatewayIncarnation [8]byte
+				binary.LittleEndian.PutUint64(gatewayIncarnation[:], participant.GatewayIncarnation)
+				hash.Write(gatewayIncarnation[:])
+				hash.Write(participant.GatewayServiceKeyDigest[:])
 				hash.Write(participant.ServiceID[:])
 				hash.Write(participant.SessionID[:])
 				hash.Write(participant.ParticipantDigest[:])
@@ -1113,7 +1123,11 @@ func (authority *ReplicatedCatalogAuthority) putNode(ctx context.Context, record
 			if scanErr != nil {
 				return scanErr
 			}
-			if !participant.ValidFor(record) || participant.Active ||
+			// The live participant scan was taken against the prior Draining
+			// record. The terminal record below necessarily increments its
+			// physical revision, so binding the witness to record would reject a
+			// fresh proof solely because of the CAS it is authorizing.
+			if !participant.ValidFor(priorRecord) || participant.Active ||
 				participant.DirectoryRevision != retirement.GatewayDirectoryRevision ||
 				participant.Digest != retirement.GatewayDirectoryDigest {
 				return ErrScalingRevision

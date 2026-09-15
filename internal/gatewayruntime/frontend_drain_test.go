@@ -49,6 +49,9 @@ func testFrontendDrainIdentity() FrontendDrainIdentity {
 	var identity FrontendDrainIdentity
 	identity.NodeID[0] = 1
 	identity.Incarnation = 2
+	identity.GatewayNodeID[0] = 9
+	identity.GatewayIncarnation = 3
+	identity.GatewayServiceKeyDigest[0] = 8
 	identity.SessionID[0] = 3
 	identity.SessionRevision = 4
 	identity.NodeRevision = 5
@@ -220,6 +223,8 @@ func TestApplyLiveDirectoryBindsDrainBeforeServiceCutValidation(t *testing.T) {
 			ServiceKeyDigest: replication.Digest{2}, ServiceID: [16]byte{3}, SessionID: [16]byte{4},
 			SessionRevision: 1, ParticipantDigest: replication.Digest{5}},
 	}
+	profiles, policy := runtimeControlTLSFixture(t, []serviceauthz.Entry{{Node: gatewayNode, Capabilities: serviceauthz.AllCapabilities}})
+	active.Gateway.ServiceKeyDigest = replication.Digest(profiles[0].LocalServiceKeyDigest())
 	if !active.Valid() {
 		t.Fatal("active directory record is invalid")
 	}
@@ -232,7 +237,6 @@ func TestApplyLiveDirectoryBindsDrainBeforeServiceCutValidation(t *testing.T) {
 	draining.Lifecycle = gateway.NodeDraining
 	draining.Revision = 2
 	drainingCut := gateway.ReplicatedControlDirectorySnapshot{Revision: 2, CatalogGeneration: 1, Nodes: []gateway.NodeRecord{draining}}
-	profiles, policy := runtimeControlTLSFixture(t, []serviceauthz.Entry{{Node: gatewayNode, Capabilities: serviceauthz.AllCapabilities}})
 	reader := frontendDrainDirectoryReader{cut: gateway.NodeDirectoryCut{
 		Revision: 2, Digest: replication.Digest{9}, CatalogGeneration: 1, Nodes: []gateway.NodeRecord{draining},
 	}}
@@ -248,6 +252,33 @@ func TestApplyLiveDirectoryBindsDrainBeforeServiceCutValidation(t *testing.T) {
 	if !runtime.frontend.isDraining() || !ack.AdmissionDrained || ack.Identity.NodeID != physical ||
 		ack.Identity.NodeRevision != draining.Revision || ack.Identity.DirectoryRevision != drainingCut.Revision {
 		t.Fatalf("local drain identity was not published before service validation: %+v", ack)
+	}
+	evidence, err := runtime.ScanGatewayParticipant(context.Background(), draining)
+	if err != nil {
+		t.Fatalf("drain scan rejected the identity published by the directory update: %v", err)
+	}
+	if !evidence.ValidFor(draining) || evidence.Active {
+		t.Fatalf("drain scan evidence = %+v", evidence)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*gateway.NodeRecord)
+	}{
+		{name: "foreign physical identity", mutate: func(record *gateway.NodeRecord) { record.NodeID[0]++ }},
+		{name: "foreign physical incarnation", mutate: func(record *gateway.NodeRecord) { record.Incarnation++ }},
+		{name: "foreign physical key", mutate: func(record *gateway.NodeRecord) { record.ServiceKeyDigest[0]++ }},
+		{name: "foreign gateway identity", mutate: func(record *gateway.NodeRecord) { record.Gateway.NodeID[0]++ }},
+		{name: "foreign gateway incarnation", mutate: func(record *gateway.NodeRecord) { record.Gateway.Incarnation++ }},
+		{name: "foreign gateway key", mutate: func(record *gateway.NodeRecord) { record.Gateway.ServiceKeyDigest[0]++ }},
+		{name: "stale node revision", mutate: func(record *gateway.NodeRecord) { record.Revision++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := draining
+			test.mutate(&candidate)
+			if evidence.ValidFor(candidate) {
+				t.Fatalf("evidence unexpectedly accepted mutated record: %+v", candidate)
+			}
+		})
 	}
 }
 

@@ -240,26 +240,38 @@ type NodeReferenceEvidence struct {
 // that a frontend session is still serving; the scanner must report the
 // current session identity and its own revision before retirement can pass.
 type GatewayParticipantEvidence struct {
-	NodeID            rafttransport.NodeID
-	Incarnation       uint64
-	ServiceKeyDigest  replication.Digest
-	ServiceID         [16]byte
-	SessionID         [16]byte
-	SessionRevision   uint64
-	ParticipantDigest replication.Digest
-	DirectoryRevision uint64
-	Active            bool
-	Digest            replication.Digest
+	// NodeID, Incarnation, and ServiceKeyDigest identify the physical node
+	// whose references are being scanned. Gateway* identifies the separately
+	// authenticated frontend principal that supplied this live observation.
+	NodeID                  rafttransport.NodeID
+	Incarnation             uint64
+	ServiceKeyDigest        replication.Digest
+	NodeRevision            uint64
+	CatalogGeneration       uint64
+	GatewayNodeID           rafttransport.NodeID
+	GatewayIncarnation      uint64
+	GatewayServiceKeyDigest replication.Digest
+	ServiceID               [16]byte
+	SessionID               [16]byte
+	SessionRevision         uint64
+	ParticipantDigest       replication.Digest
+	DirectoryRevision       uint64
+	Active                  bool
+	Digest                  replication.Digest
 }
 
 func (evidence GatewayParticipantEvidence) ValidFor(record NodeRecord) bool {
 	if record.NodeID != evidence.NodeID || record.Incarnation != evidence.Incarnation ||
 		record.ServiceKeyDigest != evidence.ServiceKeyDigest ||
-		record.Roles&NodeRoleGateway == 0 || record.Gateway.NodeID != evidence.NodeID ||
-		record.Gateway.Incarnation != evidence.Incarnation || record.Gateway.ServiceKeyDigest != evidence.ServiceKeyDigest ||
+		record.Revision != evidence.NodeRevision || record.CatalogGeneration != evidence.CatalogGeneration ||
+		evidence.NodeRevision == 0 || evidence.CatalogGeneration == 0 ||
+		record.Roles&NodeRoleGateway == 0 || record.Gateway.NodeID != evidence.GatewayNodeID ||
+		record.Gateway.Incarnation != evidence.GatewayIncarnation ||
+		record.Gateway.ServiceKeyDigest != evidence.GatewayServiceKeyDigest ||
 		record.Gateway.ServiceID != evidence.ServiceID || record.Gateway.SessionID != evidence.SessionID ||
 		record.Gateway.SessionRevision != evidence.SessionRevision || record.Gateway.ParticipantDigest != evidence.ParticipantDigest ||
-		evidence.ParticipantDigest == (replication.Digest{}) || evidence.DirectoryRevision == 0 ||
+		evidence.GatewayNodeID == (rafttransport.NodeID{}) || evidence.GatewayIncarnation == 0 ||
+		evidence.GatewayServiceKeyDigest == (replication.Digest{}) || evidence.ParticipantDigest == (replication.Digest{}) || evidence.DirectoryRevision == 0 ||
 		evidence.Digest == (replication.Digest{}) {
 		return false
 	}
