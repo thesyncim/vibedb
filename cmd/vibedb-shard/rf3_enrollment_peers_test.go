@@ -128,6 +128,76 @@ func TestRF3EnrollmentReceiptPersistsOnlyAfterGrantAndRosterCommit(t *testing.T)
 	if err := store.record(intent, grant); err != nil {
 		t.Fatalf("persist receipt: %v", err)
 	}
+	// A serving-process restart rebuilds its registry directory fence from 1,
+	// while an earlier process may have persisted this receipt at a later
+	// directory revision. The grant and physical endpoint remain the same, so
+	// both the corrected current revision and the restart-time value are safe
+	// idempotent replays. The stored receipt remains the durable witness.
+	for _, revision := range []uint64{4, 1} {
+		replay := intent
+		replay.DirectoryRevision = revision
+		if err := store.record(replay, grant); err != nil {
+			t.Fatalf("directory revision %d replay: %v", revision, err)
+		}
+	}
+	stored := store.snapshot()
+	if len(stored) != 1 || stored[0].EnrollmentDigest != intent.Digest || stored[0].DirectoryRevision != intent.DirectoryRevision {
+		t.Fatalf("replay changed durable identity: stored=%+v", stored)
+	}
+	changedEndpoint := intent
+	changedEndpoint.Peer.Endpoint = "foreign.example:17400"
+	changedEndpoint.Peer.Address = changedEndpoint.Peer.Endpoint
+	if err := store.record(changedEndpoint, grant); !errors.Is(err, errRF3EnrollmentPeerReceipt) {
+		t.Fatalf("changed endpoint replay error=%v, want receipt rejection", err)
+	}
+	changedRevision := intent
+	changedRevision.Peer.Revision++
+	if err := store.record(changedRevision, grant); !errors.Is(err, errRF3EnrollmentPeerReceipt) {
+		t.Fatalf("changed node revision replay error=%v, want receipt rejection", err)
+	}
+	// Reproduce the restart direction from the qualification: the durable
+	// source receipt was written at revision 4, then the rebuilt registry
+	// accepts the same authenticated intent at its initial revision 1.
+	restartedRoot := t.TempDir()
+	restarted, err := openRF3EnrollmentPeerStore(restartedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedAtFour := intent
+	storedAtFour.DirectoryRevision = 4
+	if err := restarted.record(storedAtFour, grant); err != nil {
+		t.Fatalf("persist revision-4 receipt: %v", err)
+	}
+	restartReplay := intent
+	restartReplay.DirectoryRevision = 1
+	restartRegistry, err := rafttransport.NewStaticRegistryWithDirectory(
+		rafttransport.NodeID{1}, initial,
+		[]rafttransport.PhysicalPeer{
+			peer(rafttransport.NodeID{1}, "member-1.internal:17400", 1),
+			peer(rafttransport.NodeID{2}, "member-2.internal:17400", 2),
+			peer(rafttransport.NodeID{3}, "member-3.internal:17400", 3),
+			{NodeID: grant.TargetNode, Node: grant.TargetNode, TrustDomain: domain, Incarnation: 6, Revision: 7,
+				ServiceKeyDigest: [32]byte{11}, Endpoint: grantManifestTargetAddress(manifest), Address: grantManifestTargetAddress(manifest), State: rafttransport.PeerEnrolled},
+		},
+		1, rafttransport.Limits{MaxGroups: 1, MaxMembers: 4, MaxPeers: 4},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callback := func() error {
+		if err := validateRF3EnrollmentGrant(restartRegistry, restartReplay); err != nil {
+			return err
+		}
+		return restarted.record(restartReplay, restartReplay.Grant)
+	}
+	if err := restartRegistry.EnrollMemberWithCommit(restartReplay,
+		rafttransport.EnrollmentVerifierFunc(func(rafttransport.EnrollmentIntent) error { return nil }), callback); err != nil {
+		t.Fatalf("restart revision-1 callback replay: %v", err)
+	}
+	restartedReceipts := restarted.snapshot()
+	if len(restartedReceipts) != 1 || restartedReceipts[0].DirectoryRevision != 4 || restartedReceipts[0].EnrollmentDigest != intent.Digest {
+		t.Fatalf("restart replay changed durable receipt: %+v", restartedReceipts)
+	}
 	reopened, err := openRF3EnrollmentPeerStore(root)
 	if err != nil || len(reopened.snapshot()) != 1 {
 		t.Fatalf("receipt was not durable before ACK boundary: count=%d err=%v", len(reopened.snapshot()), err)

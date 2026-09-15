@@ -176,6 +176,19 @@ func (store *rf3EnrollmentPeerStore) snapshot() []rf3EnrollmentPeerReceipt {
 	return slices.Clone(store.receipts)
 }
 
+// sameRF3EnrollmentPeerReceiptIdentity compares the authenticated endpoint
+// witness and its grant. DirectoryRevision is a registry-local CAS fence; it
+// is rebuilt when a serving process restarts and therefore is not part of the
+// per-group enrollment identity. ReceiptDigest is derived from that fence and
+// is excluded for the same reason.
+func sameRF3EnrollmentPeerReceiptIdentity(left, right rf3EnrollmentPeerReceipt) bool {
+	left.DirectoryRevision = 0
+	right.DirectoryRevision = 0
+	left.ReceiptDigest = [32]byte{}
+	right.ReceiptDigest = [32]byte{}
+	return left == right
+}
+
 func (store *rf3EnrollmentPeerStore) record(intent rafttransport.EnrollmentIntent, grant membershipgrant.Grant) error {
 	if store == nil {
 		return errRF3EnrollmentPeerReceipt
@@ -191,7 +204,7 @@ func (store *rf3EnrollmentPeerStore) record(intent rafttransport.EnrollmentInten
 			continue
 		}
 		if prior.EnrollmentDigest == receipt.EnrollmentDigest {
-			if prior != receipt {
+			if !sameRF3EnrollmentPeerReceiptIdentity(prior, receipt) {
 				return errRF3EnrollmentPeerReceipt
 			}
 			return nil
