@@ -356,6 +356,103 @@ func (manifest gatewayReplicaControlManifest) ValidateCatalog(snapshot *gateway.
 	return nil
 }
 
+// bindGatewayReplicaControlManifestToDirectory extends the static startup
+// roster with serving replicas that were enrolled after that roster was
+// written.  The catalog remains the authority for the group-local endpoint
+// alias; the authenticated physical directory supplies the corresponding
+// control and snapshot listeners.  A missing or mismatched directory record
+// is rejected rather than treating a new catalog replica as trusted merely
+// because its NodeID is present in the route.
+func bindGatewayReplicaControlManifestToDirectory(
+	manifest gatewayReplicaControlManifest,
+	snapshot *gateway.Snapshot,
+	nodes []gateway.NodeRecord,
+) (gatewayReplicaControlManifest, error) {
+	if snapshot == nil || len(manifest.Shards) == 0 || len(manifest.Shards) != len(manifest.SplitSnapshots) {
+		return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
+	}
+	byNode := make(map[rafttransport.NodeID]gateway.NodeRecord, len(nodes))
+	for _, node := range nodes {
+		if !node.Valid() {
+			return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
+		}
+		if prior, found := byNode[node.NodeID]; found && prior != node {
+			return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
+		}
+		byNode[node.NodeID] = node
+	}
+	known := make(map[rafttransport.NodeID]struct{}, len(manifest.Shards))
+	for _, shard := range manifest.Shards {
+		if shard.Node == (rafttransport.NodeID{}) || !validGatewayReplicaAddress(shard.ControlAddress) {
+			return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
+		}
+		if _, duplicate := known[shard.Node]; duplicate {
+			return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
+		}
+		known[shard.Node] = struct{}{}
+	}
+	bound := manifest
+	bound.Shards = slices.Clone(manifest.Shards)
+	bound.SplitSnapshots = slices.Clone(manifest.SplitSnapshots)
+	for _, descriptor := range snapshot.ReplicatedShardDescriptors() {
+		for _, replica := range descriptor.Replicas {
+			node, hasNode := byNode[replica.Node]
+			controlAddress, addressErr := snapshot.Address(replica.ControlEndpoint)
+			if _, enrolled := known[replica.Node]; enrolled {
+				if hasNode && (node.Incarnation != replica.NodeIncarnation ||
+					addressErr != nil || node.ControlAddress != controlAddress) {
+					return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
+				}
+				continue
+			}
+			found := hasNode
+			if !found || node.Incarnation != replica.NodeIncarnation ||
+				node.Lifecycle == gateway.NodeDecommissioned || node.Roles&gateway.NodeRoleStorage == 0 {
+				return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
+			}
+			if addressErr != nil || controlAddress != node.ControlAddress ||
+				!validGatewayReplicaAddress(node.ControlAddress) ||
+				!validGatewayReplicaAddress(node.SnapshotAddress) {
+				return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
+			}
+			bound.Shards = append(bound.Shards, gateway.ReplicatedEndpoint{
+				Node: node.NodeID, NodeIncarnation: node.Incarnation,
+				ControlAddress: node.ControlAddress,
+			})
+			bound.SplitSnapshots = append(bound.SplitSnapshots, node.SnapshotAddress)
+			known[node.NodeID] = struct{}{}
+		}
+	}
+	slices.SortStableFunc(bound.Shards, func(left, right gateway.ReplicatedEndpoint) int {
+		return bytes.Compare(left.Node[:], right.Node[:])
+	})
+	// Keep the snapshot listener paired with the same physical node after the
+	// sort.  Rebuild from the appended endpoint map instead of sorting the two
+	// slices independently, which could silently bind a target to another
+	// node's listener.
+	snapshotByNode := make(map[rafttransport.NodeID]string, len(bound.Shards))
+	for index, shard := range manifest.Shards {
+		snapshotByNode[shard.Node] = manifest.SplitSnapshots[index]
+	}
+	for _, node := range nodes {
+		if _, found := snapshotByNode[node.NodeID]; !found && node.SnapshotAddress != "" {
+			snapshotByNode[node.NodeID] = node.SnapshotAddress
+		}
+	}
+	bound.SplitSnapshots = make([]string, len(bound.Shards))
+	for index, shard := range bound.Shards {
+		address, found := snapshotByNode[shard.Node]
+		if !found || !validGatewayReplicaAddress(address) {
+			return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
+		}
+		bound.SplitSnapshots[index] = address
+	}
+	if err := bound.ValidateCatalog(snapshot); err != nil {
+		return gatewayReplicaControlManifest{}, err
+	}
+	return bound, nil
+}
+
 func validateGatewayReplicaCatalogEndpoint(
 	snapshot *gateway.Snapshot,
 	addresses map[rafttransport.NodeID]string,

@@ -38,7 +38,8 @@ func (runtime *Runtime) openReplicaControl() error {
 	}) {
 		return fmt.Errorf("%w: replica control TLS references do not match frontend", errGatewayReplicaControlManifest)
 	}
-	if err = manifest.ValidateCatalog(runtime.holder.Current()); err != nil {
+	manifest, err = runtime.bindReplicaControlManifestToLiveDirectory(manifest, runtime.holder.Current())
+	if err != nil {
 		return fmt.Errorf("replica control catalog endpoints: %w", err)
 	}
 	required := serviceauthz.CapabilityTopology
