@@ -64,6 +64,9 @@ func (runtime *Runtime) serveGatewayControlConnection(
 		}
 		return runtime.sourceTopologyService.Serve(ctx, wrapped)
 	}
+	if bytes.Equal(discriminator[:], frontendParticipantDiscriminator[:]) {
+		return runtime.serveFrontendParticipantConnection(ctx, wrapped)
+	}
 	if runtime.controlService == nil {
 		return errGatewayControlDirectory
 	}

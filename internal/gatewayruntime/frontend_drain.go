@@ -245,10 +245,11 @@ func (runtime *Runtime) InstallFrontendContinuationGrant(
 }
 
 // ScanGatewayParticipant implements the catalog's optional live participant
-// scanner. Retirement uses this cold path to bind the local drain cut to the
-// exact NodeRecord identity; it never infers liveness from a role bit or disk
-// capacity. Any identity or revision mismatch fails closed so a stale process
-// cannot satisfy a newer decommission fence.
+// scanner. Retirement uses this cold path to bind the drain cut to the exact
+// NodeRecord identity; it never infers liveness from a role bit or disk
+// capacity. A local record is scanned directly. A record owned by another
+// gateway is scanned over the authenticated gateway-control stream so the
+// authority never compares a remote participant with the caller's TLS key.
 func (runtime *Runtime) ScanGatewayParticipant(
 	ctx context.Context, record gateway.NodeRecord,
 ) (gateway.GatewayParticipantEvidence, error) {
@@ -259,6 +260,30 @@ func (runtime *Runtime) ScanGatewayParticipant(
 	case <-ctx.Done():
 		return gateway.GatewayParticipantEvidence{}, ctx.Err()
 	default:
+	}
+	profile := runtime.config.TLSProfile
+	if localGatewayParticipantMatches(profile, record) {
+		return runtime.scanLocalGatewayParticipant(ctx, record)
+	}
+	return runtime.scanRemoteGatewayParticipant(ctx, record)
+}
+
+func localGatewayParticipantMatches(profile *rafttransport.PeerTLS, record gateway.NodeRecord) bool {
+	if profile == nil {
+		return false
+	}
+	authenticatedGatewayNode := profile.LocalIdentity().Node
+	authenticatedGatewayKey := replication.Digest(profile.LocalServiceKeyDigest())
+	return authenticatedGatewayNode == record.Gateway.NodeID &&
+		authenticatedGatewayKey != (replication.Digest{}) &&
+		authenticatedGatewayKey == record.Gateway.ServiceKeyDigest
+}
+
+func (runtime *Runtime) scanLocalGatewayParticipant(
+	ctx context.Context, record gateway.NodeRecord,
+) (gateway.GatewayParticipantEvidence, error) {
+	if runtime == nil || ctx == nil || !record.Valid() {
+		return gateway.GatewayParticipantEvidence{}, gateway.ErrInvalidScalingMetadata
 	}
 	profile := runtime.config.TLSProfile
 	if profile == nil {
