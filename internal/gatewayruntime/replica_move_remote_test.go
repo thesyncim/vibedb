@@ -185,11 +185,17 @@ func TestGatewayGrantedMembershipInstallsPublishedTargetBeforeSourceRemoval(t *t
 	}
 }
 
-type gatewayTestObservationClient struct{ observation replicacontrol.Observation }
+type gatewayTestObservationClient struct {
+	observation replicacontrol.Observation
+	request     *replicacontrol.Request
+}
 
 func (client gatewayTestObservationClient) Observe(
 	_ context.Context, _ rafttransport.NodeID, request replicacontrol.Request,
 ) (replicacontrol.Observation, error) {
+	if client.request != nil {
+		*client.request = request
+	}
 	result := client.observation
 	result.Request = request
 	return result, nil
@@ -319,10 +325,11 @@ func TestGatewayRetirementRefreshesSourceOnlyAfterUnknownAction(t *testing.T) {
 	}}
 	observation := replicacontrol.Observation{Status: raftmember.RuntimeStatus{MemberID: source.Member},
 		StoreID: store, NodeIncarnation: 2,
-		Publication: raftmodel.Publication{ReplicaSetVersion: command.ReplicaSetVersion}, State: state}
+		Publication: raftmodel.Publication{ReplicaSetVersion: command.ReplicaSetVersion - 1}, State: state}
 	actions := &gatewayTestActionClient{queued: []error{replicaaction.ErrOutcomeUnknown}}
+	var observedRequest replicacontrol.Request
 	remote := gatewayReplicaRemoteActions{actions: actions,
-		observer: gatewayTestObservationClient{observation: observation}}
+		observer: gatewayTestObservationClient{observation: observation, request: &observedRequest}}
 	request := rebalanceexec.SourceRetirementRequest{Operation: rebalance.OperationID{10}, Step: [32]byte{11},
 		Group: group, AllocationGeneration: state.Binding.AllocationGeneration, Command: command,
 		Source: source, Target: target, Term: 12}
@@ -332,12 +339,17 @@ func TestGatewayRetirementRefreshesSourceOnlyAfterUnknownAction(t *testing.T) {
 	if actions.calls != 2 || actions.request.Fence.NodeIncarnation != observation.NodeIncarnation {
 		t.Fatalf("action calls=%d final fence incarnation=%d", actions.calls, actions.request.Fence.NodeIncarnation)
 	}
+	if observedRequest.ExpectedReplicaSetVersion != 0 {
+		t.Fatalf("identity refresh requested membership version %d; want discovery", observedRequest.ExpectedReplicaSetVersion)
+	}
 
 	for name, mutate := range map[string]func(*replicacontrol.Observation){
 		"foreign store":     func(candidate *replicacontrol.Observation) { candidate.StoreID[0]++ },
 		"older incarnation": func(candidate *replicacontrol.Observation) { candidate.NodeIncarnation = source.NodeIncarnation },
 		"wrong member":      func(candidate *replicacontrol.Observation) { candidate.Status.MemberID++ },
-		"wrong publication": func(candidate *replicacontrol.Observation) { candidate.Publication.ReplicaSetVersion++ },
+		"future publication": func(candidate *replicacontrol.Observation) {
+			candidate.Publication.ReplicaSetVersion = command.ReplicaSetVersion + 1
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			candidate := observation

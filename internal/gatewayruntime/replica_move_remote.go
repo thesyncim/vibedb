@@ -1318,10 +1318,12 @@ func (remote gatewayReplicaRemoteActions) RetireReplicaSource(
 	// attempt is deliberate: a completed source may already be serving the
 	// retired-control mux, which can settle that durable tombstone without a
 	// live observation. Refresh only after an unknown attempt, and retry once
-	// with an authenticated cut from the source itself.
+	// with an authenticated identity cut from the source itself. A removed
+	// source may stop at an older applied membership version; the survivors'
+	// post-remove proof remains the authority for the command fence below.
 	observation, observeErr := remote.observer.Observe(ctx, request.Source.Node, replicacontrol.Request{
 		Operation: request.Operation, Step: request.Step, Group: request.Group,
-		TargetMember: request.Target.Member, ExpectedReplicaSetVersion: request.Command.ReplicaSetVersion,
+		TargetMember: request.Target.Member,
 	})
 	if observeErr != nil {
 		return errors.Join(err, observeErr)
@@ -1330,7 +1332,8 @@ func (remote gatewayReplicaRemoteActions) RetireReplicaSource(
 	if observation.Status.MemberID != request.Source.Member ||
 		observation.StoreID != request.Source.StoreID ||
 		observation.NodeIncarnation <= request.Source.NodeIncarnation ||
-		observation.Publication.ReplicaSetVersion != request.Command.ReplicaSetVersion ||
+		observation.Publication.ReplicaSetVersion == 0 ||
+		observation.Publication.ReplicaSetVersion > request.Command.ReplicaSetVersion ||
 		binding.ClusterID != request.Group.ClusterID || binding.ClusterIncarnation != request.Group.ClusterIncarnation ||
 		binding.TopologyRecoveryEpoch != request.Group.TopologyRecoveryEpoch ||
 		binding.ShardIncarnation != request.Group.ShardIncarnation || binding.GroupID != request.Group.GroupID ||
