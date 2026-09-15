@@ -194,6 +194,63 @@ func TestFrontendDrainDirectoryBindsDistinctGatewayIdentity(t *testing.T) {
 	}
 }
 
+type frontendDrainDirectoryReader struct {
+	gateway.DirectoryReader
+	cut gateway.NodeDirectoryCut
+}
+
+func (reader frontendDrainDirectoryReader) ReadNodeDirectoryCut(context.Context) (gateway.NodeDirectoryCut, error) {
+	return reader.cut, nil
+}
+
+func (reader frontendDrainDirectoryReader) CatalogServiceFences(context.Context) ([]serviceauthz.ServiceFence, uint64, error) {
+	return nil, reader.cut.CatalogGeneration, nil
+}
+
+func TestApplyLiveDirectoryBindsDrainBeforeServiceCutValidation(t *testing.T) {
+	physical := rafttransport.NodeID{1}
+	gatewayNode := rafttransport.NodeID{2}
+	active := gateway.NodeRecord{
+		NodeID: physical, Incarnation: 1, ServiceKeyDigest: replication.Digest{1},
+		DataEndpoint: "peer", NativeEndpoint: "native", ControlEndpoint: "control", GatewayEndpoint: "gateway",
+		DataAddress: "localhost:1", NativeAddress: "localhost:2", ControlAddress: "localhost:3", GatewayAddress: "localhost:4",
+		FailureDomain: "worker", Roles: gateway.NodeRoleStorage | gateway.NodeRoleGateway,
+		Lifecycle: gateway.NodeActive, Revision: 1, CatalogGeneration: 1,
+		Gateway: gateway.GatewayIdentity{NodeID: gatewayNode, Incarnation: 1,
+			ServiceKeyDigest: replication.Digest{2}, ServiceID: [16]byte{3}, SessionID: [16]byte{4},
+			SessionRevision: 1, ParticipantDigest: replication.Digest{5}},
+	}
+	if !active.Valid() {
+		t.Fatal("active directory record is invalid")
+	}
+	activeCut := gateway.ReplicatedControlDirectorySnapshot{Revision: 1, CatalogGeneration: 1, Nodes: []gateway.NodeRecord{active}}
+	directory, err := gateway.NewReplicatedControlDirectory(activeCut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draining := active
+	draining.Lifecycle = gateway.NodeDraining
+	draining.Revision = 2
+	drainingCut := gateway.ReplicatedControlDirectorySnapshot{Revision: 2, CatalogGeneration: 1, Nodes: []gateway.NodeRecord{draining}}
+	profiles, policy := runtimeControlTLSFixture(t, []serviceauthz.Entry{{Node: gatewayNode, Capabilities: serviceauthz.AllCapabilities}})
+	reader := frontendDrainDirectoryReader{cut: gateway.NodeDirectoryCut{
+		Revision: 2, Digest: replication.Digest{9}, CatalogGeneration: 1, Nodes: []gateway.NodeRecord{draining},
+	}}
+	runtime := &Runtime{
+		config: Config{ControlDirectory: reader, TLSProfile: profiles[0], Authorization: policy,
+			InternalAuthority: serviceauthz.Authority{Node: gatewayNode, Generation: policy.Generation()}},
+		controlDirectory: directory, frontend: newFrontendAdmission(FrontendDrainIdentity{}, false, false),
+	}
+	if err := runtime.applyLiveControlDirectory(context.Background(), drainingCut); err == nil {
+		t.Fatal("draining cut without a continuation grant unexpectedly passed service validation")
+	}
+	ack := runtime.FrontendDrainStatus()
+	if !runtime.frontend.isDraining() || !ack.AdmissionDrained || ack.Identity.NodeID != physical ||
+		ack.Identity.NodeRevision != draining.Revision || ack.Identity.DirectoryRevision != drainingCut.Revision {
+		t.Fatalf("local drain identity was not published before service validation: %+v", ack)
+	}
+}
+
 func TestFrontendContinuationCredentialSnapshotsOpenNativeSocket(t *testing.T) {
 	frontend := newFrontendAdmission(testFrontendDrainIdentity(), false, false)
 	listener := newFrontendDrainTestListener()

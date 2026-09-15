@@ -295,6 +295,14 @@ func (runtime *Runtime) applyLiveControlDirectory(
 	if reader == nil || runtime.config.TLSProfile == nil || runtime.config.Authorization == nil {
 		return errGatewayControlDirectory
 	}
+	// Bind the local frontend to the complete physical-node cut before
+	// validating dependent service-directory projections.  A draining
+	// gateway's service binding may require a committed continuation grant
+	// that an older directory adapter cannot materialize; failing that
+	// projection must not leave the local drain acknowledgement at the prior
+	// revision.  The frontend update is still derived only from this
+	// authenticated catalog cut and never relaxes service authorization.
+	runtime.syncFrontendDrainFromDirectory(cut.Nodes, cut.Revision)
 	serviceCut, err := runtimeServiceDirectoryCut(ctx, reader, cut,
 		runtime.config.TLSProfile, runtime.config.Authorization.Generation())
 	if err != nil {
@@ -303,10 +311,6 @@ func (runtime *Runtime) applyLiveControlDirectory(
 	if err := runtime.controlDirectory.Apply(cut); err != nil {
 		return err
 	}
-	// Keep the local frontend's acknowledgement bound to the current physical
-	// record. This also applies the durable Active -> Draining admission fence
-	// when a decommission CAS becomes visible.
-	runtime.syncFrontendDrainFromDirectory(cut.Nodes, cut.Revision)
 	directory := runtime.controlDirectory
 	if runtime.controlOpener != nil {
 		if err := runtime.controlOpener.Update(cut.Revision, directory.ShardControlEndpoints()); err != nil {
