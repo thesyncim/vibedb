@@ -11,13 +11,14 @@ import (
 	"github.com/thesyncim/vibejson"
 )
 
-// preparedDirectInt64Delta recognizes the one UPDATE shape for which the
-// replicated apply point can evaluate the RHS without a gateway preimage:
-// exactly one declared top-level INTEGER column is added to or subtracted
-// from by one exact integer constant. The caller has already established the
-// stricter exact-primary-key/no-global-index direct candidate. A missing table
-// declaration or any expression outside this closed shape falls back to the
-// existing materialized, digest-guarded path.
+// preparedDirectInt64Delta recognizes UPDATE shapes for which the replicated
+// apply point can evaluate every RHS without a gateway preimage: one or more
+// distinct declared top-level INTEGER columns are each added to or subtracted
+// from by one exact integer constant. Each self-delta is evaluated against the
+// original row, preserving SQL's simultaneous assignment rule. The caller has
+// already established the stricter exact-primary-key/no-global-index direct
+// candidate. A missing table declaration or any expression outside this closed
+// shape falls back to the existing materialized, digest-guarded path.
 func preparedDirectInt64Delta(
 	snapshot *Snapshot,
 	statement *replicatedSQLBoundStatement,
@@ -29,26 +30,51 @@ func preparedDirectInt64Delta(
 		statement.prepared.statement.Kind != sqlast.KindUpdate ||
 		statement.bound.kind != sqlast.KindUpdate ||
 		len(statement.prepared.writeGlobalIndexes) != 0 ||
-		len(statement.prepared.statement.Update.Assignments) != 1 ||
-		len(statement.bound.updateAssignments) != 1 {
+		len(statement.prepared.statement.Update.Assignments) == 0 ||
+		len(statement.prepared.statement.Update.Assignments) != len(statement.bound.updateAssignments) {
 		return nil, false
 	}
 	update := statement.prepared.statement.Update
-	assignment := update.Assignments[0]
-	if assignment.Expr == nil || assignment.Value.Kind != sqlast.OperandExpression ||
-		assignment.Column == "" || !replicatedSQLExactPrimaryFilter(update.Filter, profile.PrimaryKey) ||
+	if !replicatedSQLExactPrimaryFilter(update.Filter, profile.PrimaryKey) ||
 		replicatedSQLUpdateAssignsPrimary(update, profile.PrimaryKey) {
 		return nil, false
 	}
 	info, ok := snapshot.declaredTableInfo(profile.Table)
-	if !ok || !declaredIntegerColumn(info, assignment.Column) {
-		return nil, false
-	}
-	delta, ok := scalarInt64Delta(assignment.Expr, assignment.Column, statement.bound.updateArgs)
 	if !ok {
 		return nil, false
 	}
-	descriptor, err := replication.AppendJSONInt64Delta(nil, assignment.Column, delta)
+	assignments := update.Assignments
+	if len(assignments) == 1 {
+		assignment := assignments[0]
+		if assignment.Expr == nil || assignment.Value.Kind != sqlast.OperandExpression ||
+			assignment.Column == "" || !declaredIntegerColumn(info, assignment.Column) {
+			return nil, false
+		}
+		delta, ok := scalarInt64Delta(assignment.Expr, assignment.Column, statement.bound.updateArgs)
+		if !ok {
+			return nil, false
+		}
+		descriptor, err := replication.AppendJSONInt64Delta(nil, assignment.Column, delta)
+		return descriptor, err == nil
+	}
+	fields := make([]replication.JSONInt64DeltaField, len(assignments))
+	for index, assignment := range assignments {
+		if assignment.Expr == nil || assignment.Value.Kind != sqlast.OperandExpression ||
+			assignment.Column == "" || !declaredIntegerColumn(info, assignment.Column) {
+			return nil, false
+		}
+		for prior := 0; prior < index; prior++ {
+			if fields[prior].Column == assignment.Column {
+				return nil, false
+			}
+		}
+		delta, ok := scalarInt64Delta(assignment.Expr, assignment.Column, statement.bound.updateArgs)
+		if !ok {
+			return nil, false
+		}
+		fields[index] = replication.JSONInt64DeltaField{Column: assignment.Column, Delta: delta}
+	}
+	descriptor, err := replication.AppendJSONInt64Deltas(nil, fields)
 	return descriptor, err == nil
 }
 

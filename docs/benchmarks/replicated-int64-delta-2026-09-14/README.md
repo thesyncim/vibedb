@@ -4,19 +4,23 @@ JID1 adds an apply-time mutation for the narrow, common SQL shape
 `UPDATE table SET integer_column = integer_column + $1 WHERE primary_key = $2`.
 The gateway sends the column name and the bound signed integer delta instead of
 reading the committed row, materializing a full replacement document, and
-putting that document in the replicated command. `vibejson` parses the row with
-zero-copy options at apply time and rewrites only the selected top-level value;
+putting that document in the replicated command. JID2 extends the same
+operation to two or more independent integer self-deltas in one UPDATE; the
+apply point parses the source row once and evaluates every assignment against
+that original row. `vibejson` parses with zero-copy options at apply time and
 unchanged keys and values retain their original JSON bytes. The existing
 digest-guarded materialization path remains the fallback for every unsupported
 statement shape.
 
-The production candidate is `aa25f6e0d` on top of the clean PR #236 revision
-`df5c0637375a89e0b51a48ba76961521cca309bb`; the clean baseline is that latter
-revision. The long production trials were first measured from the equivalent
-candidate working tree before the JID1 commit, and the retry-to-completion
-trials used `aa25f6e0d`. The benchmark uses the same durable settings, schema,
-fixture, and client workload for both builds. The benchmark-only workload and
-reporting additions are recorded in each campaign's `source.patch`.
+The JID1 production candidate is `aa25f6e0d` on top of the clean PR #236
+revision `df5c0637375a89e0b51a48ba76961521cca309bb`; the clean baseline is
+that latter revision. The long production trials were first measured from the
+equivalent candidate working tree before the JID1 commit, and the
+retry-to-completion trials used `aa25f6e0d`. The JID2 extension was measured
+from `825620ffd` plus the working-tree patch; its exact source bytes and the
+matching harness-only baseline are recorded in each campaign's
+`source.patch`. Every comparison uses the same durable settings, schema,
+fixture, and client workload for both builds.
 
 ## Matched SQL results
 
@@ -58,6 +62,51 @@ This confirms that the single-host fixture has periodic stalls and that the
 VibeDB-first median is the useful paired signal, rather than evidence for a
 stable 10× end-to-end result. The matched CRDB control moved about 1.10× in
 median between the VibeDB-first baseline and candidate campaigns.
+
+## Multi-field integer updates
+
+JID2 uses a bounded descriptor for one primary-key point UPDATE containing
+independent assignments such as `SET score=score+1,counter=counter+1`. The
+benchmark adds `counter` only for this workload, initializes it from the same
+independent oracle as `score`, and checks both columns after every trial. The
+apply path uses one `vibejson.ParseOptions(... ZeroCopy:true)` pass over the
+source object, builds both replacement values before publishing the row, and
+retains JID1 for the single-assignment case.
+
+The matched campaign used source `825620ffd` plus the JID2 working-tree patch
+(the candidate `source.patch` records the exact bytes), and a detached
+`825620ffd` baseline with only the benchmark harness extension. Both used
+8,192 rows, 1,000 warmups, 10,000 measured C8 operations, three repetitions,
+RF3/durable settings, and zero transient-retry allowance. Every trial had
+10,000 successes, zero errors, `verified=true`, and matching score/counter
+oracles.
+
+VibeDB-first:
+
+| build | trial 1 | trial 2 | trial 3 | median |
+| --- | ---: | ---: | ---: | ---: |
+| baseline | 722.899 | 716.363 | 730.154 | 722.899 |
+| JID2 | 1,559.206 | 1,645.414 | 1,530.012 | 1,559.206 |
+| CRDB baseline control | 1,431.411 | 1,307.878 | 2,465.307 | 1,431.411 |
+| CRDB JID2 control | 2,804.449 | 2,853.142 | 2,701.033 | 2,804.449 |
+
+The first-order VibeDB medians differ by 2.16×, but the CRDB controls moved
+substantially between campaigns, so this is recorded as an observed
+between-campaign result rather than a stable uniform improvement. A balanced
+CRDB-first confirmation retained the control difference and did not reproduce
+the gain:
+
+| build | trial 1 | trial 2 | trial 3 | median |
+| --- | ---: | ---: | ---: | ---: |
+| baseline | 1,439.094 | 1,404.685 | 1,394.432 | 1,404.685 |
+| JID2 | 1,522.508 | 1,321.003 | 1,358.147 | 1,358.147 |
+| CRDB baseline control | 2,764.953 | 2,854.663 | 2,882.876 | 2,854.663 |
+| CRDB JID2 control | 2,952.786 | 2,898.551 | 2,857.256 | 2,898.551 |
+
+Across the reverse pair, JID2 was 0.97× the baseline median. The extension is
+therefore useful for avoiding the multi-field preimage path under contention,
+but this campaign establishes no general JID2 throughput gain and does not
+support a universal 10× claim.
 
 The smaller command also reduced the measured VibeDB fixture footprint: the
 baseline `/data/vibe` was about 1,225,112 KiB with roughly 260–263 MiB node
@@ -152,6 +201,27 @@ CODEX_AGENT_ID=write_validation \
   --workloads update_hot --retry-transient --order vibedb-first --timeout 30m
 ```
 
+The corresponding two-counter contention workload was `update_multi_hot`.
+With 8,192 rows, 1,000 warmups, 10,000 measured C8 operations, three
+repetitions, and the same bounded retry-to-completion policy, all trials
+completed 10,000 logical writes with matching independent score/counter
+oracles:
+
+| engine/build | trial 1 | trial 2 | trial 3 | median |
+| --- | ---: | ---: | ---: | ---: |
+| VibeDB baseline | 246.113 | 250.049 | 114.359 | 246.113 |
+| VibeDB JID2 | 1,561.807 | 1,551.537 | 1,508.218 | 1,551.537 |
+| CRDB baseline control | 224.038 | 167.138 | 210.529 | 210.529 |
+| CRDB JID2 control | 537.224 | 577.857 | 555.838 | 555.838 |
+
+Baseline attempts/retries were 10,003/3, 10,001/1, and 10,004/4; JID2 had
+10,000/0 on every trial. The observed JID2 median is 6.30× the baseline
+median for this fixed-key two-counter workload. CRDB controls also drifted
+between the two campaigns, so this is a scoped contention result rather than
+a general engine comparison. The existing single-field JID1 hot workload's
+separate 18.81× result remains the strongest contention result in this
+campaign.
+
 ## Runtime allocation diagnostic
 
 The default runner leaves Go's process setting unchanged. A temporary wrapper
@@ -173,39 +243,47 @@ unchanged-default, long-run comparison.
 
 ## What the optimization supports
 
-JID1 is selected only for one direct, primary-key point UPDATE with a single
-top-level declared JSON `INTEGER` assignment. The expression must be an exact
-closed `column + integer` or `column - integer` operation, including a bound
+JID1 is selected for one direct, primary-key point UPDATE with a single
+top-level declared JSON `INTEGER` assignment. JID2 is selected for two or more
+distinct assignments of the same closed form. Each expression must be an
+exact `column + integer` or `column - integer` operation, including a bound
 integer parameter; primary-key assignments, maintained global indexes,
-RETURNING, multiple assignments, nested paths, and other expressions use the
-existing path. Local index maintenance still runs through the normal apply
-pipeline. SQL integer aliases collapse to the repository's JSON integer type
-and carry a signed int64 delta. The stored value and result retain the
-repository's exact arbitrary-width JSON integer semantics, including values
-beyond int64; only exponent-free JSON integer spellings are accepted, so
-`1.0` and `1e0` remain on the existing invalid-value path just as they do for
-a materialized `INTEGER` update.
+RETURNING, duplicate targets, cross-field RHS references, nested paths, and
+other expressions use the existing path. Local index maintenance still runs
+through the normal apply pipeline. SQL integer aliases collapse to the
+repository's JSON integer type and carry signed int64 deltas. The stored value
+and result retain the repository's exact arbitrary-width JSON integer
+semantics, including values beyond int64; only exponent-free JSON integer
+spellings are accepted, so `1.0` and `1e0` remain on the existing invalid-value
+path just as they do for a materialized `INTEGER` update.
 
 At apply time a missing target row remains a zero-row update. A missing or JSON
 null current value propagates JSON null, and normal schema validation preserves
 NOT NULL behavior. Malformed or non-integer stored values produce the existing
 deterministic invalid-document result while the Raft log advances; valid
 arithmetic results that exceed int64 remain exact until the normal
-document-size bound is reached. A repeated request reuses the original JID1
-command and does not increment twice; gateway
-replanning after restart reconstructs that same command instead of creating a
-new preimage-dependent digest. Tests also cover preservation of unrelated
-fields, concurrent same-key increments, and reopen/replay.
+document-size bound is reached. A repeated request reuses the original JID1 or
+JID2 command and does not increment twice; gateway replanning after restart
+reconstructs that same command instead of creating a new preimage-dependent
+digest. Tests cover simultaneous original-row evaluation, duplicate and
+malformed descriptors, preservation of unrelated fields, concurrent same-key
+single- and multi-field increments, and reopen/replay.
 
-JID1 is mutation kind 10 and is included in the authenticated apply-contract
-digest. `Machine.Open` compares the persisted contract digest with the local
-prepared contract, so a cluster cannot emit or apply JID1 under an old
-contract. An existing durable cluster must upgrade all replicas and complete
-the repository's authenticated apply-contract/schema transition before
-enabling JID1; that transition binds the old and new contract digests to the
-membership witness, authorization digest, and catalog CAS. An old binary
-rejects the new descriptor. Existing mutation kinds and their replay behavior
-are unchanged.
+JID2 is selected only when every assignment is a distinct top-level declared
+JSON `INTEGER` column with a closed self-delta expression. Cross-field RHS
+dependencies, duplicate targets, primary-key assignments, maintained global
+indexes, RETURNING, nested paths, and unsupported arithmetic remain on the
+existing path.
+
+JID1 and JID2 are mutation kind 10 and are included in the authenticated
+apply-contract digest. `Machine.Open` compares the persisted contract digest
+with the local prepared contract, so a cluster cannot emit or apply either
+descriptor under an old contract. An existing durable cluster must upgrade all
+replicas and complete the repository's authenticated apply-contract/schema
+transition before enabling these descriptors; that transition binds the old
+and new contract digests to the membership witness, authorization digest, and
+catalog CAS. An old binary rejects the new descriptor. Existing mutation kinds
+and their replay behavior are unchanged.
 
 ## Remaining write cost
 
@@ -225,13 +303,15 @@ All Go commands used `/Users/thesyncim/.codex/bin/project-env`:
 CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test ./gateway ./internal/replication ./internal/replicatedstate -count=1 -timeout=20m
 CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test -race ./gateway -run 'TestPreparedDirectIntegerUpdate|TestDurableSQLSingleTargetFastPathSkipsLedgerAndReplaysExactly|TestReplicatedDirectMutationIsOneProposalWithCrossGatewayExactRetry|TestReplicatedDirectInt64DeltaConcurrentSameKeyIncrements' -count=1 -timeout=15m
 CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test -race ./internal/replication ./internal/replicatedstate -run 'TestJSONInt64Delta|TestMaterializeJSONInt64Delta|TestGolden|TestApplyContract|TestTransition' -count=1 -timeout=15m
-CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test ./integration/pgclient/cmd/rf3-sqlbench -count=1 -timeout=15m
+cd integration/pgclient && CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test ./cmd/rf3-sqlbench -count=1 -timeout=15m
 ```
 
 The first command passed gateway (84.413s), replication (0.520s), and
-replicatedstate (104.734s). Both race-focused commands passed, as did the
-dedicated concurrent same-key test in normal and race modes. The SQL benchmark
-package test passed after adding the retry policy, hot-key workload, and
-independent final-score fields. The SQL-path tests prove JID1 was decoded from
-the actual direct proposal and that replay uses JID1 again; planner-only
+replicatedstate (104.734s) before the JID2 extension. The focused JID2 suite,
+including malformed framing, simultaneous application, exact wide integers,
+reopen/replay, and the direct executor, passed after the extension; the race
+suite also covered concurrent same-key JID1 and JID2 increments. The SQL
+benchmark package test passed after adding the two-counter workloads and
+independent score/counter verification. The SQL-path tests prove JID2 was
+decoded from the actual direct proposal with zero preimage reads; planner-only
 coverage is not the performance evidence.

@@ -578,11 +578,11 @@ func TestParseTables(t *testing.T) {
 }
 
 func TestParseWorkloads(t *testing.T) {
-	got, err := parseWorkloads("point_hit,mixed,update_existing")
+	got, err := parseWorkloads("point_hit,mixed,update_existing,update_multi_existing")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(got, ",") != "point_hit,mixed_read_update,update_existing" {
+	if strings.Join(got, ",") != "point_hit,mixed_read_update,update_existing,update_multi_existing" {
 		t.Fatalf("workloads = %v", got)
 	}
 	for _, input := range []string{"", "point_hit,point_hit", "delete_all"} {
@@ -593,11 +593,11 @@ func TestParseWorkloads(t *testing.T) {
 }
 
 func TestParseWorkloadsAcceptsExplicitUniformNames(t *testing.T) {
-	got, err := parseWorkloads("update_uniform,update_hot,mixed_uniform")
+	got, err := parseWorkloads("update_uniform,update_hot,update_multi_hot,mixed_uniform")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(got, ",") != "update_uniform,update_hot,mixed_uniform" {
+	if strings.Join(got, ",") != "update_uniform,update_hot,update_multi_hot,mixed_uniform" {
 		t.Fatalf("workloads = %v", got)
 	}
 	if _, err := parseWorkloads("update_uniform,update_uniform"); err == nil {

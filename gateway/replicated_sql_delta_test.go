@@ -92,6 +92,76 @@ func TestPreparedDirectIntegerUpdateUsesApplyTimeDeltaAndFallbackKeepsCAS(t *tes
 	}
 }
 
+func TestPreparedDirectMultiIntegerUpdateUsesApplyTimeDeltasAndFallbackKeepsCAS(t *testing.T) {
+	snapshot, executor := replicatedSQLTransactionFixture(t, true)
+	if err := snapshot.attachReplicatedTableDeclarations([]ReplicatedTableDeclaration{{
+		Table:       "messages",
+		CreateTable: `CREATE TABLE messages (id TEXT PRIMARY KEY, count INTEGER, total INTEGER, keep TEXT)`,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	old := []byte(`{"id":"message-1","count":41,"total":100,"keep":"x"}`)
+	reader, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
+	query := Query{
+		SQL: `UPDATE messages SET count = count + 1, total = total + ? WHERE id = ?`,
+		Params: []shardservice.Param{
+			shardservice.NumberParam("-2"), shardservice.StringParam("message-1"),
+		},
+	}
+	profile := executor.profileFor(ClassInteractive)
+	targets, handled, err := executor.planReplicatedSQLTransactionWithDataMode(
+		t.Context(), snapshot, []Query{query}, profile, data,
+		replicatedSQLCommittedLeaderPreimage,
+	)
+	if err != nil || !handled || len(targets) != 1 || reader.reads != 0 {
+		t.Fatalf("delta plan=%d handled=%v reads=%d err=%v", len(targets), handled, reader.reads, err)
+	}
+	mutation := targets[0].Batches[0].Mutations[0]
+	if mutation.Kind != replication.MutationJSONInt64Delta ||
+		mutation.ExpectedValueLength != 0 || mutation.ExpectedValueDigest != (replication.Digest{}) {
+		t.Fatalf("delta mutation=%+v", mutation)
+	}
+	iterator, ok := replication.OpenJSONInt64Deltas(mutation.Value)
+	if !ok {
+		t.Fatalf("not JID2: %x", mutation.Value)
+	}
+	want := map[string]int64{"count": 1, "total": -2}
+	for len(want) != 0 {
+		column, delta, next := iterator.Next()
+		if !next {
+			t.Fatalf("JID2 ended with fields=%v", want)
+		}
+		value, found := want[string(column)]
+		if !found || value != delta {
+			t.Fatalf("JID2 field=%q delta=%d want=%v", column, delta, want)
+		}
+		delete(want, string(column))
+	}
+	if _, _, next := iterator.Next(); next {
+		t.Fatal("JID2 has trailing field")
+	}
+
+	// A cross-field dependency observes the original row in SQL and is outside
+	// the closed native descriptor grammar; it must retain the ordinary CAS.
+	casReader, casData := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
+	casQuery := Query{
+		SQL:    `UPDATE messages SET count = count + 1, total = total + count WHERE id = ?`,
+		Params: []shardservice.Param{shardservice.StringParam("message-1")},
+	}
+	casTargets, casHandled, err := executor.planReplicatedSQLTransactionWithData(
+		t.Context(), snapshot, []Query{casQuery}, profile, casData,
+	)
+	if err != nil || !casHandled || len(casTargets) != 1 || casReader.reads != 1 {
+		t.Fatalf("CAS plan=%d handled=%v reads=%d err=%v", len(casTargets), casHandled, casReader.reads, err)
+	}
+	casMutation := casTargets[0].Batches[0].Mutations[0]
+	if casMutation.Kind != replication.MutationPutDigestEqual ||
+		casMutation.ExpectedValueLength != uint64(len(old)) ||
+		casMutation.ExpectedValueDigest != replication.Digest(sha256.Sum256(old)) {
+		t.Fatalf("CAS mutation=%+v", casMutation)
+	}
+}
+
 func TestPreparedDirectIntegerUpdatePublishesJID1ThroughDirectExecutor(t *testing.T) {
 	snapshot, planner := replicatedSQLTransactionFixture(t, true)
 	if err := snapshot.attachReplicatedTableDeclarations([]ReplicatedTableDeclaration{{
@@ -137,6 +207,72 @@ func TestPreparedDirectIntegerUpdatePublishesJID1ThroughDirectExecutor(t *testin
 	}
 	if len(proposal.kinds) != 1 || proposal.kinds[0] != replication.MutationJSONInt64Delta {
 		t.Fatalf("published mutation kinds=%v, want [%d]", proposal.kinds, replication.MutationJSONInt64Delta)
+	}
+}
+
+func TestPreparedDirectMultiIntegerUpdatePublishesJID2ThroughDirectExecutor(t *testing.T) {
+	snapshot, planner := replicatedSQLTransactionFixture(t, true)
+	if err := snapshot.attachReplicatedTableDeclarations([]ReplicatedTableDeclaration{{
+		Table:       "messages",
+		CreateTable: `CREATE TABLE messages (id TEXT PRIMARY KEY, count INTEGER NOT NULL, total INTEGER NOT NULL, keep TEXT)`,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	planner = NewExecutor(nil, NewCatalogHolder(snapshot), Options{})
+	old := []byte(`{"id":"message-1","count":41,"total":100,"keep":"x"}`)
+	reader, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
+	executor := &DurableSQLRequestExecutor{planner: planner, data: data, singleFast: true}
+	tenant := []byte("prepared-jid2")
+	key := preparedDirectTestKey(tenant)
+	ctx, err := serviceauthz.WithAuthority(
+		t.Context(), serviceauthz.Authority{Node: [16]byte{7}, Generation: 1},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queries := []Query{{
+		SQL: `UPDATE messages SET count = count + 1, total = total + ? WHERE id = ?`,
+		Params: []shardservice.Param{
+			shardservice.NumberParam("-2"), shardservice.StringParam("message-1"),
+		},
+	}}
+	plan, err := executor.PrepareDirect(ctx, key, tenant, queries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reader.reads != 0 || plan.Target.Batches[0].Mutations[0].Kind != replication.MutationJSONInt64Delta {
+		t.Fatalf("prepared plan reads=%d mutation=%+v", reader.reads, plan.Target.Batches[0].Mutations[0])
+	}
+	if _, ok := replication.OpenJSONInt64Deltas(plan.Target.Batches[0].Mutations[0].Value); !ok {
+		t.Fatalf("prepared plan did not carry JID2: %x", plan.Target.Batches[0].Mutations[0].Value)
+	}
+
+	proposal := &directSQLProposalClient{t: t, route: plan.Target.Route, applied: 1}
+	executor.data, err = NewReplicatedExecutor(proposal, 3, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.ExecutePreparedDirect(ctx, key, tenant, queries, plan)
+	if err != nil || !result.Direct || result.Result == nil || result.Result.RowsAffected != 1 {
+		t.Fatalf("direct result=%+v err=%v", result, err)
+	}
+	if len(proposal.kinds) != 1 || proposal.kinds[0] != replication.MutationJSONInt64Delta {
+		t.Fatalf("published mutation kinds=%v, want [%d]", proposal.kinds, replication.MutationJSONInt64Delta)
+	}
+	view, err := replication.OpenCommand(proposal.exact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relations := view.RelationBatches()
+	if !relations.Next() {
+		t.Fatal("published JID2 command has no relation batch")
+	}
+	mutations := relations.Batch().Mutations()
+	if !mutations.Next() {
+		t.Fatal("published JID2 command has no mutation")
+	}
+	if _, ok := replication.OpenJSONInt64Deltas(mutations.Mutation().Value); !ok {
+		t.Fatalf("published descriptor is not JID2: %x", mutations.Mutation().Value)
 	}
 }
 

@@ -320,7 +320,7 @@ func run(c config) (runErr error) {
 				if verifyThisTrial {
 					verifyErr = verify(ctx, admin, c, tables, scores)
 				}
-				if workload == "update_hot" && verifyErr == nil {
+				if (workload == "update_hot" || workload == "update_multi_hot") && verifyErr == nil {
 					out.ExpectedHotScores = make([]int, len(scores))
 					for group := range scores {
 						out.ExpectedHotScores[group] = scores[group][0]
@@ -456,7 +456,7 @@ func parseWorkloads(raw string) ([]string, error) {
 	}
 	allowed := map[string]struct{}{
 		"point_hit": {}, "point_miss": {}, "range_32": {}, "range_64": {}, "range_256": {}, "group_16": {},
-		"update_existing": {}, "update_hot": {}, "mixed_read_update": {}, "update_uniform": {}, "mixed_uniform": {},
+		"update_existing": {}, "update_multi_existing": {}, "update_hot": {}, "update_multi_hot": {}, "mixed_read_update": {}, "update_uniform": {}, "mixed_uniform": {},
 	}
 	workloads := make([]string, 0, len(strings.Split(raw, ",")))
 	seen := make(map[string]struct{}, len(allowed))
@@ -833,7 +833,7 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 	var hotCounts []atomic.Int64
 	var attempts atomic.Int64
 	var transientRetries atomic.Int64
-	if workload == "update_hot" {
+	if workload == "update_hot" || workload == "update_multi_hot" {
 		hotCounts = make([]atomic.Int64, len(tables))
 	}
 	connections := make([]*pgconn.PgConn, clients)
@@ -876,12 +876,22 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 			id = client
 			sql = "UPDATE " + table + " SET score=score+1 WHERE id=$1"
 			params = [][]byte{[]byte(key(id))}
+		case "update_multi_existing":
+			id = client
+			sql = "UPDATE " + table + " SET score=score+1,counter=counter+1 WHERE id=$1"
+			params = [][]byte{[]byte(key(id))}
 		case "update_hot":
 			// Every client targets the same existing row. This intentionally
 			// exposes optimistic preimage conflicts in the baseline path while
 			// keeping the SQL expression eligible for the atomic delta path.
 			id = 0
 			sql = "UPDATE " + table + " SET score=score+1 WHERE id=$1"
+			params = [][]byte{[]byte(key(id))}
+		case "update_multi_hot":
+			// Every client targets the same row while updating both integer fields.
+			// This isolates retry/conflict behavior from key-selection effects.
+			id = 0
+			sql = "UPDATE " + table + " SET score=score+1,counter=counter+1 WHERE id=$1"
 			params = [][]byte{[]byte(key(id))}
 		case "update_uniform":
 			id = uniformKeyFor(c.rows, clients, client, rep, ordinal)
@@ -959,9 +969,19 @@ func trial(ctx context.Context, c config, workload string, clients, rep, count i
 				return fmt.Errorf("update affected %d", res.CommandTag.RowsAffected())
 			}
 			scores[group][id]++
+		case "update_multi_existing":
+			if res.CommandTag.RowsAffected() != 1 {
+				return fmt.Errorf("multi update affected %d", res.CommandTag.RowsAffected())
+			}
+			scores[group][id]++
 		case "update_hot":
 			if res.CommandTag.RowsAffected() != 1 {
 				return fmt.Errorf("hot update affected %d", res.CommandTag.RowsAffected())
+			}
+			hotCounts[group].Add(1)
+		case "update_multi_hot":
+			if res.CommandTag.RowsAffected() != 1 {
+				return fmt.Errorf("multi hot update affected %d", res.CommandTag.RowsAffected())
 			}
 			hotCounts[group].Add(1)
 		case "update_uniform":

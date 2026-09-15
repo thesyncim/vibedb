@@ -20,6 +20,19 @@ func packIndexesEnabled(c config) bool {
 	return c.indexes == indexModePackLeading || c.indexes == indexModePackNonleading
 }
 
+// multiDeltaEnabled adds the second integer field used by the dedicated
+// multi-field UPDATE workload. Keeping this column conditional preserves the
+// historical five-workload schema and makes baseline/candidate comparisons
+// use exactly the same table definition.
+func multiDeltaEnabled(c config) bool {
+	for _, workload := range strings.Split(c.workloads, ",") {
+		if strings.TrimSpace(workload) == "update_multi_existing" || strings.TrimSpace(workload) == "update_multi_hot" {
+			return true
+		}
+	}
+	return false
+}
+
 func normalizeIndexMode(mode string) string {
 	if mode == "" {
 		return indexModeNone
@@ -29,6 +42,9 @@ func normalizeIndexMode(mode string) string {
 
 func tableDDL(c config, table string) string {
 	ddl := "CREATE TABLE IF NOT EXISTS " + table + " (id TEXT PRIMARY KEY, bucket INTEGER NOT NULL, score INTEGER NOT NULL, payload TEXT NOT NULL"
+	if multiDeltaEnabled(c) {
+		ddl += ", counter INTEGER NOT NULL"
+	}
 	if packIndexesEnabled(c) {
 		ddl += ", shared TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL"
 	}
@@ -97,6 +113,12 @@ func payloadFor(c config, row int) string {
 }
 
 func insertColumns(c config) string {
+	if multiDeltaEnabled(c) {
+		if packIndexesEnabled(c) {
+			return "(id,bucket,score,payload,counter,shared,a,b)"
+		}
+		return "(id,bucket,score,payload,counter)"
+	}
 	if packIndexesEnabled(c) {
 		return "(id,bucket,score,payload,shared,a,b)"
 	}
@@ -104,6 +126,15 @@ func insertColumns(c config) string {
 }
 
 func appendInsertRow(sql *strings.Builder, c config, row int) {
+	if multiDeltaEnabled(c) {
+		if packIndexesEnabled(c) {
+			fmt.Fprintf(sql, "('%s',%d,%d,'%s',%d,'%s','%s','%s')",
+				key(row), row%16, row%100, payloadFor(c, row), row%100, packSharedValue(c, row), packA(row), packB(row))
+			return
+		}
+		fmt.Fprintf(sql, "('%s',%d,%d,'%s',%d)", key(row), row%16, row%100, payloadFor(c, row), row%100)
+		return
+	}
 	if packIndexesEnabled(c) {
 		fmt.Fprintf(sql, "('%s',%d,%d,'%s','%s','%s','%s')",
 			key(row), row%16, row%100, payloadFor(c, row), packSharedValue(c, row), packA(row), packB(row))
@@ -113,6 +144,12 @@ func appendInsertRow(sql *strings.Builder, c config, row int) {
 }
 
 func verifySelectSQL(c config, table string) string {
+	if multiDeltaEnabled(c) {
+		if packIndexesEnabled(c) {
+			return "SELECT id,bucket,score,counter,payload,shared,a,b FROM " + table + " WHERE id >= $1 ORDER BY id LIMIT 512"
+		}
+		return "SELECT id,bucket,score,counter,payload FROM " + table + " WHERE id >= $1 ORDER BY id LIMIT 512"
+	}
 	if packIndexesEnabled(c) {
 		return "SELECT id,bucket,score,payload,shared,a,b FROM " + table + " WHERE id >= $1 ORDER BY id LIMIT 512"
 	}
@@ -120,25 +157,40 @@ func verifySelectSQL(c config, table string) string {
 }
 
 func verifyColumnCount(c config) int {
-	if packIndexesEnabled(c) {
-		return 7
+	count := 4
+	if multiDeltaEnabled(c) {
+		count++
 	}
-	return 4
+	if packIndexesEnabled(c) {
+		count += 3
+	}
+	return count
 }
 
 func primaryRowMatches(c config, row [][]byte, group, id int, scores [][]int) bool {
-	if len(row) < 4 {
+	if len(row) < verifyColumnCount(c) {
 		return false
 	}
 	if textCell(c, row[0]) != key(id) || string(row[1]) != strconv.Itoa(id%16) ||
-		string(row[2]) != strconv.Itoa(scores[group][id]) || textCell(c, row[3]) != payloadFor(c, id) {
+		string(row[2]) != strconv.Itoa(scores[group][id]) {
+		return false
+	}
+	payloadIndex := 3
+	if multiDeltaEnabled(c) {
+		if string(row[3]) != strconv.Itoa(scores[group][id]) {
+			return false
+		}
+		payloadIndex++
+	}
+	if textCell(c, row[payloadIndex]) != payloadFor(c, id) {
 		return false
 	}
 	if !packIndexesEnabled(c) {
-		return len(row) == 4
+		return len(row) == payloadIndex+1
 	}
-	return len(row) == 7 &&
-		textCell(c, row[4]) == packSharedValue(c, id) &&
-		textCell(c, row[5]) == packA(id) &&
-		textCell(c, row[6]) == packB(id)
+	packIndex := payloadIndex + 1
+	return len(row) == packIndex+3 &&
+		textCell(c, row[packIndex]) == packSharedValue(c, id) &&
+		textCell(c, row[packIndex+1]) == packA(id) &&
+		textCell(c, row[packIndex+2]) == packB(id)
 }

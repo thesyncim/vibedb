@@ -292,10 +292,11 @@ const (
 	// evaluates its deterministic conflict program against the current row.
 	// Value uses the VUC3 input grammar; it is never stored as a document.
 	MutationPutConflict MutationKind = 9
-	// MutationJSONInt64Delta applies the signed int64 delta in its JID1 payload
-	// to one top-level JSON integer field of the current row. The operation is
-	// evaluated at the replicated apply index and is never treated as a stored
-	// document or as a gateway-computed preimage replacement.
+	// MutationJSONInt64Delta applies the signed int64 delta in its JID1 payload,
+	// or each independent delta in its JID2 payload, to top-level JSON integer
+	// fields of the current row. The operation is evaluated at the replicated
+	// apply index and is never treated as a stored document or as a
+	// gateway-computed preimage replacement.
 	MutationJSONInt64Delta MutationKind = 10
 )
 

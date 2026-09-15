@@ -2,6 +2,7 @@ package replicatedstate
 
 import (
 	"bytes"
+	"encoding/binary"
 	"math"
 	"testing"
 
@@ -11,6 +12,15 @@ import (
 func jsonDeltaMutation(t testing.TB, key, column string, delta int64) replication.Mutation {
 	t.Helper()
 	descriptor, err := replication.AppendJSONInt64Delta(nil, column, delta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return replication.Mutation{Kind: replication.MutationJSONInt64Delta, Key: []byte(key), Value: descriptor}
+}
+
+func jsonDeltasMutation(t testing.TB, key string, fields []replication.JSONInt64DeltaField) replication.Mutation {
+	t.Helper()
+	descriptor, err := replication.AppendJSONInt64Deltas(nil, fields)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,6 +44,29 @@ func applyJSONDelta(
 	}
 	if _, err := fixture.machine.ApplyNormal(normalMeta(index), command); err != nil {
 		t.Fatalf("apply delta %d: %v", sequence, err)
+	}
+	completion, rows, _ := openMutationCompletion(t, fixture.machine, command)
+	return completion, rows
+}
+
+func applyJSONDeltas(
+	t testing.TB,
+	fixture relationBundleFixture,
+	sequence, index uint64,
+	admit bool,
+	mutation replication.Mutation,
+) (replication.CompletionView, int64) {
+	t.Helper()
+	command := fixture.command(t, sequence, replication.RelationMutationBatch{
+		Relation: 1, Mutations: []replication.Mutation{mutation},
+	})
+	if admit {
+		if err := fixture.machine.AdmitCommand(command); err != nil {
+			t.Fatalf("admit deltas %d: %v", sequence, err)
+		}
+	}
+	if _, err := fixture.machine.ApplyNormal(normalMeta(index), command); err != nil {
+		t.Fatalf("apply deltas %d: %v", sequence, err)
 	}
 	completion, rows, _ := openMutationCompletion(t, fixture.machine, command)
 	return completion, rows
@@ -221,5 +254,116 @@ func TestMaterializeJSONInt64DeltaMatchesNullableMissingAndIntegerSpellingRules(
 	updated, code = materializeJSONInt64Delta(wide, descriptor, len(wide))
 	if code != ResultTargetBound || updated != nil {
 		t.Fatalf("wide target bound update=%s code=%d", updated, code)
+	}
+}
+
+func TestMaterializeJSONInt64DeltasAppliesSimultaneouslyAndPreservesFields(t *testing.T) {
+	descriptor, err := replication.AppendJSONInt64Deltas(nil, []replication.JSONInt64DeltaField{
+		{Column: "count", Delta: 1}, {Column: "total", Delta: -2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, code := materializeJSONInt64Delta(
+		[]byte(`{"id":"counter","count":41,"total":100,"keep":{"x":true}}`), descriptor, 1024,
+	)
+	if code != ResultApplied || string(updated) != `{"id":"counter","count":42,"total":98,"keep":{"x":true}}` {
+		t.Fatalf("updated=%s code=%d", updated, code)
+	}
+
+	fixture := newRelationBundleFixture(t, true)
+	key := "multi-counter"
+	seed := fixture.command(t, 1, replication.RelationMutationBatch{Relation: 1, Mutations: []replication.Mutation{{
+		Kind: replication.MutationPut, Key: []byte(key),
+		Value: []byte(`{"count":9223372036854775807,"total":-9223372036854775808,"keep":"x"}`),
+	}}})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), seed); err != nil {
+		t.Fatal(err)
+	}
+	completion, rows := applyJSONDeltas(t, fixture, 2, 4, true, jsonDeltasMutation(t, key, []replication.JSONInt64DeltaField{
+		{Column: "count", Delta: 1}, {Column: "total", Delta: -1},
+	}))
+	if completion.ResultCode != ResultApplied || rows != 1 {
+		t.Fatalf("completion=%+v rows=%d", completion, rows)
+	}
+	value, found, err := fixture.base.Collection.AppendRaw(nil, []byte(key))
+	if err != nil || !found || string(value) != `{"count":9223372036854775808,"keep":"x","total":-9223372036854775809}` {
+		t.Fatalf("stored=%q found=%v err=%v", value, found, err)
+	}
+
+	// The exact same command is an idempotent replay and must not apply either
+	// field a second time.
+	command := fixture.command(t, 2, replication.RelationMutationBatch{Relation: 1, Mutations: []replication.Mutation{jsonDeltasMutation(t, key, []replication.JSONInt64DeltaField{
+		{Column: "count", Delta: 1}, {Column: "total", Delta: -1},
+	})}})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(5), command); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.machine.ApplyNormal(normalMeta(6), command); err != nil {
+		t.Fatal(err)
+	}
+	value, found, err = fixture.base.Collection.AppendRaw(nil, []byte(key))
+	if err != nil || !found || string(value) != `{"count":9223372036854775808,"keep":"x","total":-9223372036854775809}` {
+		t.Fatalf("replay stored=%q found=%v err=%v", value, found, err)
+	}
+	reopened := reopenRelationBundleFixture(t, fixture)
+	value, found, err = reopened.relations[0].target.Collection.AppendRaw(nil, []byte(key))
+	if err != nil || !found || string(value) != `{"count":9223372036854775808,"keep":"x","total":-9223372036854775809}` {
+		t.Fatalf("reopened multi stored=%q found=%v err=%v", value, found, err)
+	}
+}
+
+func TestJSONInt64DeltasNullMissingAndInvalidDescriptorAreDeterministic(t *testing.T) {
+	descriptor, err := replication.AppendJSONInt64Deltas(nil, []replication.JSONInt64DeltaField{
+		{Column: "count", Delta: 1}, {Column: "total", Delta: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, code := materializeJSONInt64Delta([]byte(`{"count":null,"keep":"x"}`), descriptor, 1024)
+	if code != ResultApplied || string(updated) != `{"count":null,"keep":"x","total":null}` {
+		t.Fatalf("null/missing updated=%s code=%d", updated, code)
+	}
+	for _, raw := range []string{`{"count":1.0,"total":2}`, `{"count":1e0,"total":2}`} {
+		updated, code = materializeJSONInt64Delta([]byte(raw), descriptor, 1024)
+		if code != ResultInvalidDocument || updated != nil {
+			t.Fatalf("raw=%s updated=%s code=%d", raw, updated, code)
+		}
+	}
+	bad := append([]byte(nil), descriptor...)
+	// Both columns have five bytes. Make the second field a duplicate without
+	// changing its framing; the apply helper must fail closed.
+	firstLen := int(binary.LittleEndian.Uint16(bad[8:10]))
+	second := 8 + 10 + firstLen
+	copy(bad[second+10:second+10+firstLen], bad[18:18+firstLen])
+	updated, code = materializeJSONInt64Delta([]byte(`{"count":1,"total":2}`), bad, 1024)
+	if code != ResultInvalidDocument || updated != nil {
+		t.Fatalf("duplicate descriptor updated=%s code=%d", updated, code)
+	}
+
+	// A failure in one assignment must leave the row untouched; no partially
+	// built multi-field postimage may enter the relation or data chain.
+	fixture := newRelationBundleFixture(t, true)
+	key := "multi-invalid"
+	original := []byte(`{"count":1,"total":1.0,"keep":"x"}`)
+	seed := fixture.command(t, 1, replication.RelationMutationBatch{Relation: 1, Mutations: []replication.Mutation{{
+		Kind: replication.MutationPut, Key: []byte(key), Value: original,
+	}}})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), seed); err != nil {
+		t.Fatal(err)
+	}
+	before, found, err := fixture.base.Collection.AppendRaw(nil, []byte(key))
+	if err != nil || !found {
+		t.Fatalf("invalid multi seed found=%v err=%v", found, err)
+	}
+	completion, rows := applyJSONDeltas(t, fixture, 2, 4, false, jsonDeltasMutation(t, key, []replication.JSONInt64DeltaField{
+		{Column: "count", Delta: 1}, {Column: "total", Delta: 1},
+	}))
+	if completion.ResultCode != ResultInvalidDocument || rows != 0 {
+		t.Fatalf("invalid multi completion=%+v rows=%d", completion, rows)
+	}
+	value, found, err := fixture.base.Collection.AppendRaw(nil, []byte(key))
+	if err != nil || !found || !bytes.Equal(value, before) {
+		t.Fatalf("invalid multi changed row=%q found=%v err=%v", value, found, err)
 	}
 }

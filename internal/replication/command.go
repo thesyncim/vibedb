@@ -1431,7 +1431,7 @@ func validateMutation(mutation Mutation) error {
 			return semantic("conflict mutation payload")
 		}
 	case MutationJSONInt64Delta:
-		if _, _, ok := OpenJSONInt64Delta(mutation.Value); !ok || !zeroExpected {
+		if !ValidJSONInt64Delta(mutation.Value) || !zeroExpected {
 			return semantic("JSON integer delta payload")
 		}
 	case MutationPut, MutationPutAbsentOrEqual, MutationPutAbsent, MutationPutPresent, MutationPutIfAbsent:
@@ -1896,7 +1896,7 @@ func validateMutationBytes(src []byte, count uint32) error {
 				return semantic("conflict mutation payload")
 			}
 		case MutationJSONInt64Delta:
-			if _, _, ok := OpenJSONInt64Delta(value); !ok {
+			if !ValidJSONInt64Delta(value) {
 				return semantic("JSON integer delta payload")
 			}
 		case MutationPut, MutationPutAbsentOrEqual, MutationPutAbsent, MutationPutPresent, MutationPutIfAbsent:

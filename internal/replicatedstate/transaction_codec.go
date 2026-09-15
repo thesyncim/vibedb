@@ -1360,7 +1360,7 @@ func transactionMutationValid(mutation replication.Mutation) bool {
 		_, _, ok := replication.OpenConflictValue(mutation.Value)
 		return ok && zeroExpected
 	case replication.MutationJSONInt64Delta:
-		_, _, ok := replication.OpenJSONInt64Delta(mutation.Value)
+		ok := replication.ValidJSONInt64Delta(mutation.Value)
 		return ok && zeroExpected
 	case replication.MutationPut, replication.MutationPutAbsentOrEqual,
 		replication.MutationPutAbsent, replication.MutationPutPresent, replication.MutationPutIfAbsent:

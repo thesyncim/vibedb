@@ -64,7 +64,7 @@ type replicatedSQLBoundStatement struct {
 	// inline would tax every single-statement write lowering.
 	updateExec      *query.Exec
 	conflictProgram []byte
-	// int64Delta is a JID1 operation descriptor for the prepared direct lane.
+	// int64Delta is a JID1 or JID2 operation descriptor for the prepared direct lane.
 	// It is populated only when the exact point UPDATE can execute atomically at
 	// the replicated apply index, so no gateway preimage is retained or read.
 	int64Delta []byte

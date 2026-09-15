@@ -800,7 +800,7 @@ func (session *NativeSession) validateNativeMutation(mutation NativeMutation) er
 			len(mutation.Value) > session.maxCommand {
 			return ErrNativeBundleBound
 		}
-		if _, _, ok := replication.OpenJSONInt64Delta(mutation.Value); !ok {
+		if !replication.ValidJSONInt64Delta(mutation.Value) {
 			return ErrNativeDocument
 		}
 		if mutation.ExpectedValueLength != 0 || mutation.ExpectedValueDigest != (replication.Digest{}) {

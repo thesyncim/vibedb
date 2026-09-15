@@ -416,7 +416,7 @@ func (executor *DurableSQLRequestExecutor) ReplayRequestWithTenant(
 	}
 	defer lease.release()
 	// Reconstruct the same committed-preimage lowering used by the prepared
-	// direct lane. In particular, JID1 integer deltas must survive a gateway
+	// direct lane. In particular, JID1/JID2 integer deltas must survive a gateway
 	// restart as the same operation descriptor; replanning through the old
 	// linearizable path would manufacture a different digest-guarded command
 	// after the row had already changed.

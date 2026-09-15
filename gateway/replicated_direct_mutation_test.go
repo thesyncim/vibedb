@@ -192,3 +192,83 @@ func TestReplicatedDirectInt64DeltaConcurrentSameKeyIncrements(t *testing.T) {
 		t.Fatalf("concurrent counter=%q found=%v applied=%d err=%v", stored.Value, stored.Found, client.state.Applied, err)
 	}
 }
+
+func TestReplicatedDirectMultiInt64DeltaConcurrentSameKeyIncrements(t *testing.T) {
+	route, client, _ := newRouteSessionMachine(t)
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := serviceauthz.WithAuthority(
+		t.Context(), serviceauthz.Authority{Node: [16]byte{7}, Generation: 1},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenant := []byte("concurrent-multi-delta-tenant")
+	baseKey := requestledger.RequestKey{
+		Scope:        requestledger.ScopeAuthenticated,
+		TenantDigest: requestledger.Digest(sha256.Sum256(tenant)),
+		Principal:    requestledger.PrincipalID{0x52}, Request: requestledger.RequestID{0x62},
+		IssuerEpoch: 7, IssuerSequence: 1, IssuerLane: requestledger.IssuerLane{0x72},
+	}
+	target := ReplicatedTransactionTarget{
+		Route: route, BucketBits: 8,
+		IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}},
+		Batches: []replication.RelationMutationBatch{{
+			Relation: 1, Mutations: []replication.Mutation{{
+				Kind: replication.MutationPutAbsentOrEqual, Key: []byte("multi-counter"),
+				Value: []byte(`{"id":"multi-counter","score":0,"total":0,"keep":"x"}`),
+			}},
+		}},
+	}
+	seed := ReplicatedDirectMutation{
+		Key: baseKey, RequestDigest: replication.Digest{0x82}, Tenant: tenant, Target: target,
+	}
+	if result, err := executor.DirectMutate(ctx, seed); err != nil || !result.Committed {
+		t.Fatalf("seed result=%+v err=%v", result, err)
+	}
+	descriptor, err := replication.AppendJSONInt64Deltas(nil, []replication.JSONInt64DeltaField{
+		{Column: "score", Delta: 1}, {Column: "total", Delta: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const increments = 16
+	errs := make(chan error, increments)
+	for i := 0; i < increments; i++ {
+		i := i
+		go func() {
+			request := baseKey
+			request.Request[0] = byte(0x63 + i)
+			request.IssuerLane[0] = byte(0x73 + i)
+			mutation := replication.Mutation{
+				Kind: replication.MutationJSONInt64Delta, Key: []byte("multi-counter"),
+				Value: descriptor,
+			}
+			requestDigest := replication.Digest{byte(0xa1 + i)}
+			requestTarget := target
+			requestTarget.Batches = []replication.RelationMutationBatch{{
+				Relation: 1, Mutations: []replication.Mutation{mutation},
+			}}
+			result, callErr := executor.DirectMutate(ctx, ReplicatedDirectMutation{
+				Key: request, RequestDigest: requestDigest, Tenant: tenant, Target: requestTarget,
+			})
+			if callErr != nil || !result.Committed || result.AffectedRows != 1 {
+				errs <- fmt.Errorf("increment %d result=%+v err=%v", i, result, callErr)
+				return
+			}
+			errs <- nil
+		}()
+	}
+	for i := 0; i < increments; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	stored, err := client.machine.PointReadInto(1, []byte("multi-counter"), client.state.Applied, replication.MaxMutationValueBytes, nil)
+	if err != nil || !stored.Found || !bytes.Contains(stored.Value, []byte(`"score":16`)) ||
+		!bytes.Contains(stored.Value, []byte(`"total":32`)) || !bytes.Contains(stored.Value, []byte(`"keep":"x"`)) {
+		t.Fatalf("concurrent multi counter=%q found=%v applied=%d err=%v", stored.Value, stored.Found, client.state.Applied, err)
+	}
+}
