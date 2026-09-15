@@ -357,25 +357,11 @@ func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener,
 			if !found || route.Group != intent.Group || len(route.Replicas) != len(voters) {
 				return nil, errScalingEnrollmentDrift
 			}
-			for i, member := range route.Replicas {
-				record, err := runtime.authority.ReadNode(ctx, member.Node, member.NodeIncarnation)
-				if err != nil {
-					return nil, err
-				}
-				snapshotAddress, err := preparationSnapshotAddress(snapshotAddresses, member, record)
-				if err != nil {
-					return nil, err
-				}
-				allowDraining := member.Member == intent.Source.Member &&
-					member.Node == intent.Source.Node && member.StoreID == intent.Source.StoreID &&
-					member.NodeIncarnation == intent.Source.NodeIncarnation &&
-					member.Endpoint == string(intent.Source.Endpoint) &&
-					member.NativeEndpoint == string(intent.Source.NativeEndpoint) &&
-					member.ControlEndpoint == string(intent.Source.ControlEndpoint)
-				voters[i], err = certifiedPreparationMember(member, record, snapshotAddress, allowDraining)
-				if err != nil {
-					return nil, err
-				}
+			voters, err = certifySourcePreparation(intent, route, snapshotAddresses, func(member gateway.ReplicatedEndpoint) (gateway.NodeRecord, error) {
+				return runtime.authority.ReadNode(ctx, member.Node, member.NodeIncarnation)
+			})
+			if err != nil {
+				return nil, err
 			}
 			node, err := runtime.authority.ReadNode(ctx, intent.Target.Node, intent.Target.NodeIncarnation)
 			if err != nil {
@@ -406,6 +392,44 @@ func (runtime *Runtime) openScalingEnrollment(opener nodecontrol.StreamOpener,
 	return nil
 }
 
+// certifySourcePreparation binds the per-group route aliases to the
+// authenticated physical directory cut. A NodeRecord carries one canonical
+// endpoint ID set for the physical service, while a replicated route carries
+// group-scoped aliases; the physical addresses and immutable identities are
+// the shared binding between those two views.
+func certifySourcePreparation(
+	intent gateway.GroupEnrollmentIntent,
+	route gateway.ReplicatedRoute,
+	snapshotAddresses map[rafttransport.NodeID]scalingSnapshotBinding,
+	readNode func(gateway.ReplicatedEndpoint) (gateway.NodeRecord, error),
+) ([gateway.ServingReplicaCount]nodecontrol.PreparationMember, error) {
+	var voters [gateway.ServingReplicaCount]nodecontrol.PreparationMember
+	if readNode == nil || len(route.Replicas) != len(voters) {
+		return voters, errScalingEnrollmentDrift
+	}
+	for index, member := range route.Replicas {
+		record, err := readNode(member)
+		if err != nil {
+			return voters, err
+		}
+		snapshotAddress, err := preparationSnapshotAddress(snapshotAddresses, member, record)
+		if err != nil {
+			return voters, err
+		}
+		allowDraining := member.Member == intent.Source.Member &&
+			member.Node == intent.Source.Node && member.StoreID == intent.Source.StoreID &&
+			member.NodeIncarnation == intent.Source.NodeIncarnation &&
+			member.Endpoint == string(intent.Source.Endpoint) &&
+			member.NativeEndpoint == string(intent.Source.NativeEndpoint) &&
+			member.ControlEndpoint == string(intent.Source.ControlEndpoint)
+		voters[index], err = certifiedPreparationMember(member, record, snapshotAddress, allowDraining)
+		if err != nil {
+			return voters, err
+		}
+	}
+	return voters, nil
+}
+
 func certifiedPreparationMember(
 	replica gateway.ReplicatedEndpoint, record gateway.NodeRecord, snapshotAddress string, allowDraining bool,
 ) (nodecontrol.PreparationMember, error) {
@@ -413,9 +437,7 @@ func certifiedPreparationMember(
 		(record.Lifecycle != gateway.NodeActive && !(allowDraining && record.Lifecycle == gateway.NodeDraining)) ||
 		record.ServiceKeyDigest == (replication.Digest{}) ||
 		record.Revision == 0 || replica.Member == 0 || replica.DataAddress == "" ||
-		record.DataAddress != replica.DataAddress || record.DataEndpoint != distribution.EndpointID(replica.Endpoint) ||
-		record.NativeEndpoint != distribution.EndpointID(replica.NativeEndpoint) ||
-		record.ControlEndpoint != distribution.EndpointID(replica.ControlEndpoint) ||
+		record.DataAddress != replica.DataAddress ||
 		record.NativeAddress != replica.Address || record.ControlAddress != replica.ControlAddress {
 		return nodecontrol.PreparationMember{}, errScalingEnrollmentDrift
 	}
@@ -442,9 +464,6 @@ func preparationSnapshotAddress(
 ) (string, error) {
 	if record.NodeID != replica.Node || record.Incarnation != replica.NodeIncarnation ||
 		record.ServiceKeyDigest == (replication.Digest{}) || record.Revision == 0 ||
-		record.DataEndpoint != distribution.EndpointID(replica.Endpoint) ||
-		record.NativeEndpoint != distribution.EndpointID(replica.NativeEndpoint) ||
-		record.ControlEndpoint != distribution.EndpointID(replica.ControlEndpoint) ||
 		record.DataAddress != replica.DataAddress || record.NativeAddress != replica.Address ||
 		record.ControlAddress != replica.ControlAddress {
 		return "", errScalingEnrollmentDrift

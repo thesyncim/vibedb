@@ -161,13 +161,23 @@ func TestPreparationSnapshotAddressUsesAuthenticatedDirectoryBinding(t *testing.
 		Lifecycle: gateway.NodeActive, Revision: 9, CatalogGeneration: 5,
 	}
 	replica := gateway.ReplicatedEndpoint{Member: 4, Node: record.NodeID, NodeIncarnation: record.Incarnation,
-		Endpoint: "peer-4", DataAddress: record.DataAddress, NativeEndpoint: "native-4", Address: record.NativeAddress,
-		ControlEndpoint: "control-4", ControlAddress: record.ControlAddress}
+		// Route endpoint IDs are group-scoped aliases. The physical directory
+		// retains one canonical endpoint set, so preparation must bind the
+		// route by authenticated addresses and identity instead of requiring
+		// these unrelated logical IDs to match.
+		Endpoint: "table-scale_alpha-member-4", DataAddress: record.DataAddress,
+		NativeEndpoint: "table-scale_alpha-member-4-native", Address: record.NativeAddress,
+		ControlEndpoint: "table-scale_alpha-member-4-control", ControlAddress: record.ControlAddress}
 	if !record.Valid() {
 		t.Fatal("dynamic directory record fixture is invalid")
 	}
 	if got, err := preparationSnapshotAddress(nil, replica, record); err != nil || got != record.SnapshotAddress {
 		t.Fatalf("authenticated dynamic snapshot endpoint got=%q err=%v", got, err)
+	}
+	if got, err := certifiedPreparationMember(replica, record, record.SnapshotAddress, false); err != nil ||
+		got.PeerEndpoint != distribution.EndpointID(replica.Endpoint) || got.NativeEndpoint != distribution.EndpointID(replica.NativeEndpoint) ||
+		got.ControlEndpoint != distribution.EndpointID(replica.ControlEndpoint) {
+		t.Fatalf("group-scoped route endpoint aliases were not certified: %+v err=%v", got, err)
 	}
 
 	missing := record
@@ -192,5 +202,58 @@ func TestPreparationSnapshotAddressUsesAuthenticatedDirectoryBinding(t *testing.
 	}
 	if got, err := preparationSnapshotAddress(foreignStatic, replica, missing); err == nil || got != "" {
 		t.Fatalf("foreign static control binding accepted: got=%q err=%v", got, err)
+	}
+}
+
+func TestSourcePreparationBindsGroupAliasesToPhysicalDirectory(t *testing.T) {
+	snapshot := catalogRouteSeedSnapshot(t, 1, "127.0.0.1:7101")
+	membership, ok := snapshot.ResolveReplicatedMembershipRoute(
+		gateway.ReplicatedCatalogDistribution, gateway.ReplicatedCatalogShard, nil,
+	)
+	if !ok || len(membership.Serving.Replicas) != gateway.ServingReplicaCount {
+		t.Fatal("catalog route fixture is incomplete")
+	}
+	intent := gateway.GroupEnrollmentIntent{Source: endpointIdentity(membership.Serving.Replicas[0])}
+	records := make(map[rafttransport.NodeID]gateway.NodeRecord, gateway.ServingReplicaCount)
+	snapshotAddresses := [...]string{"127.0.0.1:8001", "127.0.0.1:9001", "127.0.0.1:10001"}
+	for index, replica := range membership.Serving.Replicas {
+		record := gateway.NodeRecord{
+			NodeID: replica.Node, Incarnation: replica.NodeIncarnation,
+			ServiceKeyDigest: replication.Digest{byte(index + 1)},
+			DataEndpoint:     distribution.EndpointID("physical-peer-" + string(rune('a'+index))),
+			NativeEndpoint:   distribution.EndpointID("physical-native-" + string(rune('a'+index))),
+			ControlEndpoint:  distribution.EndpointID("physical-control-" + string(rune('a'+index))),
+			DataAddress:      replica.DataAddress, NativeAddress: replica.Address, ControlAddress: replica.ControlAddress,
+			SnapshotAddress: snapshotAddresses[index],
+			FailureDomain:   "zone", Roles: gateway.NodeRoleStorage, Lifecycle: gateway.NodeActive,
+			Revision: 1, CatalogGeneration: 1,
+		}
+		if !record.Valid() {
+			t.Fatalf("physical directory fixture %d is invalid", index)
+		}
+		records[replica.Node] = record
+	}
+	readNode := func(replica gateway.ReplicatedEndpoint) (gateway.NodeRecord, error) {
+		return records[replica.Node], nil
+	}
+	voters, err := certifySourcePreparation(intent, membership.Serving, nil, readNode)
+	if err != nil {
+		t.Fatalf("source preparation with group aliases failed: %v", err)
+	}
+	for index, voter := range voters {
+		replica := membership.Serving.Replicas[index]
+		if voter.MemberID != replica.Member || voter.Node != replica.Node ||
+			voter.PeerEndpoint != distribution.EndpointID(replica.Endpoint) ||
+			voter.NativeEndpoint != distribution.EndpointID(replica.NativeEndpoint) ||
+			voter.ControlEndpoint != distribution.EndpointID(replica.ControlEndpoint) ||
+			voter.SnapshotAddress != records[replica.Node].SnapshotAddress {
+			t.Fatalf("source voter %d lost route alias or physical binding: %+v", index, voter)
+		}
+	}
+	foreign := records[membership.Serving.Replicas[1].Node]
+	foreign.DataAddress = "127.0.0.1:7999"
+	records[membership.Serving.Replicas[1].Node] = foreign
+	if _, err = certifySourcePreparation(intent, membership.Serving, nil, readNode); err == nil {
+		t.Fatal("source preparation accepted a physical address substitution")
 	}
 }
