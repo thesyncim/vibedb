@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 
@@ -10,6 +11,20 @@ import (
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
+
+// catalogProbeResultError adds the fixed identity and raft fields needed to
+// diagnose a failed startup discovery. The response remains the authenticated
+// wire result; this only formats local context around the original error.
+func catalogProbeResultError(endpoint ReplicatedEndpoint, response *shardservice.ReplicatedResponse, cause error) error {
+	if response == nil {
+		return fmt.Errorf("gateway: catalog probe member=%d endpoint=%q response=nil: %w", endpoint.Member, endpoint.Address, cause)
+	}
+	state := response.State
+	return fmt.Errorf("gateway: catalog probe member=%d endpoint=%q kind=%d refusal=%d has_state=%t state_member=%d state_store=%x state_incarnation=%d leader=%d term=%d commit=%d applied=%d checkpoint=%d: %w",
+		endpoint.Member, endpoint.Address, response.Kind, response.Refusal, response.HasState,
+		state.Fence.MemberID, state.Fence.StoreID, state.Fence.NodeIncarnation,
+		state.LeaderID, state.Fence.Term, state.Commit, state.Applied, state.CheckpointApplied, cause)
+}
 
 func catalogBootstrapRoute(route ReplicatedRoute) bool {
 	return validReplicatedRoute(route) && route.Distribution == ReplicatedCatalogDistribution &&
@@ -145,24 +160,25 @@ func (executor *ReplicatedExecutor) catalogOperationalRouteOnce(ctx context.Cont
 			})
 		}
 		if err != nil {
-			joined = errors.Join(joined, err)
+			joined = errors.Join(joined, catalogProbeResultError(endpoint, response, err))
 			continue
 		}
 		if validReplicatedUnauthorizedWithoutState(response) {
-			return ReplicatedRoute{}, &ReplicatedRefusalError{Code: response.Refusal}
+			return ReplicatedRoute{}, catalogProbeResultError(endpoint, response, &ReplicatedRefusalError{Code: response.Refusal})
 		}
 		if response == nil || !catalogCommandProgression(bootstrap.Command, response.State.Fence.Command) {
-			joined = errors.Join(joined, ErrReplicatedRoute)
+			joined = errors.Join(joined, catalogProbeResultError(endpoint, response, ErrReplicatedRoute))
 			continue
 		}
 		route := bootstrap
 		route.Command = response.State.Fence.Command
 		observed, bindErr := bindReplicatedObservation(route, endpoint, response)
 		if bindErr != nil || response.State.LeaderID != endpoint.Member {
-			joined = errors.Join(joined, bindErr)
+			cause := bindErr
 			if bindErr == nil {
-				joined = errors.Join(joined, errReplicatedLeaderUnobserved)
+				cause = errReplicatedLeaderUnobserved
 			}
+			joined = errors.Join(joined, catalogProbeResultError(endpoint, response, cause))
 			continue
 		}
 		// This is an ephemeral control reachability set, never a published

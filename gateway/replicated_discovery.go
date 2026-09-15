@@ -103,11 +103,18 @@ func (executor *ReplicatedExecutor) discoverResponsiveLeader(
 		case result := <-results:
 			pending--
 			if result.err != nil {
-				joined = errors.Join(joined, result.err)
+				if catalog {
+					joined = errors.Join(joined, catalogProbeResultError(result.endpoint, result.response, result.err))
+				} else {
+					joined = errors.Join(joined, result.err)
+				}
 				startNext(0)
 				continue
 			}
 			if validReplicatedUnauthorizedWithoutState(result.response) {
+				if catalog {
+					return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{}, catalogProbeResultError(result.endpoint, result.response, &ReplicatedRefusalError{Code: result.response.Refusal})
+				}
 				return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{}, &ReplicatedRefusalError{Code: result.response.Refusal}
 			}
 			observedRoute := route
@@ -116,7 +123,11 @@ func (executor *ReplicatedExecutor) discoverResponsiveLeader(
 			}
 			endpoint, err := bindReplicatedObservation(observedRoute, result.endpoint, result.response)
 			if err != nil {
-				joined = errors.Join(joined, err)
+				if catalog {
+					joined = errors.Join(joined, catalogProbeResultError(result.endpoint, result.response, err))
+				} else {
+					joined = errors.Join(joined, err)
+				}
 				startNext(0)
 				continue
 			}
@@ -126,7 +137,11 @@ func (executor *ReplicatedExecutor) discoverResponsiveLeader(
 			// An authenticated follower without an observed leader is a
 			// retryable election cut even when another candidate is offline
 			// (including a not-yet-serving enrolled catalog target).
-			joined = errors.Join(joined, errReplicatedLeaderUnobserved)
+			if catalog {
+				joined = errors.Join(joined, catalogProbeResultError(result.endpoint, result.response, errReplicatedLeaderUnobserved))
+			} else {
+				joined = errors.Join(joined, errReplicatedLeaderUnobserved)
+			}
 			startNext(result.response.State.LeaderID)
 		}
 	}
