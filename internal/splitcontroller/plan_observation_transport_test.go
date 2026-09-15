@@ -30,6 +30,7 @@ type planObservationTestConnection struct {
 func (connection *planObservationTestConnection) PeerIdentity() rafttransport.PeerIdentity {
 	return connection.peer
 }
+func (*planObservationTestConnection) PeerKeyDigest() [32]byte { return [32]byte{} }
 func (connection *planObservationTestConnection) TrafficClass() rafttransport.TrafficClass {
 	return connection.class
 }

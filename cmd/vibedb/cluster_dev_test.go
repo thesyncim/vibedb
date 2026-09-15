@@ -76,6 +76,7 @@ func TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision(t *testing.T) 
 		{ClusterID: clusterID, ClusterIncarnation: clusterIncarnation, TopologyRecoveryEpoch: 1, ShardIncarnation: [16]byte{5}, GroupID: [16]byte{6}},
 		{ClusterID: clusterID, ClusterIncarnation: clusterIncarnation, TopologyRecoveryEpoch: 1, ShardIncarnation: [16]byte{7}, GroupID: [16]byte{8}},
 	}
+	expectedLogical := make(map[raftmember.GroupKey]replication.Digest, len(groups))
 	for _, role := range []struct {
 		members               []devClusterMember
 		group                 raftmember.GroupKey
@@ -98,6 +99,22 @@ func TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision(t *testing.T) 
 				role.table, role.primaryKey, role.requestLedgerIdentity,
 			)
 		}
+		// Read the canonical schema from the prepared member, independently of
+		// whether its table profile is exposed in the public application catalog.
+		member := role.members[0]
+		imageRaw, err := os.ReadFile(filepath.Join(devMemberRoot(member), "member.vdb"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		image, err := sqldriver.ValidateReplicatedSchemaCatalogImage(imageRaw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		profile, _, err := readDevReplicatedTableProfile(member, role.distributionName, role.shard, role.table, role.primaryKey, role.group, role.requestLedgerIdentity, image)
+		if err != nil || profile.LogicalSchemaDigest == (replication.Digest{}) {
+			t.Fatalf("prepared %s logical schema: %+v, %v", role.distributionName, profile, err)
+		}
+		expectedLogical[role.group] = profile.LogicalSchemaDigest
 	}
 	if err := writeDevCatalog(
 		manifest, clusterID, clusterIncarnation,
@@ -106,6 +123,15 @@ func TestDevClusterManifestResumeIsCanonicalAndDoesNotReprovision(t *testing.T) 
 		groups[2].ShardIncarnation, groups[2].GroupID,
 	); err != nil {
 		t.Fatal(err)
+	}
+	initialCatalog, err := gateway.LoadSnapshot(manifest.CatalogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, descriptor := range initialCatalog.ReplicatedShardDescriptors() {
+		if descriptor.LogicalSchemaDigest != expectedLogical[descriptor.Group] {
+			t.Fatalf("%s descriptor lost prepared logical schema: got %x want %x", descriptor.Distribution, descriptor.LogicalSchemaDigest, expectedLogical[descriptor.Group])
+		}
 	}
 	for index, role := range []string{"catalog", "ledger", "data"} {
 		prepare := devPrepareManifest{
@@ -1141,7 +1167,8 @@ func testDevCatalogSnapshot(
 			leaders:  make([]distribution.EndpointID, gateway.ServingReplicaCount),
 			replicas: make([]gateway.ReplicatedReplicaDescriptor, gateway.ServingReplicaCount),
 			digest:   [32]byte{digest}, applyDigest: [32]byte{digest + 20},
-			schemaGeneration: 1,
+			logicalSchemaDigest: replication.Digest{digest + 0x40},
+			schemaGeneration:    1,
 		}
 		for index := 0; index < gateway.ServingReplicaCount; index++ {
 			peer := distribution.EndpointID(role + "-member-" + string(rune('1'+index)))

@@ -55,6 +55,9 @@ func (client *ReplicatedNodeClient) probeReplicatedBound(ctx context.Context, ro
 	request := shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
 		Authority: authority, Capability: capability,
 		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration}}
+	if err := attachFrontendContinuation(ctx, &request); err != nil {
+		return nil, err
+	}
 	client.legacyCalls.Add(1)
 	var response *shardservice.ReplicatedResponse
 	var err error

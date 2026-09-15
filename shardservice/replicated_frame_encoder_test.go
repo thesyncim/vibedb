@@ -6,9 +6,11 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
@@ -113,7 +115,13 @@ func TestFrameEncoderBorrowedCanonicalBoundaries(t *testing.T) {
 			if got.writes != test.writeCount {
 				t.Fatalf("writes = %d, want %d", got.writes, test.writeCount)
 			}
-			assertFrameEncoderArenaCleared(t, &encoder)
+			// A query carries a payload, so it borrows a pooled scratch buffer
+			// for the frame prefix instead of the connection-owned arena;
+			// releaseReplicatedBorrowedScratch (tested separately) scrubs that
+			// scratch on release, and the arena must stay untouched here.
+			if len(encoder.arena) != 0 {
+				t.Fatal("payload-bearing request unexpectedly retained an arena")
+			}
 		})
 	}
 }
@@ -141,7 +149,11 @@ func TestFrameEncoderBorrowedWriteFailuresScrubArena(t *testing.T) {
 			if !errors.Is(err, test.wantErr) {
 				t.Fatalf("encode error = %v, want %v", err, test.wantErr)
 			}
-			assertFrameEncoderArenaCleared(t, &encoder)
+			// See TestFrameEncoderBorrowedCanonicalBoundaries: a payload-bearing
+			// query never touches the connection-owned arena.
+			if len(encoder.arena) != 0 {
+				t.Fatal("payload-bearing request unexpectedly retained an arena")
+			}
 		})
 	}
 }
@@ -157,8 +169,8 @@ func TestFrameEncoderRoundTripReplicatedUsesOwnedArena(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		if request.Operation != ReplicatedQueryLeader || !bytes.Equal(request.Query, []byte("SELECT 1")) {
-			serverDone <- errors.New("server received unexpected query request")
+		if request.Operation != ReplicatedProbe {
+			serverDone <- errors.New("server received unexpected probe request")
 			return
 		}
 		state := replicatedWireState(testReplicatedServingState())
@@ -169,7 +181,27 @@ func TestFrameEncoderRoundTripReplicatedUsesOwnedArena(t *testing.T) {
 		})
 	}()
 
-	request := testReplicatedQueryRequest([]byte("SELECT 1"))
+	// A probe carries no payload, so it is the operation that actually
+	// exercises the connection-owned arena path this test is named for;
+	// payload-bearing operations borrow a pooled scratch buffer instead (see
+	// TestFrameEncoderBorrowedCanonicalBoundaries). A probe fence is loose
+	// (unlike other operations' exact fence), so only Group and
+	// AllocationGeneration may be set.
+	probeFence := testReplicatedFence()
+	probeFence.MemberID = 0
+	probeFence.StoreID = [16]byte{}
+	probeFence.NodeIncarnation = 0
+	probeFence.Term = 0
+	probeFence.Command = raftservice.CommandFence{}
+	request := &ReplicatedRequest{
+		Operation: ReplicatedProbe,
+		Authority: serviceauthz.Authority{
+			Node:       rafttransport.NodeID{1},
+			Generation: 1,
+		},
+		Capability: serviceauthz.CapabilityDataRead,
+		Fence:      probeFence,
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	var encoder FrameEncoder
@@ -184,4 +216,27 @@ func TestFrameEncoderRoundTripReplicatedUsesOwnedArena(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertFrameEncoderArenaCleared(t, &encoder)
+}
+
+func TestReleaseReplicatedBorrowedScratchScrubsBytes(t *testing.T) {
+	scratch := &replicatedBorrowedScratch{}
+	for index := range scratch.bytes {
+		scratch.bytes[index] = 0xff
+	}
+	const used = 512
+	// Keep the deliberately poisoned unused region out of the global pool.
+	// This private pool has no borrowers, so inspecting scratch is safe even
+	// when sync.Pool drops the entry instead of retaining it.
+	var pool sync.Pool
+	releaseReplicatedBorrowedScratchTo(scratch, used, &pool)
+	for index, value := range scratch.bytes[:used] {
+		if value != 0 {
+			t.Fatalf("scratch byte %d retained %#x", index, value)
+		}
+	}
+	for index, value := range scratch.bytes[used:] {
+		if value != 0xff {
+			t.Fatalf("scratch byte %d beyond used length was unexpectedly scrubbed to %#x", used+index, value)
+		}
+	}
 }

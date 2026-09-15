@@ -138,6 +138,7 @@ func TestLocalSourceSealAndCutoverCertificateSurviveRestart(t *testing.T) {
 		t.Fatalf("certificate=%+v err=%v", certificate, err)
 	}
 	testChildAdoptionCheckpointWithCertificate(t, plan, certificate)
+	testSourceTopologyPruneAuthorityWithCertificate(t, plan, certificate)
 	if retried, retryErr := actions.ExecuteCertifyCutover(
 		plan, capture, tail, []rangesplit.ChildStageCursor{stage},
 	); retryErr != nil || retried != certificate {

@@ -21,19 +21,29 @@ type distributedMetricsTestConnection struct {
 func (connection *distributedMetricsTestConnection) PeerIdentity() rafttransport.PeerIdentity {
 	return connection.peer
 }
+func (*distributedMetricsTestConnection) PeerKeyDigest() [32]byte { return [32]byte{} }
 func (*distributedMetricsTestConnection) TrafficClass() rafttransport.TrafficClass {
 	return rafttransport.TrafficShardControl
 }
 
 type distributedMetricsTestProvider struct {
 	identity raftmember.RuntimeIdentity
+	groups   map[raftmember.GroupKey]uint64
 	cut      raftservice.ProgressMetricsSnapshot
+	budget   servicemetrics.MigrationBudgetSnapshot
 }
 
 func (provider distributedMetricsTestProvider) ProgressMetrics() raftservice.ProgressMetricsSnapshot {
 	return provider.cut
 }
+func (provider distributedMetricsTestProvider) MigrationBudgetMetrics() servicemetrics.MigrationBudgetSnapshot {
+	return provider.budget
+}
 func (provider distributedMetricsTestProvider) GroupProgressMetrics(group raftmember.GroupKey) (raftmember.RuntimeIdentity, raftservice.ProgressMetricsSnapshot, bool) {
+	if provider.groups != nil {
+		member, found := provider.groups[group]
+		return raftmember.RuntimeIdentity{Group: group, MemberID: member}, provider.cut, found && member != 0
+	}
 	return provider.identity, provider.cut, group == provider.identity.Group
 }
 
@@ -57,8 +67,9 @@ func TestDistributedMetricsAuthenticatedExactGroupRefresh(t *testing.T) {
 	peer := rafttransport.PeerIdentity{Node: rafttransport.NodeID{9}}
 	cut := raftservice.ProgressMetricsSnapshot{ProposalCommands: 10, ProposalBytes: 11,
 		AppliedEntries: 12, ReadyPersisted: 13, SnapshotsFinished: 14, ReadCompletions: 15, Faults: 16}
+	wantBudget := servicemetrics.MigrationBudgetSnapshot{ThrottledCalls: 17, ThrottledBytes: 18, PeakActive: 2, MaxActive: 3}
 	service, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
-		Provider:     distributedMetricsTestProvider{identity: raftmember.RuntimeIdentity{Group: group, MemberID: 7}, cut: cut},
+		Provider:     distributedMetricsTestProvider{identity: raftmember.RuntimeIdentity{Group: group, MemberID: 7}, cut: cut, budget: wantBudget},
 		Authorize:    func(identity rafttransport.PeerIdentity) bool { return identity == peer },
 		ReadDeadline: func() time.Time { return time.Now().Add(time.Second) }, WriteDeadline: func() time.Time { return time.Now().Add(time.Second) },
 	})
@@ -67,14 +78,63 @@ func TestDistributedMetricsAuthenticatedExactGroupRefresh(t *testing.T) {
 	}
 	metrics, err := NewDistributedMetrics(distributedMetricsTestOpener{service: service, peer: peer},
 		[]ReplicatedRoute{{Group: group, Replicas: []ReplicatedEndpoint{{Member: 7, Node: node}}}})
-	if err != nil || metrics.RefreshOne(t.Context(), 0) != nil {
+	if err != nil || metrics.RefreshOne(t.Context(), 0) != nil || metrics.RefreshOne(t.Context(), 1) != nil {
 		t.Fatalf("new/refresh err=%v", err)
 	}
 	samples, aggregate, err := metrics.SnapshotInto(make([]DistributedMetricsSample, 0, metrics.Len()))
 	if err != nil || len(samples) != 2 || samples[0].Group != group || samples[0].Member != 7 ||
 		samples[0].Node != node || samples[0].Cut != cut || samples[0].Reads != 1 || samples[0].Faults != 0 ||
-		!samples[1].NodeAggregate || samples[1].Node != node || aggregate.Cut != cut || aggregate.Samples != 2 || aggregate.Reads != 1 {
+		!samples[1].NodeAggregate || samples[1].Node != node || samples[1].Budget != wantBudget ||
+		aggregate.Cut != cut || aggregate.Budget != wantBudget || aggregate.Samples != 2 || aggregate.Reads != 2 {
 		t.Fatalf("samples=%+v aggregate=%+v err=%v", samples, aggregate, err)
+	}
+}
+
+func TestDistributedMetricsBudgetCountsOneAuthenticatedNodeAggregate(t *testing.T) {
+	base := raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}, TopologyRecoveryEpoch: 3,
+		ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
+	second := base
+	second.GroupID[0]++
+	node := rafttransport.NodeID{6}
+	peer := rafttransport.PeerIdentity{Node: rafttransport.NodeID{9}}
+	wantBudget := servicemetrics.MigrationBudgetSnapshot{ThrottledCalls: 17, ThrottledBytes: 18, PeakActive: 2, MaxActive: 3}
+	authorized := true
+	service, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
+		Provider: distributedMetricsTestProvider{
+			groups: map[raftmember.GroupKey]uint64{base: 7, second: 8},
+			budget: wantBudget,
+		},
+		Authorize:    func(identity rafttransport.PeerIdentity) bool { return authorized && identity == peer },
+		ReadDeadline: func() time.Time { return time.Now().Add(time.Second) }, WriteDeadline: func() time.Time { return time.Now().Add(time.Second) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics, err := NewDistributedMetrics(distributedMetricsTestOpener{service: service, peer: peer}, []ReplicatedRoute{
+		{Group: base, Replicas: []ReplicatedEndpoint{{Member: 7, Node: node}}},
+		{Group: second, Replicas: []ReplicatedEndpoint{{Member: 8, Node: node}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range metrics.Len() {
+		if err := metrics.RefreshOne(t.Context(), index); err != nil {
+			t.Fatalf("refresh %d: %v", index, err)
+		}
+	}
+	authorized = false
+	if err := metrics.RefreshOne(t.Context(), metrics.Len()-1); err == nil {
+		t.Fatal("unauthorized aggregate refresh accepted")
+	}
+	samples, aggregate, err := metrics.SnapshotInto(make([]DistributedMetricsSample, 0, metrics.Len()))
+	if err != nil || len(samples) != 3 || aggregate.Budget != wantBudget || samples[2].Budget != wantBudget ||
+		samples[2].Faults != 1 || samples[2].Reads != 2 {
+		t.Fatalf("samples=%+v aggregate=%+v err=%v", samples, aggregate, err)
+	}
+	for index := range 2 {
+		if samples[index].Budget != (servicemetrics.MigrationBudgetSnapshot{}) {
+			t.Fatalf("group sample %d carried node budget: %+v", index, samples[index].Budget)
+		}
 	}
 }
 

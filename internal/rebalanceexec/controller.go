@@ -3,6 +3,7 @@ package rebalanceexec
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rebalance"
@@ -21,6 +22,7 @@ type MoveDirectory interface {
 // reconciler. It intentionally has no process-local queue or progress cursor:
 // every restart rediscovers work and resumes from the replicated record.
 type Controller struct {
+	passMu            sync.Mutex
 	directory         MoveDirectory
 	journal           rebalance.ReplicatedOperationJournal
 	observer          rebalance.ReplicatedMoveObserver
@@ -82,52 +84,9 @@ func (controller *Controller) SubmitSet(
 	if !ok {
 		return nil, ErrControllerConfig
 	}
-	ids, err := controller.directory.ReadOperationIDs(ctx)
+	records, ids, err := controller.prepareSet(ctx, plans)
 	if err != nil {
 		return nil, err
-	}
-	for index, plan := range plans {
-		if plan == nil {
-			return nil, ErrControllerConfig
-		}
-		for _, prior := range plans[:index] {
-			if prior.Group() == plan.Group() {
-				return nil, ErrControllerConfig
-			}
-		}
-	}
-	for _, id := range ids {
-		record, readErr := controller.directory.ReadOperation(ctx, id)
-		if readErr != nil {
-			return nil, readErr
-		}
-		if record.Kind != gateway.ReplicatedOperationMove || record.State == gateway.ReplicatedOperationCancelled {
-			continue
-		}
-		identity, inspectErr := rebalance.InspectReplicaMoveIntent(record.Intent)
-		if inspectErr != nil {
-			return nil, inspectErr
-		}
-		for _, plan := range plans {
-			if identity.Request.Group == plan.Group() &&
-				(record.State != gateway.ReplicatedOperationComplete || identity.SourceGeneration == plan.CatalogGeneration()) {
-				// A newer failure certificate can assign a different operation ID
-				// to the same physical replacement. RunPass must resume the original
-				// immutable intent; never admit a competing saga for that group.
-				return nil, ErrAwaitMoveSet
-			}
-		}
-	}
-	records := make([]gateway.ReplicatedOperationRecord, len(plans))
-	for index, plan := range plans {
-		if plan == nil {
-			return nil, ErrControllerConfig
-		}
-		record, err := rebalance.PrepareReplicatedMoveRecord(ctx, plan, controller.observer)
-		if err != nil {
-			return nil, err
-		}
-		records[index] = record
 	}
 	if err := journal.SubmitOperationsIfDirectory(ctx, records, ids); err != nil {
 		if !errors.Is(err, gateway.ErrReplicatedCatalogPending) {
@@ -151,6 +110,71 @@ func (controller *Controller) SubmitSet(
 		failures = errors.Join(failures, err)
 	}
 	return actions, failures
+}
+
+// Prepare observes and freezes an immutable move without publishing or
+// executing it. The returned directory is the overlap fence for an atomic
+// enrollment handoff; callers must admit both records before Resume.
+func (controller *Controller) Prepare(ctx context.Context, plan *rebalance.Plan) (gateway.ReplicatedOperationRecord, [][32]byte, error) {
+	if controller == nil || ctx == nil || plan == nil {
+		return gateway.ReplicatedOperationRecord{}, nil, ErrControllerConfig
+	}
+	records, ids, err := controller.prepareSet(ctx, []*rebalance.Plan{plan})
+	if err != nil {
+		return gateway.ReplicatedOperationRecord{}, nil, err
+	}
+	return records[0], ids, nil
+}
+
+func (controller *Controller) prepareSet(ctx context.Context, plans []*rebalance.Plan) ([]gateway.ReplicatedOperationRecord, [][32]byte, error) {
+	ids, err := controller.directory.ReadOperationIDs(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	for index, plan := range plans {
+		if plan == nil {
+			return nil, nil, ErrControllerConfig
+		}
+		for _, prior := range plans[:index] {
+			if prior.Group() == plan.Group() {
+				return nil, nil, ErrControllerConfig
+			}
+		}
+	}
+	for _, id := range ids {
+		record, readErr := controller.directory.ReadOperation(ctx, id)
+		if readErr != nil {
+			return nil, nil, readErr
+		}
+		if record.Kind != gateway.ReplicatedOperationMove || record.State == gateway.ReplicatedOperationCancelled {
+			continue
+		}
+		identity, inspectErr := rebalance.InspectReplicaMoveIntent(record.Intent)
+		if inspectErr != nil {
+			return nil, nil, inspectErr
+		}
+		for _, plan := range plans {
+			if identity.Request.Group == plan.Group() &&
+				(record.State != gateway.ReplicatedOperationComplete || identity.SourceGeneration == plan.CatalogGeneration()) {
+				// A newer failure certificate can assign a different operation ID
+				// to the same physical replacement. RunPass must resume the original
+				// immutable intent; never admit a competing saga for that group.
+				return nil, nil, ErrAwaitMoveSet
+			}
+		}
+	}
+	records := make([]gateway.ReplicatedOperationRecord, len(plans))
+	for index, plan := range plans {
+		if plan == nil {
+			return nil, nil, ErrControllerConfig
+		}
+		record, err := rebalance.PrepareReplicatedMoveRecord(ctx, plan, controller.observer)
+		if err != nil {
+			return nil, nil, err
+		}
+		records[index] = record
+	}
+	return records, ids, nil
 }
 
 // Resume executes one journaled step for an already submitted move.
@@ -185,6 +209,11 @@ func (controller *Controller) RunPass(ctx context.Context) (ControllerPass, erro
 	if controller == nil || ctx == nil {
 		return ControllerPass{}, ErrControllerConfig
 	}
+	// Scaling and ordinary move scheduling share this controller. Serialize
+	// scans so they cannot race the local abandonment cursor or dispatch the
+	// same pending step concurrently from this process.
+	controller.passMu.Lock()
+	defer controller.passMu.Unlock()
 	ids, err := controller.directory.ReadOperationIDs(ctx)
 	if err != nil {
 		return ControllerPass{}, err

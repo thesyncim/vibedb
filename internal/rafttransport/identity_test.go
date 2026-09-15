@@ -6,12 +6,14 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"testing"
@@ -401,6 +403,26 @@ func TestPeerTLSMutualAuthenticationDerivesExactNode(t *testing.T) {
 		t.Fatalf("derived peers = client %+v/%d server %+v/%d",
 			client.PeerIdentity(), client.TrafficClass(), server.PeerIdentity(), server.TrafficClass())
 	}
+	serverLeaf, err := x509.ParseCertificate(serverTLS.certificate.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientLeaf, err := x509.ParseCertificate(clientTLS.certificate.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantClientKey := sha256.Sum256(serverLeaf.RawSubjectPublicKeyInfo)
+	wantServerKey := sha256.Sum256(clientLeaf.RawSubjectPublicKeyInfo)
+	if client.PeerKeyDigest() != wantClientKey || server.PeerKeyDigest() != wantServerKey ||
+		client.PeerKeyDigest() == ([sha256.Size]byte{}) || server.PeerKeyDigest() == ([sha256.Size]byte{}) {
+		t.Fatalf("peer key digests = client %x server %x, want client %x server %x",
+			client.PeerKeyDigest(), server.PeerKeyDigest(), wantClientKey, wantServerKey)
+	}
+	if clientTLS.LocalPeerKeyDigest() != wantServerKey ||
+		serverTLS.LocalServiceKeyDigest() != wantClientKey {
+		t.Fatalf("local key profile digests = client %x server %x, want client %x server %x",
+			clientTLS.LocalPeerKeyDigest(), serverTLS.LocalServiceKeyDigest(), wantServerKey, wantClientKey)
+	}
 }
 
 func TestPeerTLSInternalBuildPrefaceAcceptsOneGrammarWithOptionalCapabilities(t *testing.T) {
@@ -590,6 +612,168 @@ func TestPeerTLSInternalBuildPrefaceRetainsBoundedHandshakeDeadline(t *testing.T
 	}
 	if server.elapsed < 500*time.Millisecond || server.elapsed > 3*time.Second {
 		t.Fatalf("bounded preface elapsed = %v", server.elapsed)
+	}
+}
+
+func TestPeerTLSCancellationInterruptsPostTLSBuildPreface(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		cause error
+	}{
+		{name: "canceled", cause: errors.New("admission stopped")},
+		{name: "deadline", cause: context.DeadlineExceeded},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testPeerTLSCancellationInterruptsPostTLSBuildPreface(t, test.cause)
+		})
+	}
+}
+
+func testPeerTLSCancellationInterruptsPostTLSBuildPreface(t *testing.T, cause error) {
+	t.Helper()
+	authority := newPeerTLSTestAuthority(t, 174)
+	clientIdentity := peerTLSTestIdentity(175, 176)
+	serverIdentity := peerTLSTestIdentity(175, 196)
+	clientTLS := newPeerTLSTestProfile(t, authority, clientIdentity)
+	serverTLS := newPeerTLSTestProfile(t, authority, serverIdentity)
+	config, err := serverTLS.ServerConfig(TrafficOrdinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	clientRaw, err := net.DialTimeout("tcp", listener.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientRaw.Close()
+	serverRaw, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverRaw.Close()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	clientResult := make(chan error, 1)
+	go func() {
+		connection, err := clientTLS.Client(ctx, clientRaw, serverIdentity.Node, TrafficOrdinary,
+			func() time.Time { return time.Now().Add(30 * time.Second) })
+		if connection != nil {
+			_ = connection.Close()
+		}
+		clientResult <- err
+	}()
+	server := tls.Server(serverRaw, config)
+	if err := server.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.HandshakeContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Receiving the client's complete preface proves TLS has completed and
+	// cancellation must interrupt the subsequent read of our missing reply.
+	var preface [buildgate.PrefaceBytes]byte
+	if _, err := io.ReadFull(server, preface[:]); err != nil {
+		t.Fatal(err)
+	}
+	// Publish the cause only after admission reaches the build preface, so
+	// timeout classification is tested independently of scheduling the timer.
+	cancel(cause)
+	select {
+	case err := <-clientResult:
+		if !errors.Is(err, ErrPeerBuild) || !errors.Is(err, cause) {
+			t.Fatalf("canceled build preface = %v, want ErrPeerBuild and cancellation cause", err)
+		}
+		if cause == context.DeadlineExceeded {
+			var networkError net.Error
+			if !errors.As(err, &networkError) || !networkError.Timeout() {
+				t.Fatalf("deadline cancellation lost network timeout classification: %v", err)
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled build preface waited for the handshake deadline")
+	}
+}
+
+type peerTLSCancelOnClearDeadlineConn struct {
+	net.Conn
+	cancel context.CancelFunc
+}
+
+func (connection peerTLSCancelOnClearDeadlineConn) SetDeadline(deadline time.Time) error {
+	err := connection.Conn.SetDeadline(deadline)
+	if deadline.IsZero() {
+		connection.cancel()
+	}
+	return err
+}
+
+func TestPeerTLSRejectsCancellationAtConnectionHandoff(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 177)
+	clientIdentity := peerTLSTestIdentity(178, 179)
+	serverIdentity := peerTLSTestIdentity(178, 199)
+	clientTLS := newPeerTLSTestProfile(t, authority, clientIdentity)
+	serverTLS := newPeerTLSTestProfile(t, authority, serverIdentity)
+	clientRaw, serverRaw := net.Pipe()
+	defer clientRaw.Close()
+	defer serverRaw.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	deadline := func() time.Time { return time.Now().Add(5 * time.Second) }
+	serverResult := make(chan PeerConnection, 1)
+	go func() {
+		connection, _ := serverTLS.Server(context.Background(), serverRaw, TrafficGatewayClient, deadline)
+		serverResult <- connection
+	}()
+	connection, err := clientTLS.Client(ctx,
+		peerTLSCancelOnClearDeadlineConn{Conn: clientRaw, cancel: cancel}, serverIdentity.Node,
+		TrafficGatewayClient, deadline)
+	if connection != nil {
+		_ = connection.Close()
+		t.Error("transferred connection after cancellation at handoff")
+	}
+	if !errors.Is(err, ErrPeerAuthentication) || !errors.Is(err, context.Canceled) {
+		t.Errorf("handoff cancellation = %v, want authentication and context cancellation errors", err)
+	}
+	select {
+	case connection := <-serverResult:
+		if connection != nil {
+			_ = connection.Close()
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("peer handshake did not return after canceled handoff")
+	}
+}
+
+func TestPeerTLSHandshakeContextDoesNotOwnTransferredConnection(t *testing.T) {
+	authority := newPeerTLSTestAuthority(t, 180)
+	clientIdentity := peerTLSTestIdentity(181, 182)
+	serverIdentity := peerTLSTestIdentity(181, 202)
+	clientTLS := newPeerTLSTestProfile(t, authority, clientIdentity)
+	serverTLS := newPeerTLSTestProfile(t, authority, serverIdentity)
+	// The helper cancels its handshake context before returning both streams.
+	client, server, clientErr, serverErr := peerTLSTestHandshake(t, clientTLS, serverTLS,
+		serverIdentity.Node, TrafficOrdinary, TrafficOrdinary)
+	if clientErr != nil || serverErr != nil {
+		t.Fatalf("handshake errors = client %v, server %v", clientErr, serverErr)
+	}
+	defer client.Close()
+	defer server.Close()
+	if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write([]byte{42}); err != nil {
+		t.Fatal(err)
+	}
+	var response [1]byte
+	if _, err := io.ReadFull(server, response[:]); err != nil || response[0] != 42 {
+		t.Fatalf("transferred stream read = %v, %v", response, err)
 	}
 }
 

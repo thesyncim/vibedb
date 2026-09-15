@@ -67,7 +67,15 @@ const canonicalRF3Manifest = `{
     "max_source_concurrent": 2,
     "max_source_artifact_bytes": 1073741824,
     "max_source_disk_bytes": 4294967296,
-    "source_chunk_bytes": 1048576
+    "source_chunk_bytes": 1048576,
+    "migration_budget": {
+      "max_active": 2,
+      "cpu": {"bytes_per_second": 67108864, "burst_bytes": 4194304},
+      "disk_read": {"bytes_per_second": 67108864, "burst_bytes": 4194304},
+      "disk_write": {"bytes_per_second": 67108864, "burst_bytes": 4194304},
+      "network_send": {"bytes_per_second": 33554432, "burst_bytes": 2097152},
+      "network_receive": {"bytes_per_second": 33554432, "burst_bytes": 2097152}
+    }
   },
   "split_control": {
     "journal_path": "/srv/vibedb/split-control.journal",
@@ -552,5 +560,31 @@ func TestParseRF3ManifestEnforcesInputBoundAndDepth(t *testing.T) {
 	deep := `{"wal":{"path":{"a":{"b":{"c":1}}}}}`
 	if _, err := parseRF3Manifest([]byte(deep)); !errors.Is(err, errInvalidRF3Manifest) {
 		t.Fatalf("deep parse error = %v", err)
+	}
+}
+
+func TestRF3GroupedManifestKeepsEmptyNodeExplicit(t *testing.T) {
+	document, err := vibejson.Parse([]byte(`[]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeLog := &rf3NodeLogManifest{Format: 1}
+	groups, err := parseRF3ManifestGroups(document.Node(), nodeLog)
+	if err != nil {
+		t.Fatalf("empty grouped node rejected: %v", err)
+	}
+	if groups == nil || len(groups) != 0 {
+		t.Fatalf("groups = %#v, want non-nil empty slice", groups)
+	}
+	if _, err = parseRF3ManifestGroups(document.Node(), nil); !errors.Is(err, errInvalidRF3Manifest) {
+		t.Fatalf("legacy empty groups accepted: %v", err)
+	}
+	manifest := rf3Manifest{NodeLog: nodeLog, Groups: []rf3ManifestGroup{}}
+	if got := manifest.groupBundles(); got == nil || len(got) != 0 {
+		t.Fatalf("empty grouped bundles = %#v", got)
+	}
+	legacy := rf3Manifest{}
+	if got := legacy.groupBundles(); len(got) != 1 {
+		t.Fatalf("legacy fallback bundles = %#v", got)
 	}
 }

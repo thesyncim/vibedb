@@ -188,6 +188,7 @@ func TestBuildBeforeMutationImagesAndPostimagesIsIncompatibleBeforeAdmission(t *
 	}
 }
 
+
 func FuzzCanonicalManifestDerivation(f *testing.F) {
 	raw, err := os.ReadFile(filepath.Join("manifest", "current.txt"))
 	if err != nil {

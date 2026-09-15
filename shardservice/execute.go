@@ -95,6 +95,8 @@ type shardConn struct {
 	responseBatched bool
 	writeActive     bool
 	peer            rafttransport.NodeID
+	servicePeer     serviceauthz.AuthenticatedPeer
+	directory       *serviceauthz.ServiceDirectoryGate
 	authorization   *serviceauthz.Gate
 	audit           serviceauthz.AuditSink
 }
@@ -165,7 +167,14 @@ func (c *shardConn) authorize(request *ShardRequest) bool {
 		return false
 	}
 	generation := request.Authority.Generation
-	if serviceauthz.CheckAndAudit(c.authorization, c.audit, c.peer, generation,
+	if c.directory != nil {
+		if c.directory.CheckDelegate(c.servicePeer, generation, serviceauthz.ServiceFence{}) != serviceauthz.DecisionAllow {
+			return false
+		}
+		if request.Authority.Node != c.peer && c.directory.ManagedPrincipal(request.Authority.Node) {
+			return false
+		}
+	} else if serviceauthz.CheckAndAudit(c.authorization, c.audit, c.peer, generation,
 		serviceauthz.CapabilityDelegate) != serviceauthz.DecisionAllow {
 		return false
 	}

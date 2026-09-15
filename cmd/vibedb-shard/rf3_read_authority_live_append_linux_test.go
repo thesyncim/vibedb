@@ -112,6 +112,7 @@ func TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart(t *testing.T) {
 			Snapshot: addresses[member][2], Control: addresses[member][3],
 		}
 		group.TLS = rf3ManifestTLS{
+			PeerKeys:    rf3CommandPeerKeys(credentials[member]),
 			Certificate: credentials[member].Certificate, Key: credentials[member].Key,
 			Roots: roots, IdentityOID: rf3CommandIdentityOID.String(),
 		}

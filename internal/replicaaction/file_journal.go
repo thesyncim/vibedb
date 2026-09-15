@@ -36,6 +36,8 @@ type FileJournal struct {
 	lock       *os.File
 	maxRecords int
 	records    map[[32]byte]Record
+	pending    *Record
+	syncRoot   func(*os.Root) error
 	closed     bool
 }
 
@@ -69,7 +71,7 @@ func OpenFileJournal(path string, maxRecords int) (*FileJournal, error) {
 		return nil, err
 	}
 	journal := &FileJournal{root: root, lock: lock, maxRecords: maxRecords,
-		records: make(map[[32]byte]Record, maxRecords)}
+		records: make(map[[32]byte]Record, maxRecords), syncRoot: syncReplicaActionRoot}
 	if err = journal.recover(); err != nil {
 		_ = journal.Close()
 		return nil, err
@@ -88,6 +90,9 @@ func (journal *FileJournal) ReadReplicaAction(ctx context.Context, operation [32
 	defer journal.mu.Unlock()
 	if journal.closed {
 		return Record{}, ErrControl
+	}
+	if err := journal.settlePendingLocked(); err != nil {
+		return Record{}, err
 	}
 	record, ok := journal.records[replicaActionJournalKey(operation, kind)]
 	if !ok {
@@ -109,6 +114,9 @@ func (journal *FileJournal) PublishReplicaAction(ctx context.Context, expected u
 	if journal.closed {
 		return ErrControl
 	}
+	if err := journal.settlePendingLocked(); err != nil {
+		return err
+	}
 	operation := replicaActionJournalKey(record.Request.Operation, record.Request.Kind)
 	current, found := journal.records[operation]
 	if expected == 0 && found || expected != 0 && (!found || current.Revision != expected) {
@@ -116,7 +124,9 @@ func (journal *FileJournal) PublishReplicaAction(ctx context.Context, expected u
 	}
 	if expected == ^uint64(0) || record.Revision != expected+1 ||
 		!found && (record.State != Running || record.Revision != 1) ||
-		found && (!equalRequest(current.Request, record.Request) || current.State != Running || record.State != Complete) {
+		found && ((!equalRequest(current.Request, record.Request) &&
+			!restartRetirementRequest(current.Request, record.Request)) ||
+			!replicaActionJournalTransition(current, record)) {
 		return ErrConflict
 	}
 	if !found && len(journal.records) == journal.maxRecords {
@@ -153,10 +163,36 @@ func (journal *FileJournal) PublishReplicaAction(ctx context.Context, expected u
 		return err
 	}
 	renamed = true
-	journal.records[operation] = cloneRecord(record)
-	if err = syncReplicaActionRoot(journal.root); err != nil {
+	pending := cloneRecord(record)
+	journal.pending = &pending
+	return journal.settlePendingLocked()
+}
+
+func replicaActionJournalTransition(current, next Record) bool {
+	switch current.State {
+	case Running:
+		return next.State == Complete || next.Request.Kind == SourceRetirement && next.State == RetirementAuthorized
+	case RetirementAuthorized:
+		return next.Request.Kind == SourceRetirement && next.State == Complete
+	default:
+		return false
+	}
+}
+
+// settlePendingLocked makes a renamed record durable before any reader can
+// resolve an uncertain publication as successful. Only one publication can be
+// pending because writers settle it before checking their compare-and-swap.
+// The caller must hold journal.mu and check that the journal is open.
+func (journal *FileJournal) settlePendingLocked() error {
+	if journal.pending == nil {
+		return nil
+	}
+	if err := journal.syncRoot(journal.root); err != nil {
 		return errors.Join(ErrOutcomeUnknown, err)
 	}
+	record := *journal.pending
+	journal.records[replicaActionJournalKey(record.Request.Operation, record.Request.Kind)] = record
+	journal.pending = nil
 	return nil
 }
 
@@ -184,9 +220,11 @@ func (journal *FileJournal) Close() error {
 	if journal.closed {
 		return nil
 	}
+	err := journal.settlePendingLocked()
 	journal.closed = true
-	err := errors.Join(storeio.UnlockWriter(journal.lock), journal.lock.Close(), journal.root.Close())
+	err = errors.Join(err, storeio.UnlockWriter(journal.lock), journal.lock.Close(), journal.root.Close())
 	journal.lock, journal.root, journal.records = nil, nil, nil
+	journal.pending = nil
 	return err
 }
 
@@ -195,7 +233,6 @@ func (journal *FileJournal) recover() error {
 	if err != nil {
 		return err
 	}
-	removedTemporary := false
 	for _, entry := range entries {
 		name := entry.Name()
 		if name == "journal.lock" {
@@ -208,7 +245,6 @@ func (journal *FileJournal) recover() error {
 			if err = journal.root.Remove(name); err != nil {
 				return err
 			}
-			removedTemporary = true
 			continue
 		}
 		operation, ok := openReplicaActionJournalName(name)
@@ -239,10 +275,9 @@ func (journal *FileJournal) recover() error {
 		}
 		journal.records[operation] = record
 	}
-	if removedTemporary {
-		return syncReplicaActionRoot(journal.root)
-	}
-	return nil
+	// A prior writer may have closed after an uncertain rename. Sync recovered
+	// names even when no temporary files needed cleanup before exposing them.
+	return journal.syncRoot(journal.root)
 }
 
 func appendReplicaActionJournalRecord(dst []byte, record Record) ([]byte, error) {

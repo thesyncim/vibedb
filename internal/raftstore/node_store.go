@@ -1634,6 +1634,16 @@ func (s *NodeStore) RegisterGroupWithSnapshot(descriptor GroupDescriptor, snapsh
 }
 
 func (s *NodeStore) registerGroupSequenced(descriptor GroupDescriptor, snapshot *pb.Snapshot) (GroupIncarnation, error) {
+	return s.registerGroupSequencedAt(descriptor, snapshot, 1)
+}
+
+// registerGroupSequencedAt is the node-log publication primitive used by a
+// dynamic learner install. The requested incarnation is authenticated in the
+// same descriptor/checkpoint wave; it is never inferred from a local counter
+// after the controller has committed the target identity.
+func (s *NodeStore) registerGroupSequencedAt(
+	descriptor GroupDescriptor, snapshot *pb.Snapshot, incarnation uint64,
+) (GroupIncarnation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
@@ -1642,12 +1652,27 @@ func (s *NodeStore) registerGroupSequenced(descriptor GroupDescriptor, snapshot 
 	if s.sequencer == nil {
 		return GroupIncarnation{}, ErrInvalid
 	}
-	return s.registerGroupLocked(descriptor, snapshot)
+	return s.registerGroupLockedAt(descriptor, snapshot, incarnation)
 }
 
 func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb.Snapshot) (GroupIncarnation, error) {
+	return s.registerGroupLockedMode(descriptor, snapshot, 1, false)
+}
+
+func (s *NodeStore) registerGroupLockedAt(
+	descriptor GroupDescriptor, snapshot *pb.Snapshot, incarnation uint64,
+) (GroupIncarnation, error) {
+	return s.registerGroupLockedMode(descriptor, snapshot, incarnation, true)
+}
+
+// Ordinary descriptor retries preserve the existing incarnation. Dynamic installs
+// must additionally match the incarnation committed by their controller.
+func (s *NodeStore) registerGroupLockedMode(descriptor GroupDescriptor, snapshot *pb.Snapshot, incarnation uint64, exactIncarnation bool) (GroupIncarnation, error) {
 	if descriptor.LogKey != 0 || validateGroupDescriptor(descriptor, true) != nil {
 		return GroupIncarnation{}, ErrBounds
+	}
+	if incarnation == 0 {
+		return GroupIncarnation{}, ErrInvalid
 	}
 	if snapshot != nil {
 		if err := validateSnapshotBase(snapshot, descriptor.MemberID); err != nil {
@@ -1697,6 +1722,9 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 				return GroupIncarnation{}, ErrRetryConflict
 			}
 		}
+		if exactIncarnation && state.NodeIncarnation != incarnation {
+			return GroupIncarnation{}, ErrRetryConflict
+		}
 		return GroupIncarnation{GroupID: existing.LogKey, Incarnation: state.NodeIncarnation}, nil
 	}
 	// Capacity limits apply to new groups, not exact unknown-outcome retries.
@@ -1727,7 +1755,7 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 		return GroupIncarnation{}, err
 	}
 	s.waveEntryArena[0] = seglog.Entry{Index: descriptor.LogKey, Term: 1, DataOffset: 0, DataBytes: uint64(len(s.plainArena))}
-	s.waveBatches[0] = seglog.ReadyBatch{GroupID: descriptor.LogKey, BeginIncarnation: 1}
+	s.waveBatches[0] = seglog.ReadyBatch{GroupID: descriptor.LogKey, BeginIncarnation: incarnation}
 	if snapshot != nil {
 		s.waveCheckpoint[0] = checkpoint
 		s.waveHard[0] = seglog.HardState{Term: checkpoint.Term, Commit: checkpoint.Index}
@@ -1765,7 +1793,7 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 	s.nextLogKey++
 	s.publishCoordinatesLocked(nodeDescriptorGroup, nil, nil)
 	s.publishCoordinatesLocked(descriptor.LogKey, nil, nil)
-	return GroupIncarnation{GroupID: descriptor.LogKey, Incarnation: 1}, nil
+	return GroupIncarnation{GroupID: descriptor.LogKey, Incarnation: incarnation}, nil
 }
 
 func nodeWaveID(ready []NodeReady) seglog.WaveID {
@@ -1840,6 +1868,26 @@ func (v *GroupView) NodeIncarnation() (uint64, error) {
 	return state.NodeIncarnation, nil
 }
 
+// ReadyCursor returns the authenticated persistence sequence for the current
+// incarnation. A recovered runtime that retains that certified incarnation
+// must continue after this cursor instead of reusing ReadyID one.
+func (v *GroupView) ReadyCursor() (incarnation, readyID uint64, err error) {
+	v.store.mu.Lock()
+	defer v.store.mu.Unlock()
+	if err := v.store.usable(); err != nil {
+		return 0, 0, err
+	}
+	state, ok := v.store.engine.Summary(v.group)
+	if !ok || state.NodeIncarnation == 0 {
+		return 0, 0, ErrInvalid
+	}
+	readyID = state.ReadyID
+	if hint, ok := v.store.commitHints[v.group]; ok {
+		readyID = max(readyID, hint.readyID)
+	}
+	return state.NodeIncarnation, readyID, nil
+}
+
 // NodeIdentity returns the immutable physical-node identity authenticated by
 // this group view's owning node log.
 func (v *GroupView) NodeIdentity() (NodeIdentity, error) {
@@ -1874,7 +1922,13 @@ func (v *GroupView) CapacityProfile() (CapacityProfile, error) {
 
 func (s *NodeStore) rebuildDescriptors(limit int) error {
 	metadata, ok := s.engine.Metadata(nodeDescriptorGroup)
-	if !ok || metadata.LastIndex == 0 || metadata.LastIndex > uint64(limit) || metadata.Hard.Term != 1 || metadata.Hard.Vote != 0 || metadata.Hard.Commit != metadata.LastIndex {
+	if !ok || metadata.LastIndex > uint64(limit) || metadata.Hard.Term != 1 || metadata.Hard.Vote != 0 || metadata.Hard.Commit != metadata.LastIndex {
+		return ErrCorrupt
+	}
+	// A prepared capacity node has a durable descriptor-group hard state but
+	// no descriptors until its first enrollment. Accept only that exact genesis
+	// state; an absent or partially truncated descriptor catalog is corruption.
+	if metadata.LastIndex == 0 && metadata != (seglog.GroupMetadata{Hard: seglog.HardState{Term: 1}, FirstIndex: 1}) {
 		return ErrCorrupt
 	}
 	descriptors := make([]GroupDescriptor, 0, limit)

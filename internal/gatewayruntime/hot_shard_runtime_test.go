@@ -265,11 +265,15 @@ func gatewayHotShardMoveFixture(
 		Command: raftservice.CommandFence{ReplicaSetVersion: 7, OwnershipEpoch: 13,
 			RoutingVersion: 7, RouteGeneration: 9, ActivePolicyGeneration: 1,
 			ProtectionEpoch: 1, SchemaGeneration: 1, RelationManifestDigest: [32]byte{1}},
-		RangeIdentity: [32]byte{2}, LineageDigest: [32]byte{3}, ForwardingRuleDigest: [32]byte{4},
-		Replicas: replicas, EnrolledTarget: &target,
+		LogicalSchemaDigest: [32]byte{5}, RangeIdentity: [32]byte{2}, LineageDigest: [32]byte{3}, ForwardingRuleDigest: [32]byte{4},
+		RequestLedgerRanges: []gateway.DurableRequestLedgerRangeDescriptor{{Identity: [32]byte{6}}},
+		Replicas:            replicas, EnrolledTarget: &target,
 	}})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := gateway.CatalogSnapshotDigest(catalog); err != nil {
+		t.Fatalf("hot move fixture is not a canonical catalog cut: %v", err)
 	}
 	source := autosplit.SourceIdentity{Distribution: "data", Shard: "all",
 		AllocationGeneration: 11,

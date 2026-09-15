@@ -28,6 +28,7 @@ type DistributedMetricsSample struct {
 	Node          rafttransport.NodeID
 	Cut           raftservice.ProgressMetricsSnapshot
 	Stages        servicemetrics.StageMetricsSnapshot
+	Budget        servicemetrics.MigrationBudgetSnapshot
 	NodeAggregate bool
 	Reads         uint64
 	Faults        uint64
@@ -36,6 +37,7 @@ type DistributedMetricsSample struct {
 type DistributedMetricsAggregate struct {
 	Cut      raftservice.ProgressMetricsSnapshot
 	Stages   servicemetrics.StageMetricsSnapshot
+	Budget   servicemetrics.MigrationBudgetSnapshot
 	Samples  uint64
 	Reads    uint64
 	Faults   uint64
@@ -50,6 +52,7 @@ type distributedMetricsSlot struct {
 	refreshing    atomic.Bool
 	values        [9]atomic.Uint64
 	stages        [27]atomic.Uint64
+	budget        [4]atomic.Uint64
 	nodeAggregate bool
 	reads         atomic.Uint64
 	faults        atomic.Uint64
@@ -169,6 +172,11 @@ func (metrics *DistributedMetrics) RefreshOne(ctx context.Context, index int) er
 	for i, value := range stageValues {
 		slot.stages[i].Store(value)
 	}
+	budgetValues := [...]uint64{snapshot.Budget.ThrottledCalls, snapshot.Budget.ThrottledBytes,
+		snapshot.Budget.PeakActive, snapshot.Budget.MaxActive}
+	for i, value := range budgetValues {
+		slot.budget[i].Store(value)
+	}
 	slot.seq.Add(1)
 	return nil
 }
@@ -242,7 +250,7 @@ func (metrics *DistributedMetrics) SnapshotInto(dst []DistributedMetricsSample) 
 	dst = dst[:len(metrics.slots)]
 	aggregate := DistributedMetricsAggregate{Samples: uint64(len(dst))}
 	for index := range metrics.slots {
-		sample, values, stageValues, err := metrics.snapshotAt(index)
+		sample, values, stageValues, budgetValues, err := metrics.snapshotAt(index)
 		if err != nil {
 			return dst[:index], aggregate, ErrDistributedMetrics
 		}
@@ -250,6 +258,7 @@ func (metrics *DistributedMetrics) SnapshotInto(dst []DistributedMetricsSample) 
 		aggregate.Reads, aggregate.Overflow = saturatingAdd(aggregate.Reads, sample.Reads, aggregate.Overflow)
 		aggregate.Faults, aggregate.Overflow = saturatingAdd(aggregate.Faults, sample.Faults, aggregate.Overflow)
 		if sample.NodeAggregate {
+			mergeDistributedBudget(&aggregate.Budget, budgetValues, &aggregate.Overflow)
 			stageFields := []*uint64{&aggregate.Stages.CheckpointApplied, &aggregate.Stages.Checkpoints, &aggregate.Stages.PhysicalCheckpoints,
 				&aggregate.Stages.CheckpointBarrierSyncs, &aggregate.Stages.WALLiveBytes, &aggregate.Stages.WALEntries, &aggregate.Stages.WALSyncs,
 				&aggregate.Stages.BackupRequests, &aggregate.Stages.BackupFaults, &aggregate.Stages.BackupLogicalBytes, &aggregate.Stages.BackupScanBytes,
@@ -276,7 +285,7 @@ func (metrics *DistributedMetrics) SnapshotInto(dst []DistributedMetricsSample) 
 
 // SnapshotAt exposes one stable cached sample without allocation.
 func (metrics *DistributedMetrics) SnapshotAt(index int) (DistributedMetricsSample, error) {
-	sample, _, _, err := metrics.snapshotAt(index)
+	sample, _, _, _, err := metrics.snapshotAt(index)
 	return sample, err
 }
 
@@ -288,13 +297,14 @@ func (metrics *DistributedMetrics) Aggregate() (DistributedMetricsAggregate, err
 	}
 	aggregate := DistributedMetricsAggregate{Samples: uint64(len(metrics.slots))}
 	for index := range metrics.slots {
-		sample, values, stageValues, err := metrics.snapshotAt(index)
+		sample, values, stageValues, budgetValues, err := metrics.snapshotAt(index)
 		if err != nil {
 			return DistributedMetricsAggregate{}, err
 		}
 		aggregate.Reads, aggregate.Overflow = saturatingAdd(aggregate.Reads, sample.Reads, aggregate.Overflow)
 		aggregate.Faults, aggregate.Overflow = saturatingAdd(aggregate.Faults, sample.Faults, aggregate.Overflow)
 		if sample.NodeAggregate {
+			mergeDistributedBudget(&aggregate.Budget, budgetValues, &aggregate.Overflow)
 			fields := []*uint64{&aggregate.Stages.CheckpointApplied, &aggregate.Stages.Checkpoints, &aggregate.Stages.PhysicalCheckpoints,
 				&aggregate.Stages.CheckpointBarrierSyncs, &aggregate.Stages.WALLiveBytes, &aggregate.Stages.WALEntries, &aggregate.Stages.WALSyncs,
 				&aggregate.Stages.BackupRequests, &aggregate.Stages.BackupFaults, &aggregate.Stages.BackupLogicalBytes, &aggregate.Stages.BackupScanBytes,
@@ -318,13 +328,14 @@ func (metrics *DistributedMetrics) Aggregate() (DistributedMetricsAggregate, err
 	return aggregate, nil
 }
 
-func (metrics *DistributedMetrics) snapshotAt(index int) (DistributedMetricsSample, [9]uint64, [27]uint64, error) {
+func (metrics *DistributedMetrics) snapshotAt(index int) (DistributedMetricsSample, [9]uint64, [27]uint64, [4]uint64, error) {
 	if metrics == nil || index < 0 || index >= len(metrics.slots) {
-		return DistributedMetricsSample{}, [9]uint64{}, [27]uint64{}, ErrDistributedMetrics
+		return DistributedMetricsSample{}, [9]uint64{}, [27]uint64{}, [4]uint64{}, ErrDistributedMetrics
 	}
 	slot := &metrics.slots[index]
 	var values [9]uint64
 	var stages [27]uint64
+	var budget [4]uint64
 	for range 4 {
 		before := slot.seq.Load()
 		if before&1 != 0 {
@@ -336,6 +347,9 @@ func (metrics *DistributedMetrics) snapshotAt(index int) (DistributedMetricsSamp
 		for field := range stages {
 			stages[field] = slot.stages[field].Load()
 		}
+		for field := range budget {
+			budget[field] = slot.budget[field].Load()
+		}
 		if slot.seq.Load() != before {
 			continue
 		}
@@ -343,9 +357,29 @@ func (metrics *DistributedMetrics) snapshotAt(index int) (DistributedMetricsSamp
 			NodeAggregate: slot.nodeAggregate, Reads: slot.reads.Load(), Faults: slot.faults.Load(),
 			Cut:    raftservice.ProgressMetricsSnapshot{ProposalCommands: values[0], ProposalBytes: values[1], AppliedEntries: values[2], ReadyPersisted: values[3], SnapshotsFinished: values[4], ReadCompletions: values[5], Faults: values[6], CommitAdvancements: values[7], CommittedEntries: values[8]},
 			Stages: servicemetrics.StageMetricsSnapshot{CheckpointApplied: stages[0], Checkpoints: stages[1], PhysicalCheckpoints: stages[2], CheckpointBarrierSyncs: stages[3], WALLiveBytes: stages[4], WALEntries: stages[5], WALSyncs: stages[6], BackupRequests: stages[7], BackupFaults: stages[8], BackupLogicalBytes: stages[9], BackupScanBytes: stages[10], SnapshotTransferChunks: stages[11], SnapshotTransferBytes: stages[12], SnapshotResidentBytes: stages[13], ReplicaActionRequests: stages[14], ReplicaActionCompletions: stages[15], ReplicaActionFaults: stages[16], SplitControlRequests: stages[17], SplitControlCompletions: stages[18], SplitControlFaults: stages[19], BootstrapRequests: stages[20], BootstrapChunks: stages[21], BootstrapBytes: stages[22], BootstrapCompletions: stages[23], BootstrapFaults: stages[24], BootstrapResidentBytes: stages[25], BootstrapInflight: stages[26]},
-		}, values, stages, nil
+			Budget: servicemetrics.MigrationBudgetSnapshot{ThrottledCalls: budget[0], ThrottledBytes: budget[1], PeakActive: budget[2], MaxActive: budget[3]},
+		}, values, stages, budget, nil
 	}
-	return DistributedMetricsSample{}, values, stages, ErrDistributedMetrics
+	return DistributedMetricsSample{}, values, stages, budget, ErrDistributedMetrics
+}
+
+func mergeDistributedBudget(dst *servicemetrics.MigrationBudgetSnapshot, values [4]uint64, overflow *bool) {
+	if dst == nil || overflow == nil {
+		return
+	}
+	// The throttle counters are process-lifetime counters, so sum one
+	// authenticated node aggregate per physical node. PeakActive is a
+	// historical per-node maximum and MaxActive is its configured capacity;
+	// taking their maxima keeps those meanings intact instead of pretending
+	// that samples from different nodes occurred at one instant.
+	dst.ThrottledCalls, *overflow = saturatingAdd(dst.ThrottledCalls, values[0], *overflow)
+	dst.ThrottledBytes, *overflow = saturatingAdd(dst.ThrottledBytes, values[1], *overflow)
+	if values[2] > dst.PeakActive {
+		dst.PeakActive = values[2]
+	}
+	if values[3] > dst.MaxActive {
+		dst.MaxActive = values[3]
+	}
 }
 
 func saturatingAdd(left, right uint64, overflow bool) (uint64, bool) {

@@ -21,6 +21,7 @@ type rf3AdoptedSourceResolver struct {
 	mu          sync.Mutex
 	registries  *splitcontroller.LocalPlanAdmissionRegistries
 	inventory   *rf3AdoptedGroupInventory
+	hosted      rf3HostedSplitSources
 	observation *splitcontroller.LocalPlanObservationProvider
 	owners      splitcontroller.LocalObservationOwner
 	factory     *splitcontroller.LocalAdmittedGrantFactory
@@ -31,6 +32,7 @@ type rf3AdoptedSourceResolver struct {
 type rf3RetainedSource struct {
 	runtime  rf3AdoptedRuntime
 	registry *splitcontroller.RuntimeStoreRegistry
+	origin   [32]byte
 }
 
 func (resolver *rf3AdoptedSourceResolver) isRetained(group raftmember.GroupKey) bool {
@@ -48,7 +50,7 @@ func (resolver *rf3AdoptedSourceResolver) ResolveCatalogPlanAdmissionStores(ctx 
 	if resolver == nil || ctx == nil || catalog == nil || plan == nil {
 		return nil, splitcontroller.ErrPlanAdmission
 	}
-	if resolver.inventory != nil {
+	if resolver.inventory != nil || resolver.hosted != nil {
 		if err := resolver.ensureSource(ctx, catalog, plan); err != nil {
 			return nil, err
 		}
@@ -75,11 +77,40 @@ func (resolver *rf3AdoptedSourceResolver) ensureDescriptor(ctx context.Context, 
 	live, retained := resolver.live[descriptor.Group]
 	var paths rf3SplitChildPaths
 	var entry rf3AdoptedGroupEntry
-	if !retained {
+	var hosted rf3HostedSplitSource
+	var hostedFound bool
+	if resolver.hosted != nil {
+		var err error
+		hosted, hostedFound, err = resolver.hosted.lookupHostedSplitSource(descriptor.Group)
+		if err != nil {
+			return err
+		}
+	}
+	if hostedFound {
+		if retained && (live.origin != hosted.origin || !sameRF3DonorIdentity(live.runtime.identity, hosted.runtime.identity)) {
+			return errRF3Serving
+		}
+		found := false
+		for _, replica := range descriptor.Replicas {
+			identity := hosted.runtime.identity
+			if replica.Member == identity.MemberID && replica.Node == hosted.node &&
+				replica.StoreID == identity.StoreID && replica.NodeIncarnation == identity.NodeIncarnation {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return errRF3Serving
+		}
+		live.runtime, live.origin = hosted.runtime, hosted.origin
+	} else if !retained {
 		if descriptor.SplitOrigin == nil {
 			return nil
 		}
 		inventory := resolver.inventory
+		if inventory == nil {
+			return nil
+		}
 		inventory.mu.Lock()
 		if inventory.root == nil || inventory.failed {
 			inventory.mu.Unlock()
@@ -96,19 +127,41 @@ func (resolver *rf3AdoptedSourceResolver) ensureDescriptor(ctx context.Context, 
 				break
 			}
 		}
-		if entry.operation == ([32]byte{}) || entry.plan != descriptor.SplitOrigin.PlanDigest || entry.cutover != descriptor.SplitOrigin.CutoverDigest ||
-			inventory.manifest.groupBundles()[entry.group].Route.Group != descriptor.SplitOrigin.RootGroup {
+		if entry.operation == ([32]byte{}) || entry.plan != descriptor.SplitOrigin.PlanDigest || entry.cutover != descriptor.SplitOrigin.CutoverDigest {
 			inventory.mu.Unlock()
 			return errRF3Serving
 		}
-		root := inventory.manifest.groupBundles()[entry.group].ChildRegistry
+		resources, resourceErr := inventory.entryResources(entry)
 		inventory.mu.Unlock()
+		if resourceErr != nil {
+			return resourceErr
+		}
+		parent := descriptor.SplitOrigin.RootGroup
+		if entry.group == rf3DynamicTemplateSlot {
+			parent = descriptor.SplitOrigin.ParentGroup
+		}
+		if resources.SourceGroup != parent {
+			return errRF3Serving
+		}
+		root := resources.Registry
 		var err error
 		paths, err = root.childPaths(entry.operation, uint8(entry.child))
 		if err != nil {
 			return err
 		}
 		live.runtime = prepared
+	}
+	if !hostedFound && resolver.hosted != nil {
+		current, found, err := resolver.hosted.lookupRetainedSplitRuntime(descriptor.Group)
+		if err != nil {
+			return err
+		}
+		if found {
+			if !sameRF3DonorIdentity(live.runtime.identity, current.identity) {
+				return errRF3Serving
+			}
+			live.runtime = current
+		}
 	}
 	identity := live.runtime.identity
 	observed, err := resolver.owners.ObserveReplica(ctx, identity.Group, identity.MemberID)
@@ -127,7 +180,14 @@ func (resolver *rf3AdoptedSourceResolver) ensureDescriptor(ctx context.Context, 
 		return errRF3Serving
 	}
 	if !retained {
-		live.registry, err = resolver.registries.OpenPreparedSource(paths.Root, entry.certificate)
+		root, digest := paths.Root, entry.certificate
+		if hostedFound {
+			root, digest = hosted.root, hosted.origin
+			if err := prepareRF3HostedSplitRoot(hosted); err != nil {
+				return err
+			}
+		}
+		live.registry, err = resolver.registries.OpenPreparedSource(root, digest)
 		if err != nil {
 			return err
 		}

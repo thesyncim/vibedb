@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalance"
@@ -45,18 +46,42 @@ func (source gatewayTestGrantSource) ReadMembershipGrant(
 }
 
 type gatewayTestGrantInstaller struct {
-	nodes  []rafttransport.NodeID
-	failAt int
+	nodes    []rafttransport.NodeID
+	failAt   int
+	failFrom int
 }
 
 func (installer *gatewayTestGrantInstaller) InstallMembershipGrant(
 	_ context.Context, node rafttransport.NodeID, _ membershipgrant.Grant,
 ) error {
 	installer.nodes = append(installer.nodes, node)
-	if installer.failAt != 0 && len(installer.nodes) == installer.failAt {
+	position := len(installer.nodes)
+	if installer.failAt != 0 && position == installer.failAt ||
+		installer.failFrom != 0 && position >= installer.failFrom {
 		return errors.New("injected install failure")
 	}
 	return nil
+}
+
+type gatewayTestNodeRecordReader struct{ records []gateway.NodeRecord }
+
+func (reader gatewayTestNodeRecordReader) ListNodes(context.Context) ([]gateway.NodeRecord, error) {
+	return reader.records, nil
+}
+
+type gatewayTestEnrollmentInstaller struct {
+	nodes  []rafttransport.NodeID
+	failAt int
+}
+
+func (installer *gatewayTestEnrollmentInstaller) EnrollMember(
+	_ context.Context, node rafttransport.NodeID, _ rafttransport.EnrollmentIntent,
+) (rafttransport.EnrollmentAck, error) {
+	installer.nodes = append(installer.nodes, node)
+	if installer.failAt != 0 && len(installer.nodes) == installer.failAt {
+		return rafttransport.EnrollmentAck{}, errors.New("injected enrollment failure")
+	}
+	return rafttransport.EnrollmentAck{}, nil
 }
 
 type gatewayTestMembershipApplier struct{ calls int }
@@ -72,14 +97,27 @@ func TestGatewayGrantedMembershipInstallsEveryPeerBeforeProposal(t *testing.T) {
 	grant, route, request := gatewayMembershipFixture()
 	installer := new(gatewayTestGrantInstaller)
 	applier := new(gatewayTestMembershipApplier)
+	nodes := gatewayTestNodeRecordReader{records: []gateway.NodeRecord{
+		{NodeID: rafttransport.NodeID(grant.TargetNode), Incarnation: 1, Revision: 1,
+			DataAddress: "127.0.0.1:1", Lifecycle: gateway.NodeActive},
+	}}
+	enroller := new(gatewayTestEnrollmentInstaller)
 	client := gatewayGrantedMembershipClient{grants: gatewayTestGrantSource{grant},
-		installer: installer, applier: applier}
+		installer: installer, applier: applier, nodes: nodes, enroller: enroller}
 	if _, err := client.ApplyMembership(t.Context(), route, request); err != nil {
 		t.Fatal(err)
 	}
-	want := []rafttransport.NodeID{{1}, {2}, {3}, {4}}
+	// AddLearner is voters-only: the enrolled empty target has no group
+	// authority yet. The target becomes a known peer via the enrollment
+	// fanout checked separately below, and receives the grant on the next
+	// membership action after RegisterExecutionGroup.
+	want := []rafttransport.NodeID{{1}, {2}, {3}}
 	if !slices.Equal(installer.nodes, want) || applier.calls != 1 {
 		t.Fatalf("installed=%v apply=%d", installer.nodes, applier.calls)
+	}
+	wantEnrolled := []rafttransport.NodeID{{1}, {2}, {3}}
+	if !slices.Equal(enroller.nodes, wantEnrolled) {
+		t.Fatalf("enrolled=%v", enroller.nodes)
 	}
 	installer.nodes = nil
 	installer.failAt = 3
@@ -87,9 +125,23 @@ func TestGatewayGrantedMembershipInstallsEveryPeerBeforeProposal(t *testing.T) {
 		t.Fatalf("one failed voter err=%v apply=%d", err, applier.calls)
 	}
 	installer.nodes = nil
-	installer.failAt = 4
+	installer.failAt = 0
+	installer.failFrom = 2
 	if _, err := client.ApplyMembership(t.Context(), route, request); err == nil || applier.calls != 2 {
-		t.Fatalf("missing target grant err=%v apply=%d", err, applier.calls)
+		t.Fatalf("quorum not reached but proposal still applied err=%v apply=%d", err, applier.calls)
+	}
+	enroller.nodes = nil
+	enroller.failAt = 1
+	installer.nodes = nil
+	installer.failAt = 0
+	installer.failFrom = 0
+	if _, err := client.ApplyMembership(t.Context(), route, request); err != nil || applier.calls != 3 {
+		t.Fatalf("retiring replica enrollment is optional err=%v apply=%d enrolled=%v", err, applier.calls, enroller.nodes)
+	}
+	enroller.nodes = nil
+	enroller.failAt = 3
+	if _, err := client.ApplyMembership(t.Context(), route, request); err == nil || applier.calls != 3 {
+		t.Fatalf("snapshot donor enrollment skipped err=%v apply=%d enrolled=%v", err, applier.calls, enroller.nodes)
 	}
 }
 
@@ -147,6 +199,8 @@ type gatewayTestActionClient struct {
 	node    rafttransport.NodeID
 	request replicaaction.Request
 	err     error
+	calls   int
+	queued  []error
 }
 
 type gatewayTestMembershipLeader struct {
@@ -160,10 +214,16 @@ func (client gatewayTestMembershipLeader) ObserveMembershipLeader(context.Contex
 func (client *gatewayTestActionClient) Execute(
 	_ context.Context, node rafttransport.NodeID, request replicaaction.Request,
 ) error {
+	client.calls++
 	if _, err := replicaaction.AppendRequest(nil, request); err != nil {
 		return err
 	}
 	client.node, client.request = node, request
+	if len(client.queued) != 0 {
+		err := client.queued[0]
+		client.queued = client.queued[1:]
+		return err
+	}
 	return client.err
 }
 
@@ -228,12 +288,81 @@ func TestGatewayReplicaRemoteActionsBuildExactOwnershipAndRetirementFences(t *te
 	if err = remote.RetireReplicaSource(t.Context(), rebalanceexec.SourceRetirementRequest{
 		Operation: [32]byte(operation), Step: step, Group: route.Serving.Group,
 		AllocationGeneration: 5, Command: commandFence, Source: source, Target: target, Term: 22,
+		Survivors: []gateway.ReplicatedEndpoint{{Member: 4, ControlAddress: "127.0.0.1:14004"}, {Member: 2, ControlAddress: "127.0.0.1:14002"}, {Member: 3, ControlAddress: "127.0.0.1:14003"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if actions.node != source.Node || actions.request.Kind != replicaaction.SourceRetirement ||
 		actions.request.Fence.Command != commandFence || actions.request.Fence.Term != 22 {
 		t.Fatalf("retirement request=%+v node=%x", actions.request, actions.node)
+	}
+	locators, locatorErr := replicaaction.OpenRetirementLocators(actions.request.Command)
+	if locatorErr != nil || len(locators) != 3 || locators[0].Member != 2 || locators[1].Member != 3 || locators[2].Member != 4 || locators[2].Address != "127.0.0.1:14004" {
+		t.Fatalf("retirement discovery locators=%+v err=%v", locators, locatorErr)
+	}
+
+}
+
+func TestGatewayRetirementRefreshesSourceOnlyAfterUnknownAction(t *testing.T) {
+	group := raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
+		TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}}
+	store := [16]byte{9}
+	command := raftservice.CommandFence{ReplicaSetVersion: 11, ActivePolicyGeneration: 2,
+		ProtectionEpoch: 3, OwnershipEpoch: 4, SchemaGeneration: 5, RoutingVersion: 6,
+		RouteGeneration: 7, RelationManifestDigest: [32]byte{8}}
+	source := gateway.ReplicatedEndpoint{Member: 1, Node: [16]byte{1}, StoreID: store, NodeIncarnation: 1}
+	target := gateway.ReplicatedEndpoint{Member: 4, Node: [16]byte{4}}
+	state := replicatedstate.State{Binding: replicatedstate.Binding{
+		ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation,
+		TopologyRecoveryEpoch: group.TopologyRecoveryEpoch, ShardIncarnation: group.ShardIncarnation,
+		GroupID: group.GroupID, AllocationGeneration: 6,
+	}}
+	observation := replicacontrol.Observation{Status: raftmember.RuntimeStatus{MemberID: source.Member},
+		StoreID: store, NodeIncarnation: 2,
+		Publication: raftmodel.Publication{ReplicaSetVersion: command.ReplicaSetVersion}, State: state}
+	actions := &gatewayTestActionClient{queued: []error{replicaaction.ErrOutcomeUnknown}}
+	remote := gatewayReplicaRemoteActions{actions: actions,
+		observer: gatewayTestObservationClient{observation: observation}}
+	request := rebalanceexec.SourceRetirementRequest{Operation: rebalance.OperationID{10}, Step: [32]byte{11},
+		Group: group, AllocationGeneration: state.Binding.AllocationGeneration, Command: command,
+		Source: source, Target: target, Term: 12}
+	if err := remote.RetireReplicaSource(t.Context(), request); err != nil {
+		t.Fatalf("newer source incarnation retry: %v", err)
+	}
+	if actions.calls != 2 || actions.request.Fence.NodeIncarnation != observation.NodeIncarnation {
+		t.Fatalf("action calls=%d final fence incarnation=%d", actions.calls, actions.request.Fence.NodeIncarnation)
+	}
+
+	for name, mutate := range map[string]func(*replicacontrol.Observation){
+		"foreign store":     func(candidate *replicacontrol.Observation) { candidate.StoreID[0]++ },
+		"older incarnation": func(candidate *replicacontrol.Observation) { candidate.NodeIncarnation = source.NodeIncarnation },
+		"wrong member":      func(candidate *replicacontrol.Observation) { candidate.Status.MemberID++ },
+		"wrong publication": func(candidate *replicacontrol.Observation) { candidate.Publication.ReplicaSetVersion++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := observation
+			mutate(&candidate)
+			candidateActions := &gatewayTestActionClient{queued: []error{replicaaction.ErrOutcomeUnknown}}
+			candidateRemote := gatewayReplicaRemoteActions{actions: candidateActions,
+				observer: gatewayTestObservationClient{observation: candidate}}
+			if err := candidateRemote.RetireReplicaSource(t.Context(), request); !errors.Is(err, rebalanceexec.ErrExecutionFence) {
+				t.Fatalf("mismatched source identity err=%v", err)
+			}
+			if candidateActions.calls != 1 {
+				t.Fatalf("mismatched source retried action calls=%d", candidateActions.calls)
+			}
+		})
+	}
+
+	// A source that already completed retirement may expose only the retired
+	// control mux, which has no observation handler. The exact first action
+	// attempt must still settle its durable completion.
+	completed := &gatewayTestActionClient{}
+	if err := (gatewayReplicaRemoteActions{actions: completed}).RetireReplicaSource(t.Context(), request); err != nil {
+		t.Fatalf("completed source replay: %v", err)
+	}
+	if completed.calls != 1 {
+		t.Fatalf("completed source replay calls=%d", completed.calls)
 	}
 }
 
@@ -335,5 +464,35 @@ func TestGatewayShardControlOpenerBoundsAndReleasesAuthenticatedStreams(t *testi
 	if failed == nil || !failed.closed.Load() || len(opener.slots) != 0 {
 		t.Fatalf("failed TLS transport retained: connection=%v closed=%t slots=%d",
 			failed, failed != nil && failed.closed.Load(), len(opener.slots))
+	}
+}
+
+func TestGatewaySnapshotBootstrapIgnoresShortRPCDeadline(t *testing.T) {
+	parent, stopParent := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer stopParent()
+	ctx, cancel := gatewaySnapshotBootstrapContext(parent)
+	defer cancel()
+	time.Sleep(50 * time.Millisecond)
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("parent RPC deadline cancelled snapshot bootstrap: %v", err)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || time.Until(deadline) < time.Minute {
+		t.Fatalf("snapshot bootstrap deadline=%v remaining=%v ok=%v", deadline, time.Until(deadline), ok)
+	}
+}
+
+func TestGatewaySnapshotBootstrapStopsOnParentCancel(t *testing.T) {
+	parent, stopParent := context.WithCancel(t.Context())
+	ctx, cancel := gatewaySnapshotBootstrapContext(parent)
+	defer cancel()
+	stopParent()
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("cause=%v err=%v", context.Cause(ctx), ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled parent did not stop snapshot bootstrap")
 	}
 }

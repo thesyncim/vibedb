@@ -1,6 +1,9 @@
 package main
 
 import (
+	"sync"
+	"sync/atomic"
+
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -13,9 +16,18 @@ import (
 // membership and restore predicates; a primary-group predicate must never be
 // reused for a different group's request.
 type rf3NativeAuthorities struct {
-	groups   map[raftmember.GroupKey]rf3NativeGroupAuthority
-	registry *rafttransport.StaticRegistry
-	adopted  *rf3AdoptedGroupInventory
+	groups    map[raftmember.GroupKey]rf3NativeGroupAuthority
+	registry  *rafttransport.StaticRegistry
+	adopted   *rf3AdoptedGroupInventory
+	dynamicMu sync.Mutex
+	dynamic   atomic.Pointer[rf3NativeDynamicGroups]
+}
+
+type rf3NativeDynamicGroups map[raftmember.GroupKey]rf3NativeDynamicGroup
+type rf3NativeDynamicGroup struct {
+	identity   raftmember.RuntimeIdentity
+	specDigest [32]byte
+	authority  rf3NativeGroupAuthority
 }
 
 type rf3NativeGroupAuthority struct {
@@ -29,7 +41,7 @@ func newRF3NativeAuthorities(registry *rafttransport.StaticRegistry, authorizati
 	prepared []preparedRF3Group, restoreGates map[raftmember.GroupKey]*shardservice.RestoreServingGate,
 	restoreOperations map[raftmember.GroupKey][32]byte,
 ) (*rf3NativeAuthorities, error) {
-	if registry == nil || authorization == nil || len(prepared) == 0 || len(prepared) > maxRF3ManifestGroups {
+	if registry == nil || authorization == nil || len(prepared) > maxRF3ManifestGroups {
 		return nil, errRF3Serving
 	}
 	result := &rf3NativeAuthorities{groups: make(map[raftmember.GroupKey]rf3NativeGroupAuthority, len(prepared)), registry: registry}
@@ -59,7 +71,7 @@ func (authority *rf3NativeAuthorities) serving(state raftservice.ServingState) b
 	if authority == nil {
 		return false
 	}
-	entry, found := authority.groups[state.Identity.Group]
+	entry, found := authority.group(state.Identity.Group)
 	if !found {
 		return authority.adopted.nativeServing(authority.registry, state)
 	}
@@ -70,7 +82,45 @@ func (authority *rf3NativeAuthorities) transitional(state raftservice.ServingSta
 	if authority == nil {
 		return false
 	}
-	entry, found := authority.groups[state.Identity.Group]
-	return found && (entry.restorePreparing(state, request) || entry.move != nil && entry.move(state, request) &&
+	entry, found := authority.group(state.Identity.Group)
+	return found && (entry.restorePreparing != nil && entry.restorePreparing(state, request) || entry.move != nil && entry.move(state, request) &&
 		(request.Capability != serviceauthz.CapabilityTopology || entry.restoreGate == nil || entry.restoreGate.Allows(state)))
+}
+
+func (authority *rf3NativeAuthorities) group(group raftmember.GroupKey) (rf3NativeGroupAuthority, bool) {
+	if entry, found := authority.groups[group]; found {
+		return entry, true
+	}
+	if dynamic := authority.dynamic.Load(); dynamic != nil {
+		entry, found := (*dynamic)[group]
+		return entry.authority, found
+	}
+	return rf3NativeGroupAuthority{}, false
+}
+
+func (authority *rf3NativeAuthorities) unregisterDynamic(identity raftmember.RuntimeIdentity) error {
+	if authority == nil {
+		return nil
+	}
+	authority.dynamicMu.Lock()
+	defer authority.dynamicMu.Unlock()
+	current := authority.dynamic.Load()
+	if current == nil {
+		return nil
+	}
+	entry, found := (*current)[identity.Group]
+	if !found {
+		return nil
+	}
+	if !sameRF3DonorIdentity(entry.identity, identity) {
+		return raftservice.ErrServingFence
+	}
+	next := make(rf3NativeDynamicGroups, len(*current)-1)
+	for group, entry := range *current {
+		if group != identity.Group {
+			next[group] = entry
+		}
+	}
+	authority.dynamic.Store(&next)
+	return nil
 }

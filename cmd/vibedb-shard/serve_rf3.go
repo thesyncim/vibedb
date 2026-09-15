@@ -34,7 +34,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicacontrol"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
-	"github.com/thesyncim/vibedb/internal/schemainstall"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/serviceerrors"
 	"github.com/thesyncim/vibedb/internal/servicemetrics"
@@ -43,7 +42,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
 	"github.com/thesyncim/vibedb/internal/splitartifact"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
-	publicshardcontrol "github.com/thesyncim/vibedb/shardcontrol"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -55,10 +53,13 @@ const (
 	rf3TickInterval                      = 50 * time.Millisecond
 	rf3DefaultWALGenerationIntervalTicks = uint64((10 * time.Minute) / rf3TickInterval)
 	rf3NetworkTimeout                    = 10 * time.Second
-	rf3RequestTimeout                    = 15 * time.Second
-	rf3StartupWriterLockWait             = 2 * time.Second
-	rf3DefaultExecutionLanes             = 8
-	rf3SchemaInstallRecords              = 256
+	// rf3SnapshotBootstrapTimeout bounds learner snapshot dial/receive. Control
+	// RPCs stay on rf3NetworkTimeout so a down peer cannot stall health rounds.
+	rf3SnapshotBootstrapTimeout = 2 * time.Minute
+	rf3RequestTimeout           = 15 * time.Second
+	rf3StartupWriterLockWait    = 2 * time.Second
+	rf3DefaultExecutionLanes    = 8
+	rf3SchemaInstallRecords     = 256
 	// Every admitted schema operation can own one immutable replica-local
 	// bundle until its authenticated drain completes. Keep artifact and journal
 	// cardinality equal; a smaller artifact directory would reject valid DDL
@@ -205,7 +206,7 @@ type preparedRF3Set struct {
 	groups           []preparedRF3Group
 	members          []rafttransport.Member
 	remoteNodes      []rafttransport.NodeID
-	dial             rafttransport.RawPeerDialFunc
+	peerEndpoints    map[rafttransport.NodeID]string
 	nativeConfigured bool
 }
 
@@ -239,6 +240,10 @@ func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, op
 }
 
 func prepareRF3GroupSetOnNode(manifest rf3Manifest, profile *rafttransport.PeerTLS, opening sqldriver.ReplicatedOpenOptions, nodeOwner *rf3NodeOwner, inventory ...*rf3AdoptedGroupInventory) (preparedRF3Set, error) {
+	return prepareRF3GroupSetOnNodeWithRetirements(manifest, profile, opening, nodeOwner, nil, inventory...)
+}
+
+func prepareRF3GroupSetOnNodeWithRetirements(manifest rf3Manifest, profile *rafttransport.PeerTLS, opening sqldriver.ReplicatedOpenOptions, nodeOwner *rf3NodeOwner, retirements []replicaaction.Record, inventory ...*rf3AdoptedGroupInventory) (preparedRF3Set, error) {
 	var result preparedRF3Set
 	if (manifest.NodeLog != nil) != (nodeOwner != nil) {
 		return result, errInvalidRF3Manifest
@@ -283,6 +288,10 @@ func prepareRF3GroupSetOnNode(manifest rf3Manifest, profile *rafttransport.PeerT
 		}
 		if err != nil {
 			return result, closePreparedRF3Groups(result.groups, err)
+		}
+		if rf3ReplicaSourceRetired(retirements, groupFromBinding(base.Binding),
+			base.Binding.MemberID, base.Binding.StoreID, base.Binding.AllocationGeneration) {
+			continue
 		}
 		description, err := sqldriver.DescribeReplicatedSchemaCatalog(bundle.SQL.Path)
 		if err != nil {
@@ -401,15 +410,21 @@ func prepareRF3GroupSetOnNode(manifest rf3Manifest, profile *rafttransport.PeerT
 		}
 	}
 	slices.SortFunc(result.remoteNodes, func(a, b rafttransport.NodeID) int { return bytes.Compare(a[:], b[:]) })
-	dialer := net.Dialer{Timeout: rf3NetworkTimeout}
-	result.dial = func(ctx context.Context, node rafttransport.NodeID) (net.Conn, error) {
-		address, found := addresses[node]
-		if !found {
-			return nil, rafttransport.ErrNodeNotFound
-		}
-		return dialer.DialContext(ctx, "tcp", address)
-	}
+	result.peerEndpoints = addresses
 	return result, nil
+}
+
+// Resolve each reconnect against the committed directory, including peers
+// enrolled after this process started. The startup manifest only seeds it.
+func rf3RegistryPeerDialer(registry *rafttransport.StaticRegistry) rafttransport.RawPeerDialFunc {
+	dialer := net.Dialer{Timeout: rf3NetworkTimeout}
+	return func(ctx context.Context, node rafttransport.NodeID) (net.Conn, error) {
+		peer, err := registry.PhysicalPeer(node)
+		if err != nil || peer.State != rafttransport.PeerEnrolled || peer.Endpoint == "" {
+			return nil, rafttransport.ErrPeerUnauthorized
+		}
+		return dialer.DialContext(ctx, "tcp", peer.Endpoint)
+	}
 }
 
 func rf3SplitChildTemplateMatchesRetained(
@@ -503,9 +518,6 @@ func servePreparedRF3WithEmbeddedGatewayAndDiagnostics(
 	listen rf3ListenFunc,
 	diagnostics <-chan os.Signal,
 ) (resultErr error) {
-	if manifest.Gateway == nil {
-		return errRF3Serving
-	}
 	return servePreparedRF3WithExecutionLanesAndGateway(parent, manifest, executionLaneCount, listen, manifest.Gateway, diagnostics)
 }
 
@@ -539,6 +551,11 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	if err := validateRF3Addresses(manifest); err != nil {
 		return err
 	}
+	migrationBudget, err := openRF3MigrationBudget(manifest)
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, migrationBudget.Close()) }()
 	profile, err := servicetls.LoadProfile(
 		manifest.TLS.Certificate, manifest.TLS.Key, manifest.TLS.Roots,
 		manifest.TLS.IdentityOID, time.Now,
@@ -563,12 +580,11 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	if err != nil {
 		return fmt.Errorf("%w: authorization gate: %v", errRF3Serving, err)
 	}
-	nativeTLS, err := shardservice.NewReplicatedServerTLS(
-		profile, rf3NativePeerNodes(policy),
-	)
-	if err != nil {
-		return fmt.Errorf("%w: native TLS authority: %v", errRF3Serving, err)
-	}
+	// The native TLS allowlist is opened after the retained group set is
+	// classified. A zero-group physical node has no static roster and follows
+	// the node-scoped startup path below; it must not be rejected while the
+	// ordinary grouped path still requires its delegate allowlist.
+	var nativeTLS *shardservice.ReplicatedServerTLS
 	controlAuthorizer, err := servicetls.NewNodeAuthorizer(
 		rf3ControlPeerNodes(manifest, rf3ControlNodes(policy)),
 	)
@@ -582,28 +598,59 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		return fmt.Errorf("%w: control TLS server: %v", errRF3Serving, err)
 	}
 
+	actionJournal, err := replicaaction.OpenFileJournal(
+		manifest.ReplicaControl.ActionJournalPath,
+		manifest.ReplicaControl.MaxActionRecords,
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, actionJournal.Close()) }()
+	retirements, err := actionJournal.SourceRetirements(parent)
+	if err != nil {
+		return err
+	}
 	adoptedInventory, err := openRF3AdoptedGroupInventory(manifest)
 	if err != nil {
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, adoptedInventory.Close()) }()
-	nodeOwner, err := openRF3NodeOwner(manifest, profile)
+	allRetired, err := rf3RetiredControlEligible(manifest, retirements, adoptedInventory, profile.LocalIdentity().Node)
+	if err != nil {
+		return err
+	}
+	if allRetired {
+		return serveRF3RetiredControl(parent, manifest, listen, profile, policy, controlTLS, actionJournal)
+	}
+	nodeOwner, err := openRF3NodeOwner(manifest, profile, migrationBudget)
 	if err != nil {
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, nodeOwner.Close()) }()
-	preparedSet, err := prepareRF3GroupSetOnNode(manifest, profile, opening, nodeOwner, adoptedInventory)
+	preparedSet, err := prepareRF3GroupSetOnNodeWithRetirements(manifest, profile, opening, nodeOwner, retirements, adoptedInventory)
 	if err != nil {
 		return err
 	}
 	closePrepared := func(cause error) error { return closePreparedRF3Groups(preparedSet.groups, cause) }
+	if len(manifest.groupBundles()) == 0 {
+		return servePreparedRF3EmptyNode(parent, manifest, executionLaneCount, listen, embeddedGateway, diagnostics,
+			profile, policy, gate, controlTLS, nativeTLS, nodeOwner, adoptedInventory, migrationBudget, actionJournal, &preparedSet)
+	}
+	if len(preparedSet.groups) == 0 {
+		return errRF3Serving
+	}
+	nativeTLS, err = shardservice.NewReplicatedServerTLS(
+		profile, rf3NativePeerNodes(policy),
+	)
+	if err != nil {
+		return closePrepared(fmt.Errorf("%w: native TLS authority: %v", errRF3Serving, err))
+	}
 	first := &preparedSet.groups[0]
 	base := first.base
-	members, remoteNodes, dial := preparedSet.members, preparedSet.remoteNodes, preparedSet.dial
+	members, remoteNodes := preparedSet.members, preparedSet.remoteNodes
 	nativeConfigured := preparedSet.nativeConfigured
-	transportRegistry, err := rafttransport.NewStaticRegistry(
-		profile.LocalIdentity().Node, members,
-		rafttransport.Limits{MaxGroups: maxRF3ManifestGroups, MaxMembers: maxRF3ManifestGroups * rf3ManifestMembers},
+	transportRegistry, err := newRF3ProvisionedRegistry(manifest, profile, members, preparedSet.peerEndpoints,
+		rf3TransportRegistryLimits(),
 	)
 	if err != nil {
 		return closePrepared(fmt.Errorf("%w: transport roster: %v", errRF3Serving, err))
@@ -613,11 +660,23 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		return closePrepared(fmt.Errorf("%w: restore membership grant: %v", errRF3Serving, err))
 	}
 	deadline := func() time.Time { return time.Now().Add(rf3NetworkTimeout) }
+	snapshotBootstrapDeadline := func() time.Time { return time.Now().Add(rf3SnapshotBootstrapTimeout) }
 	membershipControl, err := shardservice.NewMembershipGrantControlService(
 		grantInstaller, policy, deadline, deadline,
 	)
 	if err != nil {
 		return closePrepared(fmt.Errorf("%w: membership grant control: %v", errRF3Serving, err))
+	}
+	var snapshotAuthorizer *servicetls.NodeAuthorizer
+	enrollmentControl, err := newRF3EnrollmentControlService(transportRegistry, policy, deadline,
+		func(intent rafttransport.EnrollmentIntent) error {
+			if snapshotAuthorizer == nil {
+				return errRF3Serving
+			}
+			return snapshotAuthorizer.Merge([]rafttransport.NodeID{intent.Peer.NodeID})
+		})
+	if err != nil {
+		return closePrepared(fmt.Errorf("%w: enrollment control: %v", errRF3Serving, err))
 	}
 	for index := range preparedSet.groups {
 		item := &preparedSet.groups[index]
@@ -774,7 +833,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
 	peer, err := raftservice.NewAuthenticatedExecutionPeerRuntime(raftservice.AuthenticatedExecutionPeerOptions{
-		Registry: transportRegistry, TLS: profile, Dial: dial, Listener: peerListener,
+		Registry: transportRegistry, TLS: profile, Dial: rf3RegistryPeerDialer(transportRegistry), Listener: peerListener,
 		HandshakeDeadline: deadline, MaxInboundStreams: 8,
 		Execution: raftservice.ExecutionOptions{
 			Registry: servingRegistry, Lanes: lanes,
@@ -805,10 +864,19 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			resultErr = finishRF3Serving(errors.Join(resultErr, componentShutdownError(peer.Run(retireCtx))), lanes, servingRegistry)
 		}
 	}()
+	// enrollmentControl was built before this peer - and its transport - could
+	// exist (its route has to be ready when controlMux is assembled, well
+	// ahead of this construction). Attach the transport now, before the
+	// control listener starts accepting connections below, so every
+	// enrollment commits its queue and not just its registry directory cut;
+	// see EnrollmentControlService.AttachTransport.
+	if err := enrollmentControl.AttachTransport(peer.Transport()); err != nil {
+		return err
+	}
 	observationControl, err := replicacontrol.NewService(replicacontrol.ServiceOptions{
-		Observer:     peer.Owners(),
-		Authorize:    rf3ReplicaObservationAuthorizer(transportRegistry, policy),
-		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 32,
+		Observer:               peer.Owners(),
+		AuthorizeAuthenticated: rf3AuthenticatedReplicaObservationAuthorizer(transportRegistry, policy),
+		ReadDeadline:           deadline, WriteDeadline: deadline, MaxConcurrent: 32,
 	})
 	if err != nil {
 		return err
@@ -827,77 +895,37 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	if err != nil {
 		return err
 	}
-	actionJournal, err := replicaaction.OpenFileJournal(
-		manifest.ReplicaControl.ActionJournalPath,
-		manifest.ReplicaControl.MaxActionRecords,
-	)
-	if err != nil {
-		return err
-	}
-	defer func() { resultErr = errors.Join(resultErr, actionJournal.Close()) }()
-	actionControl, err := replicaaction.NewService(replicaaction.Options{
-		Journal: actionJournal, Owner: peer.Owners(),
-		Authorize: func(identity rafttransport.PeerIdentity, request replicaaction.Request) bool {
-			local, err := transportRegistry.LocalMember(request.Fence.Group)
-			return err == nil && request.Fence.MemberID == local &&
-				policy.Check(identity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
-		},
-		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 32,
-	})
-	if err != nil {
-		return err
-	}
 	schemaActivator, err := newRF3SchemaActivator(peer.Owners(), preparedSet.groups, identities)
 	if err != nil {
 		return err
 	}
-	schemaRoot := manifest.ReplicaControl.SourceDataRoot
-	schemaJournal, err := schemainstall.OpenFileJournal(
-		filepath.Join(schemaRoot, "schema-rollout-journal"), rf3SchemaInstallRecords,
+	staticDonors := &rf3StaticDonorRetirements{groups: make(map[raftmember.GroupKey]rf3StaticDonorRetirement)}
+	actionControl, err := newRF3ReplicaActionControl(actionJournal, peer.Owners(), transportRegistry, policy, deadline,
+		profile, rf3ReplicaRetirementCleanup(schemaActivator, staticDonors, nil))
+	if err != nil {
+		return err
+	}
+	schemaServices, err := newRF3SchemaControlServices(
+		schemaActivator, transportRegistry, policy, manifest.ReplicaControl.SourceDataRoot,
 	)
 	if err != nil {
 		return err
 	}
-	defer func() { resultErr = errors.Join(resultErr, schemaJournal.Close()) }()
-	schemaArtifacts, err := schemainstall.OpenDirectoryBackend(schemainstall.DirectoryOptions{
-		Path:         filepath.Join(schemaRoot, "schema-rollout-artifacts"),
-		MaxArtifacts: rf3SchemaInstallArtifacts, MaxDiskBytes: rf3SchemaInstallDiskBytes,
-		Activator: schemaActivator,
-	})
+	defer func() { resultErr = errors.Join(resultErr, schemaServices.Close()) }()
+	schemaControl, schemaBuildControl := schemaServices.install, schemaServices.build
+	var capacityRevision atomic.Uint64
+	capacityDirectory, err := newRF3CapacitySourceDirectory(schemaActivator, nil, nil,
+		func(ctx context.Context, request replicacontrol.CapacityRequest, samples []replicacontrol.CapacitySourceSample) (replicacontrol.NodeCapacity, error) {
+			return RF3CapacityNodeFromOwner(ctx, nodeOwner, manifest.NodeIncarnation, migrationBudget, &capacityRevision, request, samples)
+		})
 	if err != nil {
 		return err
 	}
-	defer func() { resultErr = errors.Join(resultErr, schemaArtifacts.Close()) }()
-	if err = schemaActivator.bindArtifacts(schemaArtifacts); err != nil {
-		return err
-	}
-	schemaInstaller, err := schemainstall.New(schemainstall.Options{
-		Journal: schemaJournal, Backend: schemaArtifacts, MaxConcurrent: 8,
-	})
+	capacityProvider, err := replicacontrol.NewCapacityProvider(capacityDirectory)
 	if err != nil {
 		return err
 	}
-	schemaDeadline := servicetls.FixedDeadline(2 * time.Minute)
-	schemaControl, err := schemainstall.NewControlService(schemainstall.ControlOptions{
-		Installer: schemaInstaller,
-		Authorize: func(identity rafttransport.PeerIdentity, request schemainstall.Request, _ schemainstall.Command) bool {
-			_, err := transportRegistry.LocalMember(request.Group)
-			return err == nil && policy.Check(identity.Node, serviceauthz.CapabilitySchema) == serviceauthz.DecisionAllow
-		},
-		ReadDeadline: schemaDeadline, WriteDeadline: schemaDeadline,
-		MaxBundleBytes: schemainstall.AbsoluteMaxBundleBytes,
-	})
-	if err != nil {
-		return err
-	}
-	schemaBuildControl, err := schemainstall.NewBuildControlService(schemainstall.BuildControlOptions{
-		Builder: schemaActivator,
-		Authorize: func(identity rafttransport.PeerIdentity, request schemainstall.BuildRequest) bool {
-			_, err := transportRegistry.LocalMember(request.Group)
-			return err == nil && policy.Check(identity.Node, serviceauthz.CapabilitySchema) == serviceauthz.DecisionAllow
-		},
-		ReadDeadline: schemaDeadline, WriteDeadline: schemaDeadline, MaxConcurrent: 2, BuildTimeout: 2 * time.Minute,
-	})
+	capacityControl, err := newRF3CapacityControl(transportRegistry, policy, capacityProvider, deadline)
 	if err != nil {
 		return err
 	}
@@ -912,11 +940,19 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		target := item.manifest.EnrolledTarget
 		groupIdentity := identities[index]
 		itemGroup := groupIdentity.Group
-		if target == nil || groupIdentity.MemberID == target.MemberID {
+		if target != nil && groupIdentity.MemberID == target.MemberID {
 			continue
 		}
-		if policy.Check(target.NodeID, serviceauthz.CapabilityMembership) != serviceauthz.DecisionAllow {
+		if target != nil &&
+			policy.Check(target.NodeID, serviceauthz.CapabilityMembership) != serviceauthz.DecisionAllow {
 			return errors.Join(errRF3Serving, errors.New("enrolled target lacks membership capability"))
+		}
+		var targetMember uint64
+		var targetStore [16]byte
+		var targetIncarnation uint64
+		if target != nil {
+			targetMember, targetStore = target.MemberID, target.StoreID
+			targetIncarnation = target.NodeIncarnation
 		}
 		sourceJournal, openErr := snapshottransfer.OpenSourceFileJournal(
 			rf3SnapshotGroupPath(manifest.ReplicaControl.SourceJournalPath, itemGroup, len(preparedSet.groups) > 1),
@@ -943,15 +979,20 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 					},
 					ChunkBytes:      manifest.ReplicaControl.SourceChunkBytes,
 					MaxConcurrent:   manifest.ReplicaControl.MaxSourceConcurrent,
+					Budget:          migrationBudget,
 					RuntimeIdentity: groupIdentity,
 					SourceNode:      profile.LocalIdentity().Node,
-					TargetMember:    target.MemberID, TargetStore: target.StoreID,
-					TargetIncarnation: target.NodeIncarnation, Cut: item.apply,
+					DynamicTarget:   target == nil,
+					TargetMember:    targetMember, TargetStore: targetStore,
+					TargetIncarnation: targetIncarnation, Cut: item.apply,
 				},
 			)
 		}
 		if providerErr != nil {
 			return providerErr
+		}
+		staticDonors.groups[itemGroup] = rf3StaticDonorRetirement{
+			identity: groupIdentity, close: closeRF3RetiredDonor(provider, sourceJournal),
 		}
 		if phase := os.Getenv("VIBEDB_QUALIFICATION_ABANDON_CRASH"); phase != "" {
 			if os.Getenv("VIBEDB_REPLICA_REPLACEMENT_E2E") != "1" ||
@@ -967,11 +1008,17 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 				Journal:  sourceJournal,
 				Exporter: snapshottransfer.PinnedSourceControlExporter{Provider: provider},
 				Authorize: func(peerIdentity rafttransport.PeerIdentity, request snapshottransfer.SourceControlRequest) bool {
-					return request.Group == itemGroup && request.SourceMember == groupIdentity.MemberID &&
-						request.SourceNode == profile.LocalIdentity().Node &&
-						request.TargetMember == target.MemberID && request.TargetStore == target.StoreID &&
-						request.TargetIncarnation == target.NodeIncarnation &&
-						policy.Check(peerIdentity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow
+					if request.Group != itemGroup || request.SourceMember != groupIdentity.MemberID ||
+						request.SourceNode != profile.LocalIdentity().Node ||
+						policy.Check(peerIdentity.Node, serviceauthz.CapabilityMembership) != serviceauthz.DecisionAllow {
+						return false
+					}
+					if target == nil {
+						return rf3DynamicSnapshotTarget(transportRegistry, request.Group,
+							request.TargetMember, request.TargetIncarnation)
+					}
+					return request.TargetMember == target.MemberID && request.TargetStore == target.StoreID &&
+						request.TargetIncarnation == target.NodeIncarnation
 				},
 				ReadDeadline: deadline, WriteDeadline: deadline,
 				MaxConcurrent: manifest.ReplicaControl.MaxSourceConcurrent,
@@ -983,10 +1030,17 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		controlServices = append(controlServices, snapshottransfer.GroupSourceControlService{
 			Group: itemGroup, Service: sourceService,
 		})
+		authorizeData := snapshottransfer.AuthorizeFunc(nil)
+		if target == nil {
+			authorizeData = rf3DynamicSnapshotDataAuthorizer(transportRegistry, item.apply, groupIdentity)
+		} else {
+			authorizeData = rf3SnapshotDataAuthorizer(item.apply, groupIdentity, *target)
+		}
 		dataService, serviceErr := provider.NewDataService(snapshottransfer.ServiceOptions{
 			Registry:     transportRegistry,
-			Authorize:    rf3SnapshotDataAuthorizer(item.apply, groupIdentity, *target),
-			ReadDeadline: deadline, WriteDeadline: deadline,
+			Budget:       migrationBudget,
+			Authorize:    authorizeData,
+			ReadDeadline: snapshotBootstrapDeadline, WriteDeadline: snapshotBootstrapDeadline,
 			MaxConnections: manifest.ReplicaControl.MaxSourceConcurrent,
 			MaxChunkBytes:  manifest.ReplicaControl.SourceChunkBytes,
 			MaxInflightBytes: int64(manifest.ReplicaControl.SourceChunkBytes) *
@@ -998,7 +1052,9 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		dataServices = append(dataServices, snapshottransfer.GroupDataService{
 			Group: itemGroup, Service: dataService,
 		})
-		targetNodes = append(targetNodes, target.NodeID)
+		if target != nil {
+			targetNodes = append(targetNodes, target.NodeID)
+		}
 	}
 	if len(dataServices) != 0 {
 		var serviceErr error
@@ -1012,7 +1068,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			sourceData, serviceErr = snapshottransfer.NewGroupDataRegistry(
 				snapshottransfer.GroupDataRegistryOptions{
 					Registry: transportRegistry, Services: dataServices,
-					ReadDeadline: deadline, MaxConnections: manifest.ReplicaControl.MaxSourceConcurrent,
+					ReadDeadline: snapshotBootstrapDeadline, MaxConnections: manifest.ReplicaControl.MaxSourceConcurrent,
 					MaxInflightBytes: int64(manifest.ReplicaControl.SourceChunkBytes) *
 						int64(manifest.ReplicaControl.MaxSourceConcurrent),
 				},
@@ -1025,7 +1081,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		}
 	}
 	snapshotNodes := rf3ControlPeerNodes(manifest, policy.NodesWith(serviceauthz.CapabilityMembership))
-	snapshotAuthorizer, err := servicetls.NewNodeAuthorizer(snapshotNodes)
+	snapshotAuthorizer, err = servicetls.NewNodeAuthorizer(snapshotNodes)
 	if err == nil {
 		snapshotTLS, err = servicetls.NewServer(
 			profile, rafttransport.TrafficSnapshot, snapshotAuthorizer,
@@ -1036,11 +1092,20 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	}
 	var childPrepareControl shardcontrol.Handler
 	var childPreparer *rf3GroupChildPreparer
+	var dynamicChildren *rf3DynamicChildResources
+	if nodeOwner != nil {
+		dynamicChildren, err = newRF3DynamicChildResources(manifest, nodeOwner, schemaActivator, peer.Owners(), transportRegistry, adoptedInventory.templates)
+		if err != nil {
+			return err
+		}
+		defer func() { resultErr = errors.Join(resultErr, dynamicChildren.Close()) }()
+	}
 	if nativeListener != nil {
 		var childErr error
 		childPreparer, childErr = newRF3GroupChildPreparer(
 			manifest, profile.LocalIdentity().Node,
 			peerListener.Addr(), nativeListener.Addr(), controlListener.Addr(), snapshotListener.Addr(),
+			dynamicChildren,
 		)
 		if childErr == nil {
 			defer func() { resultErr = errors.Join(resultErr, childPreparer.Close()) }()
@@ -1073,14 +1138,18 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		topologyProfile: frontendProfile,
 		childPreparer:   childPreparer,
 		inventory:       adoptedInventory,
+		schemas:         schemaActivator,
+		nodeOwner:       nodeOwner,
+		children:        dynamicChildren,
 	})
 	if splitRuntimeErr != nil {
 		return splitRuntimeErr
 	}
 	defer func() { resultErr = errors.Join(resultErr, splitRuntime.Close()) }()
 	metricsControl, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
-		Provider: &rf3MetricsProvider{owners: peer.Owners(), groups: preparedSet.groups,
-			backup: backupControl, action: actionControl, data: dataServices, split: splitRuntime.action},
+		Provider: &rf3MetricsProvider{owners: peer.Owners(), schemas: schemaActivator,
+			backup: backupControl, action: actionControl, data: dataServices, split: splitRuntime.action,
+			budget: migrationBudget},
 		Authorize: func(identity rafttransport.PeerIdentity) bool {
 			return policy.Check(identity.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow
 		},
@@ -1098,11 +1167,15 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			return err
 		}
 	}
+	preparationSource, err := newRF3PreparationSource(schemaActivator, transportRegistry, policy, manifest.ReplicaControl.SourceDataRoot, deadline)
+	if err != nil {
+		return err
+	}
 	controlMux, err := newRF3ControlMux(
 		membershipControl, observationControl, metricsControl, backupControl, sourceControl, actionControl,
 		splitRuntime.action, schemaControl, splitRuntime.observation.service,
 		splitRuntime.admission, splitRuntime.tail, splitRuntime.terminal, childPrepareControl,
-		restoreServingControl, schemaBuildControl,
+		restoreServingControl, schemaBuildControl, capacityControl, preparationSource, enrollmentControl,
 	)
 	if err != nil {
 		return err
@@ -1200,7 +1273,11 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			MaxConnections: snapshotConcurrency, MaxHandshakes: snapshotConcurrency,
 			HandshakeDeadline: deadline,
 		}, func(ctx context.Context, connection rafttransport.PeerConnection) {
-			_ = snapshotMux.Serve(ctx, connection)
+			serveCtx, cancel := context.WithTimeout(ctx, rf3SnapshotBootstrapTimeout)
+			defer cancel()
+			if err := snapshotMux.Serve(serveCtx, connection); err != nil && ctx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "RF3 snapshot request failed: %v\n", err)
+			}
 		})
 	}()
 	var nativeDone chan error
@@ -1389,92 +1466,55 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 func newRF3ControlMux(
 	membership, observation, metrics, backup, source, action, split, schema, planObservation, admission, tail,
 	terminal, childPrepare, restoreServing, schemaBuild shardcontrol.Handler,
+	capacity ...shardcontrol.Handler,
 ) (*shardcontrol.Mux, error) {
-	routes := make([]shardcontrol.Route, 0, 15)
-	routes = append(routes,
-		shardcontrol.Route{
-			Discriminator: shardservice.MembershipGrantRequestDiscriminator(),
-			Handler:       membership,
-		},
-		shardcontrol.Route{
-			Discriminator: replicacontrol.RequestDiscriminator(),
-			Handler:       observation,
-		},
-		shardcontrol.Route{
-			Discriminator: servicemetrics.RequestDiscriminator(),
-			Handler:       metrics,
-		},
-	)
-	if backup != nil {
-		routes = append(routes, shardcontrol.Route{
-			Discriminator: clusterbackup.LiveRequestDiscriminator(),
-			Handler:       backup,
-		})
+	services := rf3ControlServices{
+		membership: membership, observation: observation, metrics: metrics, backup: backup,
+		source: source, action: action, split: split, schema: schema, planObservation: planObservation,
+		admission: admission, tail: tail, terminal: terminal, childPrepare: childPrepare,
+		restoreServing: restoreServing, schemaBuild: schemaBuild,
 	}
-	if source != nil {
-		routes = append(routes, shardcontrol.Route{
-			Discriminator: snapshottransfer.SourceControlRequestDiscriminator(),
-			Handler:       source,
-		})
+	if len(capacity) > 0 {
+		services.capacity = capacity[0]
 	}
-	if action != nil {
-		routes = append(routes, shardcontrol.Route{
-			Discriminator: replicaaction.RequestDiscriminator(),
-			Handler:       action,
-		})
+	if len(capacity) > 1 {
+		services.preparation = capacity[1]
 	}
-	if split != nil {
-		routes = append(routes, shardcontrol.Route{
-			Discriminator: publicshardcontrol.RequestDiscriminator(),
-			Handler:       split,
-		})
+	if len(capacity) > 2 {
+		services.enrollment = capacity[2]
 	}
-	if schema != nil {
-		routes = append(routes, shardcontrol.Route{
-			Discriminator: schemainstall.RequestDiscriminator(),
-			Handler:       schema,
-		})
+	return services.mux()
+}
+
+// newRF3EnrollmentControlService authorizes and applies exactly one
+// certified physical-peer enrollment per authenticated shard-control stream.
+// It uses the same TLS-identity and CapabilityMembership trust boundary as
+// shardservice.NewMembershipGrantControlService: the caller (the gateway) is
+// authenticated and authorized once by Authorize, and its enrollment content
+// is then trusted the same way an authorized caller's membership grant
+// content already is. Every further consistency check (roster digest,
+// replica-set version, directory-revision fencing, duplicate/local-member
+// rejection) is enforced locally by the registry itself.
+func newRF3EnrollmentControlService(
+	registry *rafttransport.StaticRegistry, policy *serviceauthz.Policy, deadline rafttransport.DeadlineFunc,
+	onEnrolled func(rafttransport.EnrollmentIntent) error,
+) (*rafttransport.EnrollmentControlService, error) {
+	authorize := func(
+		_ context.Context, connection rafttransport.PeerConnection, intent rafttransport.EnrollmentIntent,
+	) error {
+		identity := connection.PeerIdentity()
+		if identity.TrustDomain != intent.Domain ||
+			policy.Check(identity.Node, serviceauthz.CapabilityMembership) != serviceauthz.DecisionAllow {
+			return rafttransport.ErrEnrollmentControlUnauthorized
+		}
+		return nil
 	}
-	if schemaBuild != nil {
-		routes = append(routes, shardcontrol.Route{Discriminator: schemainstall.BuildRequestDiscriminator(), Handler: schemaBuild})
-		routes = append(routes, shardcontrol.Route{Discriminator: schemainstall.BuildResumeRequestDiscriminator(), Handler: schemaBuild})
-		routes = append(routes, shardcontrol.Route{Discriminator: schemainstall.BuildShadowRequestDiscriminator(), Handler: schemaBuild})
-	}
-	if planObservation != nil {
-		routes = append(routes, shardcontrol.Route{
-			Discriminator: splitcontroller.PlanObservationRequestDiscriminator(),
-			Handler:       planObservation,
-		})
-	}
-	if admission != nil {
-		routes = append(routes, shardcontrol.Route{
-			Discriminator: splitcontroller.PlanAdmissionRequestDiscriminator(),
-			Handler:       admission,
-		})
-	}
-	if tail != nil {
-		routes = append(routes, shardcontrol.Route{
-			Discriminator: splitcontroller.TailStreamRequestDiscriminator(),
-			Handler:       tail,
-		})
-	}
-	if terminal != nil {
-		routes = append(routes, shardcontrol.Route{
-			Discriminator: splitcontroller.TerminalRetirementRequestDiscriminator(), Handler: terminal,
-		})
-	}
-	if childPrepare != nil {
-		routes = append(routes, shardcontrol.Route{
-			Discriminator: splitcontroller.ChildPrepareRequestDiscriminator(),
-			Handler:       childPrepare,
-		})
-	}
-	if restoreServing != nil {
-		routes = append(routes, shardcontrol.Route{
-			Discriminator: shardservice.RestoreServingRequestDiscriminator(), Handler: restoreServing,
-		})
-	}
-	return shardcontrol.New(routes...)
+	verifier := rafttransport.EnrollmentVerifierFunc(func(rafttransport.EnrollmentIntent) error { return nil })
+	return rafttransport.NewEnrollmentControlService(rafttransport.EnrollmentControlServiceOptions{
+		Registry: registry, Verifier: verifier, Authorize: authorize,
+		OnEnrolled:   onEnrolled,
+		ReadDeadline: deadline, WriteDeadline: deadline,
+	})
 }
 
 func hasRestoredRF3PreparingMarker(sqlPath string) (bool, error) {
@@ -1808,29 +1848,15 @@ func rf3NativeServingAuthority(
 	group raftmember.GroupKey,
 	base sqldriver.ReplicatedShardStoreIdentity,
 ) func(raftservice.ServingState) bool {
-	roster := manifest.memberRoster()
 	return func(state raftservice.ServingState) bool {
 		if registry == nil || state.Identity.Group != group ||
 			state.Identity.MemberID != base.Binding.MemberID ||
 			state.Identity.StoreID != base.Binding.StoreID || !state.Command.Valid() {
 			return false
 		}
-		version, found := registry.ReplicaSetVersion(group)
+		version, voters, found := registry.ReplicaSetVoterCount(group)
 		if !found || version != state.Command.ReplicaSetVersion {
 			return false
-		}
-		voters := 0
-		for _, member := range roster {
-			if role, err := registry.Role(group, member.MemberID); err == nil &&
-				role == rafttransport.MemberVoter {
-				voters++
-			}
-		}
-		if target := manifest.EnrolledTarget; target != nil {
-			if role, err := registry.Role(group, target.MemberID); err == nil &&
-				role == rafttransport.MemberVoter {
-				voters++
-			}
 		}
 		role, err := registry.Role(group, base.Binding.MemberID)
 		if err != nil || role != rafttransport.MemberVoter {
@@ -1839,10 +1865,27 @@ func rf3NativeServingAuthority(
 		if target := manifest.EnrolledTarget; target != nil &&
 			base.Binding.MemberID == target.MemberID {
 			initial := base.Binding.Authority
-			return voters == rf3ManifestMembers &&
-				state.Command.OwnershipEpoch > initial.OwnershipEpoch &&
-				state.Command.RoutingVersion > initial.RoutingVersion &&
-				state.Command.RouteGeneration > initial.RouteGeneration
+			if state.Command.OwnershipEpoch <= initial.OwnershipEpoch ||
+				state.Command.RoutingVersion <= initial.RoutingVersion ||
+				state.Command.RouteGeneration <= initial.RouteGeneration {
+				return false
+			}
+			if voters == rf3ManifestMembers {
+				return true
+			}
+			// After its original handoff, this replica is an ordinary voter
+			// during later replacements. The new grant's certified initial
+			// RF3 proves admission before that replacement's RF4 transition.
+			grant, installed, err := registry.CurrentTransitionGrant(group)
+			if voters == rf3ManifestMembers+1 && err == nil && installed && grant.Valid() &&
+				grant.TargetMember != target.MemberID && version > grant.InitialReplicaSetVersion {
+				for _, member := range grant.InitialVoters {
+					if member == target.MemberID {
+						return true
+					}
+				}
+			}
+			return false
 		}
 		return true
 	}
@@ -1871,7 +1914,7 @@ func rf3NativeMoveAuthority(
 			request.Fence.AllocationGeneration != state.Identity.AllocationGeneration {
 			return false
 		}
-		version, found := registry.ReplicaSetVersion(group)
+		version, voters, found := registry.ReplicaSetVoterCount(group)
 		if !found || version != state.Command.ReplicaSetVersion {
 			return false
 		}
@@ -1879,14 +1922,6 @@ func rf3NativeMoveAuthority(
 		if err != nil || role != rafttransport.MemberVoter {
 			return false
 		}
-		voters := 0
-		for _, member := range manifest.memberRoster() {
-			if role, roleErr := registry.Role(group, member.MemberID); roleErr == nil &&
-				role == rafttransport.MemberVoter {
-				voters++
-			}
-		}
-		voters++
 		if voters != rf3ManifestMembers+1 {
 			return false
 		}
@@ -2110,7 +2145,10 @@ func rf3TransportOptions(
 			// Frame slots cover each distinct remote, including enrolled
 			// learners and multigroup rosters. The shared byte admission
 			// ceiling stays fixed; more peers do not multiply payload memory.
-			GlobalFrames: max(64, 32*len(peers)), GlobalBytes: 64 << 20,
+			// Keep one queue slot set available for the transient fourth
+			// physical node. Scale-in retires that peer before the next
+			// enrollment, so this does not grow with historical identities.
+			GlobalFrames: max(96, 32*len(peers)), GlobalBytes: 64 << 20,
 		},
 		Coalesce: rafttransport.CoalesceLimits{
 			MaxFrames: 8,

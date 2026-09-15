@@ -51,7 +51,7 @@ func TestServeNodeFrontendOpenFailureJoinsOwnersAndReleasesStorage(t *testing.T)
 		member := &input.Groups[index]
 		member.Listeners = listeners
 		member.Members[0].PeerAddress = listeners.Peer
-		member.TLS = rf3ManifestTLS{Certificate: credentials[0].Certificate, Key: credentials[0].Key, Roots: roots, IdentityOID: rf3CommandIdentityOID.String()}
+		member.TLS = rf3ManifestTLS{PeerKeys: rf3CommandPeerKeys(credentials[0]), Certificate: credentials[0].Certificate, Key: credentials[0].Key, Roots: roots, IdentityOID: rf3CommandIdentityOID.String()}
 		member.AuthorizationPolicy = policy
 	}
 	input.Gateway = &rf3ManifestGateway{
@@ -60,7 +60,7 @@ func TestServeNodeFrontendOpenFailureJoinsOwnersAndReleasesStorage(t *testing.T)
 		CatalogSessionJournal: filepath.Join(root, "absent-session"), CatalogClientID: strings.Repeat("a", 32),
 		CatalogRetryHome: strings.Repeat("b", 16), DurableAckKeyPath: filepath.Join(root, "absent-ack-key"),
 		ListenAddress: "127.0.0.1:0", AuthorizationPolicy: policy, TableCatalogs: []string{},
-		TLS: rf3ManifestTLS{Certificate: credentials[3].Certificate, Key: credentials[3].Key, Roots: roots, IdentityOID: rf3CommandIdentityOID.String()},
+		TLS: rf3ManifestTLS{PeerKeys: rf3CommandPeerKeys(credentials[3]), Certificate: credentials[3].Certificate, Key: credentials[3].Key, Roots: roots, IdentityOID: rf3CommandIdentityOID.String()},
 	}
 	for index, node := range nodes {
 		address := fmt.Sprintf("127.0.0.1:%d", 28000+index)

@@ -17,33 +17,62 @@ import (
 const MaxProcessDiagnosticBytes = 1 << 20
 
 type ProcessDiagnostic struct {
-	mu      sync.Mutex
-	buffer  bytes.Buffer
-	dropped int64
+	mu        sync.Mutex
+	buffer    bytes.Buffer
+	dropped   int64
+	tail      [32 << 10]byte
+	tailBytes int
+	tailNext  int
 }
 
 func (diagnostic *ProcessDiagnostic) Write(value []byte) (int, error) {
 	diagnostic.mu.Lock()
 	defer diagnostic.mu.Unlock()
 	accepted := len(value)
-	remaining := MaxProcessDiagnosticBytes - diagnostic.buffer.Len()
+	remaining := MaxProcessDiagnosticBytes - len(diagnostic.tail) - diagnostic.buffer.Len()
 	if remaining > 0 {
 		if remaining > len(value) {
 			remaining = len(value)
 		}
 		_, _ = diagnostic.buffer.Write(value[:remaining])
 	}
-	diagnostic.dropped += int64(len(value) - max(remaining, 0))
+	value = value[max(remaining, 0):]
+	// Keep the startup prefix for readiness and the final output for failure
+	// diagnosis. Both remain within the existing fixed diagnostic budget.
+	if len(value) > len(diagnostic.tail) {
+		diagnostic.dropped += int64(diagnostic.tailBytes + len(value) - len(diagnostic.tail))
+		copy(diagnostic.tail[:], value[len(value)-len(diagnostic.tail):])
+		diagnostic.tailBytes, diagnostic.tailNext = len(diagnostic.tail), 0
+	} else if len(value) != 0 {
+		overflow := max(0, diagnostic.tailBytes+len(value)-len(diagnostic.tail))
+		diagnostic.dropped += int64(overflow)
+		first := copy(diagnostic.tail[diagnostic.tailNext:], value)
+		copy(diagnostic.tail[:], value[first:])
+		diagnostic.tailNext = (diagnostic.tailNext + len(value)) % len(diagnostic.tail)
+		diagnostic.tailBytes = min(len(diagnostic.tail), diagnostic.tailBytes+len(value))
+	}
 	return accepted, nil
 }
 
 func (diagnostic *ProcessDiagnostic) String() string {
 	diagnostic.mu.Lock()
 	defer diagnostic.mu.Unlock()
-	if diagnostic.dropped == 0 {
+	if diagnostic.tailBytes == 0 {
 		return diagnostic.buffer.String()
 	}
-	return diagnostic.buffer.String() + "\n[diagnostic output truncated]"
+	var output strings.Builder
+	output.Grow(diagnostic.buffer.Len() + diagnostic.tailBytes + 32)
+	output.Write(diagnostic.buffer.Bytes())
+	if diagnostic.dropped != 0 {
+		output.WriteString("\n[diagnostic output truncated]\n")
+	}
+	if diagnostic.tailBytes < len(diagnostic.tail) {
+		output.Write(diagnostic.tail[:diagnostic.tailBytes])
+	} else {
+		output.Write(diagnostic.tail[diagnostic.tailNext:])
+		output.Write(diagnostic.tail[:diagnostic.tailNext])
+	}
+	return output.String()
 }
 
 type ExternalProcess struct {

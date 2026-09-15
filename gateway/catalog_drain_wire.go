@@ -263,26 +263,44 @@ type ClusterCatalogDigestVerifier interface {
 }
 
 type ClusterCatalogDrainAuthorizeFunc func(rafttransport.PeerIdentity, ClusterCatalogDrainRequest) bool
+type ClusterCatalogDrainEnvelopeAuthorizeFunc func(rafttransport.PeerIdentity, ClusterCatalogDrainEnvelope) bool
+
+// ClusterCatalogDrainAuthenticatedAuthorizeFunc receives the verified leaf
+// key in addition to the transport identity. It is used by a live service
+// directory to prevent a renewed or stale certificate from reusing a retained
+// NodeID while the legacy identity-only callback remains available to callers
+// that have no dynamic directory.
+type ClusterCatalogDrainAuthenticatedAuthorizeFunc func(rafttransport.PeerBinding, ClusterCatalogDrainRequest) bool
+type ClusterCatalogDrainAuthenticatedEnvelopeAuthorizeFunc func(rafttransport.PeerBinding, ClusterCatalogDrainEnvelope) bool
 
 type ClusterCatalogDrainControlOptions struct {
-	Holder        *CatalogHolder
-	Catalog       ClusterCatalogDigestVerifier
-	Member        ClusterCatalogDrainMember
-	Authorize     ClusterCatalogDrainAuthorizeFunc
-	ReadDeadline  rafttransport.DeadlineFunc
-	WriteDeadline rafttransport.DeadlineFunc
+	Holder                 *CatalogHolder
+	Catalog                ClusterCatalogDigestVerifier
+	Member                 ClusterCatalogDrainMember
+	Authorize              ClusterCatalogDrainAuthorizeFunc
+	AuthorizeAuthenticated ClusterCatalogDrainAuthenticatedAuthorizeFunc
+	// AuthorizeEnvelope may enforce the exact immutable roster and participant
+	// identity carried by this request. When supplied it is evaluated in
+	// addition to Authorize, so directory updates cannot broaden an old fence.
+	AuthorizeEnvelope              ClusterCatalogDrainEnvelopeAuthorizeFunc
+	AuthorizeAuthenticatedEnvelope ClusterCatalogDrainAuthenticatedEnvelopeAuthorizeFunc
+	ReadDeadline                   rafttransport.DeadlineFunc
+	WriteDeadline                  rafttransport.DeadlineFunc
 }
 
 // ClusterCatalogDrainControlService handles one exact request on one already
 // authenticated gateway-control stream. A disconnect after request receipt is
 // harmless: catalog drain is monotonic and exact retries emit the same ack.
 type ClusterCatalogDrainControlService struct {
-	holder        *CatalogHolder
-	catalog       ClusterCatalogDigestVerifier
-	member        ClusterCatalogDrainMember
-	authorize     ClusterCatalogDrainAuthorizeFunc
-	readDeadline  rafttransport.DeadlineFunc
-	writeDeadline rafttransport.DeadlineFunc
+	holder                         *CatalogHolder
+	catalog                        ClusterCatalogDigestVerifier
+	member                         ClusterCatalogDrainMember
+	authorize                      ClusterCatalogDrainAuthorizeFunc
+	authorizeAuthenticated         ClusterCatalogDrainAuthenticatedAuthorizeFunc
+	authorizeEnvelope              ClusterCatalogDrainEnvelopeAuthorizeFunc
+	authorizeAuthenticatedEnvelope ClusterCatalogDrainAuthenticatedEnvelopeAuthorizeFunc
+	readDeadline                   rafttransport.DeadlineFunc
+	writeDeadline                  rafttransport.DeadlineFunc
 }
 
 func NewClusterCatalogDrainControlService(options ClusterCatalogDrainControlOptions) (*ClusterCatalogDrainControlService, error) {
@@ -293,8 +311,11 @@ func NewClusterCatalogDrainControlService(options ClusterCatalogDrainControlOpti
 	}
 	return &ClusterCatalogDrainControlService{
 		holder: options.Holder, catalog: options.Catalog, member: options.Member,
-		authorize: options.Authorize, readDeadline: options.ReadDeadline,
-		writeDeadline: options.WriteDeadline,
+		authorize: options.Authorize, authorizeAuthenticated: options.AuthorizeAuthenticated,
+		authorizeEnvelope:              options.AuthorizeEnvelope,
+		authorizeAuthenticatedEnvelope: options.AuthorizeAuthenticatedEnvelope,
+		readDeadline:                   options.ReadDeadline,
+		writeDeadline:                  options.WriteDeadline,
 	}, nil
 }
 
@@ -316,8 +337,12 @@ func (service *ClusterCatalogDrainControlService) Serve(ctx context.Context, con
 		return err
 	}
 	peer := connection.PeerIdentity()
+	binding := rafttransport.Binding(connection)
 	if peer.TrustDomain != envelope.Fence.trust || !envelope.Fence.contains(service.member) ||
-		!service.authorize(peer, envelope.Request) {
+		!service.authorize(peer, envelope.Request) ||
+		service.authorizeAuthenticated != nil && !service.authorizeAuthenticated(binding, envelope.Request) ||
+		service.authorizeEnvelope != nil && !service.authorizeEnvelope(peer, envelope) ||
+		service.authorizeAuthenticatedEnvelope != nil && !service.authorizeAuthenticatedEnvelope(binding, envelope) {
 		return ErrClusterCatalogDrainAuth
 	}
 	if err = service.catalog.VerifyClusterCatalogDigest(
@@ -339,6 +364,15 @@ func (service *ClusterCatalogDrainControlService) Serve(ctx context.Context, con
 
 type GatewayCatalogDrainStreamOpener interface {
 	OpenGatewayControl(context.Context, rafttransport.NodeID) (rafttransport.PeerConnection, error)
+}
+
+// GatewayCatalogDrainMemberOpener is implemented by dynamic control
+// directories. A node can have more than one process incarnation while an
+// older immutable drain fence is still outstanding, so that fence must select
+// the exact participant endpoint instead of looking up only the physical node.
+// The node-only interface remains the fallback for in-process collectors.
+type GatewayCatalogDrainMemberOpener interface {
+	OpenGatewayControlMember(context.Context, ClusterCatalogDrainMember) (rafttransport.PeerConnection, error)
 }
 
 type ClusterCatalogDrainClientOptions struct {
@@ -410,7 +444,13 @@ func (client *ClusterCatalogDrainClient) collectOne(
 	encoded []byte,
 	member ClusterCatalogDrainMember,
 ) (rafttransport.PeerIdentity, ClusterCatalogDrainAck, error) {
-	connection, err := client.opener.OpenGatewayControl(ctx, member.Node)
+	var connection rafttransport.PeerConnection
+	var err error
+	if exact, ok := client.opener.(GatewayCatalogDrainMemberOpener); ok {
+		connection, err = exact.OpenGatewayControlMember(ctx, member)
+	} else {
+		connection, err = client.opener.OpenGatewayControl(ctx, member.Node)
+	}
 	if err != nil {
 		if connection != nil {
 			_ = connection.Close()

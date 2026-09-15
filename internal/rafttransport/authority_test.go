@@ -146,6 +146,7 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 	preRemovalSource := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgHeartbeat, 1, 3))
 	preRemovalVote := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgVote, 1, 3))
 	preRemovalRemaining := frameTestEncode(t, follower, group, frameTestMessage(pb.MsgAppResp, 2, 3))
+	preRemovalRemainingVote := frameTestEncode(t, follower, group, frameTestMessage(pb.MsgVote, 2, 3))
 	removed := &pb.ConfState{Voters: []uint64{2, 3, 4}}
 	for _, registry := range []*StaticRegistry{leader, follower, target} {
 		// Normal entries may separate configuration entries, so authority
@@ -164,8 +165,11 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(1)), preRemovalVote); !errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrRetiredAuthority) {
 		t.Fatalf("removed-source vote = %v", err)
 	}
-	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(2)), preRemovalRemaining); !errors.Is(err, ErrUnauthorized) || !errors.Is(err, ErrRetiredAuthority) {
-		t.Fatalf("retained-member retired frame = %v", err)
+	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(2)), preRemovalRemaining); err != nil {
+		t.Fatalf("retained-member committed-prefix acknowledgement = %v", err)
+	}
+	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(2)), preRemovalRemainingVote); !errors.Is(err, ErrUnauthorized) || !errors.Is(err, ErrRetiredAuthority) {
+		t.Fatalf("retained-member retired vote = %v", err)
 	}
 	if _, err := target.Role(group, 1); !errors.Is(err, ErrMemberNotFound) {
 		t.Fatalf("removed source retained role: %v", err)

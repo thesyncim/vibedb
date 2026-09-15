@@ -101,6 +101,29 @@ func TestRetainedSourceProviderExportsAndObservesAfterReopen(t *testing.T) {
 	}
 }
 
+func TestRetainedSourceProviderAcceptsDynamicLearnerTargetRequest(t *testing.T) {
+	cut, fixture := sourceExportFixture(t, sourceExportLimits())
+	root := t.TempDir()
+	node := rafttransport.NodeID{39}
+	options := retainedSourceOptions(fixture, root, filepath.Join(root, "source-artifacts"), node,
+		&retainedTestCut{cut: cut})
+	options.DynamicTarget = true
+	options.TargetMember = 0
+	options.TargetStore = [16]byte{}
+	options.TargetIncarnation = 0
+	provider, err := OpenRetainedSourceExportProvider(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+	request := retainedSourceRequest(fixture, node)
+	descriptor, err := (PinnedSourceControlExporter{Provider: provider}).
+		ExportReplicaMoveSnapshot(context.Background(), request)
+	if err != nil || !descriptorMatchesSourceRequest(descriptor, request) {
+		t.Fatalf("dynamic descriptor=%+v err=%v", descriptor, err)
+	}
+}
+
 type sourceProviderTestOpener struct {
 	service        *Service
 	source, target rafttransport.PeerIdentity

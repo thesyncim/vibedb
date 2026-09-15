@@ -4,21 +4,28 @@ import (
 	"math"
 
 	"github.com/thesyncim/vibedb/internal/clusterbackupservice"
+	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicaaction"
 	"github.com/thesyncim/vibedb/internal/servicemetrics"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
+	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
 type rf3MetricsProvider struct {
 	owners *raftservice.ExecutionOwners
 	groups []preparedRF3Group
-	backup *clusterbackupservice.Service
-	action *replicaaction.Service
-	data   []snapshottransfer.GroupDataService
-	split  *splitcontroller.ControlService
+	// schemas replaces the startup group slice when groups can be adopted,
+	// retired, or advanced to a new schema generation while serving.
+	schemas *rf3SchemaActivator
+	backup  *clusterbackupservice.Service
+	action  *replicaaction.Service
+	data    []snapshottransfer.GroupDataService
+	split   *splitcontroller.ControlService
+	budget  *migrationbudget.Budget
 }
 
 type coldRF3MetricsProvider struct{ groups []*preparedColdRF3Group }
@@ -49,20 +56,41 @@ func (provider *rf3MetricsProvider) GroupProgressMetrics(group raftmember.GroupK
 	return provider.owners.GroupProgressMetrics(group)
 }
 
+func (provider *rf3MetricsProvider) MigrationBudgetMetrics() servicemetrics.MigrationBudgetSnapshot {
+	metrics := provider.budget.Metrics()
+	throttledCalls := uint64(0)
+	throttledBytes := uint64(0)
+	for _, resource := range [...]migrationbudget.ResourceMetrics{
+		metrics.CPU, metrics.DiskRead, metrics.DiskWrite, metrics.NetworkSend, metrics.NetworkReceive,
+	} {
+		throttledCalls = rf3MetricsAdd(throttledCalls, resource.ThrottleEvents)
+		throttledBytes = rf3MetricsAdd(throttledBytes, resource.ThrottledBytes)
+	}
+	return servicemetrics.MigrationBudgetSnapshot{ThrottledCalls: throttledCalls,
+		ThrottledBytes: throttledBytes, PeakActive: uint64(max(metrics.PeakActive, 0)), MaxActive: uint64(max(metrics.ActiveCapacity, 0))}
+}
+
 func (provider *rf3MetricsProvider) StageMetrics() servicemetrics.StageMetricsSnapshot {
 	var result servicemetrics.StageMetricsSnapshot
-	for index := range provider.groups {
-		group := &provider.groups[index]
-		if stats, err := group.apply.DurabilityStats(); err == nil {
-			result.CheckpointApplied = rf3MetricsAdd(result.CheckpointApplied, stats.CheckpointAppliedIndex)
-			result.Checkpoints = rf3MetricsAdd(result.Checkpoints, stats.Checkpoints)
-			result.PhysicalCheckpoints = rf3MetricsAdd(result.PhysicalCheckpoints, stats.PhysicalCheckpoints)
-			result.CheckpointBarrierSyncs = rf3MetricsAdd(result.CheckpointBarrierSyncs, stats.BarrierSyncs)
+	if provider.schemas != nil {
+		provider.schemas.mu.RLock()
+		states := make([]*rf3SchemaGeneration, 0, len(provider.schemas.groups))
+		for _, state := range provider.schemas.groups {
+			states = append(states, state)
 		}
-		wal := group.wal.Metrics()
-		result.WALLiveBytes = rf3MetricsAdd(result.WALLiveBytes, wal.LiveBytes)
-		result.WALEntries = rf3MetricsAdd(result.WALEntries, wal.Entries)
-		result.WALSyncs = rf3MetricsAdd(result.WALSyncs, wal.Syncs)
+		provider.schemas.mu.RUnlock()
+		for _, state := range states {
+			if state != nil {
+				state.mu.Lock()
+				addRF3GroupStageMetrics(&result, state.apply, state.wal)
+				state.mu.Unlock()
+			}
+		}
+	} else {
+		for index := range provider.groups {
+			group := &provider.groups[index]
+			addRF3GroupStageMetrics(&result, group.apply, group.recoveryLog())
+		}
 	}
 	backup := provider.backup.Metrics()
 	result.BackupRequests, result.BackupFaults = backup.Requests, backup.Faults
@@ -82,6 +110,32 @@ func (provider *rf3MetricsProvider) StageMetrics() servicemetrics.StageMetricsSn
 	result.SplitControlRequests, result.SplitControlCompletions, result.SplitControlFaults =
 		split.Requests, split.Completions, split.Faults
 	return result
+}
+
+func addRF3GroupStageMetrics(result *servicemetrics.StageMetricsSnapshot, apply *sqldriver.ReplicatedApply, log rf3RecoveryLog) {
+	if stats, err := apply.DurabilityStats(); err == nil {
+		result.CheckpointApplied = rf3MetricsAdd(result.CheckpointApplied, stats.CheckpointAppliedIndex)
+		result.Checkpoints = rf3MetricsAdd(result.Checkpoints, stats.Checkpoints)
+		result.PhysicalCheckpoints = rf3MetricsAdd(result.PhysicalCheckpoints, stats.PhysicalCheckpoints)
+		result.CheckpointBarrierSyncs = rf3MetricsAdd(result.CheckpointBarrierSyncs, stats.BarrierSyncs)
+	}
+	// Legacy group WALs expose exact counters. A node GroupView exposes the
+	// same logical live-byte view through LiveMetrics; its separate physical
+	// reservation remains a node-wide capacity ceiling and is not counted here.
+	if source, ok := log.(interface{ Metrics() raftstore.Metrics }); ok {
+		wal := source.Metrics()
+		result.WALLiveBytes = rf3MetricsAdd(result.WALLiveBytes, wal.LiveBytes)
+		result.WALEntries = rf3MetricsAdd(result.WALEntries, wal.Entries)
+		result.WALSyncs = rf3MetricsAdd(result.WALSyncs, wal.Syncs)
+	} else if source, ok := log.(interface {
+		LiveMetrics() (raftstore.Metrics, error)
+	}); ok {
+		if wal, err := source.LiveMetrics(); err == nil {
+			result.WALLiveBytes = rf3MetricsAdd(result.WALLiveBytes, wal.LiveBytes)
+			result.WALEntries = rf3MetricsAdd(result.WALEntries, wal.Entries)
+			result.WALSyncs = rf3MetricsAdd(result.WALSyncs, wal.Syncs)
+		}
+	}
 }
 
 func rf3MetricsAdd(left, right uint64) uint64 {

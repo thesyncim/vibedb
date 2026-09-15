@@ -121,6 +121,12 @@ func TestControllerSubmitSetRefusesSecondOperationForMovingGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	prepared, directory, err := controller.Prepare(t.Context(), plan)
+	if err != nil || prepared.ID != [32]byte(plan.OperationID()) || prepared.State != gateway.ReplicatedOperationPlanned ||
+		len(directory) != 0 || len(journal.records) != 0 || len(fixture.membershipRequests) != 0 {
+		t.Fatalf("prepare published or executed before enrollment handoff: record=%+v directory=%x records=%d membership=%d err=%v",
+			prepared, directory, len(journal.records), len(fixture.membershipRequests), err)
+	}
 	if _, err = controller.SubmitSet(context.Background(), []*rebalance.Plan{plan}); err != nil {
 		t.Fatal(err)
 	}

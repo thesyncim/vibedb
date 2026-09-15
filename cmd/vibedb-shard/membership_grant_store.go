@@ -22,10 +22,9 @@ type rf3TransitionGrantAuthority interface {
 }
 
 // durableRF3GrantInstaller makes the transition grant part of the shard's
-// restart state. The authority validates and installs first; the service does
-// not acknowledge until the byte-exact grant and its semantic digest survive
-// file and parent-directory sync. A failed acknowledgement is therefore safe
-// to retry with the same grant.
+// restart state. A live registry validates first, commits the byte-exact grant
+// and its semantic digest through file and parent-directory sync, then exposes
+// its authority to transport readers. A failed acknowledgement is safe to retry.
 type durableRF3GrantInstaller struct {
 	mu        sync.Mutex
 	path      string
@@ -33,6 +32,7 @@ type durableRF3GrantInstaller struct {
 	grant     membershipgrant.Grant
 	present   bool
 	persist   func(string, membershipgrant.Grant) error
+	replace   func(string, membershipgrant.Grant, membershipgrant.Grant) error
 }
 
 type durableRF3GrantRouter struct {
@@ -107,16 +107,34 @@ func (installer *durableRF3GrantInstaller) InstallTransitionGrant(
 	}
 	installer.mu.Lock()
 	defer installer.mu.Unlock()
+	var err error
 	if installer.present && installer.grant != grant {
-		return errRF3MembershipGrant
+		authority, ok := installer.authority.(interface {
+			ReplaceTransitionGrantWithCommit(membershipgrant.Grant, membershipgrant.Grant, func() error) error
+		})
+		if !ok {
+			return errRF3MembershipGrant
+		}
+		replace := installer.replace
+		if replace == nil {
+			replace = replaceRF3MembershipGrant
+		}
+		err = authority.ReplaceTransitionGrantWithCommit(installer.grant, grant, func() error {
+			return replace(installer.path, installer.grant, grant)
+		})
+	} else {
+		commit := func() error { return installer.persist(installer.path, grant) }
+		if authority, ok := installer.authority.(interface {
+			InstallTransitionGrantWithCommit(membershipgrant.Grant, func() error) error
+		}); ok {
+			err = authority.InstallTransitionGrantWithCommit(grant, commit)
+		} else if err = installer.authority.InstallTransitionGrant(grant); err == nil {
+			// Cold-process authority only validates immutable manifest identities;
+			// it has no running transport whose admission could race persistence.
+			err = commit()
+		}
 	}
-	if err := installer.authority.InstallTransitionGrant(grant); err != nil {
-		return errors.Join(errRF3MembershipGrant, err)
-	}
-	if installer.present {
-		return nil
-	}
-	if err := installer.persist(installer.path, grant); err != nil {
+	if err != nil {
 		return errors.Join(errRF3MembershipGrant, err)
 	}
 	installer.grant, installer.present = grant, true
@@ -157,16 +175,39 @@ func readRF3MembershipGrant(path string) (membershipgrant.Grant, bool, error) {
 }
 
 func persistRF3MembershipGrant(path string, grant membershipgrant.Grant) error {
+	return writeRF3MembershipGrantFile(path, membershipgrant.Grant{}, grant)
+}
+
+// replaceRF3MembershipGrant is an exact disk CAS invoked only after the
+// registry proves the previous lifecycle completed and validates the next one.
+func replaceRF3MembershipGrant(path string, expected, grant membershipgrant.Grant) error {
+	if !expected.Valid() || expected.Group != grant.Group || expected == grant {
+		return errRF3MembershipGrant
+	}
+	return writeRF3MembershipGrantFile(path, expected, grant)
+}
+
+func writeRF3MembershipGrantFile(path string, expected, grant membershipgrant.Grant) error {
 	if !grant.Valid() {
 		return errRF3MembershipGrant
 	}
 	if existing, found, err := readRF3MembershipGrant(path); err != nil {
 		return err
 	} else if found {
-		if existing != grant {
+		if existing == grant {
+			// A prior attempt may have renamed successfully but failed syncing
+			// the directory. Finish that durability boundary before acknowledging.
+			directory, openErr := os.Open(filepath.Dir(path))
+			if openErr != nil {
+				return openErr
+			}
+			return errors.Join(directory.Sync(), directory.Close())
+		}
+		if expected == (membershipgrant.Grant{}) || existing != expected {
 			return errRF3MembershipGrant
 		}
-		return nil
+	} else if expected != (membershipgrant.Grant{}) {
+		return errRF3MembershipGrant
 	}
 	parent, base := filepath.Dir(path), filepath.Base(path)
 	if parent == "." || base == "." || base == string(filepath.Separator) {

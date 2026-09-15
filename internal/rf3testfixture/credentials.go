@@ -4,10 +4,12 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -20,6 +22,13 @@ import (
 type Credential struct {
 	Certificate string
 	Key         string
+	PeerKeys    []CredentialPeerKey
+}
+
+// CredentialPeerKey is an explicit initial transport pin in a test manifest.
+type CredentialPeerKey struct {
+	NodeID    string `json:"node_id"`
+	KeyDigest string `json:"key_digest"`
 }
 
 // WriteCredentials creates exact certificate-bound peer identities under one
@@ -31,6 +40,7 @@ func WriteCredentials(
 	nodes []rafttransport.NodeID,
 ) ([]Credential, string, error) {
 	credentials := make([]Credential, len(nodes))
+	pins := make([]CredentialPeerKey, len(nodes))
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, "", err
@@ -85,6 +95,12 @@ func WriteCredentials(
 		if err != nil {
 			return nil, "", err
 		}
+		parsedLeaf, err := x509.ParseCertificate(leafDER)
+		if err != nil {
+			return nil, "", err
+		}
+		digest := sha256.Sum256(parsedLeaf.RawSubjectPublicKeyInfo)
+		pins[index] = CredentialPeerKey{NodeID: fmt.Sprintf("%x", node), KeyDigest: fmt.Sprintf("%x", digest)}
 		certificatePath := filepath.Join(root, "member-"+big.NewInt(int64(index+1)).String()+"-cert.pem")
 		certificatePEM := append(
 			pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER}),
@@ -104,6 +120,9 @@ func WriteCredentials(
 			return nil, "", err
 		}
 		credentials[index] = Credential{Certificate: certificatePath, Key: keyPath}
+	}
+	for index := range credentials {
+		credentials[index].PeerKeys = pins
 	}
 	return credentials, roots, nil
 }

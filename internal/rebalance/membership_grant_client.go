@@ -8,6 +8,7 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/shardservice"
 )
@@ -30,7 +31,14 @@ type MembershipApplier interface {
 
 // MembershipGrantClient binds one certified move grant to its native
 // membership control. Every ApplyMembership first installs or confirms the
-// exact grant on the three current voters and the enrolled target.
+// exact grant on the three current voters, plus the enrolled target once it
+// is capable of holding group authority. AddLearner is the one exception:
+// the enrolled target is, by construction, not yet a member of the group and
+// cannot run a membership-grant-control listener or accept an install before
+// the very AddLearner this grant authorizes has been proposed and applied.
+// Requiring its confirmation first would be a permanent deadlock, so
+// AddLearner's fanout is voters-only; the target's own grant is installed or
+// confirmed by the next membership action once it has caught up.
 type MembershipGrantClient struct {
 	grant     membershipgrant.Grant
 	installer MembershipGrantInstaller
@@ -56,7 +64,7 @@ func (client *MembershipGrantClient) ApplyMembership(
 	if client == nil || ctx == nil || !membershipRequestMatchesGrant(request, client.grant) {
 		return gateway.ReplicatedMembershipResult{}, ErrMembershipGrantInstall
 	}
-	nodes, err := membershipGrantFanoutNodes(route, client.grant)
+	nodes, err := membershipGrantFanoutNodes(route, client.grant, request.Kind)
 	if err != nil {
 		return gateway.ReplicatedMembershipResult{}, err
 	}
@@ -97,19 +105,20 @@ func membershipRequestMatchesGrant(
 func membershipGrantFanoutNodes(
 	route gateway.ReplicatedMembershipRoute,
 	grant membershipgrant.Grant,
-) ([MembershipGrantFanout]rafttransport.NodeID, error) {
+	kind raftservice.MembershipKind,
+) ([]rafttransport.NodeID, error) {
 	var result [MembershipGrantFanout]rafttransport.NodeID
 	if route.Serving.Group != grant.Group ||
 		len(route.Serving.Replicas) != gateway.ServingReplicaCount ||
 		!route.HasEnrolledTarget || route.EnrolledTarget.Member != grant.TargetMember ||
 		[16]byte(route.EnrolledTarget.Node) != grant.TargetNode {
-		return result, ErrMembershipGrantInstall
+		return nil, ErrMembershipGrantInstall
 	}
 	roster := make([]membershipgrant.RosterMember, gateway.ServingReplicaCount)
 	for index, replica := range route.Serving.Replicas {
 		if replica.Member == 0 || replica.Node == (rafttransport.NodeID{}) ||
 			replica.Member == grant.TargetMember {
-			return result, ErrMembershipGrantInstall
+			return nil, ErrMembershipGrantInstall
 		}
 		roster[index] = membershipgrant.RosterMember{Member: replica.Member, Node: [16]byte(replica.Node)}
 		result[index] = replica.Node
@@ -128,15 +137,22 @@ func membershipGrantFanoutNodes(
 			grant.Group, grant.InitialReplicaSetVersion,
 			[3]membershipgrant.RosterMember{roster[0], roster[1], roster[2]},
 		) != grant.InitialRosterDigest {
-		return result, ErrMembershipGrantInstall
+		return nil, ErrMembershipGrantInstall
 	}
 	result[gateway.ServingReplicaCount] = route.EnrolledTarget.Node
 	for index := range result {
 		for prior := 0; prior < index; prior++ {
 			if result[index] == result[prior] {
-				return [MembershipGrantFanout]rafttransport.NodeID{}, ErrMembershipGrantInstall
+				return nil, ErrMembershipGrantInstall
 			}
 		}
 	}
-	return result, nil
+	// AddLearner is proposed before the enrolled target is a member of the
+	// group at all: it cannot yet run a membership-grant-control listener or
+	// hold the group authority an install requires. Only the current voters
+	// confirm the grant for this one action; see the ApplyMembership doc.
+	if kind == raftservice.MembershipAddLearner {
+		return result[:gateway.ServingReplicaCount], nil
+	}
+	return result[:], nil
 }

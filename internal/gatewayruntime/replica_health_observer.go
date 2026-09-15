@@ -53,10 +53,20 @@ func (observer gatewayAuthenticatedHealthObserver) ObserveReplicaHealth(
 	for _, endpoint := range route.Replicas {
 		endpoint := endpoint
 		go func() {
+			// No ExpectedReplicaSetVersion here: the certificate's version is the
+			// floor this probe must observe (checked below with >=), not an exact
+			// value to fence the wire request on. certificate.ReplicaSetVersion is
+			// frozen from the catalog cut at confirmation time; the live group can
+			// legitimately advance past it while an unrelated or already-scheduled
+			// move for this same suspect keeps progressing, well before the catalog
+			// is republished to match. Fencing the wire request on that frozen
+			// value would reject every future probe once that happens, since the
+			// live version can never regress back to it - permanently stranding
+			// health confirmation for this certificate. Mirrors the >= floor
+			// ObserveReplicaMove already uses for the same reason.
 			request := replicacontrol.Request{
 				Operation: operation, Step: step, Group: certificate.Group,
-				TargetMember:              endpoint.Member,
-				ExpectedReplicaSetVersion: certificate.ReplicaSetVersion,
+				TargetMember: endpoint.Member,
 			}
 			cut, err := observer.client.Observe(ctx, endpoint.Node, request)
 			results <- gatewayHealthObservationResult{
@@ -75,7 +85,7 @@ func (observer gatewayAuthenticatedHealthObserver) ObserveReplicaHealth(
 		}
 		cut := observed.observation
 		if cut.Status.MemberID != observed.member || cut.Status.Term != certificate.LeaderTerm ||
-			cut.Publication.ReplicaSetVersion != certificate.ReplicaSetVersion ||
+			cut.Publication.ReplicaSetVersion < certificate.ReplicaSetVersion ||
 			cut.Publication.Applied < certificate.CommitIndex {
 			failures = errors.Join(failures, errGatewayReplicaHealth)
 			continue
