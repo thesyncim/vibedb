@@ -57,8 +57,10 @@ func newScalingOperatorBackend(directory gateway.DirectoryReader, writer gateway
 }
 
 // ExecuteClusterControl implements the wire operation contract.  Mutating
-// work is detached from the client connection with context.WithoutCancel;
-// WaitMillis is applied only to a subsequent observation pass.
+// submission is detached from the client connection so a lost response does
+// not strand a durable intent; read-only requests and the optional observation
+// pass retain the caller's cancellation and deadline.  Cancelling --wait
+// therefore ends only that wait and never rolls back the submitted intent.
 func (backend *ScalingOperatorBackend) ExecuteClusterControl(ctx context.Context, request clustercontrol.Request) clustercontrol.Response {
 	response := clustercontrol.Response{Format: clustercontrol.Format, Op: request.Op,
 		RequestID: request.RequestID, OK: false}
@@ -66,22 +68,21 @@ func (backend *ScalingOperatorBackend) ExecuteClusterControl(ctx context.Context
 		response.Error = "invalid cluster control request"
 		return response
 	}
-	durable := context.WithoutCancel(ctx)
 	var operation [32]byte
 	var err error
 	switch request.Op {
 	case clustercontrol.OpNodes:
-		return backend.nodesResponse(durable, response)
-	case clustercontrol.OpJoin:
-		operation, err = backend.submitJoin(durable, request)
-	case clustercontrol.OpRebalance:
-		operation, err = backend.submitRebalance(durable, request)
-	case clustercontrol.OpDecommission:
-		operation, err = backend.submitDecommission(durable, request)
+		return backend.nodesResponse(ctx, response)
 	case clustercontrol.OpStatus:
 		if operation, err = decodeClusterOperationID(request.OperationID); err == nil {
-			return backend.observeResponse(durable, response, operation, request.WaitMillis)
+			return backend.observeResponse(ctx, response, operation, request.WaitMillis)
 		}
+	case clustercontrol.OpJoin:
+		operation, err = backend.submitJoin(context.WithoutCancel(ctx), request)
+	case clustercontrol.OpRebalance:
+		operation, err = backend.submitRebalance(context.WithoutCancel(ctx), request)
+	case clustercontrol.OpDecommission:
+		operation, err = backend.submitDecommission(context.WithoutCancel(ctx), request)
 	default:
 		err = errors.New("unsupported cluster control operation")
 	}
@@ -92,7 +93,7 @@ func (backend *ScalingOperatorBackend) ExecuteClusterControl(ctx context.Context
 	response.OK = true
 	response.OperationID = hex.EncodeToString(operation[:])
 	if request.WaitMillis != 0 {
-		return backend.observeResponse(durable, response, operation, request.WaitMillis)
+		return backend.observeResponse(ctx, response, operation, request.WaitMillis)
 	}
 	response.State = "reserved"
 	return response
