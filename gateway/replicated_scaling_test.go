@@ -999,6 +999,16 @@ func TestReplicatedScalingFrontendProofBlocksAndThenAllowsRetirement(t *testing.
 	if err != nil || retired.Lifecycle != NodeDecommissioned {
 		t.Fatalf("frontend-safe retirement did not persist: %+v err=%v", retired, err)
 	}
+	if _, err := authority.ScanNodeReferences(ctx, active.NodeID, active.Incarnation); !errors.Is(err, ErrReplicatedCatalogConflict) {
+		t.Fatalf("ordinary terminal scan unexpectedly required the retired frontend revision: %v", err)
+	}
+	terminal, err := authority.ScanDecommissionedNodeReferences(ctx, active.NodeID, active.Incarnation)
+	if err != nil {
+		t.Fatalf("offline terminal scan rejected the committed retirement proof: %v", err)
+	}
+	if !terminal.ZeroAllReferences() || terminal.GatewayParticipantRefs != 0 {
+		t.Fatalf("offline terminal scan did not retain fresh zero-reference proof: %+v", terminal)
+	}
 	scanner.mu.Lock()
 	calls := scanner.callCount
 	scanner.mu.Unlock()

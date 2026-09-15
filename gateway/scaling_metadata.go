@@ -246,6 +246,32 @@ type NodeReferenceEvidence struct {
 	Digest                    replication.Digest
 }
 
+// HasRetirementProof reports whether a terminal node record carries the CAS
+// witness written by RetireNode. The per-node revision stored in the witness
+// is the predecessor revision; the terminal record is its single successor.
+func (record NodeRecord) HasRetirementProof() bool {
+	return record.Lifecycle == NodeDecommissioned &&
+		record.RetirementScanDigest != (replication.Digest{}) &&
+		record.RetirementScanDirectoryRevision != 0 &&
+		record.RetirementScanCutRevision != 0 &&
+		record.Revision == record.RetirementScanDirectoryRevision+1
+}
+
+// MatchesRetirementEvidence binds the full pre-transition evidence retained by
+// a scaling intent to the terminal node record. RetiredAcknowledged is left to
+// the terminal lifecycle transition, so a witness captured immediately before
+// RetireNode may still have that flag clear.
+func (record NodeRecord) MatchesRetirementEvidence(evidence SafeToStopEvidence) bool {
+	return record.HasRetirementProof() && evidence.NodeID == record.NodeID &&
+		evidence.NodeIncarnation == record.Incarnation &&
+		evidence.ScanCatalogGeneration == record.CatalogGeneration &&
+		evidence.ScanDirectoryRevision == record.RetirementScanCutRevision &&
+		evidence.Digest == record.RetirementScanDigest &&
+		evidence.SafeForDataEvacuation() && evidence.CatalogVoters == 0 &&
+		evidence.ControlVoters == 0 && evidence.GatewayParticipants == 0 &&
+		evidence.CatalogControlMigrated
+}
+
 // GatewayParticipantEvidence is supplied by the live gateway participant
 // directory. A physical NodeRecord's Gateway role is a capability, not proof
 // that a frontend session is still serving; the scanner must report the
@@ -1021,6 +1047,14 @@ type NodeDirectoryCutReader interface {
 // bits alone.
 type GatewayParticipantScanner interface {
 	ScanGatewayParticipant(context.Context, NodeRecord) (GatewayParticipantEvidence, error)
+}
+
+// TerminalNodeReferenceScanner reads a fresh catalog/reference cut for a
+// decommissioned node. Its gateway admission proof is the committed
+// pre-transition retirement witness, so the retired process need not still be
+// running to answer a live participant scan.
+type TerminalNodeReferenceScanner interface {
+	ScanDecommissionedNodeReferences(context.Context, rafttransport.NodeID, uint64) (NodeReferenceEvidence, error)
 }
 
 // DirectoryWriter performs all transitions through replicated CAS.  An

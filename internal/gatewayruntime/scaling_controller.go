@@ -672,8 +672,8 @@ func (controller *ScalingController) reconcileRetirement(ctx context.Context, in
 	if err != nil {
 		return false, err
 	}
-	if node.Lifecycle == gateway.NodeDecommissioned {
-		evidence, scanErr := controller.directory.ScanNodeReferences(ctx, node.NodeID, node.Incarnation)
+	if node.HasRetirementProof() {
+		evidence, scanErr := controller.scanRetirementReferences(ctx, node)
 		if scanErr != nil {
 			return false, scanErr
 		}
@@ -730,6 +730,17 @@ func (controller *ScalingController) reconcileRetirement(ctx context.Context, in
 	return controller.completeIntent(ctx, intent, &node)
 }
 
+func (controller *ScalingController) scanRetirementReferences(
+	ctx context.Context, node gateway.NodeRecord,
+) (gateway.NodeReferenceEvidence, error) {
+	if node.HasRetirementProof() {
+		if scanner, ok := controller.directory.(gateway.TerminalNodeReferenceScanner); ok {
+			return scanner.ScanDecommissionedNodeReferences(ctx, node.NodeID, node.Incarnation)
+		}
+	}
+	return controller.directory.ScanNodeReferences(ctx, node.NodeID, node.Incarnation)
+}
+
 func (controller *ScalingController) recordRetirementScan(ctx context.Context, intent gateway.ScalingIntent, prior gateway.SafeToStopEvidence, blockers []gateway.ScalingBlocker) error {
 	next := intent
 	next.Blockers = slices.Clone(blockers)
@@ -751,7 +762,13 @@ func (controller *ScalingController) completeIntent(ctx context.Context, intent 
 		// current reference cut. Re-scan here even when the planner returned no
 		// moves; a concurrent catalog publication must turn completion into a
 		// retry rather than a false safe-to-stop result.
-		reference, err := controller.directory.ScanNodeReferences(ctx, intent.Request.Drain.NodeID, intent.Request.Drain.Incarnation)
+		var reference gateway.NodeReferenceEvidence
+		var err error
+		if intent.Request.Kind == gateway.ScalingDecommission && node != nil && node.Lifecycle == gateway.NodeDecommissioned {
+			reference, err = controller.scanRetirementReferences(ctx, *node)
+		} else {
+			reference, err = controller.directory.ScanNodeReferences(ctx, intent.Request.Drain.NodeID, intent.Request.Drain.Incarnation)
+		}
 		if err != nil {
 			return false, err
 		}

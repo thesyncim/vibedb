@@ -753,6 +753,36 @@ retryCut:
 }
 
 func (authority *ReplicatedCatalogAuthority) ScanNodeReferences(ctx context.Context, node rafttransport.NodeID, incarnation uint64) (NodeReferenceEvidence, error) {
+	return authority.scanNodeReferences(ctx, node, incarnation, true)
+}
+
+// ScanDecommissionedNodeReferences returns a fresh catalog/reference cut for
+// a terminal node. RetireNode already committed the gateway admission proof
+// against the prior Draining record; requiring the retired process to answer
+// again would compare that revision-2 acknowledgement with its revision-3
+// successor and make an offline terminal node impossible to observe.
+func (authority *ReplicatedCatalogAuthority) ScanDecommissionedNodeReferences(
+	ctx context.Context, node rafttransport.NodeID, incarnation uint64,
+) (NodeReferenceEvidence, error) {
+	if authority == nil || ctx == nil || node == (rafttransport.NodeID{}) || incarnation == 0 {
+		return NodeReferenceEvidence{}, ErrInvalidScalingMetadata
+	}
+	record, err := authority.ReadNode(ctx, node, incarnation)
+	if err != nil {
+		return NodeReferenceEvidence{}, err
+	}
+	if !record.HasRetirementProof() {
+		return NodeReferenceEvidence{}, ErrScalingState
+	}
+	// The terminal record's durable witness is the authority for the retired
+	// gateway process. The remaining fields are recomputed from a current
+	// catalog cut below, so references published after retirement still block.
+	return authority.scanNodeReferences(ctx, node, incarnation, false)
+}
+
+func (authority *ReplicatedCatalogAuthority) scanNodeReferences(
+	ctx context.Context, node rafttransport.NodeID, incarnation uint64, includeGateway bool,
+) (NodeReferenceEvidence, error) {
 	if authority == nil || ctx == nil || node == (rafttransport.NodeID{}) || incarnation == 0 {
 		return NodeReferenceEvidence{}, ErrInvalidScalingMetadata
 	}
@@ -892,7 +922,7 @@ func (authority *ReplicatedCatalogAuthority) ScanNodeReferences(ctx context.Cont
 	hash.Write(evidence.EnrollmentDirectoryDigest[:])
 	hash.Write(evidence.OperationDirectoryDigest[:])
 	for _, record := range nodes {
-		if record.NodeID == node && record.Incarnation == incarnation && record.Roles&NodeRoleGateway != 0 {
+		if includeGateway && record.NodeID == node && record.Incarnation == incarnation && record.Roles&NodeRoleGateway != 0 {
 			if authority.gatewayParticipants == nil {
 				// A role bit is a capability only. Without an authenticated live
 				// participant cut, conservatively keep the node referenced.
@@ -1276,13 +1306,19 @@ func (authority *ReplicatedCatalogAuthority) validateScalingCompletion(ctx conte
 	if intent.Request.Kind != ScalingScaleIn && intent.Request.Kind != ScalingDecommission {
 		return nil
 	}
-	reference, scanErr := authority.ScanNodeReferences(ctx, intent.Request.Drain.NodeID, intent.Request.Drain.Incarnation)
-	if scanErr != nil || !intent.Evidence.MatchesReference(reference) {
-		return errors.Join(scanErr, ErrScalingRevision)
-	}
 	node, nodeErr := authority.ReadNode(ctx, intent.Request.Drain.NodeID, intent.Request.Drain.Incarnation)
 	if nodeErr != nil {
 		return nodeErr
+	}
+	var reference NodeReferenceEvidence
+	var scanErr error
+	if intent.Request.Kind == ScalingDecommission && node.Lifecycle == NodeDecommissioned {
+		reference, scanErr = authority.ScanDecommissionedNodeReferences(ctx, node.NodeID, node.Incarnation)
+	} else {
+		reference, scanErr = authority.ScanNodeReferences(ctx, node.NodeID, node.Incarnation)
+	}
+	if scanErr != nil || !intent.Evidence.MatchesReference(reference) {
+		return errors.Join(scanErr, ErrScalingRevision)
 	}
 	if intent.Request.Kind == ScalingScaleIn {
 		if !intent.Evidence.SafeForDataEvacuation() ||

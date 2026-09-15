@@ -164,6 +164,52 @@ func TestScalingStateMachinesRejectTerminalCreationAndGenericRetirement(t *testi
 	}
 }
 
+func TestTerminalRetirementProofBindsPredecessorWitness(t *testing.T) {
+	record := scalingTestNodeRecord(rafttransport.NodeID{0x41}, 7, NodeDecommissioned, 3)
+	record.RetirementScanDigest = replication.Digest{0x91}
+	record.RetirementScanDirectoryRevision = 2
+	record.RetirementScanCutRevision = 11
+	if !record.Valid() || !record.HasRetirementProof() {
+		t.Fatalf("terminal record did not retain a valid predecessor proof: %+v", record)
+	}
+	witness := SafeToStopEvidence{
+		NodeID: record.NodeID, NodeIncarnation: record.Incarnation,
+		ScanCatalogGeneration: record.CatalogGeneration, ScanDirectoryRevision: record.RetirementScanCutRevision,
+		ScanDirectoryDigest: replication.Digest{1}, CatalogHeadDigest: replication.Digest{2},
+		ScalingDirectoryDigest: replication.Digest{3}, EnrollmentDirectoryDigest: replication.Digest{4},
+		OperationDirectoryDigest: replication.Digest{5}, Digest: record.RetirementScanDigest,
+		DrainAcknowledged: true, CatalogControlMigrated: true,
+	}
+	if !record.MatchesRetirementEvidence(witness) {
+		t.Fatalf("valid pre-transition witness was rejected: record=%+v witness=%+v", record, witness)
+	}
+	for _, test := range []struct {
+		name string
+		edit func(*SafeToStopEvidence)
+	}{
+		{name: "foreign node", edit: func(value *SafeToStopEvidence) { value.NodeID[0]++ }},
+		{name: "foreign incarnation", edit: func(value *SafeToStopEvidence) { value.NodeIncarnation++ }},
+		{name: "successor generation", edit: func(value *SafeToStopEvidence) { value.ScanCatalogGeneration++ }},
+		{name: "stale cut", edit: func(value *SafeToStopEvidence) { value.ScanDirectoryRevision++ }},
+		{name: "foreign digest", edit: func(value *SafeToStopEvidence) { value.Digest[0]++ }},
+		{name: "serving reference", edit: func(value *SafeToStopEvidence) { value.ServingReplicas = 1 }},
+		{name: "missing drain proof", edit: func(value *SafeToStopEvidence) { value.DrainAcknowledged = false }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := witness
+			test.edit(&candidate)
+			if record.MatchesRetirementEvidence(candidate) {
+				t.Fatalf("mutated retirement witness was accepted: %+v", candidate)
+			}
+		})
+	}
+	invalidSuccessor := record
+	invalidSuccessor.Revision++
+	if invalidSuccessor.HasRetirementProof() {
+		t.Fatal("terminal proof accepted a successor that skipped the committed predecessor revision")
+	}
+}
+
 func TestNodeSnapshotAddressPromotionBindsTheExistingPhysicalIdentity(t *testing.T) {
 	joining := scalingTestNodeRecord([16]byte{0x31}, 1, NodeJoining, 1)
 	active := joining

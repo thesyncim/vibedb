@@ -2,6 +2,7 @@ package gatewayruntime
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -12,9 +13,11 @@ import (
 
 type terminalStatusDirectory struct {
 	gateway.DirectoryReader
-	intent   gateway.ScalingIntent
-	node     gateway.NodeRecord
-	evidence gateway.NodeReferenceEvidence
+	intent           gateway.ScalingIntent
+	node             gateway.NodeRecord
+	evidence         gateway.NodeReferenceEvidence
+	terminalEvidence *gateway.NodeReferenceEvidence
+	scanErr          error
 }
 
 func (directory *terminalStatusDirectory) ListNodes(context.Context) ([]gateway.NodeRecord, error) {
@@ -34,13 +37,53 @@ func (directory *terminalStatusDirectory) ListEnrollmentIntents(context.Context,
 }
 
 func (directory *terminalStatusDirectory) ScanNodeReferences(context.Context, rafttransport.NodeID, uint64) (gateway.NodeReferenceEvidence, error) {
+	if directory.scanErr != nil {
+		return gateway.NodeReferenceEvidence{}, directory.scanErr
+	}
 	return directory.evidence, nil
+}
+
+func (directory *terminalStatusDirectory) ScanDecommissionedNodeReferences(context.Context, rafttransport.NodeID, uint64) (gateway.NodeReferenceEvidence, error) {
+	if directory.terminalEvidence == nil {
+		return gateway.NodeReferenceEvidence{}, errors.New("retired frontend is offline")
+	}
+	return *directory.terminalEvidence, nil
 }
 
 type terminalStatusCatalog struct{}
 
 func (terminalStatusCatalog) Read(context.Context) (*gateway.Snapshot, error) {
 	return &gateway.Snapshot{}, nil
+}
+
+func TestClusterControlStatusUsesCommittedTerminalCutWhenFrontendIsOffline(t *testing.T) {
+	nodeID := rafttransport.NodeID{3}
+	request := gateway.ScalingIntentRequest{Kind: gateway.ScalingDecommission, RequestID: [32]byte{4},
+		Drain: gateway.NodeReference{NodeID: nodeID, Incarnation: 1}, MaxMoves: 1}
+	intent := gateway.ScalingIntent{ID: request.ID(), Request: request, CatalogGeneration: 7,
+		Revision: 2, DirectoryRevision: 2, State: gateway.ScalingComplete}
+	fresh := gateway.NodeReferenceEvidence{NodeID: nodeID, Incarnation: 1,
+		CatalogGeneration: 8, DirectoryRevision: 3, DirectoryCutRevision: 4,
+		DirectoryCutDigest: [32]byte{7}, CatalogHeadDigest: [32]byte{8},
+		ScalingDirectoryDigest: [32]byte{9}, EnrollmentDirectoryDigest: [32]byte{10},
+		OperationDirectoryDigest: [32]byte{11}, Digest: [32]byte{12}}
+	directory := &terminalStatusDirectory{intent: intent,
+		node: gateway.NodeRecord{NodeID: nodeID, Incarnation: 1, Lifecycle: gateway.NodeDecommissioned,
+			Revision: 3, CatalogGeneration: 7, RetirementScanDigest: [32]byte{6},
+			RetirementScanDirectoryRevision: 2, RetirementScanCutRevision: 3},
+		terminalEvidence: &fresh, scanErr: errors.New("retired frontend is offline")}
+	backend := &ScalingOperatorBackend{directory: directory, catalog: terminalStatusCatalog{}}
+
+	response := backend.observeOnce(context.Background(), clustercontrol.Response{}, intent.ID)
+	if !response.SafeToStop || response.RetiringReferences != 0 || len(response.Blockers) != 0 {
+		t.Fatalf("committed terminal cut was not used for offline frontend: response=%+v", response)
+	}
+
+	directory.terminalEvidence = nil
+	response = backend.observeOnce(context.Background(), clustercontrol.Response{}, intent.ID)
+	if response.SafeToStop || len(response.Blockers) == 0 || response.Blockers[len(response.Blockers)-1].Code != "retirement_scan_unavailable" {
+		t.Fatalf("offline terminal scan failure was not surfaced: response=%+v", response)
+	}
 }
 
 func TestClusterControlStatusUsesFreshTerminalProof(t *testing.T) {

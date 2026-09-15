@@ -301,7 +301,8 @@ func (backend *ScalingOperatorBackend) observeOnce(ctx context.Context, response
 	if intent.Request.Kind == gateway.ScalingScaleIn || intent.Request.Kind == gateway.ScalingDecommission {
 		node, nodeErr := backend.directory.ReadNode(ctx, intent.Request.Drain.NodeID, intent.Request.Drain.Incarnation)
 		if nodeErr == nil {
-			if evidence, scanErr := backend.directory.ScanNodeReferences(ctx, node.NodeID, node.Incarnation); scanErr == nil {
+			evidence, scanErr := backend.scanReferenceEvidence(ctx, intent, node)
+			if scanErr == nil {
 				fresh := scalingEvidenceFromNode(evidence)
 				response.Evidence = clusterEvidence(fresh)
 				response.RetiringReferences = nodeReferenceCount(evidence)
@@ -331,6 +332,12 @@ func (backend *ScalingOperatorBackend) observeOnce(ctx context.Context, response
 				if response.SafeToStop && evidence.ZeroAllReferences() {
 					response.Blockers = nil
 				}
+			} else {
+				response.SafeToStop = false
+				response.Blockers = append(response.Blockers, clustercontrol.Blocker{
+					Code: "retirement_scan_unavailable", Detail: boundedClusterControlError(scanErr),
+					NodeID: nodeIDHex(node.NodeID), NodeIncarnation: node.Incarnation, Revision: node.Revision,
+				})
 			}
 			if intent.Request.Kind == gateway.ScalingDecommission {
 				response.State = lifecycleName(node.Lifecycle)
@@ -490,6 +497,17 @@ func nodeReferenceCount(evidence gateway.NodeReferenceEvidence) uint32 {
 	return evidence.ServingReplicas + evidence.LearnerReplicas + evidence.EnrolledTargets +
 		evidence.OutstandingMoves + evidence.CatalogVoterReferences + evidence.ControlVoterReferences +
 		evidence.GatewayParticipantRefs
+}
+
+func (backend *ScalingOperatorBackend) scanReferenceEvidence(
+	ctx context.Context, intent gateway.ScalingIntent, node gateway.NodeRecord,
+) (gateway.NodeReferenceEvidence, error) {
+	if intent.Request.Kind == gateway.ScalingDecommission && node.HasRetirementProof() {
+		if scanner, ok := backend.directory.(gateway.TerminalNodeReferenceScanner); ok {
+			return scanner.ScanDecommissionedNodeReferences(ctx, node.NodeID, node.Incarnation)
+		}
+	}
+	return backend.directory.ScanNodeReferences(ctx, node.NodeID, node.Incarnation)
 }
 
 func (backend *ScalingOperatorBackend) nodeStatuses(ctx context.Context) ([]clustercontrol.NodeStatus, uint64, uint64) {
