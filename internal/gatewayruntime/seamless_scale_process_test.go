@@ -63,6 +63,12 @@ const (
 	seamlessScaleOfferedRate         = 1_200
 	seamlessScaleWorkloadConnections = 16
 	seamlessScaleOperationWait       = 750 * time.Millisecond
+	// cluster dev gives node zero the only autonomous topology controller.
+	// Keep the controller and the long-lived survivor gateway running while
+	// this qualification retires each physical node in turn.
+	seamlessScaleControllerIndex    = 0
+	seamlessScaleSurvivorIndex      = 1
+	seamlessScaleFirstRetiringIndex = 2
 )
 
 var seamlessScaleTables = []string{"scale_alpha", "scale_beta", "scale_gamma"}
@@ -905,7 +911,11 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 		}
 	})
 
-	const survivorIndex = 1
+	firstRetiringIndex := seamlessScaleInitialRetiringIndex(len(cluster.NodeManifests))
+	if firstRetiringIndex < 0 {
+		t.Fatalf("initial topology has no non-controller retiring node: %d", len(cluster.NodeManifests))
+	}
+	const survivorIndex = seamlessScaleSurvivorIndex
 	clusterProfile, err := servicetls.LoadProfile(cluster.ClientCertificate, cluster.ClientKey, cluster.Roots, fusedNodeProcessOID, time.Now)
 	if err != nil {
 		t.Fatalf("load traffic client profile: %v", err)
@@ -1063,7 +1073,7 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 			// Node zero is the controller owner for this direct process set.
 			// Restarting this process exercises durable operation recovery while
 			// the two survivor frontends and their sessions remain connected.
-			if err := physical.Restart(ctx, 0); err != nil {
+			if err := physical.Restart(ctx, seamlessScaleControllerIndex); err != nil {
 				t.Fatalf("cycle %d restart controller owner during enrollment migration: %v", cycle+1, err)
 			}
 			controllerRestarted = true
@@ -1121,7 +1131,7 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 
 		retireID := target.NodeID
 		if cycle == 0 {
-			retireID = initialNodeIDs[0]
+			retireID = initialNodeIDs[firstRetiringIndex]
 		} else {
 			retireID = emptyTargets[cycle-1].NodeID
 		}
@@ -1141,7 +1151,7 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 			// Open only after the isolated controller restart, per the witness
 			// contract. This connection must survive long enough to hold the
 			// exact frontend-session blocker.
-			retiringSQL, err = fusedOpenDDLWire(ctx, pgListens[0])
+			retiringSQL, err = fusedOpenDDLWire(ctx, pgListens[firstRetiringIndex])
 			if err != nil {
 				t.Fatalf("cycle %d open retiring SQL witness after restart: %v", cycle+1, err)
 			}
@@ -1215,7 +1225,7 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 		}
 
 		if cycle == 0 {
-			if err := physical.StopAt(ctx, 0); err != nil {
+			if err := physical.StopAt(ctx, firstRetiringIndex); err != nil {
 				t.Fatalf("cycle %d stop original node after safe_to_stop: %v", cycle+1, err)
 			}
 		} else {
@@ -1890,6 +1900,26 @@ func hasSeamlessScaleNode(response clustercontrol.Response, nodeID rafttransport
 		}
 	}
 	return false
+}
+
+func seamlessScaleInitialRetiringIndex(nodeCount int) int {
+	if nodeCount <= seamlessScaleFirstRetiringIndex {
+		return -1
+	}
+	return seamlessScaleFirstRetiringIndex
+}
+
+func TestSeamlessScaleInitialRetirementLeavesControllerAndSurvivor(t *testing.T) {
+	if got := seamlessScaleInitialRetiringIndex(3); got != 2 {
+		t.Fatalf("initial retiring index=%d, want 2", got)
+	}
+	if got := seamlessScaleInitialRetiringIndex(2); got >= 0 {
+		t.Fatalf("two-node topology selected retiring index %d", got)
+	}
+	if seamlessScaleFirstRetiringIndex == seamlessScaleControllerIndex ||
+		seamlessScaleFirstRetiringIndex == seamlessScaleSurvivorIndex {
+		t.Fatal("initial retiring node must differ from controller and long-lived survivor")
+	}
 }
 
 func hasSeamlessScaleServingNode(response clustercontrol.Response, nodeID rafttransport.NodeID) bool {
