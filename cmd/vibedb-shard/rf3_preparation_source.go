@@ -92,11 +92,11 @@ func newRF3PreparationSource(schemas *rf3SchemaActivator, registry *rafttranspor
 			return nil, fmt.Errorf("preparation source runtime binding differs from catalog: %w", nodecontrol.ErrStale)
 		}
 		publication := state.apply.Published()
-		profile, err := state.apply.CapacityQualificationProfile()
+		actual, err := currentRF3CommandFence(state.apply, state.identity, publication)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("preparation source current command fence: %w", err)
 		}
-		if actual := commandFenceFromPublication(profile.Binding.Authority, state.identity, publication.ReplicaSetVersion); actual != intent.ExpectedCommand {
+		if actual != intent.ExpectedCommand {
 			return nil, fmt.Errorf("preparation source command got=%+v want=%+v: %w", actual, intent.ExpectedCommand, nodecontrol.ErrStale)
 		}
 		if publication.ConfState == nil || len(publication.ConfState.Voters) != 3 || len(publication.ConfState.Learners) != 0 || len(publication.ConfState.VotersOutgoing) != 0 {

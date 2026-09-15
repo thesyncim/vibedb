@@ -811,7 +811,11 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		identity := runtime.Identity()
 		identities = append(identities, identity)
 		publications = append(publications, runtimePublication)
-		commands = append(commands, commandFenceFromPublication(item.base.Binding.Authority, identity, runtimePublication.ReplicaSetVersion))
+		command, commandErr := currentRF3CommandFence(item.apply, identity, runtimePublication)
+		if commandErr != nil {
+			return errors.Join(closeAdopted(fmt.Errorf("%w: group %d current command fence: %v", errRF3Serving, index, commandErr)), closePreparedRF3Groups(preparedSet.groups[index+1:], nil))
+		}
+		commands = append(commands, command)
 		readSources = append(readSources, item.apply)
 		recoverySources = append(recoverySources, item.apply)
 	}
@@ -2177,6 +2181,70 @@ func commandFenceFromPublication(
 		RelationManifestDigest: identity.RelationManifestDigest,
 		RoutingVersion:         authority.RoutingVersion, RouteGeneration: authority.RouteGeneration,
 	}
+}
+
+// currentRF3CommandFence derives the serving command from the machine's
+// authenticated durable fence. The SQL catalog binding remains the
+// immutable physical identity, while ownership and routing generations may
+// advance in the applied state after a membership or range transition.
+func currentRF3CommandFence(
+	apply *sqldriver.ReplicatedApply,
+	identity raftmember.RuntimeIdentity,
+	publication raftmodel.Publication,
+) (raftservice.CommandFence, error) {
+	if apply == nil {
+		return raftservice.CommandFence{}, errRF3Serving
+	}
+	profile, err := apply.CapacityQualificationProfile()
+	if err != nil {
+		return raftservice.CommandFence{}, err
+	}
+	livePublication, fence, err := apply.PublishedWithSnapshotAuthorizationFence()
+	if err != nil {
+		return raftservice.CommandFence{}, err
+	}
+	if livePublication.ReplicaSetVersion != publication.ReplicaSetVersion ||
+		!proto.Equal(livePublication.ConfState, publication.ConfState) {
+		return raftservice.CommandFence{}, fmt.Errorf("%w: live publication changed during command fence capture", errRF3Serving)
+	}
+	return commandFenceFromSnapshotFence(profile, fence, identity, livePublication)
+}
+
+func commandFenceFromSnapshotFence(
+	profile sqldriver.ReplicatedApplyCapacityProfile,
+	fence replicatedstate.SnapshotFence,
+	identity raftmember.RuntimeIdentity,
+	publication raftmodel.Publication,
+) (raftservice.CommandFence, error) {
+	if fence.ReplicaSetVersion != publication.ReplicaSetVersion ||
+		fence.RelationManifestDigest != profile.RelationManifestDigest ||
+		fence.RelationManifestDigest != identity.RelationManifestDigest ||
+		!rf3CurrentFenceMatchesProfile(fence.Binding, profile.Binding, identity) {
+		return raftservice.CommandFence{}, fmt.Errorf("%w: live applied fence differs from immutable profile", errRF3Serving)
+	}
+	authority := profile.Binding.Authority
+	authority.ActivePolicyGeneration = fence.Binding.ActivePolicyGeneration
+	authority.ProtectionEpoch = fence.Binding.ProtectionEpoch
+	authority.OwnershipEpoch = fence.Binding.OwnershipEpoch
+	authority.SchemaGeneration = fence.Binding.SchemaGeneration
+	authority.RoutingVersion = fence.Binding.RoutingVersion
+	authority.RouteGeneration = fence.Binding.RouteGeneration
+	return commandFenceFromPublication(authority, identity, fence.ReplicaSetVersion), nil
+}
+
+func rf3CurrentFenceMatchesProfile(
+	current replicatedstate.Binding,
+	expected sqldriver.ReplicatedShardStoreBinding,
+	identity raftmember.RuntimeIdentity,
+) bool {
+	return current.ClusterID == replication.ID128(expected.ClusterID) &&
+		current.ClusterIncarnation == replication.ID128(expected.ClusterIncarnation) &&
+		current.TopologyRecoveryEpoch == expected.TopologyRecoveryEpoch &&
+		current.Distribution == expected.Distribution && current.Shard == expected.Shard &&
+		current.AllocationGeneration == expected.AllocationGeneration &&
+		current.ShardIncarnation == replication.ID128(expected.ShardIncarnation) &&
+		current.GroupID == replication.ID128(expected.GroupID) &&
+		identity.MemberID == expected.MemberID && identity.StoreID == expected.StoreID
 }
 
 func rf3RegistryLimits() raftserve.Limits {

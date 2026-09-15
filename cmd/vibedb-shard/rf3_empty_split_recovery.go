@@ -72,7 +72,10 @@ func recoverRF3EmptySplitChildren(ctx context.Context, runtime *rf3EmptyNodeRunt
 		if err != nil {
 			return errors.Join(err, adopted.Close())
 		}
-		command := commandFenceFromPublication(metadata.base.Binding.Authority, identity, publication.ReplicaSetVersion)
+		command, err := currentRF3CommandFence(metadata.apply, identity, publication)
+		if err != nil {
+			return errors.Join(err, adopted.Close())
+		}
 		if err = runtime.RegisterExecutionGroupWithGrant(roster, raftservice.ExecutionGroup{
 			Runtime: adopted, Identity: identity, Command: command, Read: metadata.apply, Recovery: metadata.apply,
 		}, grant); err != nil {

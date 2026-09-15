@@ -820,6 +820,25 @@ func TestReplicatedApplyOwnershipTransitionReopensThroughWriteOnceBinding(t *tes
 		state.Binding.OwnedRange != retained {
 		t.Fatalf("transitioned SQL state = %+v", state.Binding)
 	}
+	profile, err := claim.CapacityQualificationProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.Binding.Authority.OwnershipEpoch != binding.OwnershipEpoch ||
+		profile.Binding.Authority.RoutingVersion != binding.RoutingVersion ||
+		profile.Binding.Authority.RouteGeneration != binding.RouteGeneration {
+		t.Fatalf("immutable profile unexpectedly changed after transition: %+v", profile.Binding.Authority)
+	}
+	authorityFence, err := claim.SnapshotAuthorizationFence()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorityFence.ReplicaSetVersion != state.ReplicaSetVersion ||
+		authorityFence.Binding.OwnershipEpoch != state.Binding.OwnershipEpoch ||
+		authorityFence.Binding.RoutingVersion != state.Binding.RoutingVersion ||
+		authorityFence.Binding.RouteGeneration != state.Binding.RouteGeneration {
+		t.Fatalf("live authority fence = %+v, want transitioned state %+v", authorityFence, state.Binding)
+	}
 	advanced := base.Clone()
 	advanced.Binding.Authority.OwnershipEpoch = state.Binding.OwnershipEpoch
 	advanced.Binding.Authority.RoutingVersion = state.Binding.RoutingVersion

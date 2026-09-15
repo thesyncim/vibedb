@@ -333,7 +333,10 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 			return item.close(err)
 		}
 		identity := runtime.Identity()
-		command := commandFenceFromPublication(item.base.Binding.Authority, identity, item.publication.ReplicaSetVersion)
+		command, err := currentRF3CommandFence(item.apply, identity, item.publication)
+		if err != nil {
+			return errors.Join(err, runtime.Close())
+		}
 		if err := ctx.Err(); err != nil {
 			return errors.Join(err, runtime.Close())
 		}

@@ -24,6 +24,10 @@ func TestReplicatedSnapshotAuthorizationFenceFollowsApplyAndFailsClosed(t *testi
 	if err != nil || before.ReplicaSetVersion != 1 {
 		t.Fatalf("bootstrap fence: %+v %v", before, err)
 	}
+	combinedPublication, combinedFence, err := claim.PublishedWithSnapshotAuthorizationFence()
+	if err != nil || combinedPublication.ReplicaSetVersion != before.ReplicaSetVersion || combinedFence != before {
+		t.Fatalf("combined bootstrap publication/fence: %+v/%+v %v", combinedPublication, combinedFence, err)
+	}
 	if _, err := claim.ApplyConfiguration(raftmodel.ApplyMeta{Index: 2, Term: 2, Type: pb.EntryConfChange},
 		&pb.ConfState{Voters: []uint64{1}, Learners: []uint64{4}}); err != nil {
 		t.Fatal(err)
