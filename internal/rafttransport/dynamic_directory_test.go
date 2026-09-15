@@ -249,6 +249,48 @@ func TestNewEmptyRegistryEnrollsPeerBeforeDynamicGroupInstall(t *testing.T) {
 	}
 }
 
+func TestEnrollPeerRefreshesMonotonicDirectoryRevisionWithoutRotatingGrant(t *testing.T) {
+	group := testGroup(200)
+	domain := TrustDomain{ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation}
+	local, remote := testNode(1), testNode(2)
+	registry, err := NewEmptyRegistry(local, domain, Limits{MaxGroups: 1, MaxMembers: 4, MaxPeers: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := dynamicPeerIntent(registry, remote, 1, raftmember.GroupKey{}, 0, [32]byte{})
+	if err := registry.EnrollPeer(first, EnrollmentVerifierFunc(allowEnrollment)); err != nil {
+		t.Fatalf("initial physical enrollment: %v", err)
+	}
+	prior, err := registry.PhysicalPeer(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := dynamicPeerIntent(registry, remote, 2, raftmember.GroupKey{}, 0, [32]byte{})
+	updated.Peer.Revision = prior.Revision + 1
+	updated.DirectoryRevision = registry.PeerDirectoryRevision()
+	if err := registry.EnrollPeer(updated, EnrollmentVerifierFunc(allowEnrollment)); err != nil {
+		t.Fatalf("monotonic physical revision refresh: %v", err)
+	}
+	refreshed, err := registry.PhysicalPeer(remote)
+	if err != nil || refreshed.Revision != updated.Peer.Revision ||
+		refreshed.EnrollmentDigest != prior.EnrollmentDigest {
+		t.Fatalf("refreshed physical peer=%+v err=%v", refreshed, err)
+	}
+
+	stale := updated
+	stale.Peer.Revision = prior.Revision
+	stale.DirectoryRevision = registry.PeerDirectoryRevision()
+	if err := registry.EnrollPeer(stale, EnrollmentVerifierFunc(allowEnrollment)); !errors.Is(err, ErrPeerConflict) {
+		t.Fatalf("stale physical revision error=%v, want ErrPeerConflict", err)
+	}
+	changedEndpoint := updated
+	changedEndpoint.Peer.Endpoint = "127.0.0.1:25999"
+	changedEndpoint.DirectoryRevision = registry.PeerDirectoryRevision()
+	if err := registry.EnrollPeer(changedEndpoint, EnrollmentVerifierFunc(allowEnrollment)); !errors.Is(err, ErrPeerConflict) {
+		t.Fatalf("changed physical endpoint error=%v, want ErrPeerConflict", err)
+	}
+}
+
 func TestEmptyRegistryRestoresCertifiedLocalIncarnation(t *testing.T) {
 	group := testGroup(206)
 	domain := TrustDomain{ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation}

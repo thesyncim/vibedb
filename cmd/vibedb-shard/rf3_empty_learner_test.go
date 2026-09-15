@@ -60,13 +60,53 @@ func TestRF3EnrollCertifiedRosterPeersPublishesDirectory(t *testing.T) {
 	if err := rf3EnrollCertifiedRosterPeers(context.Background(), registry, registry, spec, secondCertificate, domain); err != nil {
 		t.Fatalf("shared peers from another group: %v", err)
 	}
+	priorPeer, err := registry.PhysicalPeer(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorEnrollmentDigest := priorPeer.EnrollmentDigest
 	if registry.PeerDirectoryRevision() != before {
 		t.Fatal("unchanged physical peers advanced the directory revision")
 	}
+	// A source can remain the same authenticated physical peer while its
+	// committed directory revision advances during draining. The empty target
+	// must refresh that monotone revision before replaying the roster; rejecting
+	// it strands a valid bootstrap behind a stale physical-directory cut.
+	updatedSpec := spec
+	updatedSpec.InitialVoters[0].NodeRevision++
+	if err := rf3EnrollCertifiedRosterPeersFiltered(
+		context.Background(), registry, registry, updatedSpec, secondCertificate, domain,
+		func(rafttransport.NodeID) bool { return true },
+	); err != nil {
+		t.Fatalf("authenticated newer source directory revision: %v", err)
+	}
+	updatedPeer, err := registry.PhysicalPeer(remote)
+	if err != nil || updatedPeer.Revision != updatedSpec.InitialVoters[0].NodeRevision ||
+		updatedPeer.EnrollmentDigest != priorEnrollmentDigest {
+		t.Fatalf("updated source directory revision peer=%+v err=%v", updatedPeer, err)
+	}
+	if err := rf3EnrollCertifiedRosterPeersFiltered(
+		context.Background(), registry, registry, spec, secondCertificate, domain,
+		func(rafttransport.NodeID) bool { return true },
+	); !errors.Is(err, rafttransport.ErrPeerConflict) {
+		t.Fatalf("stale source directory revision replay error = %v, want ErrPeerConflict", err)
+	}
 	changedSpec := spec
 	changedSpec.InitialVoters[0].ServiceKeyDigest = replication.Digest{42}
-	if err := rf3EnrollCertifiedRosterPeers(context.Background(), registry, registry, changedSpec, secondCertificate, domain); !errors.Is(err, rafttransport.ErrPeerConflict) {
+	changedSpec.InitialVoters[0].NodeRevision = updatedSpec.InitialVoters[0].NodeRevision
+	if err := rf3EnrollCertifiedRosterPeersFiltered(
+		context.Background(), registry, registry, changedSpec, secondCertificate, domain,
+		func(rafttransport.NodeID) bool { return true },
+	); !errors.Is(err, rafttransport.ErrPeerConflict) {
 		t.Fatalf("changed physical key reused old enrollment: %v", err)
+	}
+	changedEndpoint := updatedSpec
+	changedEndpoint.InitialVoters[0].PeerAddress = "127.0.0.1:21999"
+	if err := rf3EnrollCertifiedRosterPeersFiltered(
+		context.Background(), registry, registry, changedEndpoint, secondCertificate, domain,
+		func(rafttransport.NodeID) bool { return true },
+	); !errors.Is(err, rafttransport.ErrPeerConflict) {
+		t.Fatalf("changed physical endpoint reused old enrollment: %v", err)
 	}
 	for _, voter := range spec.InitialVoters {
 		peer, lookupErr := registry.PhysicalPeer(voter.Node)

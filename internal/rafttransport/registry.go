@@ -791,6 +791,16 @@ func samePhysicalIdentity(left, right PhysicalPeer) bool {
 		left.Endpoint == right.Endpoint && left.State == right.State
 }
 
+// samePhysicalBinding is the immutable authenticated endpoint binding. A
+// control-directory revision may advance while the process incarnation,
+// service key, and listener address remain unchanged.
+func samePhysicalBinding(left, right PhysicalPeer) bool {
+	return left.NodeID == right.NodeID && left.TrustDomain == right.TrustDomain &&
+		left.Incarnation == right.Incarnation &&
+		left.ServiceKeyDigest == right.ServiceKeyDigest &&
+		left.Endpoint == right.Endpoint && left.State == right.State
+}
+
 func samePhysicalPrincipal(left, right PhysicalPeer) bool {
 	return left.NodeID == right.NodeID && left.TrustDomain == right.TrustDomain &&
 		left.Incarnation == right.Incarnation && left.Revision == right.Revision &&
@@ -800,6 +810,27 @@ func samePhysicalPrincipal(left, right PhysicalPeer) bool {
 		// incarnation/revision; rotation must publish a fresh physical record.
 		(left.ServiceKeyDigest == right.ServiceKeyDigest ||
 			left.ServiceKeyDigest == ([sha256.Size]byte{}))
+}
+
+// physicalPeerConflictContext retains the sentinel error while exposing the
+// non-secret identity fields needed to diagnose a stale remote directory cut.
+// Service-key and enrollment-digest values are intentionally represented only
+// by equality booleans; neither digest is safe to put in a process log.
+func physicalPeerConflictContext(
+	reason string,
+	existing, candidate PhysicalPeer,
+	intentRevision, currentRevision uint64,
+) error {
+	return fmt.Errorf(
+		"%w: %s node=%x existing_incarnation=%d candidate_incarnation=%d existing_revision=%d candidate_revision=%d existing_endpoint=%q candidate_endpoint=%q intent_directory_revision=%d current_directory_revision=%d same_domain=%t same_node=%t same_incarnation=%t same_revision=%t same_service_key=%t same_endpoint=%t same_state=%t same_enrollment_digest=%t",
+		ErrPeerConflict, reason, candidate.NodeID[:], existing.Incarnation, candidate.Incarnation,
+		existing.Revision, candidate.Revision, existing.Endpoint, candidate.Endpoint,
+		intentRevision, currentRevision, existing.TrustDomain == candidate.TrustDomain,
+		existing.NodeID == candidate.NodeID, existing.Incarnation == candidate.Incarnation,
+		existing.Revision == candidate.Revision, existing.ServiceKeyDigest == candidate.ServiceKeyDigest,
+		existing.Endpoint == candidate.Endpoint, existing.State == candidate.State,
+		existing.EnrollmentDigest == candidate.EnrollmentDigest,
+	)
 }
 
 func (registry *StaticRegistry) mergedPhysical(
@@ -907,7 +938,10 @@ func (registry *StaticRegistry) enrollPeerWithCommitContext(
 			return nil
 		}
 		if intent.DirectoryRevision != registry.currentDirectoryRevision(current) {
-			return ErrPeerConflict
+			return physicalPeerConflictContext(
+				"stale directory revision", existing, intent.Peer,
+				intent.DirectoryRevision, registry.currentDirectoryRevision(current),
+			)
 		}
 		// Static bootstrap rosters know the authenticated node but have no
 		// endpoint proof.  The first certified directory intent may bind that
@@ -916,11 +950,21 @@ func (registry *StaticRegistry) enrollPeerWithCommitContext(
 			samePhysicalPrincipal(existing, intent.Peer) &&
 			existing.State == PeerEnrolled {
 			// Continue below as a bounded copy-on-write update.
+		} else if existing.State == PeerEnrolled && intent.Peer.State == PeerEnrolled &&
+			samePhysicalBinding(existing, intent.Peer) && intent.Peer.Revision > existing.Revision {
+			// A newer authenticated directory cut may refresh lifecycle/revision
+			// metadata without rotating the physical enrollment proof. Keep the
+			// first grant digest bound to this endpoint while publishing the newer
+			// monotone revision.
+			intent.Peer.EnrollmentDigest = existing.EnrollmentDigest
 		} else {
 			if existing.State != PeerRetired || intent.Peer.State != PeerEnrolled ||
 				intent.Peer.Incarnation <= existing.Incarnation ||
 				intent.Peer.Revision <= existing.Revision {
-				return ErrPeerConflict
+				return physicalPeerConflictContext(
+					"existing enrolled identity is not a newer retired incarnation", existing, intent.Peer,
+					intent.DirectoryRevision, registry.currentDirectoryRevision(current),
+				)
 			}
 		}
 	} else if intent.DirectoryRevision != registry.currentDirectoryRevision(current) {
