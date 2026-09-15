@@ -303,6 +303,10 @@ func (runtime *Runtime) applyLiveControlDirectory(
 	if err := runtime.controlDirectory.Apply(cut); err != nil {
 		return err
 	}
+	// Keep the local frontend's acknowledgement bound to the current physical
+	// record. This also applies the durable Active -> Draining admission fence
+	// when a decommission CAS becomes visible.
+	runtime.syncFrontendDrainFromDirectory(cut.Nodes, cut.Revision)
 	directory := runtime.controlDirectory
 	if runtime.controlOpener != nil {
 		if err := runtime.controlOpener.Update(cut.Revision, directory.ShardControlEndpoints()); err != nil {

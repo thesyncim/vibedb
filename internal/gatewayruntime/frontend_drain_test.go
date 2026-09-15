@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
@@ -139,6 +142,55 @@ func TestFrontendAdmissionDrainIsIdempotent(t *testing.T) {
 	}
 	if err := listener.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFrontendDrainDirectoryBindsDistinctGatewayIdentity(t *testing.T) {
+	physical := rafttransport.NodeID{1}
+	gatewayNode := rafttransport.NodeID{2}
+	record := gateway.NodeRecord{
+		NodeID: physical, Incarnation: 1, ServiceKeyDigest: replication.Digest{1},
+		DataEndpoint: "peer", NativeEndpoint: "native", ControlEndpoint: "control", GatewayEndpoint: "gateway",
+		DataAddress: "localhost:1", NativeAddress: "localhost:2", ControlAddress: "localhost:3", GatewayAddress: "localhost:4",
+		FailureDomain: "worker", Roles: gateway.NodeRoleStorage | gateway.NodeRoleGateway,
+		Lifecycle: gateway.NodeActive, Revision: 1, CatalogGeneration: 1,
+		Gateway: gateway.GatewayIdentity{NodeID: gatewayNode, Incarnation: 1,
+			ServiceKeyDigest: replication.Digest{2}, ServiceID: [16]byte{3}, SessionID: [16]byte{4},
+			SessionRevision: 1, ParticipantDigest: replication.Digest{5}},
+	}
+	if !record.Valid() {
+		t.Fatal("distinct physical and gateway identities produced an invalid node record")
+	}
+	directory, err := gateway.NewReplicatedControlDirectory(gateway.ReplicatedControlDirectorySnapshot{
+		Revision: 1, CatalogGeneration: 1, Nodes: []gateway.NodeRecord{record},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &Runtime{
+		config:           Config{InternalAuthority: serviceauthz.Authority{Node: gatewayNode, Generation: 1}},
+		controlDirectory: directory, frontend: newFrontendAdmission(FrontendDrainIdentity{}, false, false),
+	}
+	if err := runtime.restoreFrontendDrainFromDirectory(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ack := runtime.FrontendDrainStatus()
+	if ack.Identity.NodeID != physical || ack.Identity.SessionID != record.Gateway.SessionID ||
+		ack.Identity.NodeRevision != record.Revision || ack.Identity.DirectoryRevision != 1 {
+		t.Fatalf("frontend identity was not bound to the physical record: %+v", ack.Identity)
+	}
+	if runtime.frontend.isDraining() {
+		t.Fatal("active directory record unexpectedly drained frontend")
+	}
+
+	record.Lifecycle = gateway.NodeDraining
+	record.Revision++
+	if !runtime.syncFrontendDrainFromDirectory([]gateway.NodeRecord{record}, 2) {
+		t.Fatal("draining directory record was not applied")
+	}
+	ack = runtime.FrontendDrainStatus()
+	if !runtime.frontend.isDraining() || !ack.AdmissionDrained || ack.Identity.NodeID != physical {
+		t.Fatalf("durable draining lifecycle did not close frontend admission: %+v", ack)
 	}
 }
 

@@ -149,6 +149,65 @@ func (runtime *Runtime) SetFrontendDrainIdentity(identity FrontendDrainIdentity)
 	runtime.frontend.mu.Unlock()
 }
 
+// syncFrontendDrainFromDirectory binds this frontend's gateway principal to
+// the physical node record that owns it. Gateway and storage identities are
+// deliberately distinct, so matching the TLS principal against NodeRecord's
+// NodeID would leave the participant acknowledgement unauthenticated. A
+// lifecycle transition to Draining is also the durable admission fence: close
+// public admission while retaining already accepted sessions for the live
+// reference scan.
+func (runtime *Runtime) syncFrontendDrainFromDirectory(nodes []gateway.NodeRecord, directoryRevision uint64) bool {
+	return runtime.syncFrontendDrainFromDirectoryWithAdmission(nodes, directoryRevision, true)
+}
+
+func (runtime *Runtime) syncFrontendDrainFromDirectoryWithAdmission(
+	nodes []gateway.NodeRecord, directoryRevision uint64, beginAdmission bool,
+) bool {
+	if runtime == nil || runtime.frontend == nil || directoryRevision == 0 {
+		return false
+	}
+	var gatewayNode rafttransport.NodeID
+	if runtime.config.TLSProfile != nil {
+		gatewayNode = runtime.config.TLSProfile.LocalIdentity().Node
+	}
+	if gatewayNode == (rafttransport.NodeID{}) {
+		gatewayNode = runtime.config.InternalAuthority.Node
+	}
+	if gatewayNode == (rafttransport.NodeID{}) {
+		return false
+	}
+	for _, record := range nodes {
+		if !record.Valid() || record.Gateway.NodeID != gatewayNode {
+			continue
+		}
+		identity := FrontendDrainIdentity{
+			NodeID: record.NodeID, Incarnation: record.Incarnation,
+			SessionID: record.Gateway.SessionID, SessionRevision: record.Gateway.SessionRevision,
+			NodeRevision: record.Revision, CatalogGeneration: record.CatalogGeneration,
+			DirectoryRevision: directoryRevision,
+		}
+		runtime.frontend.mu.Lock()
+		wasDraining := runtime.frontend.draining
+		runtime.frontend.identity = identity
+		if record.Lifecycle >= gateway.NodeDraining && !wasDraining {
+			runtime.frontend.draining = true
+			if runtime.frontend.revision == 0 {
+				runtime.frontend.revision = 1
+			}
+			runtime.frontend.nativeAdmissionDrained = true
+			if !runtime.frontend.pgRequired {
+				runtime.frontend.pgAdmissionDrained = true
+			}
+		}
+		runtime.frontend.mu.Unlock()
+		if record.Lifecycle >= gateway.NodeDraining && !wasDraining && beginAdmission {
+			runtime.BeginFrontendDrain()
+		}
+		return true
+	}
+	return false
+}
+
 // InstallFrontendContinuationGrant publishes the committed grant digest for
 // sockets that were already accepted when the frontend admission fence began.
 // It never creates a token and never makes a newly accepted socket eligible;
@@ -442,7 +501,8 @@ func (frontend *frontendAdmission) status() FrontendDrainAck {
 // incomplete cut never turns admissions back on, and the exact session and
 // revision identity is retained for the controller to fence.
 func (runtime *Runtime) restoreFrontendDrainFromDirectory(ctx context.Context) error {
-	if runtime == nil || runtime.frontend == nil || runtime.config.ControlDirectory == nil || ctx == nil {
+	if runtime == nil || runtime.frontend == nil || ctx == nil ||
+		(runtime.controlDirectory == nil && runtime.config.ControlDirectory == nil && runtime.authority == nil) {
 		return nil
 	}
 	var nodes []gateway.NodeRecord
@@ -451,43 +511,26 @@ func (runtime *Runtime) restoreFrontendDrainFromDirectory(ctx context.Context) e
 		nodes = runtime.controlDirectory.Nodes()
 		directoryRevision = runtime.controlDirectory.Revision()
 	} else {
-		var err error
-		nodes, err = runtime.config.ControlDirectory.ListNodes(ctx)
-		if err != nil {
-			return err
+		reader := runtime.config.ControlDirectory
+		if reader == nil {
+			reader = runtime.authority
 		}
-		directoryRevision = runtime.config.FrontendDrainIdentity.DirectoryRevision
-	}
-	local := runtime.config.FrontendDrainIdentity.NodeID
-	if local == (rafttransport.NodeID{}) {
-		local = runtime.config.InternalAuthority.Node
-	}
-	for _, record := range nodes {
-		if record.NodeID != local || record.Gateway.NodeID != local ||
-			record.Gateway.Incarnation != record.Incarnation {
-			continue
-		}
-		identity := FrontendDrainIdentity{
-			NodeID: record.NodeID, Incarnation: record.Incarnation,
-			SessionID: record.Gateway.SessionID, SessionRevision: record.Gateway.SessionRevision,
-			NodeRevision: record.Revision, CatalogGeneration: record.CatalogGeneration,
-			DirectoryRevision: directoryRevision,
-		}
-		runtime.frontend.mu.Lock()
-		runtime.frontend.identity = identity
-		if record.Lifecycle >= gateway.NodeDraining {
-			runtime.frontend.draining = true
-			if runtime.frontend.revision == 0 {
-				runtime.frontend.revision = 1
+		if cutReader, ok := reader.(gateway.NodeDirectoryCutReader); ok {
+			cut, err := cutReader.ReadNodeDirectoryCut(ctx)
+			if err != nil {
+				return err
 			}
-			runtime.frontend.nativeAdmissionDrained = true
-			if !runtime.frontend.pgRequired {
-				runtime.frontend.pgAdmissionDrained = true
+			nodes, directoryRevision = cut.CurrentNodes(), cut.Revision
+		} else {
+			var err error
+			nodes, err = reader.ListNodes(ctx)
+			if err != nil {
+				return err
 			}
+			directoryRevision = runtime.config.FrontendDrainIdentity.DirectoryRevision
 		}
-		runtime.frontend.mu.Unlock()
-		return nil
 	}
+	runtime.syncFrontendDrainFromDirectoryWithAdmission(nodes, directoryRevision, false)
 	return nil
 }
 
