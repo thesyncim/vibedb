@@ -2,9 +2,12 @@ package replicacontrol
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"math"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -157,5 +160,60 @@ func TestCapacityWireSeparatesPhysicalAndGroupIncarnations(t *testing.T) {
 	got, err := OpenCapacityObservation(raw)
 	if err != nil || got.Node.NodeIncarnation != 1 || got.Identity.NodeIncarnation != 9 {
 		t.Fatalf("physical/group incarnation roundtrip: %+v %v", got, err)
+	}
+}
+
+type blockingCapacityObserver struct {
+	started chan struct{}
+}
+
+func (observer *blockingCapacityObserver) ObserveReplicaCapacity(ctx context.Context, request CapacityRequest) (CapacityObservation, error) {
+	select {
+	case <-observer.started:
+	default:
+		close(observer.started)
+	}
+	<-ctx.Done()
+	return CapacityObservation{}, context.Cause(ctx)
+}
+
+func TestCapacityServiceCancelsObserverAtRequestDeadline(t *testing.T) {
+	observer := &blockingCapacityObserver{started: make(chan struct{})}
+	deadline := func() time.Time { return time.Now().Add(50 * time.Millisecond) }
+	service, err := NewCapacityService(CapacityServiceOptions{
+		Observer: observer,
+		Authorize: func(rafttransport.PeerIdentity, CapacityRequest) bool {
+			return true
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	domain := rafttransport.TrustDomain{ClusterID: capacityTestGroup().ClusterID,
+		ClusterIncarnation: capacityTestGroup().ClusterIncarnation}
+	server := &testConnection{Conn: right,
+		identity: rafttransport.PeerIdentity{TrustDomain: domain, Node: rafttransport.NodeID{9}},
+		class:    rafttransport.TrafficShardControl}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- service.Serve(context.Background(), server) }()
+	if err := WriteCapacityRequest(left, capacityTestRequest()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-observer.started:
+	case <-time.After(time.Second):
+		t.Fatal("capacity observer did not start")
+	}
+	select {
+	case err := <-serveDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("observer deadline error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("capacity observer ignored request deadline")
 	}
 }

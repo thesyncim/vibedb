@@ -13,7 +13,6 @@ import (
 	"errors"
 	"io"
 	"math"
-	"sync"
 
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -138,7 +137,11 @@ type CapacityService struct {
 	readDeadline  rafttransport.DeadlineFunc
 	writeDeadline rafttransport.DeadlineFunc
 	slots         chan struct{}
-	stripes       []sync.Mutex
+	// Each stripe is a one-place semaphore rather than a mutex so an expired
+	// request can leave the queue without a helper goroutine. The observer still
+	// serializes identical operation keys, but cancellation never waits behind
+	// an abandoned observation.
+	stripes []chan struct{}
 }
 
 // CapacityRequestDiscriminator identifies the capacity grammar on the shared
@@ -152,11 +155,15 @@ func NewCapacityService(options CapacityServiceOptions) (*CapacityService, error
 		options.MaxConcurrent > AbsoluteMaxCapacityObservers {
 		return nil, ErrControl
 	}
+	stripes := make([]chan struct{}, options.MaxConcurrent)
+	for index := range stripes {
+		stripes[index] = make(chan struct{}, 1)
+		stripes[index] <- struct{}{}
+	}
 	return &CapacityService{
 		observer: options.Observer, authorize: options.Authorize,
 		readDeadline: options.ReadDeadline, writeDeadline: options.WriteDeadline,
-		slots:   make(chan struct{}, options.MaxConcurrent),
-		stripes: make([]sync.Mutex, options.MaxConcurrent),
+		slots: make(chan struct{}, options.MaxConcurrent), stripes: stripes,
 	}, nil
 }
 
@@ -174,9 +181,10 @@ func (service *CapacityService) Serve(ctx context.Context, connection rafttransp
 	defer connection.Close()
 	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
 	defer stop()
-	if deadline := boundedDeadline(ctx, service.readDeadline()); deadline.IsZero() {
+	readDeadline := boundedDeadline(ctx, service.readDeadline())
+	if readDeadline.IsZero() {
 		return ErrControl
-	} else if err := connection.SetReadDeadline(deadline); err != nil {
+	} else if err := connection.SetReadDeadline(readDeadline); err != nil {
 		return err
 	}
 	request, err := ReadCapacityRequest(connection)
@@ -195,10 +203,20 @@ func (service *CapacityService) Serve(ctx context.Context, connection rafttransp
 	default:
 		return ErrBound
 	}
-	stripe := &service.stripes[binary.BigEndian.Uint64(request.Operation[:8])%uint64(len(service.stripes))]
-	stripe.Lock()
-	cut, observeErr := service.observer.ObserveReplicaCapacity(ctx, request)
-	stripe.Unlock()
+	// The request deadline also bounds cooperative local observation. A source
+	// that honors ctx cannot hold a stripe after the one-shot request expires;
+	// non-cooperative storage code remains subject to its own cancellation-safe
+	// implementation contract.
+	observeCtx, cancelObserve := context.WithDeadline(ctx, readDeadline)
+	defer cancelObserve()
+	stripe := service.stripes[binary.BigEndian.Uint64(request.Operation[:8])%uint64(len(service.stripes))]
+	select {
+	case <-stripe:
+		defer func() { stripe <- struct{}{} }()
+	case <-observeCtx.Done():
+		return context.Cause(observeCtx)
+	}
+	cut, observeErr := service.observer.ObserveReplicaCapacity(observeCtx, request)
 	if observeErr != nil {
 		return observeErr
 	}

@@ -390,7 +390,11 @@ func TestSourceTopologyLostReplyDoesNotFailOverAndEraseAmbiguity(t *testing.T) {
 	}
 	_, err = client.DoReplicated(t.Context(), f.route.Replicas[0], f.request.Native)
 	<-opener.done
-	if !errors.Is(err, io.EOF) || opener.calls != 1 {
+	// A peer that closes after consuming the request is EOF on a real TCP
+	// stream, while net.Pipe can report ErrClosedPipe when the read deadline is
+	// installed at the same time as the close. Both preserve the same opened
+	// stream ambiguity; neither may trigger a second seed attempt.
+	if (!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe)) || opener.calls != 1 {
 		t.Fatalf("lost reply erased by seed failover: calls=%d err=%v", opener.calls, err)
 	}
 }

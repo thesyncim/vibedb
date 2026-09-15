@@ -104,11 +104,6 @@ func (provider *CapacityProvider) ObserveReplicaCapacity(ctx context.Context, re
 	if err := context.Cause(ctx); err != nil {
 		return CapacityObservation{}, err
 	}
-	provider.mu.Lock()
-	defer provider.mu.Unlock()
-	if err := context.Cause(ctx); err != nil {
-		return CapacityObservation{}, err
-	}
 	sources, err := provider.directory.Sources(ctx)
 	if err != nil {
 		return CapacityObservation{}, errors.Join(ErrCapacityUnavailable, err)
@@ -138,23 +133,24 @@ func (provider *CapacityProvider) ObserveReplicaCapacity(ctx context.Context, re
 		return CapacityObservation{}, ErrCapacityStale
 	}
 	if request.Round != ([32]byte{}) {
+		// Round cache state is protected only while detached from the provider.
+		// Sources and node aggregation below may perform bounded storage I/O and
+		// must not hold this process-wide lock.
+		var cached capacityRoundCut
+		found := false
+		provider.mu.Lock()
 		for _, cut := range provider.rounds {
 			if cut.round != request.Round || cut.operation != request.Operation || cut.catalog != request.ExpectedCatalogGeneration {
 				continue
 			}
-			if time.Since(cut.created) >= capacityRoundLifetime || len(cut.samples) != len(sources) || cut.revision < request.MinimumSourceRevision {
-				return CapacityObservation{}, ErrCapacityStale
-			}
-			for i, candidate := range sources {
-				if candidate.Identity() != cut.samples[i].Identity {
-					return CapacityObservation{}, ErrCapacityStale
-				}
-			}
-			sample := cut.samples[sourceIndex]
-			return NewCapacityObservation(CapacityObservation{Request: request, Identity: sample.Identity,
-				CatalogGeneration: cut.catalog, Applied: sample.Applied, SourceRevision: cut.revision,
-				Demand: sample.Demand, MigrationBytes: sample.MigrationBytes, KnownEmpty: sample.KnownEmpty,
-				Node: cut.node, DemandKind: sample.DemandKind})
+			cached = cut
+			cached.samples = append([]CapacitySourceSample(nil), cut.samples...)
+			found = true
+			break
+		}
+		provider.mu.Unlock()
+		if found {
+			return capacityRoundObservation(request, cached, sources, sourceIndex)
 		}
 	}
 
@@ -223,14 +219,47 @@ func (provider *CapacityProvider) ObserveReplicaCapacity(ctx context.Context, re
 	if request.Round != ([32]byte{}) {
 		cut := capacityRoundCut{operation: request.Operation, round: request.Round, catalog: request.ExpectedCatalogGeneration,
 			created: time.Now(), samples: samples, node: node, revision: revision}
+		provider.mu.Lock()
+		// A concurrent fresh request may have populated this exact round while
+		// this one was reading storage. Keep the first complete cut so every
+		// caller of a round observes one coherent node/source snapshot.
+		for index := range provider.rounds {
+			if provider.rounds[index].round == cut.round && provider.rounds[index].operation == cut.operation &&
+				provider.rounds[index].catalog == cut.catalog {
+				cached := provider.rounds[index]
+				cached.samples = append([]CapacitySourceSample(nil), cached.samples...)
+				provider.mu.Unlock()
+				return capacityRoundObservation(request, cached, sources, sourceIndex)
+			}
+		}
 		if len(provider.rounds) == maxCapacityRounds {
 			copy(provider.rounds, provider.rounds[1:])
 			provider.rounds[len(provider.rounds)-1] = cut
 		} else {
 			provider.rounds = append(provider.rounds, cut)
 		}
+		provider.mu.Unlock()
 	}
 	return validated, nil
+}
+
+func capacityRoundObservation(request CapacityRequest, cut capacityRoundCut,
+	sources []CapacitySource, sourceIndex int,
+) (CapacityObservation, error) {
+	if time.Since(cut.created) >= capacityRoundLifetime || len(cut.samples) != len(sources) ||
+		cut.revision < request.MinimumSourceRevision {
+		return CapacityObservation{}, ErrCapacityStale
+	}
+	for index, candidate := range sources {
+		if candidate.Identity() != cut.samples[index].Identity {
+			return CapacityObservation{}, ErrCapacityStale
+		}
+	}
+	sample := cut.samples[sourceIndex]
+	return NewCapacityObservation(CapacityObservation{Request: request, Identity: sample.Identity,
+		CatalogGeneration: cut.catalog, Applied: sample.Applied, SourceRevision: cut.revision,
+		Demand: sample.Demand, MigrationBytes: sample.MigrationBytes, KnownEmpty: sample.KnownEmpty,
+		Node: cut.node, DemandKind: sample.DemandKind})
 }
 
 // AddCapacity saturates at MaxUint64 and reports whether any component would

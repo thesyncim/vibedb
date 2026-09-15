@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"math"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -16,6 +18,59 @@ type capacityProviderSource struct {
 	sample   CapacitySourceSample
 	err      error
 	request  *CapacityRequest
+}
+
+type blockingCapacityProviderSource struct {
+	*capacityProviderSource
+	started      chan struct{}
+	blockedGroup raftmember.GroupKey
+}
+
+type concurrentRoundSource struct {
+	identity     raftmember.RuntimeIdentity
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+	calls        atomic.Int32
+}
+
+func (source *concurrentRoundSource) Identity() raftmember.RuntimeIdentity { return source.identity }
+
+func (source *concurrentRoundSource) ObserveCapacity(ctx context.Context) (CapacitySourceSample, error) {
+	return source.ObserveCapacityRequest(ctx, CapacityRequest{})
+}
+
+func (source *concurrentRoundSource) ObserveCapacityRequest(ctx context.Context, _ CapacityRequest) (CapacitySourceSample, error) {
+	call := source.calls.Add(1)
+	if call == 1 {
+		close(source.firstStarted)
+		select {
+		case <-source.releaseFirst:
+		case <-ctx.Done():
+			return CapacitySourceSample{}, context.Cause(ctx)
+		}
+	}
+	demand := uint64(128)
+	if call == 1 {
+		demand = 64
+	}
+	return capacityProviderSample(source.identity, demand, demand*2, false), nil
+}
+
+func (source *blockingCapacityProviderSource) ObserveCapacity(ctx context.Context) (CapacitySourceSample, error) {
+	select {
+	case <-source.started:
+	default:
+		close(source.started)
+	}
+	<-ctx.Done()
+	return CapacitySourceSample{}, context.Cause(ctx)
+}
+
+func (source *blockingCapacityProviderSource) ObserveCapacityRequest(ctx context.Context, request CapacityRequest) (CapacitySourceSample, error) {
+	if request.Group == source.blockedGroup {
+		return source.ObserveCapacity(ctx)
+	}
+	return source.capacityProviderSource.ObserveCapacity(ctx)
 }
 
 func (source *capacityProviderSource) Identity() raftmember.RuntimeIdentity {
@@ -175,6 +230,128 @@ func TestCapacityProviderNodeCutIncludesMultiGroupBudgetAndCancellation(t *testi
 	vector, overflowed := AddCapacityVectors(left, right)
 	if !overflowed || vector[autosplit.ResourceLiveBytes] != math.MaxUint64 {
 		t.Fatalf("saturated vector=(%d,%v)", vector[autosplit.ResourceLiveBytes], overflowed)
+	}
+}
+
+func TestCapacityProviderCancellationDoesNotSerializeOtherRound(t *testing.T) {
+	firstGroup := capacityTestGroup()
+	secondGroup := firstGroup
+	secondGroup.GroupID[0]++
+	firstIdentity := capacityProviderIdentity(firstGroup, 1, 2)
+	secondIdentity := capacityProviderIdentity(secondGroup, 2, 2)
+	first := &blockingCapacityProviderSource{
+		capacityProviderSource: &capacityProviderSource{identity: firstIdentity,
+			sample: capacityProviderSample(firstIdentity, 64, 128, false)},
+		started:      make(chan struct{}),
+		blockedGroup: firstGroup,
+	}
+	second := &capacityProviderSource{identity: secondIdentity,
+		sample: capacityProviderSample(secondIdentity, 96, 192, false)}
+	provider, err := NewCapacityProvider(CapacitySourceDirectory{
+		Sources: func(context.Context) ([]CapacitySource, error) {
+			return []CapacitySource{first, second}, nil
+		},
+		Node: func(context.Context) (NodeCapacity, error) { return capacityProviderNode(2), nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRequest := capacityTestRequest()
+	firstRequest.Group, firstRequest.TargetMember = firstGroup, firstIdentity.MemberID
+	secondRequest := firstRequest
+	secondRequest.Group, secondRequest.TargetMember = secondGroup, secondIdentity.MemberID
+	firstContext, cancelFirst := context.WithCancelCause(context.Background())
+	defer cancelFirst(context.Canceled)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, observeErr := provider.ObserveReplicaCapacity(firstContext, firstRequest)
+		firstDone <- observeErr
+	}()
+	select {
+	case <-first.started:
+	case <-time.After(time.Second):
+		t.Fatal("first capacity source did not start")
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		_, observeErr := provider.ObserveReplicaCapacity(context.Background(), secondRequest)
+		secondDone <- observeErr
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("independent capacity round failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		cancelFirst(context.Canceled)
+		t.Fatal("independent capacity round waited on canceled observer")
+	}
+	cancelFirst(context.Canceled)
+	select {
+	case err := <-firstDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled capacity round error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled capacity observer remained blocked")
+	}
+}
+
+func TestCapacityProviderRoundKeepsFirstConcurrentCut(t *testing.T) {
+	identity := capacityProviderIdentity(capacityTestGroup(), 8, 2)
+	source := &concurrentRoundSource{identity: identity,
+		firstStarted: make(chan struct{}), releaseFirst: make(chan struct{})}
+	provider, err := NewCapacityProvider(CapacitySourceDirectory{
+		Sources: func(context.Context) ([]CapacitySource, error) { return []CapacitySource{source}, nil },
+		Node:    func(context.Context) (NodeCapacity, error) { return capacityProviderNode(2), nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := capacityTestRequest()
+	request.Round = [32]byte{55}
+	firstDone := make(chan CapacityObservation, 1)
+	firstErr := make(chan error, 1)
+	go func() {
+		observation, observeErr := provider.ObserveReplicaCapacity(context.Background(), request)
+		firstDone <- observation
+		firstErr <- observeErr
+	}()
+	select {
+	case <-source.firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first round source did not start")
+	}
+	secondDone := make(chan CapacityObservation, 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		observation, observeErr := provider.ObserveReplicaCapacity(context.Background(), request)
+		secondDone <- observation
+		secondErr <- observeErr
+	}()
+	var second CapacityObservation
+	select {
+	case second = <-secondDone:
+		if err := <-secondErr; err != nil {
+			t.Fatalf("second concurrent round: %v", err)
+		}
+	case <-time.After(time.Second):
+		close(source.releaseFirst)
+		t.Fatal("same round waited behind an in-flight source")
+	}
+	close(source.releaseFirst)
+	var first CapacityObservation
+	select {
+	case first = <-firstDone:
+		if err := <-firstErr; err != nil {
+			t.Fatalf("first concurrent round: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first concurrent round did not settle")
+	}
+	if first.Demand != second.Demand || first.MigrationBytes != second.MigrationBytes ||
+		first.SourceRevision != second.SourceRevision || first.Node != second.Node {
+		t.Fatalf("concurrent round returned different cuts: first=%+v second=%+v", first, second)
 	}
 }
 
