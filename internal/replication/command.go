@@ -1430,6 +1430,10 @@ func validateMutation(mutation Mutation) error {
 		if _, _, ok := OpenConflictValue(mutation.Value); !ok || !zeroExpected {
 			return semantic("conflict mutation payload")
 		}
+	case MutationJSONInt64Delta:
+		if !ValidJSONInt64Delta(mutation.Value) || !zeroExpected {
+			return semantic("JSON integer delta payload")
+		}
 	case MutationPut, MutationPutAbsentOrEqual, MutationPutAbsent, MutationPutPresent, MutationPutIfAbsent:
 		if len(mutation.Value) == 0 || len(mutation.Value) > MaxMutationValueBytes {
 			return semantic("put value length")
@@ -1890,6 +1894,10 @@ func validateMutationBytes(src []byte, count uint32) error {
 		case MutationPutConflict:
 			if _, _, ok := OpenConflictValue(value); !ok {
 				return semantic("conflict mutation payload")
+			}
+		case MutationJSONInt64Delta:
+			if !ValidJSONInt64Delta(value) {
+				return semantic("JSON integer delta payload")
 			}
 		case MutationPut, MutationPutAbsentOrEqual, MutationPutAbsent, MutationPutPresent, MutationPutIfAbsent:
 			if len(value) == 0 || len(value) > MaxMutationValueBytes {

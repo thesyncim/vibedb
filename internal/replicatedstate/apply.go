@@ -1972,6 +1972,7 @@ func (m *Machine) planMutations(
 			mutation.Kind != replication.MutationPutPresent &&
 			mutation.Kind != replication.MutationPutIfAbsent &&
 			mutation.Kind != replication.MutationPutConflict &&
+			mutation.Kind != replication.MutationJSONInt64Delta &&
 			mutation.Kind != replication.MutationPutDigestEqual &&
 			mutation.Kind != replication.MutationDelete &&
 			mutation.Kind != replication.MutationDeleteDigestEqual ||
@@ -2093,6 +2094,19 @@ func (m *Machine) planMutations(
 		// UPDATE of an absent row is an exact zero-row no-op. Check presence
 		// before validating the replacement so a coordinator can retain a
 		// durable no-op participant without inventing values for required fields.
+		if mutation.condition == mutationJSONInt64Delta {
+			if !found {
+				continue
+			}
+			value, code := materializeJSONInt64Delta(
+				current, mutation.value, target.Limits.MaxDocumentBytes,
+			)
+			if code != ResultApplied {
+				return nil, 0, code, nil
+			}
+			mutation.value = value
+			mutation.condition = mutationUnconditional
+		}
 		if mutation.condition == mutationPutPresent && !found {
 			continue
 		}
@@ -2306,6 +2320,8 @@ func finalMutationCondition(kind replication.MutationKind) mutationCondition {
 		return mutationPutIfAbsent
 	case replication.MutationPutConflict:
 		return mutationPutConflict
+	case replication.MutationJSONInt64Delta:
+		return mutationJSONInt64Delta
 	default:
 		return mutationUnconditional
 	}

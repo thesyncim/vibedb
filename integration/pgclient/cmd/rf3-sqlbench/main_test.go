@@ -578,11 +578,11 @@ func TestParseTables(t *testing.T) {
 }
 
 func TestParseWorkloads(t *testing.T) {
-	got, err := parseWorkloads("point_hit,mixed,update_existing")
+	got, err := parseWorkloads("point_hit,mixed,update_existing,update_multi_existing")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(got, ",") != "point_hit,mixed_read_update,update_existing" {
+	if strings.Join(got, ",") != "point_hit,mixed_read_update,update_existing,update_multi_existing" {
 		t.Fatalf("workloads = %v", got)
 	}
 	for _, input := range []string{"", "point_hit,point_hit", "delete_all"} {
@@ -593,11 +593,11 @@ func TestParseWorkloads(t *testing.T) {
 }
 
 func TestParseWorkloadsAcceptsExplicitUniformNames(t *testing.T) {
-	got, err := parseWorkloads("update_uniform,mixed_uniform")
+	got, err := parseWorkloads("update_uniform,update_hot,update_multi_hot,mixed_uniform")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(got, ",") != "update_uniform,mixed_uniform" {
+	if strings.Join(got, ",") != "update_uniform,update_hot,update_multi_hot,mixed_uniform" {
 		t.Fatalf("workloads = %v", got)
 	}
 	if _, err := parseWorkloads("update_uniform,update_uniform"); err == nil {
@@ -612,6 +612,31 @@ func TestParseWorkloadsAcceptsOptionalRangeSizes(t *testing.T) {
 	}
 	if strings.Join(got, ",") != "range_32,range_64,range_256" {
 		t.Fatalf("unexpected range workloads: %v", got)
+	}
+}
+
+func TestTransientRetryPolicyIsBoundedAndReportsRetries(t *testing.T) {
+	if !isTransientRetry(&pgconn.PgError{Code: "40001"}) || !isTransientRetry(&pgconn.PgError{Code: "40P01"}) {
+		t.Fatal("serialization and deadlock SQLSTATEs were not recognized")
+	}
+	if isTransientRetry(&pgconn.PgError{Code: "23505"}) || isTransientRetry(errors.New("40001")) {
+		t.Fatal("non-retryable errors were classified as transient")
+	}
+	calls := 0
+	retries, err := executeWithTransientRetry(context.Background(), true, func() error {
+		calls++
+		if calls == 1 {
+			return &pgconn.PgError{Code: "40001"}
+		}
+		return nil
+	})
+	if err != nil || calls != 2 || retries != 1 {
+		t.Fatalf("retry result err=%v calls=%d retries=%d", err, calls, retries)
+	}
+	if retries, err := executeWithTransientRetry(context.Background(), false, func() error {
+		return &pgconn.PgError{Code: "40001"}
+	}); err == nil || retries != 0 {
+		t.Fatalf("disabled retry policy returned err=%v retries=%d", err, retries)
 	}
 }
 

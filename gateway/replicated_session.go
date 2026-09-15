@@ -794,6 +794,18 @@ func (session *NativeSession) validateNativeMutation(mutation NativeMutation) er
 		if mutation.ExpectedValueLength != 0 || mutation.ExpectedValueDigest != (replication.Digest{}) {
 			return ErrNativeBundleBound
 		}
+	case replication.MutationJSONInt64Delta:
+		if len(mutation.Value) == 0 ||
+			len(mutation.Value) > replication.MaxMutationValueBytes ||
+			len(mutation.Value) > session.maxCommand {
+			return ErrNativeBundleBound
+		}
+		if !replication.ValidJSONInt64Delta(mutation.Value) {
+			return ErrNativeDocument
+		}
+		if mutation.ExpectedValueLength != 0 || mutation.ExpectedValueDigest != (replication.Digest{}) {
+			return ErrNativeBundleBound
+		}
 	case replication.MutationPut, replication.MutationPutAbsentOrEqual,
 		replication.MutationPutDigestEqual, replication.MutationPutAbsent,
 		replication.MutationPutPresent, replication.MutationPutIfAbsent:

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/trace"
+	"slices"
 	"sync"
 	"time"
 
@@ -249,6 +250,49 @@ func postgresDirectUnknown(id replication.ID128, err error) error {
 	return fmt.Errorf("PostgreSQL write outcome unknown for request %x; verify database state before resubmitting: %w", id, errors.Join(durable.ErrCommitOutcomeUnknown, err))
 }
 
+// ownPostgresWriteQuery takes ownership of the mutable portions of a PG bind
+// request without routing it through JSON. The pgwire decoder reuses its
+// parameter buffers after Write returns, while SQL is an immutable Go string.
+// Keeping the same validation boundary as the journal writer makes this a
+// byte-for-byte semantic replacement for the old marshal/unmarshal copy on
+// the direct hot path.
+func ownPostgresWriteQuery(q gateway.Query) (gateway.Query, error) {
+	owned := q
+	if len(q.Params) != 0 {
+		owned.Params = slices.Clone(q.Params)
+		for index := range owned.Params {
+			owned.Params[index].Bytes = bytes.Clone(q.Params[index].Bytes)
+		}
+	}
+	// ParamTypes is json:",omitempty" in the legacy journal. A present but
+	// empty slice therefore round-trips as nil; preserve that normalization so
+	// the typed fast path has exactly the same version/error behavior.
+	if len(q.ParamTypes) != 0 {
+		owned.ParamTypes = slices.Clone(q.ParamTypes)
+	} else {
+		owned.ParamTypes = nil
+	}
+	if _, err := postgresWriteJournalVersion(&owned); err != nil {
+		return gateway.Query{}, err
+	}
+	return owned, nil
+}
+
+// postgresWriteQueryNeedsSizeCheck is a cheap conservative upper bound for
+// JSON escaping. Small requests, which dominate the direct workload, skip a
+// second serialization entirely. Large or heavily escaped input still takes
+// the exact legacy size check before planning, so the journal bound is kept.
+func postgresWriteQueryNeedsSizeCheck(q gateway.Query) bool {
+	upper := uint64(256) + uint64(len(q.SQL))*6 + uint64(len(q.ParamTypes))*16
+	for _, param := range q.Params {
+		upper += 64 + uint64(len(param.Bytes))*6
+		if upper > maxPostgreSQLWriteJournalBytes/2 {
+			return true
+		}
+	}
+	return upper > maxPostgreSQLWriteJournalBytes/2
+}
+
 func (p *postgresDirectPool) resolve(ctx context.Context, slot *postgresDirectSlot) (*gateway.Result, error) {
 	pending := slot.pending
 	region := trace.StartRegion(ctx, "pg.direct.execute")
@@ -311,19 +355,18 @@ func (p *postgresDirectPool) Write(ctx context.Context, q gateway.Query) (*gatew
 			return nil, true, fmt.Errorf("previous PostgreSQL write is unresolved; this statement was not executed: %w", err)
 		}
 	}
-	raw, err := vibejson.Marshal(&q)
+	owned, err := ownPostgresWriteQuery(q)
 	if err != nil {
 		return nil, true, err
 	}
-	if len(raw) > maxPostgreSQLWriteJournalBytes/2 {
-		return nil, true, gateway.ErrTransactionByteLimit
-	}
-	var owned gateway.Query
-	if err = vibejson.Unmarshal(raw, &owned); err != nil {
-		return nil, true, err
-	}
-	if _, err = postgresWriteJournalVersion(&owned); err != nil {
-		return nil, true, err
+	if postgresWriteQueryNeedsSizeCheck(owned) {
+		raw, marshalErr := vibejson.Marshal(&owned)
+		if marshalErr != nil {
+			return nil, true, marshalErr
+		}
+		if len(raw) > maxPostgreSQLWriteJournalBytes/2 {
+			return nil, true, gateway.ErrTransactionByteLimit
+		}
 	}
 	queries := []gateway.Query{owned}
 	for attempt := 0; attempt < 8; attempt++ {

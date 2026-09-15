@@ -355,7 +355,8 @@ func directSQLMutationEligible(
 	for index := range mutations {
 		switch mutations[index].Kind {
 		case replication.MutationPut, replication.MutationPutAbsentOrEqual,
-			replication.MutationDelete, replication.MutationPutAbsent, replication.MutationPutIfAbsent, replication.MutationPutConflict:
+			replication.MutationDelete, replication.MutationPutAbsent, replication.MutationPutIfAbsent,
+			replication.MutationPutConflict, replication.MutationJSONInt64Delta:
 		default:
 			return false
 		}
@@ -414,9 +415,20 @@ func (executor *DurableSQLRequestExecutor) ReplayRequestWithTenant(
 		return DurableSQLRequestResult{}, false, ErrNoCatalog
 	}
 	defer lease.release()
-	targets, handled, planErr := executor.planner.planReplicatedSQLTransactionWithData(
+	// Reconstruct the same committed-preimage lowering used by the prepared
+	// direct lane. In particular, JID1/JID2 integer deltas must survive a gateway
+	// restart as the same operation descriptor; replanning through the old
+	// linearizable path would manufacture a different digest-guarded command
+	// after the row had already changed.
+	targets, handled, planErr := executor.planner.planReplicatedSQLTransactionWithDataMode(
 		opctx, lease.snapshot, queries, profile, executor.data,
+		replicatedSQLCommittedLeaderPreimage,
 	)
+	if errors.Is(planErr, errPreparedDirectFallback) {
+		targets, handled, planErr = executor.planner.planReplicatedSQLTransactionWithData(
+			opctx, lease.snapshot, queries, profile, executor.data,
+		)
+	}
 	if planErr != nil || !handled || key.IssuerSequence == 0 ||
 		!directSQLMutationEligible(queries, targets) {
 		return executor.Replay(opctx, key)
