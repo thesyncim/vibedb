@@ -15,6 +15,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -365,17 +366,14 @@ func preflightRF3ReadAuthorityRoster(
 // voter set and absent from the static policy; otherwise the receipt cannot
 // explain this cut and startup must remain fail-closed.
 func rf3ReadAuthorityDynamicCut(
-	item preparedRF3Group, runtime *raftmember.Runtime, policy raftauthority.ReadAuthorityPolicy,
+	item preparedRF3Group, publication raftmodel.Publication, localMember uint64,
+	policy raftauthority.ReadAuthorityPolicy,
 ) (skip, localRetired bool, err error) {
 	if item.readAuthorityDynamicMember == 0 {
 		return false, false, nil
 	}
-	if runtime == nil {
+	if publication.ConfState == nil || publication.ReplicaSetVersion == 0 {
 		return false, false, errRF3ReadAuthority
-	}
-	publication, err := runtime.Publication()
-	if err != nil || publication.ConfState == nil || publication.ReplicaSetVersion == 0 {
-		return false, false, errors.Join(errRF3ReadAuthority, err)
 	}
 	confState := publication.ConfState
 	if len(confState.GetVoters()) == 0 || len(confState.GetVotersOutgoing()) != 0 ||
@@ -391,8 +389,7 @@ func rf3ReadAuthorityDynamicCut(
 		!slices.Contains(confState.GetVoters(), item.readAuthorityDynamicMember) {
 		return false, false, errRF3ReadAuthority
 	}
-	identity := runtime.Identity()
-	return true, !slices.Contains(confState.GetVoters(), identity.MemberID), nil
+	return true, !slices.Contains(confState.GetVoters(), localMember), nil
 }
 
 func ensureRF3ReadAuthorityDisabled(memberRoot string) error {
@@ -1280,7 +1277,21 @@ func configureRF3ReadAuthorities(
 		if item.adoptedChild {
 			continue
 		}
-		dynamicCut[index], _, err = rf3ReadAuthorityDynamicCut(item, runtimes[index], policy)
+		var publication raftmodel.Publication
+		if item.readAuthorityDynamicMember != 0 {
+			if runtimes[index] == nil {
+				return nil, nil, errRF3ReadAuthority
+			}
+			publication, err = runtimes[index].Publication()
+			if err != nil {
+				return nil, nil, errors.Join(errRF3ReadAuthority, err)
+			}
+		}
+		localMember := uint64(0)
+		if runtimes[index] != nil {
+			localMember = runtimes[index].Identity().MemberID
+		}
+		dynamicCut[index], _, err = rf3ReadAuthorityDynamicCut(item, publication, localMember, policy)
 		if err != nil {
 			return nil, nil, err
 		}

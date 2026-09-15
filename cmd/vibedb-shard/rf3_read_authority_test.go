@@ -10,7 +10,9 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 func testRF3ReadAuthorityConfig() *rf3ManifestReadAuthority {
@@ -128,6 +130,43 @@ func TestRF3ReadAuthorityMarkerPreflightDistinguishesCreatedState(t *testing.T) 
 	changed.Capabilities[2].MemberID = 4
 	if _, err := inspectRF3ReadAuthorityState(root, changed); !errors.Is(err, errRF3ReadAuthorityDowngrade) {
 		t.Fatalf("changed marker preflight = %v, want downgrade", err)
+	}
+}
+
+func TestRF3ReadAuthorityDynamicCutRequiresAuthenticatedTargetAndDisablesStalePolicy(t *testing.T) {
+	policy := testRF3ReadAuthorityPolicy()
+	item := preparedRF3Group{readAuthorityDynamicMember: 4}
+	publication := raftmodel.Publication{
+		ReplicaSetVersion: 2,
+		ConfState:         &pb.ConfState{Voters: []uint64{2, 3, 4}},
+	}
+	skip, retired, err := rf3ReadAuthorityDynamicCut(item, publication, 1, policy)
+	if err != nil || !skip || !retired {
+		t.Fatalf("receipt-backed post-remove cut = skip=%t retired=%t err=%v, want true/true", skip, retired, err)
+	}
+	skip, retired, err = rf3ReadAuthorityDynamicCut(item, publication, 2, policy)
+	if err != nil || !skip || retired {
+		t.Fatalf("receipt-backed survivor cut = skip=%t retired=%t err=%v, want true/false", skip, retired, err)
+	}
+	exact := publication
+	exact.ConfState = &pb.ConfState{Voters: []uint64{1, 2, 3}}
+	if skip, retired, err := rf3ReadAuthorityDynamicCut(item, exact, 1, policy); err != nil || skip || retired {
+		t.Fatalf("learner-phase exact cut = skip=%t retired=%t err=%v, want false/false", skip, retired, err)
+	}
+	withoutReceipt := item
+	withoutReceipt.readAuthorityDynamicMember = 0
+	if skip, retired, err := rf3ReadAuthorityDynamicCut(withoutReceipt, publication, 1, policy); err != nil || skip || retired {
+		t.Fatalf("uncredentialed changed cut = skip=%t retired=%t err=%v, want false/false", skip, retired, err)
+	}
+	foreign := item
+	foreign.readAuthorityDynamicMember = 5
+	if _, _, err := rf3ReadAuthorityDynamicCut(foreign, publication, 1, policy); !errors.Is(err, errRF3ReadAuthority) {
+		t.Fatalf("foreign receipt target error = %v, want read-authority refusal", err)
+	}
+	joint := publication
+	joint.ConfState = &pb.ConfState{Voters: []uint64{2, 3, 4}, VotersOutgoing: []uint64{1, 2, 3}}
+	if _, _, err := rf3ReadAuthorityDynamicCut(item, joint, 1, policy); !errors.Is(err, errRF3ReadAuthority) {
+		t.Fatalf("joint changed cut error = %v, want read-authority refusal", err)
 	}
 }
 
