@@ -260,7 +260,19 @@ func (authority *ReplicatedCatalogAuthority) readRaw(
 		// Membership may advance again after discovery but before ReadIndex.
 		// Retry only the read, with a fresh fully authenticated placement cut.
 		// Discovery still fails closed on unrelated authority or identity changes.
-		route, discoverErr := authority.executor.catalogOperationalRoute(ctx, authority.route, authority.holder.Current())
+		var snapshot *Snapshot
+		if authority.holder != nil {
+			snapshot = authority.holder.Current()
+		}
+		// During startup the holder is intentionally empty: the first
+		// authoritative read happens before the attested route seed can be
+		// published into it. Keep the route-seed snapshot's authenticated
+		// enrolled target available for that discovery sweep. Once a live
+		// snapshot is installed, it remains the source of placement truth.
+		if snapshot == nil && authority.session != nil {
+			snapshot = authority.session.catalogBootstrap
+		}
+		route, discoverErr := authority.executor.catalogOperationalRoute(ctx, authority.route, snapshot)
 		if discoverErr != nil {
 			return ReplicatedPointResult{}, discoverErr
 		}
