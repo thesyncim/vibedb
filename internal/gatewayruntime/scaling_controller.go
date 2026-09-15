@@ -1149,7 +1149,7 @@ func blockersFromEvidence(evidence gateway.NodeReferenceEvidence) []gateway.Scal
 	add("outstanding_moves", evidence.OutstandingMoves)
 	add("catalog_voters", evidence.CatalogVoterReferences)
 	add("control_voters", evidence.ControlVoterReferences)
-	add("gateway_sessions", evidence.GatewayParticipantRefs)
+	add(clustercontrol.BlockerGatewaySessions, evidence.GatewayParticipantRefs)
 	if len(result) == 0 {
 		result = append(result, gateway.ScalingBlocker{Code: "retirement_fence", Detail: "reference scan is not yet a safe-to-stop proof", Node: evidence.NodeID, Revision: evidence.DirectoryRevision})
 	}

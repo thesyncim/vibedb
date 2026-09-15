@@ -65,6 +65,11 @@ const (
 	OpRebalance    = "cluster_rebalance"
 	OpDecommission = "cluster_decommission"
 	OpStatus       = "cluster_status"
+
+	// BlockerGatewaySessions is emitted when an authenticated frontend session
+	// still references a node that is being drained. Keep this wire value in
+	// one place so status consumers and qualification predicates cannot drift.
+	BlockerGatewaySessions = "gateway_sessions"
 )
 
 var validOperations = map[string]struct{}{

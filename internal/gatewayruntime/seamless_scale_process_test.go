@@ -1828,12 +1828,44 @@ func hasSeamlessScaleNode(response clustercontrol.Response, nodeID rafttransport
 
 func hasSeamlessScaleSessionBlocker(response clustercontrol.Response, nodeID string, incarnation uint64) bool {
 	for _, blocker := range response.Blockers {
-		if blocker.Code == "gateway_session" && blocker.NodeID == nodeID && blocker.NodeIncarnation == incarnation &&
+		if blocker.Code == clustercontrol.BlockerGatewaySessions && blocker.NodeID == nodeID && blocker.NodeIncarnation == incarnation &&
 			strings.Contains(strings.ToLower(blocker.Detail), "session") {
 			return true
 		}
 	}
 	return false
+}
+
+func TestHasSeamlessScaleSessionBlockerUsesCanonicalCode(t *testing.T) {
+	const nodeID = "11111111111111111111111111111111"
+	response := clustercontrol.Response{Blockers: []clustercontrol.Blocker{{
+		Code: clustercontrol.BlockerGatewaySessions, Detail: "retiring frontend still has one authenticated session",
+		NodeID: nodeID, NodeIncarnation: 7,
+	}}}
+	if !hasSeamlessScaleSessionBlocker(response, nodeID, 7) {
+		t.Fatal("canonical gateway session blocker was not recognized")
+	}
+	for _, test := range []struct {
+		name        string
+		code        string
+		nodeID      string
+		incarnation uint64
+		detail      string
+	}{
+		{name: "legacy singular code", code: "gateway_session", nodeID: nodeID, incarnation: 7, detail: "retiring frontend still has one authenticated session"},
+		{name: "foreign node", code: clustercontrol.BlockerGatewaySessions, nodeID: "22222222222222222222222222222222", incarnation: 7, detail: "retiring frontend still has one authenticated session"},
+		{name: "foreign incarnation", code: clustercontrol.BlockerGatewaySessions, nodeID: nodeID, incarnation: 8, detail: "retiring frontend still has one authenticated session"},
+		{name: "unrelated detail", code: clustercontrol.BlockerGatewaySessions, nodeID: nodeID, incarnation: 7, detail: "no remaining references"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := clustercontrol.Response{Blockers: []clustercontrol.Blocker{{
+				Code: test.code, Detail: test.detail, NodeID: test.nodeID, NodeIncarnation: test.incarnation,
+			}}}
+			if hasSeamlessScaleSessionBlocker(response, nodeID, 7) {
+				t.Fatal("invalid gateway session blocker was accepted")
+			}
+		})
+	}
 }
 
 func seamlessScaleNodeIncarnation(response clustercontrol.Response, nodeID string) uint64 {
