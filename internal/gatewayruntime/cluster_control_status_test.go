@@ -86,6 +86,33 @@ func TestClusterControlStatusUsesCommittedTerminalCutWhenFrontendIsOffline(t *te
 	}
 }
 
+func TestClusterControlNodesUsesCommittedTerminalCutWhenFrontendIsOffline(t *testing.T) {
+	nodeID := rafttransport.NodeID{3}
+	fresh := gateway.NodeReferenceEvidence{NodeID: nodeID, Incarnation: 1,
+		CatalogGeneration: 8, DirectoryRevision: 3, DirectoryCutRevision: 4,
+		DirectoryCutDigest: [32]byte{7}, CatalogHeadDigest: [32]byte{8},
+		ScalingDirectoryDigest: [32]byte{9}, EnrollmentDirectoryDigest: [32]byte{10},
+		OperationDirectoryDigest: [32]byte{11}, Digest: [32]byte{12}}
+	directory := &terminalStatusDirectory{
+		node: gateway.NodeRecord{NodeID: nodeID, Incarnation: 1, Lifecycle: gateway.NodeDecommissioned,
+			Revision: 3, CatalogGeneration: 7, RetirementScanDigest: [32]byte{6},
+			RetirementScanDirectoryRevision: 2, RetirementScanCutRevision: 3},
+		terminalEvidence: &fresh, scanErr: errors.New("retired frontend is offline"),
+	}
+	backend := &ScalingOperatorBackend{directory: directory, catalog: terminalStatusCatalog{}}
+
+	response := backend.nodesResponse(context.Background(), clustercontrol.Response{})
+	if !response.OK || len(response.Nodes) != 1 || !response.Nodes[0].SafeToStop {
+		t.Fatalf("nodes response did not use committed terminal cut: response=%+v", response)
+	}
+
+	directory.terminalEvidence = nil
+	response = backend.nodesResponse(context.Background(), clustercontrol.Response{})
+	if !response.OK || len(response.Nodes) != 1 || response.Nodes[0].SafeToStop {
+		t.Fatalf("offline terminal scan was treated as safe: response=%+v", response)
+	}
+}
+
 func TestClusterControlStatusUsesFreshTerminalProof(t *testing.T) {
 	nodeID := rafttransport.NodeID{1}
 	request := gateway.ScalingIntentRequest{Kind: gateway.ScalingDecommission, RequestID: [32]byte{2},

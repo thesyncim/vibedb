@@ -577,7 +577,7 @@ func (backend *ScalingOperatorBackend) nodeStatus(ctx context.Context, node gate
 	status := clustercontrol.NodeStatus{NodeID: nodeIDHex(node.NodeID), Incarnation: node.Incarnation,
 		Lifecycle: lifecycleName(node.Lifecycle), Revision: node.Revision, CatalogGeneration: node.CatalogGeneration}
 	if node.Lifecycle == gateway.NodeDecommissioned {
-		if evidence, err := backend.directory.ScanNodeReferences(ctx, node.NodeID, node.Incarnation); err == nil {
+		if evidence, err := backend.scanNodeStatusReferences(ctx, node); err == nil {
 			proof := scalingEvidenceFromNode(evidence)
 			proof.DrainAcknowledged = true
 			proof.RetiredAcknowledged = true
@@ -586,6 +586,20 @@ func (backend *ScalingOperatorBackend) nodeStatus(ctx context.Context, node gate
 		}
 	}
 	return status
+}
+
+// A terminal node's live gateway may have been stopped after the retirement
+// CAS. Use the authenticated terminal scan in that case; it excludes the
+// retired gateway participant while still checking the current catalog cut.
+func (backend *ScalingOperatorBackend) scanNodeStatusReferences(
+	ctx context.Context, node gateway.NodeRecord,
+) (gateway.NodeReferenceEvidence, error) {
+	if node.HasRetirementProof() {
+		if scanner, ok := backend.directory.(gateway.TerminalNodeReferenceScanner); ok {
+			return scanner.ScanDecommissionedNodeReferences(ctx, node.NodeID, node.Incarnation)
+		}
+	}
+	return backend.directory.ScanNodeReferences(ctx, node.NodeID, node.Incarnation)
 }
 
 // Capacity and receive limits are refreshed from authenticated readiness;
