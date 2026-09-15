@@ -5,6 +5,7 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/autosplit"
@@ -740,6 +741,23 @@ func TestPlanInFlightGroupFenceSurvivesUnrelatedCatalogHeads(t *testing.T) {
 			placementAdvanceCatalog(t, &fixture, placementGeneration+3)
 			if inFlightMatchesSnapshot(intent, fixture.snapshot) {
 				t.Fatal("in-flight fence accepted a changed group command")
+			}
+			input.Snapshot = fixture.snapshot
+			plan, err = Plan(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var detail string
+			for _, blocker := range plan.Blockers {
+				if blocker.Code == BlockerStaleGeneration {
+					detail = blocker.Detail
+					break
+				}
+			}
+			for _, field := range []string{"intent=", "state=", "move=", "expected_catalog_generation=", "current_catalog_generation=", "route_command_digest=", "expected_command_digest=", "expected_source=", "current_source=", "target="} {
+				if !strings.Contains(detail, field) {
+					t.Fatalf("stale enrollment diagnostic missing %q: %s", field, detail)
+				}
 			}
 		})
 	}

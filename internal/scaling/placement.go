@@ -369,7 +369,7 @@ func Plan(input PlacementInput) (PlacementPlan, error) {
 		}
 		if targetNode.CatalogGeneration != generation || !inFlightMatchesSnapshot(intent, snapshot) {
 			invalidateTarget(PlacementBlocker{
-				Code: BlockerStaleGeneration, Detail: "in-flight enrollment has no matching group fence in the current catalog cut",
+				Code: BlockerStaleGeneration, Detail: staleEnrollmentDetail(intent, snapshot),
 				Group: intent.Group, Distribution: intent.Distribution, Shard: intent.Shard,
 				ReplicaOrdinal: intent.ReplicaOrdinal, Node: targetNode.NodeID,
 				Revision: targetNode.Revision, TargetNode: targetNode.NodeID,
@@ -740,6 +740,50 @@ func inFlightMatchesSnapshot(intent gateway.GroupEnrollmentIntent, snapshot *gat
 	}
 	roster, descriptor, ok := gateway.ReplicatedInitialMembershipDigests(snapshot, intent.Group)
 	return ok && roster == intent.ExpectedRosterDigest && descriptor == intent.ExpectedDescriptorDigest
+}
+
+// staleEnrollmentDetail keeps the planner's durable identity and the current
+// route fence together in one bounded diagnostic.  A stale enrollment must
+// remain a hard blocker; this context only records which exact values failed
+// the authenticated comparison so a caller can reconcile the retained row or
+// receipt instead of guessing from an aggregate blocker.
+func staleEnrollmentDetail(intent gateway.GroupEnrollmentIntent, snapshot *gateway.Snapshot) string {
+	detail := fmt.Sprintf("in-flight enrollment has no matching group fence in the current catalog cut: intent=%x state=%d move=%x expected_catalog_generation=%d current_catalog_generation=%d expected_allocation=%d",
+		intent.IntentID, intent.State, intent.MoveOperationID, intent.CatalogGeneration,
+		snapshotGeneration(snapshot), intent.AllocationGeneration)
+	if snapshot == nil {
+		return detail + " route=unavailable"
+	}
+	route, ok := snapshot.ResolveReplicatedMembershipRoute(intent.Distribution, intent.Shard, nil)
+	if !ok {
+		return detail + " route=unavailable"
+	}
+	command := route.Serving.Command
+	detail += fmt.Sprintf(" route_group=%v route_allocation=%d route_command_digest=%x expected_command_digest=%x route_command=(replica_set=%d policy=%d protection=%d ownership=%d schema=%d routing=%d generation=%d) expected_command=(replica_set=%d policy=%d protection=%d ownership=%d schema=%d routing=%d generation=%d) enrolled_target=%t",
+		route.Serving.Group, route.Serving.AllocationGeneration,
+		gateway.DigestCommandFence(command), gateway.DigestCommandFence(intent.ExpectedCommand),
+		command.ReplicaSetVersion, command.ActivePolicyGeneration, command.ProtectionEpoch,
+		command.OwnershipEpoch, command.SchemaGeneration, command.RoutingVersion, command.RouteGeneration,
+		intent.ExpectedCommand.ReplicaSetVersion, intent.ExpectedCommand.ActivePolicyGeneration,
+		intent.ExpectedCommand.ProtectionEpoch, intent.ExpectedCommand.OwnershipEpoch,
+		intent.ExpectedCommand.SchemaGeneration, intent.ExpectedCommand.RoutingVersion, intent.ExpectedCommand.RouteGeneration,
+		route.HasEnrolledTarget)
+	if int(intent.ReplicaOrdinal) >= len(route.Serving.Replicas) {
+		return detail + fmt.Sprintf(" source_ordinal=%d current_source=unavailable", intent.ReplicaOrdinal)
+	}
+	source := route.Serving.Replicas[int(intent.ReplicaOrdinal)]
+	detail += fmt.Sprintf(" source_ordinal=%d expected_source=%d/%x/%d/%x current_source=%d/%x/%d/%x target=%d/%x/%d/%x",
+		intent.ReplicaOrdinal, intent.Source.Member, intent.Source.Node, intent.Source.NodeIncarnation, intent.Source.StoreID,
+		source.Member, source.Node, source.NodeIncarnation, source.StoreID,
+		intent.Target.Member, intent.Target.Node, intent.Target.NodeIncarnation, intent.Target.StoreID)
+	return detail
+}
+
+func snapshotGeneration(snapshot *gateway.Snapshot) uint64 {
+	if snapshot == nil {
+		return 0
+	}
+	return snapshot.Generation()
 }
 
 func prepareDrain(

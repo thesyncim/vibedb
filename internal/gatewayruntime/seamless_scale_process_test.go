@@ -54,6 +54,10 @@ import (
 const (
 	seamlessScaleProcessEnvironment  = "VIBEDB_SEAMLESS_SCALE_E2E"
 	seamlessScaleEvidenceEnvironment = "VIBEDB_SEAMLESS_SCALE_EVIDENCE"
+	// When set, a failed qualification moves its temporary state directory to
+	// this path after all process cleanup has run. It is intentionally opt-in
+	// because the directory contains private test credentials and catalogs.
+	seamlessScaleFailureEnvironment  = "VIBEDB_SEAMLESS_SCALE_FAILURE"
 	seamlessScaleWindowDuration      = 10 * time.Second
 	seamlessScaleMinimumSamples      = 10_000
 	seamlessScaleOfferedRate         = 1_200
@@ -784,8 +788,24 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	state := filepath.Join(root, "state")
+	t.Cleanup(func() {
+		if !t.Failed() {
+			_ = os.RemoveAll(root)
+			return
+		}
+		if path := os.Getenv(seamlessScaleFailureEnvironment); path != "" {
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Logf("preserve failed scale state parent: %v", err)
+			} else if err := os.Rename(root, path); err != nil {
+				t.Logf("preserve failed scale state: %v", err)
+			} else {
+				t.Logf("preserved failed scale state: %s", path)
+				return
+			}
+		}
+		_ = os.RemoveAll(root)
+	})
 	bin := t.TempDir()
 	vibedbBinary := filepath.Join(bin, "vibedb")
 	shardBinary := filepath.Join(bin, "vibedb-shard")
