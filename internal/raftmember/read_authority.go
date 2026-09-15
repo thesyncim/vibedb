@@ -1056,7 +1056,20 @@ func cloneAuthorityPolicy(policy raftauthority.ReadAuthorityPolicy) raftauthorit
 func (runtime *Runtime) refreshAuthority() {
 	runtime.refreshLeaderTransfer()
 	state := runtime.authority
-	if state == nil || (state.round == nil && state.renewal == nil) {
+	if state == nil {
+		return
+	}
+	// A committed stable membership change invalidates the policy that was
+	// installed for the previous voter roster. This can happen on a survivor
+	// that has no active authority round: leaving the old state merely
+	// translates every observation into a configuration mismatch while the
+	// ordinary ReadIndex path is still safe to use. Keep the PromiseBook so a
+	// previously issued grant remains an election fence, but close optimized
+	// reads and discard rounds/outbound requests tied to the old cut.
+	if runtime.disableStaleAuthorityOnCommittedRosterChange(state) {
+		return
+	}
+	if state.round == nil && state.renewal == nil {
 		return
 	}
 	observation, err := runtime.ReadAuthorityObservation()
@@ -1080,6 +1093,37 @@ func (runtime *Runtime) refreshAuthority() {
 		}
 		state.outbound = state.outbound[:0]
 	}
+}
+
+func (runtime *Runtime) disableStaleAuthorityOnCommittedRosterChange(state *runtimeAuthority) bool {
+	if runtime == nil || runtime.node == nil || state == nil {
+		return false
+	}
+	publication := runtime.node.Published()
+	confState := publication.ConfState
+	// Published is the applied control cut. Only a complete, stable voter set
+	// is allowed to retire an authority policy; transient joint/pending cuts
+	// remain on the existing invalidation path until their committed result is
+	// published.
+	if publication.ReplicaSetVersion == 0 || confState == nil ||
+		len(confState.GetVoters()) == 0 || len(confState.GetVotersOutgoing()) != 0 ||
+		len(confState.GetLearnersNext()) != 0 || confState.GetAutoLeave() {
+		return false
+	}
+	if slices.Equal(confState.GetVoters(), state.policy.Voters) {
+		return false
+	}
+	state.disabled = true
+	if state.round != nil {
+		state.round.Invalidate()
+		state.round = nil
+	}
+	if state.renewal != nil {
+		state.renewal.Invalidate()
+		state.renewal = nil
+	}
+	state.outbound = state.outbound[:0]
+	return true
 }
 
 func (runtime *Runtime) transferPending() bool {
