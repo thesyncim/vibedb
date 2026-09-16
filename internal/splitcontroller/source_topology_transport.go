@@ -275,7 +275,7 @@ func (client *SourceTopologyClient) ProbeReplicated(ctx context.Context, route g
 		return nil, ErrSourceTopology
 	}
 	return client.DoReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe, Authority: authority, Capability: capability,
-		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration}})
+		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration, Command: route.Command}})
 }
 
 func (client *SourceTopologyClient) roundTrip(ctx context.Context, connection rafttransport.PeerConnection, seed nodecontrol.BootstrapGatewaySeed, request sourceTopologyRequest) (*shardservice.ReplicatedResponse, error) {

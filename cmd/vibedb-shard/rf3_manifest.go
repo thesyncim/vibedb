@@ -47,16 +47,22 @@ type rf3Manifest struct {
 	TLS                 rf3ManifestTLS
 	AuthorizationPolicy string
 	GatewaySeeds        []nodecontrol.BootstrapGatewaySeed
-	ReplicaControl      rf3ManifestReplicaControl
-	SplitControl        rf3ManifestSplitControl
-	Gateway             *rf3ManifestGateway
-	Route               rf3ManifestGroupRoute
-	DevelopmentOnly     bool
-	ReadAuthority       *rf3ManifestReadAuthority
-	Members             [rf3ManifestMembers]rf3ManifestMember
-	MemberCount         uint8
-	EnrolledTarget      *rf3ManifestEnrolledTarget
-	Groups              []rf3ManifestGroup
+	// CanonicalSourceSeeds pins the physical shard-control listeners that can
+	// publish the authority-backed frontend-drain cut before any gateway has
+	// opened. They are deliberately separate from GatewaySeeds: a storage
+	// certificate must never be treated as a gateway principal.
+	CanonicalSourceSeeds []nodecontrol.BootstrapGatewaySeed
+	ReplicaControl       rf3ManifestReplicaControl
+	SplitControl         rf3ManifestSplitControl
+	CatalogGenesis       *rf3CatalogGenesisConfig
+	Gateway              *rf3ManifestGateway
+	Route                rf3ManifestGroupRoute
+	DevelopmentOnly      bool
+	ReadAuthority        *rf3ManifestReadAuthority
+	Members              [rf3ManifestMembers]rf3ManifestMember
+	MemberCount          uint8
+	EnrolledTarget       *rf3ManifestEnrolledTarget
+	Groups               []rf3ManifestGroup
 }
 
 type rf3ManifestGroup struct {
@@ -109,9 +115,11 @@ func (manifest rf3Manifest) withGroup(group rf3ManifestGroup) rf3Manifest {
 	split.ChildRegistry = group.ChildRegistry
 	selected := rf3Manifest{NodeLog: manifest.NodeLog, NodeIncarnation: manifest.NodeIncarnation, Digest: manifest.Digest, WAL: group.WAL, SQL: group.SQL, Listeners: manifest.Listeners,
 		TLS: manifest.TLS, AuthorizationPolicy: manifest.AuthorizationPolicy,
-		GatewaySeeds:   append([]nodecontrol.BootstrapGatewaySeed(nil), manifest.GatewaySeeds...),
-		ReplicaControl: manifest.ReplicaControl,
-		SplitControl:   split, Route: group.Route,
+		GatewaySeeds:         append([]nodecontrol.BootstrapGatewaySeed(nil), manifest.GatewaySeeds...),
+		CanonicalSourceSeeds: append([]nodecontrol.BootstrapGatewaySeed(nil), manifest.CanonicalSourceSeeds...),
+		ReplicaControl:       manifest.ReplicaControl,
+		SplitControl:         split, Route: group.Route,
+		CatalogGenesis:  manifest.CatalogGenesis,
 		Gateway:         manifest.Gateway,
 		DevelopmentOnly: manifest.DevelopmentOnly, ReadAuthority: manifest.ReadAuthority, Members: group.Members,
 		MemberCount: group.MemberCount, EnrolledTarget: group.EnrolledTarget}
@@ -377,6 +385,15 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 				return rf3Manifest{}, errInvalidRF3Manifest
 			}
 		}
+		if bytes.Equal(key.Raw().Bytes(), []byte(`"canonical_source_seeds"`)) {
+			if manifest.CanonicalSourceSeeds, err = parseRF3BootstrapGatewaySeeds(node); err != nil {
+				return rf3Manifest{}, err
+			}
+			key, node, present = fields.Next()
+			if !present {
+				return rf3Manifest{}, errInvalidRF3Manifest
+			}
+		}
 		if !bytes.Equal(key.Raw().Bytes(), []byte(`"replica_control"`)) {
 			return rf3Manifest{}, errInvalidRF3Manifest
 		}
@@ -393,6 +410,16 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		key, node, present = fields.Next()
 		if !present {
 			return rf3Manifest{}, errInvalidRF3Manifest
+		}
+		if bytes.Equal(key.Raw().Bytes(), []byte(`"catalog_genesis"`)) {
+			manifest.CatalogGenesis, err = parseRF3ManifestCatalogGenesis(node)
+			if err != nil {
+				return rf3Manifest{}, err
+			}
+			key, node, present = fields.Next()
+			if !present {
+				return rf3Manifest{}, errInvalidRF3Manifest
+			}
 		}
 		if bytes.Equal(key.Raw().Bytes(), []byte(`"read_authority"`)) {
 			manifest.ReadAuthority, err = parseRF3ManifestReadAuthority(node)
@@ -420,6 +447,18 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 			return rf3Manifest{}, err
 		}
 		if len(manifest.Groups) == 0 && (manifest.NodeIncarnation == 0 || len(manifest.GatewaySeeds) == 0) {
+			return rf3Manifest{}, errInvalidRF3Manifest
+		}
+		// A grouped production manifest is a physical-node publication. Its
+		// node log and incarnation are the sole durable source of process
+		// identity; accepting a group bundle without them would silently revive
+		// the old per-group/static-bootstrap path.
+		if len(manifest.Groups) != 0 &&
+			(manifest.NodeLog == nil || manifest.NodeIncarnation == 0) {
+			return rf3Manifest{}, errInvalidRF3Manifest
+		}
+		if manifest.NodeIncarnation == 0 &&
+			(len(manifest.GatewaySeeds) != 0 || len(manifest.CanonicalSourceSeeds) != 0) {
 			return rf3Manifest{}, errInvalidRF3Manifest
 		}
 		if err := validateRF3ReadAuthority(manifest.ReadAuthority, manifest.Groups, false); err != nil {
@@ -511,6 +550,16 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 	key, node, present = fields.Next()
 	if !present {
 		return rf3Manifest{}, errInvalidRF3Manifest
+	}
+	if bytes.Equal(key.Raw().Bytes(), []byte(`"catalog_genesis"`)) {
+		manifest.CatalogGenesis, err = parseRF3ManifestCatalogGenesis(node)
+		if err != nil {
+			return rf3Manifest{}, err
+		}
+		key, node, present = fields.Next()
+		if !present {
+			return rf3Manifest{}, errInvalidRF3Manifest
+		}
 	}
 	if bytes.Equal(key.Raw().Bytes(), []byte(`"read_authority"`)) {
 		manifest.ReadAuthority, err = parseRF3ManifestReadAuthority(node)

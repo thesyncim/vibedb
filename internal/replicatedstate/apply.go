@@ -1384,15 +1384,31 @@ func (m *Machine) planBundleCommandUnaccounted(
 			return plan, nil
 		}
 		if !m.mutableBindingMatchesState(command, state) {
-			// The terminal sequence cannot retain a stale completion because that
-			// would strand an active epoch at MaxUint64. Leave the session
-			// unchanged so the same sequence can be proposed with refreshed
-			// mutable fences. The Raft apply position still advances.
-			if command.ClientSequence == math.MaxUint64 {
-				plan.refusal = ErrStaleCommand
-				return plan, nil
+			// A released route-session pin is a narrow exception: its exact seq3
+			// route-gate outcome is retained beside the session ring, so seq4 can
+			// finish cleanup after a schema or placement fence advances. The
+			// predicate is derived entirely from replicated rows and the encoded
+			// seq4/ACK3 command; it is replay-stable and cannot be requested by an
+			// ordinary stale session.
+			settle, settleErr := m.routeSessionRetireCanSettleStale(
+				command, state, systemSnapshot, session, scratch,
+			)
+			if settleErr != nil {
+				return commandPlan{}, settleErr
 			}
-			plan.resultCode = ResultStaleFence
+			if !settle {
+				// The terminal sequence cannot retain a stale completion because that
+				// would strand an active epoch at MaxUint64. Leave the session
+				// unchanged so the same sequence can be proposed with refreshed
+				// mutable fences. The Raft apply position still advances.
+				if command.ClientSequence == math.MaxUint64 {
+					plan.refusal = ErrStaleCommand
+					return plan, nil
+				}
+				plan.resultCode = ResultStaleFence
+			} else {
+				plan.resultCode = ResultSessionRetired
+			}
 		} else {
 			plan.resultCode = ResultSessionRetired
 		}

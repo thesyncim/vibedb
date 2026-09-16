@@ -16,18 +16,34 @@ type GatewayTerminalRetirer interface {
 type CatalogGatewaySplitActions struct {
 	Authority SplitCatalogAuthority
 	Terminal  GatewayTerminalRetirer
+	// Refresh republishes the gateway's complete service/control cut after a
+	// catalog publication or terminal split retirement has settled. It is
+	// optional for library compositions that do not own a live gateway.
+	Refresh func(context.Context) error
 }
 
 func (actions CatalogGatewaySplitActions) ExecuteGatewaySplitAction(
 	ctx context.Context, plan *Plan, observed Observation, action Action,
 ) error {
 	if action.Kind == ActionComplete && actions.Terminal != nil {
-		return actions.Terminal.RetirePlan(ctx, observed.Catalog, plan, observed)
+		if err := actions.Terminal.RetirePlan(ctx, observed.Catalog, plan, observed); err != nil {
+			return err
+		}
+		if actions.Refresh != nil {
+			return actions.Refresh(ctx)
+		}
+		return nil
 	}
 	if actions.Authority == nil || action.Kind != ActionPublishCatalog {
 		return ErrControllerTrigger
 	}
-	return ExecutePublishCatalog(ctx, plan, observed, actions.Authority)
+	if err := ExecutePublishCatalog(ctx, plan, observed, actions.Authority); err != nil {
+		return err
+	}
+	if actions.Refresh != nil {
+		return actions.Refresh(ctx)
+	}
+	return nil
 }
 
 type PlanAdmissionNodeClient interface {

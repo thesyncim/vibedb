@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibejson"
 )
@@ -300,13 +301,20 @@ func TestParseRF3ManifestCanonicalMultiGroupBundles(t *testing.T) {
 }
 
 func TestParseRF3ManifestSharedKeyRequiresExactNodeLogBinding(t *testing.T) {
-	shared := strings.ReplaceAll(multiGroupRF3Manifest(t), "/run/secrets/vibedb-wal-key-2", "/run/secrets/vibedb-wal-key")
+	shared := multiGroupRF3Manifest(t)
+	nodeLogStart := strings.Index(shared, "  \"node_log\":")
+	listenersStart := strings.Index(shared, "  \"listeners\":")
+	if nodeLogStart < 0 || listenersStart <= nodeLogStart {
+		t.Fatal("managed multi-group fixture lost physical node prefix")
+	}
+	shared = shared[:nodeLogStart] + shared[listenersStart:]
+	shared = strings.ReplaceAll(shared, "/run/secrets/vibedb-wal-key-2", "/run/secrets/vibedb-wal-key")
 	node := rf3NodeLogManifest{Format: 1, Path: "/srv/node/node-log", KeyID: "production-key-1", KeyMaterialPath: "/run/secrets/vibedb-wal-key"}
 	encoded, err := vibejson.Marshal(&node)
 	if err != nil {
 		t.Fatal(err)
 	}
-	document := strings.Replace(shared, "{\n", "{\n  \"node_log\": "+string(encoded)+",\n", 1)
+	document := strings.Replace(shared, "{\n", "{\n  \"node_log\": "+string(encoded)+",\n  \"node_incarnation\": 1,\n", 1)
 	parsed, err := parseRF3Manifest([]byte(document))
 	if err != nil || len(parsed.Groups) != 2 {
 		t.Fatalf("shared physical key refused: groups=%d err=%v", len(parsed.Groups), err)
@@ -342,6 +350,12 @@ func multiGroupRF3Manifest(t testing.TB) string {
 	}
 	registry := common[registryStart:registryEnd]
 	common = common[:registryStart] + `    "max_operations": 8` + common[registryEnd:]
+	nodeLog, err := vibejson.Marshal(&rf3NodeLogManifest{Format: 1, Path: "/srv/vibedb/node-log",
+		KeyID: "production-key-1", KeyMaterialPath: "/run/secrets/vibedb-node-key",
+		Options: raftstore.NodeStoreOptions{MaxGroups: 64}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	roster := strings.TrimSuffix(canonicalRF3Manifest[members:], "\n}")
 	first := "{\n" + walSQL + registry + "," + roster + "\n  }"
 	second := strings.ReplaceAll(first, "/srv/vibedb/member", "/srv/vibedb/second/member")
@@ -357,7 +371,7 @@ func multiGroupRF3Manifest(t testing.TB) string {
 		`"membership_grant_path": "/srv/vibedb/second/membership-grant"`, 1)
 	second = strings.ReplaceAll(second, "/srv/vibedb/split-children", "/srv/vibedb/second/split-children")
 	second = strings.ReplaceAll(second, "/run/secrets/vibedb-wal-key", "/run/secrets/vibedb-wal-key-2")
-	return "{\n" + common + "  \"groups\": [\n  " + first + ",\n  " + second + "\n  ]\n}"
+	return "{\n  \"node_log\": " + string(nodeLog) + ",\n  \"node_incarnation\": 1,\n" + common + "  \"groups\": [\n  " + first + ",\n  " + second + "\n  ]\n}"
 }
 
 func TestParseRF3ManifestRetainsOneEnrolledTargetOutsideServingRF3(t *testing.T) {

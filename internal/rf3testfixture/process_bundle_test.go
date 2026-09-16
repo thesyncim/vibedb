@@ -3,8 +3,13 @@ package rf3testfixture
 import (
 	"bytes"
 	"errors"
+	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
+	"github.com/thesyncim/vibedb/internal/raftstore"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -130,5 +135,36 @@ func TestCombineProcessManifestsRejectsInvalidSplitControl(t *testing.T) {
 		if _, err := CombineProcessManifests(base, bad); !errors.Is(err, ErrProcessManifestBundle) {
 			t.Fatalf("shared control drift %s error=%v", pair[0], err)
 		}
+	}
+}
+
+func TestCombineProcessManifestsWithNodeMetadataPreservesPhysicalGenesis(t *testing.T) {
+	seedNode := rafttransport.NodeID{1}
+	seed := nodecontrol.BootstrapGatewaySeed{NodeID: seedNode, Incarnation: 1,
+		ControlAddress: "127.0.0.1:7701", SPKIPinDigest: replication.Digest{2}}
+	metadata := ProcessNodeMetadata{
+		NodeLog: ProcessNodeLogManifest{Format: 1, Path: filepath.Join(t.TempDir(), "node-log"),
+			KeyID: "node-key", KeyMaterialPath: filepath.Join(t.TempDir(), "node-key-material"),
+			Options: raftstore.NodeStoreOptions{MaxGroups: 64}},
+		NodeIncarnation:      1,
+		CanonicalSourceSeeds: []nodecontrol.BootstrapGatewaySeed{seed},
+		CatalogGenesis:       []byte(`{"plan_path":"/tmp/plan","catalog_path":"/tmp/catalog","initial_node_directory":"/tmp/directory","session_journal":"/tmp/session","client_id":"0102030405060708090a0b0c0d0e0f10","retry_home":"0102030405060708","distribution":"catalog","shard":"controlplane","cluster_id":"0102030405060708090a0b0c0d0e0f10","cluster_incarnation":"1112131415161718191a1b1c1d1e1f20","topology_recovery_epoch":1,"allocation_generation":1,"shard_incarnation":"2122232425262728292a2b2c2d2e2f30","group_id":"3132333435363738393a3b3c3d3e3f40","member_id":1,"store_id":"4142434445464748494a4b4c4d4e4f50","node_id":"0102030405060708090a0b0c0d0e0f10","node_incarnation":1,"relation":1}`),
+	}
+	raw, err := CombineProcessManifestsWithNodeMetadata(metadata,
+		processBundleTestManifest(), processBundleTestManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := vibejson.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"node_log", "node_incarnation", "canonical_source_seeds", "catalog_genesis", "groups"} {
+		if _, found := parsed.Get(name); !found {
+			t.Fatalf("combined managed manifest lost %q", name)
+		}
+	}
+	if position := bytes.Index(raw, []byte(`"split_control"`)); position < 0 || bytes.Index(raw[position:], []byte(`"catalog_genesis"`)) < 0 {
+		t.Fatal("catalog genesis was not placed after split control")
 	}
 }

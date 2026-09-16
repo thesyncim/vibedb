@@ -859,7 +859,7 @@ func (executor *ReplicatedExecutor) readEndpoint(
 		response, err := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
 			Operation: shardservice.ReplicatedProbe, Capability: capability,
 			Fence: shardservice.ReplicatedFence{Group: route.Group,
-				AllocationGeneration: route.AllocationGeneration},
+				AllocationGeneration: route.AllocationGeneration, Command: route.Command},
 		})
 		if err != nil || response == nil || response.Kind != shardservice.ReplicatedHandshake ||
 			!validReplicatedResponseState(response) ||
@@ -1709,6 +1709,11 @@ func (executor *ReplicatedExecutor) discoverLeaderFresh(
 			member = 0
 			continue
 		}
+		if validReplicatedUnavailableWithoutState(response) {
+			joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
+			member = 0
+			continue
+		}
 		if validReplicatedUnauthorizedWithoutState(response) {
 			return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{},
 				&ReplicatedRefusalError{Code: response.Refusal}
@@ -1766,6 +1771,11 @@ func (executor *ReplicatedExecutor) discoverMembershipLeaderFresh(
 		response, observedEndpoint, err := executor.probeReplicated(ctx, route.Serving, endpoint, capability)
 		if err != nil {
 			joined = errors.Join(joined, err)
+			member = 0
+			continue
+		}
+		if validReplicatedUnavailableWithoutState(response) {
+			joined = errors.Join(joined, &ReplicatedRefusalError{Code: response.Refusal})
 			member = 0
 			continue
 		}

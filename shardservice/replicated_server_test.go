@@ -109,7 +109,8 @@ func TestReplicatedServerLiveServingAuthorityGatesEveryRequest(t *testing.T) {
 	request := &ReplicatedRequest{
 		Operation: ReplicatedProbe,
 		Fence: ReplicatedFence{Group: owner.state.Identity.Group,
-			AllocationGeneration: owner.state.Identity.AllocationGeneration},
+			AllocationGeneration: owner.state.Identity.AllocationGeneration,
+			Command:              owner.state.Command},
 	}
 	if response := server.executeReplicated(t.Context(), request); response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalUnavailable ||
 		!response.HasState {

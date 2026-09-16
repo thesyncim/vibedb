@@ -481,6 +481,7 @@ func TestClusterDevReplicaFlagsRejectAmbiguity(t *testing.T) {
 	for _, args := range [][]string{
 		{"--root", root, "--replicas", "2"},
 		{"--root", root, "--nodes", "0"},
+		{"--root", root, "--physical-nodes", "0"},
 		{"--root", root, "--replicas", "1", "--nodes", "3"},
 		{"--root", root, "--replicas", "1", "--pg-listen", "127.0.0.1:7432"},
 		{"--root", root, "--pg-listen", "0.0.0.0:7432"},

@@ -1,0 +1,148 @@
+package gatewayruntime
+
+import (
+	"context"
+	cryptorand "crypto/rand"
+	"errors"
+	"fmt"
+	"slices"
+
+	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/frontenddrain"
+)
+
+// publishCanonicalFrontendDrainCut distributes a complete catalog/service cut
+// after a publication callback. A cut without a drain subject is a normal
+// recovery/publication install: the exact InstallExact request carries zero
+// DrainID and GrantDigest and never invents a child proof.
+//
+// The source and roster are re-read after every round. A concurrent catalog or
+// receiver change is folded into the next bounded round, so callers only
+// report publication complete after the same cut is installed everywhere that
+// is currently serving physical routes or storage bindings.
+func (runtime *Runtime) publishCanonicalFrontendDrainCut(
+	ctx context.Context, nodeCut gateway.NodeDirectoryCut, sourceCut frontenddrain.PreparedAckCut,
+	catalog *gateway.Snapshot,
+) error {
+	if runtime == nil || ctx == nil || !nodeCut.Valid() || !sourceCut.Valid() ||
+		catalog == nil || catalog.Generation() != sourceCut.CatalogGeneration ||
+		nodeCut.Revision != sourceCut.DirectoryRevision ||
+		nodeCut.Digest != sourceCut.DirectoryDigest ||
+		nodeCut.CatalogGeneration != sourceCut.CatalogGeneration {
+		return fmt.Errorf("%w: invalid canonical publication input", gateway.ErrScalingRevision)
+	}
+	currentNodes, currentCut, currentCatalog := nodeCut, sourceCut, catalog
+	const maxPublicationRounds = 3
+	var lastPublishErr error
+	for round := 0; round < maxPublicationRounds; round++ {
+		publishErr := runtime.publishCanonicalFrontendDrainCutOnce(ctx, currentNodes, currentCut, currentCatalog)
+		if publishErr == nil {
+			return nil
+		}
+		lastPublishErr = publishErr
+		moved := errors.Is(publishErr, frontenddrain.ErrPreparedAckCutMoved)
+		revision := errors.Is(publishErr, gateway.ErrScalingRevision) && !errors.Is(publishErr, gateway.ErrScalingIdentity)
+		if !moved && !revision {
+			return publishErr
+		}
+		if round+1 == maxPublicationRounds {
+			return publishErr
+		}
+		projection, readErr := runtime.readLiveControlDirectoryProjection(ctx)
+		if readErr != nil {
+			return readErr
+		}
+		if !projection.fullCut.Valid() {
+			return fmt.Errorf("%w: reread canonical publication cut is invalid after round=%d initial-directory=%d initial-digest=%x initial-catalog=%d initial-full=%x",
+				gateway.ErrScalingRevision, round, currentNodes.Revision, currentNodes.Digest,
+				currentNodes.CatalogGeneration, currentCut.Digest())
+		}
+		if projection.fullCut.Digest() == currentCut.Digest() {
+			// A moved response is retryable only after the authority has
+			// advanced. Never spin the same exact request against an unchanged
+			// floor after a lost/ambiguous receiver response.
+			return publishErr
+		}
+		// Keep the local semantic receiver at the same complete cut that the
+		// next physical round will install. This call is intentionally below
+		// refreshLiveControlDirectory's mutex; the caller already owns it.
+		if applyErr := runtime.applyLiveControlDirectoryProjection(ctx, projection); applyErr != nil {
+			return applyErr
+		}
+		currentNodes = gateway.NodeDirectoryCut{
+			Revision: projection.cut.Revision, Digest: projection.fullCut.DirectoryDigest,
+			CatalogGeneration: projection.cut.CatalogGeneration, Nodes: slices.Clone(projection.cut.Nodes),
+		}
+		currentCut = projection.fullCut
+		currentCatalog = projection.catalog
+	}
+	if lastPublishErr != nil {
+		return lastPublishErr
+	}
+	return fmt.Errorf("%w: canonical publication exhausted without a round", gateway.ErrScalingRevision)
+}
+
+func (runtime *Runtime) publishCanonicalFrontendDrainCutOnce(
+	ctx context.Context, nodeCut gateway.NodeDirectoryCut, sourceCut frontenddrain.PreparedAckCut,
+	catalog *gateway.Snapshot,
+) error {
+	if runtime == nil || ctx == nil || runtime.config.TLSProfile == nil ||
+		runtime.config.Authorization == nil || !nodeCut.Valid() || !sourceCut.Valid() ||
+		catalog == nil || catalog.Generation() != sourceCut.CatalogGeneration ||
+		nodeCut.Revision != sourceCut.DirectoryRevision ||
+		nodeCut.Digest != sourceCut.DirectoryDigest ||
+		nodeCut.CatalogGeneration != sourceCut.CatalogGeneration {
+		return fmt.Errorf("%w: invalid canonical publication input", gateway.ErrScalingRevision)
+	}
+	receivers, err := runtime.frontendDrainPreparedAckServingReceiversFromServiceCut(
+		nodeCut, catalog, &sourceCut.ServiceDirectory,
+	)
+	if err != nil {
+		return fmt.Errorf("derive canonical prepared-ack receiver roster: %w", err)
+	}
+	// A source with no serving physical receiver has nothing to install. This
+	// is valid for a gateway-only control-plane cut and avoids requiring a
+	// fabricated gateway publisher merely to acknowledge an empty roster.
+	if len(receivers) != 0 {
+		sourcePrincipal, sourceKey, ok := runtime.frontendDrainPreparedAckPublisher(sourceCut)
+		if !ok {
+			return gateway.ErrScalingIdentity
+		}
+		for _, receiver := range receivers {
+			var nonce [16]byte
+			if _, err := cryptorand.Read(nonce[:]); err != nil {
+				return err
+			}
+			request := frontenddrain.PreparedAckRequest{
+				Nonce: nonce, SourcePrincipal: sourcePrincipal, SourcePrincipalKeyDigest: sourceKey,
+				ReceiverNode: receiver.node.NodeID, ReceiverIncarnation: receiver.node.Incarnation,
+				ReceiverServiceKeyDigest: [32]byte(receiver.node.ServiceKeyDigest),
+				ReceiverNodeRevision:     receiver.node.Revision, SourceCut: sourceCut,
+			}
+			if !request.Valid() {
+				return gateway.ErrScalingState
+			}
+			if err := runtime.acknowledgeFrontendDrainPreparedAckPhysicalReceiver(ctx, receiver, request); err != nil {
+				return fmt.Errorf("prepared-ack receiver %s incarnation %d: %w", receiver.node.NodeID,
+					receiver.node.Incarnation, err)
+			}
+		}
+	}
+	latest, err := runtime.readLiveControlDirectoryProjection(ctx)
+	if err != nil || !latest.fullCut.Valid() {
+		if err != nil {
+			return fmt.Errorf("read canonical publication cut after receiver barrier: %w", err)
+		}
+		return fmt.Errorf("%w: canonical publication cut after receiver barrier is invalid", gateway.ErrScalingRevision)
+	}
+	if latest.cut.Revision != nodeCut.Revision || latest.fullCut.DirectoryDigest != nodeCut.Digest ||
+		latest.cut.CatalogGeneration != nodeCut.CatalogGeneration ||
+		!slices.Equal(latest.cut.Nodes, nodeCut.Nodes) ||
+		latest.fullCut.Digest() != sourceCut.Digest() {
+		return fmt.Errorf("%w: canonical source cut changed during receiver barrier initial directory=%d digest=%x catalog=%d full=%x latest directory=%d digest=%x catalog=%d full=%x",
+			gateway.ErrScalingRevision, nodeCut.Revision, nodeCut.Digest, nodeCut.CatalogGeneration,
+			sourceCut.Digest(), latest.cut.Revision, latest.fullCut.DirectoryDigest,
+			latest.cut.CatalogGeneration, latest.fullCut.Digest())
+	}
+	return nil
+}

@@ -116,7 +116,8 @@ func TestRF3NativeAuthoritiesKeepRestoreExceptionGroupScoped(t *testing.T) {
 		t.Fatal("restore gate leaked between groups")
 	}
 	request := shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe, Capability: serviceauthz.CapabilityTopology,
-		Authority: serviceauthz.Authority{Node: [16]byte{10}, Generation: 1}, Fence: shardservice.ReplicatedFence{Group: group}}
+		Authority: serviceauthz.Authority{Node: [16]byte{10}, Generation: 1}, Fence: shardservice.ReplicatedFence{
+			Group: group, AllocationGeneration: states[1].Identity.AllocationGeneration, Command: states[1].Command}}
 	if !authority.transitional(states[1], &request) {
 		t.Fatal("secondary restored catalog bootstrap refused")
 	}

@@ -2,8 +2,11 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
@@ -96,5 +99,63 @@ func TestCatalogServiceFencesExcludeUnprovenSQLRoles(t *testing.T) {
 				t.Fatalf("pin=%t recovery=%t", pin, recovery)
 			}
 		})
+	}
+}
+
+// Keep the directory resource bound tied to the real catalog expansion path.
+// Each placed replicated group owns catalog read/write and recovery scopes;
+// this deliberately crosses the former action-shaped 32-entry ceiling.
+func TestCatalogServiceFencesSupportCatalogBeyondThirtyTwoResources(t *testing.T) {
+	authority, _, snapshot := newCatalogAuthorityFixture(t)
+	config := cloneConfig(snapshot.config)
+	base := snapshot.ReplicatedShardDescriptors()[0]
+	baseManifest := config.Manifests[0]
+	shards := make([]distribution.Shard, 0, baseManifest.ShardCount())
+	for index := 0; index < baseManifest.ShardCount(); index++ {
+		shard, ok := baseManifest.ShardInfo(index)
+		if !ok {
+			t.Fatalf("missing fixture shard %d", index)
+		}
+		shards = append(shards, shard)
+	}
+	descriptors := []ReplicatedShardDescriptor{base}
+	for index := 0; index < 11; index++ {
+		name := distribution.DistributionName(fmt.Sprintf("fence_growth_%02d", index))
+		manifest, err := distribution.NewManifest(name, baseManifest.Version(), shards)
+		if err != nil {
+			t.Fatal(err)
+		}
+		config.Manifests = append(config.Manifests, manifest)
+		config.Distributions = append(config.Distributions, distribution.DistributionSpec{Name: name, Arity: 1, MapperVersion: 1})
+		config.Placements = append(config.Placements, distribution.TablePlacement{Table: fmt.Sprintf("fence_growth_%02d", index), Distribution: name, Columns: []string{"/tenant_id"}})
+		descriptor := base
+		descriptor.Distribution = name
+		descriptor.Group.GroupID[0] = byte(index + 1)
+		descriptor.Group.ShardIncarnation[0] = byte(index + 1)
+		descriptor.Command.RelationManifestDigest[0] = byte(index + 1)
+		descriptor.RangeIdentity[0] = byte(index + 1)
+		descriptor.LineageDigest[0] = byte(index + 1)
+		descriptor.ForwardingRuleDigest[0] = byte(index + 1)
+		// The placement alone grants catalog read/write and transaction recovery;
+		// avoid inventing overlapping ledger ranges in this multi-table fixture.
+		descriptor.RequestLedgerRanges = nil
+		descriptors = append(descriptors, descriptor)
+	}
+	grown, err := NewSnapshotWithReplicatedMetadata(config, snapshot.endpoints, snapshot.Generation()+1, nil, nil, descriptors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority.holder = NewCatalogHolder(grown)
+	fences, generation, err := authority.CatalogServiceFences(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generation != grown.Generation() || len(fences) <= 32 {
+		t.Fatalf("catalog generation=%d fences=%d; expected real catalog fence set beyond legacy bound", generation, len(fences))
+	}
+	for _, fence := range fences {
+		if fence.Action == 0 || fence.Operation == 0 || fence.Group == (raftmember.GroupKey{}) || fence.FenceDigest == ([32]byte{}) {
+			t.Fatalf("catalog builder emitted incomplete fence: %+v", fence)
+		}
 	}
 }

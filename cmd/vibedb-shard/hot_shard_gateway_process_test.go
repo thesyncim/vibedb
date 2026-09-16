@@ -28,6 +28,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/hotshard"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
@@ -88,6 +89,7 @@ type gatewayHotShardLiveFixture struct {
 	clientNode        rafttransport.NodeID
 	gatewayNode       rafttransport.NodeID
 	authority         sqldriver.ReplicatedAuthorityProfile
+	command           raftservice.CommandFence
 	grantClient       *shardservice.MembershipGrantControlClient
 }
 
@@ -95,10 +97,10 @@ func runGatewayHotShardLiveChild(t testing.TB, fixture gatewayHotShardLiveFixtur
 	t.Helper()
 	states := make([]shardservice.ReplicatedMemberState, rf3CommandMembers)
 	for index := range states {
-		state, err := probeRF3CommandMember(t.Context(), fixture.nativeAddresses[index],
+		state, err := probeRF3CommandMemberWithCommand(t.Context(), fixture.nativeAddresses[index],
 			fixture.nodes[index], fixture.clientProfile, fixture.clientNode, fixture.group,
 			rf3CommandStoreIdentity(1).AllocationGeneration,
-			fixture.authority.ActivePolicyGeneration)
+			fixture.authority.ActivePolicyGeneration, fixture.command)
 		if err != nil {
 			t.Fatalf("probe member %d: %v", index+1, err)
 		}
@@ -388,9 +390,10 @@ func gatewayHotShardSeedFailureDiagnostics(t testing.TB, fixture gatewayHotShard
 		child.mu.Unlock()
 		t.Logf("seed grant member=%d exited=%t process_error=%v\n%s", child.member, exited, waitErr, child.diagnostic.String())
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		state, err := probeRF3CommandMember(ctx, fixture.nativeAddresses[index], fixture.nodes[index],
+		state, err := probeRF3CommandMemberWithCommand(ctx, fixture.nativeAddresses[index], fixture.nodes[index],
 			fixture.clientProfile, fixture.clientNode, fixture.group,
-			rf3CommandStoreIdentity(1).AllocationGeneration, fixture.authority.ActivePolicyGeneration)
+			rf3CommandStoreIdentity(1).AllocationGeneration, fixture.authority.ActivePolicyGeneration,
+			fixture.command)
 		cancel()
 		t.Logf("seed grant member=%d native_probe_error=%v state=%+v", child.member, err, state)
 	}
@@ -525,7 +528,7 @@ func gatewayHotShardLiveAuthority(
 		Shard: string(gateway.ReplicatedCatalogShard), Tenant: []byte{1}, ClientID: clientID,
 		RetryHome: retryHome, Resolver: gateway.BaseRelationResolver{Relation: 1}, Journal: journal,
 		ProposalCapability: serviceauthz.CapabilityTopology, MaxRelationBatches: 1,
-		MaxMutations: rf3CommandMembers + 3, InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
+		MaxMutations: rf3CommandMembers + 4, InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
 	})
 	if err != nil {
 		t.Fatal(err)

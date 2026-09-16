@@ -37,6 +37,8 @@ type ScalingOperatorBackend struct {
 	directory          gateway.DirectoryReader
 	writer             gateway.DirectoryWriter
 	catalog            scalingCatalogReader
+	drain              ScalingFrontendDrainPreparer
+	controllerNode     rafttransport.NodeID
 	distributedMetrics *gateway.DistributedMetrics
 }
 
@@ -44,7 +46,13 @@ func NewScalingOperatorBackend(controller *ScalingController) (*ScalingOperatorB
 	if controller == nil || controller.directory == nil || controller.writer == nil || controller.catalog == nil {
 		return nil, errClusterControlUnavailable
 	}
-	return newScalingOperatorBackend(controller.directory, controller.writer, controller.catalog)
+	backend, err := newScalingOperatorBackend(controller.directory, controller.writer, controller.catalog)
+	if err != nil {
+		return nil, err
+	}
+	backend.drain = controller.drain
+	backend.controllerNode = controller.controllerNode
+	return backend, nil
 }
 
 // Participants expose the same durable operator API without starting another
@@ -142,7 +150,8 @@ func (backend *ScalingOperatorBackend) submitDecommission(ctx context.Context, r
 		return [32]byte{}, err
 	}
 	drain := gateway.NodeReference{NodeID: nodeID, Incarnation: request.NodeIncarnation}
-	if _, err = backend.directory.ReadNode(ctx, nodeID, request.NodeIncarnation); err != nil {
+	node, err := backend.directory.ReadNode(ctx, nodeID, request.NodeIncarnation)
+	if err != nil {
 		return [32]byte{}, err
 	}
 	intent, err := backend.newIntent(ctx, gateway.ScalingDecommission, request.RequestID, drain, nil, 0, 4096, 1<<62, 0)
@@ -153,6 +162,25 @@ func (backend *ScalingOperatorBackend) submitDecommission(ctx context.Context, r
 	if err != nil {
 		return [32]byte{}, err
 	}
+	if backend.controllerNode != (rafttransport.NodeID{}) && nodeID == backend.controllerNode {
+		const detail = "the sole configured topology controller must remain serving; controller handoff is not configured"
+		current, readErr := backend.directory.ReadScalingIntent(ctx, operation)
+		if readErr != nil {
+			return operation, readErr
+		}
+		blocker := gateway.ScalingBlocker{Code: "sole_designated_controller", Detail: detail,
+			Node: nodeID, Revision: node.Revision}
+		if len(current.Blockers) != 1 || current.Blockers[0] != blocker {
+			next := current
+			next.Blockers = []gateway.ScalingBlocker{blocker}
+			next.Revision++
+			next.DirectoryRevision = next.Revision
+			if putErr := backend.writer.PutScalingIntent(ctx, next, current.Revision); putErr != nil {
+				return operation, putErr
+			}
+		}
+		return operation, fmt.Errorf("%w: %s", ErrScalingControllerBlocked, detail)
+	}
 	// Persist the intent first. This ordering makes a crash after the CAS
 	// visible to the controller and prevents a drained node from being
 	// mistaken for an operator request that was never admitted.
@@ -161,10 +189,41 @@ func (backend *ScalingOperatorBackend) submitDecommission(ctx context.Context, r
 		return operation, readErr
 	}
 	if node.Lifecycle == gateway.NodeActive {
-		node.Lifecycle = gateway.NodeDraining
-		node.Revision++
-		if putErr := backend.writer.PutNode(ctx, node, node.Revision-1); putErr != nil {
-			return operation, putErr
+		if node.Roles&gateway.NodeRoleGateway != 0 {
+			if backend.drain == nil {
+				return operation, errors.New("gateway frontend drain preparer is unavailable")
+			}
+			if prepareErr := backend.drain.PrepareFrontendDrain(ctx, node); prepareErr != nil {
+				return operation, prepareErr
+			}
+			enforcer, ok := backend.writer.(gateway.FrontendDrainLifecycleEnforcer)
+			if !ok {
+				return operation, errors.New("gateway frontend drain enforcer is unavailable")
+			}
+			drainID := gateway.NewFrontendDrainID(intent.ID, drain)
+			if drainID == ([32]byte{}) {
+				return operation, gateway.ErrScalingIdentity
+			}
+			if enforceErr := enforcer.EnforceFrontendDrain(ctx, drainID, nodeID, request.NodeIncarnation, node.Revision); enforceErr != nil {
+				return operation, enforceErr
+			}
+			if refresher, ok := backend.drain.(interface {
+				RefreshFrontendDrainIdentity(context.Context, gateway.NodeRecord) error
+			}); ok {
+				refreshed, readErr := backend.directory.ReadNode(ctx, nodeID, request.NodeIncarnation)
+				if readErr != nil {
+					return operation, readErr
+				}
+				if refreshErr := refresher.RefreshFrontendDrainIdentity(ctx, refreshed); refreshErr != nil {
+					return operation, refreshErr
+				}
+			}
+		} else {
+			node.Lifecycle = gateway.NodeDraining
+			node.Revision++
+			if putErr := backend.writer.PutNode(ctx, node, node.Revision-1); putErr != nil {
+				return operation, putErr
+			}
 		}
 	} else if node.Lifecycle != gateway.NodeDraining && node.Lifecycle != gateway.NodeDecommissioned {
 		return operation, fmt.Errorf("node %s is not active or draining", request.NodeID)
@@ -228,8 +287,9 @@ func (backend *ScalingOperatorBackend) nodesResponse(ctx context.Context, respon
 	response.CatalogGeneration = generation
 	response.DirectoryRevision = revision
 	response.Nodes = make([]clustercontrol.NodeStatus, 0, len(nodes))
+	acknowledged := backend.terminalDrainAcknowledgements(ctx)
 	for _, node := range nodes {
-		status := backend.nodeStatus(ctx, node)
+		status := backend.nodeStatus(ctx, node, acknowledged[NodeReferenceKey{NodeID: node.NodeID, Incarnation: node.Incarnation}])
 		response.Nodes = append(response.Nodes, status)
 	}
 	return response
@@ -308,11 +368,25 @@ func (backend *ScalingOperatorBackend) observeOnce(ctx context.Context, response
 				response.Evidence = clusterEvidence(fresh)
 				response.RetiringReferences = nodeReferenceCount(evidence)
 				if node.Lifecycle == gateway.NodeDecommissioned {
-					fresh.DrainAcknowledged = true
-					fresh.RetiredAcknowledged = true
-					fresh.CatalogControlMigrated = true
-					response.Evidence = clusterEvidence(fresh)
-					response.SafeToStop = fresh.SafeToStop()
+					// A terminal node record proves only the lifecycle CAS and
+					// reference scan. The final exact-cut acknowledgement remains
+					// durable evidence on the intent; status must never synthesize
+					// it from HasRetirementProof alone.
+					if terminalDrainAcknowledgementMatches(intent.Evidence, node, evidence) {
+						fresh.DrainAcknowledged = intent.Evidence.DrainAcknowledged
+						fresh.RetiredAcknowledged = intent.Evidence.RetiredAcknowledged
+						fresh.CatalogControlMigrated = intent.Evidence.CatalogControlMigrated
+						response.Evidence = clusterEvidence(fresh)
+						response.SafeToStop = fresh.SafeToStop()
+					} else {
+						response.SafeToStop = false
+						response.Blockers = append(response.Blockers, clustercontrol.Blocker{
+							Code:   "frontend_drain_terminal_ack_pending",
+							Detail: "terminal exact cut acknowledgement is not durable",
+							NodeID: nodeIDHex(node.NodeID), NodeIncarnation: node.Incarnation,
+							Revision: node.Revision,
+						})
+					}
 				} else {
 					// Draining is an admission fence, never a stop proof. The
 					// terminal RetireNode CAS is the only point that can make this
@@ -520,8 +594,10 @@ func (backend *ScalingOperatorBackend) nodeStatuses(ctx context.Context) ([]clus
 		return bytesCompareNodeRecords(left, right)
 	})
 	result := make([]clustercontrol.NodeStatus, 0, len(nodes))
+	acknowledged := backend.terminalDrainAcknowledgements(ctx)
 	for _, node := range nodes {
-		result = append(result, backend.nodeStatus(ctx, node))
+		result = append(result, backend.nodeStatus(ctx, node,
+			acknowledged[NodeReferenceKey{NodeID: node.NodeID, Incarnation: node.Incarnation}]))
 	}
 	return result, generation, revision
 }
@@ -574,19 +650,81 @@ func bytesCompareNodeRecords(left, right gateway.NodeRecord) int {
 	return 0
 }
 
-func (backend *ScalingOperatorBackend) nodeStatus(ctx context.Context, node gateway.NodeRecord) clustercontrol.NodeStatus {
+// NodeReferenceKey identifies the physical incarnation used by a terminal
+// acknowledgement. It keeps status projections independent of a stale
+// operator intent's textual title or request ordering.
+type NodeReferenceKey struct {
+	NodeID      rafttransport.NodeID
+	Incarnation uint64
+}
+
+func (backend *ScalingOperatorBackend) terminalDrainAcknowledgements(
+	ctx context.Context,
+) map[NodeReferenceKey]gateway.SafeToStopEvidence {
+	result := make(map[NodeReferenceKey]gateway.SafeToStopEvidence)
+	if backend == nil || backend.directory == nil || ctx == nil {
+		return result
+	}
+	intents, err := backend.directory.ListScalingIntents(ctx)
+	if err != nil {
+		return result
+	}
+	terminal, historyErr := backend.directory.ListScalingTerminalIntents(ctx)
+	if historyErr == nil {
+		intents = append(intents, terminal...)
+	}
+	for _, intent := range intents {
+		if intent.Request.Kind != gateway.ScalingDecommission || !intent.Request.Drain.Valid() ||
+			!intent.Evidence.RetiredAcknowledged {
+			continue
+		}
+		key := NodeReferenceKey{NodeID: intent.Request.Drain.NodeID, Incarnation: intent.Request.Drain.Incarnation}
+		result[key] = intent.Evidence
+	}
+	return result
+}
+
+func (backend *ScalingOperatorBackend) nodeStatus(
+	ctx context.Context, node gateway.NodeRecord, acknowledged gateway.SafeToStopEvidence,
+) clustercontrol.NodeStatus {
 	status := clustercontrol.NodeStatus{NodeID: nodeIDHex(node.NodeID), Incarnation: node.Incarnation,
 		Lifecycle: lifecycleName(node.Lifecycle), Revision: node.Revision, CatalogGeneration: node.CatalogGeneration}
 	if node.Lifecycle == gateway.NodeDecommissioned {
 		if evidence, err := backend.scanNodeStatusReferences(ctx, node); err == nil {
 			proof := scalingEvidenceFromNode(evidence)
-			proof.DrainAcknowledged = true
-			proof.RetiredAcknowledged = true
-			proof.CatalogControlMigrated = true
-			status.SafeToStop = proof.SafeToStop()
+			if terminalDrainAcknowledgementMatches(acknowledged, node, evidence) {
+				proof.DrainAcknowledged = acknowledged.DrainAcknowledged
+				proof.RetiredAcknowledged = acknowledged.RetiredAcknowledged
+				proof.CatalogControlMigrated = acknowledged.CatalogControlMigrated
+				status.SafeToStop = proof.SafeToStop()
+			}
 		}
 	}
 	return status
+}
+
+// terminalDrainAcknowledgementMatches binds the persisted terminal ACK to the
+// current physical identity and fresh zero-reference cut. Completion removes
+// the active scaling/enrollment/operation rows as part of its own CAS fences,
+// so those three mutable directory digests and the aggregate witness digest
+// are expected to advance after the ACK is retained. The node-directory,
+// catalog-head, generation, and every reference count remain exact fences.
+func terminalDrainAcknowledgementMatches(
+	ack gateway.SafeToStopEvidence, node gateway.NodeRecord, reference gateway.NodeReferenceEvidence,
+) bool {
+	return ack.NodeID == node.NodeID && ack.NodeIncarnation == node.Incarnation &&
+		ack.RetiredAcknowledged && ack.SafeToStop() &&
+		ack.ScanCatalogGeneration == reference.CatalogGeneration &&
+		ack.ScanDirectoryRevision == reference.DirectoryCutRevision &&
+		ack.ScanDirectoryDigest == reference.DirectoryCutDigest &&
+		ack.CatalogHeadDigest == reference.CatalogHeadDigest &&
+		ack.ServingReplicas == reference.ServingReplicas &&
+		ack.LearnerReplicas == reference.LearnerReplicas &&
+		ack.EnrolledTargets == reference.EnrolledTargets &&
+		ack.OutstandingMoves == reference.OutstandingMoves &&
+		ack.CatalogVoters == reference.CatalogVoterReferences &&
+		ack.ControlVoters == reference.ControlVoterReferences &&
+		ack.GatewayParticipants == reference.GatewayParticipantRefs
 }
 
 // A terminal node's live gateway may have been stopped after the retirement

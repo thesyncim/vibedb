@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/clusterbackupservice"
+	"github.com/thesyncim/vibedb/internal/gatewayruntime"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/multiraft"
@@ -349,6 +350,67 @@ func servePreparedRF3EmptyNode(
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
+	preparedAckReader, preparedAckTransport, err := newRF3FrontendDrainPreparedAckCutReaderWithSources(
+		profile, manifest.GatewaySeeds, manifest.CanonicalSourceSeeds, manifest.NodeIncarnation, deadline, deadline,
+		filepath.Join(manifest.ReplicaControl.SourceDataRoot, "frontend-drain-source-roster"),
+	)
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	if preparedAckTransport != nil {
+		defer func() { resultErr = errors.Join(resultErr, preparedAckTransport.Close()) }()
+	}
+	if preparedAckReader != nil {
+		defer func() { resultErr = errors.Join(resultErr, preparedAckReader.Close()) }()
+	}
+	if err := nativeServer.BindServiceDirectoryRefresh(
+		preparedAckReader, profile.LocalIdentity().Node, manifest.NodeIncarnation,
+		profile.LocalServiceKeyDigest(),
+	); err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	preparedAckControl, err := shardservice.NewFrontendDrainPreparedAckService(
+		shardservice.FrontendDrainPreparedAckServiceOptions{
+			Reader: preparedAckReader, Installer: nativeServer,
+			TrustDomain:  profile.LocalIdentity().TrustDomain,
+			Authorize:    rf3FrontendDrainPreparedAckAuthorizer(profile, policy),
+			ReadDeadline: deadline, WriteDeadline: deadline,
+		},
+	)
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	if err := nativeServer.SetRequireServiceDirectory(true); err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	dynamicCanonicalRows := newRF3DynamicCatalogRows(peer.Owners(), nodeOwner.store)
+	canonicalSource, err := gatewayruntime.NewFrontendDrainPreparedAckCutReadService(
+		gatewayruntime.FrontendDrainPreparedAckCutReadServiceOptions{
+			Authorize: func(connection rafttransport.PeerConnection) bool {
+				if connection == nil || connection.TrafficClass() != rafttransport.TrafficShardControl {
+					return false
+				}
+				peerIdentity := connection.PeerIdentity()
+				if peerIdentity.TrustDomain != profile.LocalIdentity().TrustDomain ||
+					peerIdentity.Node == (rafttransport.NodeID{}) || connection.PeerKeyDigest() == ([32]byte{}) {
+					return false
+				}
+				physical, lookupErr := transportRegistry.PhysicalPeer(peerIdentity.Node)
+				return lookupErr == nil && physical.State == rafttransport.PeerEnrolled
+			},
+			ReadCut: func(ctx context.Context) (gateway.FrontendDrainRuntimeCut, error) {
+				return gateway.ReadFrontendDrainRuntimeCutFromRows(ctx, dynamicCanonicalRows)
+			},
+			Profile: profile, PolicyGeneration: policy.Generation(),
+			TrafficClass: rafttransport.TrafficShardControl,
+			SourceNode:   profile.LocalIdentity().Node, SourceIncarnation: manifest.NodeIncarnation,
+			SourceServiceKeyDigest: profile.LocalServiceKeyDigest(),
+			ReadDeadline:           deadline, WriteDeadline: deadline,
+		},
+	)
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
 
 	reader := new(nodecontrol.IntentReaderSlot)
 	bootstrapTransport, err := bindRF3NodeBootstrapIntentReader(
@@ -500,7 +562,8 @@ func servePreparedRF3EmptyNode(
 		source: donors.Control, preparation: donors.Preparation,
 		split: splitRuntime.action, planObservation: splitRuntime.observation.service, admission: splitRuntime.admission,
 		tail: splitRuntime.tail, terminal: splitRuntime.terminal, childPrepare: childPrepareControl,
-		nodeInfo: nodeInfo, nodeControl: controlService, bootstrap: receivers,
+		nodeInfo: nodeInfo, nodeControl: controlService, bootstrap: receivers, preparedAck: preparedAckControl,
+		canonicalSource: canonicalSource,
 	}).mux()
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
@@ -591,10 +654,35 @@ func servePreparedRF3EmptyNode(
 	go func() {
 		nativeDone <- nativeServer.ServeAuthenticated(nativeCtx, nativeAdmission, nativeTLS, deadline, 64, 16)
 	}()
+	var (
+		serviceCutReady <-chan struct{}
+		primary         error
+	)
+	refreshCtx, cancelRefresh := context.WithCancel(parent)
+	ready := make(chan struct{})
+	serviceCutReady = ready
+	go func() {
+		_ = runRF3FrontendDrainServiceCutRefresh(
+			refreshCtx, preparedAckReader, profile, manifest.NodeIncarnation, nativeServer,
+			time.Second, ready,
+		)
+	}()
+	defer cancelRefresh()
 	var serial atomic.Uint64
-	fmt.Fprintf(os.Stderr, "vibedb-shard RF3 empty node ready node=%x incarnation=%d groups=%d peer=%s native=%s snapshot=%s control=%s gateway=disabled\n",
-		local.Node, manifest.NodeIncarnation, servingGroups.Load(), peerListener.Addr(), nativeListener.Addr(), snapshotListener.Addr(), controlListener.Addr())
-	var primary error
+	if serviceCutReady != nil {
+		readyCtx, cancelReady := context.WithTimeout(parent, rf3NetworkTimeout)
+		readyErr := waitRF3FrontendDrainServiceCutReady(readyCtx, serviceCutReady)
+		cancelReady()
+		if readyErr != nil {
+			if context.Cause(parent) == nil {
+				primary = fmt.Errorf("RF3 empty-node canonical service-directory startup: %w", readyErr)
+			}
+		}
+	}
+	if primary == nil {
+		fmt.Fprintf(os.Stderr, "vibedb-shard RF3 empty node ready node=%x incarnation=%d groups=%d peer=%s native=%s snapshot=%s control=%s gateway=disabled\n",
+			local.Node, manifest.NodeIncarnation, servingGroups.Load(), peerListener.Addr(), nativeListener.Addr(), snapshotListener.Addr(), controlListener.Addr())
+	}
 	peerFinished, controlFinished, snapshotFinished, nativeFinished := false, false, false, false
 	for primary == nil {
 		select {

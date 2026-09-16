@@ -258,6 +258,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		ControlAddress: targetListeners.Control,
 	}
 	manifestPaths := make([]string, rf3CommandMembers)
+	var initialCommand raftservice.CommandFence
 	for index := 0; index < rf3CommandMembers; index++ {
 		memberRoot := filepath.Join(root, fmt.Sprintf("member-%d", index+1))
 		if err := os.MkdirAll(memberRoot, 0o700); err != nil {
@@ -280,6 +281,12 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		}
 		if prepareErr != nil {
 			t.Fatal(prepareErr)
+		}
+		candidateCommand := rf3CommandPreparedFence(t, prepared)
+		if index == 0 {
+			initialCommand = candidateCommand
+		} else if candidateCommand != initialCommand {
+			t.Fatalf("prepared member %d command differs from member 1: %+v != %+v", index+1, candidateCommand, initialCommand)
 		}
 		prepareRF3CommandSplitRuntime(t, memberRoot, rf3testfixture.InitialBootstrap([]uint64{1, 2, 3}))
 		t.Cleanup(func() { _ = prepared.Close() })
@@ -416,9 +423,10 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	waitRF3CommandLeader(
+	waitRF3CommandLeaderWithProbeCommand(
 		t, nativeAddresses, nodes, clientProfiles, group,
 		rf3CommandStoreIdentity(1).AllocationGeneration, authority.ActivePolicyGeneration,
+		initialCommand,
 	)
 	clientProfile, err := servicetls.LoadProfile(
 		credentials[4].Certificate, credentials[4].Key, roots,
@@ -453,6 +461,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			targetIncarnation: targetIncarnation, targetListeners: targetListeners,
 			targetReservation: targetReservation,
 			clientNode:        clientNode, gatewayNode: gatewayNode, clientProfile: clientProfile, authority: authority, grantClient: grantClient,
+			command: initialCommand,
 		})
 		return
 	}
@@ -486,7 +495,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	learnerState := rf3CommandApplyMembership(
+	learnerState := rf3CommandApplyMembershipWithProbeCommand(
 		t, servingAddresses, servingNodes, clientProfile, observationClient, authorityIdentity, group,
 		rf3CommandStoreIdentity(1).AllocationGeneration,
 		shardservice.ReplicatedMembershipRequest{
@@ -494,6 +503,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			MetadataEpoch: grant.MetadataEpoch, CatalogGeneration: grant.CatalogGeneration,
 			SourceMember: grant.SourceMember, TargetMember: grant.TargetMember,
 		},
+		initialCommand,
 	)
 	sourceClient, err := snapshottransfer.NewSourceControlClient(
 		snapshottransfer.SourceControlClientOptions{
@@ -551,10 +561,10 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	targetProcess.WaitServingReady(t)
 	targetProcess.Restart(t)
 	targetProcess.WaitServingReady(t)
-	if _, err = probeRF3CommandMember(
+	if _, err = probeRF3CommandMemberWithCommand(
 		t.Context(), target.NativeAddress, targetNode, clientProfile, clientNode,
 		group, rf3CommandStoreIdentity(1).AllocationGeneration,
-		authority.ActivePolicyGeneration,
+		authority.ActivePolicyGeneration, learnerState.Fence.Command,
 	); err == nil {
 		t.Fatal("learner target served native traffic")
 	}
@@ -562,10 +572,10 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		Operation: [32]byte{0x61}, Step: [32]byte{0x62}, Group: group,
 		TargetMember: 4, ExpectedReplicaSetVersion: learnerState.Fence.Command.ReplicaSetVersion,
 	}
-	learnerLeader, learnerLeaderState := rf3CommandFindLeader(
+	learnerLeader, learnerLeaderState := rf3CommandFindLeaderWithProbeCommand(
 		t, servingAddresses, servingNodes, clientProfile, clientNode, group,
 		rf3CommandStoreIdentity(1).AllocationGeneration,
-		authority.ActivePolicyGeneration,
+		authority.ActivePolicyGeneration, learnerState.Fence.Command,
 	)
 	var leaderObservation, targetObservation replicacontrol.Observation
 	caughtUp := false
@@ -589,7 +599,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		t.Fatalf("learner did not expose a caught-up installed cut: leader=%+v target=%+v err=%v",
 			leaderObservation, targetObservation, err)
 	}
-	promotedState := rf3CommandApplyMembership(
+	promotedState := rf3CommandApplyMembershipWithProbeCommand(
 		t, servingAddresses, servingNodes, clientProfile, observationClient, authorityIdentity, group,
 		rf3CommandStoreIdentity(1).AllocationGeneration,
 		shardservice.ReplicatedMembershipRequest{
@@ -597,12 +607,14 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			MetadataEpoch: grant.MetadataEpoch, CatalogGeneration: grant.CatalogGeneration,
 			SourceMember: grant.SourceMember, TargetMember: grant.TargetMember,
 		},
+		learnerLeaderState.Fence.Command,
 	)
 	dataProbe := rf3CommandRoundTrip(t, target.NativeAddress, targetNode, clientProfile,
 		&shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
 			Authority: authorityIdentity, Capability: serviceauthz.CapabilityDataRead,
 			Fence: shardservice.ReplicatedFence{Group: group,
-				AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration}})
+				AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration,
+				Command:              promotedState.Fence.Command}})
 	if dataProbe.Kind != shardservice.ReplicatedRefusal || dataProbe.Refusal != shardservice.ReplicatedRefusalUnavailable {
 		t.Fatalf("RF4 target served public data: %+v", dataProbe)
 	}
@@ -635,27 +647,30 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	leader, leaderState := rf3CommandFindLeader(
+	leader, leaderState := rf3CommandFindLeaderWithProbeCommand(
 		t, servingAddresses, servingNodes, clientProfile, authorityIdentity.Node, group,
 		rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
+		promotedState.Fence.Command,
 	)
 	rf3CommandExecuteAction(t, actionClient, servingNodes[leader], replicaaction.Request{
 		Operation: [32]byte{0x63}, Step: [32]byte{0x64}, Kind: replicaaction.OwnershipTransition,
 		Fence: rf3CommandServingFence(leaderState.Fence), SourceMember: 1, TargetMember: 4,
 		Command: ownership,
 	})
-	leader, leaderState = rf3CommandFindLeader(
+	leader, leaderState = rf3CommandFindLeaderWithProbeCommand(
 		t, servingAddresses, servingNodes, clientProfile, authorityIdentity.Node, group,
 		rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
+		leaderState.Fence.Command,
 	)
 	if leaderState.Fence.Command.OwnershipEpoch != binding.OwnershipEpoch+1 ||
 		leaderState.Fence.Command.RoutingVersion != binding.RoutingVersion+1 ||
 		leaderState.Fence.Command.RouteGeneration != binding.RouteGeneration+1 {
 		t.Fatalf("ownership transition did not settle: %+v", leaderState.Fence.Command)
 	}
-	sourceState, err := probeRF3CommandMember(
+	sourceState, err := probeRF3CommandMemberWithCommand(
 		t.Context(), nativeAddresses[0], nodes[0], clientProfile, authorityIdentity.Node,
 		group, rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
+		leaderState.Fence.Command,
 	)
 	if err != nil {
 		t.Fatalf("capture retiring source fence: %v", err)
@@ -667,7 +682,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	}
 	if leaderState.LeaderID == grant.SourceMember {
 		beforeTerm := leaderState.Fence.Term
-		_ = rf3CommandApplyMembership(
+		_ = rf3CommandApplyMembershipWithProbeCommand(
 			t, servingAddresses, servingNodes, clientProfile, observationClient, authorityIdentity, group,
 			rf3CommandStoreIdentity(1).AllocationGeneration,
 			shardservice.ReplicatedMembershipRequest{
@@ -675,11 +690,12 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 				MetadataEpoch: grant.MetadataEpoch, CatalogGeneration: grant.CatalogGeneration,
 				SourceMember: grant.SourceMember, TargetMember: grant.TargetMember,
 			},
+			leaderState.Fence.Command,
 		)
-		leaderState = rf3CommandWaitLeaderWitness(
+		leaderState = rf3CommandWaitLeaderWitnessWithProbeCommand(
 			t, servingAddresses, servingNodes, clientProfile, authorityIdentity.Node,
 			group, rf3CommandStoreIdentity(1).AllocationGeneration,
-			authorityIdentity.Generation, grant.TargetMember, beforeTerm,
+			authorityIdentity.Generation, grant.TargetMember, beforeTerm, leaderState.Fence.Command,
 		)
 		removeRequest.ExpectedReplicaSetVersion = leaderState.Fence.Command.ReplicaSetVersion
 		removeRequest.TransferTerm = leaderState.Fence.Term
@@ -698,7 +714,9 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			&shardservice.ReplicatedRequest{
 				Operation: shardservice.ReplicatedProbe, Authority: authorityIdentity,
 				Capability: serviceauthz.CapabilityTopology,
-				Fence:      shardservice.ReplicatedFence{Group: group, AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration},
+				Fence: shardservice.ReplicatedFence{Group: group,
+					AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration,
+					Command:              leaderState.Fence.Command},
 			})
 		if identityProbe.Kind != shardservice.ReplicatedHandshake || !identityProbe.HasState ||
 			identityProbe.State.Fence.Group != group || identityProbe.State.Fence.MemberID != target.MemberID ||
@@ -719,24 +737,26 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		}
 		settlementContext, cancelSettlement := context.WithTimeout(t.Context(), 30*time.Second)
 		_, settleErr := rf3AwaitMembershipSettlement(settlementContext, beforeRemoval, removeRequest,
-			rf3MembershipNetworkObserver(observationClient, target.NativeAddress, targetNode, clientProfile,
-				authorityIdentity, rf3CommandStoreIdentity(1).AllocationGeneration, removeObservationRequest))
+			rf3MembershipNetworkObserverWithProbeCommand(observationClient, target.NativeAddress, targetNode, clientProfile,
+				authorityIdentity, rf3CommandStoreIdentity(1).AllocationGeneration, removeObservationRequest,
+				identityProbe.State.Fence.Command))
 		cancelSettlement()
 		if settleErr != nil {
 			t.Fatalf("accepted target-leader removal did not settle: %v", settleErr)
 		}
 	} else {
 		removeRequest.TransferTerm = leaderState.Fence.Term
-		_ = rf3CommandApplyMembership(
+		_ = rf3CommandApplyMembershipWithProbeCommand(
 			t, servingAddresses, servingNodes, clientProfile, observationClient, authorityIdentity, group,
-			rf3CommandStoreIdentity(1).AllocationGeneration, removeRequest,
+			rf3CommandStoreIdentity(1).AllocationGeneration, removeRequest, leaderState.Fence.Command,
 		)
 	}
 	finalAddresses := []string{nativeAddresses[1], nativeAddresses[2], target.NativeAddress}
 	finalNodes := []rafttransport.NodeID{nodes[1], nodes[2], targetNode}
-	_, finalState := rf3CommandFindLeader(
+	_, finalState := rf3CommandFindLeaderWithProbeCommand(
 		t, finalAddresses, finalNodes, clientProfile, authorityIdentity.Node, group,
 		rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
+		leaderState.Fence.Command,
 	)
 	if finalState.Fence.Command.ReplicaSetVersion <= promotedState.Fence.Command.ReplicaSetVersion {
 		t.Fatalf("final RF3 did not advance membership: %+v", finalState)
@@ -751,9 +771,10 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			NodeIncarnation: sourceState.Fence.NodeIncarnation, Term: finalState.Fence.Term},
 		SourceMember: 1, TargetMember: 4,
 	})
-	if _, err = probeRF3CommandMember(
+	if _, err = probeRF3CommandMemberWithCommand(
 		t.Context(), nativeAddresses[0], nodes[0], clientProfile, authorityIdentity.Node,
 		group, rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
+		finalState.Fence.Command,
 	); err == nil {
 		t.Fatal("retired source continued serving")
 	}
@@ -767,9 +788,10 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			peerAddresses[index], controlAddresses[index],
 			nativeAddresses[index], snapshotAddresses[index],
 		})
-		_, finalState = rf3CommandFindLeader(
+		_, finalState = rf3CommandFindLeaderWithProbeCommand(
 			t, finalAddresses, finalNodes, clientProfile, authorityIdentity.Node, group,
 			rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
+			finalState.Fence.Command,
 		)
 		if finalState.Fence.Command.ReplicaSetVersion != finalReplicaSetVersion {
 			t.Fatalf("member %d reopened wrong final replica-set cut: %+v",
@@ -778,9 +800,10 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	}
 	targetProcess.Restart(t)
 	targetProcess.WaitServingReady(t)
-	_, finalState = rf3CommandFindLeader(
+	_, finalState = rf3CommandFindLeaderWithProbeCommand(
 		t, finalAddresses, finalNodes, clientProfile, authorityIdentity.Node, group,
 		rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
+		finalState.Fence.Command,
 	)
 	if finalState.Fence.Command.ReplicaSetVersion != finalReplicaSetVersion {
 		t.Fatalf("target reopened wrong final replica-set cut: %+v", finalState.Fence.Command)
@@ -1009,7 +1032,7 @@ func (opener rf3CommandControlOpener) OpenShardControl(
 	return connection, nil
 }
 
-func rf3CommandFindLeader(
+func rf3CommandFindLeaderWithProbeCommand(
 	t testing.TB,
 	addresses []string,
 	nodes []rafttransport.NodeID,
@@ -1017,15 +1040,21 @@ func rf3CommandFindLeader(
 	authorityNode rafttransport.NodeID,
 	group raftmember.GroupKey,
 	allocation, generation uint64,
+	probeCommand raftservice.CommandFence,
 ) (int, shardservice.ReplicatedMemberState) {
 	t.Helper()
+	if !probeCommand.Valid() {
+		t.Fatal("RF3 leader discovery requires a valid command fence")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for ctx.Err() == nil {
 		for index := range addresses {
-			state, err := probeRF3CommandMember(
+			var state shardservice.ReplicatedMemberState
+			var err error
+			state, err = probeRF3CommandMemberWithCommand(
 				ctx, addresses[index], nodes[index], profile, authorityNode,
-				group, allocation, generation,
+				group, allocation, generation, probeCommand,
 			)
 			if err == nil && state.Fence.MemberID == state.LeaderID && state.Fence.Term != 0 {
 				return index, state
@@ -1111,7 +1140,7 @@ func rf3CommandExecuteAction(
 	t.Fatalf("replica action did not settle: %v", err)
 }
 
-func rf3CommandWaitLeaderWitness(
+func rf3CommandWaitLeaderWitnessWithProbeCommand(
 	t testing.TB,
 	addresses []string,
 	nodes []rafttransport.NodeID,
@@ -1119,15 +1148,21 @@ func rf3CommandWaitLeaderWitness(
 	authorityNode rafttransport.NodeID,
 	group raftmember.GroupKey,
 	allocation, generation, leaderMember, afterTerm uint64,
+	probeCommand raftservice.CommandFence,
 ) shardservice.ReplicatedMemberState {
 	t.Helper()
+	if !probeCommand.Valid() {
+		t.Fatal("RF3 leader witness requires a valid command fence")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for ctx.Err() == nil {
 		for index := range addresses {
-			state, err := probeRF3CommandMember(
+			var state shardservice.ReplicatedMemberState
+			var err error
+			state, err = probeRF3CommandMemberWithCommand(
 				ctx, addresses[index], nodes[index], profile, authorityNode,
-				group, allocation, generation,
+				group, allocation, generation, probeCommand,
 			)
 			if err == nil && state.LeaderID == leaderMember && state.Fence.Term > afterTerm {
 				return state
@@ -1139,7 +1174,7 @@ func rf3CommandWaitLeaderWitness(
 	return shardservice.ReplicatedMemberState{}
 }
 
-func rf3CommandApplyMembership(
+func rf3CommandApplyMembershipWithProbeCommand(
 	t testing.TB,
 	addresses []string,
 	nodes []rafttransport.NodeID,
@@ -1149,15 +1184,21 @@ func rf3CommandApplyMembership(
 	group raftmember.GroupKey,
 	allocation uint64,
 	request shardservice.ReplicatedMembershipRequest,
+	probeCommand raftservice.CommandFence,
 ) shardservice.ReplicatedMemberState {
 	t.Helper()
+	if !probeCommand.Valid() {
+		t.Fatal("RF3 membership apply requires a valid command fence")
+	}
 	deadline := time.Now().Add(30 * time.Second)
 	ctx, cancel := context.WithDeadline(t.Context(), deadline)
 	defer cancel()
 	for time.Now().Before(deadline) {
-		leader, state := rf3CommandFindLeader(
+		var leader int
+		var state shardservice.ReplicatedMemberState
+		leader, state = rf3CommandFindLeaderWithProbeCommand(
 			t, addresses, nodes, profile, authority.Node, group, allocation,
-			authority.Generation,
+			authority.Generation, probeCommand,
 		)
 		request.ExpectedReplicaSetVersion = state.Fence.Command.ReplicaSetVersion
 		observationRequest := replicacontrol.Request{
@@ -1184,7 +1225,8 @@ func rf3CommandApplyMembership(
 			// Accepted is admission, not quorum/apply settlement. Once accepted,
 			// never submit this mutation again; observe its exact resulting cut.
 			settled, err := rf3AwaitMembershipSettlement(ctx, before, request,
-				rf3MembershipNetworkObserver(observer, addresses[leader], nodes[leader], profile, authority, allocation, observationRequest))
+				rf3MembershipNetworkObserverWithProbeCommand(observer, addresses[leader], nodes[leader], profile,
+					authority, allocation, observationRequest, probeCommand))
 			if err != nil {
 				t.Fatalf("accepted membership did not settle exact cut: %v", err)
 			}
@@ -1247,16 +1289,20 @@ func waitRF3CommandReady(t testing.TB, child *rf3CommandChild, timeout time.Dura
 	t.Fatalf("member %d readiness timeout\n%s", child.member, child.diagnostic.String())
 }
 
-func waitRF3CommandLeader(
+func waitRF3CommandLeaderWithProbeCommand(
 	t testing.TB,
 	addresses [rf3CommandMembers]string,
 	nodes [rf3CommandMembers]rafttransport.NodeID,
 	profiles []*rafttransport.PeerTLS,
 	group raftmember.GroupKey,
 	allocation, generation uint64,
+	probeCommand raftservice.CommandFence,
 	startupErrors ...<-chan error,
 ) {
 	t.Helper()
+	if !probeCommand.Valid() {
+		t.Fatal("RF3 leader wait requires a valid command fence")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var startupError <-chan error
@@ -1277,9 +1323,11 @@ func waitRF3CommandLeader(
 		consistent := true
 		for index := 0; index < rf3CommandMembers; index++ {
 			client := (index + 1) % rf3CommandMembers
-			state, err := probeRF3CommandMember(
+			var state shardservice.ReplicatedMemberState
+			var err error
+			state, err = probeRF3CommandMemberWithCommand(
 				ctx, addresses[index], nodes[index], profiles[client], nodes[client],
-				group, allocation, generation,
+				group, allocation, generation, probeCommand,
 			)
 			if err != nil {
 				observed[index] = err.Error()
@@ -1304,17 +1352,63 @@ func waitRF3CommandLeader(
 	t.Fatalf("natural RF3 leader unavailable: %v; observed=%q", ctx.Err(), observed)
 }
 
-func probeRF3CommandMember(
-	ctx context.Context,
-	address string,
-	serverNode rafttransport.NodeID,
-	profile *rafttransport.PeerTLS,
-	authorityNode rafttransport.NodeID,
-	group raftmember.GroupKey,
-	allocation, generation uint64,
-) (shardservice.ReplicatedMemberState, error) {
-	return probeRF3CommandMemberWithDeadline(ctx, address, serverNode, profile, authorityNode,
-		group, allocation, generation, func() time.Time { return time.Now().Add(3 * time.Second) })
+func rf3CommandPreparedFence(t testing.TB, prepared *rf3testfixture.PreparedMember) raftservice.CommandFence {
+	t.Helper()
+	if prepared == nil || prepared.Apply == nil {
+		t.Fatal("prepared RF3 member has no live apply claim")
+	}
+	return rf3CommandFenceFromApply(t, prepared.Apply)
+}
+
+func rf3CommandFenceFromApply(t testing.TB, apply *sqldriver.ReplicatedApply) raftservice.CommandFence {
+	t.Helper()
+	if apply == nil {
+		t.Fatal("RF3 command fence has no live apply claim")
+	}
+	profile, err := apply.CapacityQualificationProfile()
+	if err != nil {
+		t.Fatalf("prepared RF3 capacity profile: %v", err)
+	}
+	publication, _, err := apply.PublishedWithSnapshotAuthorizationFence()
+	if err != nil {
+		t.Fatalf("prepared RF3 publication fence: %v", err)
+	}
+	command := raftservice.CommandFence{
+		ReplicaSetVersion:      publication.ReplicaSetVersion,
+		ActivePolicyGeneration: profile.Binding.Authority.ActivePolicyGeneration,
+		ProtectionEpoch:        profile.Binding.Authority.ProtectionEpoch,
+		OwnershipEpoch:         profile.Binding.Authority.OwnershipEpoch,
+		SchemaGeneration:       profile.Binding.Authority.SchemaGeneration,
+		RelationManifestDigest: profile.RelationManifestDigest,
+		RoutingVersion:         profile.Binding.Authority.RoutingVersion,
+		RouteGeneration:        profile.Binding.Authority.RouteGeneration,
+	}
+	if !command.Valid() {
+		t.Fatalf("prepared RF3 command is invalid: %+v", command)
+	}
+	return command
+}
+
+func rf3CommandFenceFromManifestGroup(t testing.TB, manifest rf3Manifest, index int) raftservice.CommandFence {
+	t.Helper()
+	bundles := manifest.groupBundles()
+	if index < 0 || index >= len(bundles) {
+		t.Fatalf("RF3 command fence group index %d is outside %d groups", index, len(bundles))
+	}
+	base, applyIdentity, err := loadRF3RetainedIdentities(manifest.withGroup(bundles[index]))
+	if err != nil {
+		t.Fatalf("load RF3 command fence identities for group %d: %v", index, err)
+	}
+	digest, err := sqldriver.ReplicatedSchemaManifest(base, applyIdentity.Placement, nil)
+	if err != nil {
+		t.Fatalf("derive RF3 command fence schema for group %d: %v", index, err)
+	}
+	command := commandFenceFromPublication(base.Binding.Authority,
+		raftmember.RuntimeIdentity{RelationManifestDigest: digest}, 1)
+	if !command.Valid() {
+		t.Fatalf("derived RF3 command fence for group %d is invalid: %+v", index, command)
+	}
+	return command
 }
 
 // probeRF3CommandMemberAtContextDeadline is used only by failure diagnostics.
@@ -1329,7 +1423,11 @@ func probeRF3CommandMemberAtContextDeadline(
 	authorityNode rafttransport.NodeID,
 	group raftmember.GroupKey,
 	allocation, generation uint64,
+	command raftservice.CommandFence,
 ) (shardservice.ReplicatedMemberState, error) {
+	if !command.Valid() {
+		return shardservice.ReplicatedMemberState{}, errors.New("RF3 diagnostic probe requires a valid command fence")
+	}
 	deadline, hasDeadline := ctx.Deadline()
 	deadlineFunc := func() time.Time {
 		if hasDeadline {
@@ -1337,11 +1435,11 @@ func probeRF3CommandMemberAtContextDeadline(
 		}
 		return time.Now().Add(3 * time.Second)
 	}
-	return probeRF3CommandMemberWithDeadline(ctx, address, serverNode, profile, authorityNode,
-		group, allocation, generation, deadlineFunc)
+	return probeRF3CommandMemberWithDeadlineAndCommand(ctx, address, serverNode, profile, authorityNode,
+		group, allocation, generation, command, deadlineFunc)
 }
 
-func probeRF3CommandMemberWithDeadline(
+func probeRF3CommandMemberWithCommand(
 	ctx context.Context,
 	address string,
 	serverNode rafttransport.NodeID,
@@ -1349,8 +1447,27 @@ func probeRF3CommandMemberWithDeadline(
 	authorityNode rafttransport.NodeID,
 	group raftmember.GroupKey,
 	allocation, generation uint64,
+	command raftservice.CommandFence,
+) (shardservice.ReplicatedMemberState, error) {
+	return probeRF3CommandMemberWithDeadlineAndCommand(ctx, address, serverNode, profile,
+		authorityNode, group, allocation, generation, command,
+		func() time.Time { return time.Now().Add(3 * time.Second) })
+}
+
+func probeRF3CommandMemberWithDeadlineAndCommand(
+	ctx context.Context,
+	address string,
+	serverNode rafttransport.NodeID,
+	profile *rafttransport.PeerTLS,
+	authorityNode rafttransport.NodeID,
+	group raftmember.GroupKey,
+	allocation, generation uint64,
+	command raftservice.CommandFence,
 	deadline func() time.Time,
 ) (shardservice.ReplicatedMemberState, error) {
+	if !command.Valid() {
+		return shardservice.ReplicatedMemberState{}, errors.New("RF3 probe requires a valid command fence")
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	raw, err := (&net.Dialer{}).DialContext(probeCtx, "tcp", address)
@@ -1371,7 +1488,7 @@ func probeRF3CommandMemberWithDeadline(
 			Authority:  serviceauthz.Authority{Node: authorityNode, Generation: generation},
 			Capability: serviceauthz.CapabilityTopology,
 			Fence: shardservice.ReplicatedFence{
-				Group: group, AllocationGeneration: allocation,
+				Group: group, AllocationGeneration: allocation, Command: command,
 			},
 		},
 	)
@@ -1519,4 +1636,3 @@ func rf3CommandPeerKeysJSON(credential rf3testfixture.Credential) []byte {
 	}
 	return append([]byte(`,"peer_keys":`), encoded...)
 }
-

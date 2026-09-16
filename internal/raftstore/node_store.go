@@ -1818,6 +1818,22 @@ func (s *NodeStore) Group(group uint64) *GroupView { return &GroupView{store: s,
 
 func (s *NodeStore) NodeIdentity() NodeIdentity { return s.identity }
 
+// GroupDescriptors returns the current authenticated descriptor catalog in
+// log-key order. The snapshot is detached while the store lock is held so a
+// physical-node source resolver can discover a newly adopted catalog group
+// without retaining a mutable descriptor reference or racing registration.
+func (s *NodeStore) GroupDescriptors() ([]GroupDescriptor, error) {
+	if s == nil {
+		return nil, ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.usable(); err != nil {
+		return nil, err
+	}
+	return slices.Clone(s.descriptors), nil
+}
+
 func (s *NodeStore) SetDataSyncForTesting(sync func(*os.File) error) {
 	s.engine.SetDataSyncForTesting(sync)
 }

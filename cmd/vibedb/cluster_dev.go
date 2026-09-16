@@ -304,6 +304,34 @@ type devGatewayConfig struct {
 	InitialNodeDirectoryPath    string                `json:"initial_node_directory"`
 }
 
+// devCatalogGenesisConfig is the closed, physical-only provisioning lane for
+// the reserved catalog relation. It is carried independently of Gateway so a
+// storage-only catalog voter can publish the first complete cut before any
+// frontend process opens. PlanPath is finalized after the catalog and initial
+// node directory are written; startup validates that immutable sidecar before
+// using this lane.
+type devCatalogGenesisConfig struct {
+	PlanPath                 string `json:"plan_path"`
+	CatalogPath              string `json:"catalog_path"`
+	InitialNodeDirectoryPath string `json:"initial_node_directory"`
+	SessionJournal           string `json:"session_journal"`
+	ClientID                 string `json:"client_id"`
+	RetryHome                string `json:"retry_home"`
+	Distribution             string `json:"distribution"`
+	Shard                    string `json:"shard"`
+	ClusterID                string `json:"cluster_id"`
+	ClusterIncarnation       string `json:"cluster_incarnation"`
+	TopologyRecoveryEpoch    uint64 `json:"topology_recovery_epoch"`
+	AllocationGeneration     uint64 `json:"allocation_generation"`
+	ShardIncarnation         string `json:"shard_incarnation"`
+	GroupID                  string `json:"group_id"`
+	MemberID                 uint64 `json:"member_id"`
+	StoreID                  string `json:"store_id"`
+	NodeID                   string `json:"node_id"`
+	NodeIncarnation          uint64 `json:"node_incarnation"`
+	Relation                 uint64 `json:"relation"`
+}
+
 type devGatewayTLS struct {
 	Certificate string `json:"certificate"`
 	Key         string `json:"key"`
@@ -570,10 +598,11 @@ func runClusterDev(args []string) int {
 			}
 		}
 	}
-	replicasSet, nodesSet, readAuthoritySet := false, false, false
+	replicasSet, nodesSet, physicalNodesSet, readAuthoritySet := false, false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		replicasSet = replicasSet || f.Name == "replicas"
 		nodesSet = nodesSet || f.Name == "nodes"
+		physicalNodesSet = physicalNodesSet || f.Name == "physical-nodes"
 		readAuthoritySet = readAuthoritySet || f.Name == "read-authority"
 	})
 	if nodesSet {
@@ -595,6 +624,10 @@ func runClusterDev(args []string) int {
 		}
 		*physicalNodes = 0
 	} else {
+		if physicalNodesSet && *physicalNodes == 0 {
+			fmt.Fprintln(os.Stderr, "cluster dev: --physical-nodes=0 is not a managed RF3 topology")
+			return 2
+		}
 		if *physicalNodes == 0 {
 			*physicalNodes = devClusterPhysicalNodes3
 		}
@@ -2038,6 +2071,31 @@ func reserveDevPortsUsing(count int, pgAddresses []string, listen func(string, s
 }
 func writeDevCredentials(root string, domain rafttransport.TrustDomain, nodes []rafttransport.NodeID) ([][2]string, string, error) {
 	return writeDevCredentialsWithCA(root, domain, nodes, "", "")
+}
+
+// devCertificateSPKIPin derives the certificate-bound public-key pin emitted
+// for a physical shard-control source. The source seed carries no certificate
+// bytes; every dial still authenticates the complete trust domain and then
+// checks this exact digest against the pinned endpoint identity.
+func devCertificateSPKIPin(path string) (replication.Digest, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) == 0 || len(raw) > 1<<20 {
+		return replication.Digest{}, errors.Join(errDevCluster, err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return replication.Digest{}, errDevCluster
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return replication.Digest{}, errors.Join(errDevCluster, err)
+	}
+	publicKey, err := x509.MarshalPKIXPublicKey(certificate.PublicKey)
+	if err != nil {
+		return replication.Digest{}, errors.Join(errDevCluster, err)
+	}
+	digest := sha256.Sum256(publicKey)
+	return replication.Digest(digest), nil
 }
 
 // writeDevCredentialsWithCA is the explicit local-development PKI seam used

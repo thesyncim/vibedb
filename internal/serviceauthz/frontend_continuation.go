@@ -57,10 +57,11 @@ const (
 	FrontendActionGatewayExecutionPin
 	FrontendActionGatewayTransactionRecovery
 	FrontendActionControllerMembership
+	FrontendActionGatewayRouteSettlement
 )
 
 func (action FrontendContinuationAction) Valid() bool {
-	return action >= FrontendActionForwardedData && action <= FrontendActionControllerMembership
+	return action >= FrontendActionForwardedData && action <= FrontendActionGatewayRouteSettlement
 }
 
 // FrontendContinuationScopeRecord is the exact scope committed for a
@@ -103,6 +104,9 @@ func (scope FrontendContinuationScopeRecord) Valid() bool {
 			scope.Relation != ([16]byte{}) && scope.IntentID != ([32]byte{}) && scope.FenceDigest != ([32]byte{})
 	case FrontendActionGatewayTransactionRecovery:
 		return scope.Operation == ServiceOperationTransactionRecovery && scope.Capability == CapabilityTransactionRecovery &&
+			scope.Relation != ([16]byte{}) && scope.IntentID != ([32]byte{}) && scope.FenceDigest != ([32]byte{})
+	case FrontendActionGatewayRouteSettlement:
+		return scope.Operation == ServiceOperationRouteSettlement && scope.Capability == CapabilityRequestLedger &&
 			scope.Relation != ([16]byte{}) && scope.IntentID != ([32]byte{}) && scope.FenceDigest != ([32]byte{})
 	case FrontendActionControllerMembership:
 		return scope.Operation == ServiceOperationMembership && scope.Capability == CapabilityMembership &&
@@ -149,6 +153,53 @@ func compareContinuationScopes(left, right FrontendContinuationScopeRecord) int 
 	return bytes.Compare(left.FenceDigest[:], right.FenceDigest[:])
 }
 
+// CompareContinuationScopes orders the canonical scope set used by a
+// persisted frontend continuation grant.  The runtime needs the same order
+// when it captures a live connection cut; exposing the comparator avoids a
+// second, subtly different ordering implementation at that boundary.
+func CompareContinuationScopes(left, right FrontendContinuationScopeRecord) int {
+	return compareContinuationScopes(left, right)
+}
+
+// compareContinuationScopeCoordinates orders the immutable resource identity
+// of a scope. IntentID and FenceDigest are the catalog proof attached to that
+// resource and must not change for an existing coordinate during a
+// catalog-only cut advance.
+func compareContinuationScopeCoordinates(left, right FrontendContinuationScopeRecord) int {
+	if left.Protocol != right.Protocol {
+		if left.Protocol < right.Protocol {
+			return -1
+		}
+		return 1
+	}
+	if left.Action != right.Action {
+		if left.Action < right.Action {
+			return -1
+		}
+		return 1
+	}
+	if left.Capability != right.Capability {
+		if left.Capability < right.Capability {
+			return -1
+		}
+		return 1
+	}
+	if left.Operation != right.Operation {
+		if left.Operation < right.Operation {
+			return -1
+		}
+		return 1
+	}
+	if result := compareContinuationGroups(left.Group, right.Group); result != 0 {
+		return result
+	}
+	return bytes.Compare(left.Relation[:], right.Relation[:])
+}
+
+func sameContinuationScopeCoordinates(left, right FrontendContinuationScopeRecord) bool {
+	return compareContinuationScopeCoordinates(left, right) == 0
+}
+
 func sameContinuationScope(left, right FrontendContinuationScopeRecord) bool {
 	return compareContinuationScopes(left, right) == 0
 }
@@ -186,9 +237,10 @@ func (envelope FrontendContinuationEnvelope) Valid() bool {
 	return envelope.GrantDigest != ([32]byte{}) && envelope.ConnToken != (FrontendConnToken{}) && envelope.Scope.Valid()
 }
 
-// CommittedFrontendContinuationGrant is an immutable catalog cut. The
-// accepted-token and scope sets are bounded and canonicalized; a grant never
-// accepts a caller populated token merely because its digest is nonzero.
+// CommittedFrontendContinuationGrant is the immutable accepted-connection
+// proof for one catalog drain. Forwarded resource scopes live on the enclosing
+// ServiceDirectoryCut because the catalog may add an exact resource while the
+// accepted connection token remains unchanged.
 type CommittedFrontendContinuationGrant struct {
 	GrantDigest              [32]byte
 	TrustDomain              rafttransport.TrustDomain
@@ -205,7 +257,6 @@ type CommittedFrontendContinuationGrant struct {
 	// that admitted it. Parallel slices are kept fixed-width so the token
 	// itself remains unmodified and protocol cross-replay is impossible.
 	AcceptedConnectionProtocols []FrontendContinuationScope
-	AllowedScopes               []FrontendContinuationScopeRecord
 	AdmissionClosedProofDigest  [32]byte
 	Revision                    uint64
 	State                       ContinuationGrantState
@@ -226,8 +277,7 @@ func (grant CommittedFrontendContinuationGrant) Valid() bool {
 		grant.GatewaySessionRevision == 0 || grant.DrainID == ([32]byte{}) || grant.AdmissionEpoch == 0 ||
 		grant.AdmissionClosedProofDigest == ([32]byte{}) || grant.Revision == 0 || !grant.State.Valid() ||
 		len(grant.AcceptedConnectionTokens) == 0 || len(grant.AcceptedConnectionTokens) > AbsoluteMaxContinuationTokens ||
-		len(grant.AcceptedConnectionProtocols) != len(grant.AcceptedConnectionTokens) ||
-		len(grant.AllowedScopes) == 0 || len(grant.AllowedScopes) > AbsoluteMaxContinuationScopes {
+		len(grant.AcceptedConnectionProtocols) != len(grant.AcceptedConnectionTokens) {
 		return false
 	}
 	for index, token := range grant.AcceptedConnectionTokens {
@@ -235,11 +285,6 @@ func (grant CommittedFrontendContinuationGrant) Valid() bool {
 			return false
 		}
 		if !grant.AcceptedConnectionProtocols[index].Valid() {
-			return false
-		}
-	}
-	for index, scope := range grant.AllowedScopes {
-		if !scope.Valid() || index > 0 && compareContinuationScopes(grant.AllowedScopes[index-1], scope) >= 0 {
 			return false
 		}
 	}
@@ -274,16 +319,6 @@ func (grant CommittedFrontendContinuationGrant) Digest() [32]byte {
 	for _, protocol := range grant.AcceptedConnectionProtocols {
 		_, _ = hash.Write([]byte{byte(protocol)})
 	}
-	writeU64(hash, uint64(len(grant.AllowedScopes)))
-	for _, scope := range grant.AllowedScopes {
-		_, _ = hash.Write([]byte{byte(scope.Protocol), byte(scope.Action)})
-		writeU64(hash, uint64(scope.Capability))
-		_, _ = hash.Write([]byte{byte(scope.Operation)})
-		writeGroup(hash, scope.Group)
-		_, _ = hash.Write(scope.Relation[:])
-		_, _ = hash.Write(scope.IntentID[:])
-		_, _ = hash.Write(scope.FenceDigest[:])
-	}
 	var digest [32]byte
 	copy(digest[:], hash.Sum(nil))
 	return digest
@@ -314,7 +349,6 @@ func writeGroup(hash interface{ Write([]byte) (int, error) }, group raftmember.G
 func cloneContinuationGrant(grant CommittedFrontendContinuationGrant) CommittedFrontendContinuationGrant {
 	grant.AcceptedConnectionTokens = slices.Clone(grant.AcceptedConnectionTokens)
 	grant.AcceptedConnectionProtocols = slices.Clone(grant.AcceptedConnectionProtocols)
-	grant.AllowedScopes = slices.Clone(grant.AllowedScopes)
 	return grant
 }
 
@@ -326,8 +360,7 @@ func sameContinuationGrant(left, right CommittedFrontendContinuationGrant) bool 
 		left.DrainID == right.DrainID && left.AdmissionEpoch == right.AdmissionEpoch &&
 		left.AdmissionClosedProofDigest == right.AdmissionClosedProofDigest && left.Revision == right.Revision &&
 		left.State == right.State && slices.Equal(left.AcceptedConnectionTokens, right.AcceptedConnectionTokens) &&
-		slices.Equal(left.AcceptedConnectionProtocols, right.AcceptedConnectionProtocols) &&
-		slices.Equal(left.AllowedScopes, right.AllowedScopes)
+		slices.Equal(left.AcceptedConnectionProtocols, right.AcceptedConnectionProtocols)
 }
 
 func containsContinuationToken(tokens []FrontendConnToken, want FrontendConnToken) bool {
@@ -392,8 +425,7 @@ func validContinuationTransition(prior, next CommittedFrontendContinuationGrant)
 		prior.AdmissionEpoch != next.AdmissionEpoch ||
 		prior.AdmissionClosedProofDigest != next.AdmissionClosedProofDigest || prior.Revision != next.Revision ||
 		!slices.Equal(prior.AcceptedConnectionTokens, next.AcceptedConnectionTokens) ||
-		!slices.Equal(prior.AcceptedConnectionProtocols, next.AcceptedConnectionProtocols) ||
-		!slices.Equal(prior.AllowedScopes, next.AllowedScopes) {
+		!slices.Equal(prior.AcceptedConnectionProtocols, next.AcceptedConnectionProtocols) {
 		return false
 	}
 	return prior.State.Allows(next.State)
@@ -444,7 +476,7 @@ func (state directoryState) checkFrontendContinuation(
 		grant.GatewaySessionID != binding.SessionID || grant.GatewaySessionRevision != binding.SessionRevision ||
 		!tokenFound || tokenIndex >= len(grant.AcceptedConnectionProtocols) ||
 		grant.AcceptedConnectionProtocols[tokenIndex] != envelope.Scope.Protocol ||
-		!containsContinuationScope(grant.AllowedScopes, actual) {
+		(actual.Action == FrontendActionForwardedData && !containsContinuationScope(state.cut.ForwardedScopes, actual)) {
 		return DecisionDenyCapability
 	}
 	if !grantMatchesBindingFields(grant, binding) {
@@ -464,9 +496,9 @@ func (gate *ServiceDirectoryGate) IsActiveGateway(peer AuthenticatedPeer, policy
 }
 
 // CheckInternalFrontendContinuation applies the complete internal-service
-// boundary for one wrapped request. Active Prepared grants additionally need
-// the binding's exact InternalFence; Draining Enforcing grants use the
-// committed continuation scope after the frontend barrier has closed.
+// boundary for one wrapped request. The immutable accepted proof is followed
+// by the binding's exact current InternalFence in every lifecycle state;
+// ForwardedScopes is reserved for end-user data resources.
 func (gate *ServiceDirectoryGate) CheckInternalFrontendContinuation(
 	peer AuthenticatedPeer, authority Authority, envelope FrontendContinuationEnvelope,
 	actual FrontendContinuationScopeRecord,
@@ -481,8 +513,7 @@ func (gate *ServiceDirectoryGate) CheckInternalFrontendContinuation(
 	if decision := state.checkFrontendContinuation(binding, peer, authority.Generation, envelope, actual); decision != DecisionAllow {
 		return decision
 	}
-	if binding.Lifecycle == ServiceActive &&
-		state.checkInternalScope(binding, peer, authority, actual) != DecisionAllow {
+	if state.checkInternalScope(binding, peer, authority, actual) != DecisionAllow {
 		return DecisionDenyCapability
 	}
 	return DecisionAllow
@@ -504,6 +535,101 @@ func (gate *ServiceDirectoryGate) CheckInternalScope(
 		return DecisionDenyNoPrincipal
 	}
 	return state.checkInternalScope(binding, peer, authority, scope)
+}
+
+// ServiceCutRefreshNeeded reports whether a denied request has a valid
+// service identity and immutable continuation proof but is missing only the
+// exact resource fence from the receiver's current cut. It deliberately does
+// not classify unknown principals, keys, grant digests, tokens, protocols, or
+// mutated continuation envelopes as refreshable: those requests remain hard
+// denies and must never cause a source read.
+//
+// A nil envelope describes a gateway-owned internal request. The scope is
+// still derived from the closed native request by the caller, so this method
+// only decides whether the current binding lacks that exact internal fence.
+func (gate *ServiceDirectoryGate) ServiceCutRefreshNeeded(
+	peer AuthenticatedPeer, authority Authority,
+	envelope *FrontendContinuationEnvelope, actual FrontendContinuationScopeRecord,
+) bool {
+	if gate == nil || !actual.Valid() {
+		return false
+	}
+	state, binding, ok := gate.lookup(peer)
+	if !ok || !authority.Valid() ||
+		authority.Generation != state.cut.PolicyGeneration {
+		return false
+	}
+	if envelope != nil {
+		if !envelope.Valid() || !sameContinuationScope(envelope.Scope, actual) {
+			return false
+		}
+		grant, found := state.continuations[envelope.GrantDigest]
+		if !found || grant.State == ContinuationGrantRetired ||
+			grant.TrustDomain != peer.Identity.TrustDomain ||
+			grant.GatewayServiceID != peer.Identity.Node || grant.PeerKeyDigest != peer.KeyDigest ||
+			grant.GatewaySessionID != binding.SessionID || grant.GatewaySessionRevision != binding.SessionRevision {
+			return false
+		}
+		tokenIndex, tokenFound := continuationTokenIndex(grant.AcceptedConnectionTokens, envelope.ConnToken)
+		if !tokenFound || tokenIndex >= len(grant.AcceptedConnectionProtocols) ||
+			grant.AcceptedConnectionProtocols[tokenIndex] != envelope.Scope.Protocol ||
+			!grantMatchesBindingFields(grant, binding) {
+			return false
+		}
+		if actual.Action == FrontendActionForwardedData {
+			return !containsContinuationScope(state.cut.ForwardedScopes, actual)
+		}
+		if authority.Node != peer.Identity.Node {
+			return false
+		}
+		return state.serviceCutRefreshNeededInternal(binding, peer, authority, actual)
+	}
+	if actual.Action == FrontendActionForwardedData {
+		return false
+	}
+	if authority.Node != peer.Identity.Node {
+		return false
+	}
+	return state.serviceCutRefreshNeededInternal(binding, peer, authority, actual)
+}
+
+// serviceCutRefreshNeededInternal narrows the refreshable miss to a current
+// Active/Draining service binding with a closed internal action grammar. Once
+// those immutable identity and lifecycle checks pass, the only remaining
+// denial this helper recognizes is absence of the exact committed fence.
+func (state directoryState) serviceCutRefreshNeededInternal(
+	binding ServiceBinding, peer AuthenticatedPeer, authority Authority,
+	scope FrontendContinuationScopeRecord,
+) bool {
+	if authority.Node != peer.Identity.Node || authority.Generation != state.cut.PolicyGeneration ||
+		!scope.Valid() || scope.Action == FrontendActionForwardedData {
+		return false
+	}
+	action, operation, ok := internalScopeAction(scope)
+	if !ok || !roleAllowsAction(binding, action) {
+		return false
+	}
+	switch action {
+	case ServiceActionControllerMembership:
+		if binding.Roles&ServiceRoleController == 0 || binding.Lifecycle != ServiceActive {
+			return false
+		}
+	case ServiceActionGatewayCatalogRead, ServiceActionGatewayCatalogWrite,
+		ServiceActionGatewayRequestLedger, ServiceActionGatewayExecutionPin,
+		ServiceActionGatewayTransactionRecovery, ServiceActionGatewayRouteSettlement:
+		if binding.Roles&ServiceRoleGateway == 0 ||
+			(binding.Lifecycle != ServiceActive && binding.Lifecycle != ServiceDraining) {
+			return false
+		}
+	default:
+		return false
+	}
+	request := ServiceRequest{Action: action, Capability: scope.Capability, Operation: operation,
+		Group: scope.Group, Relation: scope.Relation, IntentID: scope.IntentID, FenceDigest: scope.FenceDigest}
+	if binding.Roles&ServiceRoleGateway != 0 {
+		request.SessionID, request.SessionRevision = binding.SessionID, binding.SessionRevision
+	}
+	return !binding.allowsInternalFence(request.fence())
 }
 
 func (state directoryState) checkInternalScope(
@@ -539,6 +665,8 @@ func internalScopeAction(scope FrontendContinuationScopeRecord) (ServiceAction, 
 		return ServiceActionGatewayExecutionPin, ServiceOperationExecutionPin, true
 	case FrontendActionGatewayTransactionRecovery:
 		return ServiceActionGatewayTransactionRecovery, ServiceOperationTransactionRecovery, true
+	case FrontendActionGatewayRouteSettlement:
+		return ServiceActionGatewayRouteSettlement, ServiceOperationRouteSettlement, true
 	case FrontendActionControllerMembership:
 		return ServiceActionControllerMembership, ServiceOperationMembership, true
 	}

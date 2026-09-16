@@ -28,6 +28,17 @@ func (directory *terminalStatusDirectory) ReadScalingIntent(context.Context, [32
 	return directory.intent, nil
 }
 
+func (directory *terminalStatusDirectory) ListScalingIntents(context.Context) ([]gateway.ScalingIntent, error) {
+	return nil, nil
+}
+
+func (directory *terminalStatusDirectory) ListScalingTerminalIntents(context.Context) ([]gateway.ScalingIntent, error) {
+	if directory.intent.ID == ([32]byte{}) {
+		return nil, nil
+	}
+	return []gateway.ScalingIntent{directory.intent}, nil
+}
+
 func (directory *terminalStatusDirectory) ReadNode(context.Context, rafttransport.NodeID, uint64) (gateway.NodeRecord, error) {
 	return directory.node, nil
 }
@@ -67,6 +78,10 @@ func TestClusterControlStatusUsesCommittedTerminalCutWhenFrontendIsOffline(t *te
 		DirectoryCutDigest: [32]byte{7}, CatalogHeadDigest: [32]byte{8},
 		ScalingDirectoryDigest: [32]byte{9}, EnrollmentDirectoryDigest: [32]byte{10},
 		OperationDirectoryDigest: [32]byte{11}, Digest: [32]byte{12}}
+	intent.Evidence = gateway.SafeToStopEvidenceFromReference(fresh)
+	intent.Evidence.DrainAcknowledged = true
+	intent.Evidence.RetiredAcknowledged = true
+	intent.Evidence.CatalogControlMigrated = true
 	directory := &terminalStatusDirectory{intent: intent,
 		node: gateway.NodeRecord{NodeID: nodeID, Incarnation: 1, Lifecycle: gateway.NodeDecommissioned,
 			Revision: 3, CatalogGeneration: 7, RetirementScanDigest: [32]byte{6},
@@ -93,7 +108,17 @@ func TestClusterControlNodesUsesCommittedTerminalCutWhenFrontendIsOffline(t *tes
 		DirectoryCutDigest: [32]byte{7}, CatalogHeadDigest: [32]byte{8},
 		ScalingDirectoryDigest: [32]byte{9}, EnrollmentDirectoryDigest: [32]byte{10},
 		OperationDirectoryDigest: [32]byte{11}, Digest: [32]byte{12}}
+	intent := gateway.ScalingIntent{ID: gateway.ScalingIntentRequest{Kind: gateway.ScalingDecommission,
+		RequestID: [32]byte{5}, Drain: gateway.NodeReference{NodeID: nodeID, Incarnation: 1}, MaxMoves: 1}.ID(),
+		Request: gateway.ScalingIntentRequest{Kind: gateway.ScalingDecommission, RequestID: [32]byte{5},
+			Drain: gateway.NodeReference{NodeID: nodeID, Incarnation: 1}, MaxMoves: 1},
+		CatalogGeneration: 7, Revision: 1, DirectoryRevision: 1, State: gateway.ScalingComplete,
+		Evidence: gateway.SafeToStopEvidenceFromReference(fresh)}
+	intent.Evidence.DrainAcknowledged = true
+	intent.Evidence.RetiredAcknowledged = true
+	intent.Evidence.CatalogControlMigrated = true
 	directory := &terminalStatusDirectory{
+		intent: intent,
 		node: gateway.NodeRecord{NodeID: nodeID, Incarnation: 1, Lifecycle: gateway.NodeDecommissioned,
 			Revision: 3, CatalogGeneration: 7, RetirementScanDigest: [32]byte{6},
 			RetirementScanDirectoryRevision: 2, RetirementScanCutRevision: 3},
@@ -125,6 +150,10 @@ func TestClusterControlStatusUsesFreshTerminalProof(t *testing.T) {
 		DirectoryCutDigest: [32]byte{1}, CatalogHeadDigest: [32]byte{2},
 		ScalingDirectoryDigest: [32]byte{3}, EnrollmentDirectoryDigest: [32]byte{4},
 		OperationDirectoryDigest: [32]byte{5}, Digest: [32]byte{6}}
+	intent.Evidence = gateway.SafeToStopEvidenceFromReference(evidence)
+	intent.Evidence.DrainAcknowledged = true
+	intent.Evidence.RetiredAcknowledged = true
+	intent.Evidence.CatalogControlMigrated = true
 	directory := &terminalStatusDirectory{intent: intent,
 		node: gateway.NodeRecord{NodeID: nodeID, Incarnation: 1, Lifecycle: gateway.NodeDecommissioned,
 			Revision: 3, CatalogGeneration: 7}, evidence: evidence}
@@ -148,5 +177,40 @@ func TestClusterControlStatusUsesFreshTerminalProof(t *testing.T) {
 	}
 	if !foundServing {
 		t.Fatalf("fresh serving reference blocker missing: response=%+v", response)
+	}
+}
+
+func TestClusterControlStatusBlocksTerminalProofWithoutDurableFrontendAck(t *testing.T) {
+	nodeID := rafttransport.NodeID{7}
+	request := gateway.ScalingIntentRequest{Kind: gateway.ScalingDecommission, RequestID: [32]byte{8},
+		Drain: gateway.NodeReference{NodeID: nodeID, Incarnation: 1}, MaxMoves: 1}
+	evidence := gateway.NodeReferenceEvidence{NodeID: nodeID, Incarnation: 1,
+		CatalogGeneration: 7, DirectoryRevision: 3, DirectoryCutRevision: 3,
+		DirectoryCutDigest: [32]byte{1}, CatalogHeadDigest: [32]byte{2},
+		ScalingDirectoryDigest: [32]byte{3}, EnrollmentDirectoryDigest: [32]byte{4},
+		OperationDirectoryDigest: [32]byte{5}, Digest: [32]byte{6}}
+	intent := gateway.ScalingIntent{ID: request.ID(), Request: request, CatalogGeneration: 7,
+		Revision: 1, DirectoryRevision: 1, State: gateway.ScalingComplete,
+		Evidence: gateway.SafeToStopEvidenceFromReference(evidence)}
+	intent.Evidence.DrainAcknowledged = true
+	intent.Evidence.CatalogControlMigrated = true
+	directory := &terminalStatusDirectory{intent: intent,
+		node: gateway.NodeRecord{NodeID: nodeID, Incarnation: 1, Lifecycle: gateway.NodeDecommissioned,
+			Revision: 3}, evidence: evidence}
+	backend := &ScalingOperatorBackend{directory: directory, catalog: terminalStatusCatalog{}}
+
+	response := backend.observeOnce(context.Background(), clustercontrol.Response{}, intent.ID)
+	if response.SafeToStop {
+		t.Fatalf("terminal lifecycle proof bypassed missing frontend ACK: response=%+v", response)
+	}
+	found := false
+	for _, blocker := range response.Blockers {
+		if blocker.Code == "frontend_drain_terminal_ack_pending" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("missing durable terminal ACK blocker: response=%+v", response)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
+	"github.com/thesyncim/vibedb/internal/frontenddrain"
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicaaction"
@@ -56,13 +57,13 @@ func (handler *rf3ControlRouteProbe) Serve(_ context.Context, conn rafttransport
 // services needed only after an initially empty node becomes a donor. Every
 // route must reach its handler with the original discriminator still present.
 func TestRF3ControlServicesShareCompleteNodeGrammar(t *testing.T) {
-	var probes [21]rf3ControlRouteProbe
+	var probes [23]rf3ControlRouteProbe
 	services := rf3ControlServices{
 		membership: &probes[0], observation: &probes[1], metrics: &probes[2], capacity: &probes[3],
 		preparation: &probes[4], enrollment: &probes[5], backup: &probes[6], source: &probes[7],
 		action: &probes[8], split: &probes[9], schema: &probes[10], schemaBuild: &probes[11],
 		planObservation: &probes[12], admission: &probes[13], tail: &probes[14], terminal: &probes[15],
-		childPrepare: &probes[16], restoreServing: &probes[17], nodeInfo: &probes[18], nodeControl: &probes[19], bootstrap: &probes[20],
+		childPrepare: &probes[16], restoreServing: &probes[17], nodeInfo: &probes[18], nodeControl: &probes[19], bootstrap: &probes[20], preparedAck: &probes[21], canonicalSource: &probes[22],
 	}
 	mux, err := services.mux()
 	if err != nil {
@@ -96,6 +97,8 @@ func TestRF3ControlServicesShareCompleteNodeGrammar(t *testing.T) {
 		{"joining-node-info", nodecontrol.NodeInfoRequestDiscriminator(), 18},
 		{"node-enrollment", nodecontrol.RequestDiscriminator(), 19},
 		{"snapshot-bootstrap", snapshottransfer.BootstrapRequestDiscriminator(), 20},
+		{"frontend-drain-prepared-ack", frontenddrain.PreparedAckDiscriminator, 21},
+		{"frontend-drain-canonical-source", frontenddrain.PreparedAckCutReadDiscriminator, 22},
 	}
 	if len(protocols) > shardcontrol.MaxRoutes {
 		t.Fatal("physical grammar exceeds mux bound")

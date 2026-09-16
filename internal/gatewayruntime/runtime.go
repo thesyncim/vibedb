@@ -136,6 +136,19 @@ type Config struct {
 	// route, manifest, or TLS policy, and it never uses this field to append a
 	// node to an existing directory.
 	InitialNodeDirectory []gateway.NodeRecord
+	// CanonicalFrontendDrainRuntimeRows is an optional local catalog-owner
+	// source for embedded startup. It reads only the closed control-plane row
+	// grammar through the local raft serving fence; ControlDirectory remains the
+	// authority for endpoint rosters. A missing or retired local source fails
+	// closed and never falls back to a static gateway policy. Genuine catalog
+	// genesis is handled by normal catalog bootstrap before this source is used.
+	CanonicalFrontendDrainRuntimeRows gateway.FrontendDrainRuntimeCutRowReader
+	// CanonicalFrontendDrainRuntimeSource is the authenticated physical source
+	// used when this process owns a catalog follower. Startup installs its
+	// complete PreparedAckCut before reading through the local semantic
+	// transport, then validates a fresh authority cut against that source
+	// floor. There is no static gateway fallback.
+	CanonicalFrontendDrainRuntimeSource FrontendDrainRuntimeCutSource
 	// FrontendDrainIdentity binds admission-drain acknowledgements to the
 	// catalog gateway participant and its physical-node incarnation. A
 	// supervisor restoring a durable NodeDraining record should provide this
@@ -197,48 +210,56 @@ type Runtime struct {
 	ddlForwardTLS    *servicetls.Client
 	ddlForwardOwner  *gatewayDDLForwardOwner
 
-	replicaControlManifest        *gatewayReplicaControlManifest
-	provisionedSplitSources       []gatewayProvisionedSplitSource
-	hotSplitFactory               *gatewayHotSplitFactory
-	controlDirectory              *gateway.ReplicatedControlDirectory
-	serviceDirectory              *serviceauthz.ServiceDirectoryGate
-	controlListener               net.Listener
-	controlTLS                    *servicetls.Server
-	controlAuthorizer             *servicetls.NodeAuthorizer
-	controlService                *gateway.ClusterCatalogDrainControlService
-	bootstrapReadService          *nodecontrol.BootstrapReadService
-	sourceTopologyService         *splitcontroller.SourceTopologyService
-	controlOpener                 *gatewayShardControlOpener
-	clusterControlOpener          *gatewayClusterControlOpener
-	drainCoordinator              *gateway.ClusterCatalogDrainCoordinator
-	controlRosterMu               sync.RWMutex
-	controlRoster                 map[rafttransport.NodeID]map[uint64]struct{}
-	controlReadDeadline           rafttransport.DeadlineFunc
-	controlWriteDeadline          rafttransport.DeadlineFunc
-	controlHandshakeDeadline      rafttransport.DeadlineFunc
-	controlDone                   <-chan error
-	replicaControllersDone        <-chan struct{}
-	splitControllerDone           <-chan struct{}
-	hotShardDone                  <-chan struct{}
-	metricsDone                   <-chan struct{}
-	routeSeedDone                 <-chan struct{}
-	controlDirectoryDone          chan struct{}
-	splitRuntime                  *gatewayServingSplitRuntime
-	hotShardRuntime               *gatewayHotShardRuntime
-	backupOperator                gatewayBackupOperator
-	backupRepository              *clusterbackup.BackupRepository
-	distributedMetrics            *gateway.DistributedMetrics
-	distributedMetricsConcurrency int
-	schemaDDL                     *gatewaySchemaDDLRuntime
-	controllerContext             context.Context
-	controllerMetrics             *gatewayControllerMetrics
-	healthController              *gatewayReplicaHealthController
-	healthRevisions               *gatewayReplicaHealthRevisionController
-	moveController                *rebalanceexec.Controller
-	scalingController             *ScalingController
-	clusterControlBackend         *ScalingOperatorBackend
-	scalingDone                   <-chan struct{}
-	servingContext                context.Context
+	replicaControlManifest  *gatewayReplicaControlManifest
+	provisionedSplitSources []gatewayProvisionedSplitSource
+	hotSplitFactory         *gatewayHotSplitFactory
+	controlDirectory        *gateway.ReplicatedControlDirectory
+	serviceDirectory        *serviceauthz.ServiceDirectoryGate
+	controlListener         net.Listener
+	controlTLS              *servicetls.Server
+	controlAuthorizer       *servicetls.NodeAuthorizer
+	controlService          *gateway.ClusterCatalogDrainControlService
+	bootstrapReadService    *nodecontrol.BootstrapReadService
+	sourceTopologyService   *splitcontroller.SourceTopologyService
+	controlOpener           *gatewayShardControlOpener
+	// preparedAckPhysicalOpener is an optional narrow seam for exercising the
+	// controller's physical prepared-ACK exchange without replacing the
+	// production shard-control opener. Production wiring leaves it nil and
+	// uses controlOpener below.
+	preparedAckPhysicalOpener       frontendDrainPreparedAckPhysicalOpener
+	clusterControlOpener            *gatewayClusterControlOpener
+	drainCoordinator                *gateway.ClusterCatalogDrainCoordinator
+	controlDirectoryRefreshMu       sync.Mutex
+	publishedFrontendDrainCutDigest replication.Digest
+	publishedFrontendDrainCutValid  bool
+	controlRosterMu                 sync.RWMutex
+	controlRoster                   map[rafttransport.NodeID]map[uint64]struct{}
+	controlReadDeadline             rafttransport.DeadlineFunc
+	controlWriteDeadline            rafttransport.DeadlineFunc
+	controlHandshakeDeadline        rafttransport.DeadlineFunc
+	controlDone                     <-chan error
+	replicaControllersDone          <-chan struct{}
+	splitControllerDone             <-chan struct{}
+	hotShardDone                    <-chan struct{}
+	metricsDone                     <-chan struct{}
+	routeSeedDone                   <-chan struct{}
+	controlDirectoryDone            chan struct{}
+	splitRuntime                    *gatewayServingSplitRuntime
+	hotShardRuntime                 *gatewayHotShardRuntime
+	backupOperator                  gatewayBackupOperator
+	backupRepository                *clusterbackup.BackupRepository
+	distributedMetrics              *gateway.DistributedMetrics
+	distributedMetricsConcurrency   int
+	schemaDDL                       *gatewaySchemaDDLRuntime
+	controllerContext               context.Context
+	controllerMetrics               *gatewayControllerMetrics
+	healthController                *gatewayReplicaHealthController
+	healthRevisions                 *gatewayReplicaHealthRevisionController
+	moveController                  *rebalanceexec.Controller
+	scalingController               *ScalingController
+	clusterControlBackend           *ScalingOperatorBackend
+	scalingDone                     <-chan struct{}
+	servingContext                  context.Context
 
 	ctx    context.Context
 	cancel context.CancelFunc

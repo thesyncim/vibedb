@@ -135,6 +135,7 @@ const (
 	requestReadRequestLedger
 	requestReadExecutionPin
 	requestReadRouteGate
+	requestReadRouteReleaseReceipt
 	requestReplicaObservation
 	requestReplicaHealthObservation
 	requestOwnershipTransition
@@ -250,44 +251,49 @@ type ReplicaHealthObservation struct {
 }
 
 type readRequest struct {
-	fence             ServingFence
-	minimumApplied    uint64
-	delivery          *readDelivery
-	authorize         ProposalAuthorization
-	authorityEligible bool
-	forceReadIndex    bool
-	authorityFallback bool
+	fence               ServingFence
+	minimumApplied      uint64
+	delivery            *readDelivery
+	authorize           ProposalAuthorization
+	routeReleaseCommand []byte
+	authorityEligible   bool
+	forceReadIndex      bool
+	authorityFallback   bool
 }
 
 type readAuthorization struct {
-	source          ReadSource
-	recovery        TransactionRecoverySource
-	requestLedger   RequestLedgerSource
-	executionPin    ExecutionPinSource
-	routeGate       RouteGateSource
-	minimumApplied  uint64
-	generation      *ownerGeneration
-	authorityToken  raftauthority.AuthorityToken
-	authorityFast   bool
-	authorityPermit *servingFencePermit
-	state           ServingState
+	source              ReadSource
+	recovery            TransactionRecoverySource
+	requestLedger       RequestLedgerSource
+	executionPin        ExecutionPinSource
+	routeGate           RouteGateSource
+	routeReleaseReceipt RouteReleaseReceiptSource
+	routeReleaseCommand []byte
+	minimumApplied      uint64
+	generation          *ownerGeneration
+	authorityToken      raftauthority.AuthorityToken
+	authorityFast       bool
+	authorityPermit     *servingFencePermit
+	state               ServingState
 }
 
 type readDelivery struct {
 	// Assigned under owner.mu before publication; zero means not shareable.
-	admission      uint64
-	state          atomic.Uint32
-	reply          chan ownerReply
-	context        [16]byte
-	contextSet     bool
-	serving        ServingState
-	source         ReadSource
-	recovery       TransactionRecoverySource
-	requestLedger  RequestLedgerSource
-	executionPin   ExecutionPinSource
-	routeGate      RouteGateSource
-	minimumApplied uint64
-	generation     *ownerGeneration
+	admission           uint64
+	state               atomic.Uint32
+	reply               chan ownerReply
+	context             [16]byte
+	contextSet          bool
+	serving             ServingState
+	source              ReadSource
+	recovery            TransactionRecoverySource
+	requestLedger       RequestLedgerSource
+	executionPin        ExecutionPinSource
+	routeGate           RouteGateSource
+	routeReleaseReceipt RouteReleaseReceiptSource
+	routeReleaseCommand []byte
+	minimumApplied      uint64
+	generation          *ownerGeneration
 }
 
 type ownerGeneration struct {
@@ -1055,7 +1061,8 @@ func proposalIngressCandidate(request ownerRequest) bool {
 func readIngressCandidate(request ownerRequest) bool {
 	switch request.kind {
 	case requestReadLinear, requestReadFollower, requestReadTransaction,
-		requestReadRequestLedger, requestReadExecutionPin, requestReadRouteGate:
+		requestReadRequestLedger, requestReadExecutionPin, requestReadRouteGate,
+		requestReadRouteReleaseReceipt:
 		return true
 	default:
 		return false
@@ -1872,7 +1879,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 			reply.err = raftauthority.ErrPolicyDisabled
 		}
 	case requestReadLinear, requestReadFollower, requestReadTransaction, requestReadRequestLedger,
-		requestReadExecutionPin, requestReadRouteGate:
+		requestReadExecutionPin, requestReadRouteGate, requestReadRouteReleaseReceipt:
 		member, found := owner.members[request.group]
 		if !found ||
 			!servingFenceMatchesIdentity(request.read.fence, member) {
@@ -1896,6 +1903,11 @@ func (owner *Owner) handle(request ownerRequest) error {
 			}
 		} else if request.kind == requestReadRouteGate {
 			if _, ok := member.recovery.(RouteGateSource); !ok {
+				reply.err = ErrServingFence
+				break
+			}
+		} else if request.kind == requestReadRouteReleaseReceipt {
+			if _, ok := member.recovery.(RouteReleaseReceiptSource); !ok {
 				reply.err = ErrServingFence
 				break
 			}
@@ -1964,6 +1976,8 @@ func (owner *Owner) handle(request ownerRequest) error {
 		request.read.delivery.requestLedger, _ = member.recovery.(RequestLedgerSource)
 		request.read.delivery.executionPin, _ = member.recovery.(ExecutionPinSource)
 		request.read.delivery.routeGate, _ = member.recovery.(RouteGateSource)
+		request.read.delivery.routeReleaseReceipt, _ = member.recovery.(RouteReleaseReceiptSource)
+		request.read.delivery.routeReleaseCommand = request.read.routeReleaseCommand
 		request.read.delivery.minimumApplied = request.read.minimumApplied
 		request.read.delivery.generation = member.generation
 		request.read.delivery.serving = serving
@@ -2025,7 +2039,8 @@ func (owner *Owner) handle(request ownerRequest) error {
 		reply.err = ErrInvalidOwner
 	}
 	if (request.kind == requestReadLinear || request.kind == requestReadTransaction ||
-		request.kind == requestReadRequestLedger || request.kind == requestReadExecutionPin || request.kind == requestReadRouteGate) &&
+		request.kind == requestReadRequestLedger || request.kind == requestReadExecutionPin ||
+		request.kind == requestReadRouteGate || request.kind == requestReadRouteReleaseReceipt) &&
 		request.read.delivery != nil {
 		if !owner.settleReadDelivery(request.read.delivery, reply) && reply.read.generation != nil {
 			reply.read.generation.release()
@@ -2440,6 +2455,8 @@ func (owner *Owner) settleReadBarrierDelivery(delivery *readDelivery, outcome ra
 		reply.read.generation = delivery.generation
 		reply.read.executionPin = delivery.executionPin
 		reply.read.routeGate = delivery.routeGate
+		reply.read.routeReleaseReceipt = delivery.routeReleaseReceipt
+		reply.read.routeReleaseCommand = delivery.routeReleaseCommand
 		reply.read.state = delivery.serving
 	}
 	if !owner.settleReadDelivery(delivery, reply) && reply.read.generation != nil {

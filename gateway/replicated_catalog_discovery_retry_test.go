@@ -22,6 +22,39 @@ type catalogDisconnectedSweepClient struct {
 	always   bool
 }
 
+// catalogTypedRefusalSweepClient models the physical catalog receiver while
+// its canonical service gate is being installed.  An unavailable response is
+// deliberately state-less and retryable; an unauthorized response is also
+// state-less but terminal.  Keeping these as wire refusals catches accidental
+// conversion of a missing gate into a transport error (or, worse, a trusted
+// static handshake).
+type catalogTypedRefusalSweepClient struct {
+	states   map[string]shardservice.ReplicatedMemberState
+	probes   [ServingReplicaCount]atomic.Int64
+	parallel bool
+	refusal  shardservice.ReplicatedRefusalCode
+}
+
+func (client *catalogTypedRefusalSweepClient) parallelReplicatedDiscoveryEnabled() bool {
+	return client.parallel
+}
+
+func (client *catalogTypedRefusalSweepClient) DoReplicated(_ context.Context, endpoint ReplicatedEndpoint,
+	_ *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	attempt := client.probes[endpoint.Member-1].Add(1)
+	if client.refusal == shardservice.ReplicatedRefusalUnavailable && attempt == 1 {
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedRefusal,
+			Refusal: shardservice.ReplicatedRefusalUnavailable}, nil
+	}
+	if client.refusal == shardservice.ReplicatedRefusalUnauthorized {
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedRefusal,
+			Refusal: shardservice.ReplicatedRefusalUnauthorized}, nil
+	}
+	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake, HasState: true,
+		State: client.states[endpoint.Address]}, nil
+}
+
 func (client *catalogDisconnectedSweepClient) parallelReplicatedDiscoveryEnabled() bool {
 	return client.parallel
 }
@@ -87,6 +120,58 @@ func TestCatalogDiscoveryRejectsTerminalFailureBesideDisconnect(t *testing.T) {
 			for index := range client.probes {
 				if probes := client.probes[index].Load(); probes != 1 {
 					t.Fatalf("member %d probes=%d, want one terminal sweep", index+1, probes)
+				}
+			}
+		})
+	}
+}
+
+func TestCatalogDiscoveryHandlesTypedGateRefusals(t *testing.T) {
+	for _, parallel := range []bool{false, true} {
+		name := map[bool]string{false: "serial", true: "hedged"}[parallel]
+		t.Run(name, func(t *testing.T) {
+			route, _, states := testReplicatedRouteCommand(t)
+			route.Distribution, route.Shard = ReplicatedCatalogDistribution, ReplicatedCatalogShard
+			client := &catalogTypedRefusalSweepClient{
+				states: states, parallel: parallel, refusal: shardservice.ReplicatedRefusalUnavailable,
+			}
+			executor, err := NewReplicatedExecutor(client, 2, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			observed, err := executor.catalogOperationalRoute(t.Context(), route, nil)
+			if err != nil || observed.Command != route.Command {
+				t.Fatalf("typed unavailable refusal did not recover: route=%+v err=%v", observed, err)
+			}
+			var retried bool
+			for index := range client.probes {
+				if probes := client.probes[index].Load(); probes > 1 {
+					retried = true
+				}
+			}
+			if !retried {
+				t.Fatalf("typed unavailable refusal did not trigger a bounded second sweep: probes=%v", client.probes)
+			}
+
+			client = &catalogTypedRefusalSweepClient{
+				states: states, parallel: parallel, refusal: shardservice.ReplicatedRefusalUnauthorized,
+			}
+			executor, err = NewReplicatedExecutor(client, 2, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = executor.catalogOperationalRoute(t.Context(), route, nil); err == nil {
+				t.Fatal("typed unauthorized refusal unexpectedly recovered")
+			} else {
+				var refusal *ReplicatedRefusalError
+				if !errors.As(err, &refusal) || refusal.Code != shardservice.ReplicatedRefusalUnauthorized {
+					t.Fatalf("typed unauthorized refusal=%v, want refusal code %d", err,
+						shardservice.ReplicatedRefusalUnauthorized)
+				}
+			}
+			for index := range client.probes {
+				if probes := client.probes[index].Load(); probes > 1 {
+					t.Fatalf("typed unauthorized refusal retried member %d %d times", index+1, probes)
 				}
 			}
 		})

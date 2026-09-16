@@ -94,6 +94,20 @@ func rf3ControlNodes(policy *serviceauthz.Policy) []rafttransport.NodeID {
 // Transport admission never grants storage nodes delegation or topology.
 func rf3ControlPeerNodes(manifest rf3Manifest, authorized []rafttransport.NodeID) []rafttransport.NodeID {
 	nodes := slices.Clone(authorized)
+	// Gateway-control source readers use the physical node's shard-control
+	// listener for their prepared ACK. Persisted gateway seeds therefore need
+	// admission at the TLS layer before the handler can apply its exact policy
+	// and SPKI checks.
+	for _, seed := range manifest.GatewaySeeds {
+		if seed.Valid() {
+			nodes = append(nodes, seed.NodeID)
+		}
+	}
+	for _, seed := range manifest.CanonicalSourceSeeds {
+		if seed.Valid() {
+			nodes = append(nodes, seed.NodeID)
+		}
+	}
 	for _, group := range manifest.groupBundles() {
 		for _, member := range group.Members {
 			if member.NodeID != (rafttransport.NodeID{}) {
@@ -171,6 +185,10 @@ func configureRF3ManifestReload(manifest *rf3Manifest, path string, enabled bool
 	return func() {
 		signal.Stop(changes)
 	}
+}
+
+func rf3ServiceDirectoryRefreshConfigured(manifest rf3Manifest, embeddedGateway bool) bool {
+	return embeddedGateway || manifest.NodeLog != nil
 }
 
 // servePreparedRF3 opens only previously prepared durable artifacts. It never
@@ -1231,15 +1249,6 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	if err != nil {
 		return err
 	}
-	controlMux, err := newRF3ControlMux(
-		membershipControl, observationControl, metricsControl, backupControl, sourceControl, actionControl,
-		splitRuntime.action, schemaControl, splitRuntime.observation.service,
-		splitRuntime.admission, splitRuntime.tail, splitRuntime.terminal, childPrepareControl,
-		restoreServingControl, schemaBuildControl, capacityControl, preparationSource, enrollmentControl,
-	)
-	if err != nil {
-		return err
-	}
 	snapshotMux, err := newRF3SnapshotMux(sourceData, splitRuntime.artifact)
 	if err != nil {
 		return err
@@ -1274,6 +1283,99 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			return err
 		}
 	}
+	var preparedAckControl shardcontrol.Handler
+	var preparedAckReader *rf3FrontendDrainPreparedAckCutReader
+	var canonicalRows gateway.FrontendDrainRuntimeCutRowReader
+	var canonicalSourceControl shardcontrol.Handler
+	if server != nil {
+		var preparedAckTransport *servicetls.Client
+		var readerErr error
+		preparedAckReader, preparedAckTransport, readerErr = newRF3FrontendDrainPreparedAckCutReaderWithSources(
+			profile, manifest.GatewaySeeds, manifest.CanonicalSourceSeeds, manifest.NodeIncarnation, deadline, deadline,
+			filepath.Join(manifest.ReplicaControl.SourceDataRoot, "frontend-drain-source-roster"),
+		)
+		if readerErr != nil {
+			return readerErr
+		}
+		if preparedAckTransport != nil {
+			defer func() { resultErr = errors.Join(resultErr, preparedAckTransport.Close()) }()
+		}
+		if preparedAckReader != nil {
+			defer func() { resultErr = errors.Join(resultErr, preparedAckReader.Close()) }()
+		}
+		// A receiver with a managed source or embedded gateway must carry the
+		// explicit physical incarnation required by ReadLatest. The parser rejects
+		// source-configured zero-incarnation manifests; a grouped fixture with no
+		// source is the explicit nonmanaged form and has no refresh binding.
+		if manifest.NodeLog != nil || embeddedGateway != nil {
+			if err := server.BindServiceDirectoryRefresh(
+				preparedAckReader, profile.LocalIdentity().Node, manifest.NodeIncarnation,
+				profile.LocalServiceKeyDigest(),
+			); err != nil {
+				return err
+			}
+		}
+		preparedAckService, serviceErr := shardservice.NewFrontendDrainPreparedAckService(
+			shardservice.FrontendDrainPreparedAckServiceOptions{
+				Reader: preparedAckReader, Installer: server,
+				TrustDomain:  profile.LocalIdentity().TrustDomain,
+				Authorize:    rf3FrontendDrainPreparedAckAuthorizer(profile, policy),
+				ReadDeadline: deadline, WriteDeadline: deadline,
+			},
+		)
+		if serviceErr != nil {
+			return serviceErr
+		}
+		preparedAckControl = preparedAckService
+		// The physical source endpoint is fenced by the immutable node lifecycle
+		// incarnation in the manifest. Group RuntimeIdentity incarnations advance
+		// independently on every reopen and must never be advertised as the
+		// physical source identity.
+		sourceIncarnation := manifest.NodeIncarnation
+		if sourceIncarnation != 0 {
+			canonicalSource, sourceErr := gatewayruntime.NewFrontendDrainPreparedAckCutReadService(
+				gatewayruntime.FrontendDrainPreparedAckCutReadServiceOptions{
+					Authorize: func(connection rafttransport.PeerConnection) bool {
+						if connection == nil || connection.TrafficClass() != rafttransport.TrafficShardControl {
+							return false
+						}
+						peer := connection.PeerIdentity()
+						if peer.TrustDomain != profile.LocalIdentity().TrustDomain ||
+							peer.Node == (rafttransport.NodeID{}) || connection.PeerKeyDigest() == ([32]byte{}) {
+							return false
+						}
+						physical, err := transportRegistry.PhysicalPeer(peer.Node)
+						return err == nil && physical.State == rafttransport.PeerEnrolled
+					},
+					ReadCut: func(ctx context.Context) (gateway.FrontendDrainRuntimeCut, error) {
+						if canonicalRows == nil {
+							return gateway.FrontendDrainRuntimeCut{}, fmt.Errorf("%w: canonical frontend drain rows are not bound on source node=%x", errRF3Serving, profile.LocalIdentity().Node)
+						}
+						return gateway.ReadFrontendDrainRuntimeCutFromRows(ctx, canonicalRows)
+					},
+					Profile: profile, PolicyGeneration: policy.Generation(),
+					TrafficClass: rafttransport.TrafficShardControl,
+					SourceNode:   profile.LocalIdentity().Node, SourceIncarnation: sourceIncarnation,
+					SourceServiceKeyDigest: profile.LocalServiceKeyDigest(),
+					ReadDeadline:           deadline, WriteDeadline: deadline,
+				},
+			)
+			if sourceErr != nil {
+				return sourceErr
+			}
+			canonicalSourceControl = canonicalSource
+		}
+	}
+	controlMux, err := newRF3ControlMux(
+		membershipControl, observationControl, metricsControl, backupControl, sourceControl, actionControl,
+		splitRuntime.action, schemaControl, splitRuntime.observation.service,
+		splitRuntime.admission, splitRuntime.tail, splitRuntime.terminal, childPrepareControl,
+		restoreServingControl, schemaBuildControl, capacityControl, preparationSource, enrollmentControl,
+		preparedAckControl, canonicalSourceControl,
+	)
+	if err != nil {
+		return err
+	}
 
 	var preparedGateway *rf3EmbeddedGateway
 	if embeddedGateway != nil {
@@ -1281,7 +1383,17 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		if err != nil {
 			return err
 		}
+		// Every embedded gateway has the authenticated physical source
+		// available for follower startup. A local catalog leader may use the
+		// row-reader fast path; followers must install a ReadLatest proof from
+		// a surviving gateway before their local semantic catalog reads.
+		preparedGateway.config.CanonicalFrontendDrainRuntimeSource = preparedAckReader
 		defer func() { resultErr = errors.Join(resultErr, preparedGateway.remote.Close()) }()
+	}
+	if server != nil && rf3ServiceDirectoryRefreshConfigured(manifest, embeddedGateway != nil) {
+		if err := server.SetRequireServiceDirectory(true); err != nil {
+			return err
+		}
 	}
 
 	peerCtx, stopPeer := context.WithCancelCause(context.Background())
@@ -1308,6 +1420,43 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			errors.Join(errors.New("RF3 peer failed before readiness"), peerErr),
 			lanes, servingRegistry,
 		)
+	}
+	var catalogGenesisDone <-chan error
+	if manifest.CatalogGenesis != nil {
+		if catalogGroup, groupOK := rf3CatalogGenesisGroup(*manifest.CatalogGenesis); groupOK {
+			for index := range identities {
+				if identities[index].Group != catalogGroup {
+					continue
+				}
+				catalogGenesisDone = startRF3CatalogGenesis(
+					parent, manifest.CatalogGenesis, peer.Owners(), profile.LocalIdentity().Node,
+					identities[index], commands[index],
+				)
+				break
+			}
+		}
+	}
+	if preparedGateway != nil {
+		if err := bindRF3EmbeddedGatewayCanonicalRows(preparedGateway, peer, identities); err != nil {
+			return finishRF3Serving(err, lanes, servingRegistry)
+		}
+		canonicalRows = preparedGateway.config.CanonicalFrontendDrainRuntimeRows
+		if canonicalRows == nil {
+			// The local embedded optimization is intentionally leader-aware and
+			// runs before the first election. Keep the physical source route
+			// live with the retained catalog owner meanwhile; its serialized
+			// probe will begin succeeding as soon as this process is elected,
+			// while followers use another authenticated source seed.
+			canonicalRows, err = bindRF3RetainedCatalogRows(peer, &preparedSet, commands)
+			if err != nil {
+				return finishRF3Serving(err, lanes, servingRegistry)
+			}
+		}
+	} else if server != nil {
+		canonicalRows, err = bindRF3RetainedCatalogRows(peer, &preparedSet, commands)
+		if err != nil {
+			return finishRF3Serving(err, lanes, servingRegistry)
+		}
 	}
 
 	pulseDone := make(chan struct{})
@@ -1353,6 +1502,21 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			)
 		}()
 	}
+	var (
+		serviceCutReady <-chan struct{}
+	)
+	if server != nil && rf3ServiceDirectoryRefreshConfigured(manifest, embeddedGateway != nil) {
+		refreshCtx, cancelRefresh := context.WithCancel(parent)
+		ready := make(chan struct{})
+		serviceCutReady = ready
+		go func() {
+			_ = runRF3FrontendDrainServiceCutRefresh(
+				refreshCtx, preparedAckReader, profile, manifest.NodeIncarnation, server,
+				time.Second, ready,
+			)
+		}()
+		defer cancelRefresh()
+	}
 	if readAuthorityCache != nil {
 		readAuthorityCache.Start(nativeCtx)
 	}
@@ -1375,6 +1539,12 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			if err := waitRF3ServiceAdmission(gatewayCtx, controlAdmission, snapshotAdmission, nativeAdmission); err != nil {
 				result = err
 				return
+			}
+			if serviceCutReady != nil {
+				if err := waitRF3FrontendDrainServiceCutReady(gatewayCtx, serviceCutReady); err != nil {
+					result = fmt.Errorf("%w: wait for canonical frontend drain cut: %v", errRF3Serving, err)
+					return
+				}
 			}
 			runtime, openErr := gatewayruntime.Open(gatewayCtx, state.config)
 			if openErr != nil {
@@ -1420,6 +1590,11 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			case err := <-embeddedGatewayDone:
 				embeddedGatewayFinished = true
 				primary = fmt.Errorf("RF3 embedded gateway stopped during startup: %w", err)
+			case err := <-catalogGenesisDone:
+				catalogGenesisDone = nil
+				if err != nil {
+					primary = fmt.Errorf("RF3 catalog genesis: %w", err)
+				}
 			case <-parent.Done():
 				// Parent cancellation is the normal lifecycle request.
 				frontendStartupCanceled = true
@@ -1434,6 +1609,18 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 				primary, snapshotFinished = fmt.Errorf("RF3 snapshot listener stopped during embedded gateway startup: %w", err), true
 			case err := <-nativeDone:
 				primary, nativeFinished = fmt.Errorf("RF3 native listener stopped during embedded gateway startup: %w", err), true
+			}
+		}
+	}
+	if primary == nil && !frontendStartupCanceled && serviceCutReady != nil {
+		readyCtx, cancelReady := context.WithTimeout(parent, rf3NetworkTimeout)
+		readyErr := waitRF3FrontendDrainServiceCutReady(readyCtx, serviceCutReady)
+		cancelReady()
+		if readyErr != nil {
+			if context.Cause(parent) != nil {
+				frontendStartupCanceled = true
+			} else {
+				primary = fmt.Errorf("RF3 canonical service-directory startup: %w", readyErr)
 			}
 		}
 	}
@@ -1480,6 +1667,11 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			case err := <-embeddedGatewayDone:
 				embeddedGatewayFinished = true
 				primary = fmt.Errorf("RF3 embedded gateway stopped: %w", err)
+			case err := <-catalogGenesisDone:
+				catalogGenesisDone = nil
+				if err != nil {
+					primary = fmt.Errorf("RF3 catalog genesis: %w", err)
+				}
 			}
 			break
 		}
@@ -1542,6 +1734,12 @@ func newRF3ControlMux(
 	}
 	if len(capacity) > 2 {
 		services.enrollment = capacity[2]
+	}
+	if len(capacity) > 3 {
+		services.preparedAck = capacity[3]
+	}
+	if len(capacity) > 4 {
+		services.canonicalSource = capacity[4]
 	}
 	return services.mux()
 }

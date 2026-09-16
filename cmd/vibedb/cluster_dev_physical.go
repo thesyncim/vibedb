@@ -21,6 +21,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/hotshard"
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -164,6 +165,34 @@ func initializeDevPhysicalCluster(options devClusterOptions, manifestPath string
 	if err != nil {
 		return devClusterManifest{}, err
 	}
+	// Only the physical nodes that own the generation-one catalog route can
+	// answer canonical source reads before an embedded gateway has opened. The
+	// remaining storage nodes are valid receivers, but advertising them as
+	// sources would turn an expected empty binding into a false startup failure.
+	catalogPlacement := devPhysicalPlacement(physical, 0)
+	canonicalSourceSeeds := make([]nodecontrol.BootstrapGatewaySeed, len(catalogPlacement))
+	for seedIndex, nodeIndex := range catalogPlacement {
+		node := storageNodes[nodeIndex]
+		pin, pinErr := devCertificateSPKIPin(credentials[nodeIndex][0])
+		if pinErr != nil {
+			return devClusterManifest{}, pinErr
+		}
+		canonicalSourceSeeds[seedIndex] = nodecontrol.BootstrapGatewaySeed{
+			NodeID: node, Incarnation: 1,
+			ControlAddress: ports[1+nodeIndex*6+3], SPKIPinDigest: pin,
+		}
+	}
+	gatewaySeeds := make([]nodecontrol.BootstrapGatewaySeed, physical)
+	for index, node := range gatewayNodes {
+		pin, pinErr := devCertificateSPKIPin(credentials[physical+index][0])
+		if pinErr != nil {
+			return devClusterManifest{}, pinErr
+		}
+		gatewaySeeds[index] = nodecontrol.BootstrapGatewaySeed{
+			NodeID: node, Incarnation: 1,
+			ControlAddress: ports[1+index*6+4], SPKIPinDigest: pin,
+		}
+	}
 	policyPath := filepath.Join(options.root, "authorization-policy.vibejson")
 	if err := writeDevPhysicalPolicy(policyPath, storageNodes, gatewayNodes, clientNode, true); err != nil {
 		return devClusterManifest{}, err
@@ -240,7 +269,9 @@ func initializeDevPhysicalCluster(options devClusterOptions, manifestPath string
 		gatewayConfig := devGatewayConfig{
 			InitialNodeDirectoryPath: filepath.Join(options.root, "initial-node-directory.vibejson"),
 			CatalogPath:              filepath.Join(options.root, "catalog.vibejson"), CatalogRouteSeedPath: filepath.Join(gatewayBase, "catalog-route-seed"),
-			CatalogBootstrapIfMissing: nodeIndex == 0, CatalogRelation: 1, CatalogAttempts: 8,
+			// Physical catalog genesis is owned by the closed storage-side lane;
+			// embedded gateways only consume the committed cut.
+			CatalogBootstrapIfMissing: false, CatalogRelation: 1, CatalogAttempts: 8,
 			CatalogAttemptTimeoutMillis: 5000, CatalogSessionLeaseMillis: uint64((24 * time.Hour) / time.Millisecond),
 			CatalogSessionJournal: filepath.Join(gatewayBase, "catalog-session"), CatalogClientID: devIDString(gatewayNodes[nodeIndex][:]),
 			CatalogRetryHome: devRetryHomeString(gatewayRetryHome(clusterID, gatewayNodes[nodeIndex])), DurableAckKey: ackPath,
@@ -354,7 +385,36 @@ func initializeDevPhysicalCluster(options devClusterOptions, manifestPath string
 			}
 		}
 		gatewayPtr := gatewayConfig
-		nodeInput := devPrepareNodeManifest{Root: nodeRoot, NodeLog: devNodeLogManifest{Format: 1, Path: filepath.Join(nodeRoot, "node-log"), KeyID: "dev-cluster-key", KeyMaterialPath: keySource, Options: raftstore.NodeStoreOptions{MaxGroups: 64}}, Gateway: &gatewayPtr, Groups: groups}
+		nodeInput := devPrepareNodeManifest{Root: nodeRoot, NodeLog: devNodeLogManifest{Format: 1, Path: filepath.Join(nodeRoot, "node-log"), KeyID: "dev-cluster-key", KeyMaterialPath: keySource, Options: raftstore.NodeStoreOptions{MaxGroups: 64}}, Gateway: &gatewayPtr,
+			GatewaySeeds:         append([]nodecontrol.BootstrapGatewaySeed(nil), gatewaySeeds...),
+			CanonicalSourceSeeds: append([]nodecontrol.BootstrapGatewaySeed(nil), canonicalSourceSeeds...), Groups: groups}
+		for _, member := range roleMembers[0] {
+			if member.Node != node.Node {
+				continue
+			}
+			nodeInput.CatalogGenesis = &devCatalogGenesisConfig{
+				PlanPath:                 filepath.Join(options.root, fmt.Sprintf("catalog-genesis-node-%d.vibejson", nodeIndex+1)),
+				CatalogPath:              filepath.Join(options.root, "catalog.vibejson"),
+				InitialNodeDirectoryPath: filepath.Join(options.root, "initial-node-directory.vibejson"),
+				SessionJournal:           filepath.Join(gatewayBase, "catalog-genesis-session"),
+				ClientID:                 devIDString(storageNodes[nodeIndex][:]),
+				RetryHome:                devRetryHomeString(gatewayRetryHome(clusterID, storageNodes[nodeIndex])),
+				Distribution:             string(gateway.ReplicatedCatalogDistribution),
+				Shard:                    string(gateway.ReplicatedCatalogShard),
+				ClusterID:                devIDString(clusterID[:]),
+				ClusterIncarnation:       devIDString(clusterIncarnation[:]),
+				TopologyRecoveryEpoch:    1,
+				AllocationGeneration:     1,
+				ShardIncarnation:         devIDString(roles[0].shardIncarnation[:]),
+				GroupID:                  devIDString(roles[0].groupID[:]),
+				MemberID:                 member.Member,
+				StoreID:                  member.Store,
+				NodeID:                   node.Node,
+				NodeIncarnation:          1,
+				Relation:                 1,
+			}
+			break
+		}
 		if err := persistDevPhysicalNodeInput(nodeRoot, nodeInput); err != nil {
 			return devClusterManifest{}, err
 		}
@@ -466,7 +526,10 @@ func completeDevPhysicalCluster(options devClusterOptions, manifest devClusterMa
 	if err := validateDevPhysicalCatalog(manifest); err != nil {
 		return err
 	}
-	return writeDevInitialNodeDirectory(manifest)
+	if err := writeDevInitialNodeDirectory(manifest); err != nil {
+		return err
+	}
+	return writeDevPhysicalCatalogGenesisPlans(manifest)
 }
 
 func writeDevPhysicalCatalog(cluster devClusterManifest) error {

@@ -8,7 +8,7 @@ import (
 )
 
 func TestBootstrapNodeDirectoryPublishesCompleteCutAndDoesNotOverwrite(t *testing.T) {
-	authority, _, snapshot := newCatalogAuthorityFixture(t)
+	authority, _, snapshot := newCatalogAuthorityGenesisFixture(t)
 	records := make([]NodeRecord, 0, len(snapshot.replicatedReplicas))
 	for i, replica := range snapshot.replicatedReplicas {
 		record := NodeRecord{NodeID: replica.Node, Incarnation: replica.NodeIncarnation, ServiceKeyDigest: replication.Digest{byte(i + 1)},
@@ -32,6 +32,14 @@ func TestBootstrapNodeDirectoryPublishesCompleteCutAndDoesNotOverwrite(t *testin
 	cut, err := authority.ReadNodeDirectoryCut(t.Context())
 	if err != nil || len(cut.Nodes) != len(records) {
 		t.Fatalf("cut=%+v err=%v", cut, err)
+	}
+	serviceRevision, grants, fences, drainRecords, err := authority.ReadFrontendDrainServiceCut(t.Context())
+	if err != nil || serviceRevision != 1 || len(grants) != 0 || len(fences) != 0 || len(drainRecords) != 0 {
+		t.Fatalf("genesis service cut revision=%d grants=%d fences=%d records=%d err=%v",
+			serviceRevision, len(grants), len(fences), len(drainRecords), err)
+	}
+	if err := authority.EnsureFrontendDrainServiceDirectory(t.Context()); err != nil {
+		t.Fatalf("idempotent service-directory ensure: %v", err)
 	}
 	records[0].ServiceKeyDigest[0] ^= 0xff
 	if err := authority.BootstrapNodeDirectory(t.Context(), records); err != nil {

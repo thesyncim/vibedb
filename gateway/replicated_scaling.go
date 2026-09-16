@@ -132,6 +132,45 @@ func appendScalingNodeRecord(dst []byte, record NodeRecord) ([]byte, error) {
 	return appendControlPlaneDocument(dst, appendScalingNodeIdentifier(identifier[:0], record), payload, maxScalingNodeRecordBytes)
 }
 
+// CertifiedNodeReplacementDigest binds the immutable predecessor row, its
+// completed decommission intent, and the successor's physical identity.  The
+// successor replacement marker itself is excluded from the final row bytes so
+// callers can calculate this digest before filling ProofDigest.
+func CertifiedNodeReplacementDigest(
+	predecessor NodeRecord, intent ScalingIntent, successor NodeRecord,
+) (replication.Digest, error) {
+	if !predecessor.Valid() || !intent.Valid() || intent.State != ScalingComplete ||
+		successor.Replacement == nil {
+		return replication.Digest{}, ErrScalingIdentity
+	}
+	withoutMarker := successor
+	withoutMarker.Replacement = nil
+	if !withoutMarker.Valid() {
+		return replication.Digest{}, ErrScalingIdentity
+	}
+	predecessorBytes, err := appendScalingNodeRecord(nil, predecessor)
+	if err != nil {
+		return replication.Digest{}, err
+	}
+	intentBytes, err := appendScalingIntentRecord(nil, intent)
+	if err != nil {
+		return replication.Digest{}, err
+	}
+	successorBytes, err := appendScalingNodeRecord(nil, withoutMarker)
+	if err != nil {
+		return replication.Digest{}, err
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("vibedb/gateway/node-replacement/v1\x00"))
+	for _, raw := range [][]byte{predecessorBytes, intentBytes, successorBytes} {
+		var length [8]byte
+		binary.LittleEndian.PutUint64(length[:], uint64(len(raw)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.Write(raw)
+	}
+	return replication.Digest(sha256.Sum256(hash.Sum(nil))), nil
+}
+
 func openScalingNodeRecord(raw []byte, node rafttransport.NodeID, incarnation uint64) (NodeRecord, error) {
 	if len(raw) == 0 || len(raw) > maxScalingNodeRecordBytes {
 		return NodeRecord{}, ErrInvalidScalingMetadata
@@ -662,6 +701,55 @@ retryCut:
 	return nil, ErrReplicatedCatalogConflict
 }
 
+// ListScalingTerminalIntents reads the bounded completion history. Completed
+// intents leave the active directory so new admissions do not treat them as
+// live work, but their exact terminal evidence remains addressable until the
+// history bound evicts it. Status projections use this history to retain a
+// SafeToStop witness after the active row is removed.
+func (authority *ReplicatedCatalogAuthority) ListScalingTerminalIntents(ctx context.Context) ([]ScalingIntent, error) {
+	if authority == nil || ctx == nil {
+		return nil, ErrInvalidScalingMetadata
+	}
+	for attempt := 0; attempt < authority.executor.maxAttempts; attempt++ {
+		directoryResult, err := authority.readRaw(ctx, scalingHistoryKey, maxScalingTerminalHistoryBytes)
+		if err != nil {
+			return nil, err
+		}
+		if !directoryResult.Found {
+			return nil, nil
+		}
+		entries, err := openScalingIDDirectory(directoryResult.Value, scalingHistoryDocumentID[:],
+			maxScalingTerminalHistoryBytes, maxScalingTerminalHistory)
+		if err != nil {
+			return nil, err
+		}
+		intents := make([]ScalingIntent, len(entries))
+		for index, entry := range entries {
+			var id [32]byte
+			copy(id[:], entry.ID)
+			intents[index], err = authority.readScalingIntentDirectoryEntry(ctx, id, entry)
+			if err != nil {
+				if errors.Is(err, ErrReplicatedCatalogConflict) {
+					intents = nil
+					break
+				}
+				return nil, err
+			}
+		}
+		if intents == nil {
+			continue
+		}
+		latest, err := authority.readRaw(ctx, scalingHistoryKey, maxScalingTerminalHistoryBytes)
+		if err != nil {
+			return nil, err
+		}
+		if latest.Found && bytes.Equal(latest.Value, directoryResult.Value) {
+			return intents, nil
+		}
+	}
+	return nil, ErrReplicatedCatalogConflict
+}
+
 func (authority *ReplicatedCatalogAuthority) ReadEnrollmentIntent(ctx context.Context, id [32]byte) (GroupEnrollmentIntent, error) {
 	if authority == nil || ctx == nil || id == ([32]byte{}) {
 		return GroupEnrollmentIntent{}, ErrInvalidScalingMetadata
@@ -1037,6 +1125,52 @@ func (authority *ReplicatedCatalogAuthority) PutNode(ctx context.Context, record
 	return authority.putNode(ctx, record, expectedRevision, nil, nil)
 }
 
+func (authority *ReplicatedCatalogAuthority) certifiedNodeReplacementIntent(
+	ctx context.Context, predecessor NodeRecord,
+) (ScalingIntent, error) {
+	history, err := authority.ListScalingTerminalIntents(ctx)
+	if err != nil {
+		return ScalingIntent{}, err
+	}
+	want := NodeReference{NodeID: predecessor.NodeID, Incarnation: predecessor.Incarnation}
+	for _, intent := range history {
+		if intent.State != ScalingComplete || intent.Request.Kind != ScalingDecommission ||
+			intent.Request.Drain != want || !intent.Evidence.SafeToStop() ||
+			!predecessor.MatchesSafeToStopEvidence(intent.Evidence) {
+			continue
+		}
+		return intent, nil
+	}
+	return ScalingIntent{}, ErrScalingState
+}
+
+func (authority *ReplicatedCatalogAuthority) validateNodeReplacement(
+	ctx context.Context, predecessor, successor NodeRecord,
+) error {
+	if predecessor.Lifecycle != NodeDecommissioned || !predecessor.HasRetirementProof() ||
+		predecessor.NodeID != successor.NodeID || successor.Incarnation <= predecessor.Incarnation ||
+		predecessor.Roles != successor.Roles || successor.Replacement == nil ||
+		successor.Replacement.PredecessorIncarnation != predecessor.Incarnation ||
+		successor.Replacement.PredecessorServiceKeyDigest != predecessor.ServiceKeyDigest {
+		return ErrScalingIdentity
+	}
+	if successor.Roles&NodeRoleGateway != 0 && successor.Replacement.PredecessorGateway != predecessor.Gateway {
+		return ErrScalingIdentity
+	}
+	intent, err := authority.certifiedNodeReplacementIntent(ctx, predecessor)
+	if err != nil {
+		return err
+	}
+	if successor.Replacement.IntentID != intent.ID {
+		return ErrScalingIdentity
+	}
+	expected, err := CertifiedNodeReplacementDigest(predecessor, intent, successor)
+	if err != nil || successor.Replacement.ProofDigest != expected {
+		return errors.Join(err, ErrScalingIdentity)
+	}
+	return nil
+}
+
 // RetireNode is the only path that can cross Draining -> Decommissioned.  It
 // requires a fresh complete reference scan and persists its digest beside the
 // terminal node state so a restart cannot lose the safe-to-stop witness.
@@ -1082,10 +1216,17 @@ func (authority *ReplicatedCatalogAuthority) RetireNode(ctx context.Context, nod
 	next.RetirementScanDigest = evidence.Digest
 	next.RetirementScanDirectoryRevision = evidence.DirectoryRevision
 	next.RetirementScanCutRevision = evidence.DirectoryCutRevision
-	return authority.putNode(ctx, next, expectedRevision, &evidence, &headResult)
+	return authority.putNodeWithExtra(ctx, next, expectedRevision, &evidence, &headResult,
+		authority.appendRetiredFrontendDrainMutations)
 }
 
 func (authority *ReplicatedCatalogAuthority) putNode(ctx context.Context, record NodeRecord, expectedRevision uint64, retirement *NodeReferenceEvidence, catalogHead *ReplicatedPointResult) error {
+	return authority.putNodeWithExtra(ctx, record, expectedRevision, retirement, catalogHead, nil)
+}
+
+type nodeMutationAppender func(context.Context, NodeRecord, NodeRecord) ([]NativeMutation, error)
+
+func (authority *ReplicatedCatalogAuthority) putNodeWithExtra(ctx context.Context, record NodeRecord, expectedRevision uint64, retirement *NodeReferenceEvidence, catalogHead *ReplicatedPointResult, extra nodeMutationAppender) error {
 	if authority == nil || authority.session == nil || ctx == nil || !record.Valid() {
 		return ErrInvalidScalingMetadata
 	}
@@ -1121,6 +1262,16 @@ func (authority *ReplicatedCatalogAuthority) putNode(ctx context.Context, record
 			return ErrScalingRevision
 		}
 		if prior.Lifecycle == NodeDraining && record.Lifecycle == NodeDecommissioned && retirement == nil {
+			return ErrScalingState
+		}
+		// A gateway's Active -> Draining transition carries the immutable
+		// closed-admission proof and the matching service authority in the same
+		// native mutation. Generic PutNode cannot construct that proof, so
+		// allowing it here would publish a lifecycle the receiver projection is
+		// required to reject. Storage-only nodes retain the ordinary lifecycle
+		// path because they have no frontend admission surface.
+		if prior.Lifecycle == NodeActive && record.Lifecycle == NodeDraining &&
+			record.Roles&NodeRoleGateway != 0 && extra == nil {
 			return ErrScalingState
 		}
 		if prior.Lifecycle == NodeDecommissioned {
@@ -1189,12 +1340,14 @@ func (authority *ReplicatedCatalogAuthority) putNode(ctx context.Context, record
 	// exhaust the bounded historical node directory.
 	if !current.Found && record.Lifecycle == NodeJoining {
 		filtered := make([]scalingNodeDirectoryEntry, 0, len(entries))
+		var predecessor NodeRecord
+		var predecessorFound bool
 		for _, oldEntry := range entries {
 			if !bytes.Equal(oldEntry.NodeID, record.NodeID[:]) {
 				filtered = append(filtered, oldEntry)
 				continue
 			}
-			if oldEntry.Incarnation > record.Incarnation {
+			if oldEntry.Incarnation >= record.Incarnation {
 				return ErrScalingIdentity
 			}
 			var oldNode rafttransport.NodeID
@@ -1208,11 +1361,21 @@ func (authority *ReplicatedCatalogAuthority) putNode(ctx context.Context, record
 				oldRecord.RetirementScanDigest == (replication.Digest{}) {
 				return errors.Join(openErr, ErrScalingState)
 			}
+			if !predecessorFound || oldRecord.Incarnation > predecessor.Incarnation {
+				predecessor, predecessorFound = oldRecord, true
+			}
 			retiredNodeGC = append(retiredNodeGC, NativeMutation{Kind: replication.MutationDeleteDigestEqual,
 				Key: scalingNodeKey(oldNode, oldEntry.Incarnation), Value: nil,
 				ExpectedValueLength: uint64(len(oldRaw.Value)), ExpectedValueDigest: scalingDigest(oldRaw.Value)})
 		}
 		entries = filtered
+		if predecessorFound {
+			if err := authority.validateNodeReplacement(ctx, predecessor, record); err != nil {
+				return err
+			}
+		} else if record.Replacement != nil {
+			return ErrScalingIdentity
+		}
 	}
 	nextDirectoryRevision := directoryRevision + 1
 	if nextDirectoryRevision == 0 {
@@ -1289,6 +1452,13 @@ func (authority *ReplicatedCatalogAuthority) putNode(ctx context.Context, record
 			}
 			mutations = append(mutations, scalingPresenceFenceMutation(result, fence.key, fence.empty))
 		}
+	}
+	if extra != nil {
+		extraMutations, appendErr := extra(ctx, priorRecord, record)
+		if appendErr != nil {
+			return appendErr
+		}
+		mutations = append(mutations, extraMutations...)
 	}
 	result, err := authority.session.MutateBatch(ctx, mutations)
 	return scalingMutationError(result, err, authority.session)
@@ -1495,6 +1665,24 @@ func (authority *ReplicatedCatalogAuthority) PutScalingIntent(ctx context.Contex
 		if current.Found && drainNode.Lifecycle != NodeActive && drainNode.Lifecycle != NodeDraining && drainNode.Lifecycle != NodeDecommissioned {
 			return ErrScalingState
 		}
+		// A gateway frontend has one irreversible admission fence.  Refuse a
+		// second distinct decommission while the first gateway intent is still
+		// live, before this intent can be published and before its frontend can
+		// reserve a drain slot or close admission.  The scaling-intent directory
+		// mutation below is a digest CAS, so two authorities racing from the
+		// same cut cannot both pass this check.
+		if !current.Found && intent.Request.Kind == ScalingDecommission &&
+			drainNode.Roles&NodeRoleGateway != 0 {
+			activeGatewayDrains, readErr := authority.activeGatewayFrontendDrainIDs(ctx)
+			if readErr != nil {
+				return readErr
+			}
+			for activeID := range activeGatewayDrains {
+				if activeID != intent.ID {
+					return errors.Join(ErrScalingState, ErrConcurrentFrontendDrain)
+				}
+			}
+		}
 	}
 	directoryResult, err := authority.readRaw(ctx, scalingIntentDirectoryKey, maxScalingIntentDirectoryBytes)
 	if err != nil {
@@ -1535,7 +1723,36 @@ func (authority *ReplicatedCatalogAuthority) PutScalingIntent(ctx context.Contex
 		if err != nil {
 			return err
 		}
-		evictedHistory, evictedHistoryFound = terminalHistoryEntry(&historyEntries, intent.ID, intent.Revision, recordDigest, maxScalingTerminalHistory)
+		// A completed decommission intent remains the terminal node's durable
+		// SafeToStop proof. Do not evict such a history row while its
+		// Decommissioned node record still exists; otherwise a later nodes read
+		// would regress from a committed terminal ACK to an unexplained
+		// tombstone. Replacement removes the old node row atomically, after
+		// which its history entry becomes evictable again.
+		if _, alreadyRetained := findScalingDirectoryEntry(historyEntries, intent.ID); !alreadyRetained &&
+			len(historyEntries) >= maxScalingTerminalHistory {
+			evictable, found, findErr := authority.findEvictableScalingTerminalHistory(ctx, historyEntries)
+			if findErr != nil {
+				return findErr
+			}
+			if !found {
+				return ErrScalingMetadataBound
+			}
+			for index, entry := range historyEntries {
+				if bytes.Equal(entry.ID, evictable.ID) {
+					historyEntries = append(historyEntries[:index], historyEntries[index+1:]...)
+					break
+				}
+			}
+			evictedHistory, evictedHistoryFound = evictable, true
+		}
+		if !evictedHistoryFound {
+			evictedHistory, evictedHistoryFound = terminalHistoryEntry(&historyEntries, intent.ID, intent.Revision, recordDigest, maxScalingTerminalHistory)
+		} else {
+			// The selected evictable entry was removed above, so this insertion
+			// cannot evict a protected terminal row a second time.
+			_, _ = terminalHistoryEntry(&historyEntries, intent.ID, intent.Revision, recordDigest, maxScalingTerminalHistory)
+		}
 		historyBytes, err = appendScalingIDDirectory(nil, scalingHistoryDocumentID[:], historyEntries, maxScalingTerminalHistoryBytes)
 		if err != nil {
 			return err
@@ -1578,6 +1795,53 @@ func (authority *ReplicatedCatalogAuthority) PutScalingIntent(ctx context.Contex
 	}
 	result, err := authority.session.MutateBatch(ctx, mutations)
 	return scalingMutationError(result, err, authority.session)
+}
+
+// activeGatewayFrontendDrainIDs returns the exact durable identities that
+// currently own a gateway admission fence.  It is intentionally derived from
+// the complete scaling-intent cut and each immutable node record, so a role
+// bit on a caller or a process-local drain flag cannot create a false guard.
+// Completed/cancelled intents release the fence only after their terminal
+// acknowledgement and completion are durable; a terminal node alone does not
+// release an unfinished decommission intent.
+func (authority *ReplicatedCatalogAuthority) activeGatewayFrontendDrainIDs(
+	ctx context.Context,
+) (map[[32]byte]struct{}, error) {
+	if authority == nil || ctx == nil {
+		return nil, ErrInvalidScalingMetadata
+	}
+	intents, err := authority.ListScalingIntents(ctx)
+	if err != nil {
+		return nil, err
+	}
+	active := make(map[[32]byte]struct{})
+	for _, intent := range intents {
+		if intent.State >= ScalingComplete || intent.Request.Kind != ScalingDecommission ||
+			!intent.Request.Drain.Valid() {
+			continue
+		}
+		node, readErr := authority.ReadNode(ctx, intent.Request.Drain.NodeID, intent.Request.Drain.Incarnation)
+		if readErr != nil {
+			if errors.Is(readErr, ErrScalingNodeMissing) {
+				continue
+			}
+			return nil, readErr
+		}
+		// The scaling intent remains the exclusive admission owner until its
+		// terminal acknowledgement and completion are durable.  A node CAS to
+		// Decommissioned is not that completion boundary; dropping the intent
+		// here would let a second gateway drain reserve the only slot while the
+		// first terminal proof is still being retried.
+		if node.Roles&NodeRoleGateway == 0 {
+			continue
+		}
+		drainID := NewFrontendDrainID(intent.ID, intent.Request.Drain)
+		if drainID == ([32]byte{}) {
+			return nil, ErrScalingIdentity
+		}
+		active[drainID] = struct{}{}
+	}
+	return active, nil
 }
 
 func sameScalingIntentImmutable(left, right ScalingIntent) bool {
@@ -2547,6 +2811,122 @@ func terminalHistoryEntry(entries *[]scalingIDDirectoryEntry, id [32]byte, revis
 	values[position] = scalingIDDirectoryEntry{ID: bytes.Clone(id[:]), Revision: revision, Digest: bytes.Clone(digest[:])}
 	*entries = values
 	return evicted, evictedFound
+}
+
+// findEvictableScalingTerminalHistory chooses a completed row whose terminal
+// node lifecycle is no longer present. Completed decommission rows whose
+// Decommissioned node still exists are retained as the canonical terminal
+// SafeToStop proof, even when the bounded history is otherwise full.
+func (authority *ReplicatedCatalogAuthority) findEvictableScalingTerminalHistory(
+	ctx context.Context, entries []scalingIDDirectoryEntry,
+) (scalingIDDirectoryEntry, bool, error) {
+	if authority == nil || ctx == nil {
+		return scalingIDDirectoryEntry{}, false, ErrReplicatedCatalogConflict
+	}
+	for _, entry := range entries {
+		if len(entry.ID) != len([32]byte{}) || len(entry.Digest) != sha256.Size {
+			return scalingIDDirectoryEntry{}, false, ErrReplicatedCatalogConflict
+		}
+		var id [32]byte
+		copy(id[:], entry.ID)
+		raw, err := authority.readRaw(ctx, scalingIntentKey(id), maxScalingIntentRecordBytes)
+		if err != nil {
+			return scalingIDDirectoryEntry{}, false, err
+		}
+		if !raw.Found || scalingDigest(raw.Value) != replication.Digest(entry.Digest) {
+			return scalingIDDirectoryEntry{}, false, ErrReplicatedCatalogConflict
+		}
+		intent, err := openScalingIntentRecord(raw.Value, id)
+		if err != nil {
+			return scalingIDDirectoryEntry{}, false, err
+		}
+		if intent.Request.Kind != ScalingDecommission || !intent.Request.Drain.Valid() {
+			return entry, true, nil
+		}
+		node, readErr := authority.ReadNode(ctx, intent.Request.Drain.NodeID, intent.Request.Drain.Incarnation)
+		if errors.Is(readErr, ErrScalingNodeMissing) {
+			// A missing predecessor is a safe history-eviction boundary only
+			// when the latest row for this NodeID carries the exact certified
+			// replacement marker. An unexplained missing row must never be
+			// guessed away here, because its history may be the only durable
+			// SafeToStop proof a lagging reader still has.
+			replaced, replacementErr := authority.hasCertifiedReplacementSuccessor(ctx, intent)
+			if replacementErr != nil {
+				return scalingIDDirectoryEntry{}, false, replacementErr
+			}
+			if replaced {
+				return entry, true, nil
+			}
+			return scalingIDDirectoryEntry{}, false, ErrReplicatedCatalogConflict
+		}
+		if readErr != nil {
+			return scalingIDDirectoryEntry{}, false, readErr
+		}
+		if node.Lifecycle != NodeDecommissioned || !node.HasRetirementProof() ||
+			!intent.Evidence.SafeToStop() || !node.MatchesSafeToStopEvidence(intent.Evidence) {
+			return scalingIDDirectoryEntry{}, false, ErrReplicatedCatalogConflict
+		}
+	}
+	return scalingIDDirectoryEntry{}, false, nil
+}
+
+// hasCertifiedReplacementSuccessor proves that a missing terminal row was
+// removed at the physical replacement boundary. The node directory is the
+// writer's canonical latest-row index; requiring its highest incarnation to
+// carry the exact predecessor intent marker keeps history GC coupled to the
+// same durable replacement evidence used by the receiver projection.
+func (authority *ReplicatedCatalogAuthority) hasCertifiedReplacementSuccessor(
+	ctx context.Context, intent ScalingIntent,
+) (bool, error) {
+	if authority == nil || ctx == nil || intent.Request.Kind != ScalingDecommission ||
+		!intent.Request.Drain.Valid() {
+		return false, ErrReplicatedCatalogConflict
+	}
+	directoryResult, err := authority.readRaw(ctx, scalingNodeDirectoryKey, maxScalingNodeDirectoryBytes)
+	if err != nil {
+		return false, err
+	}
+	if !directoryResult.Found {
+		return false, nil
+	}
+	entries, err := openScalingNodeDirectory(directoryResult.Value)
+	if err != nil {
+		return false, err
+	}
+	var latest scalingNodeDirectoryEntry
+	var found bool
+	for _, entry := range entries {
+		if !bytes.Equal(entry.NodeID, intent.Request.Drain.NodeID[:]) ||
+			entry.Incarnation <= intent.Request.Drain.Incarnation {
+			continue
+		}
+		if !found || entry.Incarnation > latest.Incarnation {
+			latest, found = entry, true
+		}
+	}
+	if !found {
+		return false, nil
+	}
+	var successorID rafttransport.NodeID
+	copy(successorID[:], latest.NodeID)
+	successorResult, err := authority.readRaw(ctx, scalingNodeKey(successorID, latest.Incarnation), maxScalingNodeRecordBytes)
+	if err != nil {
+		return false, err
+	}
+	if !successorResult.Found || scalingDigest(successorResult.Value) != replication.Digest(latest.Digest) {
+		return false, ErrReplicatedCatalogConflict
+	}
+	successor, err := openScalingNodeRecord(successorResult.Value, successorID, latest.Incarnation)
+	if err != nil {
+		return false, err
+	}
+	marker := successor.Replacement
+	if marker == nil || marker.IntentID != intent.ID ||
+		marker.PredecessorIncarnation != intent.Request.Drain.Incarnation ||
+		!marker.ValidFor(successor) {
+		return false, ErrReplicatedCatalogConflict
+	}
+	return true, nil
 }
 
 func findScalingDirectoryEntry(entries []scalingIDDirectoryEntry, id [32]byte) (scalingIDDirectoryEntry, bool) {

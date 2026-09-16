@@ -136,7 +136,8 @@ func TestReplicatedNodeDiscoveryRebindsIncarnationAndKeepsExactOperations(t *tes
 				t.Fatalf("probe dispatch counters=%+v", stats)
 			}
 			request := &shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe, Authority: actor, Capability: serviceauthz.CapabilityDataRead,
-				Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration}}
+				Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+					Command: route.Command}}
 			if _, err := client.DoReplicated(ctx, endpoint, request); !errors.Is(err, ErrReplicatedRoute) {
 				t.Fatalf("old exact incarnation accepted: %v", err)
 			}

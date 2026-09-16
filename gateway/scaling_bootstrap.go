@@ -1,11 +1,8 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
-	"slices"
 
-	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 )
 
@@ -49,38 +46,75 @@ func (authority *ReplicatedCatalogAuthority) BootstrapNodeDirectory(ctx context.
 	if err != nil {
 		return err
 	}
-	records = slices.Clone(records)
-	slices.SortFunc(records, func(a, b NodeRecord) int { return bytes.Compare(a.NodeID[:], b.NodeID[:]) })
-	nodes := make(map[rafttransport.NodeID]NodeRecord, len(records))
-	entries := make([]scalingNodeDirectoryEntry, 0, len(records))
-	mutations := make([]NativeMutation, 0, len(records)+2)
-	for _, record := range records {
-		if !record.Valid() || record.Lifecycle != NodeActive || record.Revision != 1 || record.CatalogGeneration != snapshot.Generation() {
-			return ErrInvalidScalingMetadata
-		}
-		if _, exists := nodes[record.NodeID]; exists {
-			return ErrScalingIdentity
-		}
-		nodes[record.NodeID] = record
-		raw, err := appendScalingNodeRecord(nil, record)
-		if err != nil {
-			return err
-		}
-		digest := scalingDigest(raw)
-		entries = append(entries, scalingNodeDirectoryEntry{NodeID: bytes.Clone(record.NodeID[:]), Incarnation: record.Incarnation, Revision: record.Revision, Digest: bytes.Clone(digest[:])})
-		mutations = append(mutations, NativeMutation{Kind: replication.MutationPutAbsentOrEqual, Key: scalingNodeKey(record.NodeID, record.Incarnation), Value: raw})
-	}
-	for _, replica := range snapshot.replicatedReplicas {
-		node, found := nodes[replica.Node]
-		if !found || node.Incarnation != replica.NodeIncarnation || node.DataAddress != replica.DataAddress || node.NativeAddress != replica.Address || node.ControlAddress != replica.ControlAddress {
-			return ErrScalingIdentity
-		}
-	}
-	raw, err := appendScalingNodeDirectoryAt(nil, entries, 1)
+	// Keep the public bootstrap entry point as a thin compatibility wrapper for
+	// explicit test/operator callers. The canonical builder is the only place
+	// that defines the generation-one mutation set; Runtime.Open never invokes
+	// this method for managed startup.
+	mutations, err := BuildReplicatedCatalogGenesisMutations(snapshot, records)
 	if err != nil {
 		return err
 	}
-	mutations = append(mutations, scalingDirectoryMutation(directory, scalingNodeDirectoryKey, raw), NativeMutation{Kind: replication.MutationPutDigestEqual, Key: replicatedCatalogHeadKey, Value: head.Value, ExpectedValueLength: uint64(len(head.Value)), ExpectedValueDigest: scalingDigest(head.Value)})
+	result, err := authority.session.MutateBatch(ctx, mutations)
+	return scalingMutationError(result, err, authority.session)
+}
+
+// EnsureFrontendDrainServiceDirectory installs the revision-1 empty drain
+// index for an existing catalog that predates the frontend-drain row. The
+// service row is created only after a committed physical directory and
+// catalog head have been read, and the same immutable rows are digest-CASed in
+// the batch. This is the narrow migration for a legitimate pre-first-drain
+// state; it never grants a gateway or fabricates a source cut.
+func (authority *ReplicatedCatalogAuthority) EnsureFrontendDrainServiceDirectory(ctx context.Context) error {
+	if authority == nil || authority.session == nil || ctx == nil {
+		return ErrReplicatedCatalog
+	}
+	ctx, err := authority.authorizedContext(ctx)
+	if err != nil {
+		return err
+	}
+	authority.mu.Lock()
+	defer authority.mu.Unlock()
+	if err = authority.requireRouteSeedServingLocked(); err != nil {
+		return err
+	}
+	if authority.session.Status().Pending {
+		return ErrReplicatedCatalogPending
+	}
+	current, err := authority.readRaw(ctx, replicatedServiceDirectoryKey, maxReplicatedServiceDirectoryBytes)
+	if err != nil {
+		return err
+	}
+	if current.Found {
+		_, err = openReplicatedServiceDirectory(current.Value)
+		return err
+	}
+	nodeDirectory, err := authority.readRaw(ctx, scalingNodeDirectoryKey, maxScalingNodeDirectoryBytes)
+	if err != nil {
+		return err
+	}
+	if !nodeDirectory.Found {
+		// A process before physical-directory genesis has no canonical owner
+		// source yet. BootstrapNodeDirectory will create both rows together.
+		return ErrScalingNodeMissing
+	}
+	head, err := authority.readRaw(ctx, replicatedCatalogHeadKey, maxReplicatedCatalogBytes)
+	if err != nil {
+		return err
+	}
+	if !head.Found {
+		return ErrReplicatedCatalogMissing
+	}
+	serviceRaw, err := appendReplicatedServiceDirectory(nil, replicatedServiceDirectory{Revision: 1})
+	if err != nil {
+		return err
+	}
+	mutations := []NativeMutation{
+		NativeMutation{Kind: replication.MutationPutAbsentOrEqual, Key: replicatedServiceDirectoryKey, Value: serviceRaw},
+		{Kind: replication.MutationPutDigestEqual, Key: scalingNodeDirectoryKey, Value: nodeDirectory.Value,
+			ExpectedValueLength: uint64(len(nodeDirectory.Value)), ExpectedValueDigest: scalingDigest(nodeDirectory.Value)},
+		{Kind: replication.MutationPutDigestEqual, Key: replicatedCatalogHeadKey, Value: head.Value,
+			ExpectedValueLength: uint64(len(head.Value)), ExpectedValueDigest: scalingDigest(head.Value)},
+	}
 	result, err := authority.session.MutateBatch(ctx, mutations)
 	return scalingMutationError(result, err, authority.session)
 }

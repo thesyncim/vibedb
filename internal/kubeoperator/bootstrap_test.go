@@ -12,10 +12,12 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibejson"
 )
@@ -314,12 +316,28 @@ func verifyBootstrapProvisioning(t *testing.T, bundle []byte) {
 			}
 		}
 	}
+	var catalogSourceSeeds []nodecontrol.BootstrapGatewaySeed
 	for _, role := range []string{"catalog", "ledger", "data"} {
 		for member := 0; member < 3; member++ {
-			var manifest bootstrapPrepare
-			if err := vibejson.Unmarshal(documents[fmt.Sprintf("%s-%d.vibejson", role, member)], &manifest); err != nil {
+			var node bootstrapNodePrepare
+			if err := vibejson.Unmarshal(documents[fmt.Sprintf("%s-%d.vibejson", role, member)], &node); err != nil {
 				t.Fatal(err)
 			}
+			if node.NodeLog.Format != 1 || node.NodeLog.Path == "" || node.NodeLog.KeyID == "" || node.NodeLog.KeyMaterialPath == "" {
+				t.Fatalf("%s-%d missing canonical physical node log", role, member)
+			}
+			if len(node.CanonicalSourceSeeds) != 3 {
+				t.Fatalf("%s-%d missing canonical source seeds", role, member)
+			}
+			if role == "catalog" && member == 0 {
+				catalogSourceSeeds = slices.Clone(node.CanonicalSourceSeeds)
+			} else if !slices.Equal(node.CanonicalSourceSeeds, catalogSourceSeeds) {
+				t.Fatalf("%s-%d canonical source set differs from physical catalog voters", role, member)
+			}
+			if len(node.Groups) != 1 {
+				t.Fatalf("%s-%d has %d groups, want one role group", role, member, len(node.Groups))
+			}
+			manifest := node.Groups[0]
 			if len(manifest.TLS.PeerKeys) != 3 {
 				t.Fatal("missing initial certificate pins")
 			}
@@ -344,6 +362,38 @@ func verifyBootstrapProvisioning(t *testing.T, bundle []byte) {
 					t.Fatal("manifest pin does not match the issued peer certificate")
 				}
 			}
+			if role == "catalog" {
+				if node.CatalogGenesis == nil {
+					t.Fatalf("catalog-%d missing canonical catalog genesis config", member)
+				}
+				if len(documents[fmt.Sprintf("catalog-genesis-plan-catalog-%d.vibejson", member)]) == 0 {
+					t.Fatalf("catalog-%d missing canonical catalog genesis plan", member)
+				}
+			}
+		}
+	}
+	var catalogNode bootstrapNodePrepare
+	if err := vibejson.Unmarshal(documents["catalog-0.vibejson"], &catalogNode); err != nil || len(catalogNode.Groups) != 1 {
+		t.Fatalf("catalog source manifest: %v", err)
+	}
+	for index, seed := range catalogSourceSeeds {
+		peer := catalogNode.Groups[0].Members[index]
+		if hex.EncodeToString(seed.NodeID[:]) != peer.NodeID ||
+			seed.ControlAddress != fmt.Sprintf("vibedb-catalog-%d.vibedb-catalog-peer:7711", index) {
+			t.Fatalf("catalog source seed %d=%+v does not bind catalog peer=%+v", index, seed, peer)
+		}
+		certPEM := documents[fmt.Sprintf("catalog-%d-cert.pem", peer.MemberID-1)]
+		block, _ := pem.Decode(certPEM)
+		if block == nil {
+			t.Fatal("missing catalog source certificate")
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(certificate.RawSubjectPublicKeyInfo)
+		if seed.SPKIPinDigest != digest {
+			t.Fatalf("catalog source seed %d pin does not match physical catalog certificate", index)
 		}
 	}
 }

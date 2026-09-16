@@ -212,7 +212,7 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 	authority := serviceauthz.Authority{Node: rafttransport.NodeID{31}, Generation: 17}
 	for _, request := range []*ReplicatedRequest{
 		{Operation: ReplicatedProbe, Authority: authority, Capability: serviceauthz.CapabilityDataRead, Fence: ReplicatedFence{
-			Group: fence.Group, AllocationGeneration: fence.AllocationGeneration,
+			Group: fence.Group, AllocationGeneration: fence.AllocationGeneration, Command: fence.Command,
 		}},
 		{Operation: ReplicatedPropose, Authority: authority, Capability: serviceauthz.CapabilityDataWrite, Fence: fence, Command: command},
 		{Operation: ReplicatedMembership, Authority: authority, Capability: serviceauthz.CapabilityMembership, Fence: fence, Membership: ReplicatedMembershipRequest{
@@ -504,6 +504,58 @@ func TestReplicatedNativeWireRejectsSQLShapedAndCrossGroupPayloads(t *testing.T)
 		if err := EncodeReplicatedRequest(&encoded, request); err == nil {
 			t.Fatalf("invalid request encoded: %+v", request)
 		}
+	}
+}
+
+func TestReplicatedProbeFenceRequiresExactCommandAndNoObservedIdentity(t *testing.T) {
+	fence := testReplicatedFence()
+	probe := &ReplicatedRequest{
+		Operation: ReplicatedProbe,
+		Authority: serviceauthz.Authority{Node: rafttransport.NodeID{9}, Generation: 1},
+		Capability: serviceauthz.CapabilityDataRead,
+		Fence: ReplicatedFence{Group: fence.Group, AllocationGeneration: fence.AllocationGeneration,
+			Command: fence.Command},
+	}
+	var encoded bytes.Buffer
+	if err := EncodeReplicatedRequest(&encoded, probe); err != nil {
+		t.Fatalf("canonical probe rejected: %v", err)
+	}
+	decoded, err := DecodeReplicatedRequest(bytes.NewReader(encoded.Bytes()))
+	if err != nil || decoded.Fence != probe.Fence {
+		t.Fatalf("canonical probe round trip=%+v err=%v", decoded, err)
+	}
+
+	invalid := []struct {
+		name   string
+		mutate func(*ReplicatedRequest)
+	}{
+		{name: "missing command", mutate: func(request *ReplicatedRequest) {
+			request.Fence.Command = raftservice.CommandFence{}
+		}},
+		{name: "member assertion", mutate: func(request *ReplicatedRequest) {
+			request.Fence.MemberID = fence.MemberID
+		}},
+		{name: "store assertion", mutate: func(request *ReplicatedRequest) {
+			request.Fence.StoreID = fence.StoreID
+		}},
+		{name: "incarnation assertion", mutate: func(request *ReplicatedRequest) {
+			request.Fence.NodeIncarnation = fence.NodeIncarnation
+		}},
+		{name: "term assertion", mutate: func(request *ReplicatedRequest) {
+			request.Fence.Term = fence.Term
+		}},
+		{name: "manifest invalid", mutate: func(request *ReplicatedRequest) {
+			request.Fence.Command.RelationManifestDigest = [32]byte{}
+		}},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := *probe
+			test.mutate(&candidate)
+			if err := ValidateReplicatedRequest(&candidate); err == nil {
+				t.Fatalf("invalid probe accepted: %+v", candidate.Fence)
+			}
+		})
 	}
 }
 

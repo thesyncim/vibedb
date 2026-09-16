@@ -58,6 +58,24 @@ type ScalingNodeReadiness interface {
 	VerifyNode(context.Context, gateway.NodeRecord) (gateway.NodeRecord, error)
 }
 
+// ScalingFrontendDrainPreparer closes one local frontend admission and
+// persists its exact continuation proof before the physical node lifecycle
+// crosses Active -> Draining. A remote gateway may implement this seam over
+// its authenticated control endpoint; a nil preparer preserves the existing
+// post-cut reconciliation for adapters that do not own a frontend.
+type ScalingFrontendDrainPreparer interface {
+	PrepareFrontendDrain(context.Context, gateway.NodeRecord) error
+}
+
+// ScalingFrontendDrainLifecycleAcknowledger applies the exact committed
+// service cut to every currently serving frontend/storage receiver after a
+// lifecycle boundary.  The same operation is replayable for Enforcing and
+// Retired cuts, so a lost response or controller restart cannot skip the
+// receiver barrier.
+type ScalingFrontendDrainLifecycleAcknowledger interface {
+	AcknowledgeFrontendDrainLifecycle(context.Context, gateway.NodeRecord, [32]byte) error
+}
+
 // ScalingEnrollmentBuilder supplies the immutable public preparation material
 // for one group. It is intentionally required at admission time: the
 // controller cannot derive a target member, store identity, or schema digest
@@ -72,35 +90,42 @@ type ScalingEnrollmentBuilder interface {
 // retaining a bounded blocker in the durable intent; they never turn missing
 // capacity, readiness, or enrollment evidence into an inferred success.
 type ScalingControllerOptions struct {
-	Directory   gateway.DirectoryReader
-	Writer      gateway.DirectoryWriter
-	Catalog     scalingCatalogReader
-	Moves       *rebalanceexec.Controller
-	Provisioner gateway.NodeProvisioner
-	Capacity    scalingCapacityReader
-	Observation gatewayReplicaObservationClient
-	Readiness   ScalingNodeReadiness
-	Enrollment  ScalingEnrollmentBuilder
-	Interval    time.Duration
-	Logf        func(string, ...any)
+	Directory gateway.DirectoryReader
+	Writer    gateway.DirectoryWriter
+	Catalog   scalingCatalogReader
+	// ControllerNode identifies the one configured topology controller. A
+	// controller retirement is rejected before frontend admission or physical
+	// reservations can close; this architecture has no controller handoff.
+	ControllerNode rafttransport.NodeID
+	Moves          *rebalanceexec.Controller
+	Provisioner    gateway.NodeProvisioner
+	Capacity       scalingCapacityReader
+	Observation    gatewayReplicaObservationClient
+	Readiness      ScalingNodeReadiness
+	Enrollment     ScalingEnrollmentBuilder
+	Drain          ScalingFrontendDrainPreparer
+	Interval       time.Duration
+	Logf           func(string, ...any)
 }
 
 // ScalingController is safe to run from one goroutine.  The mutex protects
 // only the pass guard; durable revisions remain the source of truth and make
 // concurrent controller instances harmless (one loses the catalog CAS).
 type ScalingController struct {
-	directory   gateway.DirectoryReader
-	writer      gateway.DirectoryWriter
-	catalog     scalingCatalogReader
-	moves       *rebalanceexec.Controller
-	provision   gateway.NodeProvisioner
-	capacity    scalingCapacityReader
-	observation gatewayReplicaObservationClient
-	readiness   ScalingNodeReadiness
-	enrollment  ScalingEnrollmentBuilder
-	interval    time.Duration
-	logf        func(string, ...any)
-	passMu      sync.Mutex
+	directory      gateway.DirectoryReader
+	writer         gateway.DirectoryWriter
+	catalog        scalingCatalogReader
+	controllerNode rafttransport.NodeID
+	moves          *rebalanceexec.Controller
+	provision      gateway.NodeProvisioner
+	capacity       scalingCapacityReader
+	observation    gatewayReplicaObservationClient
+	readiness      ScalingNodeReadiness
+	enrollment     ScalingEnrollmentBuilder
+	drain          ScalingFrontendDrainPreparer
+	interval       time.Duration
+	logf           func(string, ...any)
+	passMu         sync.Mutex
 }
 
 type ScalingControllerPass struct {
@@ -139,9 +164,9 @@ func NewScalingController(options ScalingControllerOptions) (*ScalingController,
 		options.Logf = func(string, ...any) {}
 	}
 	return &ScalingController{directory: options.Directory, writer: options.Writer,
-		catalog: options.Catalog, moves: options.Moves, provision: options.Provisioner,
+		catalog: options.Catalog, controllerNode: options.ControllerNode, moves: options.Moves, provision: options.Provisioner,
 		capacity: options.Capacity, observation: options.Observation, readiness: options.Readiness,
-		enrollment: options.Enrollment, interval: options.Interval, logf: options.Logf}, nil
+		enrollment: options.Enrollment, drain: options.Drain, interval: options.Interval, logf: options.Logf}, nil
 }
 
 // Run starts the bounded, restart-safe reconciliation loop.  Context
@@ -672,6 +697,16 @@ func (controller *ScalingController) reconcileRetirement(ctx context.Context, in
 	if err != nil {
 		return false, err
 	}
+	if controller.controllerNode != (rafttransport.NodeID{}) && node.NodeID == controller.controllerNode &&
+		node.Lifecycle != gateway.NodeDecommissioned {
+		const detail = "the sole configured topology controller must remain serving; controller handoff is not configured"
+		if blockerErr := controller.recordBlocker(ctx, intent, gateway.ScalingBlocker{
+			Code: "sole_designated_controller", Detail: detail, Node: node.NodeID, Revision: node.Revision,
+		}); blockerErr != nil {
+			return false, blockerErr
+		}
+		return false, fmt.Errorf("%w: %s", ErrScalingControllerBlocked, detail)
+	}
 	if node.HasRetirementProof() {
 		evidence, scanErr := controller.scanRetirementReferences(ctx, node)
 		if scanErr != nil {
@@ -681,6 +716,9 @@ func (controller *ScalingController) reconcileRetirement(ctx context.Context, in
 			priorEvidence := intent.Evidence
 			intent.Evidence = scalingEvidenceFromNode(evidence)
 			return false, controller.recordRetirementScan(ctx, intent, priorEvidence, blockersFromEvidence(evidence))
+		}
+		if err := controller.acknowledgeFrontendDrainLifecycle(ctx, intent, node); err != nil {
+			return false, err
 		}
 		intent.Evidence = scalingEvidenceFromNode(evidence)
 		intent.Evidence.DrainAcknowledged = true
@@ -692,6 +730,48 @@ func (controller *ScalingController) reconcileRetirement(ctx context.Context, in
 		// A retry after an interrupted decommission admission may still find the
 		// node Active.  The intent is already durable, so the transition is a
 		// fenced CAS and does not create a second saga.
+		if node.Roles&gateway.NodeRoleGateway != 0 {
+			if controller.drain == nil {
+				return false, controller.recordBlocker(ctx, intent, gateway.ScalingBlocker{
+					Code: "frontend_drain_unavailable", Detail: "gateway has no frontend drain preparer",
+					Node: node.NodeID, Revision: node.Revision,
+				})
+			}
+			if prepareErr := controller.drain.PrepareFrontendDrain(ctx, node); prepareErr != nil {
+				return false, controller.recordBlocker(ctx, intent, gateway.ScalingBlocker{
+					Code: "frontend_drain_unavailable", Detail: boundedScalingError(prepareErr),
+					Node: node.NodeID, Revision: node.Revision,
+				})
+			}
+			enforcer, enforceOK := controller.writer.(gateway.FrontendDrainLifecycleEnforcer)
+			if !enforceOK {
+				return false, controller.recordBlocker(ctx, intent, gateway.ScalingBlocker{
+					Code: "frontend_drain_unavailable", Detail: "catalog does not expose the atomic frontend drain enforcer",
+					Node: node.NodeID, Revision: node.Revision,
+				})
+			}
+			drainID := gateway.NewFrontendDrainID(intent.ID, gateway.NodeReference{
+				NodeID: node.NodeID, Incarnation: node.Incarnation,
+			})
+			if err = enforcer.EnforceFrontendDrain(ctx, drainID, node.NodeID, node.Incarnation, node.Revision); err != nil {
+				return false, err
+			}
+			node, err = controller.directory.ReadNode(ctx, node.NodeID, node.Incarnation)
+			if err != nil {
+				return false, err
+			}
+			if refresher, refreshOK := controller.drain.(interface {
+				RefreshFrontendDrainIdentity(context.Context, gateway.NodeRecord) error
+			}); refreshOK {
+				if err = refresher.RefreshFrontendDrainIdentity(ctx, node); err != nil {
+					return false, err
+				}
+			}
+			if err = controller.acknowledgeFrontendDrainLifecycle(ctx, intent, node); err != nil {
+				return false, err
+			}
+			goto draining
+		}
 		next := node
 		next.Lifecycle = gateway.NodeDraining
 		next.Revision++
@@ -700,6 +780,8 @@ func (controller *ScalingController) reconcileRetirement(ctx context.Context, in
 		}
 		node = next
 	}
+
+draining:
 	if node.Lifecycle != gateway.NodeDraining {
 		return false, controller.recordBlocker(ctx, intent, gateway.ScalingBlocker{
 			Code: "invalid_drain_lifecycle", Detail: "decommission requires an Active or Draining node", Node: node.NodeID, Revision: node.Revision})
@@ -714,6 +796,9 @@ func (controller *ScalingController) reconcileRetirement(ctx context.Context, in
 		blockers := blockersFromEvidence(evidence)
 		return false, controller.recordRetirementScan(ctx, intent, priorEvidence, blockers)
 	}
+	if err = controller.acknowledgeFrontendDrainLifecycle(ctx, intent, node); err != nil {
+		return false, err
+	}
 	retirer, ok := controller.directory.(interface {
 		RetireNode(context.Context, rafttransport.NodeID, uint64, uint64, gateway.NodeReferenceEvidence) error
 	})
@@ -723,11 +808,46 @@ func (controller *ScalingController) reconcileRetirement(ctx context.Context, in
 	if err = retirer.RetireNode(ctx, node.NodeID, node.Incarnation, node.Revision, evidence); err != nil {
 		return false, err
 	}
-	node.Lifecycle = gateway.NodeDecommissioned
+	terminal, readErr := controller.directory.ReadNode(ctx, node.NodeID, node.Incarnation)
+	if readErr != nil {
+		return false, readErr
+	}
+	if !terminal.HasRetirementProof() {
+		return false, gateway.ErrScalingRevision
+	}
+	if err = controller.acknowledgeFrontendDrainLifecycle(ctx, intent, terminal); err != nil {
+		return false, err
+	}
+	node = terminal
 	intent.Evidence.DrainAcknowledged = true
 	intent.Evidence.RetiredAcknowledged = true
 	intent.Evidence.CatalogControlMigrated = true
 	return controller.completeIntent(ctx, intent, &node)
+}
+
+// acknowledgeFrontendDrainLifecycle is the durable lifecycle barrier used by
+// retirement. A gateway child must acknowledge the current exact source cut;
+// storage-only nodes have no frontend surface and intentionally return nil.
+func (controller *ScalingController) acknowledgeFrontendDrainLifecycle(
+	ctx context.Context, intent gateway.ScalingIntent, node gateway.NodeRecord,
+) error {
+	if node.Roles&gateway.NodeRoleGateway == 0 {
+		return nil
+	}
+	if controller == nil || controller.drain == nil {
+		return fmt.Errorf("%w: frontend drain lifecycle acknowledger is unavailable", ErrScalingControllerBlocked)
+	}
+	acknowledger, ok := controller.drain.(ScalingFrontendDrainLifecycleAcknowledger)
+	if !ok {
+		return fmt.Errorf("%w: frontend drain lifecycle acknowledger is unavailable", ErrScalingControllerBlocked)
+	}
+	drainID := gateway.NewFrontendDrainID(intent.ID, gateway.NodeReference{
+		NodeID: node.NodeID, Incarnation: node.Incarnation,
+	})
+	if drainID == ([32]byte{}) {
+		return gateway.ErrScalingIdentity
+	}
+	return acknowledger.AcknowledgeFrontendDrainLifecycle(ctx, node, drainID)
 }
 
 func (controller *ScalingController) scanRetirementReferences(

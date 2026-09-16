@@ -31,17 +31,23 @@ func catalogBootstrapRoute(route ReplicatedRoute) bool {
 		route.Shard == ReplicatedCatalogShard
 }
 
-// The catalog RF3 is the authority for its own placement. Its bootstrap
-// coordinates cannot also require a catalog publication between each adjacent
-// membership step: that would prevent the controller from journaling the step.
-// Only placement coordinates may advance. Policy, protection, schema, full
-// group/allocation, and authenticated physical member identities remain exact.
-func catalogCommandProgression(before, after raftservice.CommandFence) bool {
+// CatalogCommandProgression reports whether a retained catalog command may be
+// used by the private genesis/recovery path. The catalog RF3 is the authority
+// for its own placement, so its bootstrap coordinates cannot also require a
+// catalog publication between each adjacent membership step: that would
+// prevent the controller from journaling the step. Only placement coordinates
+// may advance. Policy, protection, schema, full group/allocation, and
+// authenticated physical member identities remain exact.
+func CatalogCommandProgression(before, after raftservice.CommandFence) bool {
 	return before.Valid() && after.Valid() && before.ActivePolicyGeneration == after.ActivePolicyGeneration &&
 		before.ProtectionEpoch == after.ProtectionEpoch && before.SchemaGeneration == after.SchemaGeneration &&
 		before.RelationManifestDigest == after.RelationManifestDigest &&
 		after.ReplicaSetVersion >= before.ReplicaSetVersion && after.OwnershipEpoch >= before.OwnershipEpoch &&
 		after.RoutingVersion >= before.RoutingVersion && after.RouteGeneration >= before.RouteGeneration
+}
+
+func catalogCommandProgression(before, after raftservice.CommandFence) bool {
+	return CatalogCommandProgression(before, after)
 }
 
 func (session *NativeSession) catalogOperationalRoute(ctx context.Context) (ReplicatedRoute, error) {
@@ -78,6 +84,15 @@ func retryCatalogDiscovery(err error) bool {
 	if !errors.Is(err, ErrReplicatedLeader) || errors.Is(err, ErrReplicatedRoute) ||
 		errors.Is(err, ErrReplicatedUnauthorized) || errors.Is(err, context.Canceled) {
 		return false
+	}
+	var refusal *ReplicatedRefusalError
+	if errors.As(err, &refusal) && refusal.Code == shardservice.ReplicatedRefusalUnavailable {
+		// A physical receiver can answer before its canonical service-directory
+		// gate is installed. This is a bounded readiness condition, not a
+		// reachable-leader failure: retry the complete authenticated sweep so a
+		// later gate installation can be observed. Other typed refusals remain
+		// terminal above or below.
+		return true
 	}
 	if errors.Is(err, errReplicatedLeaderUnobserved) || errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
@@ -156,11 +171,21 @@ func (executor *ReplicatedExecutor) catalogOperationalRouteOnce(ctx context.Cont
 		} else {
 			response, err = executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
 				Operation: shardservice.ReplicatedProbe, Capability: serviceauthz.CapabilityTopology,
-				Fence: shardservice.ReplicatedFence{Group: bootstrap.Group, AllocationGeneration: bootstrap.AllocationGeneration},
+				Fence: shardservice.ReplicatedFence{Group: bootstrap.Group, AllocationGeneration: bootstrap.AllocationGeneration,
+					Command: bootstrap.Command},
 			})
 		}
 		if err != nil {
 			joined = errors.Join(joined, catalogProbeResultError(endpoint, response, err))
+			continue
+		}
+		if validReplicatedUnavailableWithoutState(response) {
+			// A mandatory service-directory gate can be absent while the physical
+			// receiver is still installing the certified cut. Keep this probe in
+			// the bounded discovery sweep; an installed gate's Unauthorized reply
+			// remains terminal below.
+			joined = errors.Join(joined, catalogProbeResultError(endpoint, response,
+				&ReplicatedRefusalError{Code: response.Refusal}))
 			continue
 		}
 		if validReplicatedUnauthorizedWithoutState(response) {

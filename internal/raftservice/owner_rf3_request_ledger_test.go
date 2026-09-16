@@ -434,8 +434,11 @@ func TestMultiGroupRF3DurableCallerConstructsAuthorizedProbe(t *testing.T) {
 		Authority: authority, Capability: serviceauthz.CapabilityDataWrite,
 		Fence: shardservice.ReplicatedFence{AllocationGeneration: 7, Group: raftmember.GroupKey{
 			ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}, TopologyRecoveryEpoch: 3,
-			ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4},
-		}}}
+			ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4}},
+			Command: raftservice.CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
+				ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
+				RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1},
+		}}
 	var wire bytes.Buffer
 	if err := shardservice.EncodeReplicatedRequest(&wire, request); err != nil {
 		t.Fatalf("caller-bound route-gate probe is not encodable: %v", err)

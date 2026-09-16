@@ -161,6 +161,71 @@ func TestRemoteGatewayParticipantScanUsesTargetControlIdentity(t *testing.T) {
 	}
 }
 
+func TestRemoteGatewayFrontendDrainPrepareBindsExactIntent(t *testing.T) {
+	profiles, _ := runtimeControlTLSFixture(t, []serviceauthz.Entry{
+		{Node: rafttransport.NodeID{51}, Capabilities: serviceauthz.AllCapabilities},
+		{Node: rafttransport.NodeID{52}, Capabilities: serviceauthz.AllCapabilities},
+	})
+	caller, target := profiles[0], profiles[1]
+	record := frontendParticipantWireRecord(target)
+	record.Lifecycle = gateway.NodeActive
+	record.Revision = 1
+	if !record.Valid() {
+		t.Fatal("invalid active participant wire record")
+	}
+	var intentID [32]byte
+	intentID[0] = 0xa1
+	request, err := newFrontendDrainPrepareRequest(record, intentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientRaw, serverRaw := net.Pipe()
+	client := &frontendParticipantWirePeer{Conn: clientRaw,
+		peer: target.LocalIdentity(), key: target.LocalServiceKeyDigest(), class: rafttransport.TrafficGatewayControl}
+	server := &frontendParticipantWirePeer{Conn: serverRaw,
+		peer: caller.LocalIdentity(), key: caller.LocalServiceKeyDigest(), class: rafttransport.TrafficGatewayControl}
+	addressOf := func(member gateway.ClusterCatalogDrainMember) (string, bool) {
+		return record.GatewayAddress, member.Node == record.Gateway.NodeID && member.Incarnation == record.Gateway.Incarnation
+	}
+	deadline := func() time.Time { return time.Now().Add(time.Second) }
+	prepared := make(chan [32]byte, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serveFrontendDrainPrepareConnectionWith(t.Context(), server,
+			func(rafttransport.PeerConnection) bool { return true },
+			func(context.Context, rafttransport.NodeID, uint64) (gateway.NodeRecord, error) { return record, nil },
+			func(_ context.Context, got gateway.NodeRecord, gotIntent [32]byte) error {
+				if !got.Valid() {
+					return gateway.ErrInvalidScalingMetadata
+				}
+				prepared <- gotIntent
+				return nil
+			},
+			func(context.Context, gateway.NodeRecord) (gateway.GatewayParticipantEvidence, error) {
+				return frontendParticipantWireEvidence(record, false), nil
+			}, deadline, deadline)
+	}()
+	response, err := roundTripRemoteFrontendParticipant(t.Context(), record, caller,
+		frontendParticipantWireOpener{connection: client}, addressOf, request.marshal(),
+		frontendDrainPrepareDiscriminator, deadline, deadline)
+	_ = client.Close()
+	_ = server.Close()
+	if err != nil || response.Nonce != request.Nonce || !response.Evidence.ValidFor(record) {
+		t.Fatalf("prepared participant response = %+v, err=%v", response, err)
+	}
+	select {
+	case got := <-prepared:
+		if got != intentID {
+			t.Fatalf("prepared intent = %x, want %x", got, intentID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("target did not receive drain intent")
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("prepare participant server: %v", err)
+	}
+}
+
 func TestRemoteGatewayParticipantScanRejectsForeignEndpointAndPeer(t *testing.T) {
 	profiles, _ := runtimeControlTLSFixture(t, []serviceauthz.Entry{
 		{Node: rafttransport.NodeID{21}, Capabilities: serviceauthz.AllCapabilities},
@@ -262,4 +327,32 @@ func TestRemoteGatewayParticipantScanCancellationClosesConnection(t *testing.T) 
 		t.Fatal("cancelled participant scan retained the connection")
 	}
 	_ = server.Close()
+}
+
+func TestFrontendDrainPreparedAckWireBindsExactPreparedGrant(t *testing.T) {
+	profiles, _ := runtimeControlTLSFixture(t, []serviceauthz.Entry{
+		{Node: rafttransport.NodeID{51}, Capabilities: serviceauthz.AllCapabilities},
+	})
+	record := frontendParticipantWireRecord(profiles[0])
+	record.Lifecycle = gateway.NodeActive
+	base, err := newFrontendParticipantScanRequest(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := frontendDrainPreparedAckRequest{frontendParticipantScanRequest: base,
+		DrainID: [32]byte{0x91}, GrantDigest: [32]byte{0x92}}
+	opened, err := openFrontendDrainPreparedAckRequest(request.marshal())
+	if err != nil || opened != request {
+		t.Fatalf("prepared ACK request = %+v, %v", opened, err)
+	}
+	response := frontendDrainPreparedAckResponse{Nonce: request.Nonce, DrainID: request.DrainID,
+		GrantDigest: request.GrantDigest, Revision: 7}
+	if openedResponse, err := openFrontendDrainPreparedAckResponse(response.marshal(), request); err != nil || openedResponse != response {
+		t.Fatalf("prepared ACK response = %+v, %v", openedResponse, err)
+	}
+	wrong := response
+	wrong.GrantDigest[0]++
+	if _, err := openFrontendDrainPreparedAckResponse(wrong.marshal(), request); !errors.Is(err, errFrontendParticipantWire) {
+		t.Fatalf("wrong prepared grant acknowledgement = %v", err)
+	}
 }

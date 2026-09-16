@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 
+	"github.com/thesyncim/vibedb/internal/frontenddrain"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -52,6 +53,17 @@ func (client *ReplicatedNodeClient) Stats() ReplicatedNodeClientStats {
 	}
 }
 
+// LocalNodeID returns the physical storage identity selected by the native
+// client. Gateway runtimes use it to route a local prepared-drain gate install
+// directly to the embedded ReplicatedServer instead of opening a loopback
+// shard-control connection.
+func (client *ReplicatedNodeClient) LocalNodeID() rafttransport.NodeID {
+	if client == nil {
+		return rafttransport.NodeID{}
+	}
+	return client.localNode
+}
+
 // NewReplicatedNodeClient binds the storage destination and distinct gateway
 // principal to one ReplicatedServer and installs the remote transport. The
 // server must have BindAuthorization called first. A nil remote is valid for
@@ -88,6 +100,37 @@ func (client *ReplicatedNodeClient) BindServiceDirectoryGate(
 		return ErrReplicatedRoute
 	}
 	return client.localServer.BindServiceDirectoryGate(directory)
+}
+
+// InstallFrontendDrainServiceCut installs a complete source proof on the
+// fused native receiver. The server retains one gate pointer and applies the
+// full directory/catalog/service coordinates monotonically.
+func (client *ReplicatedNodeClient) InstallFrontendDrainServiceCut(
+	ctx context.Context, cut frontenddrain.PreparedAckCut,
+) (uint64, error) {
+	if client == nil || client.localServer == nil || ctx == nil {
+		return 0, ErrReplicatedRoute
+	}
+	return client.localServer.InstallFrontendDrainServiceCut(ctx, cut)
+}
+
+// ServiceDirectoryGate exposes the retained native receiver gate for the
+// local semantic path. The pointer is stable after first bind and its cut is
+// read only to verify the complete coordinate installed before ACK.
+func (client *ReplicatedNodeClient) ServiceDirectoryGate() *serviceauthz.ServiceDirectoryGate {
+	if client == nil || client.localServer == nil {
+		return nil
+	}
+	return client.localServer.ServiceDirectoryGate()
+}
+
+// ServiceCutCoordinates exposes the complete source epoch retained by the
+// fused native receiver after a service-cut install.
+func (client *ReplicatedNodeClient) ServiceCutCoordinates() (frontenddrain.PreparedAckCutReadFloor, bool) {
+	if client == nil || client.localServer == nil {
+		return frontenddrain.PreparedAckCutReadFloor{}, false
+	}
+	return client.localServer.ServiceCutCoordinates()
 }
 
 // DoReplicated routes legacy native calls for compatibility. Query calls are

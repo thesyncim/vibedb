@@ -92,7 +92,10 @@ func newGatewayDevDDL(socket string, authority *gateway.ReplicatedCatalogAuthori
 		}
 		if _, exists := current.Placement(tree.CreateTable.Table); exists {
 			if tree.CreateTable.IfNotExists {
-				return nil
+				if refreshDirectory == nil {
+					return errGatewayControlDirectory
+				}
+				return refreshDirectory(ctx)
 			}
 			return fmt.Errorf("%w: %s", sqldriver.ErrTableExists, tree.CreateTable.Table)
 		}

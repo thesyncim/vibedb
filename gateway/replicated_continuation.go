@@ -44,6 +44,16 @@ func attachFrontendContinuation(ctx context.Context, request *shardservice.Repli
 	if !ok {
 		return ErrFrontendContinuationWireUnavailable
 	}
+	// Continuation credentials prove an already-admitted frontend data stream.
+	// Ledger, execution-pin, transaction recovery, and catalog maintenance are
+	// performed by the gateway service principal under its separately committed
+	// exact InternalFences. Carrying the frontend token onto those owner calls
+	// would require every evolving internal resource to be frozen into the
+	// client grant and can strand a held session after DDL/split. The receiver
+	// still requires self-authority plus the exact internal fence.
+	if scope.Action != serviceauthz.FrontendActionForwardedData {
+		return nil
+	}
 	scope.Protocol = credential.Protocol
 	envelope, ok := serviceauthz.FrontendContinuationEnvelopeFromContext(ctx, scope)
 	if !ok {

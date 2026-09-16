@@ -2856,6 +2856,59 @@ func (registry *StaticRegistry) AcceptsRosterDigest(
 	return view != nil && view.legacyDigests[group] == digest
 }
 
+// AcceptsEnrollmentRosterDigest accepts the normal current roster cut and the
+// one static-predeclaration shape used by AddLearner. A static serving process
+// may know the exact target member-to-node mapping before that target has a
+// Raft role. The gateway can certify only the three current voters at that
+// phase, so its digest deliberately excludes that already-known target. This
+// helper recognizes precisely that shape; it does not accept a historical or
+// arbitrary subset of the registry mapping.
+func (registry *StaticRegistry) AcceptsEnrollmentRosterDigest(
+	group raftmember.GroupKey, digest [sha256.Size]byte,
+	targetMember uint64, targetNode NodeID, initialVoters [3]uint64,
+) bool {
+	if registry == nil || digest == ([sha256.Size]byte{}) || targetMember == 0 || targetNode == (NodeID{}) {
+		return false
+	}
+	if registry.AcceptsRosterDigest(group, digest) {
+		return true
+	}
+	members := registry.membersForGroup(group, registry.dynamic.Load())
+	if len(members) != len(initialVoters)+1 {
+		return false
+	}
+	wantVoters := make(map[uint64]struct{}, len(initialVoters))
+	for _, memberID := range initialVoters {
+		if memberID == 0 {
+			return false
+		}
+		if _, duplicate := wantVoters[memberID]; duplicate {
+			return false
+		}
+		wantVoters[memberID] = struct{}{}
+	}
+	serving := make([]Member, 0, len(initialVoters))
+	seenTarget := false
+	for _, member := range members {
+		if member.MemberID == targetMember {
+			if seenTarget || member.Node != targetNode {
+				return false
+			}
+			seenTarget = true
+			continue
+		}
+		if _, expected := wantVoters[member.MemberID]; !expected {
+			return false
+		}
+		serving = append(serving, member)
+	}
+	if !seenTarget || len(serving) != len(initialVoters) {
+		return false
+	}
+	expected, err := StableRosterDigest(serving)
+	return err == nil && expected == digest
+}
+
 // outboundRosterDigest chooses the handoff digest for an already-authorized
 // pair while a new physical/member mapping is being rolled through the
 // cluster.  The legacy cut is restricted to member IDs and node identities

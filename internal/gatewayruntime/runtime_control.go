@@ -129,6 +129,7 @@ func (runtime *Runtime) openReplicaControl() error {
 		}
 		runtime.clusterControlBackend, err = newScalingOperatorBackend(runtime.authority, runtime.authority, runtime.authority)
 		if err == nil {
+			runtime.clusterControlBackend.drain = runtime
 			runtime.clusterControlBackend.distributedMetrics = runtime.distributedMetrics
 		}
 		return err
@@ -169,6 +170,7 @@ func (runtime *Runtime) openReplicaControl() error {
 		catalog: runtime.authority, drain: drainer, opener: shardOpener, tls: profile,
 		shards: manifest.Shards, dial: dial, handshake: handshakeDeadline,
 		read: readDeadline, write: writeDeadline,
+		refresh: runtime.refreshLiveControlDirectory,
 		protocol: max(time.Duration(manifest.Bounds.ReadTimeout)*time.Millisecond,
 			time.Duration(manifest.Bounds.WriteTimeout)*time.Millisecond),
 		connections: int(manifest.Bounds.MaxConnections), handshakes: int(manifest.Bounds.MaxHandshakes),
@@ -242,11 +244,12 @@ func (runtime *Runtime) openReplicaControl() error {
 	if !runtime.config.ControlParticipantOnly {
 		scalingController, scalingErr := NewScalingController(ScalingControllerOptions{
 			Directory: runtime.authority, Writer: runtime.authority, Catalog: runtime.authority,
-			Moves: runtime.moveController, Provisioner: runtime.config.ScalingProvisioner,
+			ControllerNode: runtime.config.TLSProfile.LocalIdentity().Node,
+			Moves:          runtime.moveController, Provisioner: runtime.config.ScalingProvisioner,
 			Capacity: controls.Capacity, Observation: controls.HealthObservations, Readiness: runtime.config.ScalingReadiness,
-			Enrollment: runtime.config.ScalingEnrollment,
-			Interval:   time.Duration(manifest.Bounds.ControllerInterval) * time.Millisecond,
-			Logf:       runtime.config.Logf,
+			Enrollment: runtime.config.ScalingEnrollment, Drain: runtime,
+			Interval: time.Duration(manifest.Bounds.ControllerInterval) * time.Millisecond,
+			Logf:     runtime.config.Logf,
 		})
 		if scalingErr != nil {
 			return fmt.Errorf("open scaling controller: %w", scalingErr)

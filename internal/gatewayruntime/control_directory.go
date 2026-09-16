@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/frontenddrain"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
@@ -20,16 +23,40 @@ type versionedControlDirectoryReader interface {
 }
 
 // readGatewayControlDirectoryCut obtains one complete metadata cut and its
-// authoritative global directory revision. A catalog generation is carried by
-// each NodeRecord, so unrelated catalog publications do not force an endpoint
-// refresh. An adapter that cannot return the global CAS revision is rejected;
-// taking the maximum child revision would make a valid add/remove cut appear
-// stale forever.
+// authoritative global directory revision. A complete runtime-cut reader is
+// preferred when available so a catalog-only publication advances the
+// effective generation even when no NodeRecord was rewritten. An adapter that
+// cannot return the global CAS revision is rejected; taking the maximum child
+// revision would make a valid add/remove cut appear stale forever.
 func readGatewayControlDirectoryCut(
 	ctx context.Context, reader gateway.DirectoryReader,
 ) (gateway.ReplicatedControlDirectorySnapshot, error) {
 	if ctx == nil || reader == nil {
 		return gateway.ReplicatedControlDirectorySnapshot{}, errGatewayControlDirectory
+	}
+	if coherent, ok := reader.(frontendDrainRuntimeCutReader); ok {
+		source, err := coherent.ReadFrontendDrainRuntimeCut(ctx)
+		if err != nil {
+			return gateway.ReplicatedControlDirectorySnapshot{}, err
+		}
+		if !source.Nodes.Valid() || source.Catalog == nil ||
+			source.CatalogHeadDigest == (replication.Digest{}) ||
+			source.Catalog.Generation() != source.Nodes.CatalogGeneration {
+			return gateway.ReplicatedControlDirectorySnapshot{}, errGatewayControlDirectory
+		}
+		live := gateway.ReplicatedControlDirectorySnapshot{
+			Revision: source.Nodes.Revision, CatalogGeneration: source.Nodes.CatalogGeneration,
+			// The durable cut retains historical incarnations so retirement
+			// proofs can address their exact identities. The live participant
+			// directory admits only the newest incarnation of each physical
+			// NodeID; otherwise a reincarnated node would create duplicate
+			// transport participants and fail closed during startup.
+			Nodes: slices.Clone(source.Nodes.CurrentNodes()),
+		}
+		if !live.Valid() {
+			return gateway.ReplicatedControlDirectorySnapshot{}, errGatewayControlDirectory
+		}
+		return live, nil
 	}
 	if cutReader, ok := reader.(gateway.NodeDirectoryCutReader); ok {
 		cut, err := cutReader.ReadNodeDirectoryCut(ctx)
@@ -100,6 +127,118 @@ func readGatewayControlDirectoryCut(
 		return gateway.ReplicatedControlDirectorySnapshot{}, errGatewayControlDirectory
 	}
 	return cut, nil
+}
+
+func frontendDrainRuntimeCutSnapshot(
+	source gateway.FrontendDrainRuntimeCut,
+) (gateway.ReplicatedControlDirectorySnapshot, error) {
+	if !source.Nodes.Valid() || source.Catalog == nil ||
+		source.CatalogHeadDigest == (replication.Digest{}) ||
+		source.Catalog.Generation() != source.Nodes.CatalogGeneration {
+		return gateway.ReplicatedControlDirectorySnapshot{}, errGatewayControlDirectory
+	}
+	cut := gateway.ReplicatedControlDirectorySnapshot{
+		Revision: source.Nodes.Revision, CatalogGeneration: source.Nodes.CatalogGeneration,
+		Nodes: slices.Clone(source.Nodes.CurrentNodes()),
+	}
+	if !cut.Valid() {
+		return gateway.ReplicatedControlDirectorySnapshot{}, errGatewayControlDirectory
+	}
+	return cut, nil
+}
+
+type liveControlDirectoryProjection struct {
+	cut        gateway.ReplicatedControlDirectorySnapshot
+	serviceCut serviceauthz.ServiceDirectoryCut
+	fullCut    frontenddrain.PreparedAckCut
+	// catalog is the certified catalog image paired with cut/fullCut. Physical
+	// receiver discovery must use this exact image rather than rereading the
+	// runtime holder after the source epoch has been selected.
+	catalog *gateway.Snapshot
+}
+
+// readLiveControlDirectoryProjection obtains one complete source cut and
+// derives every dependent projection from that cut. Refresh callers serialize
+// this operation with the apply path so a catalog-only advance cannot be
+// paired with a stale service directory or an older native gate floor.
+func (runtime *Runtime) readLiveControlDirectoryProjection(
+	ctx context.Context,
+) (liveControlDirectoryProjection, error) {
+	if runtime == nil || ctx == nil || runtime.config.TLSProfile == nil || runtime.config.Authorization == nil {
+		return liveControlDirectoryProjection{}, errGatewayControlDirectory
+	}
+	reader := runtime.config.ControlDirectory
+	if reader == nil {
+		reader = runtime.authority
+	}
+	if reader == nil {
+		return liveControlDirectoryProjection{}, errGatewayControlDirectory
+	}
+	var (
+		cut    gateway.ReplicatedControlDirectorySnapshot
+		source *gateway.FrontendDrainRuntimeCut
+		err    error
+	)
+	if rows := runtime.config.CanonicalFrontendDrainRuntimeRows; rows != nil {
+		loaded, readErr := gateway.ReadFrontendDrainRuntimeCutFromRows(ctx, rows)
+		if readErr != nil {
+			return liveControlDirectoryProjection{}, fmt.Errorf("read canonical frontend drain row cut: %w", readErr)
+		}
+		source = &loaded
+		cut, err = frontendDrainRuntimeCutSnapshot(loaded)
+	} else if physical := runtime.config.CanonicalFrontendDrainRuntimeSource; physical != nil {
+		proof, sourceErr := physical.ReadLatestFrontendDrainCut(ctx)
+		if sourceErr != nil {
+			return liveControlDirectoryProjection{}, fmt.Errorf("read canonical frontend drain source proof: %w", sourceErr)
+		}
+		if !proof.Valid() {
+			return liveControlDirectoryProjection{}, fmt.Errorf("%w: canonical frontend drain source proof is invalid", errGatewayControlDirectory)
+		}
+		loaded, readErr := readCanonicalFrontendDrainRuntimeCutFromSourceProof(
+			ctx, proof, runtime.authority, runtime.config.TLSProfile,
+			runtime.config.Authorization.Generation(),
+		)
+		if readErr != nil {
+			return liveControlDirectoryProjection{}, fmt.Errorf("read canonical frontend drain source authority cut: %w", readErr)
+		}
+		source = &loaded
+		cut, err = frontendDrainRuntimeCutSnapshot(loaded)
+	} else if _, coherent := reader.(frontendDrainRuntimeCutReader); coherent {
+		loaded, readErr := reader.(frontendDrainRuntimeCutReader).ReadFrontendDrainRuntimeCut(ctx)
+		if readErr != nil {
+			return liveControlDirectoryProjection{}, fmt.Errorf("read canonical frontend drain cut: %w", readErr)
+		}
+		source = &loaded
+		cut, err = frontendDrainRuntimeCutSnapshot(loaded)
+	} else {
+		cut, err = readGatewayControlDirectoryCut(ctx, reader)
+	}
+	if err != nil {
+		return liveControlDirectoryProjection{}, err
+	}
+	// Bind the local admission state as soon as the complete physical cut is
+	// authenticated. Service-directory projection may reject a draining cut
+	// whose continuation material is still unavailable, but leaving the local
+	// listener Active in that interval would admit new work after the durable
+	// NodeDraining transition. applyLiveControlDirectoryProjection repeats this
+	// idempotently after all dependent projections validate.
+	runtime.syncFrontendDrainFromDirectory(cut.Nodes, cut.Revision)
+	projection := liveControlDirectoryProjection{cut: cut}
+	if source != nil {
+		projection.catalog = source.Catalog
+		projection.serviceCut, err = runtimeServiceDirectoryCutFromFrontendDrainRuntimeCut(
+			ctx, *source, runtime.config.TLSProfile, runtime.config.Authorization.Generation())
+		if err == nil {
+			projection.fullCut, err = frontendDrainPreparedAckCutFromRuntimeCut(*source, projection.serviceCut)
+		}
+	} else {
+		projection.serviceCut, err = runtimeServiceDirectoryCut(ctx, reader, cut,
+			runtime.config.TLSProfile, runtime.config.Authorization.Generation())
+	}
+	if err != nil {
+		return liveControlDirectoryProjection{}, fmt.Errorf("read service directory cut: %w", err)
+	}
+	return projection, nil
 }
 
 func controlDirectoryShardEndpoints(
@@ -253,6 +392,24 @@ func (runtime *Runtime) openControlDirectory() error {
 	if reader == nil || runtime.config.TLSProfile == nil || runtime.config.Authorization == nil {
 		return errGatewayControlDirectory
 	}
+	var sourceProof *frontenddrain.PreparedAckCut
+	if runtime.config.CanonicalFrontendDrainRuntimeRows == nil {
+		if source := runtime.config.CanonicalFrontendDrainRuntimeSource; source != nil {
+			proof, sourceErr := source.ReadLatestFrontendDrainCut(runtime.ctx)
+			if sourceErr != nil {
+				return fmt.Errorf("read initial canonical frontend drain source proof: %w", sourceErr)
+			}
+			if !proof.Valid() {
+				return fmt.Errorf("%w: initial canonical frontend drain source proof is invalid", errGatewayControlDirectory)
+			}
+			bound, bindErr := bindRuntimeServiceDirectory(runtime.ctx, runtime.config.Transport, proof, true)
+			if bindErr != nil {
+				return fmt.Errorf("install initial canonical frontend drain source proof: %w", bindErr)
+			}
+			runtime.serviceDirectory = bound
+			sourceProof = &proof
+		}
+	}
 	cut, err := readGatewayControlDirectoryCut(runtime.ctx, reader)
 	if err != nil {
 		return fmt.Errorf("read initial control directory: %w", err)
@@ -262,8 +419,51 @@ func (runtime *Runtime) openControlDirectory() error {
 		return fmt.Errorf("validate initial control directory: %w", err)
 	}
 	runtime.controlDirectory = directory
-	serviceCut, err := runtimeServiceDirectoryCut(runtime.ctx, reader, cut,
-		runtime.config.TLSProfile, runtime.config.Authorization.Generation())
+	var (
+		serviceCut serviceauthz.ServiceDirectoryCut
+		fullCut    frontenddrain.PreparedAckCut
+	)
+	if rows := runtime.config.CanonicalFrontendDrainRuntimeRows; rows != nil {
+		source, readErr := readCanonicalFrontendDrainRuntimeCutFromRows(runtime.ctx, rows, cut)
+		if readErr != nil {
+			return fmt.Errorf("read initial canonical frontend drain row cut: %w", readErr)
+		}
+		serviceCut, err = runtimeServiceDirectoryCutFromFrontendDrainRuntimeCut(
+			runtime.ctx, source, runtime.config.TLSProfile, runtime.config.Authorization.Generation())
+		if err == nil {
+			fullCut, err = frontendDrainPreparedAckCutFromRuntimeCut(source, serviceCut)
+		}
+	} else if sourceProof != nil {
+		source, readErr := readCanonicalFrontendDrainRuntimeCutFromSourceProof(
+			runtime.ctx, *sourceProof, runtime.authority, runtime.config.TLSProfile,
+			runtime.config.Authorization.Generation(),
+		)
+		if readErr != nil {
+			return fmt.Errorf("read initial canonical frontend drain source authority cut: %w", readErr)
+		}
+		if source.Nodes.Revision != cut.Revision || source.Nodes.CatalogGeneration != cut.CatalogGeneration ||
+			!reflect.DeepEqual(source.Nodes.CurrentNodes(), cut.Nodes) {
+			return fmt.Errorf("%w: source authority cut does not match initial control directory", errGatewayControlDirectory)
+		}
+		serviceCut, err = runtimeServiceDirectoryCutFromFrontendDrainRuntimeCut(
+			runtime.ctx, source, runtime.config.TLSProfile, runtime.config.Authorization.Generation())
+		if err == nil {
+			fullCut, err = frontendDrainPreparedAckCutFromRuntimeCut(source, serviceCut)
+		}
+	} else if _, coherent := reader.(frontendDrainRuntimeCutReader); coherent {
+		source, readErr := readCanonicalFrontendDrainRuntimeCut(runtime.ctx, reader, cut)
+		if readErr != nil {
+			return fmt.Errorf("read initial canonical frontend drain cut: %w", readErr)
+		}
+		serviceCut, err = runtimeServiceDirectoryCutFromFrontendDrainRuntimeCut(
+			runtime.ctx, source, runtime.config.TLSProfile, runtime.config.Authorization.Generation())
+		if err == nil {
+			fullCut, err = frontendDrainPreparedAckCutFromRuntimeCut(source, serviceCut)
+		}
+	} else {
+		serviceCut, err = runtimeServiceDirectoryCut(runtime.ctx, reader, cut,
+			runtime.config.TLSProfile, runtime.config.Authorization.Generation())
+	}
 	if err != nil {
 		return fmt.Errorf("read initial service directory: %w", err)
 	}
@@ -271,9 +471,17 @@ func (runtime *Runtime) openControlDirectory() error {
 	if err != nil {
 		return fmt.Errorf("validate initial service directory: %w", err)
 	}
-	if err := bindRuntimeServiceDirectory(runtime.config.Transport, runtime.serviceDirectory,
-		runtime.config.RequireServiceDirectoryBinding); err != nil {
-		return err
+	if fullCut.Valid() {
+		bound, bindErr := bindRuntimeServiceDirectory(runtime.ctx, runtime.config.Transport, fullCut,
+			runtime.config.RequireServiceDirectoryBinding)
+		if bindErr != nil {
+			return bindErr
+		}
+		if bound != nil {
+			runtime.serviceDirectory = bound
+		}
+	} else if runtime.config.RequireServiceDirectoryBinding {
+		return fmt.Errorf("%w: complete canonical frontend drain cut is required for the local semantic transport", errGatewayControlDirectory)
 	}
 	return nil
 }
@@ -288,13 +496,28 @@ func (runtime *Runtime) applyLiveControlDirectory(
 	if runtime == nil || runtime.controlDirectory == nil || ctx == nil {
 		return errGatewayControlDirectory
 	}
-	reader := runtime.config.ControlDirectory
-	if reader == nil {
-		reader = runtime.authority
+	projection, err := runtime.readLiveControlDirectoryProjection(ctx)
+	if err != nil {
+		return err
 	}
-	if reader == nil || runtime.config.TLSProfile == nil || runtime.config.Authorization == nil {
+	if projection.cut.Revision != cut.Revision || projection.cut.CatalogGeneration != cut.CatalogGeneration ||
+		!reflect.DeepEqual(projection.cut.Nodes, cut.Nodes) {
+		return fmt.Errorf("%w: source cut changed while applying live control directory", errGatewayControlDirectory)
+	}
+	return runtime.applyLiveControlDirectoryProjection(ctx, projection)
+}
+
+func (runtime *Runtime) applyLiveControlDirectoryProjection(
+	ctx context.Context, projection liveControlDirectoryProjection,
+) error {
+	if runtime == nil || runtime.controlDirectory == nil || ctx == nil ||
+		runtime.config.TLSProfile == nil || runtime.config.Authorization == nil ||
+		!projection.cut.Valid() || !projection.serviceCut.Valid() {
 		return errGatewayControlDirectory
 	}
+	cut := projection.cut
+	serviceCut := projection.serviceCut
+	fullCut := projection.fullCut
 	// Bind the local frontend to the complete physical-node cut before
 	// validating dependent service-directory projections.  A draining
 	// gateway's service binding may require a committed continuation grant
@@ -303,10 +526,8 @@ func (runtime *Runtime) applyLiveControlDirectory(
 	// revision.  The frontend update is still derived only from this
 	// authenticated catalog cut and never relaxes service authorization.
 	runtime.syncFrontendDrainFromDirectory(cut.Nodes, cut.Revision)
-	serviceCut, err := runtimeServiceDirectoryCut(ctx, reader, cut,
-		runtime.config.TLSProfile, runtime.config.Authorization.Generation())
-	if err != nil {
-		return fmt.Errorf("read service directory cut: %w", err)
+	if err := runtime.publishFrontendContinuationGrant(ctx, cut); err != nil {
+		return fmt.Errorf("publish frontend continuation grant: %w", err)
 	}
 	if err := runtime.controlDirectory.Apply(cut); err != nil {
 		return err
@@ -347,9 +568,22 @@ func (runtime *Runtime) applyLiveControlDirectory(
 	if runtime.serviceDirectory == nil {
 		return errGatewayControlDirectory
 	}
+	if fullCut.Valid() {
+		bound, bindErr := bindRuntimeServiceDirectory(ctx, runtime.config.Transport, fullCut,
+			runtime.config.RequireServiceDirectoryBinding)
+		if bindErr != nil {
+			return bindErr
+		}
+		if bound != nil && runtime.serviceDirectory != bound {
+			return fmt.Errorf("%w: semantic transport replaced the retained service-directory gate", errGatewayControlDirectory)
+		}
+	} else if runtime.config.RequireServiceDirectoryBinding {
+		return fmt.Errorf("%w: complete canonical frontend drain cut is required for the local semantic transport", errGatewayControlDirectory)
+	}
 	if err := runtime.serviceDirectory.ApplyCommittedCut(serviceCut); err != nil {
 		return fmt.Errorf("update service directory: %w", err)
 	}
+	runtime.installPublishedFrontendContinuation(serviceCut)
 	// Preserve old roster entries for active fences, while making current
 	// identities available to the request-level envelope authorization.
 	runtime.controlRosterMu.Lock()
@@ -376,18 +610,74 @@ func (runtime *Runtime) refreshLiveControlDirectory(ctx context.Context) error {
 	if runtime == nil || ctx == nil {
 		return errGatewayControlDirectory
 	}
-	reader := runtime.config.ControlDirectory
-	if reader == nil {
-		reader = runtime.authority
+	if err := runtime.lockControlDirectoryRefresh(ctx); err != nil {
+		return err
 	}
-	if reader == nil {
-		return errGatewayControlDirectory
-	}
-	cut, err := readGatewayControlDirectoryCut(ctx, reader)
+	defer runtime.controlDirectoryRefreshMu.Unlock()
+	projection, err := runtime.readLiveControlDirectoryProjection(ctx)
 	if err != nil {
 		return fmt.Errorf("read live control directory: %w", err)
 	}
-	return runtime.applyLiveControlDirectory(ctx, cut)
+	if err := runtime.applyLiveControlDirectoryProjection(ctx, projection); err != nil {
+		return err
+	}
+	if projection.fullCut.Valid() {
+		nodeCut := gateway.NodeDirectoryCut{
+			Revision: projection.cut.Revision, Digest: projection.fullCut.DirectoryDigest,
+			CatalogGeneration: projection.cut.CatalogGeneration, Nodes: slices.Clone(projection.cut.Nodes),
+		}
+		digest := projection.fullCut.Digest()
+		if digest == ([32]byte{}) {
+			runtime.publishedFrontendDrainCutValid = false
+			return fmt.Errorf("%w: canonical frontend drain cut digest unavailable", gateway.ErrScalingRevision)
+		}
+		if runtime.publishedFrontendDrainCutValid && runtime.publishedFrontendDrainCutDigest == digest {
+			return nil
+		}
+		// Invalidate before starting an unfinished round. A later source epoch
+		// that happens to return to this digest must still complete a fresh
+		// receiver barrier.
+		runtime.publishedFrontendDrainCutValid = false
+		if err := runtime.publishCanonicalFrontendDrainCut(ctx, nodeCut, projection.fullCut, projection.catalog); err != nil {
+			return fmt.Errorf("publish canonical frontend drain cut: %w", err)
+		}
+		runtime.publishedFrontendDrainCutDigest = digest
+		runtime.publishedFrontendDrainCutValid = true
+	} else {
+		runtime.publishedFrontendDrainCutValid = false
+	}
+	return nil
+}
+
+// lockControlDirectoryRefresh keeps cancellation effective while another
+// refresh is still waiting on a slow receiver. A plain Mutex.Lock here would
+// let a dead peer strand DDL callers until the previous round's transport
+// deadline expires.
+func (runtime *Runtime) lockControlDirectoryRefresh(ctx context.Context) error {
+	if runtime == nil || ctx == nil {
+		return errGatewayControlDirectory
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	const poll = 5 * time.Millisecond
+	for {
+		if runtime.controlDirectoryRefreshMu.TryLock() {
+			return nil
+		}
+		timer := time.NewTimer(poll)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return context.Cause(ctx)
+		case <-timer.C:
+		}
+	}
 }
 
 func (runtime *Runtime) runControlDirectory() {
@@ -406,17 +696,8 @@ func (runtime *Runtime) runControlDirectory() {
 		case <-runtime.ctx.Done():
 			return
 		case <-ticker.C:
-			reader := runtime.config.ControlDirectory
-			if reader == nil {
-				reader = runtime.authority
-			}
-			cut, err := readGatewayControlDirectoryCut(runtime.ctx, reader)
-			if err != nil {
-				runtime.config.Logf("gatewayruntime: read live control directory: %v", err)
-				continue
-			}
-			if err := runtime.applyLiveControlDirectory(runtime.ctx, cut); err != nil {
-				runtime.config.Logf("gatewayruntime: apply live control directory: %v", err)
+			if err := runtime.refreshLiveControlDirectory(runtime.ctx); err != nil {
+				runtime.config.Logf("gatewayruntime: refresh live control directory: %v", err)
 			}
 		}
 	}

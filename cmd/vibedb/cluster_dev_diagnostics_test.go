@@ -166,6 +166,66 @@ func TestDevSupervisorBoundsInheritedPipeDrain(t *testing.T) {
 	t.Fatal("missing bounded descendant diagnostic")
 }
 
+func TestDevSupervisorBoundsInheritedPipeDrainAcrossChildren(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const childCount = 6
+	children := make([]*devChild, 0, childCount)
+	defer func() {
+		// The helper deliberately leaves a process holding the supervised
+		// child's output pipe. Reap those processes on every failure path so
+		// this regression cannot leak a pipe holder into later tests.
+		for _, child := range children {
+			if child == nil {
+				continue
+			}
+			for _, line := range strings.Split(child.diagnostics.String(), "\n") {
+				text, ok := strings.CutPrefix(line, "DESCENDANT_PID=")
+				if !ok {
+					continue
+				}
+				pid, err := strconv.Atoi(text)
+				if err != nil || pid <= 0 {
+					continue
+				}
+				if process, err := os.FindProcess(pid); err == nil {
+					_ = process.Kill()
+				}
+			}
+		}
+		stopDevChildren(children)
+	}()
+	for i := 0; i < childCount; i++ {
+		child, err := startDevChild(binary, []string{"-test.run=^TestDevDiagnosticChildHelper$", "--", "dev-diagnostic-held-pipe"}, "READY")
+		if err != nil {
+			t.Fatalf("start child %d: %v", i, err)
+		}
+		children = append(children, child)
+	}
+	for i, child := range children {
+		if err := waitDevReady(t.Context(), child); err != nil {
+			t.Fatalf("child %d readiness: %v", i, err)
+		}
+	}
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for i, child := range children {
+		select {
+		case <-child.done:
+		case <-deadline.C:
+			t.Fatalf("child %d inherited pipe delayed bounded reap", i)
+		}
+	}
+	for i, child := range children {
+		diagnostic := child.diagnostics.String()
+		if !strings.Contains(diagnostic, "DESCENDANT_PID=") || !strings.HasSuffix(diagnostic, "fatal-after-readiness-without-newline") {
+			t.Fatalf("child %d lost bounded-drain diagnostics: %q", i, diagnostic)
+		}
+	}
+}
+
 func TestDevSupervisorStopsChildrenAppendedAfterDeferredCleanup(t *testing.T) {
 	root := t.TempDir()
 	reaped := [3]bool{}

@@ -1171,21 +1171,38 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 			// The decommission proof may spend several minutes draining real
 			// replicas. Keep the witness active while that proof runs so an
 			// idle frontend connection cannot disappear before the controller
-			// observes its authenticated session blocker. The query is issued
-			// from the status predicate, which also keeps the witness check in
-			// the same polling timeline as the blocker assertion.
+			// observes its authenticated session blocker. This must exercise the
+			// real stored-data route, not only the PG protocol's local SELECT 1:
+			// an insert and its exact read both travel over the held retiring
+			// frontend after the Active -> Draining transition has started.
 			var witnessLastProbe time.Time
 			var witnessProbeErr error
+			witnessRow := seamlessScaleAck{Table: seamlessScaleTables[0],
+				ID: "drain-witness-" + retireRequestID[:16], Value: 91_337,
+				Marker: seamlessScalePayload("drain-witness", cycle)}
+			witnessWriteDone := false
 			blocked, err = pollSeamlessScaleStatus(ctx, vibedbBinary, profilePath, retire.OperationID, func(response clustercontrol.Response) bool {
 				if witnessProbeErr != nil {
 					return true
 				}
+				if !witnessWriteDone {
+					writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					result, writeErr := fusedDDLWireQuery(writeCtx, retiringSQL,
+						fmt.Sprintf("INSERT INTO %s (id,value,marker) VALUES ('%s',%d,'%s')", witnessRow.Table, witnessRow.ID, witnessRow.Value, witnessRow.Marker), false)
+					cancel()
+					if writeErr != nil || result.code != "" || result.tag != "INSERT 0 1" {
+						witnessProbeErr = fmt.Errorf("retiring SQL witness stored-data write: result=%+v err=%v", result, writeErr)
+						return true
+					}
+					witnessWriteDone = true
+				}
 				if witnessLastProbe.IsZero() || time.Since(witnessLastProbe) >= 5*time.Second {
 					witnessLastProbe = time.Now()
 					probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-					probe, probeErr := fusedDDLWireQuery(probeCtx, retiringSQL, "SELECT 1", false)
+					probe, probeErr := fusedDDLWireQuery(probeCtx, retiringSQL,
+						fmt.Sprintf("SELECT id,value,marker FROM %s WHERE id='%s'", witnessRow.Table, witnessRow.ID), false)
 					cancel()
-					if probeErr != nil || probe.code != "" || len(probe.rows) != 1 || len(probe.rows[0]) != 1 || probe.rows[0][0] != "1" {
+					if probeErr != nil || !seamlessScaleSQLMatches(probe, witnessRow) {
 						witnessProbeErr = fmt.Errorf("retiring SQL witness keepalive: result=%+v err=%v", probe, probeErr)
 						return true
 					}

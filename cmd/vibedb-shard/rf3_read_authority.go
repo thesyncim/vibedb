@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -415,6 +416,7 @@ type rf3ReadAuthorityCacheKey struct {
 type rf3ReadAuthorityProbeTarget struct {
 	key        rf3ReadAuthorityCacheKey
 	allocation uint64
+	command    raftservice.CommandFence
 	address    string
 	// generation is an in-process registration generation. It is deliberately
 	// separate from the durable allocation so a late probe from a removed
@@ -583,6 +585,10 @@ func rf3ReadAuthorityGroupTargetsForPrepared(
 		identity.AllocationGeneration == 0 || identity.NodeIncarnation == 0 {
 		return rf3ReadAuthorityGroupTargets{}, errRF3ReadAuthority
 	}
+	command, err := currentRF3CommandFence(item.apply, identity, item.publication)
+	if err != nil {
+		return rf3ReadAuthorityGroupTargets{}, errRF3ReadAuthority
+	}
 	members := item.manifest.memberRoster()
 	if len(members) != rf3ManifestMembers {
 		return rf3ReadAuthorityGroupTargets{}, errRF3ReadAuthority
@@ -599,6 +605,7 @@ func rf3ReadAuthorityGroupTargetsForPrepared(
 				store: member.StoreID, allocation: identity.AllocationGeneration,
 			},
 			allocation: identity.AllocationGeneration,
+			command:    command,
 			address:    member.NativeAddress,
 		})
 	}
@@ -960,7 +967,7 @@ func (cache *rf3ReadAuthorityIncarnationCache) probeResult(
 	response, err := entry.encoder.RoundTripReplicated(ctx, entry.conn, &shardservice.ReplicatedRequest{
 		Operation: shardservice.ReplicatedProbe, Authority: cache.authority,
 		Capability: serviceauthz.CapabilityDataRead,
-		Fence:      shardservice.ReplicatedFence{Group: target.key.group, AllocationGeneration: target.allocation},
+		Fence:      shardservice.ReplicatedFence{Group: target.key.group, AllocationGeneration: target.allocation, Command: target.command},
 	})
 	if err != nil || response == nil {
 		_ = entry.conn.Close()

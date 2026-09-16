@@ -38,7 +38,7 @@ func ensureDevPhysicalTables(root, binary string, cluster *devClusterManifest, s
 	// before allocating another table, including a crash before cluster.json
 	// recorded the reserved ordinals. No directory enumeration chooses IDs.
 	if err := reserveDevPhysicalTablePlans(cluster, inventory); err != nil {
-		return err
+		return fmt.Errorf("%w: physical table plan reconciliation: %v", errDevCluster, err)
 	}
 	if schemaPath != "" {
 		ddl, err := readDevFile(schemaPath, sqldriver.ReplicatedChildSchemaMaxBytes)
@@ -114,19 +114,19 @@ func ensureDevPhysicalTables(root, binary string, cluster *devClusterManifest, s
 		completed := fragmentErr == nil || bundleErr == nil
 		members, group, err := prepareDevPhysicalTable(root, binary, *cluster, table, completed)
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: physical table %q preparation: %v", errDevCluster, table.Table, err)
 		}
 		if bundleErr == nil {
 			expected, expectedErr := buildDevPhysicalTableProvision(table, members, group, true)
 			if expectedErr != nil || !bytes.Equal(expected, bundleCatalog) {
-				return errors.Join(errDevCluster, expectedErr)
+				return fmt.Errorf("%w: physical table %q retained provision proof: %v", errDevCluster, table.Table, expectedErr)
 			}
 			if err := validateDevPhysicalTableSplitSource(root, bundle, table, members, group); err != nil {
-				return err
+				return fmt.Errorf("%w: physical table %q retained split source: %v", errDevCluster, table.Table, err)
 			}
 			if fragmentErr != nil {
 				if err := writeDevFileOnce(path, expected); err != nil {
-					return err
+					return fmt.Errorf("%w: physical table %q retained fragment: %v", errDevCluster, table.Table, err)
 				}
 				fragment, fragmentErr = expected, nil
 			}
@@ -135,22 +135,22 @@ func ensureDevPhysicalTables(root, binary string, cluster *devClusterManifest, s
 				inventory.Tables[tableIndex] = table
 				raw, marshalErr := vibejson.Marshal(&inventory)
 				if marshalErr != nil {
-					return marshalErr
+					return fmt.Errorf("%w: physical table %q inventory upgrade: %v", errDevCluster, table.Table, marshalErr)
 				}
 				if err := replaceDevFile(inventoryPath, raw); err != nil {
-					return err
+					return fmt.Errorf("%w: physical table %q inventory upgrade write: %v", errDevCluster, table.Table, err)
 				}
 			}
 		} else {
 			provision, err := buildDevPhysicalTableProvision(table, members, group, completed)
 			if err != nil {
-				return err
+				return fmt.Errorf("%w: physical table %q provision build: %v", errDevCluster, table.Table, err)
 			}
 			if fragmentErr == nil && !bytes.Equal(fragment, provision) {
 				return fmt.Errorf("%w: retained table fragment differs from prepared identity", errDevCluster)
 			}
 			if err := writeDevFileOnce(path, provision); err != nil {
-				return err
+				return fmt.Errorf("%w: physical table %q fragment write: %v", errDevCluster, table.Table, err)
 			}
 			fragment = provision
 			// New plans require a complete bundle. Legacy plans may be upgraded
@@ -161,26 +161,26 @@ func ensureDevPhysicalTables(root, binary string, cluster *devClusterManifest, s
 			if sourceErr == nil {
 				bundle, sourceErr = gateway.AppendReplicatedTableProvisionBundle(nil, fragment, sourceRaw)
 				if sourceErr != nil {
-					return sourceErr
+					return fmt.Errorf("%w: physical table %q split bundle: %v", errDevCluster, table.Table, sourceErr)
 				}
 				if err := writeDevFileOnce(bundlePath, bundle); err != nil {
-					return err
+					return fmt.Errorf("%w: physical table %q split bundle write: %v", errDevCluster, table.Table, err)
 				}
 				if table.ProvisionBundleFormat != gateway.ReplicatedTableProvisionBundleFormat {
 					table.ProvisionBundleFormat = gateway.ReplicatedTableProvisionBundleFormat
 					inventory.Tables[tableIndex] = table
 					raw, marshalErr := vibejson.Marshal(&inventory)
 					if marshalErr != nil {
-						return marshalErr
+						return fmt.Errorf("%w: physical table %q inventory upgrade: %v", errDevCluster, table.Table, marshalErr)
 					}
 					if err := replaceDevFile(inventoryPath, raw); err != nil {
-						return err
+						return fmt.Errorf("%w: physical table %q inventory upgrade write: %v", errDevCluster, table.Table, err)
 					}
 				}
 				bundleErr = nil
 			}
 			if sourceErr != nil && table.ProvisionBundleFormat == gateway.ReplicatedTableProvisionBundleFormat {
-				return sourceErr
+				return fmt.Errorf("%w: physical table %q split source: %v", errDevCluster, table.Table, sourceErr)
 			}
 		}
 		if table.ProvisionBundleFormat == gateway.ReplicatedTableProvisionBundleFormat || bundleErr == nil {
@@ -189,7 +189,10 @@ func ensureDevPhysicalTables(root, binary string, cluster *devClusterManifest, s
 			cluster.additionalCatalogs = append(cluster.additionalCatalogs, path)
 		}
 	}
-	return updateDevPhysicalGatewayCatalogs(*cluster, cluster.additionalCatalogs)
+	if err := updateDevPhysicalGatewayCatalogs(*cluster, cluster.additionalCatalogs); err != nil {
+		return fmt.Errorf("%w: physical table catalog inventory: %v", errDevCluster, err)
+	}
+	return nil
 }
 
 func planDevPhysicalTable(cluster devClusterManifest, name, primary, ddl string, ordinal uint64) (devTableProvision, error) {
@@ -330,24 +333,27 @@ func plannedDevPhysicalMembers(cluster devClusterManifest, table devTableProvisi
 func prepareDevPhysicalTable(root, binary string, cluster devClusterManifest, table devTableProvision, completed bool) ([]devClusterMember, raftmember.GroupKey, error) {
 	members, err := plannedDevPhysicalMembers(cluster, table)
 	if err != nil {
-		return nil, raftmember.GroupKey{}, err
+		return nil, raftmember.GroupKey{}, fmt.Errorf("%w: physical table %q member plan: %v", errDevCluster, table.Table, err)
 	}
 	for index, member := range members {
 		base, err := devPhysicalNodeMember(cluster, member.Node)
 		if err != nil {
-			return nil, raftmember.GroupKey{}, err
+			return nil, raftmember.GroupKey{}, fmt.Errorf("%w: physical table %q member %d base node lookup: %v", errDevCluster, table.Table, index+1, err)
 		}
 		raw, err := readDevFile(filepath.Dir(base.GroupRoot)+"."+filepath.Base(base.GroupRoot)+".prepare.vibejson", 1<<20)
 		if err != nil {
-			return nil, raftmember.GroupKey{}, err
+			return nil, raftmember.GroupKey{}, fmt.Errorf("%w: physical table %q member %d base preparation read: %v", errDevCluster, table.Table, index+1, err)
 		}
 		var prepare devPrepareManifest
-		if err := vibejson.Unmarshal(raw, &prepare); err != nil || prepare.Root != base.GroupRoot || prepare.StoreID != base.Store || prepare.MemberID != base.Member {
-			return nil, raftmember.GroupKey{}, errors.Join(errDevCluster, err)
+		if err := vibejson.Unmarshal(raw, &prepare); err != nil {
+			return nil, raftmember.GroupKey{}, fmt.Errorf("%w: physical table %q member %d base preparation decode: %v", errDevCluster, table.Table, index+1, err)
+		}
+		if prepare.Root != base.GroupRoot || prepare.StoreID != base.Store || prepare.MemberID != base.Member {
+			return nil, raftmember.GroupKey{}, fmt.Errorf("%w: physical table %q member %d base preparation identity", errDevCluster, table.Table, index+1)
 		}
 		if !devReadAuthorityEqual(prepare.ReadAuthority, cluster.ReadAuthority) ||
 			prepare.ReadAuthority != nil && !validDevReadAuthority(*prepare.ReadAuthority) {
-			return nil, raftmember.GroupKey{}, fmt.Errorf("%w: retained group read authority differs from cluster policy", errDevCluster)
+			return nil, raftmember.GroupKey{}, fmt.Errorf("%w: physical table %q member %d retained group read authority differs from cluster policy", errDevCluster, table.Table, index+1)
 		}
 		prepare.Root, prepare.MemberID, prepare.StoreID = member.GroupRoot, member.Member, member.Store
 		prepare.Table, prepare.CreateTable = table.Table, table.CreateTable
@@ -367,37 +373,37 @@ func prepareDevPhysicalTable(root, binary string, cluster devClusterManifest, ta
 		}
 		raw, err = vibejson.Marshal(&prepare)
 		if err != nil {
-			return nil, raftmember.GroupKey{}, err
+			return nil, raftmember.GroupKey{}, fmt.Errorf("%w: physical table %q member %d preparation encode: %v", errDevCluster, table.Table, index+1, err)
 		}
 		path := filepath.Join(root, fmt.Sprintf("prepare-%s-member-%d.vibejson", table.artifactStem(), index+1))
 		if completed {
 			retained, err := readDevFile(path, 1<<20)
 			if err != nil || !bytes.Equal(retained, raw) {
-				return nil, raftmember.GroupKey{}, errors.Join(errDevCluster, err)
+				return nil, raftmember.GroupKey{}, fmt.Errorf("%w: physical table %q member %d retained preparation mismatch: %v", errDevCluster, table.Table, index+1, err)
 			}
 		} else if err := writeDevFileOnce(path, raw); err != nil {
-			return nil, raftmember.GroupKey{}, err
+			return nil, raftmember.GroupKey{}, fmt.Errorf("%w: physical table %q member %d preparation write: %v", errDevCluster, table.Table, index+1, err)
 		}
 		if _, err := os.Stat(filepath.Join(member.GroupRoot, "serve-rf3.vibejson")); errors.Is(err, os.ErrNotExist) {
 			if completed {
-				return nil, raftmember.GroupKey{}, errors.Join(errDevCluster, err)
+				return nil, raftmember.GroupKey{}, fmt.Errorf("%w: physical table %q member %d missing retained serving manifest", errDevCluster, table.Table, index+1)
 			}
 			if err := runDevCommand(binary, "prepare-node-group-rf3", "-manifest", path); err != nil {
-				return nil, raftmember.GroupKey{}, err
+				return nil, raftmember.GroupKey{}, fmt.Errorf("%w: physical table %q member %d prepare-node-group-rf3: %v", errDevCluster, table.Table, index+1, err)
 			}
 		} else if err != nil {
-			return nil, raftmember.GroupKey{}, err
+			return nil, raftmember.GroupKey{}, fmt.Errorf("%w: physical table %q member %d serving manifest stat: %v", errDevCluster, table.Table, index+1, err)
 		}
 	}
 	members, group, err := devPhysicalTableMembersAt(cluster, table, !completed)
 	if err != nil {
-		return nil, group, err
+		return nil, group, fmt.Errorf("%w: physical table %q prepared member validation: %v", errDevCluster, table.Table, err)
 	}
 	// Every SQL root is durable before any live manifest advertises the new
 	// group. A retry can find any prefix of these manifest publications.
 	for _, member := range members {
 		if err := reconcileDevPhysicalNodeGroup(member, !completed, cluster.ReadAuthority); err != nil {
-			return nil, group, err
+			return nil, group, fmt.Errorf("%w: physical table %q node %q group reconciliation: %v", errDevCluster, table.Table, member.Node, err)
 		}
 	}
 	return members, group, nil
@@ -818,28 +824,28 @@ func plannedDevPhysicalTableRoute(endpoints map[distribution.EndpointID]string, 
 func reconcileDevPhysicalNodeGroup(member devClusterMember, appendMissing bool, expected *devReadAuthority) error {
 	groupRaw, err := readDevFile(filepath.Join(member.GroupRoot, "serve-rf3.vibejson"), 4<<20)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: group serving manifest read: %v", errDevCluster, err)
 	}
 	nodeRaw, err := readDevFile(member.ServeManifest, 4<<20)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: node serving manifest read: %v", errDevCluster, err)
 	}
 	var source, groupSource map[string]json.RawMessage
 	if err := json.Unmarshal(nodeRaw, &source); err != nil {
-		return err
+		return fmt.Errorf("%w: node serving manifest decode: %v", errDevCluster, err)
 	}
 	if err := validateDevReadAuthorityRaw(nodeRaw, expected); err != nil {
-		return err
+		return fmt.Errorf("%w: node serving read authority: %v", errDevCluster, err)
 	}
 	if err := validateDevReadAuthorityRaw(groupRaw, expected); err != nil {
-		return err
+		return fmt.Errorf("%w: group serving read authority: %v", errDevCluster, err)
 	}
 	if err := json.Unmarshal(groupRaw, &groupSource); err != nil {
-		return err
+		return fmt.Errorf("%w: group serving manifest decode: %v", errDevCluster, err)
 	}
 	var split map[string]json.RawMessage
 	if err := json.Unmarshal(groupSource["split_control"], &split); err != nil || len(split["child_registry"]) == 0 {
-		return errDevCluster
+		return fmt.Errorf("%w: group split-control child registry", errDevCluster)
 	}
 	bundle := map[string]json.RawMessage{"child_registry": split["child_registry"]}
 	for _, key := range []string{"wal", "sql", "route", "members"} {
@@ -851,11 +857,11 @@ func reconcileDevPhysicalNodeGroup(member devClusterMember, appendMissing bool, 
 	}
 	var groups []json.RawMessage
 	if err := json.Unmarshal(source["groups"], &groups); err != nil || len(groups) == 0 {
-		return errDevCluster
+		return fmt.Errorf("%w: node group inventory", errDevCluster)
 	}
 	ordinal, err := devPhysicalGroupOrdinal(filepath.Dir(member.ServeManifest), member.GroupRoot)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: node group ordinal: %v", errDevCluster, err)
 	}
 	for index, existing := range groups {
 		if bytes.Equal(existing, bundleRaw) {
@@ -866,30 +872,53 @@ func reconcileDevPhysicalNodeGroup(member devClusterMember, appendMissing bool, 
 		}
 	}
 	if !appendMissing || ordinal != len(groups) || len(groups) >= devPhysicalMaxGroups {
-		return errDevCluster
+		return fmt.Errorf("%w: node group append fence append=%t ordinal=%d existing=%d max=%d", errDevCluster, appendMissing, ordinal, len(groups), devPhysicalMaxGroups)
 	}
 	if err := retainDevPhysicalManifest(member.ServeManifest, nodeRaw); err != nil {
-		return err
+		return fmt.Errorf("%w: retain node serving manifest: %v", errDevCluster, err)
 	}
 	groups = append(groups, bundleRaw)
 	source["groups"], err = json.Marshal(groups)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: encode node group inventory: %v", errDevCluster, err)
 	}
-	order := []string{"node_log"}
-	if len(source["node_incarnation"]) != 0 {
-		order = append(order, "node_incarnation")
-	}
-	order = append(order, "listeners", "tls", "authorization_policy", "replica_control", "split_control")
-	if len(source["read_authority"]) != 0 {
-		order = append(order, "read_authority")
-	}
-	order = append(order, "gateway", "groups")
+	order := devNodeRuntimeManifestOrder(source)
 	raw, err := orderedDevManifestObject(source, order)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: order node serving manifest: %v", errDevCluster, err)
 	}
-	return replaceDevFile(member.ServeManifest, raw)
+	if err := replaceDevFile(member.ServeManifest, raw); err != nil {
+		return fmt.Errorf("%w: publish node serving manifest: %v", errDevCluster, err)
+	}
+	return nil
+}
+
+// devNodeRuntimeManifestOrder is the one canonical order for rebuilding a
+// physical node runtime after appending a prepared group.  The optional
+// source seeds, catalog-genesis witness, read-authority proof, and embedded
+// gateway must all survive that rewrite in the order consumed by parseRF3Manifest.
+func devNodeRuntimeManifestOrder(fields map[string]json.RawMessage) []string {
+	order := make([]string, 0, 16)
+	if len(fields["node_log"]) != 0 {
+		order = append(order, "node_log")
+		if len(fields["node_incarnation"]) != 0 {
+			order = append(order, "node_incarnation")
+		}
+	}
+	order = append(order, "listeners", "tls", "authorization_policy")
+	for _, key := range []string{"bootstrap_gateway_seeds", "canonical_source_seeds"} {
+		if len(fields[key]) != 0 {
+			order = append(order, key)
+		}
+	}
+	order = append(order, "replica_control", "split_control")
+	for _, key := range []string{"catalog_genesis", "read_authority", "gateway"} {
+		if len(fields[key]) != 0 {
+			order = append(order, key)
+		}
+	}
+	order = append(order, "groups")
+	return order
 }
 
 func retainDevPhysicalManifest(path string, raw []byte) error {

@@ -1869,10 +1869,18 @@ func newLiveCatalogRolloverSession(
 func newCatalogAuthorityFixture(t *testing.T) (
 	*ReplicatedCatalogAuthority, *catalogAuthorityClient, *Snapshot,
 ) {
-	return newCatalogAuthorityFixtureWithDescriptor(t, nil)
+	return newCatalogAuthorityFixtureAtGeneration(t, nil, 5)
 }
 
 func newCatalogAuthorityFixtureWithDescriptor(t *testing.T, prepare func(*ReplicatedShardDescriptor)) (*ReplicatedCatalogAuthority, *catalogAuthorityClient, *Snapshot) {
+	return newCatalogAuthorityFixtureAtGeneration(t, prepare, 5)
+}
+
+func newCatalogAuthorityGenesisFixture(t *testing.T) (*ReplicatedCatalogAuthority, *catalogAuthorityClient, *Snapshot) {
+	return newCatalogAuthorityFixtureAtGeneration(t, nil, 1)
+}
+
+func newCatalogAuthorityFixtureAtGeneration(t *testing.T, prepare func(*ReplicatedShardDescriptor), currentGeneration uint64) (*ReplicatedCatalogAuthority, *catalogAuthorityClient, *Snapshot) {
 	t.Helper()
 	config, endpoints, descriptor := testReplicatedCatalogInput(t)
 	if prepare != nil {
@@ -1889,7 +1897,7 @@ func newCatalogAuthorityFixtureWithDescriptor(t *testing.T, prepare func(*Replic
 		t.Fatal(err)
 	}
 	current, err := NewSnapshotWithReplicatedMetadata(
-		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+		config, endpoints, currentGeneration, nil, nil, []ReplicatedShardDescriptor{descriptor},
 	)
 	if err != nil {
 		t.Fatal(err)

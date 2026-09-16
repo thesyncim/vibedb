@@ -42,6 +42,7 @@ type gatewayServingSplitOptions struct {
 	protocol    time.Duration
 	connections int
 	handshakes  int
+	refresh     func(context.Context) error
 }
 
 func newGatewayServingSplitRuntime(
@@ -140,7 +141,7 @@ func newGatewayServingSplitRuntime(
 	}
 	controller, err := splitcontroller.NewServingControllerService(
 		options.catalog, observer, router, coordinator,
-		splitcontroller.CatalogGatewaySplitActions{Authority: options.catalog, Terminal: terminal},
+		splitcontroller.CatalogGatewaySplitActions{Authority: options.catalog, Terminal: terminal, Refresh: options.refresh},
 		gatewayCommittedChildPreparer{client: prepareClient},
 	)
 	if err != nil {

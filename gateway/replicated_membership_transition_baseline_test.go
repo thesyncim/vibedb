@@ -34,7 +34,7 @@ func (client *baselineMembershipTransitionClient) ProbeReplicated(
 	response, err := client.delegate.DoReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
 		Operation: shardservice.ReplicatedProbe, Capability: capability,
 		Fence: shardservice.ReplicatedFence{
-			Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+			Group: route.Group, AllocationGeneration: route.AllocationGeneration, Command: route.Command,
 		},
 	})
 	if err != nil || response == nil || !response.HasState {

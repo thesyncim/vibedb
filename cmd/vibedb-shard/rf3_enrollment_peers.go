@@ -43,7 +43,8 @@ func validateRF3EnrollmentGrant(registry *rafttransport.StaticRegistry, intent r
 	if !found || version != grant.InitialReplicaSetVersion {
 		return errRF3EnrollmentPeerReceipt
 	}
-	if !registry.AcceptsRosterDigest(intent.Group, intent.ExpectedRosterDigest) {
+	if !registry.AcceptsEnrollmentRosterDigest(intent.Group, intent.ExpectedRosterDigest,
+		intent.Member.MemberID, intent.Peer.NodeID, grant.InitialVoters) {
 		return errRF3EnrollmentPeerReceipt
 	}
 	var initial [3]membershipgrant.RosterMember

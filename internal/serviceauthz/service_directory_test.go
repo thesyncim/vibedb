@@ -56,9 +56,6 @@ func serviceDirectoryCut(revision uint64, bindings ...ServiceBinding) ServiceDir
 func serviceDirectoryContinuationGrant(peer AuthenticatedPeer, binding ServiceBinding,
 	state ContinuationGrantState,
 ) CommittedFrontendContinuationGrant {
-	scope := FrontendContinuationScopeRecord{Protocol: FrontendScopeNative,
-		Action: FrontendActionForwardedData, Capability: CapabilityDataRead,
-		Operation: ServiceOperationForwardedRead, Group: serviceDirectoryGroup(31), Relation: [16]byte{37}}
 	grant, err := NewCommittedFrontendContinuationGrant(CommittedFrontendContinuationGrant{
 		TrustDomain: peer.Identity.TrustDomain, PhysicalNode: binding.PhysicalNode,
 		PhysicalIncarnation: binding.PhysicalIncarnation, PeerKeyDigest: binding.KeyDigest,
@@ -66,7 +63,6 @@ func serviceDirectoryContinuationGrant(peer AuthenticatedPeer, binding ServiceBi
 		GatewaySessionRevision: binding.SessionRevision, DrainID: [32]byte{32}, AdmissionEpoch: 33,
 		AcceptedConnectionTokens:    []FrontendConnToken{{34}},
 		AcceptedConnectionProtocols: []FrontendContinuationScope{FrontendScopeNative},
-		AllowedScopes:               []FrontendContinuationScopeRecord{scope},
 		AdmissionClosedProofDigest:  [32]byte{35}, Revision: 36, State: state,
 	})
 	if err != nil {
@@ -79,6 +75,15 @@ func serviceDirectoryCutWithContinuations(revision uint64, grants []CommittedFro
 	bindings ...ServiceBinding,
 ) ServiceDirectoryCut {
 	cut := serviceDirectoryCut(revision, bindings...)
+	for _, grant := range grants {
+		for _, protocol := range grant.AcceptedConnectionProtocols {
+			cut.ForwardedScopes = append(cut.ForwardedScopes, FrontendContinuationScopeRecord{
+				Protocol: protocol, Action: FrontendActionForwardedData, Capability: CapabilityDataRead,
+				Operation: ServiceOperationForwardedRead, Group: serviceDirectoryGroup(31), Relation: [16]byte{37},
+			})
+		}
+	}
+	slices.SortFunc(cut.ForwardedScopes, CompareContinuationScopes)
 	cut.ContinuationGrants = grants
 	return cut
 }
@@ -200,12 +205,8 @@ func TestServiceDirectoryDrainingRequiresExactCommittedFence(t *testing.T) {
 		name string
 		edit func(*ServiceFence)
 	}{
-		{"action", func(f *ServiceFence) { f.Action = ServiceActionGatewayCatalogWrite }},
-		{"operation", func(f *ServiceFence) { f.Operation = ServiceOperationCatalogWrite }},
 		{"group", func(f *ServiceFence) { f.Group.GroupID[0]++ }},
 		{"relation", func(f *ServiceFence) { f.Relation[0]++ }},
-		{"session", func(f *ServiceFence) { f.SessionID[0]++ }},
-		{"session revision", func(f *ServiceFence) { f.SessionRevision++ }},
 		{"intent", func(f *ServiceFence) { f.IntentID[0]++ }},
 		{"digest", func(f *ServiceFence) { f.FenceDigest[0]++ }},
 	}
@@ -213,8 +214,9 @@ func TestServiceDirectoryDrainingRequiresExactCommittedFence(t *testing.T) {
 		t.Run(mutation.name, func(t *testing.T) {
 			changed := binding.DrainFence
 			mutation.edit(&changed)
-			// Even an additional committed internal grant must not widen the
-			// one exact continuation selected by the drain fence.
+			// The frontend drain fence remains one exact delegated continuation,
+			// while a draining service may retain separately committed exact
+			// internal resource fences for catalog/ledger/pin cleanup.
 			cutBinding := binding
 			cutBinding.InternalFences = []ServiceFence{binding.DrainFence, changed}
 			slices.SortFunc(cutBinding.InternalFences, CompareServiceFences)
@@ -229,8 +231,8 @@ func TestServiceDirectoryDrainingRequiresExactCommittedFence(t *testing.T) {
 				Operation: changed.Operation, Group: changed.Group, Relation: changed.Relation,
 				SessionID: changed.SessionID, SessionRevision: changed.SessionRevision,
 				IntentID: changed.IntentID, FenceDigest: changed.FenceDigest}
-			if gate.CheckInternal(peer, Authority{Node: peer.Identity.Node, Generation: 21}, request) == DecisionAllow {
-				t.Fatal("draining internal action admitted a different continuation scope")
+			if gate.CheckInternal(peer, Authority{Node: peer.Identity.Node, Generation: 21}, request) != DecisionAllow {
+				t.Fatal("draining internal action rejected an exact committed resource scope")
 			}
 		})
 	}
@@ -244,7 +246,6 @@ func TestServiceDirectoryInternalContinuationUsesOneCut(t *testing.T) {
 		Action: FrontendActionGatewayCatalog, Capability: CapabilityTopology,
 		Operation: ServiceOperationCatalogRead, Group: serviceDirectoryGroup(31),
 		Relation: [16]byte{37}, IntentID: [32]byte{38}, FenceDigest: [32]byte{39}}
-	prepared.AllowedScopes = []FrontendContinuationScopeRecord{scope}
 	prepared, err := NewCommittedFrontendContinuationGrant(prepared)
 	if err != nil {
 		t.Fatal(err)
@@ -271,6 +272,9 @@ func TestServiceDirectoryInternalContinuationUsesOneCut(t *testing.T) {
 		Operation: scope.Operation, Group: scope.Group, Relation: scope.Relation,
 		SessionID: active.SessionID, SessionRevision: active.SessionRevision,
 		IntentID: scope.IntentID, FenceDigest: scope.FenceDigest}}
+	drainingWithFence := serviceDirectoryBinding(peer, ServiceRoleGateway, ServiceDraining)
+	drainingWithFence.InternalFences = append(drainingWithFence.InternalFences, activeWithFence.InternalFences...)
+	slices.SortFunc(drainingWithFence.InternalFences, CompareServiceFences)
 	allowedActive, err := newDirectoryState(serviceDirectoryCutWithContinuations(1,
 		[]CommittedFrontendContinuationGrant{prepared}, activeWithFence))
 	if err != nil {
@@ -279,7 +283,7 @@ func TestServiceDirectoryInternalContinuationUsesOneCut(t *testing.T) {
 	enforcing := prepared
 	enforcing.State = ContinuationGrantEnforcing
 	allowedDraining, err := newDirectoryState(serviceDirectoryCutWithContinuations(2,
-		[]CommittedFrontendContinuationGrant{enforcing}, draining))
+		[]CommittedFrontendContinuationGrant{enforcing}, drainingWithFence))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +345,9 @@ func TestServiceDirectoryContinuationAdmissionDoesNotRehashGrant(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope := prepared.AllowedScopes[0]
+	scope := FrontendContinuationScopeRecord{Protocol: FrontendScopeNative,
+		Action: FrontendActionForwardedData, Capability: CapabilityDataRead,
+		Operation: ServiceOperationForwardedRead, Group: serviceDirectoryGroup(31), Relation: [16]byte{37}}
 	envelope := FrontendContinuationEnvelope{GrantDigest: prepared.GrantDigest,
 		ConnToken: prepared.AcceptedConnectionTokens[0], Scope: scope}
 	if allocations := testing.AllocsPerRun(100, func() {
@@ -380,6 +386,88 @@ func TestServiceDirectoryRevisionConflictAndTombstoneRetention(t *testing.T) {
 	}
 }
 
+func TestServiceDirectoryCertifiedReplacementRevokesOldKeyAndGrant(t *testing.T) {
+	oldPeer := serviceDirectoryPeer(22, 23)
+	oldBinding := serviceDirectoryBinding(oldPeer, ServiceRoleGateway, ServiceDecommissioned)
+	oldGrant := serviceDirectoryContinuationGrant(oldPeer, oldBinding, ContinuationGrantRetired)
+	oldCut := serviceDirectoryCutWithContinuations(1, []CommittedFrontendContinuationGrant{oldGrant}, oldBinding)
+	retained, err := NewServiceDirectoryGate(oldCut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPeer := oldPeer
+	newPeer.KeyDigest[0]++
+	newBinding := serviceDirectoryBinding(newPeer, ServiceRoleGateway, ServiceActive)
+	newBinding.PhysicalIncarnation = oldBinding.PhysicalIncarnation + 1
+	newBinding.GatewayIncarnation = oldBinding.GatewayIncarnation + 1
+	newBinding.SessionID[0]++
+	newBinding.SessionRevision++
+	newBinding.ParticipantDigest[0]++
+	replacement, err := NewServiceBindingReplacement(oldBinding.Identity(), newBinding.Identity(), [32]byte{24}, [32]byte{25})
+	if err != nil {
+		t.Fatalf("replacement proof: %v", err)
+	}
+	nextCut := serviceDirectoryCut(2, newBinding)
+	nextCut.Replacements = []ServiceBindingReplacement{replacement}
+	missingProof := serviceDirectoryCut(2, newBinding)
+	missingGate, err := NewServiceDirectoryGate(oldCut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := missingGate.ApplyCommittedCut(missingProof); !errors.Is(err, ErrInvalidServiceDirectory) {
+		t.Fatalf("identity change without replacement proof accepted: %v", err)
+	}
+	if err := retained.ApplyCommittedCut(nextCut); err != nil {
+		t.Fatalf("retained gate rejected certified replacement: %v", err)
+	}
+	if got := retained.CheckGatewayPeer(oldPeer); got == DecisionAllow {
+		t.Fatalf("retained gate accepted predecessor key: %v", got)
+	}
+	if got := retained.CheckGatewayPeer(newPeer); got != DecisionAllow {
+		t.Fatalf("retained gate rejected successor key: %v", got)
+	}
+	scope := FrontendContinuationScopeRecord{Protocol: FrontendScopeNative, Action: FrontendActionForwardedData,
+		Capability: CapabilityDataRead, Operation: ServiceOperationForwardedRead,
+		Group: serviceDirectoryGroup(31), Relation: [16]byte{37}}
+	envelope := FrontendContinuationEnvelope{GrantDigest: oldGrant.GrantDigest,
+		ConnToken: oldGrant.AcceptedConnectionTokens[0], Scope: scope}
+	if got := retained.CheckFrontendContinuation(oldPeer, 21, envelope, scope); got == DecisionAllow {
+		t.Fatalf("retained gate admitted saved predecessor continuation: %v", got)
+	}
+	fresh, err := NewServiceDirectoryGate(nextCut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fresh.CheckGatewayPeer(oldPeer); got == DecisionAllow {
+		t.Fatalf("fresh gate accepted predecessor key: %v", got)
+	}
+	if got := fresh.CheckFrontendContinuation(oldPeer, 21, envelope, scope); got == DecisionAllow {
+		t.Fatalf("fresh gate admitted saved predecessor continuation: %v", got)
+	}
+	if got := fresh.CheckGatewayPeer(newPeer); got != DecisionAllow {
+		t.Fatalf("fresh gate rejected successor key: %v", got)
+	}
+
+	negatives := []struct {
+		name string
+		edit func(*ServiceBindingIdentity, *ServiceBindingIdentity)
+	}{
+		{name: "same-key", edit: func(prior, next *ServiceBindingIdentity) { next.KeyDigest = prior.KeyDigest }},
+		{name: "same-incarnation", edit: func(prior, next *ServiceBindingIdentity) { next.PhysicalIncarnation = prior.PhysicalIncarnation }},
+		{name: "lower-incarnation", edit: func(prior, next *ServiceBindingIdentity) { next.PhysicalIncarnation = prior.PhysicalIncarnation - 1 }},
+		{name: "no-terminal-predecessor", edit: func(prior, _ *ServiceBindingIdentity) { prior.Lifecycle = ServiceActive }},
+	}
+	for _, negative := range negatives {
+		t.Run(negative.name, func(t *testing.T) {
+			prior, next := oldBinding.Identity(), newBinding.Identity()
+			negative.edit(&prior, &next)
+			if _, err := NewServiceBindingReplacement(prior, next, [32]byte{24}, [32]byte{25}); !errors.Is(err, ErrInvalidServiceDirectory) {
+				t.Fatalf("invalid replacement accepted: %v", err)
+			}
+		})
+	}
+}
+
 func TestServiceDirectoryContinuationGrantBindsConnectionAndLifecycle(t *testing.T) {
 	peer := serviceDirectoryPeer(40, 41)
 	active := serviceDirectoryBinding(peer, ServiceRoleGateway, ServiceActive)
@@ -389,7 +477,9 @@ func TestServiceDirectoryContinuationGrantBindsConnectionAndLifecycle(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope := prepared.AllowedScopes[0]
+	scope := FrontendContinuationScopeRecord{Protocol: FrontendScopeNative,
+		Action: FrontendActionForwardedData, Capability: CapabilityDataRead,
+		Operation: ServiceOperationForwardedRead, Group: serviceDirectoryGroup(31), Relation: [16]byte{37}}
 	envelope := FrontendContinuationEnvelope{GrantDigest: prepared.GrantDigest,
 		ConnToken: prepared.AcceptedConnectionTokens[0], Scope: scope}
 	if got := gate.CheckFrontendContinuation(peer, 21, envelope, scope); got != DecisionAllow {
@@ -397,7 +487,6 @@ func TestServiceDirectoryContinuationGrantBindsConnectionAndLifecycle(t *testing
 	}
 	postgresGrant := serviceDirectoryContinuationGrant(peer, active, ContinuationGrantPrepared)
 	postgresGrant.AcceptedConnectionProtocols[0] = FrontendScopePostgreSQL
-	postgresGrant.AllowedScopes[0].Protocol = FrontendScopePostgreSQL
 	postgresGrant, err = NewCommittedFrontendContinuationGrant(postgresGrant)
 	if err != nil {
 		t.Fatal(err)
@@ -473,6 +562,107 @@ func TestServiceDirectoryContinuationGrantBindsConnectionAndLifecycle(t *testing
 	}
 	if got := gate.CheckDelegate(peer, 21, ServiceFence{}); got == DecisionAllow {
 		t.Fatal("decommissioned principal retained Delegate")
+	}
+}
+
+func TestServiceDirectoryCatalogOnlyAdvanceUsesExactCurrentForwardedScopes(t *testing.T) {
+	peer := serviceDirectoryPeer(60, 61)
+	active := serviceDirectoryBinding(peer, ServiceRoleGateway, ServiceActive)
+	grant := serviceDirectoryContinuationGrant(peer, active, ContinuationGrantPrepared)
+	cut := serviceDirectoryCutWithContinuations(7, []CommittedFrontendContinuationGrant{grant}, active)
+	cut.CatalogGeneration = 1
+	gate, err := NewServiceDirectoryGate(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldScope := cut.ForwardedScopes[0]
+	envelope := FrontendContinuationEnvelope{GrantDigest: grant.GrantDigest,
+		ConnToken: grant.AcceptedConnectionTokens[0], Scope: oldScope}
+	if got := gate.CheckFrontendContinuation(peer, 21, envelope, oldScope); got != DecisionAllow {
+		t.Fatalf("initial exact forwarded scope decision=%d", got)
+	}
+
+	// A catalog-only generation advance may publish both a CREATE group and a
+	// split child in the same service revision. The immutable accepted token and
+	// grant digest stay unchanged while each exact new group/relation scope is
+	// added to the current catalog inventory.
+	createScope := oldScope
+	createScope.Group = serviceDirectoryGroup(62)
+	createScope.Relation = [16]byte{}
+	splitScope := oldScope
+	splitScope.Group = serviceDirectoryGroup(63)
+	splitScope.Relation = [16]byte{64}
+	advanced := cut
+	advanced.CatalogGeneration = 2
+	advanced.ForwardedScopes = append(slices.Clone(cut.ForwardedScopes), createScope, splitScope)
+	slices.SortFunc(advanced.ForwardedScopes, CompareContinuationScopes)
+	if err := gate.ApplyCommittedCut(advanced); err != nil {
+		t.Fatalf("catalog-only CREATE and split scope advance: %v", err)
+	}
+	if advanced.ContinuationGrants[0].GrantDigest != grant.GrantDigest {
+		t.Fatal("catalog-only scope advance changed immutable grant digest")
+	}
+	for name, newScope := range map[string]FrontendContinuationScopeRecord{
+		"CREATE":      createScope,
+		"split-child": splitScope,
+	} {
+		t.Run(name, func(t *testing.T) {
+			newEnvelope := envelope
+			newEnvelope.Scope = newScope
+			if got := gate.CheckFrontendContinuation(peer, 21, newEnvelope, newScope); got != DecisionAllow {
+				t.Fatalf("exact new catalog scope decision=%d", got)
+			}
+		})
+	}
+
+	// Every forwarded tuple remains an exact member of this one published
+	// scope set. A copied token, protocol, group, or relation cannot borrow the
+	// newly visible child.
+	mutations := []struct {
+		name string
+		edit func(*FrontendContinuationEnvelope)
+	}{
+		{"token", func(candidate *FrontendContinuationEnvelope) { candidate.ConnToken[0]++ }},
+		{"protocol", func(candidate *FrontendContinuationEnvelope) { candidate.Scope.Protocol = FrontendScopePostgreSQL }},
+		{"group", func(candidate *FrontendContinuationEnvelope) { candidate.Scope.Group = serviceDirectoryGroup(64) }},
+		{"relation", func(candidate *FrontendContinuationEnvelope) { candidate.Scope.Relation[0]++ }},
+	}
+	newEnvelope := envelope
+	newEnvelope.Scope = splitScope
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			candidate := newEnvelope
+			mutation.edit(&candidate)
+			if got := gate.CheckFrontendContinuation(peer, 21, candidate, candidate.Scope); got == DecisionAllow {
+				t.Fatalf("fabricated %s tuple was admitted", mutation.name)
+			}
+		})
+	}
+
+	// Accepted-token/protocol state remains immutable even when the catalog
+	// generation advances again. Recomputing a different valid grant digest is
+	// a mutation of the durable child, not a catalog-only scope publication.
+	mutated := grant
+	mutated.AcceptedConnectionTokens = []FrontendConnToken{{65}}
+	mutated, err = NewCommittedFrontendContinuationGrant(mutated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutatedCut := advanced
+	mutatedCut.CatalogGeneration = 3
+	mutatedCut.ContinuationGrants = []CommittedFrontendContinuationGrant{mutated}
+	if err := gate.ApplyCommittedCut(mutatedCut); !errors.Is(err, ErrInvalidServiceDirectory) {
+		t.Fatalf("accepted-token mutation during catalog advance error=%v", err)
+	}
+
+	// Equal-coordinate proof mutation is rejected by the canonical scope
+	// validator, while the normal catalog-only rule still permits additions.
+	duplicate := advanced
+	duplicate.CatalogGeneration = 4
+	duplicate.ForwardedScopes = append(slices.Clone(advanced.ForwardedScopes), oldScope)
+	slices.SortFunc(duplicate.ForwardedScopes, CompareContinuationScopes)
+	if err := gate.ApplyCommittedCut(duplicate); !errors.Is(err, ErrInvalidServiceDirectory) {
+		t.Fatalf("duplicate same-coordinate scope error=%v", err)
 	}
 }
 

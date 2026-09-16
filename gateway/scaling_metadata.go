@@ -39,11 +39,12 @@ const (
 )
 
 var (
-	ErrInvalidScalingMetadata = errors.New("gateway: invalid scaling metadata")
-	ErrScalingMetadataBound   = errors.New("gateway: scaling metadata bound exceeded")
-	ErrScalingRevision        = errors.New("gateway: scaling metadata revision conflict")
-	ErrScalingState           = errors.New("gateway: invalid scaling state transition")
-	ErrScalingIdentity        = errors.New("gateway: scaling identity mismatch")
+	ErrInvalidScalingMetadata  = errors.New("gateway: invalid scaling metadata")
+	ErrScalingMetadataBound    = errors.New("gateway: scaling metadata bound exceeded")
+	ErrScalingRevision         = errors.New("gateway: scaling metadata revision conflict")
+	ErrScalingState            = errors.New("gateway: invalid scaling state transition")
+	ErrScalingIdentity         = errors.New("gateway: scaling identity mismatch")
+	ErrConcurrentFrontendDrain = errors.New("gateway: concurrent frontend drains are unsupported")
 )
 
 // NodeLifecycle is the physical-node state machine.  Enrollment and
@@ -107,6 +108,49 @@ type GatewayIdentity struct {
 	ParticipantDigest replication.Digest
 }
 
+// Valid reports whether a gateway identity has the complete immutable
+// coordinates required to bind a gateway principal to a physical node.  A
+// zero value is reserved for storage-only nodes.
+func (identity GatewayIdentity) Valid() bool {
+	return identity.NodeID != (rafttransport.NodeID{}) && identity.Incarnation != 0 &&
+		identity.ServiceKeyDigest != (replication.Digest{}) && identity.ServiceID != ([16]byte{}) &&
+		identity.SessionID != ([16]byte{}) && identity.SessionRevision != 0 &&
+		identity.ParticipantDigest != (replication.Digest{})
+}
+
+// NodeReplacementProof certifies one physical lifecycle replacement.  It is
+// carried by the successor row because the predecessor row is removed in the
+// same catalog mutation.  The proof is intentionally bounded: one successor
+// retains only the exact predecessor identity, completed intent, and
+// certificate digest needed by a receiver gate to reject the old process.
+type NodeReplacementProof struct {
+	PredecessorIncarnation      uint64
+	PredecessorServiceKeyDigest replication.Digest
+	PredecessorGateway          GatewayIdentity
+	IntentID                    [32]byte
+	ProofDigest                 replication.Digest
+}
+
+func (proof NodeReplacementProof) ValidFor(record NodeRecord) bool {
+	if record.NodeID == (rafttransport.NodeID{}) || record.Incarnation == 0 ||
+		proof.PredecessorIncarnation == 0 || proof.PredecessorIncarnation >= record.Incarnation ||
+		proof.PredecessorServiceKeyDigest == (replication.Digest{}) ||
+		proof.PredecessorServiceKeyDigest == record.ServiceKeyDigest || proof.IntentID == ([32]byte{}) ||
+		proof.ProofDigest == (replication.Digest{}) {
+		return false
+	}
+	if record.Roles&NodeRoleGateway != 0 {
+		if !proof.PredecessorGateway.Valid() ||
+			proof.PredecessorGateway.ServiceKeyDigest == record.Gateway.ServiceKeyDigest ||
+			!record.Gateway.Valid() {
+			return false
+		}
+	} else if proof.PredecessorGateway != (GatewayIdentity{}) {
+		return false
+	}
+	return true
+}
+
 // NodeRecord is one replicated physical-node lifecycle record.  Endpoint IDs
 // are catalog handles; their addresses are included in the same record so a
 // directory read is a complete, revision-fenced participant cut.
@@ -125,21 +169,26 @@ type NodeRecord struct {
 	// original static directory, whose manifest supplies the bootstrap seed;
 	// dynamically enrolled voters must retain it here so a later enrollment can
 	// use their snapshot service after a gateway restart.
-	SnapshotAddress                 string `json:"snapshot_address,omitempty"`
-	ControlAddress                  string
-	GatewayAddress                  string
-	FailureDomain                   string
-	Roles                           NodeRole
-	Capacity                        autosplit.CapacityVector
-	Used                            autosplit.CapacityVector
-	MigrationCapacity               uint64
-	MigrationUsed                   uint64
-	MaxReceives                     uint32
-	ActiveReceives                  uint32
-	Lifecycle                       NodeLifecycle
-	Revision                        uint64
-	CatalogGeneration               uint64
-	Gateway                         GatewayIdentity
+	SnapshotAddress   string `json:"snapshot_address,omitempty"`
+	ControlAddress    string
+	GatewayAddress    string
+	FailureDomain     string
+	Roles             NodeRole
+	Capacity          autosplit.CapacityVector
+	Used              autosplit.CapacityVector
+	MigrationCapacity uint64
+	MigrationUsed     uint64
+	MaxReceives       uint32
+	ActiveReceives    uint32
+	Lifecycle         NodeLifecycle
+	Revision          uint64
+	CatalogGeneration uint64
+	Gateway           GatewayIdentity
+	// Replacement is present only on a physical successor whose predecessor
+	// reached a certified terminal lifecycle.  It remains on the successor
+	// through Joining -> Active -> Draining so a receiver that missed the
+	// initial replacement cut can still validate the identity change.
+	Replacement                     *NodeReplacementProof `json:"replacement,omitempty"`
 	RetirementScanDigest            replication.Digest
 	RetirementScanDirectoryRevision uint64
 	RetirementScanCutRevision       uint64
@@ -178,10 +227,7 @@ func (record NodeRecord) Valid() bool {
 			record.GatewayEndpoint == record.DataEndpoint || record.GatewayEndpoint == record.NativeEndpoint ||
 			record.GatewayEndpoint == record.ControlEndpoint || record.GatewayAddress == record.DataAddress ||
 			record.GatewayAddress == record.NativeAddress || record.GatewayAddress == record.ControlAddress ||
-			record.Gateway.NodeID == (rafttransport.NodeID{}) || record.Gateway.Incarnation == 0 ||
-			record.Gateway.ServiceKeyDigest == (replication.Digest{}) || record.Gateway.ServiceID == ([16]byte{}) ||
-			record.Gateway.SessionID == ([16]byte{}) || record.Gateway.SessionRevision == 0 ||
-			record.Gateway.ParticipantDigest == (replication.Digest{}) {
+			!record.Gateway.Valid() {
 			return false
 		}
 	} else if record.GatewayEndpoint != "" || record.GatewayAddress != "" ||
@@ -193,6 +239,9 @@ func (record NodeRecord) Valid() bool {
 			return false
 		}
 	} else if record.RetirementScanDigest != (replication.Digest{}) || record.RetirementScanDirectoryRevision != 0 || record.RetirementScanCutRevision != 0 {
+		return false
+	}
+	if record.Replacement != nil && !record.Replacement.ValidFor(record) {
 		return false
 	}
 	return true
@@ -270,6 +319,20 @@ func (record NodeRecord) MatchesRetirementEvidence(evidence SafeToStopEvidence) 
 		evidence.SafeForDataEvacuation() && evidence.CatalogVoters == 0 &&
 		evidence.ControlVoters == 0 && evidence.GatewayParticipants == 0 &&
 		evidence.CatalogControlMigrated
+}
+
+// MatchesSafeToStopEvidence binds a completed intent to the fresh scan made
+// after the terminal node CAS.  That scan intentionally advances beyond the
+// pre-retirement witness stored on the node row, so it cannot be compared with
+// MatchesRetirementEvidence.  Completion validation already checks every
+// digest in this evidence against the current authority cut; this helper adds
+// the terminal row identity and revision needed by history retention and
+// physical replacement.
+func (record NodeRecord) MatchesSafeToStopEvidence(evidence SafeToStopEvidence) bool {
+	return record.HasRetirementProof() && evidence.NodeID == record.NodeID &&
+		evidence.NodeIncarnation == record.Incarnation &&
+		evidence.ScanCatalogGeneration == record.CatalogGeneration &&
+		evidence.ScanDirectoryRevision == record.Revision && evidence.SafeToStop()
 }
 
 // GatewayParticipantEvidence is supplied by the live gateway participant
@@ -1025,6 +1088,7 @@ type DirectoryReader interface {
 	ListNodes(context.Context) ([]NodeRecord, error)
 	ReadNode(context.Context, rafttransport.NodeID, uint64) (NodeRecord, error)
 	ListScalingIntents(context.Context) ([]ScalingIntent, error)
+	ListScalingTerminalIntents(context.Context) ([]ScalingIntent, error)
 	ReadScalingIntent(context.Context, [32]byte) (ScalingIntent, error)
 	ReadScalingIntentAt(context.Context, [32]byte, uint64, replication.Digest) (ScalingIntent, error)
 	ListEnrollmentIntents(context.Context, raftmember.GroupKey) ([]GroupEnrollmentIntent, error)
@@ -1125,7 +1189,15 @@ func sameNodeIdentityExceptSnapshot(left, right NodeRecord) bool {
 		left.ControlEndpoint == right.ControlEndpoint && left.GatewayEndpoint == right.GatewayEndpoint &&
 		left.DataAddress == right.DataAddress && left.NativeAddress == right.NativeAddress &&
 		left.ControlAddress == right.ControlAddress && left.GatewayAddress == right.GatewayAddress &&
-		left.FailureDomain == right.FailureDomain && left.Roles == right.Roles && left.Gateway == right.Gateway
+		left.FailureDomain == right.FailureDomain && left.Roles == right.Roles && left.Gateway == right.Gateway &&
+		sameNodeReplacement(left.Replacement, right.Replacement)
+}
+
+func sameNodeReplacement(left, right *NodeReplacementProof) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func cloneScalingIntent(intent ScalingIntent) ScalingIntent {

@@ -21,9 +21,12 @@ import (
 // Fresh preparation publishes the shared log and every initial SQL root in one
 // directory rename. It does not read or migrate any legacy range log.
 type prepareRF3NodeManifest struct {
-	Root    string              `json:"root"`
-	NodeLog rf3NodeLogManifest  `json:"node_log"`
-	Gateway *rf3ManifestGateway `json:"gateway,omitempty"`
+	Root                 string                             `json:"root"`
+	NodeLog              rf3NodeLogManifest                 `json:"node_log"`
+	Gateway              *rf3ManifestGateway                `json:"gateway,omitempty"`
+	CatalogGenesis       *rf3CatalogGenesisConfig           `json:"catalog_genesis,omitempty"`
+	GatewaySeeds         []nodecontrol.BootstrapGatewaySeed `json:"bootstrap_gateway_seeds,omitempty"`
+	CanonicalSourceSeeds []nodecontrol.BootstrapGatewaySeed `json:"canonical_source_seeds,omitempty"`
 	// Services is required when Groups is empty.  Keeping the physical-node
 	// listeners and control budgets outside a group makes an empty-capacity
 	// node an explicit, restartable manifest kind instead of relying on a
@@ -36,13 +39,14 @@ type prepareRF3NodeServices struct {
 	// NodeIncarnation is the replicated physical-node lifecycle incarnation.
 	// Empty nodes must carry it explicitly; it is never inferred from a group
 	// roster because a cold node has no group roster to consult.
-	NodeIncarnation     uint64                             `json:"node_incarnation"`
-	Listeners           rf3ManifestListeners               `json:"listeners"`
-	TLS                 rf3ManifestTLS                     `json:"tls"`
-	AuthorizationPolicy string                             `json:"authorization_policy"`
-	GatewaySeeds        []nodecontrol.BootstrapGatewaySeed `json:"bootstrap_gateway_seeds"`
-	ReplicaControl      persistedRF3ReplicaControl         `json:"replica_control"`
-	SplitControl        persistedRF3NodeSplitControl       `json:"split_control"`
+	NodeIncarnation      uint64                             `json:"node_incarnation"`
+	Listeners            rf3ManifestListeners               `json:"listeners"`
+	TLS                  rf3ManifestTLS                     `json:"tls"`
+	AuthorizationPolicy  string                             `json:"authorization_policy"`
+	GatewaySeeds         []nodecontrol.BootstrapGatewaySeed `json:"bootstrap_gateway_seeds"`
+	CanonicalSourceSeeds []nodecontrol.BootstrapGatewaySeed `json:"canonical_source_seeds,omitempty"`
+	ReplicaControl       persistedRF3ReplicaControl         `json:"replica_control"`
+	SplitControl         persistedRF3NodeSplitControl       `json:"split_control"`
 }
 
 type persistedRF3NodeGroup struct {
@@ -62,17 +66,19 @@ type persistedRF3NodeSplitControl struct {
 }
 
 type persistedRF3NodeRuntime struct {
-	NodeLog             rf3NodeLogManifest                 `json:"node_log"`
-	NodeIncarnation     uint64                             `json:"node_incarnation,omitempty"`
-	Listeners           rf3ManifestListeners               `json:"listeners"`
-	TLS                 rf3ManifestTLS                     `json:"tls"`
-	AuthorizationPolicy string                             `json:"authorization_policy"`
-	GatewaySeeds        []nodecontrol.BootstrapGatewaySeed `json:"bootstrap_gateway_seeds,omitempty"`
-	ReplicaControl      persistedRF3ReplicaControl         `json:"replica_control"`
-	SplitControl        persistedRF3NodeSplitControl       `json:"split_control"`
-	ReadAuthority       *rf3ManifestReadAuthority          `json:"read_authority,omitempty"`
-	Gateway             *rf3ManifestGateway                `json:"gateway,omitempty"`
-	Groups              []persistedRF3NodeGroup            `json:"groups"`
+	NodeLog              rf3NodeLogManifest                 `json:"node_log"`
+	NodeIncarnation      uint64                             `json:"node_incarnation,omitempty"`
+	Listeners            rf3ManifestListeners               `json:"listeners"`
+	TLS                  rf3ManifestTLS                     `json:"tls"`
+	AuthorizationPolicy  string                             `json:"authorization_policy"`
+	GatewaySeeds         []nodecontrol.BootstrapGatewaySeed `json:"bootstrap_gateway_seeds,omitempty"`
+	CanonicalSourceSeeds []nodecontrol.BootstrapGatewaySeed `json:"canonical_source_seeds,omitempty"`
+	ReplicaControl       persistedRF3ReplicaControl         `json:"replica_control"`
+	SplitControl         persistedRF3NodeSplitControl       `json:"split_control"`
+	CatalogGenesis       *rf3CatalogGenesisConfig           `json:"catalog_genesis,omitempty"`
+	ReadAuthority        *rf3ManifestReadAuthority          `json:"read_authority,omitempty"`
+	Gateway              *rf3ManifestGateway                `json:"gateway,omitempty"`
+	Groups               []persistedRF3NodeGroup            `json:"groups"`
 }
 
 func runPrepareNodeRF3(args []string) int {
@@ -118,6 +124,12 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 	if _, err = parseRF3NodeLogManifest(configDoc.Node()); err != nil {
 		return err
 	}
+	if input.CatalogGenesis != nil {
+		if !validRF3CatalogGenesisConfig(*input.CatalogGenesis) ||
+			filepath.Dir(input.CatalogGenesis.SessionJournal) != filepath.Join(input.Root, "gateway") {
+			return errPrepareRF3
+		}
+	}
 	if _, err := os.Lstat(input.Root); !errors.Is(err, os.ErrNotExist) {
 		return errors.Join(errPrepareRF3, err)
 	}
@@ -141,6 +153,7 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 	var firstTLS rf3ManifestTLS
 	var firstPolicy string
 	var firstGatewaySeeds []nodecontrol.BootstrapGatewaySeed
+	var firstCanonicalSourceSeeds []nodecontrol.BootstrapGatewaySeed
 	var firstReadAuthority *rf3ManifestReadAuthority
 	var firstReplica persistedRF3ReplicaControl
 	var firstSplit persistedRF3NodeSplitControl
@@ -175,7 +188,9 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 		if i == 0 {
 			identity = current
 			firstListeners, firstTLS, firstPolicy = group.Listeners, group.TLS, group.AuthorizationPolicy
+			firstGatewaySeeds = slices.Clone(input.GatewaySeeds)
 			firstReadAuthority = group.ReadAuthority
+			firstCanonicalSourceSeeds = slices.Clone(input.CanonicalSourceSeeds)
 			firstReplica = prepared.ReplicaControl
 			firstSplit = persistedRF3NodeSplitControl{
 				MaxRecords:    prepared.SplitControl.MaxRecords,
@@ -230,18 +245,12 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 		firstListeners = input.Services.Listeners
 		firstTLS, firstPolicy = input.Services.TLS, input.Services.AuthorizationPolicy
 		firstGatewaySeeds = slices.Clone(input.Services.GatewaySeeds)
+		firstCanonicalSourceSeeds = slices.Clone(input.Services.CanonicalSourceSeeds)
 		if len(firstGatewaySeeds) == 0 || len(firstGatewaySeeds) > nodecontrol.MaxBootstrapGatewaySeeds {
 			return errPrepareRF3
 		}
-		seenGatewaySeeds := make(map[rafttransport.NodeID]struct{}, len(firstGatewaySeeds))
-		for _, seed := range firstGatewaySeeds {
-			if !seed.Valid() {
-				return errPrepareRF3
-			}
-			if _, found := seenGatewaySeeds[seed.NodeID]; found {
-				return errPrepareRF3
-			}
-			seenGatewaySeeds[seed.NodeID] = struct{}{}
+		if !validRF3BootstrapSeedSet(firstGatewaySeeds) {
+			return errPrepareRF3
 		}
 		firstReplica, firstSplit = input.Services.ReplicaControl, input.Services.SplitControl
 		if input.Services.NodeIncarnation == 0 || firstReplica.SourceDataRoot != input.Root ||
@@ -255,6 +264,12 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 		if firstSplit.MaxRecords <= 0 || firstSplit.MaxFileBytes <= 0 || firstSplit.MaxOperations <= 0 || len(firstSplit.Grants) == 0 {
 			return errPrepareRF3
 		}
+	}
+	if len(firstGatewaySeeds) != 0 && !validRF3BootstrapSeedSet(firstGatewaySeeds) {
+		return errPrepareRF3
+	}
+	if len(firstCanonicalSourceSeeds) != 0 && !validRF3BootstrapSeedSet(firstCanonicalSourceSeeds) {
+		return errPrepareRF3
 	}
 	// These controls belong to the physical node. Keeping them under the node
 	// root makes every group independent of which group happened to be first in
@@ -295,8 +310,8 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 		// A newly prepared physical node starts at incarnation one. Group
 		// runtime incarnations advance independently inside its node log.
 		return 1
-	}(), Gateway: nodeGateway, Listeners: firstListeners, TLS: firstTLS, AuthorizationPolicy: firstPolicy,
-		GatewaySeeds: firstGatewaySeeds, ReadAuthority: firstReadAuthority, ReplicaControl: nodeReplica,
+	}(), Gateway: nodeGateway, CatalogGenesis: input.CatalogGenesis, Listeners: firstListeners, TLS: firstTLS, AuthorizationPolicy: firstPolicy,
+		GatewaySeeds: firstGatewaySeeds, CanonicalSourceSeeds: firstCanonicalSourceSeeds, ReadAuthority: firstReadAuthority, ReplicaControl: nodeReplica,
 		SplitControl: nodeSplit, Groups: make([]persistedRF3NodeGroup, 0, len(manifests))}
 	runtime.NodeLog.KeyMaterialPath = filepath.Join(input.Root, "node-key")
 	for _, manifest := range manifests {
@@ -332,7 +347,7 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 	// The node-level controls are published with the node root. Their
 	// directories are intentionally created before any group becomes visible;
 	// a partially prepared group must never become a serving control namespace.
-	for _, directory := range []string{"replica-actions", "source-exports", "source-artifacts"} {
+	for _, directory := range []string{"gateway", "replica-actions", "source-exports", "source-artifacts"} {
 		if err := os.Mkdir(filepath.Join(stage, directory), 0o700); err != nil {
 			return err
 		}
@@ -402,4 +417,21 @@ func provisionRF3Node(input prepareRF3NodeManifest) (resultErr error) {
 	}
 	published = true
 	return syncPrepareRF3Directory(parent)
+}
+
+func validRF3BootstrapSeedSet(seeds []nodecontrol.BootstrapGatewaySeed) bool {
+	if len(seeds) == 0 || len(seeds) > nodecontrol.MaxBootstrapGatewaySeeds {
+		return false
+	}
+	seen := make(map[rafttransport.NodeID]struct{}, len(seeds))
+	for _, seed := range seeds {
+		if !seed.Valid() {
+			return false
+		}
+		if _, found := seen[seed.NodeID]; found {
+			return false
+		}
+		seen[seed.NodeID] = struct{}{}
+	}
+	return true
 }

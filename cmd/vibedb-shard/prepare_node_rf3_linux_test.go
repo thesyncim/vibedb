@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
@@ -271,6 +272,22 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 		profiles = append(profiles, profile)
 		nativeAddresses[i] = addresses[i][1]
 	}
+	owner, err := openRF3NodeOwner(manifests[0], profiles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := prepareRF3GroupSetOnNode(manifests[0], profiles[0], sqldriver.ReplicatedOpenOptions{}, owner)
+	if err != nil {
+		_ = owner.Close()
+		t.Fatal(err)
+	}
+	commands := make(map[raftmember.GroupKey]raftservice.CommandFence, len(set.groups))
+	for index := range set.groups {
+		commands[set.groups[index].manifest.Route.Group] = rf3CommandFenceFromApply(t, set.groups[index].apply)
+	}
+	if err := closePreparedRF3Groups(set.groups, owner.Close()); err != nil {
+		t.Fatal(err)
+	}
 	for restart := range 2 {
 		ctx, cancel := context.WithCancel(t.Context())
 		done := make(chan error, 3)
@@ -327,7 +344,7 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 		}
 		t.Cleanup(stop)
 		for _, bundle := range manifests[0].Groups {
-			waitRF3CommandLeader(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration)
+			waitRF3CommandLeaderWithProbeCommand(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration, commands[bundle.Route.Group])
 		}
 		// A diagnostic signal is consumed by the serving loop and must not
 		// terminate the process. Send two snapshots and require the second
@@ -346,7 +363,7 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 				reloads[i] <- syscall.SIGHUP
 			}
 			for _, bundle := range manifests[0].Groups {
-				waitRF3CommandLeader(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration)
+				waitRF3CommandLeaderWithProbeCommand(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration, commands[bundle.Route.Group])
 			}
 		}
 		stop()

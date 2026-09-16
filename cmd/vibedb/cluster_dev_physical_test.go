@@ -13,8 +13,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/hotshard"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibejson"
 )
@@ -44,6 +47,53 @@ func TestDevPhysicalPlacementIsDeterministicAndCoversSixNodes(t *testing.T) {
 				t.Fatalf("group %d changed from %v to %v", group, placements[group], again)
 			}
 		}
+	}
+}
+
+func TestDevNodeRuntimeManifestOrderRoundTripsAllBootstrapFields(t *testing.T) {
+	fields := map[string]json.RawMessage{
+		"node_log":                json.RawMessage(`{}`),
+		"node_incarnation":        json.RawMessage(`1`),
+		"listeners":               json.RawMessage(`{}`),
+		"tls":                     json.RawMessage(`{}`),
+		"authorization_policy":    json.RawMessage(`"policy"`),
+		"bootstrap_gateway_seeds": json.RawMessage(`[]`),
+		"canonical_source_seeds":  json.RawMessage(`[]`),
+		"replica_control":         json.RawMessage(`{}`),
+		"split_control":           json.RawMessage(`{}`),
+		"catalog_genesis":         json.RawMessage(`{}`),
+		"read_authority":          json.RawMessage(`{}`),
+		"gateway":                 json.RawMessage(`{}`),
+		"groups":                  json.RawMessage(`[]`),
+	}
+	raw, err := orderedDevManifestObject(fields, devNodeRuntimeManifestOrder(fields))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"node_log":{},"node_incarnation":1,"listeners":{},"tls":{},"authorization_policy":"policy","bootstrap_gateway_seeds":[],"canonical_source_seeds":[],"replica_control":{},"split_control":{},"catalog_genesis":{},"read_authority":{},"gateway":{},"groups":[]}`
+	if string(raw) != want {
+		t.Fatalf("canonical runtime order=%s, want %s", raw, want)
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &decoded); err != nil || len(decoded) != len(fields) {
+		t.Fatalf("runtime manifest roundtrip fields=%d err=%v", len(decoded), err)
+	}
+	for key, value := range fields {
+		if !bytes.Equal(decoded[key], value) {
+			t.Fatalf("runtime field %q changed: %s != %s", key, decoded[key], value)
+		}
+	}
+	processFields := map[string]json.RawMessage{
+		"listeners":            json.RawMessage(`{}`),
+		"tls":                  json.RawMessage(`{}`),
+		"authorization_policy": json.RawMessage(`"policy"`),
+		"replica_control":      json.RawMessage(`{}`),
+		"split_control":        json.RawMessage(`{}`),
+		"groups":               json.RawMessage(`[]`),
+	}
+	processRaw, err := orderedDevManifestObject(processFields, devNodeRuntimeManifestOrder(processFields))
+	if err != nil || string(processRaw) != `{"listeners":{},"tls":{},"authorization_policy":"policy","replica_control":{},"split_control":{},"groups":[]}` {
+		t.Fatalf("group process order=%s err=%v", processRaw, err)
 	}
 }
 
@@ -230,6 +280,126 @@ func TestDevPhysicalPlannedPlacementAndCapacity(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDevPhysicalCatalogRoutesBindPhysicalAddressesAcrossRoleAliases(t *testing.T) {
+	for _, physical := range []int{devClusterPhysicalNodes3, devClusterPhysicalNodes6} {
+		t.Run(fmt.Sprint(physical), func(t *testing.T) {
+			snapshot, records := devPhysicalAliasCatalogFixture(t, physical)
+			byNode := make(map[rafttransport.NodeID]gateway.NodeRecord, len(records))
+			for _, record := range records {
+				byNode[record.NodeID] = record
+			}
+			aliases := 0
+			for _, descriptor := range snapshot.ReplicatedShardDescriptors() {
+				route, ok := snapshot.ResolveReplicatedRoute(descriptor.Distribution, descriptor.Shard, nil)
+				if !ok {
+					t.Fatalf("resolve %s/%s", descriptor.Distribution, descriptor.Shard)
+				}
+				for _, replica := range route.Replicas {
+					record, found := byNode[replica.Node]
+					if !found || record.Incarnation != replica.NodeIncarnation ||
+						record.DataAddress != replica.DataAddress || record.NativeAddress != replica.Address ||
+						record.ControlAddress != replica.ControlAddress {
+						t.Fatalf("%s/%s replica=%+v physical-record=%+v", descriptor.Distribution, descriptor.Shard, replica, record)
+					}
+					if replica.Endpoint != string(record.DataEndpoint) || replica.NativeEndpoint != string(record.NativeEndpoint) ||
+						replica.ControlEndpoint != string(record.ControlEndpoint) {
+						aliases++
+					}
+				}
+			}
+			if aliases == 0 {
+				t.Fatal("catalog role routes did not exercise distinct role-handle aliases")
+			}
+		})
+	}
+}
+
+func devPhysicalAliasCatalogFixture(t *testing.T, physical int) (*gateway.Snapshot, []gateway.NodeRecord) {
+	t.Helper()
+	if physical != devClusterPhysicalNodes3 && physical != devClusterPhysicalNodes6 {
+		t.Fatalf("unsupported physical fixture size %d", physical)
+	}
+	base, dataBase, groups := testDevCatalogSnapshot(t)
+	_ = base
+	roleNames := []string{"catalog", "ledger", "data"}
+	placements := [][]int{{0, 1, 2}, {0, 1, 2}, {0, 1, 2}}
+	if physical == devClusterPhysicalNodes6 {
+		placements = [][]int{{0, 1, 2}, {2, 3, 4}, {4, 5, 0}}
+	}
+	endpoints := make(map[distribution.EndpointID]string, len(roleNames)*devClusterRF3*3)
+	physicalAddresses := make([][3]string, physical)
+	for index := range physicalAddresses {
+		physicalAddresses[index] = [3]string{
+			fmt.Sprintf("127.0.0.1:%d", 7001+index), fmt.Sprintf("127.0.0.1:%d", 7101+index),
+			fmt.Sprintf("127.0.0.1:%d", 7201+index),
+		}
+	}
+	routes := make([]devPreparedRoute, len(roleNames))
+	for roleIndex, role := range roleNames {
+		route := devPreparedRoute{
+			leaders: make([]distribution.EndpointID, devClusterRF3), replicas: make([]gateway.ReplicatedReplicaDescriptor, devClusterRF3),
+			digest: [32]byte{byte(0x31 + roleIndex)}, applyDigest: [32]byte{byte(0x41 + roleIndex)},
+			logicalSchemaDigest: replication.Digest{byte(0x51 + roleIndex)}, schemaGeneration: 1,
+		}
+		for ordinal, physicalIndex := range placements[roleIndex] {
+			prefix := fmt.Sprintf("%s-member-%d", role, ordinal+1)
+			dataEndpoint := distribution.EndpointID(prefix)
+			nativeEndpoint := distribution.EndpointID(prefix + "-native")
+			controlEndpoint := distribution.EndpointID(prefix + "-control")
+			endpointSet := []distribution.EndpointID{dataEndpoint, nativeEndpoint, controlEndpoint}
+			for lane, endpoint := range endpointSet {
+				endpoints[endpoint] = physicalAddresses[physicalIndex][lane]
+			}
+			route.leaders[ordinal] = dataEndpoint
+			route.replicas[ordinal] = gateway.ReplicatedReplicaDescriptor{
+				Member: uint64(ordinal + 1), Node: rafttransport.NodeID{byte(physicalIndex + 1)},
+				StoreID: [16]byte{byte(0x61 + roleIndex*devClusterRF3 + ordinal)}, NodeIncarnation: 1,
+				Endpoint: dataEndpoint, NativeEndpoint: nativeEndpoint, ControlEndpoint: controlEndpoint,
+			}
+		}
+		routes[roleIndex] = route
+	}
+	routes[2].table = dataBase.table
+	routes[2].digest = dataBase.digest
+	routes[2].applyDigest = dataBase.applyDigest
+	routes[2].logicalSchemaDigest = dataBase.logicalSchemaDigest
+	routes[2].schemaGeneration = dataBase.schemaGeneration
+	snapshot, err := newDevCatalogSnapshot(endpoints, groups[0], groups[1], groups[2], routes[0], routes[1], routes[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := make([]gateway.NodeRecord, physical)
+	for index := range records {
+		firstRole := 0
+		if physical == devClusterPhysicalNodes6 {
+			firstRole = 2
+			for roleIndex, placement := range placements {
+				for _, physicalIndex := range placement {
+					if physicalIndex == index {
+						firstRole = roleIndex
+						break
+					}
+				}
+				if firstRole == roleIndex {
+					break
+				}
+			}
+		}
+		prefix := fmt.Sprintf("%s-member-%d", roleNames[firstRole], index+1)
+		records[index] = gateway.NodeRecord{
+			NodeID: rafttransport.NodeID{byte(index + 1)}, Incarnation: 1, ServiceKeyDigest: replication.Digest{byte(0x90 + index)},
+			DataEndpoint: distribution.EndpointID(prefix), NativeEndpoint: distribution.EndpointID(prefix + "-native"),
+			ControlEndpoint: distribution.EndpointID(prefix + "-control"), DataAddress: physicalAddresses[index][0],
+			NativeAddress: physicalAddresses[index][1], ControlAddress: physicalAddresses[index][2], FailureDomain: fmt.Sprintf("dev-%d", index+1),
+			Roles: gateway.NodeRoleStorage | gateway.NodeRoleCatalog, Lifecycle: gateway.NodeActive, Revision: 1, CatalogGeneration: 1,
+		}
+		if !records[index].Valid() {
+			t.Fatalf("invalid physical record %d: %+v", index, records[index])
+		}
+	}
+	return snapshot, records
 }
 
 // This opt-in test invokes the shipped Linux preparer, including its strict
@@ -510,6 +680,19 @@ func TestDevPhysicalRealPreparationRecoversExactPlans(t *testing.T) {
 				addition, err := gateway.OpenReplicatedTableProvision(fragment)
 				if err != nil || addition.ReplicatedShardDescriptors()[0].Group != group {
 					t.Fatalf("fragment group differs: %v", err)
+				}
+				descriptor := addition.ReplicatedShardDescriptors()[0]
+				route, routeOK := addition.ResolveReplicatedRoute(descriptor.Distribution, descriptor.Shard, nil)
+				if !routeOK || len(route.Replicas) != len(members) {
+					t.Fatalf("prepared table route=%t replicas=%d members=%d", routeOK, len(route.Replicas), len(members))
+				}
+				for index, replica := range route.Replicas {
+					memberNode, decodeErr := decodeDev16(members[index].Node)
+					if decodeErr != nil || replica.Node != rafttransport.NodeID(memberNode) ||
+						replica.DataAddress != members[index].Peer || replica.Address != members[index].Native ||
+						replica.ControlAddress != members[index].Control {
+						t.Fatalf("prepared table replica[%d]=%+v member=%+v decode=%v", index, replica, members[index], decodeErr)
+					}
 				}
 				catalog, err = gateway.BuildReplicatedTableAddition(catalog, addition)
 				if err != nil {

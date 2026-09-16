@@ -482,6 +482,44 @@ func testGroup(seed byte) raftmember.GroupKey {
 
 func testNode(seed byte) NodeID { return NodeID{seed} }
 
+func TestAcceptsEnrollmentRosterDigestForExactPredeclaredTarget(t *testing.T) {
+	group := testGroup(250)
+	serving := []Member{
+		{Group: group, ReplicaSetVersion: 1, MemberID: 1, Node: testNode(1), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 1, MemberID: 2, Node: testNode(2), Role: MemberVoter},
+		{Group: group, ReplicaSetVersion: 1, MemberID: 3, Node: testNode(3), Role: MemberVoter},
+	}
+	predeclared := append(append([]Member(nil), serving...), Member{
+		Group: group, ReplicaSetVersion: 1, MemberID: 4, Node: testNode(4), Role: MemberEnrolled,
+	})
+	registry, err := NewStaticRegistry(testNode(1), predeclared, Limits{MaxGroups: 1, MaxMembers: 4, MaxPeers: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := StableRosterDigest(serving)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !registry.AcceptsEnrollmentRosterDigest(group, digest, 4, testNode(4), [3]uint64{1, 2, 3}) {
+		t.Fatal("exact three-voter roster was rejected for matching predeclared target")
+	}
+	if registry.AcceptsEnrollmentRosterDigest(group, digest, 4, testNode(9), [3]uint64{1, 2, 3}) ||
+		registry.AcceptsEnrollmentRosterDigest(group, digest, 5, testNode(4), [3]uint64{1, 2, 3}) ||
+		registry.AcceptsEnrollmentRosterDigest(group, digest, 4, testNode(4), [3]uint64{1, 2, 9}) {
+		t.Fatal("foreign target or initial voter set was accepted")
+	}
+	extra := append(append([]Member(nil), predeclared...), Member{
+		Group: group, ReplicaSetVersion: 1, MemberID: 5, Node: testNode(5), Role: MemberEnrolled,
+	})
+	withExtra, err := NewStaticRegistry(testNode(1), extra, Limits{MaxGroups: 1, MaxMembers: 5, MaxPeers: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withExtra.AcceptsEnrollmentRosterDigest(group, digest, 4, testNode(4), [3]uint64{1, 2, 3}) {
+		t.Fatal("predeclared roster with unrelated member was accepted")
+	}
+}
+
 func testPeerIdentity(registry *StaticRegistry, node NodeID) PeerIdentity {
 	return PeerIdentity{TrustDomain: registry.TrustDomain(), Node: node}
 }

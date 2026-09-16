@@ -25,7 +25,12 @@ var (
 
 const (
 	AbsoluteMaxServiceBindings = 4096
-	AbsoluteMaxServiceActions  = 32
+	// Internal fences are resource coordinates, not action kinds. A catalog
+	// with multiple placed groups legitimately contributes catalog, ledger,
+	// pin, and recovery fences per group, so the directory must scale to the
+	// same bounded resource inventory as the catalog rather than an arbitrary
+	// small action count.
+	AbsoluteMaxServiceActions = AbsoluteMaxServiceBindings
 )
 
 // ServiceRoleMask is a physical service role.  Roles are deliberately not
@@ -109,6 +114,82 @@ type ServiceBinding struct {
 	DrainFence ServiceFence
 }
 
+// ServiceBindingIdentity contains the fields that identify an authenticated
+// service independently of its current lifecycle fences.  It is used by the
+// bounded replacement proof below when a retained gate must advance from a
+// retired physical process to a new process using the same NodeID.
+type ServiceBindingIdentity struct {
+	Principal           rafttransport.NodeID
+	PhysicalNode        rafttransport.NodeID
+	PhysicalIncarnation uint64
+	KeyDigest           [32]byte
+	Roles               ServiceRoleMask
+	Lifecycle           ServiceLifecycle
+	GatewayIncarnation  uint64
+	SessionID           [16]byte
+	SessionRevision     uint64
+	ParticipantDigest   [32]byte
+}
+
+func (identity ServiceBindingIdentity) Valid() bool {
+	if identity.Principal == (rafttransport.NodeID{}) || identity.PhysicalNode == (rafttransport.NodeID{}) ||
+		identity.PhysicalIncarnation == 0 || identity.KeyDigest == ([32]byte{}) ||
+		!identity.Roles.Valid() || !identity.Lifecycle.Valid() {
+		return false
+	}
+	if identity.Roles&ServiceRoleGateway != 0 {
+		return identity.GatewayIncarnation != 0 && identity.SessionID != ([16]byte{}) &&
+			identity.SessionRevision != 0 && identity.ParticipantDigest != ([32]byte{})
+	}
+	return identity.GatewayIncarnation == 0 && identity.SessionID == ([16]byte{}) &&
+		identity.SessionRevision == 0 && identity.ParticipantDigest == ([32]byte{})
+}
+
+// Identity returns the exact lifecycle/key identity represented by binding.
+func (binding ServiceBinding) Identity() ServiceBindingIdentity {
+	return ServiceBindingIdentity{
+		Principal: binding.Principal, PhysicalNode: binding.PhysicalNode,
+		PhysicalIncarnation: binding.PhysicalIncarnation, KeyDigest: binding.KeyDigest,
+		Roles: binding.Roles, Lifecycle: binding.Lifecycle,
+		GatewayIncarnation: binding.GatewayIncarnation, SessionID: binding.SessionID,
+		SessionRevision: binding.SessionRevision, ParticipantDigest: binding.ParticipantDigest,
+	}
+}
+
+// ServiceBindingReplacement is the one certified lifecycle edge that permits
+// a retained gate to accept a reused physical NodeID.  The predecessor must
+// be a Decommissioned tombstone, the successor must use a higher incarnation
+// and a new key, and the proof remains bounded to this exact binding pair.
+type ServiceBindingReplacement struct {
+	Prior       ServiceBindingIdentity
+	Next        ServiceBindingIdentity
+	IntentID    [32]byte
+	ProofDigest [32]byte
+}
+
+func (replacement ServiceBindingReplacement) Valid() bool {
+	return replacement.Prior.Valid() && replacement.Next.Valid() &&
+		replacement.Prior.Lifecycle == ServiceDecommissioned &&
+		replacement.Prior.PhysicalNode == replacement.Next.PhysicalNode &&
+		replacement.Next.PhysicalIncarnation > replacement.Prior.PhysicalIncarnation &&
+		replacement.Prior.KeyDigest != replacement.Next.KeyDigest &&
+		replacement.Prior.Roles == replacement.Next.Roles &&
+		replacement.IntentID != ([32]byte{}) && replacement.ProofDigest != ([32]byte{})
+}
+
+// NewServiceBindingReplacement constructs one canonical replacement edge from
+// the writer's certified predecessor marker.  It deliberately does not infer
+// any identity or proof bytes from a caller's TLS peer.
+func NewServiceBindingReplacement(
+	prior, next ServiceBindingIdentity, intentID, proofDigest [32]byte,
+) (ServiceBindingReplacement, error) {
+	replacement := ServiceBindingReplacement{Prior: prior, Next: next, IntentID: intentID, ProofDigest: proofDigest}
+	if !replacement.Valid() {
+		return ServiceBindingReplacement{}, ErrInvalidServiceDirectory
+	}
+	return replacement, nil
+}
+
 func (binding ServiceBinding) Valid() bool {
 	if binding.Principal == (rafttransport.NodeID{}) ||
 		binding.PhysicalNode == (rafttransport.NodeID{}) || binding.PhysicalIncarnation == 0 ||
@@ -152,11 +233,20 @@ func (binding ServiceBinding) Valid() bool {
 // rotated by this gate.
 type ServiceDirectoryCut struct {
 	// CatalogGeneration fences grants derived from the committed catalog.
-	CatalogGeneration  uint64
-	Revision           uint64
-	TrustDomain        rafttransport.TrustDomain
-	PolicyGeneration   uint64
-	Bindings           []ServiceBinding
+	CatalogGeneration uint64
+	Revision          uint64
+	TrustDomain       rafttransport.TrustDomain
+	PolicyGeneration  uint64
+	Bindings          []ServiceBinding
+	// ForwardedScopes is the exact catalog-derived resource inventory shared by
+	// all immutable continuation grants in this cut. Keeping it outside a grant
+	// lets a newer catalog generation add a resource without reminting accepted
+	// connection tokens or changing the grant digest.
+	ForwardedScopes []FrontendContinuationScopeRecord
+	// Replacements is the bounded certified predecessor -> successor set.  It
+	// is part of the same complete cut as Bindings so a receiver cannot allow an
+	// identity change based on a local or caller-supplied incarnation.
+	Replacements       []ServiceBindingReplacement
 	ContinuationGrants []CommittedFrontendContinuationGrant
 }
 
@@ -169,6 +259,25 @@ func (cut ServiceDirectoryCut) Valid() bool {
 	}
 	for index, binding := range cut.Bindings {
 		if !binding.Valid() || index > 0 && bytes.Compare(cut.Bindings[index-1].Principal[:], binding.Principal[:]) >= 0 {
+			return false
+		}
+	}
+	if len(cut.ForwardedScopes) > AbsoluteMaxContinuationScopes {
+		return false
+	}
+	for index, scope := range cut.ForwardedScopes {
+		if !scope.Valid() || index > 0 && compareContinuationScopes(cut.ForwardedScopes[index-1], scope) >= 0 {
+			return false
+		}
+		if index > 0 && sameContinuationScopeCoordinates(cut.ForwardedScopes[index-1], scope) {
+			return false
+		}
+	}
+	if len(cut.Replacements) > AbsoluteMaxServiceBindings {
+		return false
+	}
+	for index, replacement := range cut.Replacements {
+		if !replacement.Valid() || index > 0 && compareServiceBindingReplacements(cut.Replacements[index-1], replacement) >= 0 {
 			return false
 		}
 	}
@@ -205,10 +314,11 @@ const (
 	ServiceActionGatewayExecutionPin
 	ServiceActionGatewayTransactionRecovery
 	ServiceActionControllerMembership
+	ServiceActionGatewayRouteSettlement
 )
 
 func (action ServiceAction) Valid() bool {
-	return action >= ServiceActionStorageBootstrapRead && action <= ServiceActionControllerMembership
+	return action >= ServiceActionStorageBootstrapRead && action <= ServiceActionGatewayRouteSettlement
 }
 
 // ServiceOperation identifies the typed operation inside an internal action.
@@ -229,10 +339,12 @@ const (
 	// still checks the forwarded authority and capability.
 	ServiceOperationForwardedRead
 	ServiceOperationForwardedWrite
+	ServiceOperationRouteSettlement
 )
 
 func (operation ServiceOperation) Valid() bool {
-	return operation >= ServiceOperationBootstrapMetadata && operation <= ServiceOperationMembership
+	return operation >= ServiceOperationBootstrapMetadata &&
+		(operation <= ServiceOperationMembership || operation == ServiceOperationRouteSettlement)
 }
 
 // ServiceFence carries the exact continuation coordinates for a request that
@@ -251,6 +363,13 @@ type ServiceFence struct {
 
 func (fence ServiceFence) validShape() bool {
 	return fence.validScopeShape() && fence.SessionID != ([16]byte{}) && fence.SessionRevision != 0
+}
+
+// Valid reports whether this fence carries one complete session-bound service
+// tuple. It is used by runtime projections when they copy the durable catalog
+// drain fence into the synthetic admission marker.
+func (fence ServiceFence) Valid() bool {
+	return fence.validShape()
 }
 
 // validScopeShape is shared by all internal fences. Storage bootstrap and
@@ -344,13 +463,48 @@ func sameServiceBinding(left, right ServiceBinding) bool {
 		slices.Equal(left.InternalFences, right.InternalFences)
 }
 
+func compareServiceBindingReplacements(left, right ServiceBindingReplacement) int {
+	if result := bytes.Compare(left.Next.Principal[:], right.Next.Principal[:]); result != 0 {
+		return result
+	}
+	if result := bytes.Compare(left.Next.PhysicalNode[:], right.Next.PhysicalNode[:]); result != 0 {
+		return result
+	}
+	if left.Next.PhysicalIncarnation != right.Next.PhysicalIncarnation {
+		if left.Next.PhysicalIncarnation < right.Next.PhysicalIncarnation {
+			return -1
+		}
+		return 1
+	}
+	if result := bytes.Compare(left.Prior.Principal[:], right.Prior.Principal[:]); result != 0 {
+		return result
+	}
+	return bytes.Compare(left.ProofDigest[:], right.ProofDigest[:])
+}
+
+func sameServiceBindingReplacement(left, right ServiceBindingReplacement) bool {
+	return left.Prior == right.Prior && left.Next == right.Next &&
+		left.IntentID == right.IntentID && left.ProofDigest == right.ProofDigest
+}
+
 func sameDirectoryCut(left, right ServiceDirectoryCut) bool {
 	if left.CatalogGeneration != right.CatalogGeneration || left.Revision != right.Revision || left.TrustDomain != right.TrustDomain ||
-		left.PolicyGeneration != right.PolicyGeneration || len(left.Bindings) != len(right.Bindings) {
+		left.PolicyGeneration != right.PolicyGeneration || len(left.Bindings) != len(right.Bindings) ||
+		len(left.ForwardedScopes) != len(right.ForwardedScopes) || len(left.Replacements) != len(right.Replacements) {
 		return false
 	}
 	for index := range left.Bindings {
 		if !sameServiceBinding(left.Bindings[index], right.Bindings[index]) {
+			return false
+		}
+	}
+	for index := range left.ForwardedScopes {
+		if !sameContinuationScope(left.ForwardedScopes[index], right.ForwardedScopes[index]) {
+			return false
+		}
+	}
+	for index := range left.Replacements {
+		if !sameServiceBindingReplacement(left.Replacements[index], right.Replacements[index]) {
 			return false
 		}
 	}
@@ -423,6 +577,12 @@ func newDirectoryState(cut ServiceDirectoryCut) (*directoryState, error) {
 		return bytes.Compare(left.Principal[:], right.Principal[:])
 	})
 	cut.Bindings = owned
+	scopes := slices.Clone(cut.ForwardedScopes)
+	slices.SortFunc(scopes, CompareContinuationScopes)
+	cut.ForwardedScopes = scopes
+	replacements := slices.Clone(cut.Replacements)
+	slices.SortFunc(replacements, compareServiceBindingReplacements)
+	cut.Replacements = replacements
 	grants := slices.Clone(cut.ContinuationGrants)
 	for index := range grants {
 		grants[index] = cloneContinuationGrant(grants[index])
@@ -440,6 +600,17 @@ func newDirectoryState(cut ServiceDirectoryCut) (*directoryState, error) {
 			return nil, ErrInvalidServiceDirectory
 		}
 		bindings[binding.Principal] = cloneServiceBinding(binding)
+	}
+	seenReplacementPrior := make(map[ServiceBindingIdentity]struct{}, len(cut.Replacements))
+	for _, replacement := range cut.Replacements {
+		nextBinding, found := bindings[replacement.Next.Principal]
+		if !found || nextBinding.Identity() != replacement.Next {
+			return nil, ErrInvalidServiceDirectory
+		}
+		if _, duplicate := seenReplacementPrior[replacement.Prior]; duplicate {
+			return nil, ErrInvalidServiceDirectory
+		}
+		seenReplacementPrior[replacement.Prior] = struct{}{}
 	}
 	continuations := make(map[[32]byte]CommittedFrontendContinuationGrant, len(cut.ContinuationGrants))
 	for _, grant := range cut.ContinuationGrants {
@@ -510,6 +681,8 @@ func (gate *ServiceDirectoryGate) Cut() (ServiceDirectoryCut, bool) {
 	for index := range cut.ContinuationGrants {
 		cut.ContinuationGrants[index] = cloneContinuationGrant(cut.ContinuationGrants[index])
 	}
+	cut.ForwardedScopes = slices.Clone(cut.ForwardedScopes)
+	cut.Replacements = slices.Clone(cut.Replacements)
 	return cut, true
 }
 
@@ -546,7 +719,9 @@ func (gate *ServiceDirectoryGate) ApplyCommittedCut(cut ServiceDirectoryCut) err
 		}
 		if next.cut.Revision == prior.cut.Revision {
 			// A catalog-only advance may change internal resource grants, but
-			// cannot change principals, sessions, lifecycle, or drain grants.
+			// cannot change principals, sessions, lifecycle, or drain grants. An
+			// existing forwarded resource coordinate remains bound to its original
+			// catalog proof; only exact resources may be added or retired.
 			priorDirectory, nextDirectory := prior.cut, next.cut
 			priorDirectory.CatalogGeneration = nextDirectory.CatalogGeneration
 			priorDirectory.Bindings = slices.Clone(prior.cut.Bindings)
@@ -556,6 +731,11 @@ func (gate *ServiceDirectoryGate) ApplyCommittedCut(cut ServiceDirectoryCut) err
 				}
 				priorDirectory.Bindings[index].InternalFences = nextDirectory.Bindings[index].InternalFences
 			}
+			priorDirectory.Replacements = slices.Clone(prior.cut.Replacements)
+			priorDirectory.ForwardedScopes = slices.Clone(nextDirectory.ForwardedScopes)
+			if !forwardedScopeProofsStable(prior.cut.ForwardedScopes, nextDirectory.ForwardedScopes) {
+				return ErrInvalidServiceDirectory
+			}
 			if !sameDirectoryCut(priorDirectory, nextDirectory) {
 				return ErrInvalidServiceDirectory
 			}
@@ -563,14 +743,43 @@ func (gate *ServiceDirectoryGate) ApplyCommittedCut(cut ServiceDirectoryCut) err
 		for principal, priorBinding := range prior.bindings {
 			nextBinding, found := next.bindings[principal]
 			if !found {
+				if !replacementMatchesPrior(next.cut.Replacements, priorBinding) {
+					return ErrInvalidServiceDirectory
+				}
+				continue
+			}
+			if !validBindingTransition(priorBinding, nextBinding) &&
+				!replacementMatchesBindings(next.cut.Replacements, priorBinding, nextBinding) {
 				return ErrInvalidServiceDirectory
 			}
-			if !validBindingTransition(priorBinding, nextBinding) {
+		}
+		for _, replacement := range next.cut.Replacements {
+			priorBinding, found := prior.bindings[replacement.Prior.Principal]
+			if !found || priorBinding.Identity() != replacement.Prior {
 				return ErrInvalidServiceDirectory
 			}
 		}
 		for digest, priorGrant := range prior.continuations {
 			nextGrant, found := next.continuations[digest]
+			// Terminal proof compaction removes only a Retired child. A receiver
+			// that already saw it keeps its deny-only state; a fresh/restarted
+			// receiver has no matching grant and also denies the token. No live
+			// continuation authority can disappear through this exception.
+			if !found && priorGrant.State == ContinuationGrantRetired {
+				continue
+			}
+			// A receiver may have installed Enforcing and then missed the
+			// Retired cut while the terminal child was compacted.  Accept that
+			// one transition only when the newer authoritative cut still carries
+			// the exact same physical/principal/session identity as a
+			// Decommissioned tombstone.  The grant is deliberately dropped, so
+			// the saved envelope becomes a deny on the very next lookup.
+			if !found && priorGrant.State == ContinuationGrantEnforcing {
+				if nextBinding, bindingFound := next.bindings[priorGrant.GatewayServiceID]; bindingFound &&
+					terminalCompactionMatchesEnforcingGrant(priorGrant, nextBinding, next.cut.TrustDomain) {
+					continue
+				}
+			}
 			if !found || !validContinuationTransition(priorGrant, nextGrant) {
 				return ErrInvalidServiceDirectory
 			}
@@ -579,6 +788,39 @@ func (gate *ServiceDirectoryGate) ApplyCommittedCut(cut ServiceDirectoryCut) err
 			return nil
 		}
 	}
+}
+
+// forwardedScopeProofsStable validates the catalog-only advance rule. The
+// resource inventory may add or remove exact coordinates, but a coordinate
+// already present in the prior cut cannot be relabeled with a new intent or
+// fence digest under the same service revision.
+func forwardedScopeProofsStable(prior, next []FrontendContinuationScopeRecord) bool {
+	type key struct {
+		Protocol   FrontendContinuationScope
+		Action     FrontendContinuationAction
+		Capability Capability
+		Operation  ServiceOperation
+		Group      raftmember.GroupKey
+		Relation   [16]byte
+	}
+	priorByCoordinate := make(map[key]FrontendContinuationScopeRecord, len(prior))
+	for _, scope := range prior {
+		coordinateKey := key{Protocol: scope.Protocol, Action: scope.Action, Capability: scope.Capability,
+			Operation: scope.Operation, Group: scope.Group, Relation: scope.Relation}
+		if _, duplicate := priorByCoordinate[coordinateKey]; duplicate {
+			return false
+		}
+		priorByCoordinate[coordinateKey] = scope
+	}
+	for _, scope := range next {
+		coordinateKey := key{Protocol: scope.Protocol, Action: scope.Action, Capability: scope.Capability,
+			Operation: scope.Operation, Group: scope.Group, Relation: scope.Relation}
+		if previous, found := priorByCoordinate[coordinateKey]; found &&
+			(previous.IntentID != scope.IntentID || previous.FenceDigest != scope.FenceDigest) {
+			return false
+		}
+	}
+	return true
 }
 
 func validBindingTransition(prior, next ServiceBinding) bool {
@@ -600,6 +842,42 @@ func validBindingTransition(prior, next ServiceBinding) bool {
 		}
 	}
 	return true
+}
+
+func replacementMatchesBindings(
+	replacements []ServiceBindingReplacement, prior, next ServiceBinding,
+) bool {
+	priorIdentity, nextIdentity := prior.Identity(), next.Identity()
+	for _, replacement := range replacements {
+		if replacement.Prior == priorIdentity && replacement.Next == nextIdentity && replacement.Valid() {
+			return true
+		}
+	}
+	return false
+}
+
+func replacementMatchesPrior(
+	replacements []ServiceBindingReplacement, prior ServiceBinding,
+) bool {
+	priorIdentity := prior.Identity()
+	for _, replacement := range replacements {
+		if replacement.Prior == priorIdentity && replacement.Valid() {
+			return true
+		}
+	}
+	return false
+}
+
+func terminalCompactionMatchesEnforcingGrant(
+	grant CommittedFrontendContinuationGrant, binding ServiceBinding, trustDomain rafttransport.TrustDomain,
+) bool {
+	return grant.Valid() && binding.Valid() && grant.State == ContinuationGrantEnforcing &&
+		binding.Lifecycle == ServiceDecommissioned && binding.Roles&ServiceRoleGateway != 0 &&
+		grant.TrustDomain == trustDomain &&
+		grant.PhysicalNode == binding.PhysicalNode &&
+		grant.PhysicalIncarnation == binding.PhysicalIncarnation &&
+		grant.PeerKeyDigest == binding.KeyDigest && grant.GatewayServiceID == binding.Principal &&
+		grant.GatewaySessionID == binding.SessionID && grant.GatewaySessionRevision == binding.SessionRevision
 }
 
 func (gate *ServiceDirectoryGate) lookup(peer AuthenticatedPeer) (directoryState, ServiceBinding, bool) {
@@ -725,9 +1003,11 @@ func (state directoryState) checkInternal(
 		if request.SessionID != binding.SessionID || request.SessionRevision != binding.SessionRevision {
 			return DecisionDenyCapability
 		}
-		if binding.Lifecycle == ServiceDraining && !sameServiceFence(request.fence(), binding.DrainFence) {
-			return DecisionDenyCapability
-		}
+		// Draining keeps the service's exact committed internal resource fences
+		// available for cleanup and recovery. DrainFence remains a separate
+		// frontend-admission fence; requiring every catalog/ledger/pin request
+		// to equal it would reduce owner work to one synthetic resource and
+		// strand the gateway before it can complete retirement.
 	}
 	return DecisionAllow
 }
@@ -749,7 +1029,7 @@ func roleAllowsAction(binding ServiceBinding, action ServiceAction) bool {
 		return binding.Roles&ServiceRoleController != 0
 	case ServiceActionGatewayCatalogRead, ServiceActionGatewayCatalogWrite,
 		ServiceActionGatewayRequestLedger, ServiceActionGatewayExecutionPin,
-		ServiceActionGatewayTransactionRecovery:
+		ServiceActionGatewayTransactionRecovery, ServiceActionGatewayRouteSettlement:
 		return binding.Roles&ServiceRoleGateway != 0
 	default:
 		return false
@@ -776,6 +1056,8 @@ func validInternalRequest(request ServiceRequest) bool {
 		wantOperation, wantCapability = ServiceOperationExecutionPin, CapabilityExecutionPin
 	case ServiceActionGatewayTransactionRecovery:
 		wantOperation, wantCapability = ServiceOperationTransactionRecovery, CapabilityTransactionRecovery
+	case ServiceActionGatewayRouteSettlement:
+		wantOperation, wantCapability = ServiceOperationRouteSettlement, CapabilityRequestLedger
 	case ServiceActionControllerMembership:
 		wantOperation, wantCapability = ServiceOperationMembership, CapabilityMembership
 	default:

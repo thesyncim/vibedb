@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 
+	"github.com/thesyncim/vibedb/internal/frontenddrain"
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
@@ -66,6 +67,15 @@ func (runtime *Runtime) serveGatewayControlConnection(
 	}
 	if bytes.Equal(discriminator[:], frontendParticipantDiscriminator[:]) {
 		return runtime.serveFrontendParticipantConnection(ctx, wrapped)
+	}
+	if bytes.Equal(discriminator[:], frontendDrainPrepareDiscriminator[:]) {
+		return runtime.serveFrontendDrainPrepareConnection(ctx, wrapped)
+	}
+	if bytes.Equal(discriminator[:], frontendDrainPreparedAckDiscriminator[:]) {
+		return runtime.serveFrontendDrainPreparedAckConnection(ctx, wrapped)
+	}
+	if bytes.Equal(discriminator[:], frontenddrain.PreparedAckCutReadDiscriminator[:]) {
+		return runtime.serveFrontendDrainPreparedAckCutReadConnection(ctx, wrapped)
 	}
 	if runtime.controlService == nil {
 		return errGatewayControlDirectory

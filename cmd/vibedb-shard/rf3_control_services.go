@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
+	"github.com/thesyncim/vibedb/internal/frontenddrain"
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicaaction"
@@ -25,7 +26,7 @@ type rf3ControlServices struct {
 	membership, observation, metrics, capacity, preparation, enrollment      shardcontrol.Handler
 	backup, source, action, split, schema, schemaBuild                       shardcontrol.Handler
 	planObservation, admission, tail, terminal, childPrepare, restoreServing shardcontrol.Handler
-	nodeInfo, nodeControl, bootstrap                                         shardcontrol.Handler
+	nodeInfo, nodeControl, bootstrap, preparedAck, canonicalSource           shardcontrol.Handler
 }
 
 func (services rf3ControlServices) mux() (*shardcontrol.Mux, error) {
@@ -61,6 +62,8 @@ func (services rf3ControlServices) mux() (*shardcontrol.Mux, error) {
 	add(nodecontrol.NodeInfoRequestDiscriminator(), services.nodeInfo)
 	add(nodecontrol.RequestDiscriminator(), services.nodeControl)
 	add(snapshottransfer.BootstrapRequestDiscriminator(), services.bootstrap)
+	add(frontenddrain.PreparedAckDiscriminator, services.preparedAck)
+	add(frontenddrain.PreparedAckCutReadDiscriminator, services.canonicalSource)
 	return shardcontrol.New(routes...)
 }
 

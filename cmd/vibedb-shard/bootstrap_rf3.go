@@ -22,6 +22,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicacontrol"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/internal/servicemetrics"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/internal/shardcontrol"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
@@ -185,6 +186,35 @@ func bootstrapPreparedRF3(
 	if err != nil {
 		return err
 	}
+	// A cold target is already visible in the physical control directory while
+	// it waits for its snapshot. Gateway capacity and health loops therefore
+	// continue to send the ordinary metrics and observation discriminators to
+	// this listener. Keep those requests on authenticated handlers during the
+	// cold interval; the observation handler reports the absence of an adopted
+	// replica instead of rejecting a valid control stream at the mux boundary.
+	metricsControl, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
+		Provider: &coldRF3MetricsProvider{},
+		Authorize: func(identity rafttransport.PeerIdentity) bool {
+			return identity.TrustDomain == profile.LocalIdentity().TrustDomain &&
+				policy.Check(identity.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline,
+	})
+	if err != nil {
+		return err
+	}
+	observationControl, err := replicacontrol.NewService(replicacontrol.ServiceOptions{
+		Observer: rf3RetiredControlOwner{},
+		Authorize: func(identity rafttransport.PeerIdentity, request replicacontrol.Request) bool {
+			return identity.TrustDomain == profile.LocalIdentity().TrustDomain &&
+				policy.Check(identity.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow &&
+				request.Group == groupFromBinding(base.Binding) && request.TargetMember == base.Binding.MemberID
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 4,
+	})
+	if err != nil {
+		return err
+	}
 	database, err := sqldriver.OpenReplicatedSnapshotTarget(member.SQL.Path, base, applyIdentity,
 		sqldriver.ReplicatedOpenOptions{WriterLockContext: parent, WriterLockDeadline: time.Now().Add(rf3StartupWriterLockWait)})
 	if err != nil {
@@ -338,6 +368,8 @@ func bootstrapPreparedRF3(
 			},
 		},
 		shardcontrol.Route{Discriminator: replicacontrol.CapacityRequestDiscriminator(), Handler: capacityControl},
+		shardcontrol.Route{Discriminator: replicacontrol.RequestDiscriminator(), Handler: observationControl},
+		shardcontrol.Route{Discriminator: servicemetrics.RequestDiscriminator(), Handler: metricsControl},
 	)
 	if err != nil {
 		return err

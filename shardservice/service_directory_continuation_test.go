@@ -75,10 +75,15 @@ func TestFrontendContinuationLedgerReadRejectsForgedForwarding(t *testing.T) {
 }
 
 func TestFrontendContinuationProbeScopeIsGroupBound(t *testing.T) {
+	probeFence := testReplicatedFence()
+	probeFence.MemberID = 0
+	probeFence.StoreID = [16]byte{}
+	probeFence.NodeIncarnation = 0
+	probeFence.Term = 0
 	request := &ReplicatedRequest{Operation: ReplicatedProbe,
 		Authority:  serviceauthz.Authority{Node: rafttransport.NodeID{9}, Generation: 3},
 		Capability: serviceauthz.CapabilityDataRead,
-		Fence:      ReplicatedFence{Group: testReplicatedFence().Group, AllocationGeneration: 4}}
+		Fence:      probeFence}
 	scope, ok := FrontendContinuationScopeForReplicatedRequest(request)
 	if !ok || scope.Action != serviceauthz.FrontendActionForwardedData ||
 		scope.Operation != serviceauthz.ServiceOperationForwardedRead || scope.Group != request.Fence.Group {

@@ -22,9 +22,17 @@ import (
 // sessions.
 var frontendParticipantDiscriminator = [...]byte{'V', 'B', 'D', 'P', 'A', 'R', 'T', 1}
 
+// frontendDrainPrepareDiscriminator selects the authenticated request that
+// asks the gateway owning a remote participant to close its own admission and
+// persist the Prepared drain child. It is a separate frame from the read-only
+// participant scan so a caller cannot accidentally turn an evidence request
+// into a lifecycle side effect.
+var frontendDrainPrepareDiscriminator = [...]byte{'V', 'B', 'D', 'D', 'R', 'A', 'I', 1}
+
 const (
 	frontendParticipantRequestWireSize  = 225
 	frontendParticipantResponseWireSize = 297
+	frontendDrainPrepareRequestWireSize = frontendParticipantRequestWireSize + 32
 	frontendParticipantNonceSize        = 16
 	frontendParticipantReadTimeout      = 5 * time.Second
 )
@@ -97,9 +105,9 @@ func (request frontendParticipantScanRequest) matches(record gateway.NodeRecord)
 		request.ParticipantDigest == record.Gateway.ParticipantDigest
 }
 
-func (request frontendParticipantScanRequest) marshal() []byte {
+func (request frontendParticipantScanRequest) marshalWithDiscriminator(discriminator [8]byte) []byte {
 	encoded := make([]byte, frontendParticipantRequestWireSize)
-	copy(encoded[:8], frontendParticipantDiscriminator[:])
+	copy(encoded[:8], discriminator[:])
 	copy(encoded[8:24], request.Nonce[:])
 	copy(encoded[24:40], request.NodeID[:])
 	binary.LittleEndian.PutUint64(encoded[40:48], request.Incarnation)
@@ -117,11 +125,17 @@ func (request frontendParticipantScanRequest) marshal() []byte {
 	return encoded
 }
 
-func unmarshalFrontendParticipantScanRequest(encoded []byte) (frontendParticipantScanRequest, error) {
+func (request frontendParticipantScanRequest) marshal() []byte {
+	return request.marshalWithDiscriminator(frontendParticipantDiscriminator)
+}
+
+func unmarshalFrontendParticipantScanRequestWithDiscriminator(
+	encoded []byte, discriminator [8]byte,
+) (frontendParticipantScanRequest, error) {
 	if len(encoded) != frontendParticipantRequestWireSize {
 		return frontendParticipantScanRequest{}, errFrontendParticipantWire
 	}
-	if string(encoded[:8]) != string(frontendParticipantDiscriminator[:]) {
+	if string(encoded[:8]) != string(discriminator[:]) {
 		return frontendParticipantScanRequest{}, errFrontendParticipantWire
 	}
 	var request frontendParticipantScanRequest
@@ -141,6 +155,57 @@ func unmarshalFrontendParticipantScanRequest(encoded []byte) (frontendParticipan
 	copy(request.ParticipantDigest[:], encoded[193:225])
 	if !request.valid() {
 		return frontendParticipantScanRequest{}, errFrontendParticipantWire
+	}
+	return request, nil
+}
+
+func unmarshalFrontendParticipantScanRequest(encoded []byte) (frontendParticipantScanRequest, error) {
+	return unmarshalFrontendParticipantScanRequestWithDiscriminator(encoded, frontendParticipantDiscriminator)
+}
+
+type frontendDrainPrepareRequest struct {
+	frontendParticipantScanRequest
+	IntentID [32]byte
+}
+
+func newFrontendDrainPrepareRequest(record gateway.NodeRecord, intentID [32]byte) (frontendDrainPrepareRequest, error) {
+	request, err := newFrontendParticipantScanRequest(record)
+	if err != nil {
+		return frontendDrainPrepareRequest{}, err
+	}
+	if intentID == ([32]byte{}) {
+		return frontendDrainPrepareRequest{}, gateway.ErrScalingIntentMissing
+	}
+	return frontendDrainPrepareRequest{frontendParticipantScanRequest: request, IntentID: intentID}, nil
+}
+
+func (request frontendDrainPrepareRequest) valid() bool {
+	return request.frontendParticipantScanRequest.valid() && request.IntentID != ([32]byte{}) &&
+		request.Lifecycle == gateway.NodeActive
+}
+
+func (request frontendDrainPrepareRequest) marshal() []byte {
+	encoded := make([]byte, frontendDrainPrepareRequestWireSize)
+	copy(encoded[:frontendParticipantRequestWireSize],
+		request.frontendParticipantScanRequest.marshalWithDiscriminator(frontendDrainPrepareDiscriminator))
+	copy(encoded[frontendParticipantRequestWireSize:], request.IntentID[:])
+	return encoded
+}
+
+func unmarshalFrontendDrainPrepareRequest(encoded []byte) (frontendDrainPrepareRequest, error) {
+	if len(encoded) != frontendDrainPrepareRequestWireSize {
+		return frontendDrainPrepareRequest{}, errFrontendParticipantWire
+	}
+	base, err := unmarshalFrontendParticipantScanRequestWithDiscriminator(
+		encoded[:frontendParticipantRequestWireSize], frontendDrainPrepareDiscriminator)
+	if err != nil {
+		return frontendDrainPrepareRequest{}, err
+	}
+	var request frontendDrainPrepareRequest
+	request.frontendParticipantScanRequest = base
+	copy(request.IntentID[:], encoded[frontendParticipantRequestWireSize:])
+	if !request.valid() {
+		return frontendDrainPrepareRequest{}, errFrontendParticipantWire
 	}
 	return request, nil
 }
@@ -167,9 +232,9 @@ func (response frontendParticipantScanResponse) valid() bool {
 		evidence.DirectoryRevision != 0 && evidence.Digest != (replication.Digest{})
 }
 
-func (response frontendParticipantScanResponse) marshal() []byte {
+func (response frontendParticipantScanResponse) marshalWithDiscriminator(discriminator [8]byte) []byte {
 	encoded := make([]byte, frontendParticipantResponseWireSize)
-	copy(encoded[:8], frontendParticipantDiscriminator[:])
+	copy(encoded[:8], discriminator[:])
 	copy(encoded[8:24], response.Nonce[:])
 	evidence := response.Evidence
 	copy(encoded[24:40], evidence.NodeID[:])
@@ -194,9 +259,15 @@ func (response frontendParticipantScanResponse) marshal() []byte {
 	return encoded
 }
 
-func unmarshalFrontendParticipantScanResponse(encoded []byte) (frontendParticipantScanResponse, error) {
+func (response frontendParticipantScanResponse) marshal() []byte {
+	return response.marshalWithDiscriminator(frontendParticipantDiscriminator)
+}
+
+func unmarshalFrontendParticipantScanResponseWithDiscriminator(
+	encoded []byte, discriminator [8]byte,
+) (frontendParticipantScanResponse, error) {
 	if len(encoded) != frontendParticipantResponseWireSize ||
-		string(encoded[:8]) != string(frontendParticipantDiscriminator[:]) {
+		string(encoded[:8]) != string(discriminator[:]) {
 		return frontendParticipantScanResponse{}, errFrontendParticipantWire
 	}
 	expected := sha256.Sum256(encoded[:265])
@@ -230,6 +301,10 @@ func unmarshalFrontendParticipantScanResponse(encoded []byte) (frontendParticipa
 		return frontendParticipantScanResponse{}, errFrontendParticipantWire
 	}
 	return response, nil
+}
+
+func unmarshalFrontendParticipantScanResponse(encoded []byte) (frontendParticipantScanResponse, error) {
+	return unmarshalFrontendParticipantScanResponseWithDiscriminator(encoded, frontendParticipantDiscriminator)
 }
 
 func frontendParticipantDeadline(ctx context.Context, configured time.Time) time.Time {
@@ -282,6 +357,113 @@ func (runtime *Runtime) scanRemoteGatewayParticipant(
 	}
 	return scanRemoteGatewayParticipantOverControl(ctx, record, profile, runtime.clusterControlOpener, addressOf,
 		runtime.controlReadDeadline, runtime.controlWriteDeadline)
+}
+
+// prepareRemoteFrontendDrain asks the gateway that owns record.Gateway to
+// close its own admission and persist the exact Prepared child. The request
+// carries the immutable decommission intent ID so a target with duplicate or
+// stale local intent rows fails closed instead of choosing a different drain.
+func (runtime *Runtime) prepareRemoteFrontendDrain(
+	ctx context.Context, record gateway.NodeRecord, intentID [32]byte,
+) error {
+	profile := runtime.config.TLSProfile
+	if profile == nil || runtime.clusterControlOpener == nil {
+		return fmt.Errorf("%w: remote gateway frontend drain control is unavailable", ErrScalingControllerBlocked)
+	}
+	addressOf := func(member gateway.ClusterCatalogDrainMember) (string, bool) {
+		runtime.clusterControlOpener.mu.RLock()
+		address, found := runtime.clusterControlOpener.members[member]
+		runtime.clusterControlOpener.mu.RUnlock()
+		return address, found
+	}
+	request, err := newFrontendDrainPrepareRequest(record, intentID)
+	if err != nil {
+		return err
+	}
+	response, err := roundTripRemoteFrontendParticipant(
+		ctx, record, profile, runtime.clusterControlOpener, addressOf,
+		request.marshal(), frontendDrainPrepareDiscriminator,
+		runtime.controlReadDeadline, runtime.controlWriteDeadline,
+	)
+	if err != nil {
+		return err
+	}
+	if response.Nonce != request.Nonce || !response.Evidence.ValidFor(record) {
+		return errors.Join(gateway.ErrScalingRevision, errFrontendParticipantWire)
+	}
+	return nil
+}
+
+// roundTripRemoteFrontendParticipant performs the common authenticated
+// endpoint, peer-identity, and bounded-frame checks for participant RPCs.
+// The caller supplies the operation-specific request and discriminator; a
+// response is always parsed as the fixed-size signed participant evidence
+// envelope.
+func roundTripRemoteFrontendParticipant(
+	ctx context.Context, record gateway.NodeRecord, profile *rafttransport.PeerTLS,
+	opener frontendParticipantMemberOpener, addressOf frontendParticipantMemberAddress,
+	request []byte, responseDiscriminator [8]byte,
+	readDeadline, writeDeadline rafttransport.DeadlineFunc,
+) (frontendParticipantScanResponse, error) {
+	if ctx == nil || !record.Valid() || profile == nil || opener == nil || addressOf == nil ||
+		len(request) == 0 {
+		return frontendParticipantScanResponse{}, fmt.Errorf(
+			"%w: remote gateway participant control is unavailable", gateway.ErrScalingRevision,
+		)
+	}
+	member := gateway.ClusterCatalogDrainMember{Node: record.Gateway.NodeID, Incarnation: record.Gateway.Incarnation}
+	address, found := addressOf(member)
+	if !found || address != record.GatewayAddress {
+		return frontendParticipantScanResponse{}, fmt.Errorf(
+			"%w: gateway participant endpoint is not the authenticated directory endpoint", gateway.ErrScalingRevision,
+		)
+	}
+	connection, err := opener.OpenGatewayControlMember(ctx, member)
+	if err != nil {
+		return frontendParticipantScanResponse{}, frontendParticipantRemoteError(ctx, err)
+	}
+	if connection == nil {
+		return frontendParticipantScanResponse{}, fmt.Errorf("%w: nil gateway participant connection", gateway.ErrScalingRevision)
+	}
+	defer connection.Close()
+	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stop()
+	peer := connection.PeerIdentity()
+	if connection.TrafficClass() != rafttransport.TrafficGatewayControl ||
+		peer.TrustDomain != profile.LocalIdentity().TrustDomain || peer.Node != member.Node ||
+		replication.Digest(connection.PeerKeyDigest()) != record.Gateway.ServiceKeyDigest {
+		return frontendParticipantScanResponse{}, fmt.Errorf("%w: gateway participant peer binding differs from the directory", gateway.ErrScalingIdentity)
+	}
+	var configuredWriteDeadline time.Time
+	if writeDeadline != nil {
+		configuredWriteDeadline = writeDeadline()
+	}
+	if deadline := frontendParticipantDeadline(ctx, configuredWriteDeadline); deadline.IsZero() {
+		return frontendParticipantScanResponse{}, errFrontendParticipantWire
+	} else if err := connection.SetWriteDeadline(deadline); err != nil {
+		return frontendParticipantScanResponse{}, err
+	}
+	if err := writeFrontendParticipantFrame(connection, request); err != nil {
+		return frontendParticipantScanResponse{}, frontendParticipantRemoteError(ctx, err)
+	}
+	var configuredReadDeadline time.Time
+	if readDeadline != nil {
+		configuredReadDeadline = readDeadline()
+	}
+	if deadline := frontendParticipantDeadline(ctx, configuredReadDeadline); deadline.IsZero() {
+		return frontendParticipantScanResponse{}, errFrontendParticipantWire
+	} else if err := connection.SetReadDeadline(deadline); err != nil {
+		return frontendParticipantScanResponse{}, err
+	}
+	encoded := make([]byte, frontendParticipantResponseWireSize)
+	if _, err := io.ReadFull(connection, encoded); err != nil {
+		return frontendParticipantScanResponse{}, frontendParticipantRemoteError(ctx, err)
+	}
+	response, err := unmarshalFrontendParticipantScanResponseWithDiscriminator(encoded, responseDiscriminator)
+	if err != nil {
+		return frontendParticipantScanResponse{}, errors.Join(gateway.ErrScalingRevision, errFrontendParticipantWire)
+	}
+	return response, nil
 }
 
 func scanRemoteGatewayParticipantOverControl(
@@ -367,6 +549,112 @@ func (runtime *Runtime) serveFrontendParticipantConnection(
 			}
 			return runtime.authority.ReadNode(readContext, node, incarnation)
 		}, runtime.scanLocalGatewayParticipant, runtime.controlReadDeadline, runtime.controlWriteDeadline)
+}
+
+func (runtime *Runtime) serveFrontendDrainPrepareConnection(
+	ctx context.Context, connection rafttransport.PeerConnection,
+) error {
+	if runtime == nil || ctx == nil || connection == nil {
+		return errFrontendParticipantAuth
+	}
+	return serveFrontendDrainPrepareConnectionWith(ctx, connection,
+		runtime.authorizeFrontendDrainPreparePeer,
+		func(readContext context.Context, node rafttransport.NodeID, incarnation uint64) (gateway.NodeRecord, error) {
+			if runtime.authority == nil {
+				return gateway.NodeRecord{}, errFrontendParticipantAuth
+			}
+			return runtime.authority.ReadNode(readContext, node, incarnation)
+		},
+		func(readContext context.Context, record gateway.NodeRecord, intentID [32]byte) error {
+			intent, err := runtime.decommissionIntentForNode(readContext, record)
+			if err != nil {
+				return err
+			}
+			if intent.ID != intentID {
+				return errors.Join(gateway.ErrScalingIdentity, errFrontendParticipantAuth)
+			}
+			return runtime.PrepareFrontendDrain(readContext, record)
+		}, runtime.scanLocalGatewayParticipant, runtime.controlReadDeadline, runtime.controlWriteDeadline)
+}
+
+// authorizeFrontendDrainPreparePeer is stricter than the read-only
+// participant scan. Preparing a remote drain closes a public listener and
+// persists a catalog proof, so only an authenticated controller-capable
+// gateway may request it; the target still verifies the exact durable intent.
+func (runtime *Runtime) authorizeFrontendDrainPreparePeer(
+	connection rafttransport.PeerConnection,
+) bool {
+	if runtime == nil || !runtime.authorizeFrontendParticipantPeer(connection) ||
+		runtime.config.Authorization == nil || connection == nil {
+		return false
+	}
+	return runtime.config.Authorization.Check(
+		connection.PeerIdentity().Node, serviceauthz.CapabilityMembership,
+	) == serviceauthz.DecisionAllow
+}
+
+func serveFrontendDrainPrepareConnectionWith(
+	ctx context.Context, connection rafttransport.PeerConnection,
+	authorize func(rafttransport.PeerConnection) bool,
+	readRecord func(context.Context, rafttransport.NodeID, uint64) (gateway.NodeRecord, error),
+	prepare func(context.Context, gateway.NodeRecord, [32]byte) error,
+	scanLocal func(context.Context, gateway.NodeRecord) (gateway.GatewayParticipantEvidence, error),
+	readDeadline, writeDeadline rafttransport.DeadlineFunc,
+) error {
+	if ctx == nil || connection == nil || authorize == nil || readRecord == nil ||
+		prepare == nil || scanLocal == nil {
+		return errFrontendParticipantAuth
+	}
+	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stop()
+	if !authorize(connection) {
+		return errFrontendParticipantAuth
+	}
+	var configuredReadDeadline time.Time
+	if readDeadline != nil {
+		configuredReadDeadline = readDeadline()
+	}
+	if deadline := frontendParticipantDeadline(ctx, configuredReadDeadline); deadline.IsZero() {
+		return errFrontendParticipantWire
+	} else if err := connection.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	requestBytes := make([]byte, frontendDrainPrepareRequestWireSize)
+	if _, err := io.ReadFull(connection, requestBytes); err != nil {
+		return err
+	}
+	request, err := unmarshalFrontendDrainPrepareRequest(requestBytes)
+	if err != nil {
+		return err
+	}
+	record, err := readRecord(ctx, request.NodeID, request.Incarnation)
+	if err != nil {
+		return errors.Join(gateway.ErrScalingRevision, err)
+	}
+	if !request.frontendParticipantScanRequest.matches(record) {
+		return errors.Join(gateway.ErrScalingIdentity, errFrontendParticipantAuth)
+	}
+	if err := prepare(ctx, record, request.IntentID); err != nil {
+		return err
+	}
+	evidence, err := scanLocal(ctx, record)
+	if err != nil {
+		return err
+	}
+	response := frontendParticipantScanResponse{Nonce: request.Nonce, Evidence: evidence}
+	if !response.valid() || !evidence.ValidFor(record) {
+		return errors.Join(gateway.ErrScalingRevision, errFrontendParticipantWire)
+	}
+	var configuredWriteDeadline time.Time
+	if writeDeadline != nil {
+		configuredWriteDeadline = writeDeadline()
+	}
+	if deadline := frontendParticipantDeadline(ctx, configuredWriteDeadline); deadline.IsZero() {
+		return errFrontendParticipantWire
+	} else if err := connection.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	return writeFrontendParticipantFrame(connection, response.marshalWithDiscriminator(frontendDrainPrepareDiscriminator))
 }
 
 func serveFrontendParticipantConnectionWith(

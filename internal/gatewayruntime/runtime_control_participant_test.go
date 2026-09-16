@@ -89,6 +89,14 @@ func (fixture participantControlDirectoryFixture) CatalogServiceFences(context.C
 	return nil, fixture.cut.CatalogGeneration, nil
 }
 
+func (fixture participantControlDirectoryFixture) ReadCompleteServiceDirectoryCut(context.Context) (serviceDirectoryCompleteCut, error) {
+	return serviceDirectoryCompleteCut{
+		Revision:          fixture.cut.Revision,
+		CatalogGeneration: fixture.cut.CatalogGeneration,
+		ScopesGeneration:  fixture.cut.CatalogGeneration,
+	}, nil
+}
+
 // TestOpenReplicaControlParticipantInitializesGatewayControlOpener exercises
 // the real participant-only startup branch. The opener must be constructed
 // from the authenticated manifest before that branch returns; injecting one

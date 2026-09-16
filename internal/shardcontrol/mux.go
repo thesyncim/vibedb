@@ -24,7 +24,7 @@ const (
 	// RF3 control plane. One logical service may own multiple fixed wire
 	// grammars (for example schema build, resume, and shadow build), so the
 	// route bound must cover discriminators rather than handler arguments.
-	MaxRoutes = 24
+	MaxRoutes = 25
 )
 
 // Handler owns one already-authenticated connection. Implementations consume

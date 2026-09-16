@@ -138,6 +138,11 @@ func FrontendContinuationScopeForReplicatedRequestWithProtocol(
 			return serviceauthz.FrontendContinuationScopeRecord{}, false
 		}
 		scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayRequestLedger, serviceauthz.ServiceOperationRequestLedger
+	case ReplicatedRouteSettlement:
+		if request.Capability != serviceauthz.CapabilityRequestLedger {
+			return serviceauthz.FrontendContinuationScopeRecord{}, false
+		}
+		scope.Action, scope.Operation = serviceauthz.FrontendActionGatewayRouteSettlement, serviceauthz.ServiceOperationRouteSettlement
 	case ReplicatedReadLeader, ReplicatedReadFollower, ReplicatedReadBatchLeader, ReplicatedQueryLeader:
 		if request.Capability == serviceauthz.CapabilityDataRead {
 			scope.Action, scope.Operation = serviceauthz.FrontendActionForwardedData,
@@ -151,7 +156,7 @@ func FrontendContinuationScopeForReplicatedRequestWithProtocol(
 		return serviceauthz.FrontendContinuationScopeRecord{}, false
 	}
 	if scope.Action != serviceauthz.FrontendActionForwardedData {
-		if (scope.Action != serviceauthz.FrontendActionGatewayCatalog && scope.Action != serviceauthz.FrontendActionGatewayRequestLedger && scope.Action != serviceauthz.FrontendActionGatewayExecutionPin && scope.Action != serviceauthz.FrontendActionGatewayTransactionRecovery) ||
+		if (scope.Action != serviceauthz.FrontendActionGatewayCatalog && scope.Action != serviceauthz.FrontendActionGatewayRequestLedger && scope.Action != serviceauthz.FrontendActionGatewayExecutionPin && scope.Action != serviceauthz.FrontendActionGatewayTransactionRecovery && scope.Action != serviceauthz.FrontendActionGatewayRouteSettlement) ||
 			request.Fence.Command.RelationManifestDigest == ([32]byte{}) {
 			return serviceauthz.FrontendContinuationScopeRecord{}, false
 		}
@@ -172,7 +177,7 @@ func replicatedRequestRequiresServiceScope(request *ReplicatedRequest) bool {
 		return false
 	}
 	switch request.Operation {
-	case ReplicatedRequestLedgerRead, ReplicatedExecutionPinRead, ReplicatedTransactionRead:
+	case ReplicatedRequestLedgerRead, ReplicatedExecutionPinRead, ReplicatedTransactionRead, ReplicatedRouteSettlement:
 		return true
 	case ReplicatedMembership:
 		// Membership proposals are cluster-topology control, not tenant/frontend

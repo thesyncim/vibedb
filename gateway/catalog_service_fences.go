@@ -5,6 +5,9 @@ import (
 	"encoding/binary"
 	"slices"
 
+	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
@@ -51,11 +54,38 @@ func (authority *ReplicatedCatalogAuthority) catalogServiceFences(
 	if err != nil {
 		return nil, 0, err
 	}
-	digest := route.Command.RelationManifestDigest
+	return catalogServiceFencesForRoute(snapshot, route.Group, route.Command, authority.relation)
+}
+
+// catalogServiceFencesForFrontendDrainRuntimeRoute projects the exact
+// catalog resource inventory from a certified local owner route. It is the
+// pure counterpart to ReplicatedCatalogAuthority.catalogServiceFences and is
+// used before a gateway session exists; it performs no route discovery and no
+// mutation authorization.
+func catalogServiceFencesForFrontendDrainRuntimeRoute(
+	snapshot *Snapshot, route FrontendDrainRuntimeCatalogRoute,
+) ([]serviceauthz.ServiceFence, uint64, error) {
+	if !route.valid() {
+		return nil, 0, ErrReplicatedCatalogConflict
+	}
+	return catalogServiceFencesForRoute(snapshot, route.Group, route.Command, route.Relation)
+}
+
+func catalogServiceFencesForRoute(
+	snapshot *Snapshot, group raftmember.GroupKey,
+	command raftservice.CommandFence, relationID replication.RelationID,
+) ([]serviceauthz.ServiceFence, uint64, error) {
+	if snapshot == nil || group == (raftmember.GroupKey{}) || !command.Valid() ||
+		relationID == 0 || relationID > replication.MaxRelationID {
+		return nil, 0, ErrReplicatedCatalogConflict
+	}
+	digest := command.RelationManifestDigest
 	var manifest, relation [16]byte
 	copy(manifest[:], digest[:16])
-	binary.BigEndian.PutUint16(relation[14:], uint16(authority.relation))
-	read := serviceauthz.ServiceFence{Action: serviceauthz.ServiceActionGatewayCatalogRead, Operation: serviceauthz.ServiceOperationCatalogRead, Group: route.Group, Relation: manifest, IntentID: digest, FenceDigest: digest}
+	binary.BigEndian.PutUint16(relation[14:], uint16(relationID))
+	read := serviceauthz.ServiceFence{Action: serviceauthz.ServiceActionGatewayCatalogRead,
+		Operation: serviceauthz.ServiceOperationCatalogRead, Group: group, Relation: manifest,
+		IntentID: digest, FenceDigest: digest}
 	point := read
 	point.Relation = relation
 	write := read
@@ -78,20 +108,18 @@ func (authority *ReplicatedCatalogAuthority) catalogServiceFences(
 		copy(relation[:], digest[:16])
 		appendScope := func(action serviceauthz.ServiceAction, operation serviceauthz.ServiceOperation) {
 			fences = append(fences, serviceauthz.ServiceFence{
-				Action: action, Operation: operation,
-				Group: descriptor.Group, Relation: relation, IntentID: digest, FenceDigest: digest,
+				Action: action, Operation: operation, Group: descriptor.Group,
+				Relation: relation, IntentID: digest, FenceDigest: digest,
 			})
 		}
 		if ledger {
 			appendScope(serviceauthz.ServiceActionGatewayRequestLedger, serviceauthz.ServiceOperationRequestLedger)
 			appendScope(serviceauthz.ServiceActionGatewayExecutionPin, serviceauthz.ServiceOperationExecutionPin)
 		}
-		// Native capture/prune sessions operate on the table's source group.
-		// They retain the exact topology capability and relation manifest;
-		// ledger-only and unplaced groups do not receive these scopes.
 		if placed {
 			appendScope(serviceauthz.ServiceActionGatewayCatalogRead, serviceauthz.ServiceOperationCatalogRead)
 			appendScope(serviceauthz.ServiceActionGatewayCatalogWrite, serviceauthz.ServiceOperationCatalogWrite)
+			appendScope(serviceauthz.ServiceActionGatewayRouteSettlement, serviceauthz.ServiceOperationRouteSettlement)
 		}
 		if participant {
 			appendScope(serviceauthz.ServiceActionGatewayTransactionRecovery, serviceauthz.ServiceOperationTransactionRecovery)

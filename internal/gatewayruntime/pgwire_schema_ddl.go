@@ -61,6 +61,54 @@ type gatewaySchemaDDLGate struct {
 	applied  uint64
 }
 
+// completeGatewayTableDropPostCommit owns the DropTable commit boundary. A
+// durable retirement is irreversible even when publication or its response
+// fails; only a precommit failure may release the old route gates. The
+// committed bit is returned by retire so an outcome-unknown authority write
+// can preserve the same fencing rule for the recovery/IF EXISTS retry.
+func completeGatewayTableDropPostCommit(
+	ctx context.Context,
+	retire func(context.Context) (bool, error),
+	refresh func(context.Context) error,
+	release func(context.Context) error,
+) (resultErr error) {
+	if ctx == nil || retire == nil {
+		return gateway.ErrSchemaRollout
+	}
+	committed, err := retire(ctx)
+	if err != nil {
+		if committed {
+			return err
+		}
+		if release != nil {
+			return errors.Join(err, release(ctx))
+		}
+		return err
+	}
+	if !committed {
+		if release != nil {
+			return errors.Join(gateway.ErrSchemaRollout, release(ctx))
+		}
+		return gateway.ErrSchemaRollout
+	}
+	if refresh == nil {
+		return gateway.ErrSchemaRollout
+	}
+	return refresh(ctx)
+}
+
+// retryGatewayTableDropAfterCommit is the exact pending-witness path used by
+// IF EXISTS and recovery. It retries the publication barrier without invoking
+// the durable retirement or releasing the old route gates.
+func retryGatewayTableDropAfterCommit(
+	ctx context.Context, pending bool, refresh func(context.Context) error,
+) error {
+	if ctx == nil || !pending || refresh == nil {
+		return gateway.ErrSchemaRollout
+	}
+	return refresh(ctx)
+}
+
 func (r *gatewaySchemaDDLRuntime) drainProof(ctx context.Context, result gateway.SchemaRolloutResult,
 	gates []gatewaySchemaDDLGate, plans []gateway.SchemaRolloutReplicaPlan,
 ) (schemainstall.DrainProof, error) {
@@ -648,6 +696,15 @@ func (r *gatewaySchemaDDLRuntime) recoverRetainedTableDrop(ctx context.Context) 
 	if err != nil {
 		return err
 	}
+	if table, _, pending := current.PendingProvisionedTableRetirement(); pending {
+		if r.refresh == nil {
+			return fmt.Errorf("%w: refresh live control directory after pending table retirement %q is unavailable", gateway.ErrSchemaRollout, table)
+		}
+		if err := r.refresh(ctx); err != nil {
+			return fmt.Errorf("refresh live control directory after pending table retirement: %w", err)
+		}
+		return nil
+	}
 	for _, profile := range current.ReplicatedTableProfiles() {
 		operation, operationErr := gatewayTableDropOperation(current, profile.Table)
 		if operationErr != nil {
@@ -893,6 +950,9 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 						return releaseErr
 					}
 				}
+				if err := r.refresh(ctx); err != nil {
+					return fmt.Errorf("refresh live control directory after recovered schema publication: %w", err)
+				}
 				return nil
 			}
 			target, plans, planErr := gateway.BuildReplicatedSchemaDDLPlan(current, operation, table, sql, resumed)
@@ -925,6 +985,9 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 					return releaseErr
 				}
 			}
+			if err := r.refresh(ctx); err != nil {
+				return fmt.Errorf("refresh live control directory after recovered schema publication: %w", err)
+			}
 			return nil
 		}
 	}
@@ -955,6 +1018,9 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 				noOpCount, shadowCount, gateway.ErrSchemaRolloutConflict)
 		}
 		if noOpCount == shadowCount {
+			if err := r.refresh(ctx); err != nil {
+				return fmt.Errorf("refresh live control directory after schema no-op: %w", err)
+			}
 			return nil
 		}
 	}
@@ -1066,6 +1132,9 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 		return fmt.Errorf("construct distributed schema plan: %w", err)
 	}
 	if len(plans) == 0 {
+		if err := r.refresh(ctx); err != nil {
+			return fmt.Errorf("refresh live control directory after recovered schema no-op: %w", err)
+		}
 		return nil
 	}
 	controller, err := gateway.NewSchemaRolloutController(gateway.SchemaRolloutControllerOptions{
@@ -1084,6 +1153,9 @@ func (r *gatewaySchemaDDLRuntime) Execute(ctx context.Context, sql string) (resu
 	}
 	if err = controller.Drain(ctx, plans, result.Authorization, proof); err != nil {
 		return fmt.Errorf("drain distributed schema predecessors: %w", err)
+	}
+	if err = r.refresh(ctx); err != nil {
+		return fmt.Errorf("refresh live control directory after schema publication: %w", err)
 	}
 	return nil
 }
@@ -1107,7 +1179,21 @@ func (r *gatewaySchemaDDLRuntime) DropTable(ctx context.Context, table string, i
 	}
 	placement, found := current.Placement(table)
 	if !found {
+		if pendingTable, _, pending := current.PendingProvisionedTableRetirement(); pending && pendingTable == table {
+			if err := retryGatewayTableDropAfterCommit(ctx, true, r.refresh); err != nil {
+				if r.refresh == nil {
+					return fmt.Errorf("%w: refresh live control directory after pending table retirement %q is unavailable", gateway.ErrSchemaRollout, table)
+				}
+				return fmt.Errorf("refresh live control directory after pending table retirement retry: %w", err)
+			}
+			return nil
+		}
 		if ifExists {
+			if r.refresh != nil {
+				if err := r.refresh(ctx); err != nil {
+					return fmt.Errorf("refresh live control directory after IF EXISTS table retirement retry: %w", err)
+				}
+			}
 			return nil
 		}
 		return fmt.Errorf("%w: %s", sqldriver.ErrTableNotFound, table)
@@ -1118,15 +1204,25 @@ func (r *gatewaySchemaDDLRuntime) DropTable(ctx context.Context, table string, i
 	}
 	gates := make([]gatewaySchemaDDLGate, 0, 1)
 	committed := false
+	released := false
+	releaseGates := func(releaseCtx context.Context) error {
+		if released {
+			return nil
+		}
+		released = true
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(releaseCtx), 30*time.Second)
+		defer cancel()
+		var releaseErr error
+		for index := len(gates) - 1; index >= 0; index-- {
+			releaseErr = errors.Join(releaseErr, r.releaseGate(releaseCtx, operation, gates[index], current))
+		}
+		return releaseErr
+	}
 	defer func() {
 		if committed {
 			return
 		}
-		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
-		for index := len(gates) - 1; index >= 0; index-- {
-			resultErr = errors.Join(resultErr, r.releaseGate(releaseCtx, operation, gates[index], current))
-		}
+		resultErr = errors.Join(resultErr, releaseGates(ctx))
 	}()
 	for _, descriptor := range current.ReplicatedShardDescriptors() {
 		if descriptor.Distribution != placement.Distribution {
@@ -1146,9 +1242,36 @@ func (r *gatewaySchemaDDLRuntime) DropTable(ctx context.Context, table string, i
 	if len(gates) == 0 {
 		return gateway.ErrReplicatedRoute
 	}
-	if err = r.authority.RetireProvisionedTable(ctx, table, operation); err != nil {
+	retire := func(retireCtx context.Context) (bool, error) {
+		if retireErr := r.authority.RetireProvisionedTable(retireCtx, table, operation); retireErr != nil {
+			// RetireProvisionedTable can report an outcome-unknown catalog write
+			// after the RF3 head has already committed. Preserve the old route
+			// gates whenever the durable witness proves that this exact operation
+			// owns the committed removal; the next IF EXISTS/recovery pass will
+			// retry publication from that witness.
+			if observed, readErr := r.authority.Read(retireCtx); readErr == nil {
+				pendingTable, pendingOperation, pending := observed.PendingProvisionedTableRetirement()
+				if pending && pendingTable == table && pendingOperation == operation {
+					committed = true
+					return true, retireErr
+				}
+			}
+			return false, retireErr
+		}
+		// The durable catalog retirement is the commit point. Once it succeeds,
+		// publication is a retryable postcommit barrier and the old route gates
+		// must remain fenced until the exact current cut is installed.
+		committed = true
+		return true, nil
+	}
+	publish := func(publishCtx context.Context) error {
+		if refreshErr := r.refresh(publishCtx); refreshErr != nil {
+			return fmt.Errorf("refresh live control directory after table retirement: %w", refreshErr)
+		}
+		return nil
+	}
+	if err = completeGatewayTableDropPostCommit(ctx, retire, publish, releaseGates); err != nil {
 		return err
 	}
-	committed = true
 	return nil
 }

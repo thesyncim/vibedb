@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 
@@ -112,9 +113,10 @@ func NewReplicatedControlDirectory(snapshot ReplicatedControlDirectorySnapshot) 
 	return directory, nil
 }
 
-// Apply publishes one complete newer cut. Equal revisions are accepted only
-// for an exact replay; gaps are allowed because the reader returns a complete
-// snapshot and the next update re-establishes a newer CAS boundary.
+// Apply publishes one complete newer cut. Equal revisions are accepted for an
+// exact replay or a catalog-only generation advance with the same physical
+// records; gaps are allowed because the reader returns a complete snapshot
+// and the next update re-establishes a newer CAS boundary.
 func (directory *ReplicatedControlDirectory) Apply(snapshot ReplicatedControlDirectorySnapshot) error {
 	if directory == nil || !snapshot.Valid() {
 		return ErrReplicatedControlDirectory
@@ -122,12 +124,17 @@ func (directory *ReplicatedControlDirectory) Apply(snapshot ReplicatedControlDir
 	directory.mu.Lock()
 	defer directory.mu.Unlock()
 	if snapshot.Revision < directory.revision || snapshot.CatalogGeneration < directory.catalogGeneration {
-		return ErrReplicatedControlRevision
+		return fmt.Errorf("%w: incoming revision=%d catalog=%d current revision=%d catalog=%d",
+			ErrReplicatedControlRevision, snapshot.Revision, snapshot.CatalogGeneration,
+			directory.revision, directory.catalogGeneration)
 	}
 	if snapshot.Revision == directory.revision {
-		if !sameControlDirectoryRecords(directory.current, snapshot.Nodes) ||
-			snapshot.CatalogGeneration != directory.catalogGeneration {
-			return ErrReplicatedControlRevision
+		if !sameControlDirectoryRecords(directory.current, snapshot.Nodes) {
+			return fmt.Errorf("%w: same revision=%d physical records changed incoming=%d current=%d",
+				ErrReplicatedControlRevision, snapshot.Revision, len(snapshot.Nodes), len(directory.current))
+		}
+		if snapshot.CatalogGeneration > directory.catalogGeneration {
+			directory.catalogGeneration = snapshot.CatalogGeneration
 		}
 		return nil
 	}

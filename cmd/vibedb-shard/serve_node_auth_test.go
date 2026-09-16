@@ -128,7 +128,8 @@ func TestRF3EmbeddedGatewayBindsBeforeNativeAdmissionWithIndependentRights(t *te
 	}
 	request := shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
 		Authority: serviceauthz.Authority{Node: frontendNode, Generation: 1}, Capability: serviceauthz.CapabilityDataRead,
-		Fence: shardservice.ReplicatedFence{Group: group.Route.Group, AllocationGeneration: identity.AllocationGeneration}}
+		Fence: shardservice.ReplicatedFence{Group: group.Route.Group, AllocationGeneration: identity.AllocationGeneration,
+			Command: owner.state.Command}}
 	endpoint := gateway.ReplicatedEndpoint{Address: manifest.Listeners.Native, Node: storageNode, Member: identity.MemberID, StoreID: identity.StoreID, NodeIncarnation: identity.NodeIncarnation}
 	reply, err := prepared.client.DoReplicated(ctx, endpoint, &request)
 	if err != nil || reply == nil || reply.Kind != shardservice.ReplicatedHandshake {

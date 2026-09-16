@@ -382,7 +382,8 @@ func (client *membershipTransitionSQLClient) ProbeReplicated(
 	client.probes++
 	response, err := client.delegate.DoReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
 		Operation: shardservice.ReplicatedProbe, Capability: capability,
-		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration},
+		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+			Command: route.Command},
 	})
 	if err != nil || !client.transition {
 		if err == nil && response != nil && response.HasState && client.observedCommand.Valid() {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -53,6 +54,18 @@ func TestRunServeRF3ArgumentExitClasses(t *testing.T) {
 				t.Fatalf("run(%q) = %d, want %d", tc.args, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRF3ServiceDirectoryRefreshRequiresNodeIncarnation(t *testing.T) {
+	if rf3ServiceDirectoryRefreshConfigured(rf3Manifest{GatewaySeeds: []nodecontrol.BootstrapGatewaySeed{{}}}, false) {
+		t.Fatal("seed-only RF3 manifest inferred managed refresh without a physical node log")
+	}
+	if !rf3ServiceDirectoryRefreshConfigured(rf3Manifest{NodeLog: &rf3NodeLogManifest{}}, false) {
+		t.Fatal("physical node manifest did not enable the mandatory refresh")
+	}
+	if !rf3ServiceDirectoryRefreshConfigured(rf3Manifest{NodeIncarnation: 1}, true) {
+		t.Fatal("embedded node manifest did not enable the mandatory refresh")
 	}
 }
 
@@ -332,7 +345,7 @@ func TestRF3NativeServingAuthorityActivatesTargetOnlyAtFinalOwnedRF3(t *testing.
 	membershipServing := rf3NativeMoveAuthority(registry, manifest, group, base)
 	catalogProbe := shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
 		Capability: serviceauthz.CapabilityTopology, Fence: shardservice.ReplicatedFence{Group: group,
-			AllocationGeneration: base.Binding.AllocationGeneration}}
+			AllocationGeneration: base.Binding.AllocationGeneration, Command: state.Command}}
 	if membershipServing(state, &catalogProbe) {
 		t.Fatal("unpromoted learner served catalog control")
 	}

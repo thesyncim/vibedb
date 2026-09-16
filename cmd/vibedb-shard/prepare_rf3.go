@@ -69,7 +69,7 @@ type prepareRF3Manifest struct {
 	Members               []prepareRF3Member                        `json:"members"`
 	// TargetMember is local adapter state for learner reservation. It is never
 	// serialized into a controller payload or a serving manifest.
-	TargetMember           *prepareRF3Member                         `json:"-"`
+	TargetMember *prepareRF3Member `json:"-"`
 }
 
 type prepareRF3SplitControl struct {

@@ -77,7 +77,15 @@ func (ack FrontendDrainAck) Valid() bool {
 // must continue serving.
 var errFrontendAdmissionDrained = errors.New("gatewayruntime: frontend admission drained")
 
-const maxFrontendContinuationTokens = 65536
+const (
+	// These are deliberately below serviceauthz's wire-format absolutes. A
+	// frontend drain stores both the immutable token proof and its scope set in
+	// one 4 MiB replicated catalog document; admission must therefore stop
+	// before a valid but unpersistable proof can exist. Rejection at admission
+	// is explicit -- a drain never silently drops an accepted token.
+	maxFrontendContinuationTokens = 8192
+	maxFrontendContinuationScopes = 4096
+)
 
 type frontendAdmission struct {
 	mu sync.Mutex
@@ -241,7 +249,63 @@ func (runtime *Runtime) InstallFrontendContinuationGrant(
 	if runtime == nil || runtime.frontend == nil || digest == ([32]byte{}) || !scope.Valid() {
 		return false
 	}
+	if runtime.serviceDirectory == nil {
+		return false
+	}
+	cut, ok := runtime.serviceDirectory.Cut()
+	if !ok {
+		return false
+	}
+	committed := false
+	for _, grant := range cut.ContinuationGrants {
+		if grant.GrantDigest != digest || (grant.State != serviceauthz.ContinuationGrantPrepared &&
+			grant.State != serviceauthz.ContinuationGrantEnforcing) {
+			continue
+		}
+		for _, protocol := range grant.AcceptedConnectionProtocols {
+			if protocol == scope {
+				committed = true
+				break
+			}
+		}
+		break
+	}
+	if !committed {
+		return false
+	}
 	return runtime.frontend.installGrant(digest, scope)
+}
+
+// installPublishedFrontendContinuation is the receiver acknowledgement
+// boundary for a local frontend. The catalog grant may be durable before a
+// receiver has applied its complete service cut; credentials become visible
+// to accepted sockets only after ApplyCommittedCut succeeds.
+func (runtime *Runtime) installPublishedFrontendContinuation(
+	cut serviceauthz.ServiceDirectoryCut,
+) {
+	if runtime == nil || runtime.frontend == nil || !cut.Valid() {
+		return
+	}
+	runtime.frontend.mu.Lock()
+	identity := runtime.frontend.identity
+	runtime.frontend.mu.Unlock()
+	for _, grant := range cut.ContinuationGrants {
+		if grant.State != serviceauthz.ContinuationGrantEnforcing ||
+			grant.PhysicalNode != identity.NodeID || grant.PhysicalIncarnation != identity.Incarnation ||
+			grant.GatewayServiceID != identity.GatewayNodeID ||
+			grant.GatewaySessionID != identity.SessionID ||
+			grant.GatewaySessionRevision != identity.SessionRevision {
+			continue
+		}
+		seen := [3]bool{}
+		for _, protocol := range grant.AcceptedConnectionProtocols {
+			if !protocol.Valid() || seen[protocol] {
+				continue
+			}
+			seen[protocol] = true
+			runtime.InstallFrontendContinuationGrant(grant.GrantDigest, protocol)
+		}
+	}
 }
 
 // ScanGatewayParticipant implements the catalog's optional live participant
@@ -616,8 +680,113 @@ func (runtime *Runtime) restoreFrontendDrainFromDirectory(ctx context.Context) e
 			directoryRevision = runtime.config.FrontendDrainIdentity.DirectoryRevision
 		}
 	}
-	runtime.syncFrontendDrainFromDirectoryWithAdmission(nodes, directoryRevision, false)
+	if !runtime.syncFrontendDrainFromDirectoryWithAdmission(nodes, directoryRevision, false) {
+		return nil
+	}
+
+	// The node lifecycle tells us whether admission must be closed; the child
+	// row tells us which immutable continuation proof may be installed after a
+	// restart. Never revive a token from a different physical or gateway
+	// session, even when the process-local frontend starts with an empty token
+	// map.
+	reader := runtime.config.ControlDirectory
+	if reader == nil && runtime.authority != nil {
+		reader = runtime.authority
+	}
+	if reader == nil {
+		return nil
+	}
+	drainReader, ok := any(reader).(gateway.FrontendDrainRecordReader)
+	if !ok && runtime.authority != nil {
+		drainReader, ok = any(runtime.authority).(gateway.FrontendDrainRecordReader)
+	}
+	if !ok {
+		return nil
+	}
+	_, records, err := drainReader.ReadFrontendDrainRecordCut(ctx)
+	if err != nil {
+		return err
+	}
+	var currentNode gateway.NodeRecord
+	for _, candidate := range nodes {
+		if candidate.Valid() && runtime.frontend.identityMatchesNode(candidate) {
+			currentNode = candidate
+			break
+		}
+	}
+	if currentNode.NodeID == (rafttransport.NodeID{}) {
+		return nil
+	}
+	var record *gateway.FrontendDrainRecord
+	for index := range records {
+		candidate := records[index]
+		if candidate.PhysicalNode != currentNode.NodeID || candidate.PhysicalIncarnation != currentNode.Incarnation ||
+			candidate.GatewayServiceID != currentNode.Gateway.NodeID || candidate.GatewayIncarnation != currentNode.Gateway.Incarnation ||
+			candidate.GatewayIdentityServiceID != currentNode.Gateway.ServiceID ||
+			candidate.GatewaySessionID != currentNode.Gateway.SessionID ||
+			candidate.GatewaySessionRevision != currentNode.Gateway.SessionRevision {
+			continue
+		}
+		if record != nil {
+			return gateway.ErrScalingIdentity
+		}
+		copyOfRecord := candidate
+		record = &copyOfRecord
+		break
+	}
+	if record == nil {
+		return nil
+	}
+	if !record.Valid() || record.Lifecycle != gateway.FrontendDrainRetired && record.NodeRevision != currentNode.Revision ||
+		record.Lifecycle == gateway.FrontendDrainRetired &&
+			(record.NodeRevision == ^uint64(0) || record.NodeRevision+1 != currentNode.Revision) {
+		return gateway.ErrScalingIdentity
+	}
+	if currentNode.Lifecycle == gateway.NodeActive && record.Lifecycle != gateway.FrontendDrainPrepared {
+		return gateway.ErrScalingState
+	}
+	if currentNode.Lifecycle == gateway.NodeDraining && record.Lifecycle != gateway.FrontendDrainEnforcing {
+		return gateway.ErrScalingState
+	}
+	if currentNode.Lifecycle == gateway.NodeDecommissioned && record.Lifecycle != gateway.FrontendDrainRetired {
+		return gateway.ErrScalingState
+	}
+	if currentNode.Lifecycle >= gateway.NodeDraining {
+		runtime.BeginFrontendDrain()
+	} else if record.Lifecycle == gateway.FrontendDrainPrepared {
+		// The process may have crashed after persisting Prepared and before the
+		// node CAS. Keep admission closed until the retry can complete that CAS.
+		runtime.BeginFrontendDrain()
+	}
+	if record.ContinuationGrant != nil && record.Lifecycle == gateway.FrontendDrainEnforcing {
+		seen := [3]bool{}
+		for _, protocol := range record.ContinuationGrant.AcceptedConnectionProtocols {
+			if !protocol.Valid() || seen[protocol] {
+				continue
+			}
+			seen[protocol] = true
+			runtime.InstallFrontendContinuationGrant(record.ContinuationGrant.GrantDigest, protocol)
+		}
+	}
+	if runtime.serviceDirectory != nil {
+		if cut, ok := runtime.serviceDirectory.Cut(); ok {
+			runtime.installPublishedFrontendContinuation(cut)
+		}
+	}
 	return nil
+}
+
+func (frontend *frontendAdmission) identityMatchesNode(node gateway.NodeRecord) bool {
+	if frontend == nil {
+		return false
+	}
+	frontend.mu.Lock()
+	identity := frontend.identity
+	frontend.mu.Unlock()
+	return identity.NodeID == node.NodeID && identity.Incarnation == node.Incarnation &&
+		identity.GatewayNodeID == node.Gateway.NodeID && identity.GatewayIncarnation == node.Gateway.Incarnation &&
+		identity.GatewayServiceKeyDigest == node.Gateway.ServiceKeyDigest &&
+		identity.SessionID == node.Gateway.SessionID && identity.SessionRevision == node.Gateway.SessionRevision
 }
 
 // frontendAdmissionListener fences native listener admission and attaches a

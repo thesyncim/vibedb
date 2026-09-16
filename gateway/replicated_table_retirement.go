@@ -33,6 +33,18 @@ type replicatedTableRetirement struct {
 	Distribution     distribution.DistributionName
 }
 
+// PendingProvisionedTableRetirement reports the durable namespace removal
+// witness, if the catalog is between the committed removal and inventory
+// cleanup barriers. Callers use this to retry publication after a lost
+// response without treating the already-committed table drop as precommit.
+func (s *Snapshot) PendingProvisionedTableRetirement() (table string, operation [32]byte, ok bool) {
+	if s == nil || s.tableRetirement == nil {
+		return "", [32]byte{}, false
+	}
+	retirement := s.tableRetirement
+	return retirement.Table, retirement.Operation, true
+}
+
 func (r replicatedTableRetirement) valid() bool {
 	return r.Operation != ([32]byte{}) && r.Proof != ([32]byte{}) &&
 		r.SourceGeneration != 0 && r.SourceGeneration != math.MaxUint64 &&

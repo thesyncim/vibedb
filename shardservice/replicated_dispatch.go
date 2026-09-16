@@ -113,6 +113,15 @@ func (server *ReplicatedServer) DispatchReplicated(ctx context.Context, call Rep
 	if binding == nil || !binding.gatewayProof.Valid() || !binding.storageProof.Valid() {
 		return nil, ErrReplicatedAuthentication
 	}
+	if server.serviceDirectoryRequired.Load() && server.directory.Load() == nil {
+		// Match the authenticated socket path: the mandatory committed gate is
+		// not installed yet, so the caller receives a bounded no-state
+		// availability reply and may retry discovery. A present gate continues
+		// through the normal identity and capability checks below.
+		return &replicatedReplyLease{reply: &ReplicatedReply{Response: ReplicatedResponse{
+			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
+		}}}, nil
+	}
 	if err := context.Cause(ctx); err != nil {
 		return nil, err
 	}
@@ -160,7 +169,7 @@ func (server *ReplicatedServer) DispatchReplicated(ctx context.Context, call Rep
 	}()
 	if call.Request.Fence.Group.ClusterID != binding.principal.TrustDomain.ClusterID ||
 		call.Request.Fence.Group.ClusterIncarnation != binding.principal.TrustDomain.ClusterIncarnation ||
-		!server.authorizeReplicatedPeer(binding.servicePeer, &call.Request) {
+		!server.authorizeReplicatedPeerWithDirectoryRefresh(requestCtx, binding.servicePeer, &call.Request) {
 		return &replicatedReplyLease{reply: &ReplicatedReply{Response: ReplicatedResponse{
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnauthorized,
 		}}}, nil

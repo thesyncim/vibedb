@@ -63,7 +63,8 @@ func (executor *ReplicatedExecutor) discoverResponsiveLeader(
 				} else {
 					response, err = executor.doReplicated(attempt, endpoint, &shardservice.ReplicatedRequest{
 						Operation: shardservice.ReplicatedProbe, Capability: capability,
-						Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration},
+						Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+							Command: route.Command},
 					})
 				}
 			} else {
@@ -107,6 +108,16 @@ func (executor *ReplicatedExecutor) discoverResponsiveLeader(
 					joined = errors.Join(joined, catalogProbeResultError(result.endpoint, result.response, result.err))
 				} else {
 					joined = errors.Join(joined, result.err)
+				}
+				startNext(0)
+				continue
+			}
+			if validReplicatedUnavailableWithoutState(result.response) {
+				if catalog {
+					joined = errors.Join(joined, catalogProbeResultError(result.endpoint, result.response,
+						&ReplicatedRefusalError{Code: result.response.Refusal}))
+				} else {
+					joined = errors.Join(joined, &ReplicatedRefusalError{Code: result.response.Refusal})
 				}
 				startNext(0)
 				continue

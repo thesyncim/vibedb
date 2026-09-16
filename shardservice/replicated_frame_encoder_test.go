@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
@@ -184,15 +183,14 @@ func TestFrameEncoderRoundTripReplicatedUsesOwnedArena(t *testing.T) {
 	// A probe carries no payload, so it is the operation that actually
 	// exercises the connection-owned arena path this test is named for;
 	// payload-bearing operations borrow a pooled scratch buffer instead (see
-	// TestFrameEncoderBorrowedCanonicalBoundaries). A probe fence is loose
-	// (unlike other operations' exact fence), so only Group and
-	// AllocationGeneration may be set.
+	// TestFrameEncoderBorrowedCanonicalBoundaries). A probe carries the exact
+	// catalog command contract, while the response supplies member, store,
+	// incarnation, and term.
 	probeFence := testReplicatedFence()
 	probeFence.MemberID = 0
 	probeFence.StoreID = [16]byte{}
 	probeFence.NodeIncarnation = 0
 	probeFence.Term = 0
-	probeFence.Command = raftservice.CommandFence{}
 	request := &ReplicatedRequest{
 		Operation: ReplicatedProbe,
 		Authority: serviceauthz.Authority{

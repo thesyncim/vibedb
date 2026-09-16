@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"sync"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
 
 func TestReplicatedScalingNodeLifecycleDirectoryCutAndRestart(t *testing.T) {
@@ -888,6 +891,307 @@ func TestReplicatedScalingRetirementPersistsEvidenceAndRevalidatesCut(t *testing
 	}
 }
 
+func TestReplicatedScalingCertifiedPhysicalReplacementRotatesKey(t *testing.T) {
+	ctx := context.Background()
+	authority, _, current := newCatalogAuthorityFixture(t)
+	nodeID := rafttransport.NodeID{0xc1}
+	joining := scalingTestNodeRecord(nodeID, 1, NodeJoining, 1)
+	if err := authority.PutNode(ctx, joining, 0); err != nil {
+		t.Fatal(err)
+	}
+	active := joining
+	active.Lifecycle, active.Revision = NodeActive, 2
+	if err := authority.PutNode(ctx, active, joining.Revision); err != nil {
+		t.Fatal(err)
+	}
+	request := ScalingIntentRequest{Kind: ScalingDecommission, RequestID: [32]byte{0xc2},
+		Drain: NodeReference{NodeID: nodeID, Incarnation: 1}, MaxMoves: 1, MaxMigrationBytes: 1 << 20}
+	intent := ScalingIntent{ID: request.ID(), Request: request, CatalogGeneration: current.Generation(),
+		Revision: 1, DirectoryRevision: 1, State: ScalingReserved}
+	if err := authority.PutScalingIntent(ctx, intent, 0); err != nil {
+		t.Fatalf("reserve decommission intent: %v", err)
+	}
+	running := intent
+	running.State, running.Revision, running.DirectoryRevision = ScalingRunning, 2, 2
+	if err := authority.PutScalingIntent(ctx, running, intent.Revision); err != nil {
+		t.Fatalf("start decommission intent: %v", err)
+	}
+	draining := active
+	draining.Lifecycle, draining.Revision = NodeDraining, 3
+	if err := authority.PutNode(ctx, draining, active.Revision); err != nil {
+		t.Fatal(err)
+	}
+
+	evidence, err := authority.ScanNodeReferences(ctx, nodeID, 1)
+	if err != nil || !evidence.ZeroAllReferences() {
+		t.Fatalf("pre-retirement evidence=%+v err=%v", evidence, err)
+	}
+	if err := authority.RetireNode(ctx, nodeID, 1, draining.Revision, evidence); err != nil {
+		t.Fatalf("retire predecessor: %v", err)
+	}
+	predecessor, err := authority.ReadNode(ctx, nodeID, 1)
+	if err != nil || predecessor.Lifecycle != NodeDecommissioned || !predecessor.HasRetirementProof() {
+		t.Fatalf("predecessor=%+v err=%v", predecessor, err)
+	}
+	terminalEvidence, err := authority.ScanDecommissionedNodeReferences(ctx, nodeID, 1)
+	if err != nil || !terminalEvidence.ZeroAllReferences() {
+		t.Fatalf("terminal evidence=%+v err=%v", terminalEvidence, err)
+	}
+	// A terminal row with no certified completion cannot authorize a new
+	// physical incarnation. Build a syntactically complete digest from the
+	// still-running intent, but leave the durable intent state incomplete.
+	incompleteSuccessor := scalingTestNodeRecord(nodeID, 2, NodeJoining, 1)
+	incompleteSuccessor.ServiceKeyDigest = replication.Digest{0xc3}
+	incompleteSuccessor.Replacement = &NodeReplacementProof{
+		PredecessorIncarnation: 1, PredecessorServiceKeyDigest: predecessor.ServiceKeyDigest,
+		IntentID: running.ID, ProofDigest: replication.Digest{0xc4},
+	}
+	fakeComplete := running
+	fakeComplete.State = ScalingComplete
+	fakeComplete.Revision, fakeComplete.DirectoryRevision = 3, 3
+	incompleteDigest, err := CertifiedNodeReplacementDigest(predecessor, fakeComplete, incompleteSuccessor)
+	if err != nil {
+		t.Fatalf("incomplete replacement digest: %v", err)
+	}
+	incompleteSuccessor.Replacement.ProofDigest = incompleteDigest
+	if err := authority.PutNode(ctx, incompleteSuccessor, 0); !errors.Is(err, ErrScalingState) {
+		t.Fatalf("incomplete predecessor intent accepted: %v", err)
+	}
+
+	complete := running
+	complete.State, complete.Revision, complete.DirectoryRevision = ScalingComplete, 3, 3
+	complete.Evidence = SafeToStopEvidenceFromReference(terminalEvidence)
+	complete.Evidence.DrainAcknowledged = true
+	complete.Evidence.RetiredAcknowledged = true
+	complete.Evidence.CatalogControlMigrated = true
+	if err := authority.PutScalingIntent(ctx, complete, running.Revision); err != nil {
+		t.Fatalf("complete predecessor intent: %v", err)
+	}
+
+	successor := scalingTestNodeRecord(nodeID, 2, NodeJoining, 1)
+	successor.ServiceKeyDigest = replication.Digest{0xc5}
+	successor.Replacement = &NodeReplacementProof{
+		PredecessorIncarnation: 1, PredecessorServiceKeyDigest: predecessor.ServiceKeyDigest,
+		IntentID: complete.ID, ProofDigest: replication.Digest{0xc6},
+	}
+	digest, err := CertifiedNodeReplacementDigest(predecessor, complete, successor)
+	if err != nil {
+		t.Fatalf("certified replacement digest: %v", err)
+	}
+	successor.Replacement.ProofDigest = digest
+	if !successor.Valid() {
+		t.Fatal("certified successor is invalid")
+	}
+	if err := authority.PutNode(ctx, successor, 0); err != nil {
+		t.Fatalf("publish certified successor: %v", err)
+	}
+	cut, err := authority.ReadNodeDirectoryCut(ctx)
+	if err != nil || len(cut.Nodes) != 1 || !reflect.DeepEqual(cut.Nodes[0], successor) ||
+		len(cut.CurrentNodes()) != 1 || !reflect.DeepEqual(cut.CurrentNodes()[0], successor) {
+		t.Fatalf("replacement projection cut=%+v current=%+v err=%v", cut.Nodes, cut.CurrentNodes(), err)
+	}
+	if _, err := authority.ReadNode(ctx, nodeID, 1); !errors.Is(err, ErrScalingNodeMissing) {
+		t.Fatalf("predecessor row survived atomic replacement: %v", err)
+	}
+
+	// The writer keeps the successor marker on the latest row, so a later
+	// same-key incarnation still has to present a new certified predecessor.
+	sameKey := successor
+	sameKey.Incarnation = 3
+	sameKey.Revision = 1
+	sameKey.Replacement = nil
+	if err := authority.PutNode(ctx, sameKey, 0); !errors.Is(err, ErrScalingState) {
+		t.Fatalf("same-key physical restart accepted: %v", err)
+	}
+}
+
+func TestReplicatedScalingFullTerminalHistoryRetainsSafeToStopUntilReplacementGC(t *testing.T) {
+	ctx := context.Background()
+	authority, client, current := newCatalogAuthorityFixture(t)
+	const historyCount = maxScalingTerminalHistory
+	nodes := make([]NodeRecord, historyCount)
+	nodeEntries := make([]scalingNodeDirectoryEntry, historyCount)
+	historyEntries := make([]scalingIDDirectoryEntry, historyCount)
+	for index := range nodes {
+		nodeID := rafttransport.NodeID{byte(index + 1), byte((index + 1) >> 8)}
+		node := scalingTestNodeRecord(nodeID, 1, NodeDecommissioned, 2)
+		node.ServiceKeyDigest = replication.Digest{byte(index + 1), 0xa5}
+		node.RetirementScanDigest = replication.Digest{byte(index + 1), 0xa6}
+		node.RetirementScanDirectoryRevision, node.RetirementScanCutRevision = 1, 1
+		nodes[index] = node
+		raw := mustAppendNode(node)
+		nodeDigest := scalingDigest(raw)
+		nodeEntries[index] = scalingNodeDirectoryEntry{NodeID: append([]byte(nil), node.NodeID[:]...),
+			Incarnation: node.Incarnation, Revision: node.Revision, Digest: append([]byte(nil), nodeDigest[:]...)}
+		clientKey := scalingNodeKey(node.NodeID, node.Incarnation)
+		client.rows[string(clientKey)] = raw
+
+		request := ScalingIntentRequest{Kind: ScalingDecommission,
+			RequestID: [32]byte{byte(index + 1), 0xa7},
+			Drain:     NodeReference{NodeID: node.NodeID, Incarnation: node.Incarnation}, MaxMoves: 1, MaxMigrationBytes: 1 << 20}
+		intent := ScalingIntent{ID: request.ID(), Request: request, CatalogGeneration: current.Generation(),
+			Revision: 1, DirectoryRevision: 1, State: ScalingComplete,
+			Evidence: SafeToStopEvidence{
+				NodeID: node.NodeID, NodeIncarnation: node.Incarnation, ScanCatalogGeneration: current.Generation(),
+				ScanDirectoryRevision: node.Revision, ScanDirectoryDigest: replication.Digest{byte(index + 1), 0xa8},
+				CatalogHeadDigest: replication.Digest{byte(index + 1), 0xa9},
+				ServingReplicas:   0, LearnerReplicas: 0, EnrolledTargets: 0, OutstandingMoves: 0,
+				CatalogVoters: 0, ControlVoters: 0, GatewayParticipants: 0,
+				DrainAcknowledged: true, RetiredAcknowledged: true, CatalogControlMigrated: true,
+				Digest: replication.Digest{byte(index + 1), 0xaa},
+			},
+		}
+		raw = mustAppendScalingIntent(intent)
+		client.rows[string(scalingIntentKey(intent.ID))] = raw
+		intentDigest := scalingDigest(raw)
+		historyEntries[index] = scalingIDDirectoryEntry{ID: append([]byte(nil), intent.ID[:]...), Revision: intent.Revision,
+			Digest: append([]byte(nil), intentDigest[:]...)}
+	}
+	slices.SortFunc(nodeEntries, func(left, right scalingNodeDirectoryEntry) int {
+		return compareNodeDirectoryEntry(left, right)
+	})
+	slices.SortFunc(historyEntries, func(left, right scalingIDDirectoryEntry) int {
+		return bytes.Compare(left.ID, right.ID)
+	})
+	nodeDirectoryRaw, err := appendScalingNodeDirectoryAt(nil, nodeEntries, 2)
+	if err != nil {
+		t.Fatalf("full node directory: %v", err)
+	}
+	historyRaw, err := appendScalingIDDirectory(nil, scalingHistoryDocumentID[:], historyEntries, maxScalingTerminalHistoryBytes)
+	if err != nil {
+		t.Fatalf("full terminal history: %v", err)
+	}
+	client.mu.Lock()
+	client.rows[string(scalingNodeDirectoryKey)] = nodeDirectoryRaw
+	client.rows[string(scalingHistoryKey)] = historyRaw
+	client.mu.Unlock()
+
+	// Install one still-live Running intent against the first terminal row. Its
+	// completion is the candidate insertion that would evict history if every
+	// existing terminal proof were not protected.
+	target := nodes[0]
+	request := ScalingIntentRequest{Kind: ScalingDecommission, RequestID: [32]byte{0xab},
+		Drain: NodeReference{NodeID: target.NodeID, Incarnation: target.Incarnation}, MaxMoves: 1, MaxMigrationBytes: 1 << 20}
+	running := ScalingIntent{ID: request.ID(), Request: request, CatalogGeneration: current.Generation(),
+		Revision: 1, DirectoryRevision: 1, State: ScalingRunning}
+	runningRaw := mustAppendScalingIntent(running)
+	runningDigest := scalingDigest(runningRaw)
+	activeEntry := scalingIDDirectoryEntry{ID: append([]byte(nil), running.ID[:]...), Revision: running.Revision,
+		Digest: append([]byte(nil), runningDigest[:]...)}
+	activeDirectoryRaw, err := appendScalingIDDirectory(nil, scalingIntentDirectoryDocumentID[:],
+		[]scalingIDDirectoryEntry{activeEntry}, maxScalingIntentDirectoryBytes)
+	if err != nil {
+		t.Fatalf("active scaling directory: %v", err)
+	}
+	client.mu.Lock()
+	client.rows[string(scalingIntentKey(running.ID))] = runningRaw
+	client.rows[string(scalingIntentDirectoryKey)] = activeDirectoryRaw
+	client.mu.Unlock()
+
+	terminalEvidence, err := authority.ScanDecommissionedNodeReferences(ctx, target.NodeID, target.Incarnation)
+	if err != nil || !terminalEvidence.ZeroAllReferences() {
+		t.Fatalf("full-history terminal scan=%+v err=%v", terminalEvidence, err)
+	}
+	complete := running
+	complete.State, complete.Revision, complete.DirectoryRevision = ScalingComplete, 2, 2
+	complete.Evidence = SafeToStopEvidenceFromReference(terminalEvidence)
+	complete.Evidence.DrainAcknowledged = true
+	complete.Evidence.RetiredAcknowledged = true
+	complete.Evidence.CatalogControlMigrated = true
+	if err := authority.PutScalingIntent(ctx, complete, running.Revision); !errors.Is(err, ErrScalingMetadataBound) {
+		t.Fatalf("protected full terminal history completion=%v", err)
+	}
+
+	// Replace one terminal node and its directory entry in the same synthetic
+	// replacement boundary. The next completion may evict only that now
+	// unneeded proof and must retain the target's SafeToStop history. The
+	// successor marker is required; a bare missing predecessor is a catalog
+	// conflict and cannot authorize history GC.
+	removed := nodes[1]
+	var removedIntent ScalingIntent
+	for _, historyEntry := range historyEntries {
+		if len(historyEntry.ID) != 32 {
+			continue
+		}
+		var candidateID [32]byte
+		copy(candidateID[:], historyEntry.ID)
+		candidateRaw := client.rows[string(scalingIntentKey(candidateID))]
+		candidate, openErr := openScalingIntentRecord(candidateRaw, candidateID)
+		if openErr == nil && candidate.Request.Drain.NodeID == removed.NodeID {
+			removedIntent = candidate
+			break
+		}
+	}
+	if !removedIntent.Valid() {
+		t.Fatal("open replaced terminal intent")
+	}
+	successor := removed
+	successor.Incarnation = removed.Incarnation + 1
+	successor.ServiceKeyDigest = replication.Digest{0xb1, 0xb2}
+	successor.Lifecycle, successor.Revision = NodeJoining, 1
+	successor.RetirementScanDigest = replication.Digest{}
+	successor.RetirementScanDirectoryRevision, successor.RetirementScanCutRevision = 0, 0
+	successor.Replacement = &NodeReplacementProof{
+		PredecessorIncarnation: removed.Incarnation, PredecessorServiceKeyDigest: removed.ServiceKeyDigest,
+		IntentID: removedIntent.ID, ProofDigest: replication.Digest{0xb3},
+	}
+	replacementDigest, err := CertifiedNodeReplacementDigest(removed, removedIntent, successor)
+	if err != nil {
+		t.Fatalf("replacement history proof: %v", err)
+	}
+	successor.Replacement.ProofDigest = replacementDigest
+	if !successor.Valid() {
+		t.Fatal("replacement successor is invalid")
+	}
+	successorRaw := mustAppendNode(successor)
+	successorDigest := scalingDigest(successorRaw)
+	successorEntry := scalingNodeDirectoryEntry{NodeID: append([]byte(nil), successor.NodeID[:]...),
+		Incarnation: successor.Incarnation, Revision: successor.Revision, Digest: append([]byte(nil), successorDigest[:]...)}
+	client.mu.Lock()
+	delete(client.rows, string(scalingNodeKey(removed.NodeID, removed.Incarnation)))
+	client.rows[string(scalingNodeKey(successor.NodeID, successor.Incarnation))] = successorRaw
+	client.mu.Unlock()
+	filteredNodes := make([]scalingNodeDirectoryEntry, 0, len(nodeEntries)-1)
+	for _, entry := range nodeEntries {
+		if bytes.Equal(entry.NodeID, removed.NodeID[:]) {
+			filteredNodes = append(filteredNodes, successorEntry)
+		} else {
+			filteredNodes = append(filteredNodes, entry)
+		}
+	}
+	nodeDirectoryRaw, err = appendScalingNodeDirectoryAt(nil, filteredNodes, 3)
+	if err != nil {
+		t.Fatalf("post-replacement node directory: %v", err)
+	}
+	client.mu.Lock()
+	client.rows[string(scalingNodeDirectoryKey)] = nodeDirectoryRaw
+	client.mu.Unlock()
+	terminalEvidence, err = authority.ScanDecommissionedNodeReferences(ctx, target.NodeID, target.Incarnation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	complete.Evidence = SafeToStopEvidenceFromReference(terminalEvidence)
+	complete.Evidence.DrainAcknowledged = true
+	complete.Evidence.RetiredAcknowledged = true
+	complete.Evidence.CatalogControlMigrated = true
+	if err := authority.PutScalingIntent(ctx, complete, running.Revision); err != nil {
+		t.Fatalf("completion after atomic predecessor removal: %v", err)
+	}
+	history, err := authority.ListScalingTerminalIntents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != historyCount || !slices.ContainsFunc(history, func(candidate ScalingIntent) bool {
+		return candidate.ID == complete.ID && candidate.State == ScalingComplete && candidate.Evidence.SafeToStop()
+	}) {
+		t.Fatalf("safe terminal history after GC=%d entries=%+v", len(history), history)
+	}
+	if retained, err := authority.ReadNode(ctx, target.NodeID, target.Incarnation); err != nil ||
+		retained.Lifecycle != NodeDecommissioned || !retained.HasRetirementProof() {
+		t.Fatalf("target terminal proof regressed: %+v err=%v", retained, err)
+	}
+}
+
 type scalingTestGatewayScanner struct {
 	mu        sync.Mutex
 	evidence  GatewayParticipantEvidence
@@ -905,6 +1209,49 @@ func (scanner *scalingTestGatewayScanner) setActive(active bool) {
 	scanner.mu.Lock()
 	scanner.evidence.Active = active
 	scanner.mu.Unlock()
+}
+
+func TestReplicatedScalingGatewayActiveToDrainingRequiresPreparedChild(t *testing.T) {
+	ctx := context.Background()
+	authority, _, _ := newCatalogAuthorityFixture(t)
+	joining := scalingTestNodeRecord([16]byte{0x8e}, 1, NodeJoining, 1)
+	joining.Roles = NodeRoleStorage | NodeRoleGateway
+	joining.GatewayEndpoint = distribution.EndpointID("gateway-8e")
+	joining.GatewayAddress = "127.0.0.1:8398"
+	joining.Gateway = GatewayIdentity{
+		NodeID: joining.NodeID, Incarnation: joining.Incarnation,
+		ServiceKeyDigest: joining.ServiceKeyDigest, ServiceID: [16]byte{0x8f},
+		SessionID: [16]byte{0x90}, SessionRevision: 1,
+		ParticipantDigest: replication.Digest{0x91},
+	}
+	if err := authority.PutNode(ctx, joining, 0); err != nil {
+		t.Fatal(err)
+	}
+	active := joining
+	active.Lifecycle, active.Revision = NodeActive, 2
+	if err := authority.PutNode(ctx, active, joining.Revision); err != nil {
+		t.Fatal(err)
+	}
+	bareDraining := active
+	bareDraining.Lifecycle, bareDraining.Revision = NodeDraining, active.Revision+1
+	if err := authority.PutNode(ctx, bareDraining, active.Revision); !errors.Is(err, ErrScalingState) {
+		t.Fatalf("bare gateway Active -> Draining=%v, want scaling-state rejection", err)
+	}
+
+	storageJoining := scalingTestNodeRecord([16]byte{0x9d}, 1, NodeJoining, 1)
+	if err := authority.PutNode(ctx, storageJoining, 0); err != nil {
+		t.Fatal(err)
+	}
+	storageActive := storageJoining
+	storageActive.Lifecycle, storageActive.Revision = NodeActive, 2
+	if err := authority.PutNode(ctx, storageActive, storageJoining.Revision); err != nil {
+		t.Fatal(err)
+	}
+	storageDraining := storageActive
+	storageDraining.Lifecycle, storageDraining.Revision = NodeDraining, storageActive.Revision+1
+	if err := authority.PutNode(ctx, storageDraining, storageActive.Revision); err != nil {
+		t.Fatalf("storage-only Active -> Draining=%v", err)
+	}
 }
 
 func TestReplicatedScalingFrontendProofBlocksAndThenAllowsRetirement(t *testing.T) {
@@ -945,11 +1292,48 @@ func TestReplicatedScalingFrontendProofBlocksAndThenAllowsRetirement(t *testing.
 	if err := authority.PutNode(ctx, active, 1); err != nil {
 		t.Fatal(err)
 	}
+	request := ScalingIntentRequest{Kind: ScalingDecommission, RequestID: [32]byte{0x96},
+		Drain:    NodeReference{NodeID: active.NodeID, Incarnation: active.Incarnation},
+		MaxMoves: 1, MaxMigrationBytes: 1 << 20}
+	intent := ScalingIntent{ID: request.ID(), Request: request, CatalogGeneration: current.Generation(),
+		Revision: 1, DirectoryRevision: 1, State: ScalingReserved}
+	if err := authority.PutScalingIntent(ctx, intent, 0); err != nil {
+		t.Fatalf("gateway drain intent: %v", err)
+	}
+	drainID := NewFrontendDrainID(intent.ID, request.Drain)
+	fence := serviceauthz.ServiceFence{
+		Action: serviceauthz.ServiceActionGatewayCatalogRead, Operation: serviceauthz.ServiceOperationCatalogRead,
+		Group: current.ReplicatedShardDescriptors()[0].Group, Relation: [16]byte{0x97},
+		SessionID: active.Gateway.SessionID, SessionRevision: active.Gateway.SessionRevision,
+		IntentID: [32]byte{0x98}, FenceDigest: [32]byte{0x99},
+	}
+	record := FrontendDrainRecord{
+		IntentID: intent.ID, DrainID: drainID,
+		TrustDomain:  rafttransport.TrustDomain{ClusterID: [16]byte{0x9a}, ClusterIncarnation: [16]byte{0x9b}},
+		PhysicalNode: active.NodeID, PhysicalIncarnation: active.Incarnation,
+		GatewayServiceID: active.Gateway.NodeID, GatewayIncarnation: active.Gateway.Incarnation,
+		PeerKeyDigest: active.Gateway.ServiceKeyDigest, GatewayIdentityServiceID: active.Gateway.ServiceID,
+		GatewaySessionID: active.Gateway.SessionID, GatewaySessionRevision: active.Gateway.SessionRevision,
+		NodeRevision: active.Revision, AdmissionEpoch: 1, AdmissionClosedProofDigest: replication.Digest{0x9c},
+		DrainFence: fence, Lifecycle: FrontendDrainPrepared, Revision: 1,
+	}
+	if !record.Valid() || !record.ValidForNode(active) {
+		t.Fatalf("gateway prepared drain fixture invalid: valid=%t for-node=%t", record.Valid(), record.ValidForNode(active))
+	}
+	if err := authority.ReserveFrontendDrainCapacity(ctx, drainID); err != nil {
+		t.Fatalf("gateway drain reservation: %v", err)
+	}
+	if err := authority.PutFrontendDrainRecord(ctx, record, 0); err != nil {
+		t.Fatalf("gateway prepared drain child: %v", err)
+	}
 	draining := active
-	draining.Lifecycle = NodeDraining
-	draining.Revision = 3
-	if err := authority.PutNode(ctx, draining, 2); err != nil {
-		t.Fatal(err)
+	if err := authority.EnforceFrontendDrain(ctx, drainID, active.NodeID, active.Incarnation, active.Revision); err != nil {
+		t.Fatalf("gateway prepared drain enforcement: %v", err)
+	}
+	var readErr error
+	draining, readErr = authority.ReadNode(ctx, active.NodeID, active.Incarnation)
+	if readErr != nil || draining.Lifecycle != NodeDraining {
+		t.Fatalf("gateway draining node=%+v err=%v", draining, readErr)
 	}
 	scanner.evidence.NodeRevision = draining.Revision
 	if !scanner.evidence.ValidFor(draining) {
@@ -975,24 +1359,11 @@ func TestReplicatedScalingFrontendProofBlocksAndThenAllowsRetirement(t *testing.
 	if evidence.GatewayParticipantRefs != 0 || !evidence.ZeroAllReferences() {
 		t.Fatalf("inactive frontend proof did not clear references: %+v", evidence)
 	}
-	changed := draining
-	changed.Revision++
-	if err := authority.PutNode(ctx, changed, draining.Revision); err != nil {
-		t.Fatalf("publish concurrent node revision: %v", err)
-	}
-	if err := authority.RetireNode(ctx, active.NodeID, active.Incarnation, draining.Revision, evidence); !errors.Is(err, ErrScalingRevision) {
-		t.Fatalf("stale frontend proof crossed a concurrent node revision: %v", err)
-	}
-	scanner.evidence.NodeRevision = changed.Revision
-	evidence, err = authority.ScanNodeReferences(ctx, active.NodeID, active.Incarnation)
-	if err != nil {
-		t.Fatal(err)
-	}
 	fresh, err := authority.ScanNodeReferences(ctx, active.NodeID, active.Incarnation)
 	if err != nil || !sameNodeReferenceEvidence(fresh, evidence) {
 		t.Fatalf("frontend proof changed between scans: evidence=%+v fresh=%+v err=%v", evidence, fresh, err)
 	}
-	if err := authority.RetireNode(ctx, active.NodeID, active.Incarnation, changed.Revision, evidence); err != nil {
+	if err := authority.RetireNode(ctx, active.NodeID, active.Incarnation, draining.Revision, evidence); err != nil {
 		t.Fatal(err)
 	}
 	retired, err := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x98).ReadNode(ctx, active.NodeID, active.Incarnation)
