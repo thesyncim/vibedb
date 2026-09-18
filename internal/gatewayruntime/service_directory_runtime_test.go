@@ -155,6 +155,43 @@ func TestInstallControlDirectoryFromRuntimeCutDoesNotNeedAuthorityReader(t *test
 	}
 }
 
+type failingCanonicalRowReader struct{}
+
+func (failingCanonicalRowReader) ReadFrontendDrainRuntimeCatalogRoute(
+	context.Context,
+) (gateway.FrontendDrainRuntimeCatalogRoute, error) {
+	return gateway.FrontendDrainRuntimeCatalogRoute{}, gateway.ErrReplicatedCatalogConflict
+}
+
+func (failingCanonicalRowReader) ReadFrontendDrainRuntimeRow(
+	context.Context, gateway.FrontendDrainRuntimeRowKey,
+) (gateway.FrontendDrainRuntimeRow, error) {
+	return gateway.FrontendDrainRuntimeRow{}, gateway.ErrReplicatedCatalogConflict
+}
+
+func TestReadLiveControlDirectoryFallsBackWhenLocalRowsAreNotLeader(t *testing.T) {
+	profile, _, source, _, _ := frontendDrainSourceTestFixture(t)
+	_, policy := runtimeControlTLSFixture(t, []serviceauthz.Entry{{
+		Node: profile.LocalIdentity().Node, Capabilities: serviceauthz.AllCapabilities,
+	}})
+	reader := &runtimeCanonicalCutReaderTest{cut: source}
+	transport := new(runtimeFullServiceCutTransportTest)
+	runtime := &Runtime{config: Config{
+		ControlDirectory:                  reader,
+		CanonicalFrontendDrainRuntimeRows: failingCanonicalRowReader{},
+		TLSProfile:                        profile,
+		Authorization:                     policy,
+		Transport:                         transport,
+		RequireServiceDirectoryBinding:    true,
+	}, ctx: t.Context()}
+	if err := runtime.openControlDirectory(); err != nil {
+		t.Fatalf("open with not-leader local rows: %v", err)
+	}
+	if _, err := runtime.readLiveControlDirectoryProjection(t.Context()); err != nil {
+		t.Fatalf("live projection with not-leader local rows: %v", err)
+	}
+}
+
 func TestRuntimeControlDirectoryPropagatesLifecycleCutsToRetainedReceiver(t *testing.T) {
 	profile, subject, source, _, _ := frontendDrainSourceTestFixture(t)
 	_, policy := runtimeControlTLSFixture(t, []serviceauthz.Entry{{

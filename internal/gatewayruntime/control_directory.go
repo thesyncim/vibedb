@@ -147,6 +147,13 @@ func frontendDrainRuntimeCutSnapshot(
 	return cut, nil
 }
 
+func fallbackControlDirectoryError(prior, next error) error {
+	if next != nil {
+		return next
+	}
+	return prior
+}
+
 type liveControlDirectoryProjection struct {
 	cut        gateway.ReplicatedControlDirectorySnapshot
 	serviceCut serviceauthz.ServiceDirectoryCut
@@ -175,43 +182,61 @@ func (runtime *Runtime) readLiveControlDirectoryProjection(
 		return liveControlDirectoryProjection{}, errGatewayControlDirectory
 	}
 	var (
-		cut    gateway.ReplicatedControlDirectorySnapshot
-		source *gateway.FrontendDrainRuntimeCut
-		err    error
+		cut     gateway.ReplicatedControlDirectorySnapshot
+		source  *gateway.FrontendDrainRuntimeCut
+		err     error
+		rowsErr error
 	)
+	// Local catalog rows are the leader fast path. Followers and a former
+	// leader after a transfer keep the same reader bound; a not-leader probe
+	// must fall through to the authenticated source or the catalog authority
+	// instead of failing CREATE/refresh closed.
 	if rows := runtime.config.CanonicalFrontendDrainRuntimeRows; rows != nil {
 		loaded, readErr := gateway.ReadFrontendDrainRuntimeCutFromRows(ctx, rows)
-		if readErr != nil {
-			return liveControlDirectoryProjection{}, fmt.Errorf("read canonical frontend drain row cut: %w", readErr)
+		if readErr == nil {
+			if snap, snapErr := frontendDrainRuntimeCutSnapshot(loaded); snapErr == nil {
+				copied := loaded
+				source = &copied
+				cut = snap
+			} else {
+				readErr = snapErr
+			}
 		}
-		source = &loaded
-		cut, err = frontendDrainRuntimeCutSnapshot(loaded)
-	} else if physical := runtime.config.CanonicalFrontendDrainRuntimeSource; physical != nil {
-		proof, sourceErr := physical.ReadLatestFrontendDrainCut(ctx)
-		if sourceErr != nil {
-			return liveControlDirectoryProjection{}, fmt.Errorf("read canonical frontend drain source proof: %w", sourceErr)
+		if source == nil {
+			rowsErr = fmt.Errorf("read canonical frontend drain row cut: %w", readErr)
 		}
-		if !proof.Valid() {
-			return liveControlDirectoryProjection{}, fmt.Errorf("%w: canonical frontend drain source proof is invalid", errGatewayControlDirectory)
+	}
+	if source == nil {
+		if physical := runtime.config.CanonicalFrontendDrainRuntimeSource; physical != nil {
+			proof, sourceErr := physical.ReadLatestFrontendDrainCut(ctx)
+			if sourceErr != nil {
+				return liveControlDirectoryProjection{}, fallbackControlDirectoryError(rowsErr, fmt.Errorf("read canonical frontend drain source proof: %w", sourceErr))
+			}
+			if !proof.Valid() {
+				return liveControlDirectoryProjection{}, fallbackControlDirectoryError(rowsErr, fmt.Errorf("%w: canonical frontend drain source proof is invalid", errGatewayControlDirectory))
+			}
+			loaded, readErr := readCanonicalFrontendDrainRuntimeCutFromSourceProof(
+				ctx, proof, runtime.authority, runtime.config.TLSProfile,
+				runtime.config.Authorization.Generation(),
+			)
+			if readErr != nil {
+				return liveControlDirectoryProjection{}, fallbackControlDirectoryError(rowsErr, fmt.Errorf("read canonical frontend drain source authority cut: %w", readErr))
+			}
+			source = &loaded
+			cut, err = frontendDrainRuntimeCutSnapshot(loaded)
+		} else if _, coherent := reader.(frontendDrainRuntimeCutReader); coherent {
+			loaded, readErr := reader.(frontendDrainRuntimeCutReader).ReadFrontendDrainRuntimeCut(ctx)
+			if readErr != nil {
+				return liveControlDirectoryProjection{}, fallbackControlDirectoryError(rowsErr, fmt.Errorf("read canonical frontend drain cut: %w", readErr))
+			}
+			source = &loaded
+			cut, err = frontendDrainRuntimeCutSnapshot(loaded)
+		} else {
+			cut, err = readGatewayControlDirectoryCut(ctx, reader)
+			if err != nil && rowsErr != nil {
+				err = fallbackControlDirectoryError(rowsErr, err)
+			}
 		}
-		loaded, readErr := readCanonicalFrontendDrainRuntimeCutFromSourceProof(
-			ctx, proof, runtime.authority, runtime.config.TLSProfile,
-			runtime.config.Authorization.Generation(),
-		)
-		if readErr != nil {
-			return liveControlDirectoryProjection{}, fmt.Errorf("read canonical frontend drain source authority cut: %w", readErr)
-		}
-		source = &loaded
-		cut, err = frontendDrainRuntimeCutSnapshot(loaded)
-	} else if _, coherent := reader.(frontendDrainRuntimeCutReader); coherent {
-		loaded, readErr := reader.(frontendDrainRuntimeCutReader).ReadFrontendDrainRuntimeCut(ctx)
-		if readErr != nil {
-			return liveControlDirectoryProjection{}, fmt.Errorf("read canonical frontend drain cut: %w", readErr)
-		}
-		source = &loaded
-		cut, err = frontendDrainRuntimeCutSnapshot(loaded)
-	} else {
-		cut, err = readGatewayControlDirectoryCut(ctx, reader)
 	}
 	if err != nil {
 		return liveControlDirectoryProjection{}, err
