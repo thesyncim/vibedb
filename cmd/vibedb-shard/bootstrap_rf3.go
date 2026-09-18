@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/frontenddrain"
 	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -355,6 +356,18 @@ func bootstrapPreparedRF3(
 	if err != nil {
 		return err
 	}
+	preparedAckControl, preparedAckReader, preparedAckTransport, err := newRF3NonmanagedPreparedAckService(
+		profile, policy, target.NodeIncarnation, deadline,
+	)
+	if err != nil {
+		return err
+	}
+	if preparedAckTransport != nil {
+		defer func() { _ = preparedAckTransport.Close() }()
+	}
+	if preparedAckReader != nil {
+		defer func() { _ = preparedAckReader.Close() }()
+	}
 	complete := make(chan struct{}, 1)
 	controlMux, err := shardcontrol.New(
 		shardcontrol.Route{
@@ -370,6 +383,7 @@ func bootstrapPreparedRF3(
 		shardcontrol.Route{Discriminator: replicacontrol.CapacityRequestDiscriminator(), Handler: capacityControl},
 		shardcontrol.Route{Discriminator: replicacontrol.RequestDiscriminator(), Handler: observationControl},
 		shardcontrol.Route{Discriminator: servicemetrics.RequestDiscriminator(), Handler: metricsControl},
+		shardcontrol.Route{Discriminator: frontenddrain.PreparedAckDiscriminator, Handler: preparedAckControl},
 	)
 	if err != nil {
 		return err

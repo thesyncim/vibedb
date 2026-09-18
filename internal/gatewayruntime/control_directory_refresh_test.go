@@ -312,8 +312,9 @@ func TestFrontendDrainPreparedAckReceiverUnreachable(t *testing.T) {
 	if !frontendDrainPreparedAckReceiverUnreachable(&net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}) {
 		t.Fatal("connection refused must be unreachable")
 	}
-	if frontendDrainPreparedAckReceiverUnreachable(io.EOF) {
-		t.Fatal("EOF is a protocol close, not an unreachable peer")
+	if frontendDrainPreparedAckReceiverUnreachable(syscall.ECONNRESET) ||
+		frontendDrainPreparedAckReceiverUnreachable(io.EOF) {
+		t.Fatal("reset/EOF is a protocol close, not an unreachable peer")
 	}
 	if frontendDrainPreparedAckReceiverUnreachable(errors.New("injected prepared-ack receiver failure")) {
 		t.Fatal("injected protocol failure must not be skipped")

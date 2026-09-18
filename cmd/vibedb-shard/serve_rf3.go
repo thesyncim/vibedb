@@ -1318,9 +1318,13 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 				return err
 			}
 		}
+		var preparedAckInstaller shardservice.FrontendDrainServiceCutInstaller = server
+		if !rf3ServiceDirectoryRefreshConfigured(manifest, embeddedGateway != nil) {
+			preparedAckInstaller = rf3NonmanagedPreparedAckInstaller{}
+		}
 		preparedAckService, serviceErr := shardservice.NewFrontendDrainPreparedAckService(
 			shardservice.FrontendDrainPreparedAckServiceOptions{
-				Reader: preparedAckReader, Installer: server,
+				Reader: preparedAckReader, Installer: preparedAckInstaller,
 				TrustDomain:  profile.LocalIdentity().TrustDomain,
 				Authorize:    rf3FrontendDrainPreparedAckAuthorizer(profile, policy),
 				ReadDeadline: deadline, WriteDeadline: deadline,

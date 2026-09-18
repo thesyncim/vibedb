@@ -23,6 +23,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
+	"github.com/thesyncim/vibedb/shardservice"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -995,6 +996,49 @@ func rf3FrontendDrainPreparedAckCutPublishedBy(
 		}
 	}
 	return false
+}
+
+// rf3NonmanagedPreparedAckInstaller acknowledges a publisher cut without
+// binding a native service directory. Seed-less receivers cannot refresh that
+// directory independently, and installing it would switch CheckDelegate on
+// for a process that is still using the static Policy roster.
+type rf3NonmanagedPreparedAckInstaller struct{}
+
+func (rf3NonmanagedPreparedAckInstaller) InstallFrontendDrainServiceCut(
+	ctx context.Context, cut frontenddrain.PreparedAckCut,
+) (uint64, error) {
+	if ctx == nil || !cut.Valid() {
+		return 0, errRF3FrontendDrainPreparedAckReaderUnavailable
+	}
+	return cut.ServiceDirectoryRevision, nil
+}
+
+func newRF3NonmanagedPreparedAckService(
+	profile *rafttransport.PeerTLS, policy *serviceauthz.Policy,
+	incarnation uint64, deadline rafttransport.DeadlineFunc,
+) (*shardservice.FrontendDrainPreparedAckService, *rf3FrontendDrainPreparedAckCutReader, *servicetls.Client, error) {
+	reader, transport, err := newRF3FrontendDrainPreparedAckCutReaderWithSources(
+		profile, nil, nil, incarnation, deadline, deadline,
+	)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	service, err := shardservice.NewFrontendDrainPreparedAckService(
+		shardservice.FrontendDrainPreparedAckServiceOptions{
+			Reader: reader, Installer: rf3NonmanagedPreparedAckInstaller{},
+			TrustDomain:  profile.LocalIdentity().TrustDomain,
+			Authorize:    rf3FrontendDrainPreparedAckAuthorizer(profile, policy),
+			ReadDeadline: deadline, WriteDeadline: deadline,
+		},
+	)
+	if err != nil {
+		_ = reader.Close()
+		if transport != nil {
+			_ = transport.Close()
+		}
+		return nil, nil, nil, err
+	}
+	return service, reader, transport, nil
 }
 
 func rf3FrontendDrainPreparedAckAuthorizer(

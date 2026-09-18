@@ -603,9 +603,8 @@ func frontendDrainPreparedAckReceiverUnreachable(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) ||
-		errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) ||
-		errors.Is(err, syscall.EPIPE) || errors.Is(err, net.ErrClosed) {
+	if errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) {
 		return true
 	}
 	var op *net.OpError
