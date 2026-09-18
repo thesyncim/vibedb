@@ -1456,6 +1456,11 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			if err != nil {
 				return finishRF3Serving(err, lanes, servingRegistry)
 			}
+			// Gateway Open reads Config.CanonicalFrontendDrainRuntimeRows, not
+			// this local binding. Copy the retained catalog owner onto the
+			// embedded config so a first-start leader does not dial an unopened
+			// gateway for its own cut.
+			preparedGateway.config.CanonicalFrontendDrainRuntimeRows = canonicalRows
 		}
 	} else if server != nil {
 		canonicalRows, err = bindRF3RetainedCatalogRows(peer, &preparedSet, commands)

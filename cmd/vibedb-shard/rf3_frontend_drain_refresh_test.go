@@ -82,6 +82,22 @@ func TestRF3PreferLocalServiceCutReaderFallsBackToRemote(t *testing.T) {
 	}
 }
 
+func TestWaitRF3FrontendDrainServiceCutReadyHonorsCallerContext(t *testing.T) {
+	ready := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := waitRF3FrontendDrainServiceCutReady(ctx, ready)
+	elapsed := time.Since(start)
+	if err == nil || elapsed > time.Second {
+		t.Fatalf("wait error=%v elapsed=%s, want caller context to expire quickly", err, elapsed)
+	}
+	close(ready)
+	if err := waitRF3FrontendDrainServiceCutReady(context.Background(), ready); err != nil {
+		t.Fatalf("ready channel wait: %v", err)
+	}
+}
+
 type countingRF3ServiceCutReader struct {
 	cut   frontenddrain.ServiceCut
 	err   error

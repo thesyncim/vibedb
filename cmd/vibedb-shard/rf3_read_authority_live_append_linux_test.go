@@ -476,6 +476,10 @@ func TestRF3ReadAuthorityConfigureFailureUnregistersCache(t *testing.T) {
 	item.manifest.ReadAuthority = testRF3ReadAuthorityConfig()
 	cache := testRF3ReadAuthorityCache(identity.NodeIncarnation)
 	cache.localNode = profile.LocalIdentity().Node
+	targetsForRetry, err := rf3ReadAuthorityGroupTargetsForPrepared(*item, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -490,10 +494,6 @@ func TestRF3ReadAuthorityConfigureFailureUnregistersCache(t *testing.T) {
 	}
 	if _, err := os.Stat(rf3ReadAuthorityMarkerPath(item.manifest.Route.MemberRoot)); err != nil {
 		t.Fatalf("failed configuration removed durable marker: %v", err)
-	}
-	targetsForRetry, err := rf3ReadAuthorityGroupTargetsForPrepared(*item, identity)
-	if err != nil {
-		t.Fatal(err)
 	}
 	retryRegistrations, err := cache.RegisterGroups([]rf3ReadAuthorityGroupTargets{targetsForRetry})
 	if err != nil || len(retryRegistrations) != 1 {

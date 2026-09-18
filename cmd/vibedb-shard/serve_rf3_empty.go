@@ -654,13 +654,9 @@ func servePreparedRF3EmptyNode(
 	go func() {
 		nativeDone <- nativeServer.ServeAuthenticated(nativeCtx, nativeAdmission, nativeTLS, deadline, 64, 16)
 	}()
-	var (
-		serviceCutReady <-chan struct{}
-		primary         error
-	)
+	var primary error
 	refreshCtx, cancelRefresh := context.WithCancel(parent)
 	ready := make(chan struct{})
-	serviceCutReady = ready
 	refreshReader := rf3LatestServiceCutReader(preparedAckReader)
 	if dynamicCanonicalRows != nil {
 		refreshReader = rf3PreferLocalServiceCutReader{
@@ -670,6 +666,10 @@ func servePreparedRF3EmptyNode(
 			remote: preparedAckReader,
 		}
 	}
+	// Refresh continues in the background. An empty node is not in the catalog
+	// until join, so blocking ready on ReadLatest would shut the process down
+	// before enrollment can publish the receiver. Native stays fail-closed
+	// until the first cut is installed.
 	go func() {
 		_ = runRF3FrontendDrainServiceCutRefresh(
 			refreshCtx, refreshReader, profile, manifest.NodeIncarnation, nativeServer,
@@ -678,20 +678,8 @@ func servePreparedRF3EmptyNode(
 	}()
 	defer cancelRefresh()
 	var serial atomic.Uint64
-	if serviceCutReady != nil {
-		readyCtx, cancelReady := context.WithTimeout(parent, rf3NetworkTimeout)
-		readyErr := waitRF3FrontendDrainServiceCutReady(readyCtx, serviceCutReady)
-		cancelReady()
-		if readyErr != nil {
-			if context.Cause(parent) == nil {
-				primary = fmt.Errorf("RF3 empty-node canonical service-directory startup: %w", readyErr)
-			}
-		}
-	}
-	if primary == nil {
-		fmt.Fprintf(os.Stderr, "vibedb-shard RF3 empty node ready node=%x incarnation=%d groups=%d peer=%s native=%s snapshot=%s control=%s gateway=disabled\n",
-			local.Node, manifest.NodeIncarnation, servingGroups.Load(), peerListener.Addr(), nativeListener.Addr(), snapshotListener.Addr(), controlListener.Addr())
-	}
+	fmt.Fprintf(os.Stderr, "vibedb-shard RF3 empty node ready node=%x incarnation=%d groups=%d peer=%s native=%s snapshot=%s control=%s gateway=disabled\n",
+		local.Node, manifest.NodeIncarnation, servingGroups.Load(), peerListener.Addr(), nativeListener.Addr(), snapshotListener.Addr(), controlListener.Addr())
 	peerFinished, controlFinished, snapshotFinished, nativeFinished := false, false, false, false
 	for primary == nil {
 		select {

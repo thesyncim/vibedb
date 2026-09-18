@@ -31,6 +31,7 @@ func TestEmptyNodePreparationFixtureMatchesShippedGrammar(t *testing.T) {
 		Listeners:  rf3testfixture.ProcessListeners{Peer: "127.0.0.1:21001", Native: "127.0.0.1:21002", Snapshot: "127.0.0.1:21003", Control: "127.0.0.1:21004"},
 		Credential: credentials[0], Roots: roots, AuthorizationPolicy: "/policy",
 		GrantNodes: nodes, GatewaySeeds: []nodecontrol.BootstrapGatewaySeed{{NodeID: nodes[0], Incarnation: 1, ControlAddress: "127.0.0.1:22001", SPKIPinDigest: replication.Digest{1}}},
+		CanonicalSourceSeeds: []nodecontrol.BootstrapGatewaySeed{{NodeID: nodes[1], Incarnation: 1, ControlAddress: "127.0.0.1:23001", SPKIPinDigest: replication.Digest{2}}},
 	}, root+".node-key")
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +46,8 @@ func TestEmptyNodePreparationFixtureMatchesShippedGrammar(t *testing.T) {
 	}
 	if input.Root != root || input.Services == nil || input.Services.NodeIncarnation != 7 || input.NodeLog.Path != filepath.Join(root, "node-log") ||
 		input.Services == nil || len(input.Groups) != 0 || input.Services.ReplicaControl.SourceDataRoot != root ||
-		len(input.Services.GatewaySeeds) != 1 || input.Services.GatewaySeeds[0].NodeID != nodes[0] {
+		len(input.Services.GatewaySeeds) != 1 || input.Services.GatewaySeeds[0].NodeID != nodes[0] ||
+		len(input.Services.CanonicalSourceSeeds) != 1 || input.Services.CanonicalSourceSeeds[0].NodeID != nodes[1] {
 		t.Fatalf("empty fixture lost explicit node grammar: %+v", input)
 	}
 	if err := provisionRF3Node(input); err != nil {
@@ -55,7 +57,8 @@ func TestEmptyNodePreparationFixtureMatchesShippedGrammar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load prepared empty node: %v", err)
 	}
-	if manifest.Groups == nil || len(manifest.Groups) != 0 || manifest.NodeIncarnation != 7 {
-		t.Fatal("prepared capacity node must retain an explicit empty group array and its incarnation")
+	if manifest.Groups == nil || len(manifest.Groups) != 0 || manifest.NodeIncarnation != 7 ||
+		len(manifest.CanonicalSourceSeeds) != 1 || manifest.CanonicalSourceSeeds[0].NodeID != nodes[1] {
+		t.Fatal("prepared capacity node must retain an explicit empty group array, incarnation, and canonical source seeds")
 	}
 }

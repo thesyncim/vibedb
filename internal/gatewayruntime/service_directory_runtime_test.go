@@ -135,6 +135,26 @@ func TestRuntimeControlDirectoryUpdatesRetainedFullServiceCut(t *testing.T) {
 	}
 }
 
+func TestInstallControlDirectoryFromRuntimeCutDoesNotNeedAuthorityReader(t *testing.T) {
+	profile, _, source, _, _ := frontendDrainSourceTestFixture(t)
+	_, policy := runtimeControlTLSFixture(t, []serviceauthz.Entry{{
+		Node: profile.LocalIdentity().Node, Capabilities: serviceauthz.AllCapabilities,
+	}})
+	transport := new(runtimeFullServiceCutTransportTest)
+	runtime := &Runtime{config: Config{
+		TLSProfile:                     profile,
+		Authorization:                  policy,
+		Transport:                      transport,
+		RequireServiceDirectoryBinding: true,
+	}, ctx: t.Context()}
+	if err := runtime.installControlDirectoryFromRuntimeCut(source); err != nil {
+		t.Fatalf("install local runtime cut: %v", err)
+	}
+	if runtime.controlDirectory == nil || runtime.serviceDirectory == nil || transport.gate == nil {
+		t.Fatal("local runtime cut did not install the control and service directories")
+	}
+}
+
 func TestRuntimeControlDirectoryPropagatesLifecycleCutsToRetainedReceiver(t *testing.T) {
 	profile, subject, source, _, _ := frontendDrainSourceTestFixture(t)
 	_, policy := runtimeControlTLSFixture(t, []serviceauthz.Entry{{

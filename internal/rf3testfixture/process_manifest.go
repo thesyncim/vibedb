@@ -71,16 +71,17 @@ type PreparedColdTarget struct {
 // credentials, listeners, and the exact certificate principals that may use
 // the node-wide split control.
 type EmptyNodeOptions struct {
-	Root                string
-	NodeIncarnation     uint64
-	Key                 raftstore.Key
-	NodeStore           raftstore.NodeStoreOptions
-	Listeners           ProcessListeners
-	Credential          Credential
-	Roots               string
-	AuthorizationPolicy string
-	GrantNodes          []rafttransport.NodeID
-	GatewaySeeds        []nodecontrol.BootstrapGatewaySeed
+	Root                 string
+	NodeIncarnation      uint64
+	Key                  raftstore.Key
+	NodeStore            raftstore.NodeStoreOptions
+	Listeners            ProcessListeners
+	Credential           Credential
+	Roots                string
+	AuthorizationPolicy  string
+	GrantNodes           []rafttransport.NodeID
+	GatewaySeeds         []nodecontrol.BootstrapGatewaySeed
+	CanonicalSourceSeeds []nodecontrol.BootstrapGatewaySeed
 	// MigrationBudget overrides only the prepared empty node's physical
 	// transfer budget. A nil value keeps the canonical shipped defaults.
 	MigrationBudget *migrationbudget.Config
@@ -111,13 +112,14 @@ type emptyNodeLogManifest struct {
 }
 
 type emptyNodeServices struct {
-	NodeIncarnation     uint64                             `json:"node_incarnation"`
-	Listeners           ProcessListeners                   `json:"listeners"`
-	TLS                 emptyNodeTLS                       `json:"tls"`
-	AuthorizationPolicy string                             `json:"authorization_policy"`
-	GatewaySeeds        []nodecontrol.BootstrapGatewaySeed `json:"bootstrap_gateway_seeds"`
-	ReplicaControl      emptyNodeReplicaControl            `json:"replica_control"`
-	SplitControl        emptyNodeSplitControl              `json:"split_control"`
+	NodeIncarnation      uint64                             `json:"node_incarnation"`
+	Listeners            ProcessListeners                   `json:"listeners"`
+	TLS                  emptyNodeTLS                       `json:"tls"`
+	AuthorizationPolicy  string                             `json:"authorization_policy"`
+	GatewaySeeds         []nodecontrol.BootstrapGatewaySeed `json:"bootstrap_gateway_seeds"`
+	CanonicalSourceSeeds []nodecontrol.BootstrapGatewaySeed `json:"canonical_source_seeds,omitempty"`
+	ReplicaControl       emptyNodeReplicaControl            `json:"replica_control"`
+	SplitControl         emptyNodeSplitControl              `json:"split_control"`
 }
 
 type emptyNodeTLS struct {
@@ -200,7 +202,8 @@ func EmptyNodePreparationManifest(options EmptyNodeOptions, keyMaterialPath stri
 		NodeIncarnation: options.NodeIncarnation, Listeners: options.Listeners,
 		TLS: emptyNodeTLS{Certificate: options.Credential.Certificate, Key: options.Credential.Key,
 			Roots: options.Roots, IdentityOID: ProcessIdentityOID},
-		AuthorizationPolicy: options.AuthorizationPolicy, GatewaySeeds: options.GatewaySeeds, ReplicaControl: control,
+		AuthorizationPolicy: options.AuthorizationPolicy, GatewaySeeds: options.GatewaySeeds,
+		CanonicalSourceSeeds: options.CanonicalSourceSeeds, ReplicaControl: control,
 		SplitControl: emptyNodeSplitControl{JournalPath: filepath.Join(root, "split-control.journal"),
 			MaxRecords: 4096, MaxFileBytes: 64 << 20, Grants: grants, MaxOperations: 8},
 	}
@@ -265,15 +268,20 @@ func validateEmptyNodeOptions(options EmptyNodeOptions, keyMaterialPath string) 
 	if len(options.GatewaySeeds) == 0 || len(options.GatewaySeeds) > nodecontrol.MaxBootstrapGatewaySeeds {
 		return errors.New("rf3 process fixture: empty node requires bounded gateway seeds")
 	}
-	seenSeeds := make(map[rafttransport.NodeID]struct{}, len(options.GatewaySeeds))
-	for _, seed := range options.GatewaySeeds {
-		if !seed.Valid() {
-			return errors.New("rf3 process fixture: invalid gateway seed")
+	for _, seeds := range [][]nodecontrol.BootstrapGatewaySeed{options.GatewaySeeds, options.CanonicalSourceSeeds} {
+		if len(seeds) > nodecontrol.MaxBootstrapGatewaySeeds {
+			return errors.New("rf3 process fixture: empty node requires bounded gateway seeds")
 		}
-		if _, found := seenSeeds[seed.NodeID]; found {
-			return errors.New("rf3 process fixture: duplicate gateway seed")
+		seenSeeds := make(map[rafttransport.NodeID]struct{}, len(seeds))
+		for _, seed := range seeds {
+			if !seed.Valid() {
+				return errors.New("rf3 process fixture: invalid gateway seed")
+			}
+			if _, found := seenSeeds[seed.NodeID]; found {
+				return errors.New("rf3 process fixture: duplicate gateway seed")
+			}
+			seenSeeds[seed.NodeID] = struct{}{}
 		}
-		seenSeeds[seed.NodeID] = struct{}{}
 	}
 	seen := make(map[rafttransport.NodeID]struct{}, len(options.GrantNodes))
 	for _, node := range options.GrantNodes {

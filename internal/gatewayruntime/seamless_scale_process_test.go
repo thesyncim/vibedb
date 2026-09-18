@@ -1569,7 +1569,8 @@ func buildSeamlessScaleEmptyPreparation(sourceManifest, targetRoot, targetCertif
 		return nil, err
 	}
 	var source struct {
-		NodeLog seamlessScaleNodeLogInput `json:"node_log"`
+		NodeLog              seamlessScaleNodeLogInput          `json:"node_log"`
+		CanonicalSourceSeeds []nodecontrol.BootstrapGatewaySeed `json:"canonical_source_seeds"`
 	}
 	if err := vibejson.Unmarshal(raw, &source); err != nil {
 		return nil, err
@@ -1600,7 +1601,8 @@ func buildSeamlessScaleEmptyPreparation(sourceManifest, targetRoot, targetCertif
 		NodeStore: source.NodeLog.Options, Listeners: rf3testfixture.ProcessListeners{
 			Peer: listeners["peer"], Native: listeners["native"], Snapshot: listeners["snapshot"], Control: listeners["control"],
 		}, Credential: rf3testfixture.Credential{Certificate: targetCertificate, Key: targetKey}, Roots: roots,
-		AuthorizationPolicy: policy, GrantNodes: grantNodes, GatewaySeeds: gatewaySeeds, MigrationBudget: &migrationBudget}
+		AuthorizationPolicy: policy, GrantNodes: grantNodes, GatewaySeeds: gatewaySeeds,
+		CanonicalSourceSeeds: source.CanonicalSourceSeeds, MigrationBudget: &migrationBudget}
 	return rf3testfixture.EmptyNodePreparationManifest(options, targetNodeKey)
 }
 

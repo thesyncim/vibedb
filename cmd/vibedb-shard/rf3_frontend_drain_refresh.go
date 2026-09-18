@@ -203,8 +203,6 @@ func waitRF3FrontendDrainServiceCutReady(ctx context.Context, ready <-chan struc
 	if ctx == nil || ready == nil {
 		return errRF3FrontendDrainCutRefreshUnavailable
 	}
-	timer := time.NewTimer(rf3NetworkTimeout)
-	defer timer.Stop()
 	select {
 	case <-ready:
 		if serverReady := context.Cause(ctx); serverReady != nil {
@@ -216,7 +214,5 @@ func waitRF3FrontendDrainServiceCutReady(ctx context.Context, ready <-chan struc
 			return cause
 		}
 		return context.Canceled
-	case <-timer.C:
-		return errRF3FrontendDrainCutRefreshUnavailable
 	}
 }
