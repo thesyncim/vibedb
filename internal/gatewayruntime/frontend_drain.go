@@ -667,6 +667,9 @@ func (runtime *Runtime) restoreFrontendDrainFromDirectory(ctx context.Context) e
 		}
 		if cutReader, ok := reader.(gateway.NodeDirectoryCutReader); ok {
 			cut, err := cutReader.ReadNodeDirectoryCut(ctx)
+			if errors.Is(err, gateway.ErrScalingNodeMissing) {
+				return nil
+			}
 			if err != nil {
 				return err
 			}
@@ -674,6 +677,9 @@ func (runtime *Runtime) restoreFrontendDrainFromDirectory(ctx context.Context) e
 		} else {
 			var err error
 			nodes, err = reader.ListNodes(ctx)
+			if errors.Is(err, gateway.ErrScalingNodeMissing) {
+				return nil
+			}
 			if err != nil {
 				return err
 			}
@@ -704,6 +710,9 @@ func (runtime *Runtime) restoreFrontendDrainFromDirectory(ctx context.Context) e
 		return nil
 	}
 	_, records, err := drainReader.ReadFrontendDrainRecordCut(ctx)
+	if errors.Is(err, gateway.ErrScalingNodeMissing) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}

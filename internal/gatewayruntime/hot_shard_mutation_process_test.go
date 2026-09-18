@@ -1170,7 +1170,7 @@ func hotMutationCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS,
 		t.Fatal(err)
 	}
 	session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{Executor: executor,
-		CatalogBootstrap: snapshot, MaxMutations: 12,
+		CatalogBootstrap: snapshot, MaxMutations: gateway.MaxReplicatedCatalogBatchMutations,
 		Route: route, Distribution: string(route.Distribution), Shard: string(route.Shard),
 		Tenant: []byte{1}, ClientID: replication.ID128{0xa1}, RetryHome: replication.RetryHome{0xb1},
 		Resolver: gateway.BaseRelationResolver{Relation: 1}, Journal: journal,

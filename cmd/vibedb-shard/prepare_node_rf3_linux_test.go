@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
-	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
@@ -281,10 +280,6 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 		_ = owner.Close()
 		t.Fatal(err)
 	}
-	commands := make(map[raftmember.GroupKey]raftservice.CommandFence, len(set.groups))
-	for index := range set.groups {
-		commands[set.groups[index].manifest.Route.Group] = rf3CommandFenceFromApply(t, set.groups[index].apply)
-	}
 	if err := closePreparedRF3Groups(set.groups, owner.Close()); err != nil {
 		t.Fatal(err)
 	}
@@ -343,8 +338,8 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 			}
 		}
 		t.Cleanup(stop)
-		for _, bundle := range manifests[0].Groups {
-			waitRF3CommandLeaderWithProbeCommand(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration, commands[bundle.Route.Group])
+		for index, bundle := range manifests[0].Groups {
+			waitRF3CommandLeaderWithProbeCommand(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration, rf3CommandFenceFromManifestGroup(t, manifests[0], index))
 		}
 		// A diagnostic signal is consumed by the serving loop and must not
 		// terminate the process. Send two snapshots and require the second
@@ -362,8 +357,8 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 				manifests[i] = appendRF3LiveNodeTestGroup(t, inputs[i], manifests[i])
 				reloads[i] <- syscall.SIGHUP
 			}
-			for _, bundle := range manifests[0].Groups {
-				waitRF3CommandLeaderWithProbeCommand(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration, commands[bundle.Route.Group])
+			for index, bundle := range manifests[0].Groups {
+				waitRF3CommandLeaderWithProbeCommand(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration, rf3CommandFenceFromManifestGroup(t, manifests[0], index))
 			}
 		}
 		stop()

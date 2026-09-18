@@ -1095,7 +1095,7 @@ func replicaProcessCatalogAuthority(t *testing.T, profile *rafttransport.PeerTLS
 		t.Fatal(err)
 	}
 	session, err := gateway.NewNativeSession(gateway.NativeSessionOptions{Executor: executor,
-		CatalogBootstrap: snapshot, MaxMutations: 6,
+		CatalogBootstrap: snapshot, MaxMutations: gateway.MaxReplicatedCatalogBatchMutations,
 		Route: route, Distribution: string(route.Distribution), Shard: string(route.Shard),
 		Tenant: []byte{1}, ClientID: replication.ID128{0xc1}, RetryHome: replication.RetryHome{0xd1},
 		Resolver: gateway.BaseRelationResolver{Relation: 1}, Journal: journal,
