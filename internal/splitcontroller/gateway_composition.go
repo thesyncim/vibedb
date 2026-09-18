@@ -30,7 +30,11 @@ func (actions CatalogGatewaySplitActions) ExecuteGatewaySplitAction(
 			return err
 		}
 		if actions.Refresh != nil {
-			return actions.Refresh(ctx)
+			// A certified Complete record must still be collected when the
+			// live directory refresh is racing a catalog pin. The periodic
+			// control-directory loop retries that cut; failing closed here
+			// leaves the operation in the directory forever.
+			_ = actions.Refresh(ctx)
 		}
 		return nil
 	}

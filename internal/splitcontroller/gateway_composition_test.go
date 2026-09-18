@@ -32,7 +32,7 @@ func TestCatalogGatewaySplitActionsRefreshesAfterTerminalRetirement(t *testing.T
 		},
 	}
 	err := actions.ExecuteGatewaySplitAction(t.Context(), plan, Observation{Catalog: catalog}, Action{Kind: ActionComplete})
-	if !errors.Is(err, wantRefreshErr) || terminal.calls != 1 || refreshCalls != 1 {
-		t.Fatalf("terminal calls=%d refresh calls=%d err=%v, want one call each and refresh error", terminal.calls, refreshCalls, err)
+	if err != nil || terminal.calls != 1 || refreshCalls != 1 {
+		t.Fatalf("terminal calls=%d refresh calls=%d err=%v, want one call each and collected Complete", terminal.calls, refreshCalls, err)
 	}
 }
