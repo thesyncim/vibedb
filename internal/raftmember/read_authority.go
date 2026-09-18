@@ -187,7 +187,13 @@ type runtimeAuthority struct {
 	// disabled retains the promise book and election gate while a local
 	// downgrade drains. Clearing a live promise here would let an election
 	// overlap a grant made under the previous feature policy.
-	disabled          bool
+	disabled bool
+	// installedVoters is the stable published roster present when this
+	// authority state was installed or last re-enabled. A later committed
+	// roster change disables optimized reads. Restore onto an already
+	// changed roster snapshots that later cut so fail-closed mismatch is
+	// preserved instead of looking like a disabled policy.
+	installedVoters   []uint64
 	leaderIncarnation func(uint64) (uint64, bool, error)
 	outbound          []OutboundMessage
 	// These counters are read by diagnostics outside the serialized owner. The
@@ -242,6 +248,7 @@ func (runtime *Runtime) ConfigureReadAuthority(options ReadAuthorityOptions) err
 			return ErrAuthorityReconfiguration
 		}
 		runtime.authority.disabled = false
+		runtime.authority.installedVoters = clonePublishedVoters(runtime)
 		return nil
 	}
 	return runtime.installReadAuthority(options, false)
@@ -314,6 +321,7 @@ func (runtime *Runtime) installReadAuthority(options ReadAuthorityOptions, prist
 		policy: cloneAuthorityPolicy(options.Policy), clock: options.Clock, promise: book,
 		leaderIncarnation: options.LeaderIncarnation,
 		outbound:          make([]OutboundMessage, 0, len(options.Policy.Voters)),
+		installedVoters:   clonePublishedVoters(runtime),
 	}
 	runtime.authority = state
 	return nil
@@ -1053,18 +1061,28 @@ func cloneAuthorityPolicy(policy raftauthority.ReadAuthorityPolicy) raftauthorit
 	return policy
 }
 
+func clonePublishedVoters(runtime *Runtime) []uint64 {
+	if runtime == nil || runtime.node == nil {
+		return nil
+	}
+	publication := runtime.node.Published()
+	if publication.ConfState == nil {
+		return nil
+	}
+	return append([]uint64(nil), publication.ConfState.GetVoters()...)
+}
+
 func (runtime *Runtime) refreshAuthority() {
 	runtime.refreshLeaderTransfer()
 	state := runtime.authority
 	if state == nil {
 		return
 	}
-	// A committed stable membership change invalidates the policy that was
-	// installed for the previous voter roster. This can happen on a survivor
-	// that has no active authority round: leaving the old state merely
-	// translates every observation into a configuration mismatch while the
-	// ordinary ReadIndex path is still safe to use. Keep the PromiseBook so a
-	// previously issued grant remains an election fence, but close optimized
+	// A later committed stable membership change invalidates the policy that
+	// was installed for an earlier published roster. Restore snapshots the
+	// already-changed cut at install time, so this only fires when the
+	// published voters move again after that install. Keep the PromiseBook so
+	// a previously issued grant remains an election fence, but close optimized
 	// reads and discard rounds/outbound requests tied to the old cut.
 	if runtime.disableStaleAuthorityOnCommittedRosterChange(state) {
 		return
@@ -1110,7 +1128,7 @@ func (runtime *Runtime) disableStaleAuthorityOnCommittedRosterChange(state *runt
 		len(confState.GetLearnersNext()) != 0 || confState.GetAutoLeave() {
 		return false
 	}
-	if slices.Equal(confState.GetVoters(), state.policy.Voters) {
+	if slices.Equal(confState.GetVoters(), state.installedVoters) {
 		return false
 	}
 	state.disabled = true

@@ -61,11 +61,23 @@ func TestRF3ServiceDirectoryRefreshRequiresNodeIncarnation(t *testing.T) {
 	if rf3ServiceDirectoryRefreshConfigured(rf3Manifest{GatewaySeeds: []nodecontrol.BootstrapGatewaySeed{{}}}, false) {
 		t.Fatal("seed-only RF3 manifest inferred managed refresh without a physical node log")
 	}
-	if !rf3ServiceDirectoryRefreshConfigured(rf3Manifest{NodeLog: &rf3NodeLogManifest{}}, false) {
-		t.Fatal("physical node manifest did not enable the mandatory refresh")
+	if rf3ServiceDirectoryRefreshConfigured(rf3Manifest{NodeLog: &rf3NodeLogManifest{}}, false) {
+		t.Fatal("physical node without source seeds inferred managed refresh")
 	}
-	if !rf3ServiceDirectoryRefreshConfigured(rf3Manifest{NodeIncarnation: 1}, true) {
-		t.Fatal("embedded node manifest did not enable the mandatory refresh")
+	if !rf3ServiceDirectoryRefreshConfigured(rf3Manifest{
+		NodeLog:              &rf3NodeLogManifest{},
+		CanonicalSourceSeeds: []nodecontrol.BootstrapGatewaySeed{{}},
+	}, false) {
+		t.Fatal("physical node with canonical source seeds did not enable the mandatory refresh")
+	}
+	if rf3ServiceDirectoryRefreshConfigured(rf3Manifest{NodeIncarnation: 1}, true) {
+		t.Fatal("embedded node without source seeds inferred managed refresh")
+	}
+	if !rf3ServiceDirectoryRefreshConfigured(rf3Manifest{
+		NodeIncarnation: 1,
+		GatewaySeeds:    []nodecontrol.BootstrapGatewaySeed{{}},
+	}, true) {
+		t.Fatal("embedded node with gateway seeds did not enable the mandatory refresh")
 	}
 }
 

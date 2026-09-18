@@ -188,6 +188,9 @@ func configureRF3ManifestReload(manifest *rf3Manifest, path string, enabled bool
 }
 
 func rf3ServiceDirectoryRefreshConfigured(manifest rf3Manifest, embeddedGateway bool) bool {
+	if len(manifest.CanonicalSourceSeeds) == 0 && len(manifest.GatewaySeeds) == 0 {
+		return false
+	}
 	return embeddedGateway || manifest.NodeLog != nil
 }
 
@@ -1304,10 +1307,10 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 			defer func() { resultErr = errors.Join(resultErr, preparedAckReader.Close()) }()
 		}
 		// A receiver with a managed source or embedded gateway must carry the
-		// explicit physical incarnation required by ReadLatest. The parser rejects
-		// source-configured zero-incarnation manifests; a grouped fixture with no
-		// source is the explicit nonmanaged form and has no refresh binding.
-		if manifest.NodeLog != nil || embeddedGateway != nil {
+		// explicit physical incarnation required by ReadLatest. Grouped
+		// fixtures without source seeds remain the nonmanaged form and have
+		// no refresh binding.
+		if rf3ServiceDirectoryRefreshConfigured(manifest, embeddedGateway != nil) {
 			if err := server.BindServiceDirectoryRefresh(
 				preparedAckReader, profile.LocalIdentity().Node, manifest.NodeIncarnation,
 				profile.LocalServiceKeyDigest(),
@@ -1383,11 +1386,13 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		if err != nil {
 			return err
 		}
-		// Every embedded gateway has the authenticated physical source
-		// available for follower startup. A local catalog leader may use the
-		// row-reader fast path; followers must install a ReadLatest proof from
-		// a surviving gateway before their local semantic catalog reads.
-		preparedGateway.config.CanonicalFrontendDrainRuntimeSource = preparedAckReader
+		// Followers install a ReadLatest proof from an authenticated source
+		// before they open the semantic catalog. Catalog leaders use the local
+		// row reader instead; a seed-less fixture must not wait on an empty
+		// source reader that can never succeed.
+		if rf3ServiceDirectoryRefreshConfigured(manifest, true) {
+			preparedGateway.config.CanonicalFrontendDrainRuntimeSource = preparedAckReader
+		}
 		defer func() { resultErr = errors.Join(resultErr, preparedGateway.remote.Close()) }()
 	}
 	if server != nil && rf3ServiceDirectoryRefreshConfigured(manifest, embeddedGateway != nil) {
@@ -1509,9 +1514,18 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		refreshCtx, cancelRefresh := context.WithCancel(parent)
 		ready := make(chan struct{})
 		serviceCutReady = ready
+		refreshReader := rf3LatestServiceCutReader(preparedAckReader)
+		if canonicalRows != nil {
+			refreshReader = rf3PreferLocalServiceCutReader{
+				local: rf3LocalCatalogServiceCutReader{
+					rows: canonicalRows, profile: profile, policyGeneration: policy.Generation(),
+				},
+				remote: preparedAckReader,
+			}
+		}
 		go func() {
 			_ = runRF3FrontendDrainServiceCutRefresh(
-				refreshCtx, preparedAckReader, profile, manifest.NodeIncarnation, server,
+				refreshCtx, refreshReader, profile, manifest.NodeIncarnation, server,
 				time.Second, ready,
 			)
 		}()

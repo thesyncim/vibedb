@@ -212,9 +212,6 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 	if len(nodeOwners) == 1 {
 		nodeOwner = nodeOwners[0]
 	}
-	if (current.NodeLog != nil) != (nodeOwner != nil) {
-		return errInvalidRF3Manifest
-	}
 	next, err := loadRF3Manifest(current.reloadPath)
 	if err != nil {
 		return err
@@ -311,6 +308,9 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 			if err := ensureRF3ReadAuthorityDisabled(bundle.Route.MemberRoot); err != nil {
 				return err
 			}
+		}
+		if (current.NodeLog != nil) != (nodeOwner != nil) {
+			return errInvalidRF3Manifest
 		}
 		set, err := prepareRF3GroupSetOnNode(next.withGroup(bundle), profile, sqldriver.ReplicatedOpenOptions{
 			WriterLockContext: ctx, WriterLockDeadline: time.Now().Add(rf3StartupWriterLockWait),

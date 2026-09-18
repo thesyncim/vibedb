@@ -150,7 +150,11 @@ func TestCatalogDiscoveryHandlesTypedGateRefusals(t *testing.T) {
 				}
 			}
 			if !retried {
-				t.Fatalf("typed unavailable refusal did not trigger a bounded second sweep: probes=%v", client.probes)
+				counts := make([]int64, len(client.probes))
+				for index := range client.probes {
+					counts[index] = client.probes[index].Load()
+				}
+				t.Fatalf("typed unavailable refusal did not trigger a bounded second sweep: probes=%v", counts)
 			}
 
 			client = &catalogTypedRefusalSweepClient{

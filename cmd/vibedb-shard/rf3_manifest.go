@@ -449,12 +449,10 @@ func parseRF3Manifest(data []byte) (rf3Manifest, error) {
 		if len(manifest.Groups) == 0 && (manifest.NodeIncarnation == 0 || len(manifest.GatewaySeeds) == 0) {
 			return rf3Manifest{}, errInvalidRF3Manifest
 		}
-		// A grouped production manifest is a physical-node publication. Its
-		// node log and incarnation are the sole durable source of process
-		// identity; accepting a group bundle without them would silently revive
-		// the old per-group/static-bootstrap path.
-		if len(manifest.Groups) != 0 &&
-			(manifest.NodeLog == nil || manifest.NodeIncarnation == 0) {
+		// Grouped production publications that name a node log must also name
+		// the physical incarnation. Grouped fixtures without a node log remain
+		// the explicit nonmanaged form used by per-group WAL serving.
+		if manifest.NodeLog != nil && manifest.NodeIncarnation == 0 {
 			return rf3Manifest{}, errInvalidRF3Manifest
 		}
 		if manifest.NodeIncarnation == 0 &&

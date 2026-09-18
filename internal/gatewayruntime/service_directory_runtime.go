@@ -99,6 +99,24 @@ func runtimeServiceDirectoryCutFromFrontendDrainRuntimeCut(
 		snapshot, profile, policyGeneration)
 }
 
+// PreparedAckCutFromFrontendDrainRuntimeCut projects one complete authority
+// cut into the native receiver proof. Catalog leaders use this locally so
+// startup does not wait for a gateway that is itself waiting for the same
+// proof.
+func PreparedAckCutFromFrontendDrainRuntimeCut(
+	ctx context.Context,
+	source gateway.FrontendDrainRuntimeCut,
+	profile *rafttransport.PeerTLS,
+	policyGeneration uint64,
+) (frontenddrain.PreparedAckCut, error) {
+	serviceCut, err := runtimeServiceDirectoryCutFromFrontendDrainRuntimeCut(
+		ctx, source, profile, policyGeneration)
+	if err != nil {
+		return frontenddrain.PreparedAckCut{}, err
+	}
+	return frontendDrainPreparedAckCutFromRuntimeCut(source, serviceCut)
+}
+
 // readCanonicalFrontendDrainRuntimeCut reads the complete authority cut used
 // by a control-directory publication and verifies that its live node view is
 // the same view that selected the transport endpoints.  The full cut is kept

@@ -62,12 +62,10 @@ func bindRF3EmbeddedGatewayCanonicalRows(
 		active = catalog
 	}
 	if active == nil {
-		if config.CatalogBootstrapIfMissing {
-			// Genuine catalog genesis has no committed route to read. The normal
-			// catalog bootstrap path remains the sole authority for creation.
-			return nil
-		}
-		return fmt.Errorf("%w: local catalog source has no committed route", errRF3Serving)
+		// Genuine catalog genesis and an explicit Open of a missing catalog
+		// still own creation. This binder only attaches an already committed
+		// local source route.
+		return nil
 	}
 	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
 	route, ok := active.ResolveReplicatedRoute(

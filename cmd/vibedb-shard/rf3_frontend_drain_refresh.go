@@ -8,7 +8,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/frontenddrain"
+	"github.com/thesyncim/vibedb/internal/gatewayruntime"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/shardservice"
 )
@@ -20,6 +22,59 @@ var (
 
 type rf3LatestServiceCutReader interface {
 	ReadLatestServiceCut(context.Context, frontenddrain.ServiceCutReadLatestRequest) (frontenddrain.ServiceCut, error)
+}
+
+// rf3LocalCatalogServiceCutReader projects the locally owned catalog rows into
+// a complete service cut. Catalog leaders install this proof without dialing a
+// gateway that has not opened yet.
+type rf3LocalCatalogServiceCutReader struct {
+	rows             gateway.FrontendDrainRuntimeCutRowReader
+	profile          *rafttransport.PeerTLS
+	policyGeneration uint64
+}
+
+func (reader rf3LocalCatalogServiceCutReader) ReadLatestServiceCut(
+	ctx context.Context, query frontenddrain.ServiceCutReadLatestRequest,
+) (frontenddrain.ServiceCut, error) {
+	if ctx == nil || reader.rows == nil || reader.profile == nil || reader.policyGeneration == 0 || !query.Valid() {
+		return frontenddrain.ServiceCut{}, errRF3FrontendDrainCutRefreshUnavailable
+	}
+	source, err := gateway.ReadFrontendDrainRuntimeCutFromRows(ctx, reader.rows)
+	if err != nil {
+		return frontenddrain.ServiceCut{}, err
+	}
+	cut, err := gatewayruntime.PreparedAckCutFromFrontendDrainRuntimeCut(
+		ctx, source, reader.profile, reader.policyGeneration)
+	if err != nil {
+		return frontenddrain.ServiceCut{}, err
+	}
+	if !cut.Valid() || !cut.AtLeastFloor(query.SourceFloor) {
+		return frontenddrain.ServiceCut{}, errRF3FrontendDrainCutRefreshState
+	}
+	return cut, nil
+}
+
+// rf3PreferLocalServiceCutReader tries the local catalog owner first and
+// falls back to the authenticated remote source. Followers keep using the
+// remote path; a missing local source never disables it.
+type rf3PreferLocalServiceCutReader struct {
+	local  rf3LatestServiceCutReader
+	remote rf3LatestServiceCutReader
+}
+
+func (reader rf3PreferLocalServiceCutReader) ReadLatestServiceCut(
+	ctx context.Context, query frontenddrain.ServiceCutReadLatestRequest,
+) (frontenddrain.ServiceCut, error) {
+	if reader.local != nil {
+		cut, err := reader.local.ReadLatestServiceCut(ctx, query)
+		if err == nil {
+			return cut, nil
+		}
+	}
+	if reader.remote == nil {
+		return frontenddrain.ServiceCut{}, errRF3FrontendDrainCutRefreshUnavailable
+	}
+	return reader.remote.ReadLatestServiceCut(ctx, query)
 }
 
 // refreshRF3FrontendDrainServiceCut performs one bounded authoritative

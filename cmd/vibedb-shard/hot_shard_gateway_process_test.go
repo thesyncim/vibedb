@@ -528,7 +528,7 @@ func gatewayHotShardLiveAuthority(
 		Shard: string(gateway.ReplicatedCatalogShard), Tenant: []byte{1}, ClientID: clientID,
 		RetryHome: retryHome, Resolver: gateway.BaseRelationResolver{Relation: 1}, Journal: journal,
 		ProposalCapability: serviceauthz.CapabilityTopology, MaxRelationBatches: 1,
-		MaxMutations: rf3CommandMembers + 4, InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
+		MaxMutations: rf3CommandMembers + 1 + 5, InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
 	})
 	if err != nil {
 		t.Fatal(err)

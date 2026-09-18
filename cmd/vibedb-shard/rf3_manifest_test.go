@@ -335,7 +335,14 @@ func TestParseRF3ManifestSharedKeyRequiresExactNodeLogBinding(t *testing.T) {
 }
 
 func multiGroupRF3Manifest(t testing.TB) string {
+	return managedRF3Manifest(t, 2)
+}
+
+func managedRF3Manifest(t testing.TB, groups int) string {
 	t.Helper()
+	if groups != 1 && groups != 2 {
+		t.Fatalf("managed RF3 fixture groups=%d, want 1 or 2", groups)
+	}
 	listener := strings.Index(canonicalRF3Manifest, `  "listeners":`)
 	members := strings.Index(canonicalRF3Manifest, "\n  \"members\":")
 	if listener < 0 || members <= listener {
@@ -358,20 +365,24 @@ func multiGroupRF3Manifest(t testing.TB) string {
 	}
 	roster := strings.TrimSuffix(canonicalRF3Manifest[members:], "\n}")
 	first := "{\n" + walSQL + registry + "," + roster + "\n  }"
-	second := strings.ReplaceAll(first, "/srv/vibedb/member", "/srv/vibedb/second/member")
-	second = strings.Replace(second, `"group_id": "3132333435363738393a3b3c3d3e3f40"`,
-		`"group_id": "5152535455565758595a5b5c5d5e5f60"`, 1)
-	second = strings.Replace(second, `"store_id": "4142434445464748494a4b4c4d4e4f50"`,
-		`"store_id": "6162636465666768696a6b6c6d6e6f70"`, 1)
-	second = strings.Replace(second, `"member_root": "/srv/vibedb"`,
-		`"member_root": "/srv/vibedb/second"`, 1)
-	second = strings.Replace(second, `"split_runtime_root": "/srv/vibedb/split-runtime"`,
-		`"split_runtime_root": "/srv/vibedb/second/split-runtime"`, 1)
-	second = strings.Replace(second, `"membership_grant_path": "/srv/vibedb/membership-grant"`,
-		`"membership_grant_path": "/srv/vibedb/second/membership-grant"`, 1)
-	second = strings.ReplaceAll(second, "/srv/vibedb/split-children", "/srv/vibedb/second/split-children")
-	second = strings.ReplaceAll(second, "/run/secrets/vibedb-wal-key", "/run/secrets/vibedb-wal-key-2")
-	return "{\n  \"node_log\": " + string(nodeLog) + ",\n  \"node_incarnation\": 1,\n" + common + "  \"groups\": [\n  " + first + ",\n  " + second + "\n  ]\n}"
+	list := first
+	if groups == 2 {
+		second := strings.ReplaceAll(first, "/srv/vibedb/member", "/srv/vibedb/second/member")
+		second = strings.Replace(second, `"group_id": "3132333435363738393a3b3c3d3e3f40"`,
+			`"group_id": "5152535455565758595a5b5c5d5e5f60"`, 1)
+		second = strings.Replace(second, `"store_id": "4142434445464748494a4b4c4d4e4f50"`,
+			`"store_id": "6162636465666768696a6b6c6d6e6f70"`, 1)
+		second = strings.Replace(second, `"member_root": "/srv/vibedb"`,
+			`"member_root": "/srv/vibedb/second"`, 1)
+		second = strings.Replace(second, `"split_runtime_root": "/srv/vibedb/split-runtime"`,
+			`"split_runtime_root": "/srv/vibedb/second/split-runtime"`, 1)
+		second = strings.Replace(second, `"membership_grant_path": "/srv/vibedb/membership-grant"`,
+			`"membership_grant_path": "/srv/vibedb/second/membership-grant"`, 1)
+		second = strings.ReplaceAll(second, "/srv/vibedb/split-children", "/srv/vibedb/second/split-children")
+		second = strings.ReplaceAll(second, "/run/secrets/vibedb-wal-key", "/run/secrets/vibedb-wal-key-2")
+		list = first + ",\n  " + second
+	}
+	return "{\n  \"node_log\": " + string(nodeLog) + ",\n  \"node_incarnation\": 1,\n" + common + "  \"groups\": [\n  " + list + "\n  ]\n}"
 }
 
 func TestParseRF3ManifestRetainsOneEnrolledTargetOutsideServingRF3(t *testing.T) {

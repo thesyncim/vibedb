@@ -164,7 +164,38 @@ func TestCombineProcessManifestsWithNodeMetadataPreservesPhysicalGenesis(t *test
 			t.Fatalf("combined managed manifest lost %q", name)
 		}
 	}
+	if position := bytes.Index(raw, []byte(`"authorization_policy"`)); position < 0 ||
+		bytes.Index(raw[position:], []byte(`"canonical_source_seeds"`)) < 0 ||
+		bytes.Index(raw[position:], []byte(`"replica_control"`)) < 0 {
+		t.Fatal("source seeds were not placed after authorization policy")
+	}
+	if policy := bytes.Index(raw, []byte(`"authorization_policy"`)); bytes.Index(raw[policy:], []byte(`"canonical_source_seeds"`)) >
+		bytes.Index(raw[policy:], []byte(`"replica_control"`)) {
+		t.Fatal("source seeds were placed after replica control")
+	}
 	if position := bytes.Index(raw, []byte(`"split_control"`)); position < 0 || bytes.Index(raw[position:], []byte(`"catalog_genesis"`)) < 0 {
 		t.Fatal("catalog genesis was not placed after split control")
+	}
+}
+
+func TestCombineManagedProcessManifestsPrefixesPhysicalNodeIdentity(t *testing.T) {
+	root := t.TempDir()
+	raw, err := CombineManagedProcessManifests(root, processBundleTestManifest(), processBundleTestManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := vibejson.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"node_log", "node_incarnation", "groups"} {
+		if _, found := parsed.Get(name); !found {
+			t.Fatalf("managed combined manifest lost %q", name)
+		}
+	}
+	log, _ := parsed.Get("node_log")
+	path, _ := log.Get("path")
+	if actual, ok := path.Text(); !ok || actual != filepath.Join(root, "node-log") {
+		t.Fatalf("managed node log path=%q", actual)
 	}
 }

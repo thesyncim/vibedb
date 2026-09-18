@@ -820,12 +820,14 @@ func (cluster *processRF3Cluster) probeFence() (shardservice.ReplicatedFence, bo
 		route.Group.ClusterIncarnation != ([16]byte{}) &&
 		route.Group.TopologyRecoveryEpoch != 0 &&
 		route.Group.ShardIncarnation != ([16]byte{}) &&
-		route.Group.GroupID != ([16]byte{}) && route.AllocationGeneration != 0
+		route.Group.GroupID != ([16]byte{}) && route.AllocationGeneration != 0 &&
+		route.Command.Valid()
 	if !valid {
 		return shardservice.ReplicatedFence{}, false
 	}
 	return shardservice.ReplicatedFence{
 		Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+		Command: route.Command,
 	}, true
 }
 

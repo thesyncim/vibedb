@@ -88,27 +88,39 @@ func CombineProcessManifestsWithNodeMetadata(
 	prefix = append(prefix, nodeLog...)
 	prefix = append(prefix, `,"node_incarnation":`...)
 	prefix = strconv.AppendUint(prefix, metadata.NodeIncarnation, 10)
-	if len(metadata.GatewaySeeds) != 0 {
-		prefix = append(prefix, `,"bootstrap_gateway_seeds":`...)
-		seeds, marshalErr := vibejson.Marshal(&metadata.GatewaySeeds)
-		if marshalErr != nil {
-			return nil, errors.Join(ErrProcessManifestBundle, marshalErr)
-		}
-		prefix = append(prefix, seeds...)
-	}
-	if len(metadata.CanonicalSourceSeeds) != 0 {
-		prefix = append(prefix, `,"canonical_source_seeds":`...)
-		seeds, marshalErr := vibejson.Marshal(&metadata.CanonicalSourceSeeds)
-		if marshalErr != nil {
-			return nil, errors.Join(ErrProcessManifestBundle, marshalErr)
-		}
-		prefix = append(prefix, seeds...)
-	}
 	prefix = append(prefix, ',')
 	if len(bundle) < 2 || bundle[0] != '{' {
 		return nil, ErrProcessManifestBundle
 	}
 	prefix = append(prefix, bundle[1:]...)
+	var seeds []byte
+	if len(metadata.GatewaySeeds) != 0 {
+		encoded, marshalErr := vibejson.Marshal(&metadata.GatewaySeeds)
+		if marshalErr != nil {
+			return nil, errors.Join(ErrProcessManifestBundle, marshalErr)
+		}
+		seeds = append(seeds, `,"bootstrap_gateway_seeds":`...)
+		seeds = append(seeds, encoded...)
+	}
+	if len(metadata.CanonicalSourceSeeds) != 0 {
+		encoded, marshalErr := vibejson.Marshal(&metadata.CanonicalSourceSeeds)
+		if marshalErr != nil {
+			return nil, errors.Join(ErrProcessManifestBundle, marshalErr)
+		}
+		seeds = append(seeds, `,"canonical_source_seeds":`...)
+		seeds = append(seeds, encoded...)
+	}
+	if len(seeds) != 0 {
+		position := bytes.Index(prefix, []byte(`,"replica_control":`))
+		if position < 0 {
+			return nil, ErrProcessManifestBundle
+		}
+		inserted := make([]byte, 0, len(prefix)+len(seeds))
+		inserted = append(inserted, prefix[:position]...)
+		inserted = append(inserted, seeds...)
+		inserted = append(inserted, prefix[position:]...)
+		prefix = inserted
+	}
 	if len(metadata.CatalogGenesis) == 0 {
 		return prefix, nil
 	}
@@ -127,15 +139,41 @@ func CombineProcessManifestsWithNodeMetadata(
 	return result, nil
 }
 
+// CombineManagedProcessManifests composes singleton groups and prefixes the
+// physical-node identity the serve-rf3 parser requires for a grouped
+// manifest. The node-log path is unique to root so group WAL key material
+// can stay distinct; callers that actually serve must still create that log.
+func CombineManagedProcessManifests(root string, documents ...[]byte) ([]byte, error) {
+	if root == "" {
+		return nil, ErrProcessManifestBundle
+	}
+	if !filepath.IsAbs(root) {
+		abs, err := filepath.Abs(root)
+		if err != nil {
+			return nil, errors.Join(ErrProcessManifestBundle, err)
+		}
+		root = abs
+	}
+	root = filepath.Clean(root)
+	if root == "/" {
+		return nil, ErrProcessManifestBundle
+	}
+	return CombineProcessManifestsWithNodeMetadata(ProcessNodeMetadata{
+		NodeLog: ProcessNodeLogManifest{
+			Format: 1, Path: filepath.Join(root, "node-log"), KeyID: "managed-node-key",
+			KeyMaterialPath: filepath.Join(root, "node-key-material"),
+			Options:         raftstore.NodeStoreOptions{MaxGroups: 64},
+		},
+		NodeIncarnation: 1,
+	}, documents...)
+}
+
 func validateProcessNodeMetadata(metadata ProcessNodeMetadata) error {
 	log := metadata.NodeLog
 	if log.Format != 1 || log.KeyID == "" || metadata.NodeIncarnation == 0 ||
 		!filepath.IsAbs(log.Path) || filepath.Clean(log.Path) != log.Path ||
 		!filepath.IsAbs(log.KeyMaterialPath) || filepath.Clean(log.KeyMaterialPath) != log.KeyMaterialPath ||
 		log.Path == "/" || log.KeyMaterialPath == "/" || log.Path == log.KeyMaterialPath {
-		return ErrProcessManifestBundle
-	}
-	if len(metadata.GatewaySeeds) == 0 && len(metadata.CanonicalSourceSeeds) == 0 {
 		return ErrProcessManifestBundle
 	}
 	for _, seeds := range [][]nodecontrol.BootstrapGatewaySeed{metadata.GatewaySeeds, metadata.CanonicalSourceSeeds} {

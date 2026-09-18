@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/frontenddrain"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
 
 type blockingRF3ServiceCutReader struct {
@@ -55,4 +56,41 @@ func TestRF3FrontendDrainServiceCutRefreshCancellationKeepsReadinessClosed(t *te
 		t.Fatal("readiness opened before a canonical service cut was installed")
 	default:
 	}
+}
+
+func TestRF3PreferLocalServiceCutReaderFallsBackToRemote(t *testing.T) {
+	query := frontenddrain.ServiceCutReadLatestRequest{
+		Operation: frontenddrain.ReadLatest, Nonce: [16]byte{1},
+		ReceiverNode: rafttransport.NodeID{1}, ReceiverIncarnation: 1,
+		ReceiverServiceKeyDigest: [32]byte{2},
+	}
+	if !query.Valid() {
+		t.Fatal("read-latest query must be valid")
+	}
+	want := frontenddrain.ServiceCut{DirectoryRevision: 7}
+	local := &countingRF3ServiceCutReader{err: errRF3FrontendDrainCutRefreshUnavailable}
+	remote := &countingRF3ServiceCutReader{cut: want}
+	got, err := (rf3PreferLocalServiceCutReader{local: local, remote: remote}).ReadLatestServiceCut(context.Background(), query)
+	if err != nil || got.DirectoryRevision != want.DirectoryRevision || local.calls != 1 || remote.calls != 1 {
+		t.Fatalf("fallback cut=%+v err=%v local=%d remote=%d", got, err, local.calls, remote.calls)
+	}
+	localSuccess := &countingRF3ServiceCutReader{cut: frontenddrain.ServiceCut{DirectoryRevision: 9}}
+	remoteUnused := &countingRF3ServiceCutReader{cut: want}
+	got, err = (rf3PreferLocalServiceCutReader{local: localSuccess, remote: remoteUnused}).ReadLatestServiceCut(context.Background(), query)
+	if err != nil || got.DirectoryRevision != 9 || localSuccess.calls != 1 || remoteUnused.calls != 0 {
+		t.Fatalf("local cut=%+v err=%v local=%d remote=%d", got, err, localSuccess.calls, remoteUnused.calls)
+	}
+}
+
+type countingRF3ServiceCutReader struct {
+	cut   frontenddrain.ServiceCut
+	err   error
+	calls int
+}
+
+func (reader *countingRF3ServiceCutReader) ReadLatestServiceCut(
+	context.Context, frontenddrain.ServiceCutReadLatestRequest,
+) (frontenddrain.ServiceCut, error) {
+	reader.calls++
+	return reader.cut, reader.err
 }

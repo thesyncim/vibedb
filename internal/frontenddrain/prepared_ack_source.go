@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"math"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -443,7 +444,7 @@ func (response PreparedAckCutReadResponse) Marshal() ([]byte, error) {
 		return nil, ErrPreparedAckWire
 	}
 	cut, err := marshalPreparedAckCut(response.Cut)
-	if err != nil || len(cut) > int(^uint32(0)) {
+	if err != nil || uint64(len(cut)) > math.MaxUint32 {
 		return nil, ErrPreparedAckWire
 	}
 	raw := make([]byte, preparedAckCutReadResponseHeaderBytes+len(cut)+sha256.Size)

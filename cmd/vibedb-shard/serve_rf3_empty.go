@@ -661,9 +661,18 @@ func servePreparedRF3EmptyNode(
 	refreshCtx, cancelRefresh := context.WithCancel(parent)
 	ready := make(chan struct{})
 	serviceCutReady = ready
+	refreshReader := rf3LatestServiceCutReader(preparedAckReader)
+	if dynamicCanonicalRows != nil {
+		refreshReader = rf3PreferLocalServiceCutReader{
+			local: rf3LocalCatalogServiceCutReader{
+				rows: dynamicCanonicalRows, profile: profile, policyGeneration: policy.Generation(),
+			},
+			remote: preparedAckReader,
+		}
+	}
 	go func() {
 		_ = runRF3FrontendDrainServiceCutRefresh(
-			refreshCtx, preparedAckReader, profile, manifest.NodeIncarnation, nativeServer,
+			refreshCtx, refreshReader, profile, manifest.NodeIncarnation, nativeServer,
 			time.Second, ready,
 		)
 	}()

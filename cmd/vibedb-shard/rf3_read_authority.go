@@ -1199,6 +1199,9 @@ func configureRF3ReadAuthorityGroup(
 	if cache == nil || manifest.ReadAuthority == nil || runtime == nil || item.adoptedChild {
 		return rf3ReadAuthorityRegistration{}, errRF3ReadAuthority
 	}
+	if err := runtime.Failure(); errors.Is(err, raftmember.ErrRuntimeClosed) {
+		return rf3ReadAuthorityRegistration{}, err
+	}
 	policy, err := manifest.ReadAuthority.rf3Policy()
 	if err != nil {
 		return rf3ReadAuthorityRegistration{}, err
