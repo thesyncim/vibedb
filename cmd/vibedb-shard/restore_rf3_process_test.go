@@ -453,7 +453,26 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 		if loadErr != nil {
 			t.Fatal(loadErr)
 		}
-		fixture.probeCommand = rf3CommandFenceFromManifestGroup(t, serving, 0)
+		bundles := serving.groupBundles()
+		if len(bundles) == 0 {
+			t.Fatal("restored RF3 serving manifest has no groups")
+		}
+		base, _, identityErr := loadRF3RetainedIdentities(serving.withGroup(bundles[0]))
+		if identityErr != nil {
+			t.Fatal(identityErr)
+		}
+		digest, digestErr := sqldriver.ReplicatedRelationManifestDigest(base)
+		if digestErr != nil {
+			t.Fatal(digestErr)
+		}
+		fixture.probeCommand = commandFenceFromPublication(
+			base.Binding.Authority,
+			raftmember.RuntimeIdentity{RelationManifestDigest: digest},
+			1,
+		)
+		if !fixture.probeCommand.Valid() {
+			t.Fatalf("restored RF3 probe command is invalid: %+v", fixture.probeCommand)
+		}
 	}
 	return fixtures, gateway.RestoreActivationOptions{Root: activationRoot, Staging: staging, Operation: operation, Installer: installer, Catalog: catalog, Gate: gate, Operator: serviceauthz.Authority{Node: operatorNode, Generation: 5}}, snapshot
 }

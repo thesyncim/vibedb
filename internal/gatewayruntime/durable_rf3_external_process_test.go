@@ -733,7 +733,17 @@ func newDurableRF3ExternalFixtureWithPeerFaults(t *testing.T, ctx context.Contex
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture.probeClient = durableRF3ExternalReplicatedClient(t, fixture.observerProfile)
+	gatewayProfile, err := servicetls.LoadProfile(
+		fixture.credentials[fixture.gatewayANode].Certificate,
+		fixture.credentials[fixture.gatewayANode].Key, fixture.roots,
+		rf3testfixture.ProcessIdentityOID, time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Native receivers with a committed service directory only admit gateway
+	// delegates. Observer topology authority stays on the request.
+	fixture.probeClient = durableRF3ExternalReplicatedClient(t, gatewayProfile)
 	fixture.measurements = &durableRF3ExternalMeasurements{}
 	fixture.snapshot = built.Snapshot
 	return fixture
