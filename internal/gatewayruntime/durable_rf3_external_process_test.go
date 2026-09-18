@@ -742,7 +742,8 @@ func newDurableRF3ExternalFixtureWithPeerFaults(t *testing.T, ctx context.Contex
 		t.Fatal(err)
 	}
 	// Native receivers with a committed service directory only admit gateway
-	// delegates. Observer topology authority stays on the request.
+	// delegates. Probe TLS and request authority must be that same principal;
+	// a directory-managed observer on the request is denied.
 	fixture.probeClient = durableRF3ExternalReplicatedClient(t, gatewayProfile)
 	fixture.measurements = &durableRF3ExternalMeasurements{}
 	fixture.snapshot = built.Snapshot
@@ -1369,7 +1370,7 @@ func (fixture *durableRF3ExternalFixture) probeMember(group, member int, require
 	defer cancel()
 	route := fixture.routes[group]
 	ctx, err := serviceauthz.WithAuthority(ctx, serviceauthz.Authority{
-		Node: fixture.nodes[fixture.observerNode], Generation: 5,
+		Node: fixture.nodes[fixture.gatewayANode], Generation: 5,
 	})
 	if err != nil {
 		return shardservice.ReplicatedMemberState{}, err
