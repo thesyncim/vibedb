@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"slices"
+	"syscall"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -593,6 +595,22 @@ func frontendDrainPreparedAckCutContainsReceiver(cut frontenddrain.PreparedAckCu
 			(binding.Lifecycle == serviceauthz.ServiceActive || binding.Lifecycle == serviceauthz.ServiceDraining) {
 			return true
 		}
+	}
+	return false
+}
+
+func frontendDrainPreparedAckReceiverUnreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var op *net.OpError
+	if errors.As(err, &op) && op != nil && op.Err != nil {
+		return frontendDrainPreparedAckReceiverUnreachable(op.Err)
 	}
 	return false
 }

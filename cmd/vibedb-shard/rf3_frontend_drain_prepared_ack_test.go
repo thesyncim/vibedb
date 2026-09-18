@@ -347,6 +347,37 @@ func TestRF3PhysicalSourceInstallExactRequiresMatchingDrain(t *testing.T) {
 	}
 }
 
+func TestRF3FrontendDrainPreparedAckReaderInstallsAuthenticatedCutWithoutSeeds(t *testing.T) {
+	request, seed, cut := rf3PreparedAckReaderTestRequest(t)
+	reader := &rf3FrontendDrainPreparedAckCutReader{
+		trust: cut.ServiceDirectory.TrustDomain, localNode: request.ReceiverNode,
+		localIncarnation: request.ReceiverIncarnation, localServiceKey: request.ReceiverServiceKeyDigest,
+		readDeadline:  func() time.Time { return time.Now().Add(time.Second) },
+		writeDeadline: func() time.Time { return time.Now().Add(time.Second) },
+	}
+	got, err := reader.ReadFrontendDrainPreparedAckCut(t.Context(), request)
+	if err != nil {
+		t.Fatalf("unmanaged install: %v", err)
+	}
+	if got.Digest() != cut.Digest() {
+		t.Fatalf("unmanaged cut digest=%x, want %x", got.Digest(), cut.Digest())
+	}
+
+	wrongReceiver := request
+	wrongReceiver.ReceiverNode = rafttransport.NodeID{99}
+	if _, err = reader.ReadFrontendDrainPreparedAckCut(t.Context(), wrongReceiver); !errors.Is(err, errRF3FrontendDrainPreparedAckReaderAuth) {
+		t.Fatalf("wrong receiver err=%v, want auth", err)
+	}
+
+	managed := *reader
+	managed.seeds = map[rafttransport.NodeID]nodecontrol.BootstrapGatewaySeed{
+		rafttransport.NodeID{9}: seed,
+	}
+	if _, err = managed.ReadFrontendDrainPreparedAckCut(t.Context(), request); !errors.Is(err, errRF3FrontendDrainPreparedAckReaderUnavailable) {
+		t.Fatalf("managed missing publisher err=%v, want unavailable", err)
+	}
+}
+
 func rf3PreparedAckReaderTestRequest(t *testing.T) (
 	frontenddrain.PreparedAckRequest, nodecontrol.BootstrapGatewaySeed, frontenddrain.PreparedAckCut,
 ) {

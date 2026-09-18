@@ -108,6 +108,8 @@ func (runtime *Runtime) publishCanonicalFrontendDrainCutOnce(
 		if !ok {
 			return gateway.ErrScalingIdentity
 		}
+		acked := 0
+		var lastUnreachable error
 		for _, receiver := range receivers {
 			var nonce [16]byte
 			if _, err := cryptorand.Read(nonce[:]); err != nil {
@@ -123,9 +125,27 @@ func (runtime *Runtime) publishCanonicalFrontendDrainCutOnce(
 				return gateway.ErrScalingState
 			}
 			if err := runtime.acknowledgeFrontendDrainPreparedAckPhysicalReceiver(ctx, receiver, request); err != nil {
+				// A recovery/publication install carries no drain subject. A
+				// serving replica that is already gone must not strand the
+				// remaining live barrier or the periodic directory refresh.
+				if request.DrainID == ([32]byte{}) && frontendDrainPreparedAckReceiverUnreachable(err) {
+					if runtime.config.Logf != nil {
+						runtime.config.Logf("gatewayruntime: skip unreachable prepared-ack receiver %s incarnation %d: %v",
+							receiver.node.NodeID, receiver.node.Incarnation, err)
+					}
+					lastUnreachable = err
+					continue
+				}
 				return fmt.Errorf("prepared-ack receiver %s incarnation %d: %w", receiver.node.NodeID,
 					receiver.node.Incarnation, err)
 			}
+			acked++
+		}
+		if acked == 0 {
+			if lastUnreachable != nil {
+				return fmt.Errorf("prepared-ack receivers unreachable: %w", lastUnreachable)
+			}
+			return gateway.ErrScalingState
 		}
 	}
 	latest, err := runtime.readLiveControlDirectoryProjection(ctx)

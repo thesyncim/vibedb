@@ -3,8 +3,10 @@ package gatewayruntime
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -66,6 +68,7 @@ type refreshDedupPreparedAckOpener struct {
 	profile      *rafttransport.PeerTLS
 	receiverKey  [32]byte
 	receiverNode rafttransport.NodeID
+	refuseNode   rafttransport.NodeID
 	fail         bool
 	calls        int
 }
@@ -77,12 +80,16 @@ func (opener *refreshDedupPreparedAckOpener) OpenShardControlEndpoint(
 	opener.calls++
 	fail := opener.fail
 	profile := opener.profile
+	refuseNode := opener.refuseNode
 	receiverNode := endpoint.Node
 	receiverKey := opener.receiverKey
 	if receiverNode != opener.receiverNode {
 		receiverKey = [32]byte{100 + receiverNode[0]}
 	}
 	opener.mu.Unlock()
+	if refuseNode != (rafttransport.NodeID{}) && endpoint.Node == refuseNode {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
+	}
 	if fail {
 		return nil, errors.New("injected prepared-ack receiver failure")
 	}
@@ -163,12 +170,15 @@ func newRefreshDedupRuntime(
 	}
 }
 
-func TestRefreshLiveControlDirectoryFanoutDedupAndInvalidation(t *testing.T) {
-	_, _, source, _, _ := frontendDrainSourceTestFixture(t)
+func refreshDedupExpandedSource(t *testing.T) (
+	source gateway.FrontendDrainRuntimeCut, profile *rafttransport.PeerTLS, policy *serviceauthz.Policy, grantNode gateway.NodeRecord,
+) {
+	t.Helper()
+	_, _, source, _, _ = frontendDrainSourceTestFixture(t)
 	profiles, _ := runtimeControlTLSFixture(t, []serviceauthz.Entry{{
 		Node: rafttransport.NodeID{9}, Capabilities: serviceauthz.AllCapabilities,
 	}})
-	profile := profiles[0]
+	profile = profiles[0]
 	// Use a gateway principal distinct from route member three.  This keeps
 	// the complete source projection's physical and gateway bindings uniquely
 	// addressable while retaining the catalog route's canonical RF3 members.
@@ -184,7 +194,7 @@ func TestRefreshLiveControlDirectoryFanoutDedupAndInvalidation(t *testing.T) {
 		}
 		source.ContinuationGrants[index] = grant
 	}
-	node := source.Nodes.Nodes[0]
+	grantNode = source.Nodes.Nodes[0]
 	// The fixture's catalog route has the canonical RF3 members one, two, and
 	// three while its continuation grant names physical receiver four.  Build
 	// the complete serving roster so this test exercises both route receivers
@@ -193,7 +203,7 @@ func TestRefreshLiveControlDirectoryFanoutDedupAndInvalidation(t *testing.T) {
 		preparedAckRosterNode(1, 21, gateway.NodeActive, gateway.NodeRoleStorage),
 		preparedAckRosterNode(2, 22, gateway.NodeActive, gateway.NodeRoleStorage),
 		preparedAckRosterNode(3, 23, gateway.NodeActive, gateway.NodeRoleStorage),
-		node,
+		grantNode,
 	}
 	routeNodes[0].DataEndpoint, routeNodes[0].NativeEndpoint, routeNodes[0].ControlEndpoint = "one", "one-native", "one-control"
 	routeNodes[0].DataAddress, routeNodes[0].NativeAddress, routeNodes[0].ControlAddress = "127.0.0.1:7001", "127.0.0.1:9101", "127.0.0.1:7201"
@@ -206,12 +216,18 @@ func TestRefreshLiveControlDirectoryFanoutDedupAndInvalidation(t *testing.T) {
 	if !source.Nodes.Valid() {
 		t.Fatalf("expanded source node cut invalid: rev=%d digest=%x nodes=%+v", source.Nodes.Revision, source.Nodes.Digest, source.Nodes.Nodes)
 	}
-	policy, err := serviceauthz.NewPolicy(1, []serviceauthz.Entry{{
+	var err error
+	policy, err = serviceauthz.NewPolicy(1, []serviceauthz.Entry{{
 		Node: profile.LocalIdentity().Node, Capabilities: serviceauthz.AllCapabilities,
 	}})
 	if err != nil {
 		t.Fatalf("test policy: %v", err)
 	}
+	return source, profile, policy, grantNode
+}
+
+func TestRefreshLiveControlDirectoryFanoutDedupAndInvalidation(t *testing.T) {
+	source, profile, policy, node := refreshDedupExpandedSource(t)
 	reader := &refreshDedupRuntimeCutReader{cut: source}
 	opener := &refreshDedupPreparedAckOpener{
 		profile: profile, receiverNode: node.NodeID, receiverKey: [32]byte(node.ServiceKeyDigest),
@@ -289,5 +305,36 @@ func TestRefreshLiveControlDirectoryFanoutDedupAndInvalidation(t *testing.T) {
 	}
 	if got := failedOpener.callsObserved(); got != 6 {
 		t.Fatalf("retry fanout=%d, want one failed receiver plus recovered five-receiver round", got)
+	}
+}
+
+func TestFrontendDrainPreparedAckReceiverUnreachable(t *testing.T) {
+	if !frontendDrainPreparedAckReceiverUnreachable(&net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}) {
+		t.Fatal("connection refused must be unreachable")
+	}
+	if frontendDrainPreparedAckReceiverUnreachable(io.EOF) {
+		t.Fatal("EOF is a protocol close, not an unreachable peer")
+	}
+	if frontendDrainPreparedAckReceiverUnreachable(errors.New("injected prepared-ack receiver failure")) {
+		t.Fatal("injected protocol failure must not be skipped")
+	}
+}
+
+func TestRefreshLiveControlDirectorySkipsUnreachableRecoveryReceiver(t *testing.T) {
+	source, profile, policy, node := refreshDedupExpandedSource(t)
+	reader := &refreshDedupRuntimeCutReader{cut: source}
+	opener := &refreshDedupPreparedAckOpener{
+		profile: profile, receiverNode: node.NodeID, receiverKey: [32]byte(node.ServiceKeyDigest),
+		refuseNode: rafttransport.NodeID{1},
+	}
+	runtime := newRefreshDedupRuntime(t, source, reader, opener, profile, policy)
+	if err := runtime.refreshLiveControlDirectory(t.Context()); err != nil {
+		t.Fatalf("publication with one unreachable receiver: %v", err)
+	}
+	if !runtime.publishedFrontendDrainCutValid {
+		t.Fatal("reachable receiver barrier did not cache the cut")
+	}
+	if got := opener.callsObserved(); got != 4 {
+		t.Fatalf("fanout=%d, want one four-receiver round including the refused peer", got)
 	}
 }

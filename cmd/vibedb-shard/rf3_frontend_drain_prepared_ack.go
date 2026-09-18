@@ -497,9 +497,20 @@ func (reader *rf3FrontendDrainPreparedAckCutReader) ReadFrontendDrainPreparedAck
 		trafficClass = rafttransport.TrafficShardControl
 		physicalSource = found
 	}
+	unmanaged := len(reader.seeds) == 0 && len(reader.canonicalSourceSeeds) == 0 &&
+		reader.transport == nil && reader.canonicalSourceTransport == nil
 	reader.mu.RUnlock()
 	if !found || replication.Digest(request.SourcePrincipalKeyDigest) != seed.SPKIPinDigest ||
 		transport == nil {
+		// Grouped fixtures without source seeds are the nonmanaged serving
+		// form: they have no independent ReadLatest route. The ACK caller is
+		// already TLS-authenticated as SourcePrincipal, so the exact cut on
+		// the request is the only source this process can install.
+		if unmanaged && rf3FrontendDrainPreparedAckCutPublishedBy(
+			request.SourceCut, request.SourcePrincipal, request.SourcePrincipalKeyDigest,
+		) {
+			return request.SourceCut, nil
+		}
 		return frontenddrain.PreparedAckCut{}, errRF3FrontendDrainPreparedAckReaderUnavailable
 	}
 	connection, err := transport.Dial(ctx, seed.ControlAddress)
@@ -965,6 +976,22 @@ func rf3FrontendDrainPreparedAckPhysicalSourceCutMatchesQuery(
 		if grant.GrantDigest == query.GrantDigest {
 			return grant.Valid() && grant.DrainID == query.DrainID &&
 				(!query.RequirePrepared || grant.State == serviceauthz.ContinuationGrantPrepared)
+		}
+	}
+	return false
+}
+
+func rf3FrontendDrainPreparedAckCutPublishedBy(
+	cut frontenddrain.PreparedAckCut, principal rafttransport.NodeID, key [32]byte,
+) bool {
+	if !cut.Valid() || principal == (rafttransport.NodeID{}) || key == ([32]byte{}) {
+		return false
+	}
+	for _, binding := range cut.ServiceDirectory.Bindings {
+		if binding.Principal == principal && binding.KeyDigest == key &&
+			binding.Roles&serviceauthz.ServiceRoleGateway != 0 &&
+			(binding.Lifecycle == serviceauthz.ServiceActive || binding.Lifecycle == serviceauthz.ServiceDraining) {
+			return true
 		}
 	}
 	return false
