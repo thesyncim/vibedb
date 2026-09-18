@@ -449,6 +449,11 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 				t.Fatal(err)
 			}
 		}
+		serving, loadErr := loadRF3Manifest(fixture.manifestPaths[0])
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		fixture.probeCommand = rf3CommandFenceFromManifestGroup(t, serving, 0)
 	}
 	return fixtures, gateway.RestoreActivationOptions{Root: activationRoot, Staging: staging, Operation: operation, Installer: installer, Catalog: catalog, Gate: gate, Operator: serviceauthz.Authority{Node: operatorNode, Generation: 5}}, snapshot
 }
@@ -605,7 +610,7 @@ func restoreRF3AssertClosed(t *testing.T, fixture *rf3FaultFixture, member int) 
 		Fence: shardservice.ReplicatedFence{Group: fixture.group, AllocationGeneration: 23, Command: fixture.probeCommand}})
 	if err != nil || response.Kind != shardservice.ReplicatedRefusal ||
 		response.Refusal != shardservice.ReplicatedRefusalUnavailable || !response.HasState {
-		t.Fatalf("restored member %d served without a fresh catalog grant: %+v", member+1, response)
+		t.Fatalf("restored member %d served without a fresh catalog grant: %+v err=%v", member+1, response, err)
 	}
 }
 

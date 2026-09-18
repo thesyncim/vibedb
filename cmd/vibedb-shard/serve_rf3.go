@@ -1593,54 +1593,47 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	var primary error
 	peerFinished, controlFinished, snapshotFinished, nativeFinished := false, false, false, false
 	frontendStartupCanceled := false
-	// Catalog recovery is allowed to take its bounded election attempts, but it
-	// must remain concurrent with component failure and parent cancellation. A
-	// frontend failure after owners have started enters the same reverse drain
-	// path as any listener failure below.
-	if embeddedGatewayOpened != nil {
-		for embeddedGatewayState == nil && primary == nil && !frontendStartupCanceled {
-			select {
-			case embeddedGatewayState = <-embeddedGatewayOpened:
-			case <-diagnostics:
-				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, nil, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator, progressMetrics, rf3AuthorityDiagnostics{
-					RoundMetrics: peer.Owners().ReadAuthorityRoundMetrics,
-					Evidence:     peer.Owners().ReadAuthorityEvidence,
-				})
-			case err := <-embeddedGatewayDone:
-				embeddedGatewayFinished = true
-				primary = fmt.Errorf("RF3 embedded gateway stopped during startup: %w", err)
-			case err := <-catalogGenesisDone:
-				catalogGenesisDone = nil
-				if err != nil {
-					primary = fmt.Errorf("RF3 catalog genesis: %w", err)
-				}
-			case <-parent.Done():
-				// Parent cancellation is the normal lifecycle request.
-				frontendStartupCanceled = true
-				if stopEmbeddedGateway != nil {
-					stopEmbeddedGateway(context.Cause(parent))
-				}
-			case err := <-peerDone:
-				primary, peerFinished = fmt.Errorf("RF3 peer stopped during embedded gateway startup: %w", err), true
-			case err := <-controlDone:
-				primary, controlFinished = fmt.Errorf("RF3 control listener stopped during embedded gateway startup: %w", err), true
-			case err := <-snapshotDone:
-				primary, snapshotFinished = fmt.Errorf("RF3 snapshot listener stopped during embedded gateway startup: %w", err), true
-			case err := <-nativeDone:
-				primary, nativeFinished = fmt.Errorf("RF3 native listener stopped during embedded gateway startup: %w", err), true
-			}
+	// Catalog genesis, election, and the first canonical cut regularly take
+	// longer than one RPC deadline. Native stays fail-closed until the cut is
+	// installed; abort only on component failure or parent cancellation.
+	for primary == nil && !frontendStartupCanceled {
+		waitingGateway := embeddedGatewayOpened != nil && embeddedGatewayState == nil
+		waitingCut := serviceCutReady != nil
+		if !waitingGateway && !waitingCut {
+			break
 		}
-	}
-	if primary == nil && !frontendStartupCanceled && serviceCutReady != nil {
-		readyCtx, cancelReady := context.WithTimeout(parent, rf3NetworkTimeout)
-		readyErr := waitRF3FrontendDrainServiceCutReady(readyCtx, serviceCutReady)
-		cancelReady()
-		if readyErr != nil {
-			if context.Cause(parent) != nil {
-				frontendStartupCanceled = true
-			} else {
-				primary = fmt.Errorf("RF3 canonical service-directory startup: %w", readyErr)
+		select {
+		case embeddedGatewayState = <-embeddedGatewayOpened:
+			embeddedGatewayOpened = nil
+		case <-serviceCutReady:
+			serviceCutReady = nil
+		case <-diagnostics:
+			emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, nil, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator, progressMetrics, rf3AuthorityDiagnostics{
+				RoundMetrics: peer.Owners().ReadAuthorityRoundMetrics,
+				Evidence:     peer.Owners().ReadAuthorityEvidence,
+			})
+		case err := <-embeddedGatewayDone:
+			embeddedGatewayFinished = true
+			primary = fmt.Errorf("RF3 embedded gateway stopped during startup: %w", err)
+		case err := <-catalogGenesisDone:
+			catalogGenesisDone = nil
+			if err != nil {
+				primary = fmt.Errorf("RF3 catalog genesis: %w", err)
 			}
+		case <-parent.Done():
+			// Parent cancellation is the normal lifecycle request.
+			frontendStartupCanceled = true
+			if stopEmbeddedGateway != nil {
+				stopEmbeddedGateway(context.Cause(parent))
+			}
+		case err := <-peerDone:
+			primary, peerFinished = fmt.Errorf("RF3 peer stopped during frontend startup: %w", err), true
+		case err := <-controlDone:
+			primary, controlFinished = fmt.Errorf("RF3 control listener stopped during frontend startup: %w", err), true
+		case err := <-snapshotDone:
+			primary, snapshotFinished = fmt.Errorf("RF3 snapshot listener stopped during frontend startup: %w", err), true
+		case err := <-nativeDone:
+			primary, nativeFinished = fmt.Errorf("RF3 native listener stopped during frontend startup: %w", err), true
 		}
 	}
 	topology := "RF3"
