@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
+	"github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 )
@@ -57,6 +59,129 @@ func testDirectPool(t *testing.T, s *directPoolService) *postgresDirectPool {
 	})
 	return p
 }
+
+func TestPostgreSQLDirectQueryOwnershipDetachesBuffers(t *testing.T) {
+	params := []shardservice.Param{
+		shardservice.StringBytesParam([]byte("row-a")),
+		shardservice.NumberBytesParam([]byte("17")),
+	}
+	types := []driver.ParamType{driver.ParamTypeText, driver.ParamTypeOther}
+	query := gateway.Query{
+		SQL: `UPDATE docs SET n = ? WHERE id = ?`, Params: params,
+		ParamTypes: types, Class: gateway.ClassInteractive,
+	}
+	owned, err := ownPostgresWriteQuery(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := vibejson.Marshal(&query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jsonOwned gateway.Query
+	if err := vibejson.Unmarshal(raw, &jsonOwned); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(owned, jsonOwned) {
+		t.Fatalf("typed ownership differs from JSON ownership: clone=%+v json=%+v", owned, jsonOwned)
+	}
+	params[0].Bytes[0] = 'X'
+	params[1].Bytes[0] = '9'
+	types[0] = driver.ParamTypeBool
+	query.Params[0].Bytes[1] = 'X'
+	if got := string(owned.Params[0].Bytes); got != "row-a" {
+		t.Fatalf("owned string parameter changed to %q", got)
+	}
+	if got := string(owned.Params[1].Bytes); got != "17" {
+		t.Fatalf("owned number parameter changed to %q", got)
+	}
+	if owned.ParamTypes[0] != driver.ParamTypeText || owned.Class != gateway.ClassInteractive {
+		t.Fatalf("owned metadata changed: %+v", owned)
+	}
+}
+
+func TestPostgreSQLDirectQueryOwnershipPreservesEmptySliceNormalization(t *testing.T) {
+	cases := []gateway.Query{
+		{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"},
+		{SQL: "UPDATE docs SET n=n+1 WHERE id='a'", Params: []shardservice.Param{}},
+		{SQL: "UPDATE docs SET n=n+1 WHERE id='a'", ParamTypes: []driver.ParamType{}},
+		{SQL: "UPDATE docs SET n=n+1 WHERE id='a'", Params: []shardservice.Param{}, ParamTypes: []driver.ParamType{}},
+	}
+	for index, query := range cases {
+		owned, err := ownPostgresWriteQuery(query)
+		if err != nil {
+			t.Fatalf("case %d clone: %v", index, err)
+		}
+		raw, err := vibejson.Marshal(&query)
+		if err != nil {
+			t.Fatalf("case %d marshal: %v", index, err)
+		}
+		var jsonOwned gateway.Query
+		if err := vibejson.Unmarshal(raw, &jsonOwned); err != nil {
+			t.Fatalf("case %d unmarshal: %v", index, err)
+		}
+		if !reflect.DeepEqual(owned, jsonOwned) {
+			t.Fatalf("case %d differs: clone=%+v json=%+v", index, owned, jsonOwned)
+		}
+	}
+}
+
+func TestPostgreSQLDirectQueryOwnershipPreservesJournalSizeLimit(t *testing.T) {
+	prepared := 0
+	s := &directPoolService{}
+	s.prepare = func(context.Context, durableExecBatchIdentity, []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
+		prepared++
+		return nil, errors.New("oversized query reached preparation")
+	}
+	p := testDirectPool(t, s)
+	query := gateway.Query{SQL: strings.Repeat("\x00", 400_000)}
+	raw, err := vibejson.Marshal(&query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= maxPostgreSQLWriteJournalBytes/2 || !postgresWriteQueryNeedsSizeCheck(query) {
+		t.Fatalf("oversized query preflight: bytes=%d needs-check=%t", len(raw), postgresWriteQueryNeedsSizeCheck(query))
+	}
+	if _, handled, err := p.Write(t.Context(), query); !handled || !errors.Is(err, gateway.ErrTransactionByteLimit) {
+		t.Fatalf("Write oversized query: handled=%t err=%v", handled, err)
+	}
+	if prepared != 0 {
+		t.Fatalf("oversized query reached preparation: %d", prepared)
+	}
+}
+
+func BenchmarkPostgreSQLDirectQueryOwnership(b *testing.B) {
+	query := gateway.Query{
+		SQL: `UPDATE docs SET n = ? WHERE id = ?`,
+		Params: []shardservice.Param{
+			shardservice.NumberParam("17"), shardservice.StringParam("row-a"),
+		},
+		ParamTypes: []driver.ParamType{driver.ParamTypeOther, driver.ParamTypeText},
+		Class:      gateway.ClassInteractive,
+	}
+	b.Run("json", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			raw, err := vibejson.Marshal(&query)
+			if err != nil {
+				b.Fatal(err)
+			}
+			var owned gateway.Query
+			if err := vibejson.Unmarshal(raw, &owned); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("clone", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			if _, err := ownPostgresWriteQuery(query); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 func TestPostgreSQLDirectReservationsRestartAndWarmWrites(t *testing.T) {
 	s := &directPoolService{}
 	p := testDirectPool(t, s)

@@ -218,11 +218,11 @@ func TestReplicatedDigestGoldenVectors(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertDigestHex(t, "apply contract", contract,
-		"f02d8df22b65ebc0811c0fc045f168fd899376937eb70f00a051ad13d880b948")
+		"3891251cccb59edec7979f0bff239957b96ea6fcec151d2ec6ffce6a66e28216")
 	assertDigestHex(t, "data-chain seed", seed,
-		"cc8a919668b96b9c6cc0ed4a25db89343ac7e8c22d1bb58f7f3b569a6324bd5f")
+		"d4d8495554f81d31cff74e7344f547db0c22d91d89da561fad2cea7a4a141a11")
 	assertDigestHex(t, "data-chain transition", transition,
-		"66d7c24f6098115371742cd05e08c07651190f80cc0f5606a0d5ac096f0e393f")
+		"50aa298fc5bb247b47ea1d73945f559180f158566e3baf5bbaabbb2ca8301f71")
 }
 
 func deriveBundleContractForTest(manifest [sha256.Size]byte, maxSessions uint64,
@@ -234,7 +234,7 @@ func deriveBundleContractForTest(manifest [sha256.Size]byte, maxSessions uint64,
 	bundle := sha256.Sum256([]byte(deterministicBundleApplySemantics))
 	_, _ = h.Write(base[:])
 	_, _ = h.Write(bundle[:])
-	var grammar [4 + 37*4]byte
+	var grammar [4 + 38*4]byte
 	binary.LittleEndian.PutUint16(grammar[:2], ResultFormatMutation)
 	binary.LittleEndian.PutUint16(grammar[2:4], ResultFormatRouteGate)
 	for index, code := range [...]uint32{
@@ -246,7 +246,7 @@ func deriveBundleContractForTest(manifest [sha256.Size]byte, maxSessions uint64,
 		uint32(replication.MutationPutAbsentOrEqual),
 		uint32(replication.MutationDeleteDigestEqual),
 		uint32(replication.MutationPutDigestEqual), uint32(replication.MutationPutAbsent),
-		uint32(replication.MutationPutPresent), uint32(replication.MutationPutIfAbsent), uint32(replication.MutationPutConflict), replication.MutationDigestCompareBytes,
+		uint32(replication.MutationPutPresent), uint32(replication.MutationPutIfAbsent), uint32(replication.MutationPutConflict), uint32(replication.MutationJSONInt64Delta), replication.MutationDigestCompareBytes,
 		ResultRouteGate, uint32(replication.CommandRouteGate),
 		routegate.CommandBytes, routegate.OutcomeBytes,
 		routegate.HeadBytes, routegate.StoredPinBytes,

@@ -26,6 +26,7 @@ type directSQLProposalClient struct {
 	exact         []byte
 	completion    []byte
 	originalApply uint64
+	kinds         []replication.MutationKind
 }
 
 func (client *directSQLProposalClient) DoReplicated(
@@ -54,6 +55,13 @@ func (client *directSQLProposalClient) DoReplicated(
 	control, err := distributedtxn.OpenReplicatedCommand(view.TransactionBytes())
 	if err != nil || control.Operation != distributedtxn.ReplicatedApplySingleTarget {
 		client.t.Fatalf("direct SQL command operation=%d err=%v", control.Operation, err)
+	}
+	relations := view.RelationBatches()
+	for relations.Next() {
+		mutations := relations.Batch().Mutations()
+		for mutations.Next() {
+			client.kinds = append(client.kinds, mutations.Mutation().Kind)
+		}
 	}
 	client.proposals++
 	client.applied++

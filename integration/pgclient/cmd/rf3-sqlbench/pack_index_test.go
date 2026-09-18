@@ -64,6 +64,40 @@ func TestPackInsertAndVerifySQL(t *testing.T) {
 	}
 }
 
+func TestMultiDeltaSchemaAndVerificationOracle(t *testing.T) {
+	c := config{workloads: "update_multi_existing", indexes: indexModePackLeading, sharedBytes: 16, sharedCardinality: 8}
+	if got := tableDDL(c, "t"); !strings.Contains(got, "score INTEGER NOT NULL, payload TEXT NOT NULL, counter INTEGER NOT NULL") {
+		t.Fatalf("multi-field schema missing counter: %s", got)
+	}
+	if got := insertColumns(c); got != "(id,bucket,score,payload,counter,shared,a,b)" {
+		t.Fatalf("multi-field insert columns = %s", got)
+	}
+	if got := verifySelectSQL(c, "t"); !strings.Contains(got, "SELECT id,bucket,score,counter,payload,shared,a,b") {
+		t.Fatalf("multi-field verify SQL = %s", got)
+	}
+	if got := verifyColumnCount(c); got != 8 {
+		t.Fatalf("multi-field verify columns = %d, want 8", got)
+	}
+	var sql strings.Builder
+	sql.WriteString("INSERT INTO t " + insertColumns(c) + " VALUES ")
+	appendInsertRow(&sql, c, 3)
+	if !strings.Contains(sql.String(), "',3,'") {
+		t.Fatalf("multi-field seed did not initialize counter: %s", sql.String())
+	}
+	row := [][]byte{
+		[]byte("key-00000003"), []byte("3"), []byte("4"), []byte("4"), []byte(payload),
+		[]byte(packSharedValue(c, 3)), []byte(packA(3)), []byte(packB(3)),
+	}
+	scores := [][]int{{0, 0, 0, 4}}
+	if !primaryRowMatches(c, row, 0, 3, scores) {
+		t.Fatal("multi-field row did not match score and counter oracle")
+	}
+	row[3] = []byte("3")
+	if primaryRowMatches(c, row, 0, 3, scores) {
+		t.Fatal("multi-field verification accepted a stale counter")
+	}
+}
+
 func TestTenMillionRowsAreAdmitted(t *testing.T) {
 	c := config{
 		engine: "vibedb", url: "postgresql://local@127.0.0.1:1/db?sslmode=disable",
