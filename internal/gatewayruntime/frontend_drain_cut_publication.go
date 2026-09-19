@@ -94,7 +94,7 @@ func (runtime *Runtime) publishCanonicalFrontendDrainCutOnce(
 		nodeCut.CatalogGeneration != sourceCut.CatalogGeneration {
 		return fmt.Errorf("%w: invalid canonical publication input", gateway.ErrScalingRevision)
 	}
-	receivers, err := runtime.frontendDrainPreparedAckServingReceiversFromServiceCut(
+	receivers, err := runtime.frontendDrainPreparedAckPublicationReceiversFromServiceCut(
 		nodeCut, catalog, &sourceCut.ServiceDirectory,
 	)
 	if err != nil {

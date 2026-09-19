@@ -472,7 +472,7 @@ type durableRF3ExternalFixture struct {
 	initialDirectory  string
 
 	userProfile      *rafttransport.PeerTLS
-	observerProfile  *rafttransport.PeerTLS
+	gatewayProfile   *rafttransport.PeerTLS
 	probeClient      *gateway.AuthenticatedReplicatedClient
 	catalogAuthority *gateway.ReplicatedCatalogAuthority
 	ledger           *gateway.DurableRequestLedgerRF3
@@ -725,15 +725,7 @@ func newDurableRF3ExternalFixtureWithPeerFaults(t *testing.T, ctx context.Contex
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture.observerProfile, err = servicetls.LoadProfile(
-		fixture.credentials[fixture.observerNode].Certificate,
-		fixture.credentials[fixture.observerNode].Key, fixture.roots,
-		rf3testfixture.ProcessIdentityOID, time.Now,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	gatewayProfile, err := servicetls.LoadProfile(
+	fixture.gatewayProfile, err = servicetls.LoadProfile(
 		fixture.credentials[fixture.gatewayANode].Certificate,
 		fixture.credentials[fixture.gatewayANode].Key, fixture.roots,
 		rf3testfixture.ProcessIdentityOID, time.Now,
@@ -744,7 +736,7 @@ func newDurableRF3ExternalFixtureWithPeerFaults(t *testing.T, ctx context.Contex
 	// Native receivers with a committed service directory only admit gateway
 	// delegates. Probe TLS and request authority must be that same principal;
 	// a directory-managed observer on the request is denied.
-	fixture.probeClient = durableRF3ExternalReplicatedClient(t, gatewayProfile)
+	fixture.probeClient = durableRF3ExternalReplicatedClient(t, fixture.gatewayProfile)
 	fixture.measurements = &durableRF3ExternalMeasurements{}
 	fixture.snapshot = built.Snapshot
 	return fixture
@@ -1168,15 +1160,19 @@ func mustDurableRF3ExternalExecutor(
 	return executor
 }
 
+func (fixture *durableRF3ExternalFixture) gatewayAuthority() serviceauthz.Authority {
+	return serviceauthz.Authority{Node: fixture.nodes[fixture.gatewayANode], Generation: 5}
+}
+
 func (fixture *durableRF3ExternalFixture) initializeObservers(t *testing.T) {
 	t.Helper()
-	// These readers use a third authenticated service principal and exact
-	// shipped RF3 codecs; neither reaches into a child process store.
-	fixture.catalogAuthority, fixture.catalogClose = hotMutationCatalogAuthority(t, fixture.observerProfile,
+	// After a service directory is installed, native catalog and ledger
+	// traffic must use a gateway delegate. Probe TLS already is gateway A;
+	// catalog session TLS and ledger Service must match that principal.
+	fixture.catalogAuthority, fixture.catalogClose = hotMutationCatalogAuthority(t, fixture.gatewayProfile,
 		fixture.snapshot, filepath.Join(fixture.root, "observer-catalog-session"))
-	observerAuthority := serviceauthz.Authority{Node: fixture.nodes[fixture.observerNode], Generation: 5}
 	ledgerRF3, err := gateway.NewReplicatedRequestLedgerRF3(gateway.ReplicatedRequestLedgerRF3Options{
-		Executor: mustDurableRF3ExternalExecutor(t, fixture.probeClient), Service: observerAuthority,
+		Executor: mustDurableRF3ExternalExecutor(t, fixture.probeClient), Service: fixture.gatewayAuthority(),
 		ServiceTenant: durableRequestServiceTenant[:],
 	})
 	if err != nil {

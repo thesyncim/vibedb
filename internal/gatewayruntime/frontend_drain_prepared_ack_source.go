@@ -227,10 +227,7 @@ func serveFrontendDrainPreparedAckCutReadConnectionWithOptions(
 		node.Incarnation != request.ReceiverIncarnation ||
 		node.ServiceKeyDigest != replication.Digest(request.ReceiverServiceKeyDigest) ||
 		node.Roles&gateway.NodeRoleStorage == 0 || node.Lifecycle == gateway.NodeDecommissioned ||
-		(operation == frontenddrain.CutOperationInstallExact &&
-			(node.Lifecycle != gateway.NodeActive && node.Lifecycle != gateway.NodeDraining)) ||
-		(operation == frontenddrain.CutOperationReadLatest &&
-			(node.Lifecycle != gateway.NodeJoining && node.Lifecycle != gateway.NodeActive && node.Lifecycle != gateway.NodeDraining)) ||
+		!frontendDrainPreparedAckSourceLifecycleAllows(operation, node.Lifecycle, request.DrainID) ||
 		(operation == frontenddrain.CutOperationInstallExact &&
 			(request.ReceiverNodeRevision == 0 || node.Revision != request.ReceiverNodeRevision)) {
 		return errFrontendDrainPreparedAckSourceState
@@ -417,6 +414,25 @@ func sourceRosterContains(
 		}
 	}
 	return false
+}
+
+func frontendDrainPreparedAckSourceLifecycleAllows(
+	operation frontenddrain.CutOperation, lifecycle gateway.NodeLifecycle, drainID [32]byte,
+) bool {
+	switch lifecycle {
+	case gateway.NodeActive, gateway.NodeDraining:
+		return operation == frontenddrain.CutOperationReadLatest ||
+			operation == frontenddrain.CutOperationInstallExact
+	case gateway.NodeJoining:
+		if operation == frontenddrain.CutOperationReadLatest {
+			return true
+		}
+		// Empty-DrainID InstallExact is the recovery/publication install that
+		// first binds a joining storage node onto the serving directory.
+		return operation == frontenddrain.CutOperationInstallExact && drainID == ([32]byte{})
+	default:
+		return false
+	}
 }
 
 func serviceCutContainsActiveStorage(

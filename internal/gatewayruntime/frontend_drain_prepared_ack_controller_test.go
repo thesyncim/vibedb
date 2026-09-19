@@ -217,6 +217,17 @@ func TestFrontendDrainPreparedAckServingReceiversUsesServingRoster(t *testing.T)
 			t.Fatalf("receiver[%d] endpoint=%+v was not projected solely from NodeRecord=%+v", index, receiver.endpoint, receiver.node)
 		}
 	}
+
+	published, err := runtime.frontendDrainPreparedAckPublicationReceiversFromServiceCut(nodeCut, snapshot, &serviceCut)
+	if err != nil {
+		t.Fatalf("publication receiver projection: %v", err)
+	}
+	if len(published) != 5 {
+		t.Fatalf("publication receiver count=%d, want serving roster plus joining storage", len(published))
+	}
+	if published[4].node.NodeID != (rafttransport.NodeID{5}) || published[4].node.Lifecycle != gateway.NodeJoining {
+		t.Fatalf("publication receivers=%+v, want joining node 5 last", published)
+	}
 }
 
 func preparedAckAliasRouteSnapshot(t *testing.T, conflicting bool, reverse bool) *gateway.Snapshot {

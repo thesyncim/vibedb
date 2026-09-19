@@ -415,6 +415,23 @@ func frontendDrainContinuationState(
 func (runtime *Runtime) frontendDrainPreparedAckServingReceiversFromServiceCut(
 	cut gateway.NodeDirectoryCut, snapshot *gateway.Snapshot, serviceCut *serviceauthz.ServiceDirectoryCut,
 ) ([]frontendDrainPreparedAckReceiver, error) {
+	return runtime.frontendDrainPreparedAckReceiversFromServiceCut(cut, snapshot, serviceCut, false)
+}
+
+// frontendDrainPreparedAckPublicationReceiversFromServiceCut is the empty-DrainID
+// recovery/publication roster. Joining storage nodes must install the serving
+// cut before NodeInfo promotion, so they are included here and excluded from
+// drain-lifecycle ACKs.
+func (runtime *Runtime) frontendDrainPreparedAckPublicationReceiversFromServiceCut(
+	cut gateway.NodeDirectoryCut, snapshot *gateway.Snapshot, serviceCut *serviceauthz.ServiceDirectoryCut,
+) ([]frontendDrainPreparedAckReceiver, error) {
+	return runtime.frontendDrainPreparedAckReceiversFromServiceCut(cut, snapshot, serviceCut, true)
+}
+
+func (runtime *Runtime) frontendDrainPreparedAckReceiversFromServiceCut(
+	cut gateway.NodeDirectoryCut, snapshot *gateway.Snapshot, serviceCut *serviceauthz.ServiceDirectoryCut,
+	includeJoining bool,
+) ([]frontendDrainPreparedAckReceiver, error) {
 	var snapshotGeneration uint64
 	if snapshot != nil {
 		snapshotGeneration = snapshot.Generation()
@@ -434,10 +451,13 @@ func (runtime *Runtime) frontendDrainPreparedAckServingReceiversFromServiceCut(
 	byIdentity := make(map[frontendDrainPreparedAckReceiverIdentity]frontendDrainPreparedAckReceiver)
 	add := func(node gateway.NodeRecord, route *gateway.ReplicatedEndpoint) error {
 		if node.Lifecycle == gateway.NodeJoining {
-			return nil
+			if !includeJoining {
+				return nil
+			}
+		} else if node.Lifecycle != gateway.NodeActive && node.Lifecycle != gateway.NodeDraining {
+			return gateway.ErrScalingState
 		}
-		if (node.Lifecycle != gateway.NodeActive && node.Lifecycle != gateway.NodeDraining) ||
-			node.Roles&gateway.NodeRoleStorage == 0 || node.ControlAddress == "" {
+		if node.Roles&gateway.NodeRoleStorage == 0 || node.ControlAddress == "" {
 			return gateway.ErrScalingState
 		}
 		endpoint := gateway.ReplicatedEndpoint{
@@ -489,7 +509,8 @@ func (runtime *Runtime) frontendDrainPreparedAckServingReceiversFromServiceCut(
 	if serviceCut != nil {
 		for _, binding := range serviceCut.Bindings {
 			if binding.Roles&serviceauthz.ServiceRoleStorage == 0 ||
-				(binding.Lifecycle != serviceauthz.ServiceActive && binding.Lifecycle != serviceauthz.ServiceDraining) {
+				(binding.Lifecycle != serviceauthz.ServiceActive && binding.Lifecycle != serviceauthz.ServiceDraining &&
+					!(includeJoining && binding.Lifecycle == serviceauthz.ServiceJoining)) {
 				continue
 			}
 			node, found := current[binding.PhysicalNode]
@@ -498,6 +519,16 @@ func (runtime *Runtime) frontendDrainPreparedAckServingReceiversFromServiceCut(
 				return nil, fmt.Errorf("%w: receiver service binding node=%s found=%t node-incarnation=%d binding-incarnation=%d node-key=%x binding-key=%x",
 					gateway.ErrScalingIdentity, binding.PhysicalNode, found, node.Incarnation, binding.PhysicalIncarnation,
 					node.ServiceKeyDigest, binding.KeyDigest)
+			}
+			if err := add(node, nil); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if includeJoining {
+		for _, node := range cut.CurrentNodes() {
+			if node.Lifecycle != gateway.NodeJoining || node.Roles&gateway.NodeRoleStorage == 0 {
+				continue
 			}
 			if err := add(node, nil); err != nil {
 				return nil, err

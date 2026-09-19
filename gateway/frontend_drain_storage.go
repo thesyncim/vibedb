@@ -457,11 +457,7 @@ func (authority *ReplicatedCatalogAuthority) ReadFrontendDrainRuntimeCut(ctx con
 		catalog, headDigest, err := authority.ReadReplicatedCatalogHead(ctx)
 		if err != nil || catalog == nil || headDigest == (replication.Digest{}) ||
 			catalog.Generation() < nodes.CatalogGeneration {
-			// A locally published head can win the holder/route-seed race
-			// against an in-flight attested read of the previous generation.
-			// Retry the bounded cut instead of failing the live directory
-			// refresh closed for the rest of the generation.
-			if err != nil && !errors.Is(err, ErrStaleGeneration) {
+			if err != nil {
 				return FrontendDrainRuntimeCut{}, err
 			}
 			continue
@@ -488,9 +484,6 @@ func (authority *ReplicatedCatalogAuthority) ReadFrontendDrainRuntimeCut(ctx con
 		}
 		latestCatalog, latestHead, err := authority.ReadReplicatedCatalogHead(ctx)
 		if err != nil {
-			if errors.Is(err, ErrStaleGeneration) {
-				continue
-			}
 			return FrontendDrainRuntimeCut{}, err
 		}
 		if latestNodes.Revision != nodes.Revision || latestNodes.Digest != nodes.Digest ||

@@ -350,7 +350,7 @@ func assertReadBatchRF3FormerLeaderRefuses(
 		fixture.routes[durableRF3DataAGroup].Replicas[member],
 		&shardservice.ReplicatedRequest{
 			Operation:  shardservice.ReplicatedReadBatchLeader,
-			Authority:  serviceauthz.Authority{Node: fixture.nodes[fixture.observerNode], Generation: 5},
+			Authority:  fixture.gatewayAuthority(),
 			Capability: serviceauthz.CapabilityDataRead, Fence: state.Fence,
 			BatchRead: packed, MinimumApplied: 1, MaxValueBytes: 1 << 20,
 		},

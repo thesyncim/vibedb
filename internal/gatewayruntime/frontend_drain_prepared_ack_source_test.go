@@ -444,4 +444,76 @@ func TestFrontendDrainPreparedAckCutReadRejectsPeerIncarnationGrantAndState(t *t
 	}
 }
 
+func TestFrontendDrainPreparedAckCutReadInstallExactAllowsJoiningPublication(t *testing.T) {
+	profile, gatewayNode, source, _, drainRequest := frontendDrainSourceTestFixture(t)
+	joining := preparedAckRosterNode(5, 1, gateway.NodeJoining, gateway.NodeRoleStorage)
+	joining.Revision = 1
+	joining.CatalogGeneration = source.Nodes.CatalogGeneration
+	source.Nodes.Nodes = append(append([]gateway.NodeRecord(nil), source.Nodes.Nodes...), joining)
+	if !joining.Valid() || !source.Nodes.Valid() {
+		t.Fatal("joining publication source cut is invalid")
+	}
+	serviceCut, err := runtimeServiceDirectoryCutFromFrontendDrainRuntimeCut(t.Context(), source, profile, 1)
+	if err != nil {
+		t.Fatalf("project joining source service cut: %v", err)
+	}
+	cut, err := frontendDrainPreparedAckCutFromRuntimeCut(source, serviceCut)
+	if err != nil || !cut.Valid() {
+		t.Fatalf("joining publication cut invalid err=%v", err)
+	}
+	deadline := func() time.Time { return time.Now().Add(time.Second) }
+	authorize := func(connection rafttransport.PeerConnection) bool {
+		return connection.TrafficClass() == rafttransport.TrafficGatewayControl &&
+			connection.PeerIdentity().TrustDomain == profile.LocalIdentity().TrustDomain &&
+			connection.PeerIdentity().Node == joining.NodeID &&
+			connection.PeerKeyDigest() == [32]byte(joining.ServiceKeyDigest)
+	}
+	readNode := func(_ context.Context, got rafttransport.NodeID, incarnation uint64) (gateway.NodeRecord, error) {
+		if got == joining.NodeID && incarnation == joining.Incarnation {
+			return joining, nil
+		}
+		if got == gatewayNode.NodeID && incarnation == gatewayNode.Incarnation {
+			return gatewayNode, nil
+		}
+		return gateway.NodeRecord{}, gateway.ErrScalingIdentity
+	}
+	publication := frontenddrain.PreparedAckCutReadRequest{
+		Operation: frontenddrain.CutOperationInstallExact, Nonce: [16]byte{50},
+		ReceiverNode: joining.NodeID, ReceiverIncarnation: joining.Incarnation,
+		ReceiverServiceKeyDigest: [32]byte(joining.ServiceKeyDigest),
+		ReceiverNodeRevision:     joining.Revision, SourceFloor: cut.ReadFloor(),
+		SourceCutDigest: cut.Digest(),
+	}
+	connection := &frontendDrainSourceTestConnection{
+		input: bytes.NewReader(publication.Marshal()),
+		peer:  rafttransport.PeerIdentity{TrustDomain: profile.LocalIdentity().TrustDomain, Node: joining.NodeID},
+		key:   [32]byte(joining.ServiceKeyDigest), class: rafttransport.TrafficGatewayControl,
+	}
+	if err := serveFrontendDrainPreparedAckCutReadConnectionWith(t.Context(), connection, authorize, readNode,
+		func(context.Context) (gateway.FrontendDrainRuntimeCut, error) { return source, nil },
+		profile, 1, deadline, deadline); err != nil {
+		t.Fatalf("joining publication InstallExact: %v", err)
+	}
+	if _, err := frontenddrain.OpenPreparedAckCutReadResponse(connection.output.Bytes(), publication); err != nil {
+		t.Fatalf("open joining publication response: %v", err)
+	}
+
+	drainRequest.ReceiverNode = joining.NodeID
+	drainRequest.ReceiverIncarnation = joining.Incarnation
+	drainRequest.ReceiverServiceKeyDigest = [32]byte(joining.ServiceKeyDigest)
+	drainRequest.ReceiverNodeRevision = joining.Revision
+	drainRequest.SourceFloor = cut.ReadFloor()
+	drainRequest.SourceCutDigest = cut.Digest()
+	denied := &frontendDrainSourceTestConnection{
+		input: bytes.NewReader(drainRequest.Marshal()),
+		peer:  rafttransport.PeerIdentity{TrustDomain: profile.LocalIdentity().TrustDomain, Node: joining.NodeID},
+		key:   [32]byte(joining.ServiceKeyDigest), class: rafttransport.TrafficGatewayControl,
+	}
+	if err := serveFrontendDrainPreparedAckCutReadConnectionWith(t.Context(), denied, authorize, readNode,
+		func(context.Context) (gateway.FrontendDrainRuntimeCut, error) { return source, nil },
+		profile, 1, deadline, deadline); !errors.Is(err, errFrontendDrainPreparedAckSourceState) {
+		t.Fatalf("drain InstallExact for joining node err=%v, want source state", err)
+	}
+}
+
 var _ io.ReadWriter = (*frontendDrainSourceTestConnection)(nil)

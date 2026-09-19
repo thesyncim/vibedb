@@ -29,8 +29,7 @@ func (fixture *durableRF3ExternalFixture) verifyNativeMultiRelation(
 	t *testing.T, client *durableRF3ExternalWireClient,
 ) []time.Duration {
 	t.Helper()
-	ctx, err := serviceauthz.WithAuthority(fixture.ctx, serviceauthz.Authority{
-		Node: fixture.nodes[fixture.observerNode], Generation: 5})
+	ctx, err := serviceauthz.WithAuthority(fixture.ctx, fixture.gatewayAuthority())
 	if err != nil {
 		t.Fatal(err)
 	}
