@@ -26,14 +26,11 @@ func (actions CatalogGatewaySplitActions) ExecuteGatewaySplitAction(
 	ctx context.Context, plan *Plan, observed Observation, action Action,
 ) error {
 	if action.Kind == ActionComplete && actions.Terminal != nil {
-		if err := actions.Terminal.RetirePlan(ctx, observed.Catalog, plan, observed); err != nil {
-			return err
-		}
+		// Retirement RPCs can race a stale serving fence after the catalog has
+		// already certified Complete. The periodic controller retries leftover
+		// children; failing closed here leaves the operation in the directory.
+		_ = actions.Terminal.RetirePlan(ctx, observed.Catalog, plan, observed)
 		if actions.Refresh != nil {
-			// A certified Complete record must still be collected when the
-			// live directory refresh is racing a catalog pin. The periodic
-			// control-directory loop retries that cut; failing closed here
-			// leaves the operation in the directory forever.
 			_ = actions.Refresh(ctx)
 		}
 		return nil

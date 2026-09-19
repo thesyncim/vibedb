@@ -1599,11 +1599,12 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	frontendStartupCanceled := false
 	// Catalog genesis, election, and the first canonical cut regularly take
 	// longer than one RPC deadline. Native stays fail-closed until the cut is
-	// installed; abort only on component failure or parent cancellation.
+	// installed. Do not wait for that cut before advertising process readiness:
+	// an external gateway is started only after shards are ready, and blocking
+	// here deadlocks first-start refresh against an unopened publisher.
 	for primary == nil && !frontendStartupCanceled {
 		waitingGateway := embeddedGatewayOpened != nil && embeddedGatewayState == nil
-		waitingCut := serviceCutReady != nil
-		if !waitingGateway && !waitingCut {
+		if !waitingGateway {
 			break
 		}
 		select {

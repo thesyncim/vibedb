@@ -60,7 +60,9 @@ const (
 	// cannot hide inside the whole-tree ceiling.
 	durableRF3ExternalRecoveryFiles         = 42
 	durableRF3ExternalRecoveryBudget uint64 = 506 << 20
-	durableRF3ExternalBaselineBudget uint64 = 2188 << 20
+	// Node-directory and frontend-drain files at genesis sit ~290MiB above the
+	// original 2188MiB ceiling measured before physical-node scaling.
+	durableRF3ExternalBaselineBudget uint64 = 2560 << 20
 	// Shards plus gateway A, gateway B, the stable user principal, and an
 	// independent observation principal all carry distinct certificate IDs.
 	durableRF3ExternalNodes = 7
