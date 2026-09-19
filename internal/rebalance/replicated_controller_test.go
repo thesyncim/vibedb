@@ -528,6 +528,21 @@ func TestReplicatedMoveControllerJournalsPostRemoveFenceRefresh(t *testing.T) {
 		t.Fatalf("refresh action=%+v calls=%d record=%+v err=%v",
 			action, len(executor.calls), journal.record, err)
 	}
+	// The source removal committed, but its reply and journal acknowledgement
+	// were lost before another election. Recovery observes the exact removed
+	// roster and advances to publication without issuing removal again.
+	record.Cursor[3] = replicaMoveCursorExecuting
+	record.Cursor[4]--
+	record.Proof = replicaMoveActionProof(plan.OperationID(), record.IntentDigest,
+		replicaMovePlanBaseDigest(bound), record.Cursor)
+	journal.record = record
+	observer.cut.LeaderStatus.Term++
+	executor.calls = nil
+	action, err = ExecuteReplicatedMoveStep(t.Context(), plan.OperationID(), nil, journal, observer, executor)
+	if err != nil || action.Kind != ActionRefreshCatalogFence || len(executor.calls) != 1 ||
+		executor.calls[0].Kind != ActionRefreshCatalogFence {
+		t.Fatalf("lost removal reply: action=%+v calls=%+v err=%v", action, executor.calls, err)
+	}
 }
 
 func raftMemberStatus(member, applied uint64) raftmember.RuntimeStatus {

@@ -11,13 +11,73 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicaaction"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 )
+
+func TestRF3CatalogGenesisOnlyFinishesForProvenSourceRetirement(t *testing.T) {
+	for _, name := range []string{"authorized", "completed", "unproven", "wrong group", "wrong member", "wrong store", "wrong allocation", "different error", "closed journal"} {
+		t.Run(name, func(t *testing.T) {
+			journal, err := replicaaction.OpenFileJournal(t.TempDir(), 8)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer journal.Close()
+			record := rf3RetirementRecoveryRecord(rf3RecoveryEnrollmentIntent())
+			if err := journal.PublishReplicaAction(t.Context(), 0, record); err != nil {
+				t.Fatal(err)
+			}
+			if name != "unproven" {
+				record.Revision, record.State = 2, replicaaction.RetirementAuthorized
+				if err := journal.PublishReplicaAction(t.Context(), 1, record); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if name == "completed" {
+				record.Revision, record.State = 3, replicaaction.Complete
+				if err := journal.PublishReplicaAction(t.Context(), 2, record); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fence := record.Request.Fence
+			identity := raftmember.RuntimeIdentity{Group: fence.Group, MemberID: fence.MemberID,
+				StoreID: fence.StoreID, AllocationGeneration: fence.AllocationGeneration,
+				NodeIncarnation: fence.NodeIncarnation + 1}
+			cause := multiraft.ErrGroupNotFound
+			switch name {
+			case "wrong group":
+				identity.Group.GroupID[0]++
+			case "wrong member":
+				identity.MemberID++
+			case "wrong store":
+				identity.StoreID[0]++
+			case "wrong allocation":
+				identity.AllocationGeneration++
+			case "different error":
+				cause = errRF3CatalogGenesis
+			case "closed journal":
+				if err := journal.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err = finishRF3CatalogGenesis(t.Context(), journal, identity, cause)
+			if name == "authorized" || name == "completed" {
+				if err != nil {
+					t.Fatalf("proven retirement: %v", err)
+				}
+			} else if !errors.Is(err, cause) {
+				t.Fatalf("initializer failure lost: got %v, want %v", err, cause)
+			}
+		})
+	}
+}
 
 func TestInitializeRF3CatalogGenesisExistingLifecycleDoesNotOpenPrivateSession(t *testing.T) {
 	for _, lifecycle := range []struct {
@@ -30,11 +90,18 @@ func TestInitializeRF3CatalogGenesisExistingLifecycleDoesNotOpenPrivateSession(t
 		t.Run(lifecycle.name, func(t *testing.T) {
 			localNode := rafttransport.NodeID{1}
 			identity, state, config := rf3CatalogGenesisExistingFixture(t, localNode)
+			startupCommand := state.Command
+			// A follower may still be waiting for leadership when the running
+			// cluster moves this group. Recovery uses the current owner fence.
+			state.Command.ReplicaSetVersion++
+			state.Command.OwnershipEpoch++
+			state.Command.RoutingVersion++
+			state.Command.RouteGeneration++
 			cut := rf3CatalogGenesisExistingCutFixture(t, localNode, lifecycle.want)
 			var probeCalls, relationCalls, cutCalls int
 			var gotRoute gateway.FrontendDrainRuntimeCatalogRoute
 			err := initializeRF3CatalogGenesisWithReaders(
-				context.Background(), config, nil, localNode, identity, state.Command,
+				context.Background(), config, nil, localNode, identity, startupCommand,
 				func(context.Context, raftmember.GroupKey) (raftservice.ServingState, error) {
 					probeCalls++
 					return state, nil
@@ -92,6 +159,36 @@ func TestInitializeRF3CatalogGenesisExistingRejectsMalformedCommittedCut(t *test
 	)
 	if !errors.Is(err, errRF3CatalogGenesis) || cutCalls != 1 {
 		t.Fatalf("malformed existing cut err=%v calls=%d", err, cutCalls)
+	}
+}
+
+func TestInitializeRF3CatalogGenesisRejectsUnsafeCommandChanges(t *testing.T) {
+	for name, change := range map[string]func(*raftservice.CommandFence){
+		"replica regression": func(command *raftservice.CommandFence) { command.ReplicaSetVersion-- },
+		"policy":             func(command *raftservice.CommandFence) { command.ActivePolicyGeneration++ },
+		"protection":         func(command *raftservice.CommandFence) { command.ProtectionEpoch++ },
+		"schema":             func(command *raftservice.CommandFence) { command.SchemaGeneration++ },
+		"manifest":           func(command *raftservice.CommandFence) { command.RelationManifestDigest[0]++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			localNode := rafttransport.NodeID{1}
+			identity, state, config := rf3CatalogGenesisExistingFixture(t, localNode)
+			startupCommand := state.Command
+			change(&state.Command)
+			err := initializeRF3CatalogGenesisWithReaders(t.Context(), config, nil, localNode, identity, startupCommand,
+				func(context.Context, raftmember.GroupKey) (raftservice.ServingState, error) { return state, nil },
+				func(context.Context, raftservice.ServingFence, replication.RelationID) (bool, bool, int, error) {
+					t.Fatal("unsafe command reached the catalog read")
+					return false, false, 0, nil
+				},
+				func(context.Context, gateway.FrontendDrainRuntimeCatalogRoute) (gateway.FrontendDrainRuntimeCut, error) {
+					t.Fatal("unsafe command reached the committed cut")
+					return gateway.FrontendDrainRuntimeCut{}, nil
+				})
+			if !errors.Is(err, errRF3CatalogGenesis) {
+				t.Fatalf("unsafe command error=%v", err)
+			}
+		})
 	}
 }
 
@@ -392,13 +489,15 @@ func TestInitializeRF3CatalogGenesisRetriesPendingLifecycleExactly(t *testing.T)
 	}
 }
 
-func TestRF3CatalogGenesisRetryableOutcomeUnknown(t *testing.T) {
+func TestRF3CatalogGenesisRetryableTransientOutcomes(t *testing.T) {
 	for _, err := range []error{
 		raftservice.ErrOutcomeUnknown,
 		errors.Join(fmt.Errorf("private command: %w", raftservice.ErrOutcomeUnknown), errRF3CatalogGenesis),
+		raftmodel.ErrReadLeadershipLost,
+		fmt.Errorf("existing catalog read: %w", raftmodel.ErrReadLeadershipLost),
 	} {
 		if !rf3CatalogGenesisRetryable(err) {
-			t.Fatalf("outcome-unknown error %v was not retryable", err)
+			t.Fatalf("transient error %v was not retryable", err)
 		}
 	}
 	for _, err := range []error{errRF3CatalogGenesis, context.Canceled, raftservice.ErrServingFence} {
@@ -425,6 +524,7 @@ func TestInitializeRF3CatalogGenesisRejectsNonLeaderBeforePlanLoad(t *testing.T)
 	identity, state, config := rf3CatalogGenesisExistingFixture(t, localNode)
 	nonLeader := state
 	nonLeader.Status.LeaderID = 2
+	nonLeader.Command.ReplicaSetVersion++
 	owner := &rf3CatalogGenesisOwnerFixture{state: nonLeader}
 	var loadCalls, sessionCalls int
 	err := initializeRF3CatalogGenesisWithDependencies(

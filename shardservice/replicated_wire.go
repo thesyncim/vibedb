@@ -48,7 +48,7 @@ const (
 // Membership is fixed-width: the original 279-byte control body plus the
 // forwarded 16-byte node identity, 8-byte authorization generation, and the
 // 8-byte exact requested capability.
-const replicatedMembershipRequestBodyBytes = 311
+const replicatedMembershipRequestBodyBytes = 303
 
 // Transaction recovery reads are fixed-width: the common 242-byte native
 // prefix followed by a one-byte closed read kind, one exact transaction ID,
@@ -244,7 +244,6 @@ type ReplicatedMembershipRequest struct {
 	ExpectedReplicaSetVersion uint64
 	SourceMember              uint64
 	TargetMember              uint64
-	TransferTerm              uint64
 }
 
 // ReplicatedResponseKind separates definite pre-admission refusals from an
@@ -1230,7 +1229,6 @@ func encodeReplicatedMembership(e *encbuf, request ReplicatedMembershipRequest) 
 	e.u64(request.ExpectedReplicaSetVersion)
 	e.u64(request.SourceMember)
 	e.u64(request.TargetMember)
-	e.u64(request.TransferTerm)
 }
 
 func decodeReplicatedMembership(d *deccur) ReplicatedMembershipRequest {
@@ -1238,7 +1236,6 @@ func decodeReplicatedMembership(d *deccur) ReplicatedMembershipRequest {
 		Kind: raftservice.MembershipKind(d.u8()), TransitionID: d.fixed16(),
 		MetadataEpoch: d.u64(), CatalogGeneration: d.u64(),
 		ExpectedReplicaSetVersion: d.u64(), SourceMember: d.u64(), TargetMember: d.u64(),
-		TransferTerm: d.u64(),
 	}
 }
 
@@ -1480,12 +1477,16 @@ func validReplicatedRequestLedgerPrincipal(
 	if command.ClientID != replication.ID128(request.Authority.Node) {
 		return false
 	}
-	// Admission inspects only Create's authenticated subject. Nil scratch
-	// fully validates pending bytes without putting a 256-entry StepRef array
+	// Nil scratch validates pending bytes without a 256-entry StepRef array
 	// on every shard-wire request stack.
 	inner, err := command.OpenRequestLedgerInto(nil)
 	if err != nil {
 		return false
+	}
+	if release, releases := inner.SchemaPinRelease(); releases {
+		nested, err := executionpin.OpenCommand(release.Command)
+		return err == nil && nested.AuthorityNode == executionpin.ID(request.Authority.Node) &&
+			nested.AuthorityGeneration == request.Authority.Generation
 	}
 	head, creates := inner.Head()
 	if !creates {

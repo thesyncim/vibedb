@@ -24,6 +24,7 @@ type rf3MetricsProvider struct {
 	backup  *clusterbackupservice.Service
 	action  *replicaaction.Service
 	data    []snapshottransfer.GroupDataService
+	donors  *rf3DynamicDonorServices
 	split   *splitcontroller.ControlService
 	budget  *migrationbudget.Budget
 }
@@ -95,7 +96,11 @@ func (provider *rf3MetricsProvider) StageMetrics() servicemetrics.StageMetricsSn
 	backup := provider.backup.Metrics()
 	result.BackupRequests, result.BackupFaults = backup.Requests, backup.Faults
 	result.BackupLogicalBytes, result.BackupScanBytes = backup.LogicalArtifactBytes, backup.SnapshotScanBytes
-	for _, item := range provider.data {
+	data := provider.data
+	if provider.donors != nil {
+		data = provider.donors.DataServices()
+	}
+	for _, item := range data {
 		stats := item.Service.Stats()
 		result.SnapshotTransferChunks = rf3MetricsAdd(result.SnapshotTransferChunks, stats.Chunks)
 		result.SnapshotTransferBytes = rf3MetricsAdd(result.SnapshotTransferBytes, stats.Bytes)

@@ -35,21 +35,30 @@ type durableRF3GrantInstaller struct {
 	replace   func(string, membershipgrant.Grant, membershipgrant.Grant) error
 }
 
-type durableRF3GrantRouter struct {
-	installers map[raftmember.GroupKey]*durableRF3GrantInstaller
+type durableRF3GrantRouter = rf3DynamicGrantRouter
+
+// Grant recovery follows the already verified serving inventory. A retired
+// source retains its immutable manifest and grant file, but neither may
+// register authority for a group excluded by its durable retirement proof.
+func openPreparedRF3GrantRouter(set preparedRF3Set, authority rf3TransitionGrantAuthority) (*durableRF3GrantRouter, error) {
+	groups := make([]rf3ManifestGroup, 0, len(set.groups))
+	for _, group := range set.groups {
+		if !group.adoptedChild {
+			groups = append(groups, group.manifest.groupBundles()...)
+		}
+	}
+	return openDurableRF3GrantRouter(groups, authority)
 }
 
 func openDurableRF3GrantRouter(
-	manifest rf3Manifest,
+	groups []rf3ManifestGroup,
 	authority rf3TransitionGrantAuthority,
 ) (*durableRF3GrantRouter, error) {
 	if authority == nil {
 		return nil, errRF3MembershipGrant
 	}
-	router := &durableRF3GrantRouter{
-		installers: make(map[raftmember.GroupKey]*durableRF3GrantInstaller, len(manifest.groupBundles())),
-	}
-	for _, bundle := range manifest.groupBundles() {
+	router := newRF3DynamicGrantRouter(authority)
+	for _, bundle := range groups {
 		group := bundle.Route.Group
 		if group == (raftmember.GroupKey{}) || bundle.Route.MembershipGrantPath == "" {
 			return nil, errRF3MembershipGrant
@@ -64,17 +73,6 @@ func openDurableRF3GrantRouter(
 		router.installers[group] = installer
 	}
 	return router, nil
-}
-
-func (router *durableRF3GrantRouter) InstallTransitionGrant(grant membershipgrant.Grant) error {
-	if router == nil || !grant.Valid() {
-		return errRF3MembershipGrant
-	}
-	installer := router.installers[grant.Group]
-	if installer == nil {
-		return errRF3MembershipGrant
-	}
-	return installer.InstallTransitionGrant(grant)
 }
 
 func openDurableRF3GrantInstaller(

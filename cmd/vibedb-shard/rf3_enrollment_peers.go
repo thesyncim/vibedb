@@ -320,99 +320,140 @@ func rf3MembershipGrantForGroup(manifest rf3Manifest, group raftmember.GroupKey)
 	return readRF3MembershipGrant(path)
 }
 
-// rf3DynamicEnrollmentTarget selects the one dynamic member present in the
-// durable ConfState and proves its physical endpoint with a source receipt.
-// A missing or ambiguous receipt is a startup error: member IDs alone never
-// authorize a peer endpoint.
-func rf3DynamicEnrollmentTarget(
-	manifest rf3Manifest, group raftmember.GroupKey, publication raftmodel.Publication,
-	receipts []rf3EnrollmentPeerReceipt,
-) (*rf3ManifestEnrolledTarget, rafttransport.PhysicalPeer, error) {
-	if manifest.EnrolledTarget != nil || publication.ConfState == nil {
-		return nil, rafttransport.PhysicalPeer{}, nil
+// rf3RecoveredEnrollmentRoster reconstructs endpoints from the authenticated
+// enrollment chain, and roles only from durable Raft membership. Historical
+// receipts prove identities; they do not accumulate live member mappings.
+func rf3RecoveredEnrollmentRoster(
+	manifest rf3Manifest, group raftmember.GroupKey, localMember uint64,
+	publication raftmodel.Publication, receipts []rf3EnrollmentPeerReceipt,
+) (rf3EnrollmentRoster, error) {
+	var result rf3EnrollmentRoster
+	conf := publication.ConfState
+	if raftmodel.ValidateConfState(conf, publication.ReplicaSetVersion) != nil ||
+		len(conf.GetVotersOutgoing()) != 0 || len(conf.GetLearnersNext()) != 0 || conf.GetAutoLeave() ||
+		(!manifest.DevelopmentOnly && (len(conf.GetVoters()) < 3 || len(conf.GetVoters()) > 4 ||
+			len(conf.GetLearners()) > 1 || len(conf.GetVoters())+len(conf.GetLearners()) > 4)) {
+		return result, fmt.Errorf("%w: unsupported durable membership cut", errRF3EnrollmentPeerReceipt)
 	}
-	base := make(map[uint64]struct{}, len(manifest.memberRoster()))
+	known := make(map[uint64]rf3ManifestMember)
 	for _, member := range manifest.memberRoster() {
-		base[member.MemberID] = struct{}{}
+		known[member.MemberID] = member
 	}
-	dynamicMembers := make(map[uint64]struct{}, 1)
-	for _, member := range append(slices.Clone(publication.ConfState.GetVoters()), publication.ConfState.GetLearners()...) {
-		if _, isBase := base[member]; !isBase {
-			dynamicMembers[member] = struct{}{}
+	if target := manifest.EnrolledTarget; target != nil {
+		known[target.MemberID] = rf3ManifestMember{MemberID: target.MemberID, NodeID: target.NodeID, PeerAddress: target.PeerAddress}
+	}
+	chain := make([]rf3EnrollmentPeerReceipt, 0)
+	for _, receipt := range receipts {
+		if receipt.Group == group {
+			chain = append(chain, receipt)
 		}
 	}
-	if len(dynamicMembers) == 0 {
-		return nil, rafttransport.PhysicalPeer{}, nil
-	}
-	if len(dynamicMembers) != 1 {
-		return nil, rafttransport.PhysicalPeer{}, errRF3EnrollmentPeerReceipt
-	}
-	var memberID uint64
-	for member := range dynamicMembers {
-		memberID = member
-	}
-	var currentGrant membershipgrant.Grant
-	grantFound := false
-	if manifest.Route.MembershipGrantPath != "" {
-		var err error
-		currentGrant, grantFound, err = readRF3MembershipGrant(manifest.Route.MembershipGrantPath)
-		if err != nil {
-			return nil, rafttransport.PhysicalPeer{}, err
+	slices.SortFunc(chain, func(a, b rf3EnrollmentPeerReceipt) int {
+		if a.ReplicaSetVersion < b.ReplicaSetVersion {
+			return -1
 		}
-	}
-	var selected *rf3EnrollmentPeerReceipt
-	for index := range receipts {
-		receipt := &receipts[index]
-		if receipt.Group != group || receipt.MemberID != memberID {
-			continue
+		if a.ReplicaSetVersion > b.ReplicaSetVersion {
+			return 1
 		}
+		return compareRF3EnrollmentPeerReceipt(a, b)
+	})
+	witnesses := make(map[uint64]rf3EnrollmentPeerReceipt, len(chain))
+	for index, receipt := range chain {
 		if err := receipt.validate(); err != nil {
-			return nil, rafttransport.PhysicalPeer{}, err
+			return result, err
 		}
-		if grantFound && currentGrant.TargetMember == memberID && receipt.Grant != currentGrant {
-			continue
+		if _, exists := witnesses[receipt.MemberID]; exists || index > 0 && chain[index-1].ReplicaSetVersion == receipt.ReplicaSetVersion {
+			return result, fmt.Errorf("%w: ambiguous enrollment chain", errRF3EnrollmentPeerReceipt)
 		}
-		if selected != nil {
-			return nil, rafttransport.PhysicalPeer{}, errRF3EnrollmentPeerReceipt
+		var certified [3]membershipgrant.RosterMember
+		stable := make([]rafttransport.Member, 3)
+		for i, id := range receipt.Grant.InitialVoters {
+			member, found := known[id]
+			if !found || member.NodeID == receipt.NodeID {
+				return result, fmt.Errorf("%w: unresolved initial voter %d", errRF3EnrollmentPeerReceipt, id)
+			}
+			certified[i] = membershipgrant.RosterMember{Member: id, Node: member.NodeID}
+			stable[i] = rafttransport.Member{Group: group, ReplicaSetVersion: receipt.ReplicaSetVersion, MemberID: id, Node: member.NodeID, Role: rafttransport.MemberVoter}
 		}
-		selected = receipt
+		digest, err := rafttransport.StableRosterDigest(stable)
+		if err != nil || digest != receipt.ExpectedRosterDigest ||
+			membershipgrant.CertifiedRosterDigest(group, receipt.ReplicaSetVersion, certified) != receipt.Grant.InitialRosterDigest {
+			return result, fmt.Errorf("%w: initial roster differs from enrollment grant", errRF3EnrollmentPeerReceipt)
+		}
+		member := rf3ManifestMember{MemberID: receipt.MemberID, NodeID: receipt.NodeID, PeerAddress: receipt.PeerAddress}
+		if prior, exists := known[member.MemberID]; exists && prior != member {
+			return result, errRF3EnrollmentPeerReceipt
+		}
+		known[member.MemberID], witnesses[member.MemberID] = member, receipt
 	}
-	if selected == nil {
-		return nil, rafttransport.PhysicalPeer{}, fmt.Errorf("%w: dynamic member %d has no authenticated endpoint receipt", errRF3EnrollmentPeerReceipt, memberID)
+	required := make(map[uint64]struct{}, 4)
+	for _, id := range conf.GetVoters() {
+		required[id] = struct{}{}
 	}
-	if grantFound && currentGrant.TargetMember == memberID && selected.Grant != currentGrant {
-		return nil, rafttransport.PhysicalPeer{}, errRF3EnrollmentPeerReceipt
+	for _, id := range conf.GetLearners() {
+		required[id] = struct{}{}
 	}
-	if err := selected.validateAgainstManifest(manifest, group); err != nil {
-		return nil, rafttransport.PhysicalPeer{}, err
+	required[localMember] = struct{}{}
+	if target := manifest.EnrolledTarget; target != nil {
+		required[target.MemberID] = struct{}{}
 	}
-	target := &rf3ManifestEnrolledTarget{
-		MemberID: selected.MemberID, NodeID: selected.NodeID,
-		NodeIncarnation: selected.NodeIncarnation, PeerAddress: selected.PeerAddress,
+	if manifest.Route.MembershipGrantPath != "" {
+		grant, found, err := readRF3MembershipGrant(manifest.Route.MembershipGrantPath)
+		if err != nil {
+			return result, err
+		}
+		if found {
+			if grant.Group != group {
+				return result, errRF3EnrollmentPeerReceipt
+			}
+			for _, id := range grant.InitialVoters {
+				required[id] = struct{}{}
+			}
+			required[grant.TargetMember] = struct{}{}
+			if receipt, exists := witnesses[grant.TargetMember]; exists && receipt.Grant != grant {
+				return result, errRF3EnrollmentPeerReceipt
+			}
+		}
 	}
-	return target, selected.physicalPeer(), nil
+	ids := make([]uint64, 0, len(required))
+	for id := range required {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	result.endpoints = make(map[rafttransport.NodeID]string, len(ids))
+	for _, id := range ids {
+		member, found := known[id]
+		if !found {
+			return result, fmt.Errorf("%w: member %d has no authenticated endpoint", errRF3EnrollmentPeerReceipt, id)
+		}
+		if _, duplicate := result.endpoints[member.NodeID]; duplicate {
+			return result, fmt.Errorf("%w: physical node has two live members", errRF3EnrollmentPeerReceipt)
+		}
+		role := rafttransport.MemberEnrolled
+		if slices.Contains(conf.GetVoters(), id) {
+			role = rafttransport.MemberVoter
+		} else if slices.Contains(conf.GetLearners(), id) {
+			role = rafttransport.MemberLearner
+		}
+		result.members = append(result.members, rafttransport.Member{Group: group, ReplicaSetVersion: publication.ReplicaSetVersion, MemberID: id, Node: member.NodeID, Role: role})
+		result.endpoints[member.NodeID] = member.PeerAddress
+		if receipt, dynamic := witnesses[id]; dynamic {
+			result.peers = append(result.peers, receipt.physicalPeer())
+			if role == rafttransport.MemberVoter || result.dynamicMember == 0 {
+				result.dynamicMember = id
+			}
+		}
+		if id == localMember {
+			result.native = role == rafttransport.MemberVoter || manifest.EnrolledTarget != nil && id == manifest.EnrolledTarget.MemberID
+		}
+	}
+	return result, nil
 }
 
-func (receipt rf3EnrollmentPeerReceipt) validateAgainstManifest(manifest rf3Manifest, group raftmember.GroupKey) error {
-	if err := receipt.validate(); err != nil || receipt.Group != group {
-		return errRF3EnrollmentPeerReceipt
-	}
-	if len(manifest.memberRoster()) != rf3ManifestMembers {
-		return errRF3EnrollmentPeerReceipt
-	}
-	authority := coldRF3GrantAuthority{group: group, target: rf3ManifestEnrolledTarget{MemberID: receipt.MemberID, NodeID: receipt.NodeID}}
-	copy(authority.members[:], manifest.memberRoster())
-	if err := authority.InstallTransitionGrant(receipt.Grant); err != nil {
-		return errors.Join(errRF3EnrollmentPeerReceipt, err)
-	}
-	stable := make([]rafttransport.Member, len(manifest.memberRoster()))
-	for index, member := range manifest.memberRoster() {
-		stable[index] = rafttransport.Member{Group: group, ReplicaSetVersion: receipt.Grant.InitialReplicaSetVersion,
-			MemberID: member.MemberID, Node: member.NodeID, Role: rafttransport.MemberVoter}
-	}
-	rosterDigest, err := rafttransport.StableRosterDigest(stable)
-	if err != nil || rosterDigest != receipt.ExpectedRosterDigest {
-		return errRF3EnrollmentPeerReceipt
-	}
-	return nil
+type rf3EnrollmentRoster struct {
+	members       []rafttransport.Member
+	endpoints     map[rafttransport.NodeID]string
+	peers         []rafttransport.PhysicalPeer
+	dynamicMember uint64
+	native        bool
 }

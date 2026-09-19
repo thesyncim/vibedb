@@ -14,7 +14,7 @@ import (
 func TestRF3NativeChildPublicationIsDurableAndExact(t *testing.T) {
 	registry, gate, prepared, states := nativeAuthorityFixture(t, 3)
 	inventory := testRF3AdoptedInventory(t)
-	authority, err := newRF3NativeAuthorities(registry, gate, prepared[:1], nil, nil)
+	authority, err := newRF3NativeAuthorities(registry, gate, prepared[:1], nativeAuthorityIdentities(states[:1]), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

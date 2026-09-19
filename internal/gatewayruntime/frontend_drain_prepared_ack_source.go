@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
 	"time"
@@ -202,25 +203,25 @@ func serveFrontendDrainPreparedAckCutReadConnectionWithOptions(
 		var err error
 		node, err = options.readNode(ctx, request.ReceiverNode, request.ReceiverIncarnation)
 		if err != nil {
-			return errors.Join(errFrontendDrainPreparedAckSourceState, err)
+			return fmt.Errorf("%w: read receiver: %w", errFrontendDrainPreparedAckSourceState, err)
 		}
 	}
 	source, err := options.readCut(ctx)
 	if err != nil {
-		return errors.Join(errFrontendDrainPreparedAckSourceState, err)
+		return fmt.Errorf("%w: read canonical source: %w", errFrontendDrainPreparedAckSourceState, err)
 	}
 	if options.readNode == nil {
 		found := false
 		for _, candidate := range source.Nodes.Nodes {
 			if candidate.NodeID == request.ReceiverNode && candidate.Incarnation == request.ReceiverIncarnation {
 				if found {
-					return errFrontendDrainPreparedAckSourceState
+					return fmt.Errorf("%w: duplicate receiver in source directory", errFrontendDrainPreparedAckSourceState)
 				}
 				node, found = candidate, true
 			}
 		}
 		if !found {
-			return errFrontendDrainPreparedAckSourceState
+			return fmt.Errorf("%w: receiver absent from source directory", errFrontendDrainPreparedAckSourceState)
 		}
 	}
 	if !node.Valid() || node.NodeID != request.ReceiverNode ||
@@ -230,15 +231,16 @@ func serveFrontendDrainPreparedAckCutReadConnectionWithOptions(
 		!frontendDrainPreparedAckSourceLifecycleAllows(operation, node.Lifecycle, request.DrainID) ||
 		(operation == frontenddrain.CutOperationInstallExact &&
 			(request.ReceiverNodeRevision == 0 || node.Revision != request.ReceiverNodeRevision)) {
-		return errFrontendDrainPreparedAckSourceState
+		return fmt.Errorf("%w: receiver binding operation=%d lifecycle=%d revision=%d requested=%d",
+			errFrontendDrainPreparedAckSourceState, operation, node.Lifecycle, node.Revision, request.ReceiverNodeRevision)
 	}
 	if !source.Nodes.Valid() || source.Catalog == nil ||
 		source.CatalogHeadDigest == (replication.Digest{}) ||
 		source.Catalog.Generation() != source.Nodes.CatalogGeneration {
-		return errFrontendDrainPreparedAckSourceState
+		return fmt.Errorf("%w: invalid canonical source directory/catalog", errFrontendDrainPreparedAckSourceState)
 	}
 	if !sourceContainsExactNode(source, node) {
-		return errFrontendDrainPreparedAckSourceState
+		return fmt.Errorf("%w: receiver changed between node and source reads", errFrontendDrainPreparedAckSourceState)
 	}
 	if !options.requireCurrentGateway &&
 		(options.sourceNode == (rafttransport.NodeID{}) || options.sourceIncarnation == 0 ||
@@ -250,17 +252,19 @@ func serveFrontendDrainPreparedAckCutReadConnectionWithOptions(
 	serviceCut, err := runtimeServiceDirectoryCutFromFrontendDrainRuntimeCut(
 		ctx, source, options.profile, options.policyGeneration)
 	if err != nil {
-		return errors.Join(errFrontendDrainPreparedAckSourceState, err)
+		return fmt.Errorf("%w: project canonical service directory: %w", errFrontendDrainPreparedAckSourceState, err)
 	}
 	if options.requireCurrentGateway && !serviceCutContainsCurrentGateway(serviceCut, options.profile) {
 		return errFrontendDrainPreparedAckSourceAuth
 	}
 	if !serviceCutContainsActiveStorage(serviceCut, node, peerKey) {
-		return errFrontendDrainPreparedAckSourceState
+		return fmt.Errorf("%w: receiver absent from active storage bindings", errFrontendDrainPreparedAckSourceState)
 	}
-	if !frontendDrainPreparedAckSourceSubjectMatches(source, request) ||
-		!frontendDrainPreparedAckServiceSubjectMatches(serviceCut, request) {
-		return errFrontendDrainPreparedAckSourceState
+	if !frontendDrainPreparedAckSourceSubjectMatches(source, request) {
+		return fmt.Errorf("%w: canonical drain subject mismatch", errFrontendDrainPreparedAckSourceState)
+	}
+	if !frontendDrainPreparedAckServiceSubjectMatches(serviceCut, request) {
+		return fmt.Errorf("%w: projected service drain subject mismatch", errFrontendDrainPreparedAckSourceState)
 	}
 	cut := frontenddrain.PreparedAckCut{
 		DirectoryRevision: source.Nodes.Revision, DirectoryDigest: source.Nodes.Digest,
@@ -269,8 +273,14 @@ func serveFrontendDrainPreparedAckCutReadConnectionWithOptions(
 		SourceRoster: frontendDrainPreparedAckSourceRoster(source),
 		Subjects:     frontendDrainPreparedAckSubjects(source),
 	}
-	if !cut.Valid() || !frontendDrainPreparedAckCutAtLeastFloor(cut, request.SourceFloor) {
-		return errFrontendDrainPreparedAckSourceState
+	if !cut.Valid() {
+		return fmt.Errorf("%w: invalid complete projected cut", errFrontendDrainPreparedAckSourceState)
+	}
+	if !frontendDrainPreparedAckCutAtLeastFloor(cut, request.SourceFloor) {
+		return fmt.Errorf("%w: source floor mismatch directory=%d/%d catalog=%d/%d service=%d/%d",
+			errFrontendDrainPreparedAckSourceState, cut.DirectoryRevision, request.SourceFloor.DirectoryRevision,
+			cut.CatalogGeneration, request.SourceFloor.CatalogGeneration,
+			cut.ServiceDirectoryRevision, request.SourceFloor.ServiceDirectoryRevision)
 	}
 	if operation == frontenddrain.CutOperationInstallExact && cut.Digest() != request.SourceCutDigest {
 		return writeFrontendDrainPreparedAckCutReadMovedResponse(ctx, connection, request, cut, options.writeDeadline)
@@ -309,7 +319,7 @@ func writeFrontendDrainPreparedAckCutReadMovedResponse(
 	if ctx == nil || connection == nil || !request.Valid() || request.Operation != frontenddrain.CutOperationInstallExact ||
 		!cut.Valid() || !cut.AtLeastFloor(request.SourceFloor) || cut.Digest() == request.SourceCutDigest ||
 		!frontendDrainPreparedAckCutFloorStrictlyAdvanced(cut, request.SourceFloor) {
-		return errFrontendDrainPreparedAckSourceState
+		return fmt.Errorf("%w: changed cut without a strictly newer source floor", errFrontendDrainPreparedAckSourceState)
 	}
 	response := frontenddrain.PreparedAckCutReadMovedResponse{
 		Operation: frontenddrain.CutOperationInstallExact, RequirePrepared: request.RequirePrepared,

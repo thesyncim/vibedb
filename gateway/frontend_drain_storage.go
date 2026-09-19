@@ -110,8 +110,8 @@ func (authority *ReplicatedCatalogAuthority) EnforceFrontendDrain(
 	}
 	next.Revision++
 	return authority.putNodeWithExtra(ctx, next, expectedRevision, nil, nil,
-		func(appendCtx context.Context, prior, current NodeRecord) ([]NativeMutation, error) {
-			return authority.appendEnforcedFrontendDrainMutations(appendCtx, drainID, prior, current)
+		func(appendCtx context.Context, prior, current NodeRecord, directoryRevision uint64, directoryDigest replication.Digest) ([]NativeMutation, error) {
+			return authority.appendEnforcedFrontendDrainMutations(appendCtx, drainID, prior, current, directoryRevision, directoryDigest)
 		})
 }
 
@@ -732,6 +732,7 @@ func samePreparedFrontendDrainImmutable(left, right FrontendDrainRecord) bool {
 // session that was scanned before retirement.
 func (authority *ReplicatedCatalogAuthority) appendRetiredFrontendDrainMutations(
 	ctx context.Context, prior NodeRecord, terminal NodeRecord,
+	_ uint64, _ replication.Digest,
 ) ([]NativeMutation, error) {
 	if authority == nil || ctx == nil {
 		return nil, ErrReplicatedCatalog
@@ -849,6 +850,7 @@ func (authority *ReplicatedCatalogAuthority) appendRetiredFrontendDrainMutations
 // process-local marker.
 func (authority *ReplicatedCatalogAuthority) appendEnforcedFrontendDrainMutations(
 	ctx context.Context, drainID [32]byte, prior NodeRecord, current NodeRecord,
+	nodeDirectoryRevision uint64, nodeDirectoryDigest replication.Digest,
 ) ([]NativeMutation, error) {
 	if authority == nil || ctx == nil || drainID == ([32]byte{}) ||
 		prior.Lifecycle != NodeActive || current.Lifecycle != NodeDraining ||
@@ -876,28 +878,28 @@ func (authority *ReplicatedCatalogAuthority) appendEnforcedFrontendDrainMutation
 		record.DrainID != drainID {
 		return nil, ErrScalingIdentity
 	}
-	var receiverHead ReplicatedPointResult
-	if record.ReceiverDirectoryRevision != 0 {
-		// Enforce must compare against the same effective catalog generation
-		// used by the Prepared acknowledgement barrier. The catalog head can
-		// advance without rewriting the node directory, so ReadNodeDirectoryCut
-		// alone would reject a valid catalog-only publication or allow a mixed
-		// source epoch into this CAS batch.
-		cut, cutErr := authority.ReadFrontendDrainRuntimeCut(ctx)
-		if cutErr != nil || !cut.Nodes.Valid() || cut.Catalog == nil ||
-			cut.CatalogHeadDigest == (replication.Digest{}) ||
-			cut.Catalog.Generation() != cut.Nodes.CatalogGeneration ||
-			cut.Nodes.Revision != record.ReceiverDirectoryRevision ||
-			cut.Nodes.Digest != record.ReceiverDirectoryDigest ||
-			cut.Nodes.CatalogGeneration != record.ReceiverCatalogGeneration ||
-			cut.CatalogHeadDigest != record.ReceiverCatalogHeadDigest {
-			return nil, ErrScalingRevision
-		}
-		var headErr error
-		receiverHead, headErr = authority.readRaw(ctx, replicatedCatalogHeadKey, maxReplicatedCatalogBytes)
-		if headErr != nil || !receiverHead.Found || scalingDigest(receiverHead.Value) != record.ReceiverCatalogHeadDigest {
-			return nil, ErrScalingRevision
-		}
+	if record.ReceiverDirectoryRevision == 0 {
+		return nil, ErrScalingRevision
+	}
+	// Use the exact node directory already fenced by this mutation. Reading
+	// a runtime projection here would re-enter the authority mutex through
+	// route-seed publication. The raw catalog head is the only other source
+	// needed: its digest is compared again by the same atomic batch below.
+	if nodeDirectoryRevision != record.ReceiverDirectoryRevision ||
+		nodeDirectoryDigest != record.ReceiverDirectoryDigest {
+		return nil, ErrScalingRevision
+	}
+	receiverHead, headErr := authority.readRaw(ctx, replicatedCatalogHeadKey, maxReplicatedCatalogBytes)
+	if headErr != nil || !receiverHead.Found || scalingDigest(receiverHead.Value) != record.ReceiverCatalogHeadDigest {
+		return nil, ErrScalingRevision
+	}
+	payload, openErr := openTypedControlPlaneDocument(receiverHead.Value, replicatedCatalogHeadDocumentID[:], maxReplicatedCatalogBytes)
+	if openErr != nil {
+		return nil, openErr
+	}
+	snapshot, openErr := OpenSnapshotDocument(payload)
+	if openErr != nil || snapshot.Generation() != record.ReceiverCatalogGeneration {
+		return nil, errors.Join(ErrScalingRevision, openErr)
 	}
 	enforcing := record
 	enforcing.Lifecycle = FrontendDrainEnforcing

@@ -13,7 +13,7 @@ func TestTailStreamRequestResponseRoundTripBindsDurableAdvance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := TailStreamRequest{Binding: binding, Before: before, Batch: batch}
+	request := TailStreamRequest{Binding: binding, Batch: batch}
 	var codec TailStreamCodecWorkspace
 	raw, err := AppendTailStreamRequestWithWorkspace(nil, request, &codec)
 	if err != nil {
@@ -31,6 +31,29 @@ func TestTailStreamRequestResponseRoundTripBindsDurableAdvance(t *testing.T) {
 	canonical, err := AppendTailStreamRequestWithWorkspace(nil, opened, &codec)
 	if err != nil || !bytes.Equal(canonical, raw) {
 		t.Fatalf("canonical error=%v equal=%v", err, bytes.Equal(canonical, raw))
+	}
+	if !before.CanApplyTailBatch(opened.Batch) {
+		t.Fatal("durable predecessor rejected next authenticated batch")
+	}
+	for name, mutate := range map[string]func(*ChildStageCursor){
+		"gap":       func(c *ChildStageCursor) { c.applied++ },
+		"term":      func(c *ChildStageCursor) { c.term = batch.Term + 1 },
+		"child":     func(c *ChildStageCursor) { c.child++ },
+		"plan":      func(c *ChildStageCursor) { c.planDigest[0] ^= 1 },
+		"placement": func(c *ChildStageCursor) { c.placementDigest[0] ^= 1 },
+		"artifact":  func(c *ChildStageCursor) { c.artifactDigest[0] ^= 1 },
+		"receipt":   func(c *ChildStageCursor) { c.pendingBatchDigest = [32]byte{99} },
+	} {
+		changed := before
+		mutate(&changed)
+		if changed.CanApplyTailBatch(opened.Batch) {
+			t.Fatalf("accepted conflicting %s", name)
+		}
+	}
+	pending := before
+	pending.pendingBatchDigest = batch.Digest
+	if !pending.CanApplyTailBatch(opened.Batch) {
+		t.Fatal("exact pending receipt rejected")
 	}
 	if err = stage.ApplyTailBatch(opened.Batch, persist); err != nil {
 		t.Fatal(err)
@@ -54,8 +77,11 @@ func TestTailStreamRequestResponseRoundTripBindsDurableAdvance(t *testing.T) {
 	if err = ValidateTailStreamResponse(opened, openedResponse); err != nil {
 		t.Fatal(err)
 	}
-	// The request cursor deliberately remains the pre-apply durable cursor.
-	// Re-encoding after apply is therefore byte-identical for outcome-unknown retry.
+	if after.CanApplyTailBatch(opened.Batch) {
+		t.Fatal("already applied batch was authorized for another apply")
+	}
+	// Sender restart cannot change the request: only immutable batch authority
+	// is transmitted, regardless of which receivers have already applied it.
 	retry, err := AppendTailStreamRequestWithWorkspace(nil, opened, &codec)
 	if err != nil || !bytes.Equal(retry, raw) {
 		t.Fatalf("retry error=%v equal=%v", err, bytes.Equal(retry, raw))
@@ -63,14 +89,14 @@ func TestTailStreamRequestResponseRoundTripBindsDurableAdvance(t *testing.T) {
 }
 
 func TestTailStreamRequestRejectsEveryBindingAndFramePerturbation(t *testing.T) {
-	partitioner, set, _, before, batch, _ := testTailStreamFixture(t)
+	partitioner, set, _, _, batch, _ := testTailStreamFixture(t)
 	operation := [32]byte{92}
 	binding, err := NewTailStreamBinding(operation, set.Children[1])
 	if err != nil {
 		t.Fatal(err)
 	}
 	raw, err := AppendTailStreamRequest(nil, TailStreamRequest{
-		Binding: binding, Before: before, Batch: batch,
+		Binding: binding, Batch: batch,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -119,6 +145,50 @@ func TestTailStreamRequestRejectsEveryBindingAndFramePerturbation(t *testing.T) 
 				t.Fatalf("error=%v", validateErr)
 			}
 		})
+	}
+}
+
+func TestTailReplayFloorPreservesArtifactAndEntryIdentity(t *testing.T) {
+	_, _, stage, before, batch, persist := testTailStreamFixture(t)
+	if err := stage.ApplyTailBatch(batch, persist); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := stage.Cursor()
+	pending := before
+	pending.pendingBatchDigest = batch.Digest
+	for _, pair := range [][2]ChildStageCursor{{before, after}, {after, before}, {pending, after}, {before, pending}} {
+		floor, ok := pair[0].TailReplayFloor(pair[1])
+		if !ok || floor.SourceCut() != before.SourceCut() {
+			t.Fatal("compatible partial acknowledgement blocked replay")
+		}
+	}
+	for name, mutate := range map[string]func(*ChildStageCursor){
+		"child":     func(c *ChildStageCursor) { c.child++ },
+		"plan":      func(c *ChildStageCursor) { c.planDigest[0] ^= 1 },
+		"placement": func(c *ChildStageCursor) { c.placementDigest[0] ^= 1 },
+		"artifact":  func(c *ChildStageCursor) { c.artifactDigest[0] ^= 1 },
+		"prefix":    func(c *ChildStageCursor) { c.lastChunkDigest[0] ^= 1 },
+		"base":      func(c *ChildStageCursor) { c.baseDigest[0] ^= 1 },
+		"gap":       func(c *ChildStageCursor) { c.applied++ },
+	} {
+		changed := after
+		mutate(&changed)
+		if _, ok := before.TailReplayFloor(changed); ok {
+			t.Fatalf("accepted incompatible %s", name)
+		}
+	}
+	conflict := before
+	conflict.entryDigest[0] ^= 1
+	if _, ok := before.TailReplayFloor(conflict); ok {
+		t.Fatal("accepted divergent entry at same index")
+	}
+	conflict = pending
+	conflict.pendingBatchDigest[0] ^= 1
+	if _, ok := pending.TailReplayFloor(conflict); ok {
+		t.Fatal("accepted conflicting durable receipts")
+	}
+	if _, ok := conflict.TailReplayFloor(after); ok {
+		t.Fatal("accepted a result that does not match its pending receipt")
 	}
 }
 

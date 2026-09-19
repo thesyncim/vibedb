@@ -355,7 +355,10 @@ func (workload *seamlessScaleWorkload) WindowUntil(ctx context.Context, phase st
 func calibrateSeamlessScaleRate(t *testing.T, workload *seamlessScaleWorkload, ctx context.Context) int {
 	t.Helper()
 	for _, candidate := range []int{seamlessScaleOfferedRate, 1_000} {
-		probe := workload.Window(ctx, "calibration", 2*time.Second, candidate)
+		// The queue holds two seconds of arrivals. A two-second probe can
+		// always enqueue its entire workload and falsely pass while draining
+		// below the offered rate. Use the actual qualification window.
+		probe := workload.Window(ctx, "calibration", seamlessScaleWindowDuration, candidate)
 		t.Logf("scale calibration rate=%d scheduled=%d completed=%d errors=%d missed=%d writes=%d reads=%d p99=%s", candidate, probe.Scheduled, probe.Completed, probe.Errors, probe.Missed, probe.AcknowledgedWrites, probe.VerifiedReads, time.Duration(probe.P99NS))
 		if probe.Errors != 0 {
 			workload.historyMu.Lock()
@@ -368,7 +371,7 @@ func calibrateSeamlessScaleRate(t *testing.T, workload *seamlessScaleWorkload, c
 			}
 			workload.historyMu.Unlock()
 		}
-		if probe.Scheduled >= uint64(candidate)*2 && probe.Started == probe.Scheduled &&
+		if probe.Scheduled >= uint64(candidate)*uint64(seamlessScaleWindowDuration/time.Second) && probe.Started == probe.Scheduled &&
 			probe.Completed == probe.Started && probe.Errors == 0 && probe.Missed == 0 {
 			return candidate
 		}
@@ -975,6 +978,12 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 	baseline := workload.WindowSet(ctx, seamlessScalePhaseBaseline, 5, seamlessScaleWindowDuration, calibratedRate)
 	t.Logf("scale baseline complete: rate=%d scheduled=%d completed=%d errors=%d missed=%d p99=%s", calibratedRate,
 		baseline.Scheduled, baseline.Completed, baseline.Errors, baseline.Missed, time.Duration(baseline.P99NS))
+	// These are already mandatory final evidence gates. An invalid baseline
+	// cannot qualify after any topology wave, so preserve the failure now.
+	if baseline.Errors != 0 || baseline.Timeouts != 0 || baseline.Missed != 0 || baseline.Completed != baseline.Scheduled {
+		t.Fatalf("strict baseline cannot qualify: scheduled=%d completed=%d errors=%d timeouts=%d missed=%d",
+			baseline.Scheduled, baseline.Completed, baseline.Errors, baseline.Timeouts, baseline.Missed)
+	}
 
 	// The actor starts before the first enrollment and runs until the third
 	// retired process has stopped. Every retained during sample is assigned by

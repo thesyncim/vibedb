@@ -15,6 +15,8 @@ import (
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibejson"
@@ -259,13 +261,25 @@ func (authority *bootstrapReadTestAuthority) ScanNodeReferences(_ context.Contex
 
 type bootstrapRecoveryTestAuthority struct {
 	*bootstrapReadTestAuthority
-	snapshot *gateway.Snapshot
-	digest   replication.Digest
-	err      error
+	snapshot    *gateway.Snapshot
+	digest      replication.Digest
+	err         error
+	grant       membershipgrant.Grant
+	grantFound  bool
+	grantReads  int
+	changeGrant bool
 }
 
 func (authority *bootstrapRecoveryTestAuthority) ReadReplicatedCatalogHead(context.Context) (*gateway.Snapshot, replication.Digest, error) {
 	return authority.snapshot, authority.digest, authority.err
+}
+
+func (authority *bootstrapRecoveryTestAuthority) ReadMembershipGrant(context.Context, raftmember.GroupKey) (membershipgrant.Grant, bool, error) {
+	authority.grantReads++
+	if authority.changeGrant && authority.grantReads == 2 {
+		authority.grantFound = !authority.grantFound
+	}
+	return authority.grant, authority.grantFound, nil
 }
 
 func bootstrapRecoveryTestSnapshot(t *testing.T, intent gateway.GroupEnrollmentIntent, targetServing bool) *gateway.Snapshot {
@@ -377,7 +391,7 @@ func TestBootstrapRecoveryReadRejectsCatalogChangeAndUnavailableAuthority(t *tes
 	request := BootstrapReadRequest{Nonce: [16]byte{1}, Operation: OpReadOwnEnrollmentRecovery, PhysicalNode: node.NodeID, Incarnation: node.Incarnation, IntentID: intent.IntentID}
 	snapshot := bootstrapRecoveryTestSnapshot(t, intent, true)
 	node, cut := bootstrapRecoveryTestDirectory(t, snapshot, node)
-	for _, name := range []string{"unsupported", "unavailable", "first scan changed", "second scan changed", "missing physical peer", "group absent"} {
+	for _, name := range []string{"unsupported", "unavailable", "first scan changed", "second scan changed", "missing physical peer", "group absent", "membership grant changed"} {
 		t.Run(name, func(t *testing.T) {
 			base := &bootstrapReadTestAuthority{intent: intent, node: node, cut: cut, evidence: bootstrapReadTestEvidence(node)}
 			authority := &bootstrapRecoveryTestAuthority{bootstrapReadTestAuthority: base, snapshot: snapshot, digest: base.evidence.CatalogHeadDigest}
@@ -395,6 +409,8 @@ func TestBootstrapRecoveryReadRejectsCatalogChangeAndUnavailableAuthority(t *tes
 						state.evidence.CatalogHeadDigest[0]++
 					}
 				}
+			case "membership grant changed":
+				authority.changeGrant = true
 			case "missing physical peer":
 				base.cut.Nodes = base.cut.Nodes[1:]
 			case "group absent":

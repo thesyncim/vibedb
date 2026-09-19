@@ -6,7 +6,10 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 func TestRF3DynamicGrantRouterPersistsAndDefersRestoredAuthority(t *testing.T) {
@@ -49,5 +52,65 @@ func TestRF3DynamicGrantRouterPersistsAndDefersRestoredAuthority(t *testing.T) {
 	}
 	if err := restarted.InstallTransitionGrant(grant); err != nil {
 		t.Fatalf("exact retry after restart: %v", err)
+	}
+}
+
+func TestRF3DynamicGrantRecoveryPreservesActiveAndReplacesCompletedAuthority(t *testing.T) {
+	intent := rf3RecoveryEnrollmentIntent()
+	cut := rf3RecoveryServingCut(t, intent)
+	cut.CatalogGeneration = 20
+	manifest := serveRF3TestManifest()
+	manifest.EnrolledTarget = serveRF3TestEnrolledTarget()
+	manifest.EnrolledTarget.NodeID = intent.Target.Node
+	previous := rf3MembershipGrantFixture(manifest, intent.Group, 1)
+	next := previous
+	next.InitialReplicaSetVersion, next.CatalogGeneration = 4, previous.CatalogGeneration+1
+	next.InitialVoters, next.SourceMember, next.TargetMember = [3]uint64{2, 3, 4}, 2, 5
+	next.TargetNode = [16]byte{9}
+	for _, name := range []string{"active", "successor", "absence", "stale"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "grant")
+			if err := persistRF3MembershipGrant(path, previous); err != nil {
+				t.Fatal(err)
+			}
+			router := newRF3DynamicGrantRouter(&rf3GrantSink{grants: make(map[raftmember.GroupKey]membershipgrant.Grant)})
+			if _, _, err := router.Register(intent.Group, path); err != nil {
+				t.Fatal(err)
+			}
+			current := cut
+			candidate := next
+			current.CurrentGrant = &candidate
+			publication := raftmodel.Publication{ReplicaSetVersion: 4, ConfState: &pb.ConfState{Voters: []uint64{2, 3, 4}}}
+			want := next
+			switch name {
+			case "active":
+				publication.ReplicaSetVersion = 3
+				publication.ConfState.Voters = []uint64{1, 2, 3, 4}
+				want = previous
+			case "absence":
+				current.CurrentGrant = nil
+				want = membershipgrant.Grant{}
+			case "stale":
+				candidate.CatalogGeneration = previous.CatalogGeneration
+			}
+			actual, err := router.Recover(intent.Group, publication, &current)
+			if name == "stale" {
+				if !errors.Is(err, nodecontrol.ErrStale) {
+					t.Fatalf("stale grant accepted: %v", err)
+				}
+				want = previous
+			} else if err != nil || actual != want {
+				t.Fatalf("recovery got=%+v err=%v", actual, err)
+			}
+			stored, found, err := readRF3MembershipGrant(path)
+			if err != nil || found != (want != (membershipgrant.Grant{})) || stored != want {
+				t.Fatalf("wrong durable authority: %+v found=%v err=%v", stored, found, err)
+			}
+			if name != "stale" {
+				if retry, err := router.Recover(intent.Group, publication, &current); err != nil || retry != want {
+					t.Fatalf("recovery retry: %+v %v", retry, err)
+				}
+			}
+		})
 	}
 }

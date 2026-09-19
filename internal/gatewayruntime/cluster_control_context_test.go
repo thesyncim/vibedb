@@ -8,6 +8,7 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/clustercontrol"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
 
 type blockingClusterControlDirectory struct {
@@ -128,5 +129,38 @@ func TestExecuteClusterControlPersistsIntentAfterClientCancellation(t *testing.T
 	}
 	if writer.putContext == nil || writer.putContext.Err() != nil {
 		t.Fatalf("intent write did not use detached context: err=%v", writer.putContext.Err())
+	}
+}
+
+type decommissionAdmissionDirectory struct {
+	*lifecycleBarrierDirectoryTest
+}
+
+func (directory *decommissionAdmissionDirectory) ListScalingIntents(context.Context) ([]gateway.ScalingIntent, error) {
+	if directory.intent.Revision == 0 {
+		return nil, nil
+	}
+	return []gateway.ScalingIntent{directory.intent}, nil
+}
+
+func TestDecommissionSubmissionLeavesLifecycleToRecoverableController(t *testing.T) {
+	directory := &decommissionAdmissionDirectory{&lifecycleBarrierDirectoryTest{
+		node: gateway.NodeRecord{NodeID: rafttransport.NodeID{5}, Incarnation: 1, Revision: 1,
+			Lifecycle: gateway.NodeActive, Roles: gateway.NodeRoleStorage | gateway.NodeRoleGateway},
+	}}
+	requestID, _ := clustercontrol.NewRequestID()
+	request := clustercontrol.Request{Format: clustercontrol.Format, Op: clustercontrol.OpDecommission,
+		RequestID: requestID, NodeID: hex.EncodeToString(directory.node.NodeID[:]), NodeIncarnation: 1}
+	backend := &ScalingOperatorBackend{directory: directory, writer: directory, catalog: durableClusterControlCatalog{}}
+	first := backend.ExecuteClusterControl(t.Context(), request)
+	if !first.OK || first.OperationID == "" || directory.intent.State != gateway.ScalingReserved || directory.node.Lifecycle != gateway.NodeActive {
+		t.Fatalf("admission must persist only its intent: response=%+v node=%+v", first, directory.node)
+	}
+	// A lost response and gateway restart reuse the same durable operation;
+	// no frontend connection or preparer is needed on the admission path.
+	backend = &ScalingOperatorBackend{directory: directory, writer: directory, catalog: durableClusterControlCatalog{}}
+	retry := backend.ExecuteClusterControl(t.Context(), request)
+	if !retry.OK || retry.OperationID != first.OperationID || directory.intent.Revision != 1 || directory.node.Lifecycle != gateway.NodeActive {
+		t.Fatalf("retry repeated lifecycle work: %+v", retry)
 	}
 }

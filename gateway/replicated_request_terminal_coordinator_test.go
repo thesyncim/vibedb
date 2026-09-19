@@ -8,13 +8,13 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
-	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 )
 
 type terminalCoordinatorLedger struct {
+	pin          *terminalCoordinatorPin
 	head         requestledger.HeadRecord
 	continuation requestledger.ContinuationRecord
 	prepared     requestledger.PreparedTerminalRecord
@@ -41,16 +41,12 @@ func (ledger *terminalCoordinatorLedger) ApplyCAS(
 			ledger.head, ledger.continuation, cas.Prepared,
 		)
 		ledger.prepared = cas.Prepared
-	case requestledger.OperationBeginSchemaPinRelease:
-		ledger.head, err = requestledger.InstallSchemaPinRelease(
-			ledger.head, ledger.prepared, cas.SchemaPin,
-		)
-		ledger.release = cas.SchemaPin
-	case requestledger.OperationRecordSchemaPinReleased:
-		ledger.head, err = requestledger.MarkSchemaPinReleased(
-			ledger.head, ledger.prepared, ledger.release, cas.SchemaPin,
-		)
-		ledger.release = cas.SchemaPin
+	case requestledger.OperationReleaseSchemaPin:
+		var proof []byte
+		proof, err = ledger.pin.release(cas.SchemaPin.Command)
+		if err == nil {
+			ledger.head, ledger.release, err = requestledger.CompleteSchemaPinRelease(ledger.head, ledger.prepared, cas.SchemaPin, proof)
+		}
 	case requestledger.OperationComplete:
 		ledger.head, err = requestledger.MarkTerminal(
 			ledger.head, ledger.prepared, ledger.release, cas.Terminal,
@@ -98,15 +94,7 @@ func (ledger *terminalCoordinatorLedger) ReadRow(
 }
 
 type terminalCoordinatorPin struct {
-	t            testing.TB
-	route        ReplicatedRoute
-	tenant       []byte
-	retryHome    replication.RetryHome
-	clientID     replication.ID128
-	epoch        uint64
-	sequence     uint64
 	record       executionpin.Record
-	fault        bool
 	attempts     [][]byte
 	fenceCalls   int
 	fenceFaultAt int
@@ -114,6 +102,7 @@ type terminalCoordinatorPin struct {
 
 func (pin *terminalCoordinatorPin) ValidateFence(
 	_ context.Context,
+	_ ReplicatedRoute,
 	lease executionpin.LeaseCertificate,
 ) error {
 	pin.fenceCalls++
@@ -123,104 +112,26 @@ func (pin *terminalCoordinatorPin) ValidateFence(
 	return executionpin.ValidateSideEffectFence(lease, pin.record, pin.record.LastApplied)
 }
 
-func (pin *terminalCoordinatorPin) BuildRelease(
-	transition executionpin.Command,
-) ([]byte, error) {
-	var storage [executionpin.CommandBytes]byte
-	nested, err := executionpin.AppendCommand(storage[:0], transition)
+func (pin *terminalCoordinatorPin) release(exact []byte) ([]byte, error) {
+	pin.attempts = append(pin.attempts, bytes.Clone(exact))
+	command, err := executionpin.OpenCommand(exact)
 	if err != nil {
 		return nil, err
 	}
-	outer := replicatedTransactionCommandHeader(
-		pin.route, pin.tenant, pin.retryHome, pin.clientID, pin.epoch, pin.sequence,
-	)
-	outer.Kind = replication.CommandExecutionPin
-	outer.AuthorityClass = replication.CommandAuthorityExecutionPin
-	outer.ExecutionPin = nested
-	outer.Fingerprint = nativeCommandFingerprint(outer)
-	return replication.AppendCommand(nil, outer)
-}
-
-func (pin *terminalCoordinatorPin) ProposeNew(
-	_ context.Context,
-	transition executionpin.Command,
-	exact []byte,
-) (ReplicatedResult, error) {
-	built, err := pin.BuildRelease(transition)
-	if err != nil || !bytes.Equal(built, exact) {
-		return ReplicatedResult{}, errors.Join(err, ErrDurableRequestConflict)
-	}
-	return pin.propose(exact)
-}
-
-func (pin *terminalCoordinatorPin) RetryExact(
-	_ context.Context,
-	exact []byte,
-) (ReplicatedResult, error) {
-	return pin.propose(exact)
-}
-
-func (pin *terminalCoordinatorPin) propose(exact []byte) (ReplicatedResult, error) {
-	pin.attempts = append(pin.attempts, bytes.Clone(exact))
-	if pin.fault {
-		pin.fault = false
-		return ReplicatedResult{}, errLifecycleRunnerFault
-	}
-	outer, err := replication.OpenCommand(exact)
+	authority, err := executionpin.ReleaseAuthorityDigest(exact)
 	if err != nil {
-		return ReplicatedResult{}, err
+		return nil, err
 	}
-	command, err := outer.OpenExecutionPin()
-	if err != nil {
-		return ReplicatedResult{}, err
-	}
-	authority, ok := replication.ExecutionPinAuthorityDigest(outer)
-	if !ok {
-		return ReplicatedResult{}, ErrDurableRequestConflict
-	}
-	transition := executionpin.Apply(
-		pin.record, true, command, 77, executionpin.Digest(authority), executionpin.Digest{9},
-	)
-	if transition.Reason != executionpin.ReasonApplied {
-		return ReplicatedResult{}, ErrDurableRequestConflict
+	transition := executionpin.Apply(pin.record, true, command, 77, executionpin.Digest(authority), executionpin.Digest{9})
+	if transition.Reason != executionpin.ReasonApplied || !transition.Mutated {
+		return nil, ErrDurableRequestConflict
 	}
 	pin.record = transition.Record
 	proof, err := executionpin.CompletionFromRecord(executionpin.OperationRelease, pin.record)
 	if err != nil {
-		return ReplicatedResult{}, err
+		return nil, err
 	}
-	result, err := executionpin.AppendCompletion(nil, proof)
-	if err != nil {
-		return ReplicatedResult{}, err
-	}
-	digest := replication.CompletionResultDigest(
-		replicatedstate.ResultApplied, replicatedstate.ResultFormatExecutionPin, result,
-	)
-	completion, err := replication.AppendCompletionBytes(nil, replication.CompletionBytes{
-		ClusterID: outer.ClusterID, ClusterIncarnation: outer.ClusterIncarnation,
-		TopologyRecoveryEpoch: outer.TopologyRecoveryEpoch,
-		Distribution:          outer.Distribution, Shard: outer.Shard,
-		AllocationGeneration: outer.AllocationGeneration,
-		ShardIncarnation:     outer.ShardIncarnation, GroupID: outer.GroupID,
-		ReplicaSetVersion:      outer.ReplicaSetVersion,
-		ActivePolicyGeneration: outer.ActivePolicyGeneration,
-		ProtectionEpoch:        outer.ProtectionEpoch,
-		RoutingVersion:         outer.RoutingVersion, RouteGeneration: outer.RouteGeneration,
-		Tenant: outer.Tenant, ClientID: outer.ClientID, ClientEpoch: outer.ClientEpoch,
-		ClientSequence: outer.ClientSequence, Fingerprint: outer.Fingerprint,
-		RetryHome: outer.RetryHome, AppliedSequence: 77,
-		ResultCode:   replicatedstate.ResultApplied,
-		ResultFormat: replicatedstate.ResultFormatExecutionPin,
-		Storage:      replication.CompletionInline, ResultLength: uint64(len(result)),
-		ResultDigest: digest, InlineResult: result,
-	})
-	if err != nil {
-		return ReplicatedResult{}, err
-	}
-	return ReplicatedResult{
-		Outcome:    raftserve.Outcome{Code: raftserve.OutcomeCompletion, AppliedIndex: 77},
-		Completion: completion,
-	}, nil
+	return executionpin.AppendCompletion(nil, proof)
 }
 
 func terminalCoordinatorFixture(t testing.TB) (
@@ -230,7 +141,7 @@ func terminalCoordinatorFixture(t testing.TB) (
 	*terminalCoordinatorPin,
 ) {
 	t.Helper()
-	wave, _, route := lifecycleRunnerFixture(t)
+	_, _, route := lifecycleRunnerFixture(t)
 	key := lifecycleKey()
 	keyDigest, _ := requestledger.KeyDigest(key)
 	binding := executionpin.Binding{
@@ -365,10 +276,7 @@ func terminalCoordinatorFixture(t testing.TB) (
 	homePoint, _ := requestledger.Home(key)
 	var ack requestledger.AckToken
 	copy(ack[:], []byte("terminal-ack-capability-00000001"))
-	pin := &terminalCoordinatorPin{
-		t: t, route: route, tenant: wave.Tenant, retryHome: wave.Identity.RetryHome,
-		clientID: replication.ID128{3}, epoch: 2, sequence: 2, record: acquired.Record,
-	}
+	pin := &terminalCoordinatorPin{record: acquired.Record}
 	lease, ok := acquired.Record.LeaseCertificate()
 	if !ok {
 		t.Fatal("missing acquired lease certificate")
@@ -376,6 +284,7 @@ func terminalCoordinatorFixture(t testing.TB) (
 	return DurableRequestTerminalPlan{
 		Home: DurableRequestLedgerHome{
 			Identity: replication.Digest(lifecycleDigest("terminal-home")), Point: homePoint,
+			route: route,
 		},
 		Key: key, Outcome: requestledger.OutcomeCommitted,
 		AffectedRows: 12, AffectedRowsValid: true, Result: []byte("committed-result"),
@@ -388,21 +297,18 @@ func TestDurableRequestTerminalCoordinatorResumesEveryBoundary(t *testing.T) {
 	faults := []struct {
 		name      string
 		operation requestledger.Operation
-		proposal  bool
 	}{
-		{"prepare", requestledger.OperationPrepareTerminal, false},
-		{"release_intent", requestledger.OperationBeginSchemaPinRelease, false},
-		{"release_proposal", requestledger.OperationInvalid, true},
-		{"release_proof", requestledger.OperationRecordSchemaPinReleased, false},
-		{"complete", requestledger.OperationComplete, false},
+		{"prepare", requestledger.OperationPrepareTerminal},
+		{"atomic_release", requestledger.OperationReleaseSchemaPin},
+		{"complete", requestledger.OperationComplete},
 	}
 	for _, testCase := range faults {
 		t.Run(testCase.name, func(t *testing.T) {
 			plan, head, continuation, pin := terminalCoordinatorFixture(t)
 			ledger := &terminalCoordinatorLedger{
+				pin:  pin,
 				head: head, continuation: continuation, fault: testCase.operation,
 			}
-			pin.fault = testCase.proposal
 			coordinator, err := newDurableRequestTerminalCoordinator(ledger, pin)
 			if err != nil {
 				t.Fatal(err)
@@ -422,10 +328,8 @@ func TestDurableRequestTerminalCoordinatorResumesEveryBoundary(t *testing.T) {
 				!bytes.Equal(result.Terminal.Result, plan.Result) {
 				t.Fatalf("result=%+v head=%+v err=%v", result, ledger.head, err)
 			}
-			for index := 1; index < len(pin.attempts); index++ {
-				if !bytes.Equal(pin.attempts[0], pin.attempts[index]) {
-					t.Fatal("execution-pin retry changed exact command bytes")
-				}
+			if len(pin.attempts) != 1 || pin.record.Status != executionpin.StatusReleased {
+				t.Fatal("lost reply replayed the atomic release")
 			}
 		})
 	}
@@ -434,7 +338,7 @@ func TestDurableRequestTerminalCoordinatorResumesEveryBoundary(t *testing.T) {
 func TestDurableRequestTerminalCoordinatorFencesPreparedAndReleaseSideEffects(t *testing.T) {
 	plan, head, continuation, pin := terminalCoordinatorFixture(t)
 	pin.fenceFaultAt = 1
-	ledger := &terminalCoordinatorLedger{head: head, continuation: continuation}
+	ledger := &terminalCoordinatorLedger{pin: pin, head: head, continuation: continuation}
 	coordinator, err := newDurableRequestTerminalCoordinator(ledger, pin)
 	if err != nil {
 		t.Fatal(err)
@@ -450,6 +354,7 @@ func TestDurableRequestTerminalCoordinatorFencesPreparedAndReleaseSideEffects(t 
 func TestDurableRequestTerminalCoordinatorRejectsChangedResultAfterPrepare(t *testing.T) {
 	plan, head, continuation, pin := terminalCoordinatorFixture(t)
 	ledger := &terminalCoordinatorLedger{
+		pin:  pin,
 		head: head, continuation: continuation,
 		fault: requestledger.OperationPrepareTerminal,
 	}
@@ -471,7 +376,7 @@ func TestDurableRequestTerminalCoordinatorRejectsChangedResultAfterPrepare(t *te
 
 func TestDurableRequestTerminalCoordinatorExactCommandDigestStable(t *testing.T) {
 	plan, head, continuation, pin := terminalCoordinatorFixture(t)
-	ledger := &terminalCoordinatorLedger{head: head, continuation: continuation}
+	ledger := &terminalCoordinatorLedger{pin: pin, head: head, continuation: continuation}
 	coordinator, _ := newDurableRequestTerminalCoordinator(ledger, pin)
 	result, err := coordinator.Complete(t.Context(), plan)
 	if err != nil {

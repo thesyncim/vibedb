@@ -37,8 +37,6 @@ type ScalingOperatorBackend struct {
 	directory          gateway.DirectoryReader
 	writer             gateway.DirectoryWriter
 	catalog            scalingCatalogReader
-	drain              ScalingFrontendDrainPreparer
-	controllerNode     rafttransport.NodeID
 	distributedMetrics *gateway.DistributedMetrics
 }
 
@@ -50,8 +48,6 @@ func NewScalingOperatorBackend(controller *ScalingController) (*ScalingOperatorB
 	if err != nil {
 		return nil, err
 	}
-	backend.drain = controller.drain
-	backend.controllerNode = controller.controllerNode
 	return backend, nil
 }
 
@@ -149,86 +145,23 @@ func (backend *ScalingOperatorBackend) submitDecommission(ctx context.Context, r
 	if err != nil {
 		return [32]byte{}, err
 	}
-	drain := gateway.NodeReference{NodeID: nodeID, Incarnation: request.NodeIncarnation}
 	node, err := backend.directory.ReadNode(ctx, nodeID, request.NodeIncarnation)
 	if err != nil {
 		return [32]byte{}, err
 	}
+	if node.Lifecycle != gateway.NodeActive && node.Lifecycle != gateway.NodeDraining && node.Lifecycle != gateway.NodeDecommissioned {
+		return [32]byte{}, fmt.Errorf("node %s is not active or draining", request.NodeID)
+	}
+	drain := gateway.NodeReference{NodeID: nodeID, Incarnation: request.NodeIncarnation}
 	intent, err := backend.newIntent(ctx, gateway.ScalingDecommission, request.RequestID, drain, nil, 0, 4096, 1<<62, 0)
 	if err != nil {
 		return [32]byte{}, err
 	}
-	operation, err := backend.submitOrReuseIntent(ctx, intent)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	if backend.controllerNode != (rafttransport.NodeID{}) && nodeID == backend.controllerNode {
-		const detail = "the sole configured topology controller must remain serving; controller handoff is not configured"
-		current, readErr := backend.directory.ReadScalingIntent(ctx, operation)
-		if readErr != nil {
-			return operation, readErr
-		}
-		blocker := gateway.ScalingBlocker{Code: "sole_designated_controller", Detail: detail,
-			Node: nodeID, Revision: node.Revision}
-		if len(current.Blockers) != 1 || current.Blockers[0] != blocker {
-			next := current
-			next.Blockers = []gateway.ScalingBlocker{blocker}
-			next.Revision++
-			next.DirectoryRevision = next.Revision
-			if putErr := backend.writer.PutScalingIntent(ctx, next, current.Revision); putErr != nil {
-				return operation, putErr
-			}
-		}
-		return operation, fmt.Errorf("%w: %s", ErrScalingControllerBlocked, detail)
-	}
-	// Persist the intent first. This ordering makes a crash after the CAS
-	// visible to the controller and prevents a drained node from being
-	// mistaken for an operator request that was never admitted.
-	node, readErr := backend.directory.ReadNode(ctx, nodeID, request.NodeIncarnation)
-	if readErr != nil {
-		return operation, readErr
-	}
-	if node.Lifecycle == gateway.NodeActive {
-		if node.Roles&gateway.NodeRoleGateway != 0 {
-			if backend.drain == nil {
-				return operation, errors.New("gateway frontend drain preparer is unavailable")
-			}
-			if prepareErr := backend.drain.PrepareFrontendDrain(ctx, node); prepareErr != nil {
-				return operation, prepareErr
-			}
-			enforcer, ok := backend.writer.(gateway.FrontendDrainLifecycleEnforcer)
-			if !ok {
-				return operation, errors.New("gateway frontend drain enforcer is unavailable")
-			}
-			drainID := gateway.NewFrontendDrainID(intent.ID, drain)
-			if drainID == ([32]byte{}) {
-				return operation, gateway.ErrScalingIdentity
-			}
-			if enforceErr := enforcer.EnforceFrontendDrain(ctx, drainID, nodeID, request.NodeIncarnation, node.Revision); enforceErr != nil {
-				return operation, enforceErr
-			}
-			if refresher, ok := backend.drain.(interface {
-				RefreshFrontendDrainIdentity(context.Context, gateway.NodeRecord) error
-			}); ok {
-				refreshed, readErr := backend.directory.ReadNode(ctx, nodeID, request.NodeIncarnation)
-				if readErr != nil {
-					return operation, readErr
-				}
-				if refreshErr := refresher.RefreshFrontendDrainIdentity(ctx, refreshed); refreshErr != nil {
-					return operation, refreshErr
-				}
-			}
-		} else {
-			node.Lifecycle = gateway.NodeDraining
-			node.Revision++
-			if putErr := backend.writer.PutNode(ctx, node, node.Revision-1); putErr != nil {
-				return operation, putErr
-			}
-		}
-	} else if node.Lifecycle != gateway.NodeDraining && node.Lifecycle != gateway.NodeDecommissioned {
-		return operation, fmt.Errorf("node %s is not active or draining", request.NodeID)
-	}
-	return operation, nil
+	// Submission only owns durable intent admission. The controller owns
+	// frontend drain, lifecycle CAS and retirement, including retries after
+	// crashes. Running that same workflow here races its first reconcile and
+	// can report failure after the operation is already durably admitted.
+	return backend.submitOrReuseIntent(ctx, intent)
 }
 
 func (backend *ScalingOperatorBackend) newIntent(ctx context.Context, kind gateway.ScalingKind, requestID string, drain gateway.NodeReference, targets []gateway.NodeReference, desired, maxMoves uint16, maxBytes, hysteresis uint64) (gateway.ScalingIntent, error) {

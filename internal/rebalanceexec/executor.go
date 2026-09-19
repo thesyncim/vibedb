@@ -266,12 +266,8 @@ func (executor *Executor) executeMembership(
 	if err != nil || [16]byte(cut.Target.Node) != grant.TargetNode {
 		return errors.Join(err, ErrExecutionFence)
 	}
-	if execution.Action.Kind == rebalance.ActionRemoveSource && execution.LeaderTerm == 0 {
-		return ErrExecutionFence
-	}
 	cut.Membership.Serving.Command.ReplicaSetVersion = execution.PublicationReplicaSet
 	kind := raftservice.MembershipAddLearner
-	transferTerm := uint64(0)
 	switch execution.Action.Kind {
 	case rebalance.ActionAddLearner:
 		kind = raftservice.MembershipAddLearner
@@ -281,14 +277,12 @@ func (executor *Executor) executeMembership(
 		kind = raftservice.MembershipTransferLeader
 	case rebalance.ActionRemoveSource:
 		kind = raftservice.MembershipRemoveVoter
-		transferTerm = execution.LeaderTerm
 	}
 	request := shardservice.ReplicatedMembershipRequest{
 		Kind: kind, TransitionID: grant.TransitionID, MetadataEpoch: grant.MetadataEpoch,
 		CatalogGeneration:         grant.CatalogGeneration,
 		ExpectedReplicaSetVersion: execution.PublicationReplicaSet,
 		SourceMember:              plan.RetiringMember(), TargetMember: plan.TargetMember(),
-		TransferTerm: transferTerm,
 	}
 	_, err = executor.options.Membership.ApplyMembership(ctx, cut.Membership, request)
 	return err

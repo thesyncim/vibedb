@@ -392,7 +392,7 @@ func TestRF3NativeServingAuthorityActivatesTargetOnlyAtFinalOwnedRF3(t *testing.
 			Kind: raftservice.MembershipRemoveVoter, TransitionID: grant.TransitionID,
 			MetadataEpoch: grant.MetadataEpoch, CatalogGeneration: grant.CatalogGeneration,
 			ExpectedReplicaSetVersion: 11, SourceMember: grant.SourceMember,
-			TargetMember: grant.TargetMember, TransferTerm: 3,
+			TargetMember: grant.TargetMember,
 		}}
 	if !membershipServing(state, &request) {
 		t.Fatal("exact authenticated RF4 membership request rejected")

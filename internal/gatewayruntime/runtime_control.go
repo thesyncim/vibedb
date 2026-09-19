@@ -129,7 +129,6 @@ func (runtime *Runtime) openReplicaControl() error {
 		}
 		runtime.clusterControlBackend, err = newScalingOperatorBackend(runtime.authority, runtime.authority, runtime.authority)
 		if err == nil {
-			runtime.clusterControlBackend.drain = runtime
 			runtime.clusterControlBackend.distributedMetrics = runtime.distributedMetrics
 		}
 		return err

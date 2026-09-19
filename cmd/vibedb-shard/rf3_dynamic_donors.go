@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"os"
 	"sync"
 	"time"
 
@@ -168,6 +169,11 @@ func (donors *rf3DynamicDonorServices) Register(group raftmember.GroupKey) error
 	if err != nil {
 		return errors.Join(err, journal.Close())
 	}
+	if phase := os.Getenv("VIBEDB_QUALIFICATION_ABANDON_CRASH"); phase != "" {
+		if os.Getenv("VIBEDB_REPLICA_REPLACEMENT_E2E") != "1" || !provider.InstallAbandonmentExitFaultForQualification(phase, func() { os.Exit(97) }) {
+			return errors.Join(errRF3Serving, provider.Close(), journal.Close())
+		}
+	}
 	control, err := snapshottransfer.NewSourceControlService(snapshottransfer.SourceControlOptions{
 		Journal: journal, Exporter: snapshottransfer.PinnedSourceControlExporter{Provider: provider},
 		Authorize: func(peer rafttransport.PeerIdentity, request snapshottransfer.SourceControlRequest) bool {
@@ -294,4 +300,14 @@ func (cut rf3DynamicDonorCut) SnapshotAuthorizationFence() (replicatedstate.Snap
 		return replicatedstate.SnapshotFence{}, snapshottransfer.ErrStaleFence
 	}
 	return cut.state.apply.SnapshotAuthorizationFence()
+}
+
+func (donors *rf3DynamicDonorServices) DataServices() []snapshottransfer.GroupDataService {
+	donors.mu.RLock()
+	defer donors.mu.RUnlock()
+	result := make([]snapshottransfer.GroupDataService, 0, len(donors.groups))
+	for group, item := range donors.groups {
+		result = append(result, snapshottransfer.GroupDataService{Group: group, Service: item.data})
+	}
+	return result
 }

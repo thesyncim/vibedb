@@ -20,14 +20,12 @@ type SchemaPinReleasePhase uint8
 
 const (
 	SchemaPinReleaseInvalid SchemaPinReleasePhase = iota
-	SchemaPinReleasing
+	SchemaPinReleaseProposal
 	SchemaPinReleased
 )
 
-// SchemaPinReleaseRecord is a write-ahead release intent and its exact
-// authenticated settled completion. The state-machine integration verifies
-// the execution-pin command/completion semantics before calling the Released
-// step.
+// SchemaPinReleaseRecord carries a proposal or its atomically committed
+// execution-pin certificate. Only SchemaPinReleased is a durable row.
 type SchemaPinReleaseRecord struct {
 	KeyDigest                    Digest
 	RequestDigest                Digest
@@ -66,31 +64,33 @@ func NewSchemaPinRelease(
 		PinID:                  prepared.PinID, PinDigest: prepared.PinDigest,
 		RouteSchemaCertificateDigest: prepared.RouteSchemaCertificateDigest,
 		CatalogGeneration:            prepared.CatalogGeneration, Revision: revision,
-		Phase: SchemaPinReleasing, Command: command,
+		Phase: SchemaPinReleaseProposal, Command: command,
 	}
 	record.CommandDigest = digestBytes([]byte("vibedb/request-ledger/schema-pin-command\x00"), command)
 	record.RecordDigest = schemaPinReleaseDigest(record)
 	return record, validateSchemaPinRelease(record)
 }
 
-func RecordVerifiedSchemaPinReleased(
-	record SchemaPinReleaseRecord,
-	revision uint64,
-	completion []byte,
-) (SchemaPinReleaseRecord, error) {
-	if err := validateSchemaPinRelease(record); err != nil || record.Phase != SchemaPinReleasing ||
-		!nextRevision(record.Revision, revision) || len(completion) == 0 ||
-		len(completion) > MaxExecutionPinCompletionBytes {
-		return SchemaPinReleaseRecord{}, ErrInvalidState
+// CompleteSchemaPinRelease installs the release and its locally verified proof
+// at one ledger revision. The intent is proposal input, never durable pending
+// work owned by a gateway that another gateway would need to impersonate.
+func CompleteSchemaPinRelease(head HeadRecord, prepared PreparedTerminalRecord, intent SchemaPinReleaseRecord, completion []byte) (HeadRecord, SchemaPinReleaseRecord, error) {
+	next, err := validateSchemaPinReleaseProposal(head, prepared, intent)
+	if err != nil || len(completion) == 0 || len(completion) > MaxExecutionPinCompletionBytes {
+		return HeadRecord{}, SchemaPinReleaseRecord{}, ErrInvalidState
 	}
-	record.PriorRecordDigest = record.RecordDigest
-	record.Revision = revision
-	record.Phase = SchemaPinReleased
-	record.Completion = completion
-	record.CompletionDigest = digestBytes([]byte("vibedb/request-ledger/schema-pin-completion\x00"), completion)
-	record.CertificateDigest = schemaPinCertificateDigest(record)
-	record.RecordDigest = schemaPinReleaseDigest(record)
-	return record, validateSchemaPinRelease(record)
+	released := intent
+	released.PriorRecordDigest = intent.RecordDigest
+	released.Phase = SchemaPinReleased
+	released.Completion = completion
+	released.CompletionDigest = digestBytes([]byte("vibedb/request-ledger/schema-pin-completion\x00"), completion)
+	released.CertificateDigest = schemaPinCertificateDigest(released)
+	released.RecordDigest = schemaPinReleaseDigest(released)
+	next.SchemaPinReleaseCertificateDigest = released.CertificateDigest
+	if err := validateSchemaPinRelease(released); err != nil {
+		return HeadRecord{}, SchemaPinReleaseRecord{}, err
+	}
+	return next, released, validateHead(next)
 }
 
 func AppendSchemaPinRelease(dst []byte, record SchemaPinReleaseRecord) ([]byte, error) {
@@ -162,8 +162,8 @@ func validateSchemaPinRelease(record SchemaPinReleaseRecord) error {
 		record.CatalogGeneration == 0 || record.Revision == 0 || len(record.Command) == 0 ||
 		len(record.Command) > MaxExecutionPinCommandBytes ||
 		record.CommandDigest != digestBytes([]byte("vibedb/request-ledger/schema-pin-command\x00"), record.Command) ||
-		record.Phase < SchemaPinReleasing || record.Phase > SchemaPinReleased ||
-		(record.Phase == SchemaPinReleasing && (len(record.Completion) != 0 || nonzeroDigest(record.CompletionDigest) ||
+		record.Phase < SchemaPinReleaseProposal || record.Phase > SchemaPinReleased ||
+		(record.Phase == SchemaPinReleaseProposal && (len(record.Completion) != 0 || nonzeroDigest(record.CompletionDigest) ||
 			nonzeroDigest(record.PriorRecordDigest) || nonzeroDigest(record.CertificateDigest))) ||
 		(record.Phase == SchemaPinReleased && (len(record.Completion) == 0 ||
 			len(record.Completion) > MaxExecutionPinCompletionBytes ||
@@ -211,9 +211,9 @@ func schemaPinReleaseDigest(record SchemaPinReleaseRecord) Digest {
 	return Digest(sha256.Sum256(framed[:at+16]))
 }
 
-func InstallSchemaPinRelease(head HeadRecord, prepared PreparedTerminalRecord, record SchemaPinReleaseRecord) (HeadRecord, error) {
+func validateSchemaPinReleaseProposal(head HeadRecord, prepared PreparedTerminalRecord, record SchemaPinReleaseRecord) (HeadRecord, error) {
 	if err := validateHead(head); err != nil || errOrNil(validatePreparedTerminal(prepared)) != nil ||
-		errOrNil(validateSchemaPinRelease(record)) != nil || record.Phase != SchemaPinReleasing ||
+		errOrNil(validateSchemaPinRelease(record)) != nil || record.Phase != SchemaPinReleaseProposal ||
 		head.Phase != PhasePrepared || nonzeroDigest(head.SchemaPinReleaseCertificateDigest) ||
 		prepared.PreparedDigest != head.PreparedTerminalDigest || record.PreparedTerminalDigest != prepared.PreparedDigest ||
 		record.KeyDigest != head.KeyDigest || record.RequestDigest != head.RequestDigest ||
@@ -224,30 +224,5 @@ func InstallSchemaPinRelease(head HeadRecord, prepared PreparedTerminalRecord, r
 		return HeadRecord{}, ErrInvalidState
 	}
 	head.Revision = record.Revision
-	return head, validateHead(head)
-}
-
-func MarkSchemaPinReleased(
-	head HeadRecord,
-	prepared PreparedTerminalRecord,
-	prior SchemaPinReleaseRecord,
-	record SchemaPinReleaseRecord,
-) (HeadRecord, error) {
-	if err := validateHead(head); err != nil || errOrNil(validatePreparedTerminal(prepared)) != nil ||
-		errOrNil(validateSchemaPinRelease(prior)) != nil || errOrNil(validateSchemaPinRelease(record)) != nil ||
-		prior.Phase != SchemaPinReleasing || record.Phase != SchemaPinReleased ||
-		head.Phase != PhasePrepared || prepared.PreparedDigest != head.PreparedTerminalDigest ||
-		record.PreparedTerminalDigest != prepared.PreparedDigest || record.KeyDigest != head.KeyDigest ||
-		record.RequestDigest != head.RequestDigest || record.PlanRoot != head.PlanRoot ||
-		record.CatalogGeneration != head.CatalogGeneration || record.PinID != head.PinID ||
-		record.PinDigest != head.PinDigest ||
-		record.RouteSchemaCertificateDigest != head.RouteSchemaCertificateDigest ||
-		record.PriorRecordDigest != prior.RecordDigest ||
-		prior.KeyDigest != record.KeyDigest || prior.PreparedTerminalDigest != record.PreparedTerminalDigest ||
-		!nextRevision(head.Revision, record.Revision) {
-		return HeadRecord{}, ErrInvalidState
-	}
-	head.Revision = record.Revision
-	head.SchemaPinReleaseCertificateDigest = record.CertificateDigest
 	return head, validateHead(head)
 }

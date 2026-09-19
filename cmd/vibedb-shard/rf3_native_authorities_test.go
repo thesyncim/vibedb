@@ -56,7 +56,7 @@ func nativeAuthorityFixture(t *testing.T, count int) (*rafttransport.StaticRegis
 
 func TestRF3NativeAuthoritiesDispatchEveryPreparedGroup(t *testing.T) {
 	registry, gate, prepared, states := nativeAuthorityFixture(t, 3)
-	authority, err := newRF3NativeAuthorities(registry, gate, prepared, nil, nil)
+	authority, err := newRF3NativeAuthorities(registry, gate, prepared, nativeAuthorityIdentities(states), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,8 @@ func TestRF3NativeAuthoritiesDispatchEveryPreparedGroup(t *testing.T) {
 		if !authority.serving(state) {
 			t.Fatalf("prepared group %d refused native traffic", index)
 		}
-		if index > 0 && authority.groups[states[0].Identity.Group].baseServing(state) {
+		primary, _ := authority.group(states[0].Identity.Group)
+		if index > 0 && primary.baseServing(state) {
 			t.Fatal("fixture does not distinguish the primary-only regression")
 		}
 		if allocs := testing.AllocsPerRun(100, func() { _ = authority.serving(state) }); allocs != 0 {
@@ -86,11 +87,11 @@ func TestRF3NativeAuthoritiesDispatchEveryPreparedGroup(t *testing.T) {
 			})
 		}
 	}
-	if _, err = newRF3NativeAuthorities(registry, gate, append(prepared, prepared[0]), nil, nil); err == nil {
+	if _, err = newRF3NativeAuthorities(registry, gate, append(prepared, prepared[0]), nativeAuthorityIdentities(append(states, states[0])), nil, nil); err == nil {
 		t.Fatal("duplicate group accepted")
 	}
 	prepared[1].base.Binding.MemberID = 2
-	if _, err = newRF3NativeAuthorities(registry, gate, prepared, nil, nil); err == nil {
+	if _, err = newRF3NativeAuthorities(registry, gate, prepared, nativeAuthorityIdentities(states), nil, nil); err == nil {
 		t.Fatal("nonlocal identity accepted")
 	}
 }
@@ -107,7 +108,7 @@ func TestRF3NativeAuthoritiesKeepRestoreExceptionGroupScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	authority, err := newRF3NativeAuthorities(registry, gate, prepared,
+	authority, err := newRF3NativeAuthorities(registry, gate, prepared, nativeAuthorityIdentities(states),
 		map[raftmember.GroupKey]*shardservice.RestoreServingGate{group: restore}, map[raftmember.GroupKey][32]byte{group: operation})
 	if err != nil {
 		t.Fatal(err)
@@ -131,4 +132,12 @@ func TestRF3NativeAuthoritiesKeepRestoreExceptionGroupScoped(t *testing.T) {
 	if authority.transitional(states[1], nil) {
 		t.Fatal("nil request admitted")
 	}
+}
+
+func nativeAuthorityIdentities(states []raftservice.ServingState) []raftmember.RuntimeIdentity {
+	out := make([]raftmember.RuntimeIdentity, len(states))
+	for i := range states {
+		out[i] = states[i].Identity
+	}
+	return out
 }

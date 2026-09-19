@@ -409,7 +409,7 @@ func TestPlanningExpiryCleanupRestartFencesOldBuild(t *testing.T) {
 			t.Fatalf("planning op %d: append=%v open=%v", command.Operation, appendErr, openErr)
 		}
 	}
-	if OperationRestartPlanning != 21 || OperationCleanupPlanning != 22 {
+	if OperationRestartPlanning != 20 || OperationCleanupPlanning != 21 {
 		t.Fatal("planning restart operation codes changed")
 	}
 	overflow := cleaned
@@ -653,20 +653,11 @@ func terminalFixtureForKey(t *testing.T, key RequestKey) (HeadRecord, PreparedTe
 	if err != nil {
 		t.Fatal(err)
 	}
-	head, err = InstallSchemaPinRelease(head, prepared, release)
+	head, release, err = CompleteSchemaPinRelease(head, prepared, release, []byte("exact-schema-release-completion"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent := release
-	release, err = RecordVerifiedSchemaPinReleased(release, 7, []byte("exact-schema-release-completion"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	head, err = MarkSchemaPinReleased(head, prepared, intent, release)
-	if err != nil {
-		t.Fatal(err)
-	}
-	terminal, err := NewTerminal(head, prepared, release, 8)
+	terminal, err := NewTerminal(head, prepared, release, head.Revision+1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -723,7 +714,7 @@ func TestContinuationTerminalAckTokenAndGC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ack, err := NewAck(terminalHead, terminal, 9, 10000)
+	ack, err := NewAck(terminalHead, terminal, terminalHead.Revision+1, 10000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -751,10 +742,10 @@ func TestContinuationTerminalAckTokenAndGC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = AdvanceAckGC(ack, collect, 10, 1, math.MaxUint64-24, false); err == nil {
+	if _, err = AdvanceAckGC(ack, collect, ack.Revision+1, 1, math.MaxUint64-24, false); err == nil {
 		t.Fatal("reclaimed byte overflow accepted")
 	}
-	ack, err = AdvanceAckGC(ack, collect, 10, 1, 10000, true)
+	ack, err = AdvanceAckGC(ack, collect, ack.Revision+1, 1, 10000, true)
 	if err != nil || ack.GCPhase != AckGCComplete {
 		t.Fatal("final GC")
 	}
@@ -875,9 +866,9 @@ func TestIssuerHighwaterCanonicalAntiResurrection(t *testing.T) {
 	if !ok || openedAdvance != request1 {
 		t.Fatal("issuer advance command accessor")
 	}
-	if OperationAdvanceIssuerHighwater != 23 || OperationOpenIssuerLane != 24 ||
-		OperationRecordRoutePinAcquiredPutPending != 25 ||
-		OperationAdvanceBeginRoutePinRelease != 26 ||
+	if OperationAdvanceIssuerHighwater != 22 || OperationOpenIssuerLane != 23 ||
+		OperationRecordRoutePinAcquiredPutPending != 24 ||
+		OperationAdvanceBeginRoutePinRelease != 25 ||
 		LastOperation != OperationAdvanceBeginRoutePinRelease {
 		t.Fatal("issuer highwater operation code changed")
 	}
@@ -1019,9 +1010,8 @@ func TestPreparedTerminalSchemaReleaseAndCompleteCanonical(t *testing.T) {
 		payload  []byte
 	}{
 		{OperationPrepareTerminal, 4, 5, prepared.PreparedDigest, preparedRaw},
-		{OperationBeginSchemaPinRelease, 5, 6, intent.RecordDigest, intentRaw},
-		{OperationRecordSchemaPinReleased, 6, 7, released.RecordDigest, releasedRaw},
-		{OperationComplete, 7, 8, terminal.ResultDigest, terminalRaw},
+		{OperationReleaseSchemaPin, 5, 6, intent.RecordDigest, intentRaw},
+		{OperationComplete, 6, 7, terminal.ResultDigest, terminalRaw},
 	}
 	for _, test := range tests {
 		command := Command{Operation: test.op, ExpectedRevision: test.expected, Revision: test.revision,
@@ -1052,7 +1042,7 @@ func TestPreparedTerminalSchemaReleaseAndCompleteCanonical(t *testing.T) {
 			if !ok || value.PreparedDigest != prepared.PreparedDigest {
 				t.Fatal("prepared accessor")
 			}
-		case OperationBeginSchemaPinRelease, OperationRecordSchemaPinReleased:
+		case OperationReleaseSchemaPin:
 			value, ok := opened.SchemaPinRelease()
 			if !ok || value.RecordDigest != test.subject {
 				t.Fatal("schema release accessor")
@@ -1061,7 +1051,7 @@ func TestPreparedTerminalSchemaReleaseAndCompleteCanonical(t *testing.T) {
 	}
 
 	wrongPhase, _ := AppendCommand(nil, Command{
-		Operation: OperationBeginSchemaPinRelease, ExpectedRevision: 6, Revision: 7,
+		Operation: OperationReleaseSchemaPin, ExpectedRevision: 6, Revision: 7,
 		KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot,
 		SubjectDigest: released.RecordDigest, ExpectedRangeIdentity: rangeIdentity, Home: home,
 		Payload: releasedRaw,
@@ -1069,16 +1059,10 @@ func TestPreparedTerminalSchemaReleaseAndCompleteCanonical(t *testing.T) {
 	if _, err = OpenCommandInto(wrongPhase, nil); err == nil {
 		t.Fatal("schema release operation accepted the wrong phase")
 	}
-	installedHead, err := InstallSchemaPinRelease(preparedHead, prepared, intent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	otherIntent, err := NewSchemaPinRelease(preparedHead, prepared, 6, []byte("different-release-command"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = MarkSchemaPinReleased(installedHead, prepared, otherIntent, released); err == nil {
-		t.Fatal("released certificate accepted a different durable intent")
+	wrongIntent := intent
+	wrongIntent.PreparedTerminalDigest[0] ^= 1
+	if _, _, err = CompleteSchemaPinRelease(preparedHead, prepared, wrongIntent, []byte("proof")); err == nil {
+		t.Fatal("release accepted a different prepared result")
 	}
 	forgedTerminal := terminal
 	forgedTerminal.Result = []byte("different-result")
@@ -1089,10 +1073,6 @@ func TestPreparedTerminalSchemaReleaseAndCompleteCanonical(t *testing.T) {
 	}
 	if _, err = MarkTerminal(head, prepared, released, forgedTerminal); err == nil {
 		t.Fatal("Complete accepted a result different from the prepared candidate")
-	}
-	if OperationPrepareTerminal != 18 || OperationBeginSchemaPinRelease != 19 ||
-		OperationRecordSchemaPinReleased != 20 {
-		t.Fatal("prepared-terminal operation codes changed")
 	}
 
 	tooLarge := prepared

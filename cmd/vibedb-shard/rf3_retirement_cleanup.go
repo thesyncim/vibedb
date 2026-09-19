@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"sync/atomic"
 
@@ -64,40 +63,4 @@ func rf3ReplicaRetirementCleanup(schemas *rf3SchemaActivator, donors rf3RetiredD
 		}
 		return nil
 	}
-}
-
-// Static-source services share the same retirement boundary as dynamic donors.
-// Constructors populate this inventory before listeners start; retirement
-// releases retained export files and journal handles without touching other
-// groups on the physical node.
-type rf3StaticDonorRetirements struct {
-	mu     sync.Mutex
-	groups map[raftmember.GroupKey]rf3StaticDonorRetirement
-}
-type rf3StaticDonorRetirement struct {
-	identity raftmember.RuntimeIdentity
-	close    func() error
-}
-
-func (donors *rf3StaticDonorRetirements) Unregister(identity raftmember.RuntimeIdentity) error {
-	if donors == nil {
-		return nil
-	}
-	donors.mu.Lock()
-	defer donors.mu.Unlock()
-	item, found := donors.groups[identity.Group]
-	if !found {
-		return nil
-	}
-	if !sameRF3DonorIdentity(item.identity, identity) {
-		return raftservice.ErrServingFence
-	}
-	err := item.close()
-	if err == nil {
-		delete(donors.groups, identity.Group)
-	}
-	return err
-}
-func closeRF3RetiredDonor(first, second interface{ Close() error }) func() error {
-	return func() error { return errors.Join(first.Close(), second.Close()) }
 }

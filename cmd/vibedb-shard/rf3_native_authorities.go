@@ -16,7 +16,6 @@ import (
 // membership and restore predicates; a primary-group predicate must never be
 // reused for a different group's request.
 type rf3NativeAuthorities struct {
-	groups    map[raftmember.GroupKey]rf3NativeGroupAuthority
 	registry  *rafttransport.StaticRegistry
 	adopted   *rf3AdoptedGroupInventory
 	dynamicMu sync.Mutex
@@ -38,16 +37,17 @@ type rf3NativeGroupAuthority struct {
 }
 
 func newRF3NativeAuthorities(registry *rafttransport.StaticRegistry, authorization *serviceauthz.Gate,
-	prepared []preparedRF3Group, restoreGates map[raftmember.GroupKey]*shardservice.RestoreServingGate,
+	prepared []preparedRF3Group, identities []raftmember.RuntimeIdentity, restoreGates map[raftmember.GroupKey]*shardservice.RestoreServingGate,
 	restoreOperations map[raftmember.GroupKey][32]byte,
 ) (*rf3NativeAuthorities, error) {
-	if registry == nil || authorization == nil || len(prepared) > maxRF3ManifestGroups {
+	if registry == nil || authorization == nil || len(prepared) > maxRF3ManifestGroups || len(prepared) != len(identities) {
 		return nil, errRF3Serving
 	}
-	result := &rf3NativeAuthorities{groups: make(map[raftmember.GroupKey]rf3NativeGroupAuthority, len(prepared)), registry: registry}
-	for _, item := range prepared {
+	result := &rf3NativeAuthorities{registry: registry}
+	groups := make(rf3NativeDynamicGroups, len(prepared))
+	for index, item := range prepared {
 		group := groupFromBinding(item.base.Binding)
-		if _, duplicate := result.groups[group]; duplicate {
+		if _, duplicate := groups[group]; duplicate || identities[index].Group != group {
 			return nil, errRF3Serving
 		}
 		local, err := registry.LocalMember(group)
@@ -62,8 +62,9 @@ func newRF3NativeAuthorities(registry *rafttransport.StaticRegistry, authorizati
 			entry.move = rf3NativeMoveAuthority(registry, item.manifest, group, item.base)
 		}
 		entry.restorePreparing = rf3RestoreCatalogPreparingAuthority(authorization, restoreOperations[group], group, item.base, entry.baseServing)
-		result.groups[group] = entry
+		groups[group] = rf3NativeDynamicGroup{identity: identities[index], authority: entry}
 	}
+	result.dynamic.Store(&groups)
 	return result, nil
 }
 
@@ -88,9 +89,6 @@ func (authority *rf3NativeAuthorities) transitional(state raftservice.ServingSta
 }
 
 func (authority *rf3NativeAuthorities) group(group raftmember.GroupKey) (rf3NativeGroupAuthority, bool) {
-	if entry, found := authority.groups[group]; found {
-		return entry, true
-	}
 	if dynamic := authority.dynamic.Load(); dynamic != nil {
 		entry, found := (*dynamic)[group]
 		return entry.authority, found

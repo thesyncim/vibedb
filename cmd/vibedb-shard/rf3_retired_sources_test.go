@@ -94,7 +94,7 @@ func TestRF3RetiredLearnerRecoveryDoesNotReopenPriorMembership(t *testing.T) {
 					t.Fatal(err)
 				}
 				factory := &rf3DynamicLearnerFactory{root: root,
-					runtime: &rf3EmptyNodeRuntime{reader: slot, actionJournal: journal}}
+					runtime: &rf3NodeRuntime{reader: slot, actionJournal: journal}}
 				// No storage or receiver is configured: crossing into registration
 				// would fail. Recovery must skip before either resource is opened.
 				if err = factory.Recover(t.Context()); err != nil {

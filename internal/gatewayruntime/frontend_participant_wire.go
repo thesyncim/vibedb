@@ -635,11 +635,11 @@ func serveFrontendDrainPrepareConnectionWith(
 		return errors.Join(gateway.ErrScalingIdentity, errFrontendParticipantAuth)
 	}
 	if err := prepare(ctx, record, request.IntentID); err != nil {
-		return err
+		return fmt.Errorf("prepare remote frontend drain: %w", err)
 	}
 	evidence, err := scanLocal(ctx, record)
 	if err != nil {
-		return err
+		return fmt.Errorf("scan prepared frontend drain: %w", err)
 	}
 	response := frontendParticipantScanResponse{Nonce: request.Nonce, Evidence: evidence}
 	if !response.valid() || !evidence.ValidFor(record) {

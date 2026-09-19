@@ -1001,7 +1001,7 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 	if err := raftservice.ValidateMembershipFields(
 		membership.Kind, membership.TransitionID, membership.MetadataEpoch,
 		membership.CatalogGeneration, membership.ExpectedReplicaSetVersion,
-		membership.SourceMember, membership.TargetMember, membership.TransferTerm,
+		membership.SourceMember, membership.TargetMember,
 	); err != nil {
 		return ReplicatedMembershipResult{}, err
 	}

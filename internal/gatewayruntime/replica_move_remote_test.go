@@ -173,7 +173,6 @@ func TestGatewayGrantedMembershipInstallsPublishedTargetBeforeSourceRemoval(t *t
 	route.HasEnrolledTarget = false
 	route.EnrolledTarget = gateway.ReplicatedEndpoint{}
 	request.Kind = raftservice.MembershipRemoveVoter
-	request.TransferTerm = 2
 	installer := new(gatewayTestGrantInstaller)
 	applier := new(gatewayTestMembershipApplier)
 	client := gatewayGrantedMembershipClient{grants: gatewayTestGrantSource{grant}, installer: installer, applier: applier}

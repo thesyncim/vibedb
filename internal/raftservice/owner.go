@@ -928,7 +928,6 @@ type MembershipRequest struct {
 	ExpectedReplicaSetVersion uint64
 	SourceMember              uint64
 	TargetMember              uint64
-	TransferTerm              uint64
 }
 
 // ValidateMembershipFields rejects every malformed fixed-width control
@@ -940,13 +939,12 @@ func ValidateMembershipFields(
 	kind MembershipKind,
 	transitionID [16]byte,
 	metadataEpoch, catalogGeneration, expectedReplicaSetVersion uint64,
-	sourceMember, targetMember, transferTerm uint64,
+	sourceMember, targetMember uint64,
 ) error {
 	if kind < MembershipAddLearner || kind > MembershipTransferLeader ||
 		transitionID == ([16]byte{}) || metadataEpoch == 0 || catalogGeneration == 0 ||
 		expectedReplicaSetVersion == 0 || sourceMember == 0 || targetMember == 0 ||
-		sourceMember == targetMember ||
-		(kind == MembershipRemoveVoter) != (transferTerm != 0) {
+		sourceMember == targetMember {
 		return ErrMembershipMalformed
 	}
 	return nil
@@ -3171,7 +3169,10 @@ func validateMembershipTransition(
 			return ErrMembershipNotCaughtUp
 		}
 	case MembershipRemoveVoter:
-		if status.LeaderID == request.SourceMember || status.Term != request.TransferTerm ||
+		// Admission already binds this request to the current leader's serving
+		// fence. A prior transfer term cannot constrain a resumed removal after
+		// another election; the exact live roster and caught-up target do.
+		if status.LeaderID == request.SourceMember ||
 			len(voters) != len(authority.InitialVoters)+1 || len(learners) != 0 ||
 			len(publication.ConfState.GetVotersOutgoing()) != 0 ||
 			len(publication.ConfState.GetLearnersNext()) != 0 ||
@@ -3191,7 +3192,6 @@ func validateMembershipIdentity(
 	if err := ValidateMembershipFields(
 		request.Kind, request.TransitionID, request.MetadataEpoch, request.CatalogGeneration,
 		request.ExpectedReplicaSetVersion, request.SourceMember, request.TargetMember,
-		request.TransferTerm,
 	); err != nil {
 		return err
 	}

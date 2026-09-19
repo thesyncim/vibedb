@@ -25,6 +25,39 @@ func (reader *runtimeCanonicalCutReaderTest) ReadFrontendDrainRuntimeCut(context
 	return reader.cut, nil
 }
 
+type advancingInitialDirectoryReader struct {
+	*runtimeCanonicalCutReaderTest
+	stale     gateway.NodeDirectoryCut
+	nodeReads int
+}
+
+func (reader *advancingInitialDirectoryReader) ReadNodeDirectoryCut(context.Context) (gateway.NodeDirectoryCut, error) {
+	reader.nodeReads++
+	return reader.stale, nil
+}
+
+func TestRuntimeControlDirectoryOpensFromOneCompleteAuthorityCut(t *testing.T) {
+	profile, _, source, _, _ := frontendDrainSourceTestFixture(t)
+	_, policy := runtimeControlTLSFixture(t, []serviceauthz.Entry{{Node: profile.LocalIdentity().Node, Capabilities: serviceauthz.AllCapabilities}})
+	stale := source.Nodes
+	source.Nodes.Revision++
+	source.Nodes.Digest[0]++
+	source.ServiceDirectoryRevision++
+	reader := &advancingInitialDirectoryReader{runtimeCanonicalCutReaderTest: &runtimeCanonicalCutReaderTest{cut: source}, stale: stale}
+	transport := new(runtimeFullServiceCutTransportTest)
+	runtime := &Runtime{ctx: t.Context(), config: Config{ControlDirectory: reader,
+		TLSProfile: profile, Authorization: policy, Transport: transport, RequireServiceDirectoryBinding: true}}
+	if err := runtime.openControlDirectory(); err != nil {
+		t.Fatalf("concurrent publication prevented startup: %v", err)
+	}
+	if reader.nodeReads != 0 || runtime.controlDirectory.Revision() != source.Nodes.Revision ||
+		transport.coordinates.DirectoryRevision != source.Nodes.Revision ||
+		runtime.serviceDirectory != transport.gate {
+		t.Fatalf("initial directories came from different cuts: node reads=%d directory=%d floor=%+v",
+			reader.nodeReads, runtime.controlDirectory.Revision(), transport.coordinates)
+	}
+}
+
 type runtimeFullServiceCutTransportTest struct {
 	gateway.ReplicatedRoundTripper
 	gate        *serviceauthz.ServiceDirectoryGate

@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -54,23 +55,22 @@ func TestRF3EnrollmentPeerReceiptRestoresExactDynamicEndpoint(t *testing.T) {
 	}
 	publication := raftmodel.Publication{ReplicaSetVersion: 10,
 		ConfState: &raftpb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}}
-	target, restored, err := rf3DynamicEnrollmentTarget(base, group, publication, reopened.snapshot())
+	restored, err := rf3RecoveredEnrollmentRoster(base, group, 1, publication, reopened.snapshot())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if target == nil || target.MemberID != 4 || target.NodeID != peer.NodeID || target.PeerAddress != peer.Endpoint ||
-		restored != peer {
-		t.Fatalf("restored target=%+v peer=%+v, want target=%+v peer=%+v", target, restored, target, peer)
+	if restored.dynamicMember != 4 || len(restored.members) != 4 || len(restored.peers) != 1 || restored.peers[0] != peer || restored.endpoints[peer.NodeID] != peer.Endpoint {
+		t.Fatalf("restored roster=%+v, want exact peer=%+v", restored, peer)
 	}
 
 	tampered := reopened.snapshot()
 	tampered[0].PeerAddress = "foreign.example:17400"
-	if _, _, err := rf3DynamicEnrollmentTarget(base, group, publication, tampered); !errors.Is(err, errRF3EnrollmentPeerReceipt) {
+	if _, err := rf3RecoveredEnrollmentRoster(base, group, 1, publication, tampered); !errors.Is(err, errRF3EnrollmentPeerReceipt) {
 		t.Fatalf("tampered endpoint error=%v, want receipt rejection", err)
 	}
 	foreign := publication
 	foreign.ConfState = &raftpb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{5}}
-	if _, _, err := rf3DynamicEnrollmentTarget(base, group, foreign, reopened.snapshot()); !errors.Is(err, errRF3EnrollmentPeerReceipt) {
+	if _, err := rf3RecoveredEnrollmentRoster(base, group, 1, foreign, reopened.snapshot()); !errors.Is(err, errRF3EnrollmentPeerReceipt) {
 		t.Fatalf("foreign member error=%v, want receipt rejection", err)
 	}
 }
@@ -220,7 +220,75 @@ func TestRF3EnrollmentPeerReceiptRejectsAmbiguousReplay(t *testing.T) {
 	publication := raftmodel.Publication{ReplicaSetVersion: 10,
 		ConfState: &raftpb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}}
 	receipts := []rf3EnrollmentPeerReceipt{{Group: group, MemberID: 4}, {Group: group, MemberID: 4}}
-	if _, _, err := rf3DynamicEnrollmentTarget(manifest, group, publication, receipts); !errors.Is(err, errRF3EnrollmentPeerReceipt) {
+	if _, err := rf3RecoveredEnrollmentRoster(manifest, group, 1, publication, receipts); !errors.Is(err, errRF3EnrollmentPeerReceipt) {
 		t.Fatalf("ambiguous receipt error=%v, want receipt rejection", err)
+	}
+}
+
+func TestRF3EnrollmentRosterRecoversRepeatedMovesAndNodeReuse(t *testing.T) {
+	base := serveRF3TestManifest()
+	group := serveRF3TestGroup()
+	current := base
+	var receipts []rf3EnrollmentPeerReceipt
+	for cycle := 0; cycle < 3; cycle++ {
+		version := uint64(1 + cycle*3)
+		target := serveRF3TestEnrolledTarget()
+		target.MemberID = uint64(4 + cycle)
+		if cycle > 0 {
+			target.NodeID = base.Members[cycle-1].NodeID
+			target.PeerAddress = base.Members[cycle-1].PeerAddress
+		}
+		current.EnrolledTarget = target
+		grant := rf3MembershipGrantFixture(current, group, version)
+		grant.CatalogGeneration += uint64(cycle)
+		members := rf3GrantTransportMembers(current, group, version, rafttransport.MemberEnrolled)
+		digest, err := rafttransport.StableRosterDigest(members[:3])
+		if err != nil {
+			t.Fatal(err)
+		}
+		domain := rafttransport.TrustDomain{ClusterID: group.ClusterID, ClusterIncarnation: group.ClusterIncarnation}
+		peer := rafttransport.PhysicalPeer{NodeID: target.NodeID, Node: target.NodeID, TrustDomain: domain, Incarnation: 1, Revision: 1, ServiceKeyDigest: [32]byte{11}, EnrollmentDigest: grant.Digest(), Endpoint: target.PeerAddress, Address: target.PeerAddress, State: rafttransport.PeerEnrolled}
+		receipt, err := newRF3EnrollmentPeerReceipt(rafttransport.EnrollmentIntent{Digest: grant.Digest(), Domain: domain, Peer: peer, Group: group, Member: members[3], ExpectedRosterDigest: digest, DirectoryRevision: 1}, grant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipts = append(receipts, receipt)
+		current.Members[0] = rf3ManifestMember{MemberID: target.MemberID, NodeID: target.NodeID, PeerAddress: target.PeerAddress}
+		slices.SortFunc(current.Members[:], func(a, b rf3ManifestMember) int {
+			if a.MemberID < b.MemberID {
+				return -1
+			}
+			if a.MemberID > b.MemberID {
+				return 1
+			}
+			return 0
+		})
+		voters := []uint64{current.Members[0].MemberID, current.Members[1].MemberID, current.Members[2].MemberID}
+		publication := raftmodel.Publication{ReplicaSetVersion: version + 3, ConfState: &raftpb.ConfState{Voters: voters}}
+		recovered, err := rf3RecoveredEnrollmentRoster(base, group, voters[0], publication, receipts)
+		if err != nil {
+			t.Fatalf("cycle %d: %v", cycle, err)
+		}
+		if len(recovered.members) != 3 || len(recovered.endpoints) != 3 || !recovered.native {
+			t.Fatalf("cycle %d accumulated obsolete mappings: %+v", cycle, recovered)
+		}
+		for _, member := range recovered.members {
+			if !slices.Contains(voters, member.MemberID) || member.Role != rafttransport.MemberVoter {
+				t.Fatalf("obsolete serving identity: %+v", member)
+			}
+		}
+		if cycle > 0 {
+			if _, err := rf3RecoveredEnrollmentRoster(base, group, voters[0], publication, receipts[1:]); !errors.Is(err, errRF3EnrollmentPeerReceipt) {
+				t.Fatalf("broken chain accepted: %v", err)
+			}
+		}
+	}
+	bad := slices.Clone(receipts)
+	bad[2].Grant.InitialRosterDigest[0]++
+	bad[2].EnrollmentDigest = bad[2].Grant.Digest()
+	bad[2].ReceiptDigest = bad[2].computedDigest()
+	publication := raftmodel.Publication{ReplicaSetVersion: 10, ConfState: &raftpb.ConfState{Voters: []uint64{4, 5, 6}}}
+	if _, err := rf3RecoveredEnrollmentRoster(base, group, 4, publication, bad); !errors.Is(err, errRF3EnrollmentPeerReceipt) {
+		t.Fatalf("divergent certified chain accepted: %v", err)
 	}
 }

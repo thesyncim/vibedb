@@ -727,28 +727,27 @@ func (controller *ScalingController) reconcileRetirement(ctx context.Context, in
 		return controller.completeIntent(ctx, intent, &node)
 	}
 	if node.Lifecycle == gateway.NodeActive {
-		// A retry after an interrupted decommission admission may still find the
-		// node Active.  The intent is already durable, so the transition is a
-		// fenced CAS and does not create a second saga.
+		// The operator only admits the durable intent. This controller owns
+		// the lifecycle transition and retries its fenced CAS after a crash.
 		if node.Roles&gateway.NodeRoleGateway != 0 {
 			if controller.drain == nil {
-				return false, controller.recordBlocker(ctx, intent, gateway.ScalingBlocker{
+				return false, errors.Join(ErrScalingControllerBlocked, controller.recordBlocker(ctx, intent, gateway.ScalingBlocker{
 					Code: "frontend_drain_unavailable", Detail: "gateway has no frontend drain preparer",
 					Node: node.NodeID, Revision: node.Revision,
-				})
+				}))
 			}
 			if prepareErr := controller.drain.PrepareFrontendDrain(ctx, node); prepareErr != nil {
-				return false, controller.recordBlocker(ctx, intent, gateway.ScalingBlocker{
+				return false, errors.Join(prepareErr, controller.recordBlocker(ctx, intent, gateway.ScalingBlocker{
 					Code: "frontend_drain_unavailable", Detail: boundedScalingError(prepareErr),
 					Node: node.NodeID, Revision: node.Revision,
-				})
+				}))
 			}
 			enforcer, enforceOK := controller.writer.(gateway.FrontendDrainLifecycleEnforcer)
 			if !enforceOK {
-				return false, controller.recordBlocker(ctx, intent, gateway.ScalingBlocker{
+				return false, errors.Join(ErrScalingControllerBlocked, controller.recordBlocker(ctx, intent, gateway.ScalingBlocker{
 					Code: "frontend_drain_unavailable", Detail: "catalog does not expose the atomic frontend drain enforcer",
 					Node: node.NodeID, Revision: node.Revision,
-				})
+				}))
 			}
 			drainID := gateway.NewFrontendDrainID(intent.ID, gateway.NodeReference{
 				NodeID: node.NodeID, Incarnation: node.Incarnation,

@@ -142,42 +142,20 @@ func requestLedgerRouteOutcomeProves(
 }
 
 func requestLedgerSchemaReleaseEvidenceAvailable(record requestledger.SchemaPinReleaseRecord) bool {
-	outer, err := replication.OpenCommand(record.Command)
-	if err != nil || outer.Kind() != replication.CommandExecutionPin {
-		return false
-	}
-	command, err := outer.OpenExecutionPin()
+	command, err := executionpin.OpenCommand(record.Command)
 	if err != nil || !requestLedgerSchemaReleaseCommandMatches(record, command) {
 		return false
 	}
-	completion, err := replication.OpenCompletion(record.Completion)
-	if err != nil || !requestLedgerCompletionMatchesCommand(outer, completion) ||
-		completion.ResultCode != ResultApplied ||
-		completion.ResultFormat != ResultFormatExecutionPin ||
-		completion.Storage != replication.CompletionInline ||
-		completion.ResultLength != executionpin.CompletionBytes ||
-		len(completion.InlineResult) != executionpin.CompletionBytes {
-		return false
-	}
-	proof, err := executionpin.OpenCompletion(completion.InlineResult)
+	proof, err := executionpin.OpenCompletion(record.Completion)
 	if err != nil {
 		return false
 	}
-	authority, ok := replication.ExecutionPinAuthorityDigest(outer)
-	if !ok || executionpin.ValidateReleasePair(
-		command, proof, executionpin.Digest(authority),
-	) != nil {
-		return false
-	}
-	return true
+	authority, err := executionpin.ReleaseAuthorityDigest(record.Command)
+	return err == nil && executionpin.ValidateReleasePair(command, proof, authority) == nil
 }
 
 func requestLedgerSchemaReleaseCommandAvailable(record requestledger.SchemaPinReleaseRecord) bool {
-	outer, err := replication.OpenCommand(record.Command)
-	if err != nil || outer.Kind() != replication.CommandExecutionPin {
-		return false
-	}
-	command, err := outer.OpenExecutionPin()
+	command, err := executionpin.OpenCommand(record.Command)
 	return err == nil && requestLedgerSchemaReleaseCommandMatches(record, command)
 }
 

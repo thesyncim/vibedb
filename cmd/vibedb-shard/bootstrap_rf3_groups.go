@@ -177,7 +177,7 @@ func bootstrapPreparedRF3Groups(
 			authorities[group] = coldRF3GrantAuthority{group: group, members: member.Members, target: *target}
 		}
 	}
-	grantRouter, err := openDurableRF3GrantRouter(combined, authorities)
+	grantRouter, err := openDurableRF3GrantRouter(combined.groupBundles(), authorities)
 	if err != nil {
 		return err
 	}

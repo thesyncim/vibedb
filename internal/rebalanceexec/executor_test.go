@@ -211,8 +211,7 @@ func TestExecutorMapsExactMembershipSnapshotWaitAndDrainActions(t *testing.T) {
 		request := fixture.membershipRequests[len(fixture.membershipRequests)-1]
 		if request.Kind != test.want || request.TransitionID != fixture.grant.TransitionID ||
 			request.ExpectedReplicaSetVersion != execution.PublicationReplicaSet ||
-			request.SourceMember != plan.RetiringMember() || request.TargetMember != plan.TargetMember() ||
-			(test.kind == rebalance.ActionRemoveSource) != (request.TransferTerm == execution.LeaderTerm) {
+			request.SourceMember != plan.RetiringMember() || request.TargetMember != plan.TargetMember() {
 			t.Fatalf("%s request=%+v", test.kind, request)
 		}
 	}

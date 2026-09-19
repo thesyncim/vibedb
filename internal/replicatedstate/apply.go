@@ -435,14 +435,14 @@ func (m *Machine) applyNormal(meta raftmodel.ApplyMeta, data []byte, completion 
 	}
 	if command.Kind() == replication.CommandRequestLedger {
 		ledgerPlan, planErr := m.planRequestLedgerCommand(
-			command, m.state, pointSnapshot{value: systemSnapshot},
+			command, meta.Index, m.state, pointSnapshot{value: systemSnapshot},
 		)
 		err = errors.Join(planErr, m.applyCut.Close())
 		if err != nil {
 			return raftmodel.Publication{}, m.fail(err)
 		}
 		next := m.nextState(meta, RecordNormal, digest)
-		if err := applyRequestLedgerStateDelta(&next, ledgerPlan.delta); err != nil {
+		if err := errors.Join(applyRequestLedgerStateDelta(&next, ledgerPlan.delta), applyExecutionPinStateDelta(&next, ledgerPlan.pinDelta)); err != nil {
 			return raftmodel.Publication{}, m.fail(err)
 		}
 		if err := m.persistTransitionRows(
@@ -852,7 +852,7 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	}
 	if command.Kind() == replication.CommandRequestLedger {
 		ledgerPlan, planErr := m.planRequestLedgerCommand(
-			command, m.state, systemBase,
+			command, m.state.Applied+1, m.state, systemBase,
 		)
 		closeErr := m.applyCut.Close()
 		if planErr != nil || closeErr != nil {
@@ -869,7 +869,7 @@ func (m *Machine) AdmitCommand(data []byte) error {
 				command.Bytes(),
 			),
 		)
-		if stateErr := applyRequestLedgerStateDelta(&next, ledgerPlan.delta); stateErr != nil {
+		if stateErr := errors.Join(applyRequestLedgerStateDelta(&next, ledgerPlan.delta), applyExecutionPinStateDelta(&next, ledgerPlan.pinDelta)); stateErr != nil {
 			return m.fail(stateErr)
 		}
 		return m.checkTransitionCapacityWithCaptureRows(

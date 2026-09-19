@@ -53,13 +53,13 @@ func newRF3ProvisionedRegistryWithPeers(manifest rf3Manifest, profile *rafttrans
 		if record.NodeID == profile.LocalIdentity().Node && [32]byte(record.ServiceKeyDigest) != profile.LocalServiceKeyDigest() {
 			return nil, fmt.Errorf("%w: prepared local certificate pin", errInvalidRF3Manifest)
 		}
-		peers = append(peers, rafttransport.PhysicalPeer{NodeID: record.NodeID, TrustDomain: profile.LocalIdentity().TrustDomain, Incarnation: record.Incarnation, Revision: record.Revision, ServiceKeyDigest: [32]byte(record.ServiceKeyDigest), Endpoint: record.DataAddress, State: rafttransport.PeerEnrolled})
+		peers = append(peers, rafttransport.PhysicalPeer{NodeID: record.NodeID, Node: record.NodeID, TrustDomain: profile.LocalIdentity().TrustDomain, Incarnation: record.Incarnation, Revision: record.Revision, ServiceKeyDigest: [32]byte(record.ServiceKeyDigest), Endpoint: record.DataAddress, Address: record.DataAddress, State: rafttransport.PeerEnrolled})
 	}
 	peers, err = appendRF3EnrolledPeers(peers, enrolledPeers, profile.LocalIdentity().TrustDomain)
 	if err != nil {
 		return nil, err
 	}
-	return rafttransport.NewStaticRegistryWithDirectory(profile.LocalIdentity().Node, members, peers, 1, limits)
+	return rafttransport.NewNodeRegistryWithDirectory(profile.LocalIdentity().Node, members, peers, 1, limits)
 }
 
 // Static compositions carry their initial certificate pins in the prepared
@@ -126,7 +126,7 @@ func newRF3PinnedStaticRegistryWithPeers(manifest rf3Manifest, profile *rafttran
 	if err != nil {
 		return nil, err
 	}
-	return rafttransport.NewStaticRegistryWithDirectory(profile.LocalIdentity().Node, members, peers, 1, limits)
+	return rafttransport.NewNodeRegistryWithDirectory(profile.LocalIdentity().Node, members, peers, 1, limits)
 }
 
 func appendRF3EnrolledPeers(peers, enrolled []rafttransport.PhysicalPeer, domain rafttransport.TrustDomain) ([]rafttransport.PhysicalPeer, error) {

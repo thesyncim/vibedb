@@ -222,7 +222,10 @@ func (runtime *Runtime) AcknowledgeFrontendDrainLifecycle(
 }
 
 func (runtime *Runtime) serveFrontendDrainPreparedAckConnection(ctx context.Context, connection rafttransport.PeerConnection) error {
-	if runtime == nil || ctx == nil || connection == nil || !runtime.authorizeFrontendDrainPreparePeer(connection) {
+	// The retiring gateway distributes its already committed proof. It need
+	// not be the topology controller allowed to initiate a drain; the handler
+	// rereads the exact child before applying any service-directory change.
+	if runtime == nil || ctx == nil || connection == nil || !runtime.authorizeFrontendParticipantPeer(connection) {
 		return errFrontendParticipantAuth
 	}
 	var configuredReadDeadline time.Time

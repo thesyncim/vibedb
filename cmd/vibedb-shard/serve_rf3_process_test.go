@@ -698,7 +698,6 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			authorityIdentity.Generation, grant.TargetMember, beforeTerm, leaderState.Fence.Command,
 		)
 		removeRequest.ExpectedReplicaSetVersion = leaderState.Fence.Command.ReplicaSetVersion
-		removeRequest.TransferTerm = leaderState.Fence.Term
 		removeObservationRequest := replicacontrol.Request{
 			Operation: sha256.Sum256(removeRequest.TransitionID[:]), Step: [32]byte{0x6d, byte(removeRequest.Kind)},
 			Group: group, TargetMember: removeRequest.TargetMember, ExpectedReplicaSetVersion: removeRequest.ExpectedReplicaSetVersion,
@@ -745,7 +744,6 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			t.Fatalf("accepted target-leader removal did not settle: %v", settleErr)
 		}
 	} else {
-		removeRequest.TransferTerm = leaderState.Fence.Term
 		_ = rf3CommandApplyMembershipWithProbeCommand(
 			t, servingAddresses, servingNodes, clientProfile, observationClient, authorityIdentity, group,
 			rf3CommandStoreIdentity(1).AllocationGeneration, removeRequest, leaderState.Fence.Command,

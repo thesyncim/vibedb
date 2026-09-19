@@ -126,6 +126,60 @@ func frontendDrainSourceTestFixture(t *testing.T) (
 	return profile, node, source, cut, request
 }
 
+func TestFrontendDrainProofAckAdmitsParticipantButCannotInitiateDrain(t *testing.T) {
+	profile, node, _, cut, _ := frontendDrainSourceTestFixture(t)
+	policy, err := serviceauthz.NewPolicy(1, []serviceauthz.Entry{{
+		Node: profile.LocalIdentity().Node, Capabilities: serviceauthz.CapabilityTopology,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, err := serviceauthz.NewServiceDirectoryGate(cut.ServiceDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &Runtime{config: Config{TLSProfile: profile, Authorization: policy}, serviceDirectory: gate,
+		controlRoster: map[rafttransport.NodeID]map[uint64]struct{}{profile.LocalIdentity().Node: {1: {}}}}
+	base, err := newFrontendParticipantScanRequest(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := frontendDrainPreparedAckRequest{frontendParticipantScanRequest: base, DrainID: [32]byte{1}}
+	for _, test := range []struct {
+		name         string
+		capabilities serviceauthz.Capability
+		mutate       func(*frontendDrainSourceTestConnection)
+		want         error
+	}{
+		{name: "participant", capabilities: serviceauthz.CapabilityTopology, want: gateway.ErrScalingState},
+		{name: "wrong key", capabilities: serviceauthz.CapabilityTopology, want: errFrontendParticipantAuth,
+			mutate: func(c *frontendDrainSourceTestConnection) { c.key[0]++ }},
+		{name: "wrong principal", capabilities: serviceauthz.CapabilityTopology, want: errFrontendParticipantAuth,
+			mutate: func(c *frontendDrainSourceTestConnection) { c.peer.Node[0]++ }},
+		{name: "wrong domain", capabilities: serviceauthz.CapabilityTopology, want: errFrontendParticipantAuth,
+			mutate: func(c *frontendDrainSourceTestConnection) { c.peer.TrustDomain.ClusterID[0]++ }},
+		{name: "insufficient capability", capabilities: serviceauthz.CapabilityDataRead, want: errFrontendParticipantAuth},
+	} {
+		policy, err := serviceauthz.NewPolicy(1, []serviceauthz.Entry{{Node: profile.LocalIdentity().Node, Capabilities: test.capabilities}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime.config.Authorization = policy
+		connection := &frontendDrainSourceTestConnection{input: bytes.NewReader(request.marshal()),
+			peer: profile.LocalIdentity(), key: profile.LocalServiceKeyDigest(), class: rafttransport.TrafficGatewayControl}
+		if test.mutate != nil {
+			test.mutate(connection)
+		}
+		if runtime.authorizeFrontendDrainPreparePeer(connection) {
+			t.Fatal("participant gained controller drain initiation authority")
+		}
+		err = runtime.serveFrontendDrainPreparedAckConnection(t.Context(), connection)
+		if !errors.Is(err, test.want) || connection.output.Len() != 0 {
+			t.Fatalf("%s error=%v want=%v response bytes=%d", test.name, err, test.want, connection.output.Len())
+		}
+	}
+}
+
 func TestFrontendDrainPreparedAckCutReadDispatchAndAuthorityProjection(t *testing.T) {
 	profile, node, source, cut, request := frontendDrainSourceTestFixture(t)
 	deadline := func() time.Time { return time.Now().Add(time.Second) }

@@ -34,6 +34,22 @@ var (
 	errRF3FrontendDrainPreparedAckReaderState       = errors.New("vibedb-shard: prepared drain source reader state mismatch")
 )
 
+// The source service checks the receiver's exact physical identity, key and
+// lifecycle against its complete committed catalog cut before returning bytes.
+// A local Raft transport registry only contains peers of hosted groups: using
+// it here would prevent a storage node in another group from obtaining the
+// service directory it needs to start. This first check authenticates the
+// transport; it grants no authority independently of that catalog check.
+func rf3CanonicalSourcePeerAuthorizer(profile *rafttransport.PeerTLS) func(rafttransport.PeerConnection) bool {
+	return func(connection rafttransport.PeerConnection) bool {
+		return profile != nil && connection != nil &&
+			connection.TrafficClass() == rafttransport.TrafficShardControl &&
+			connection.PeerIdentity().TrustDomain == profile.LocalIdentity().TrustDomain &&
+			connection.PeerIdentity().Node != (rafttransport.NodeID{}) &&
+			connection.PeerKeyDigest() != ([32]byte{})
+	}
+}
+
 // rf3FrontendDrainPreparedAckCutReader is the physical storage reader for a
 // prepared frontend drain.  It opens a fresh gateway-control stream for every
 // request through the exact manifest seed set.  The source gateway supplies

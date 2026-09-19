@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -48,7 +49,7 @@ const (
 
 type rf3DynamicLearnerFactory struct {
 	mu          sync.Mutex
-	runtime     *rf3EmptyNodeRuntime
+	runtime     *rf3NodeRuntime
 	owner       *rf3NodeOwner
 	root        string
 	profile     *rafttransport.PeerTLS
@@ -72,7 +73,7 @@ type rf3DynamicLearnerService struct {
 }
 
 func newRF3DynamicLearnerFactory(
-	runtime *rf3EmptyNodeRuntime, owner *rf3NodeOwner, manifest rf3Manifest,
+	runtime *rf3NodeRuntime, owner *rf3NodeOwner, manifest rf3Manifest,
 	profile *rafttransport.PeerTLS, policy *serviceauthz.Policy, gate *serviceauthz.Gate,
 	budget *migrationbudget.Budget, deadline rafttransport.DeadlineFunc,
 ) (*rf3DynamicLearnerFactory, error) {
@@ -106,6 +107,26 @@ func (factory *rf3DynamicLearnerFactory) Close() error {
 		delete(factory.services, group)
 	}
 	return result
+}
+
+func (factory *rf3DynamicLearnerFactory) Unregister(identity raftmember.RuntimeIdentity) error {
+	factory.mu.Lock()
+	defer factory.mu.Unlock()
+	item := factory.services[identity.Group]
+	if item == nil {
+		return nil
+	}
+	if item.descriptor.TargetMember != identity.MemberID || item.descriptor.TargetStore != identity.StoreID {
+		return nodecontrol.ErrConflict
+	}
+	if err := factory.runtime.receivers.Remove(context.Background(), item.installer.intent, item.installer.proof); err != nil {
+		return err
+	}
+	if err := item.close(); err != nil {
+		return err
+	}
+	delete(factory.services, identity.Group)
+	return nil
 }
 
 // Register publishes one real bootstrap service for the exact currently
@@ -266,20 +287,38 @@ func (factory *rf3DynamicLearnerFactory) recoverEnrollment(ctx context.Context, 
 	}
 	intentRoot := filepath.Join(factory.root, "enrollments", entry.Name())
 	raw, readErr := readRF3BoundedFile(filepath.Join(intentRoot, rf3EnrollmentDescriptorFile), 256<<10)
-	if errors.Is(readErr, os.ErrNotExist) {
-		// Preparation has not crossed the descriptor fence yet.
-		return nil
-	}
-	if readErr != nil {
-		return readErr
-	}
-	var descriptorReceipt rf3EnrollmentDescriptorReceipt
-	if readErr = vibejson.Unmarshal(raw, &descriptorReceipt); readErr != nil || descriptorReceipt.Kind != rf3EnrollmentPayloadKind ||
-		len(descriptorReceipt.Descriptor) != snapshottransfer.DescriptorBytes {
-		return errors.Join(nodecontrol.ErrJournalCorrupt, readErr)
-	}
+	descriptorPresent := !errors.Is(readErr, os.ErrNotExist)
 	var intentID [32]byte
-	copy(intentID[:], descriptorReceipt.IntentID[:])
+	var targetNode rafttransport.NodeID
+	var targetIncarnation uint64
+	if !descriptorPresent {
+		// Adopt is durable before the source can export its first descriptor.
+		// A crash at that boundary must restore the pre-Raft receiver too.
+		raw, readErr = readRF3BoundedFile(filepath.Join(intentRoot, rf3EnrollmentReceiverFile), 16<<10)
+		if errors.Is(readErr, os.ErrNotExist) {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+		var receipt rf3EnrollmentReceiverReceipt
+		if err := vibejson.Unmarshal(raw, &receipt); err != nil || receipt.Kind != rf3EnrollmentPayloadKind {
+			return errors.Join(nodecontrol.ErrJournalCorrupt, err)
+		}
+		intentID, targetNode, targetIncarnation = receipt.IntentID, receipt.TargetNode, receipt.TargetNodeIncarnation
+	} else {
+		if readErr != nil {
+			return readErr
+		}
+		var receipt rf3EnrollmentDescriptorReceipt
+		if err := vibejson.Unmarshal(raw, &receipt); err != nil || receipt.Kind != rf3EnrollmentPayloadKind || len(receipt.Descriptor) != snapshottransfer.DescriptorBytes {
+			return errors.Join(nodecontrol.ErrJournalCorrupt, err)
+		}
+		intentID, targetNode, targetIncarnation = receipt.IntentID, receipt.TargetNode, receipt.TargetIncarnation
+	}
+	if hex.EncodeToString(intentID[:]) != entry.Name() {
+		return nodecontrol.ErrJournalCorrupt
+	}
 	cut, readErr := factory.readEnrollmentRecovery(ctx, intentID)
 	if readErr != nil {
 		if cause := context.Cause(ctx); cause != nil {
@@ -291,7 +330,7 @@ func (factory *rf3DynamicLearnerFactory) recoverEnrollment(ctx context.Context, 
 		return errors.Join(nodecontrol.ErrStale, readErr)
 	}
 	if cut.EnrollmentMissing() {
-		if cut.IntentID != intentID || cut.PhysicalNode != descriptorReceipt.TargetNode || cut.Incarnation != descriptorReceipt.TargetIncarnation {
+		if cut.IntentID != intentID || cut.PhysicalNode != targetNode || cut.Incarnation != targetIncarnation {
 			return nodecontrol.ErrStale
 		}
 		// The catalog pins completed enrollments for every live target. A
@@ -316,6 +355,20 @@ func (factory *rf3DynamicLearnerFactory) recoverEnrollment(ctx context.Context, 
 			return nil
 		}
 		recovery = &cut
+	}
+	if !descriptorPresent {
+		if recovery != nil {
+			return nodecontrol.ErrJournalCorrupt
+		}
+		adopter := rf3NodeControlAdopter{NodeRoot: factory.root, ActivateReceiver: factory.runtime.receivers.Activate}
+		found, err := adopter.ObserveAdopted(ctx, intent, *intent.Proof)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return nodecontrol.ErrJournalCorrupt
+		}
+		return nil
 	}
 	descriptor, found, descriptorErr := readRF3EnrollmentDescriptor(intentRoot, intent)
 	if descriptorErr != nil {
@@ -563,6 +616,12 @@ func (installer *rf3DynamicLearnerInstaller) recoverInstalledLocked(ctx context.
 	if err != nil {
 		return errors.Join(err, runtime.Close())
 	}
+	if installer.recovery != nil {
+		grant, err = installer.factory.runtime.grants.Recover(descriptor.Group, publication, installer.recovery)
+		if err != nil {
+			return errors.Join(err, runtime.Close())
+		}
+	}
 	roster, command, err := rf3RecoveredRoster(installer.spec, descriptor, publication, installer.intent.ExpectedCommand, installer.recovery, grant)
 	if err != nil {
 		return errors.Join(err, runtime.Close())
@@ -612,7 +671,24 @@ func (installer *rf3DynamicLearnerInstaller) recoverRuntime(
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("read recovered enrollment receipt: %w", err)
 	}
-	if _, found := installer.factory.owner.store.GroupByID(descriptor.Group.GroupID); !found {
+	registered, found := installer.factory.owner.store.GroupByID(descriptor.Group.GroupID)
+	if found {
+		previous, err := registered.Descriptor()
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if previous.MemberID != descriptor.TargetMember || previous.StoreID != descriptor.TargetStore {
+			retired, err := installer.factory.owner.descriptorRetired(ctx, previous)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			if !retired {
+				return nil, nil, false, nodecontrol.ErrConflict
+			}
+			found = false
+		}
+	}
+	if !found {
 		if receiptFound || installer.recovery != nil {
 			return nil, nil, false, nodecontrol.ErrJournalCorrupt
 		}
@@ -885,13 +961,25 @@ func rf3RecoveredRoster(spec nodecontrol.PreparationSpec, descriptor snapshottra
 			roster[index].Role = members.role
 		}
 	}
-	// The original mappings are a bounded historical proof. Remove mappings
-	// that neither the current route nor a retained grant needs once Raft has
-	// durably stopped referring to them.
-	if cut != nil && grant == (membershipgrant.Grant{}) {
+	// Only durable Raft membership and the committed route require mappings.
+	// A retained operation grant does not keep a removed member alive: its
+	// physical node may already be enrolled again under a new member identity.
+	if cut != nil {
 		roster = slices.DeleteFunc(roster, func(member rafttransport.Member) bool {
-			return member.Role == rafttransport.MemberEnrolled &&
-				!slices.ContainsFunc(cut.CurrentRoute.Serving.Replicas, func(replica gateway.ReplicatedEndpoint) bool { return replica.Member == member.MemberID }) &&
+			if member.Role != rafttransport.MemberEnrolled {
+				return false
+			}
+			if grant != (membershipgrant.Grant{}) && (slices.Contains(grant.InitialVoters[:], member.MemberID) || grant.TargetMember == member.MemberID) {
+				return false
+			}
+			// A future enrolled target can reuse a node still present in this
+			// lagging local ConfState. Its mapping is installed after replay.
+			if slices.ContainsFunc(roster, func(other rafttransport.Member) bool {
+				return other.Node == member.Node && other.Role != rafttransport.MemberEnrolled
+			}) {
+				return true
+			}
+			return !slices.ContainsFunc(cut.CurrentRoute.Serving.Replicas, func(replica gateway.ReplicatedEndpoint) bool { return replica.Member == member.MemberID }) &&
 				(!cut.CurrentRoute.HasEnrolledTarget || cut.CurrentRoute.EnrolledTarget.Member != member.MemberID)
 		})
 	}

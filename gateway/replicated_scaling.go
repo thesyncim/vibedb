@@ -1224,7 +1224,7 @@ func (authority *ReplicatedCatalogAuthority) putNode(ctx context.Context, record
 	return authority.putNodeWithExtra(ctx, record, expectedRevision, retirement, catalogHead, nil)
 }
 
-type nodeMutationAppender func(context.Context, NodeRecord, NodeRecord) ([]NativeMutation, error)
+type nodeMutationAppender func(context.Context, NodeRecord, NodeRecord, uint64, replication.Digest) ([]NativeMutation, error)
 
 func (authority *ReplicatedCatalogAuthority) putNodeWithExtra(ctx context.Context, record NodeRecord, expectedRevision uint64, retirement *NodeReferenceEvidence, catalogHead *ReplicatedPointResult, extra nodeMutationAppender) error {
 	if authority == nil || authority.session == nil || ctx == nil || !record.Valid() {
@@ -1454,7 +1454,7 @@ func (authority *ReplicatedCatalogAuthority) putNodeWithExtra(ctx context.Contex
 		}
 	}
 	if extra != nil {
-		extraMutations, appendErr := extra(ctx, priorRecord, record)
+		extraMutations, appendErr := extra(ctx, priorRecord, record, directoryRevision, scalingDigest(directoryResult.Value))
 		if appendErr != nil {
 			return appendErr
 		}

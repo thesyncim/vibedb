@@ -34,13 +34,10 @@ import (
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
-// rf3EmptyNodeRuntime is the live process boundary retained by an empty node.
-// It starts all authenticated listeners and the zero-group execution owner,
-// but publishes no execution group until a later certified learner install
-// calls RegisterExecutionGroup. The control reader slot is intentionally
-// empty at construction; a committed-directory bootstrap adapter must attach
-// it after authenticating a seed and the node's exact Joining record.
-type rf3EmptyNodeRuntime struct {
+// rf3NodeRuntime owns one physical node and its live group inventory. Initial
+// groups and certified later learners share the same execution, grant, schema
+// and donor resources; retirement withdraws those resources before readoption.
+type rf3NodeRuntime struct {
 	peer          *raftservice.AuthenticatedExecutionPeerRuntime
 	registry      *rafttransport.StaticRegistry
 	lanes         *multiraft.ExecutionLanes
@@ -64,13 +61,13 @@ type rf3EmptyNodeRuntime struct {
 // visible to ordinary transport and native execution. It is intentionally
 // useful to the snapshot installer while retaining one shared physical-node
 // peer runtime.
-func (runtime *rf3EmptyNodeRuntime) RegisterExecutionGroup(
+func (runtime *rf3NodeRuntime) RegisterExecutionGroup(
 	roster []rafttransport.Member, group raftservice.ExecutionGroup,
 ) error {
 	return runtime.RegisterExecutionGroupWithGrant(roster, group, membershipgrant.Grant{})
 }
 
-func (runtime *rf3EmptyNodeRuntime) RegisterExecutionGroupWithGrant(
+func (runtime *rf3NodeRuntime) RegisterExecutionGroupWithGrant(
 	roster []rafttransport.Member, group raftservice.ExecutionGroup, grant membershipgrant.Grant,
 ) error {
 	if runtime == nil || runtime.peer == nil {
@@ -100,7 +97,7 @@ func (runtime *rf3EmptyNodeRuntime) RegisterExecutionGroupWithGrant(
 // UnregisterExecutionGroup withdraws a quiescent group from the shared peer
 // and native listener. It is the inverse of RegisterExecutionGroup and keeps
 // a different adopted group serving while one group is retired.
-func (runtime *rf3EmptyNodeRuntime) UnregisterExecutionGroup(identity raftmember.RuntimeIdentity) error {
+func (runtime *rf3NodeRuntime) UnregisterExecutionGroup(identity raftmember.RuntimeIdentity) error {
 	if runtime == nil || runtime.peer == nil {
 		return raftservice.ErrInvalidOwner
 	}
@@ -126,18 +123,18 @@ func (runtime *rf3EmptyNodeRuntime) UnregisterExecutionGroup(identity raftmember
 	return cleanup
 }
 
-func (runtime *rf3EmptyNodeRuntime) nativeServing() bool {
+func (runtime *rf3NodeRuntime) nativeServing() bool {
 	return runtime != nil && runtime.servingGroups != nil && runtime.servingGroups.Load() > 0
 }
 
-func (runtime *rf3EmptyNodeRuntime) IntentReaderSlot() *nodecontrol.IntentReaderSlot {
+func (runtime *rf3NodeRuntime) IntentReaderSlot() *nodecontrol.IntentReaderSlot {
 	if runtime == nil {
 		return nil
 	}
 	return runtime.reader
 }
 
-func (runtime *rf3EmptyNodeRuntime) BootstrapReceivers() *rf3DynamicBootstrapRegistry {
+func (runtime *rf3NodeRuntime) BootstrapReceivers() *rf3DynamicBootstrapRegistry {
 	if runtime == nil {
 		return nil
 	}
@@ -147,7 +144,7 @@ func (runtime *rf3EmptyNodeRuntime) BootstrapReceivers() *rf3DynamicBootstrapReg
 // BindIntentReader attaches the authenticated committed-directory client. It
 // is deliberately a one-time capability handoff; until it is attached the
 // node-control service fails closed before any journal or storage side effect.
-func (runtime *rf3EmptyNodeRuntime) BindIntentReader(reader nodecontrol.IntentReader) error {
+func (runtime *rf3NodeRuntime) BindIntentReader(reader nodecontrol.IntentReader) error {
 	if runtime == nil || runtime.reader == nil {
 		return nodecontrol.ErrControl
 	}
@@ -158,7 +155,7 @@ func (runtime *rf3EmptyNodeRuntime) BindIntentReader(reader nodecontrol.IntentRe
 // for one certified post-AddLearner descriptor. A reservation alone never
 // creates this service, so an activated empty target cannot receive or install
 // arbitrary snapshot bytes.
-func (runtime *rf3EmptyNodeRuntime) RegisterBootstrapService(
+func (runtime *rf3NodeRuntime) RegisterBootstrapService(
 	ctx context.Context, intent gateway.GroupEnrollmentIntent,
 	proof gateway.PreparedReplicaProof, descriptor snapshottransfer.Descriptor,
 ) error {
@@ -168,11 +165,50 @@ func (runtime *rf3EmptyNodeRuntime) RegisterBootstrapService(
 	return runtime.learner.Register(ctx, intent, proof, descriptor)
 }
 
-func (runtime *rf3EmptyNodeRuntime) CloseBootstrapServices() error {
+func (runtime *rf3NodeRuntime) CloseBootstrapServices() error {
 	if runtime == nil || runtime.learner == nil {
 		return nil
 	}
 	return runtime.learner.Close()
+}
+
+// Unregister is called after the journaled source retirement closed the owner.
+// All startup and adopted groups release the same runtime inventories.
+func (runtime *rf3NodeRuntime) Unregister(identity raftmember.RuntimeIdentity) error {
+	if runtime == nil {
+		return nil
+	}
+	if runtime.registry != nil {
+		member, err := runtime.registry.LocalMember(identity.Group)
+		if err == nil && member != identity.MemberID {
+			return raftservice.ErrServingFence
+		}
+		if err != nil && !errors.Is(err, rafttransport.ErrGroupNotFound) {
+			return err
+		}
+	}
+	if runtime.donors != nil {
+		if err := runtime.donors.Unregister(identity); err != nil {
+			return err
+		}
+	}
+	if runtime.learner != nil {
+		if err := runtime.learner.Unregister(identity); err != nil {
+			return err
+		}
+	}
+	if runtime.grants != nil {
+		runtime.grants.mu.Lock()
+		delete(runtime.grants.installers, identity.Group)
+		runtime.grants.mu.Unlock()
+	}
+	if runtime.registry != nil {
+		err := runtime.registry.RemoveGroup(identity.Group, func(withdraw func()) error { withdraw(); return nil })
+		if err != nil && !errors.Is(err, rafttransport.ErrGroupNotFound) {
+			return err
+		}
+	}
+	return nil
 }
 
 func rf3TransportRegistryLimits() rafttransport.Limits {
@@ -220,10 +256,7 @@ func servePreparedRF3EmptyNode(
 	}
 	local := profile.LocalIdentity()
 	deadline := func() time.Time { return time.Now().Add(rf3NetworkTimeout) }
-	template, err := rf3NodePreparationTemplateFromManifest(manifest)
-	if err != nil {
-		return fmt.Errorf("%w: empty-node preparation template: %v", errRF3Serving, err)
-	}
+
 	transportRegistry, err := rafttransport.NewEmptyRegistry(local.Node, local.TrustDomain, rf3TransportRegistryLimits())
 	if err != nil {
 		return fmt.Errorf("%w: empty-node transport registry: %v", errRF3Serving, err)
@@ -333,7 +366,7 @@ func servePreparedRF3EmptyNode(
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
-	nativeAuthorities, err := newRF3NativeAuthorities(transportRegistry, gate, nil, nil, nil)
+	nativeAuthorities, err := newRF3NativeAuthorities(transportRegistry, gate, nil, nil, nil, nil)
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
@@ -386,18 +419,7 @@ func servePreparedRF3EmptyNode(
 	dynamicCanonicalRows := newRF3DynamicCatalogRows(peer.Owners(), nodeOwner.store)
 	canonicalSource, err := gatewayruntime.NewFrontendDrainPreparedAckCutReadService(
 		gatewayruntime.FrontendDrainPreparedAckCutReadServiceOptions{
-			Authorize: func(connection rafttransport.PeerConnection) bool {
-				if connection == nil || connection.TrafficClass() != rafttransport.TrafficShardControl {
-					return false
-				}
-				peerIdentity := connection.PeerIdentity()
-				if peerIdentity.TrustDomain != profile.LocalIdentity().TrustDomain ||
-					peerIdentity.Node == (rafttransport.NodeID{}) || connection.PeerKeyDigest() == ([32]byte{}) {
-					return false
-				}
-				physical, lookupErr := transportRegistry.PhysicalPeer(peerIdentity.Node)
-				return lookupErr == nil && physical.State == rafttransport.PeerEnrolled
-			},
+			Authorize: rf3CanonicalSourcePeerAuthorizer(profile),
 			ReadCut: func(ctx context.Context) (gateway.FrontendDrainRuntimeCut, error) {
 				return gateway.ReadFrontendDrainRuntimeCutFromRows(ctx, dynamicCanonicalRows)
 			},
@@ -412,56 +434,14 @@ func servePreparedRF3EmptyNode(
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
 
-	reader := new(nodecontrol.IntentReaderSlot)
-	bootstrapTransport, err := bindRF3NodeBootstrapIntentReader(
-		reader, profile, manifest.GatewaySeeds, local.Node, manifest.NodeIncarnation, deadline,
-	)
-	if err != nil {
-		return errors.Join(err, lanes.Close(), servingRegistry.Close())
-	}
-	defer func() { resultErr = errors.Join(resultErr, bootstrapTransport.Close()) }()
-	journal, err := nodecontrol.NewFileJournal(filepath.Join(manifest.ReplicaControl.SourceDataRoot, "node-control-journal"))
-	if err != nil {
-		return errors.Join(err, lanes.Close(), servingRegistry.Close())
-	}
-	defer func() { resultErr = errors.Join(resultErr, journal.Close()) }()
-	receivers, err := newRF3DynamicBootstrapRegistry(local.TrustDomain, deadline, 32)
-	if err != nil {
-		return errors.Join(err, lanes.Close(), servingRegistry.Close())
-	}
-	preparer := &rf3NodeControlPreparer{NodeRoot: manifest.ReplicaControl.SourceDataRoot, Template: template}
-	adopter := &rf3NodeControlAdopter{NodeRoot: manifest.ReplicaControl.SourceDataRoot,
-		ActivateReceiver: receivers.Activate}
-	controlService, err := nodecontrol.NewService(nodecontrol.ServiceOptions{
-		Reader: reader, Journal: journal, Preparer: preparer, Adopter: adopter,
-		Authorize: func(identity rafttransport.PeerIdentity, request nodecontrol.Request) bool {
-			if identity.TrustDomain != local.TrustDomain || request.TargetNode != local.Node ||
-				request.TargetNodeIncarnation != manifest.NodeIncarnation {
-				return false
-			}
-			return policy.Check(identity.Node, serviceauthz.CapabilityMembership) == serviceauthz.DecisionAllow ||
-				policy.Check(identity.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow
-		},
-		ValidatePayload: func(ctx context.Context, intent gateway.GroupEnrollmentIntent, payload []byte) error {
-			_, validateErr := validateRF3EnrollmentPayload(ctx, intent, payload, manifest.ReplicaControl.SourceDataRoot, template)
-			return validateErr
-		},
-		LocalNode: local.Node, LocalIncarnation: manifest.NodeIncarnation,
-		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 32,
-	})
-	if err != nil {
-		return errors.Join(err, lanes.Close(), servingRegistry.Close())
-	}
-	nodeInfo, err := newRF3EmptyNodeInfo(nodeOwner.store, profile, manifest, policy, migrationBudget, &servingGroups, preparer, deadline)
-	if err != nil {
-		return errors.Join(err, lanes.Close(), servingRegistry.Close())
-	}
-	// Catch-up delivers the exact grant after snapshot registration. Retain it
-	// beside the certified reservation so restart can restore historical
-	// configuration replay authority atomically with the recovered group.
 	grantRouter := newRF3DynamicGrantRouter(transportRegistry)
-	runtime := &rf3EmptyNodeRuntime{native: nativeAuthorities, peer: peer, registry: transportRegistry, lanes: lanes,
-		serving: servingRegistry, reader: reader, receivers: receivers, grants: grantRouter, schemas: schemas, donors: donors, actionJournal: actionJournal, servingGroups: &servingGroups}
+	runtime := &rf3NodeRuntime{native: nativeAuthorities, peer: peer, registry: transportRegistry, lanes: lanes,
+		serving: servingRegistry, grants: grantRouter, schemas: schemas, donors: donors, actionJournal: actionJournal, servingGroups: &servingGroups}
+	enrollment, err := newRF3NodeEnrollment(manifest, profile, policy, gate, migrationBudget, runtime, nodeOwner, deadline)
+	if err != nil {
+		return errors.Join(err, lanes.Close(), servingRegistry.Close())
+	}
+	defer func() { resultErr = errors.Join(resultErr, enrollment.Close()) }()
 	membershipControl, err := shardservice.NewMembershipGrantControlService(
 		grantRouter, policy, deadline, deadline,
 	)
@@ -477,7 +457,7 @@ func servePreparedRF3EmptyNode(
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
 	actionControl, err := newRF3ReplicaActionControl(actionJournal, peer.Owners(), transportRegistry, policy, deadline,
-		profile, rf3ReplicaRetirementCleanup(schemas, donors, &servingGroups, nativeAuthorities))
+		profile, rf3ReplicaRetirementCleanup(schemas, runtime, &servingGroups, nativeAuthorities))
 	if err != nil {
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
@@ -495,7 +475,7 @@ func servePreparedRF3EmptyNode(
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
 	metricsProvider := &rf3MetricsProvider{owners: peer.Owners(), schemas: schemas, backup: backupControl, action: actionControl,
-		budget: migrationBudget}
+		budget: migrationBudget, donors: donors}
 	metricsControl, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
 		Provider: metricsProvider,
 		Authorize: func(identity rafttransport.PeerIdentity) bool {
@@ -562,7 +542,7 @@ func servePreparedRF3EmptyNode(
 		source: donors.Control, preparation: donors.Preparation,
 		split: splitRuntime.action, planObservation: splitRuntime.observation.service, admission: splitRuntime.admission,
 		tail: splitRuntime.tail, terminal: splitRuntime.terminal, childPrepare: childPrepareControl,
-		nodeInfo: nodeInfo, nodeControl: controlService, bootstrap: receivers, preparedAck: preparedAckControl,
+		nodeInfo: enrollment.info, nodeControl: enrollment.control, bootstrap: runtime.receivers, preparedAck: preparedAckControl,
 		canonicalSource: canonicalSource,
 	}).mux()
 	if err != nil {
@@ -578,19 +558,6 @@ func servePreparedRF3EmptyNode(
 		return errors.Join(err, lanes.Close(), servingRegistry.Close())
 	}
 
-	learner, err := newRF3DynamicLearnerFactory(runtime, nodeOwner, manifest, profile, policy, gate, migrationBudget, deadline)
-	if err != nil {
-		return errors.Join(err, lanes.Close(), servingRegistry.Close())
-	}
-	runtime.learner = learner
-	if err := receivers.BindRegistrar(runtime.RegisterBootstrapService); err != nil {
-		return errors.Join(err, lanes.Close(), servingRegistry.Close())
-	}
-	defer func() { resultErr = errors.Join(resultErr, runtime.CloseBootstrapServices()) }()
-	if err := nodeOwner.bindEmptyRuntime(runtime); err != nil {
-		return errors.Join(err, lanes.Close(), servingRegistry.Close())
-	}
-	defer nodeOwner.unbindEmptyRuntime(runtime)
 	peerCtx, stopPeer := context.WithCancelCause(context.Background())
 	controlCtx, stopControl := context.WithCancelCause(context.Background())
 	snapshotCtx, stopSnapshot := context.WithCancelCause(context.Background())
@@ -616,7 +583,7 @@ func servePreparedRF3EmptyNode(
 	recoveryCtx, cancelRecovery := context.WithTimeout(parent, rf3NetworkTimeout)
 	recoveryErr := recoverRF3EmptySplitChildren(recoveryCtx, runtime, prepared, adoptedInventory, profile)
 	if recoveryErr == nil {
-		recoveryErr = learner.Recover(recoveryCtx)
+		recoveryErr = runtime.learner.Recover(recoveryCtx)
 	}
 	cancelRecovery()
 	if recoveryErr != nil {

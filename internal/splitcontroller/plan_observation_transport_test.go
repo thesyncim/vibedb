@@ -15,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/rangesplit"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"go.etcd.io/raft/v3"
@@ -339,6 +340,73 @@ func TestMergeChildPlanObservationsRequiresIdenticalLifecycleAndDistinctMembers(
 	results[2].cut.Runtime.ReadyReplicas[0] = results[1].cut.Runtime.ReadyReplicas[0]
 	if _, err = mergeChildPlanObservations(request, results); !errors.Is(err, ErrPlanObservation) {
 		t.Fatalf("duplicate member error=%v", err)
+	}
+}
+
+func TestMergeChildPlanObservationsRecoversPartialTailAcknowledgement(t *testing.T) {
+	plan, artifacts, actions, before, batch := testTailStreamTransportFixture(t)
+	request, _, _ := networkPlanObservationFixture(t)
+	request.Operation, request.Child = plan.OperationID(), 1
+	request.RequestDigest = planObservationRequestDigest(request)
+	if err := actions.ApplyTailBatch(plan, artifacts, 1, batch); err != nil {
+		t.Fatal(err)
+	}
+	after, found, err := actions.Observe(plan, artifacts, 1)
+	if err != nil || !found || after == before {
+		t.Fatal("fixture did not durably advance", err)
+	}
+	results := []planObservationMemberResult{
+		{cut: ChildPlanObservation{RequestDigest: request.RequestDigest, Stage: &after}},
+		{cut: ChildPlanObservation{RequestDigest: request.RequestDigest, Stage: &before}},
+		{cut: ChildPlanObservation{RequestDigest: request.RequestDigest, Stage: &after}},
+	}
+	merged, err := mergeChildPlanObservations(request, results)
+	if err != nil || merged.Stage == nil || *merged.Stage != before {
+		t.Fatalf("partial durable fanout must schedule replay from predecessor: %v", err)
+	}
+	// The same source entry is replayed to every receiver. The advanced
+	// replica must preserve its exact durable result across that replay.
+	if err := actions.ApplyTailBatch(plan, artifacts, 1, batch); err != nil {
+		t.Fatal(err)
+	}
+	replayed, found, err := actions.Observe(plan, artifacts, 1)
+	if err != nil || !found || replayed != after {
+		t.Fatal("replay changed the durable result", err)
+	}
+	// Build a separately valid conflicting entry at the same source index.
+	// The fixture entry is a configuration no-op, so both branches have the
+	// same artifact rows. A third, earlier replica must not hide this fork.
+	initial, err := plan.partitioner.InitialTailCursor(artifacts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := rangesplit.TailEntry{
+		Applied: batch.Applied, Term: batch.Term,
+		BeforeOwnershipEpoch: batch.BeforeOwnershipEpoch, AfterOwnershipEpoch: batch.AfterOwnershipEpoch,
+		BeforeRoutingVersion: batch.BeforeRoutingVersion, AfterRoutingVersion: batch.AfterRoutingVersion,
+		BeforeRouteGeneration: batch.BeforeRouteGeneration, AfterRouteGeneration: batch.AfterRouteGeneration,
+		PreviousEntryDigest: batch.PreviousEntryDigest, EntryDigest: [32]byte{0xf1},
+		BeforeDataChainDigest: batch.BeforeDataChainDigest, AfterDataChainDigest: batch.AfterDataChainDigest,
+	}
+	var forkBatch rangesplit.TailBatch
+	if _, _, err := plan.partitioner.TranslateTailEntry(initial, entry, []rangesplit.TailSink{
+		func(rangesplit.TailBatch) error { return nil },
+		func(value rangesplit.TailBatch) error { forkBatch = value; return nil },
+	}, &rangesplit.TailWorkspace{}); err != nil {
+		t.Fatal(err)
+	}
+	beforeRaw, _ := rangesplit.AppendChildStageCursor(nil, &before)
+	branch, err := rangesplit.NewChildStage(plan.partitioner, artifacts.Children[1], actions.collection, beforeRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := branch.ApplyTailBatch(forkBatch, func([]byte) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	fork, _ := branch.Cursor()
+	results[0].cut.Stage, results[1].cut.Stage, results[2].cut.Stage = &before, &after, &fork
+	if _, err := mergeChildPlanObservations(request, results); !errors.Is(err, ErrPlanObservation) {
+		t.Fatalf("earlier replica concealed conflicting advanced entries: %v", err)
 	}
 }
 

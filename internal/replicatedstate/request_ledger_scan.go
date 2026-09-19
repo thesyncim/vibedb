@@ -441,10 +441,8 @@ func (scan *requestLedgerImageScanner) finishRequest() error {
 		scan.schemaPin.PinID != scan.head.PinID || scan.schemaPin.PinDigest != scan.head.PinDigest ||
 		scan.schemaPin.RouteSchemaCertificateDigest != scan.head.RouteSchemaCertificateDigest ||
 		scan.schemaPin.Revision != scan.head.Revision ||
-		scan.schemaPin.Phase == requestledger.SchemaPinReleasing &&
-			scan.head.SchemaPinReleaseCertificateDigest != (requestledger.Digest{}) ||
-		scan.schemaPin.Phase == requestledger.SchemaPinReleased &&
-			scan.head.SchemaPinReleaseCertificateDigest != scan.schemaPin.CertificateDigest) {
+		scan.schemaPin.Phase != requestledger.SchemaPinReleased ||
+		scan.head.SchemaPinReleaseCertificateDigest != scan.schemaPin.CertificateDigest) {
 		return fmt.Errorf("%w: request ledger schema pin", ErrStateCorrupt)
 	}
 	if scan.preparedFound && !scan.schemaPinFound &&

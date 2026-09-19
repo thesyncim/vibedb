@@ -522,8 +522,8 @@ func newMultiGroupRF3DurableGatewayWithAttempts(
 	if err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := gateway.NewDurableRequestTerminalCoordinatorWithSessionFactory(
-		ledger, native, sessions,
+	terminal, err := gateway.NewDurableRequestTerminalCoordinator(
+		ledger, native, principal,
 	)
 	if err != nil {
 		t.Fatal(err)

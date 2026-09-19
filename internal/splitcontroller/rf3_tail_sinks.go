@@ -26,9 +26,8 @@ func (resolver RF3TailSinkResolver) ResolveSplitTailSinks(
 			result[child] = func(rangesplit.TailBatch) error { return nil }
 			continue
 		}
-		cursor := observed.Stages[child]
 		target, ok := plan.Target(child)
-		if cursor == nil || !ok || len(target.Replicas) == 0 {
+		if !ok || len(target.Replicas) == 0 {
 			return nil, ErrTailStreamControl
 		}
 		binding, err := rangesplit.NewTailStreamBinding(
@@ -43,7 +42,7 @@ func (resolver RF3TailSinkResolver) ResolveSplitTailSinks(
 		remotes := make([]*RemoteTailSink, len(target.Replicas))
 		for index, replica := range target.Replicas {
 			remotes[index], err = NewRemoteTailSink(
-				ctx, resolver.Client, replica.Node, trust, binding, *cursor,
+				ctx, resolver.Client, replica.Node, trust, binding,
 			)
 			if err != nil {
 				return nil, err

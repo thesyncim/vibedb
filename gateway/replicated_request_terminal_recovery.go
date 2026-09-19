@@ -1,12 +1,9 @@
 package gateway
 
 import (
-	"bytes"
 	"errors"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
-	"github.com/thesyncim/vibedb/internal/replicatedstate"
-	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 )
 
@@ -45,9 +42,9 @@ func validateDurableRequestPreparedCut(execution DurableRequestTypedExecutionCon
 // durableRequestTerminalReleaseCommand exposes only a release already owned
 // by the authenticated ledger cut. It never substitutes today's controller or
 // lease into those bytes, and grants no authority to execute another wave.
-func durableRequestTerminalReleaseCommand(execution DurableRequestTypedExecutionContext, cut durableRequestTerminalReadCut) (replication.CommandView, executionpin.Command, error) {
-	fail := func(err error) (replication.CommandView, executionpin.Command, error) {
-		return replication.CommandView{}, executionpin.Command{}, errors.Join(err, ErrDurableRequestConflict)
+func durableRequestTerminalReleaseCommand(execution DurableRequestTypedExecutionContext, cut durableRequestTerminalReadCut) (executionpin.Command, error) {
+	fail := func(err error) (executionpin.Command, error) {
+		return executionpin.Command{}, errors.Join(err, ErrDurableRequestConflict)
 	}
 	if err := validateDurableRequestPreparedCut(execution, cut); err != nil {
 		return fail(err)
@@ -60,49 +57,25 @@ func durableRequestTerminalReleaseCommand(execution DurableRequestTypedExecution
 		release.RouteSchemaCertificateDigest != head.RouteSchemaCertificateDigest {
 		return fail(nil)
 	}
-	switch release.Phase {
-	case requestledger.SchemaPinReleasing:
-		if release.Revision != prepared.Revision+1 {
-			return fail(nil)
-		}
-		prior := head
-		prior.Revision--
-		if _, err := requestledger.InstallSchemaPinRelease(prior, prepared, release); err != nil {
-			return fail(err)
-		}
-	case requestledger.SchemaPinReleased:
-		if release.Revision != prepared.Revision+2 || release.CertificateDigest != head.SchemaPinReleaseCertificateDigest {
-			return fail(nil)
-		}
-		if _, err := requestledger.NewTerminal(head, prepared, release, head.Revision+1); err != nil {
-			return fail(err)
-		}
-	default:
+	if release.Phase != requestledger.SchemaPinReleased || release.Revision != prepared.Revision+1 ||
+		release.CertificateDigest != head.SchemaPinReleaseCertificateDigest {
 		return fail(nil)
 	}
-	outer, err := replication.OpenCommand(release.Command)
-	if err != nil || !commandMatchesRoute(release.Command, execution.Home.borrowedRoute()) ||
-		!bytes.Equal(outer.Tenant, execution.Recipe.Tenant) || outer.RetryHome != execution.Recipe.Identity.RetryHome {
+	if _, err := requestledger.NewTerminal(head, prepared, release, head.Revision+1); err != nil {
 		return fail(err)
 	}
-	command, err := outer.OpenExecutionPin()
+
+	command, err := executionpin.OpenCommand(release.Command)
 	binding, bindingErr := BuildDurableRequestExecutionPinBinding(execution)
 	if err != nil || bindingErr != nil || command.Operation != executionpin.OperationRelease ||
 		command.Binding != binding || command.PrepareTerminalDigest != executionpin.Digest(prepared.PreparedDigest) {
 		return fail(errors.Join(err, bindingErr))
 	}
-	if release.Phase == requestledger.SchemaPinReleased {
-		completion, err := replication.OpenCompletion(release.Completion)
-		if err != nil || !nativeCompletionMatches(outer, completion) || completion.ResultCode != replicatedstate.ResultApplied ||
-			completion.ResultFormat != replicatedstate.ResultFormatExecutionPin || completion.Storage != replication.CompletionInline ||
-			completion.ResultLength != executionpin.CompletionBytes || len(completion.InlineResult) != executionpin.CompletionBytes {
-			return fail(err)
-		}
-		proof, err := executionpin.OpenCompletion(completion.InlineResult)
-		authority, ok := replication.ExecutionPinAuthorityDigest(outer)
-		if err != nil || !ok || executionpin.ValidateReleasePair(command, proof, executionpin.Digest(authority)) != nil {
-			return fail(err)
-		}
+	proof, err := executionpin.OpenCompletion(release.Completion)
+	authority, authorityErr := executionpin.ReleaseAuthorityDigest(release.Command)
+	if err != nil || authorityErr != nil || executionpin.ValidateReleasePair(command, proof, authority) != nil {
+		return fail(err)
 	}
-	return outer, command, nil
+
+	return command, nil
 }

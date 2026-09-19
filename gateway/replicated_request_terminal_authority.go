@@ -61,7 +61,7 @@ func (provider *NativeDurableRequestTerminalAuthorityProvider) TerminalAuthority
 			return DurableRequestTerminalAuthority{}, err
 		}
 		if cut.SchemaPin.Revision != 0 {
-			_, release, err := durableRequestTerminalReleaseCommand(execution, *cut)
+			release, err := durableRequestTerminalReleaseCommand(execution, *cut)
 			if err != nil {
 				return DurableRequestTerminalAuthority{}, err
 			}

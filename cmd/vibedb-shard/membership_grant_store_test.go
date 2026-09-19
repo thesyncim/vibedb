@@ -39,7 +39,7 @@ func TestDurableRF3GrantRouterKeepsExactPerGroupFiles(t *testing.T) {
 	second.Route.MembershipGrantPath = filepath.Join(root, "second.grant")
 	manifest := rf3Manifest{Groups: []rf3ManifestGroup{first, second}}
 	sink := &rf3GrantSink{grants: make(map[raftmember.GroupKey]membershipgrant.Grant)}
-	router, err := openDurableRF3GrantRouter(manifest, sink)
+	router, err := openDurableRF3GrantRouter(manifest.groupBundles(), sink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,6 +138,37 @@ func TestDurableRF3GrantInstallerSurvivesUnknownAckAndLearnerHandoff(t *testing.
 	forged.TransitionID[0]++
 	if err = serving.InstallTransitionGrant(forged); !errors.Is(err, errRF3MembershipGrant) {
 		t.Fatalf("conflicting grant = %v", err)
+	}
+}
+
+func TestPreparedRF3GrantRouterRecoversOnlyServingGroups(t *testing.T) {
+	base := serveRF3TestManifest()
+	base.EnrolledTarget = serveRF3TestEnrolledTarget()
+	serving := serveRF3TestGroup()
+	retired := serving
+	retired.GroupID[0]++
+	root := t.TempDir()
+	servingGrant := rf3MembershipGrantFixture(base, serving, 9)
+	retiredGrant := rf3MembershipGrantFixture(base, retired, 11)
+	for name, grant := range map[string]membershipgrant.Grant{"serving": servingGrant, "retired": retiredGrant} {
+		if err := persistRF3MembershipGrant(filepath.Join(root, name+".grant"), grant); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base.Route.Group, base.Route.MembershipGrantPath = serving, filepath.Join(root, "serving.grant")
+	set := preparedRF3Set{groups: []preparedRF3Group{{manifest: base}, {adoptedChild: true}}}
+	for restart := 0; restart < 2; restart++ {
+		sink := &rf3GrantSink{grants: make(map[raftmember.GroupKey]membershipgrant.Grant)}
+		router, err := openPreparedRF3GrantRouter(set, sink)
+		if err != nil || len(sink.grants) != 1 || sink.grants[serving] != servingGrant {
+			t.Fatalf("restart %d serving grants=%v err=%v", restart, sink.grants, err)
+		}
+		if err := router.InstallTransitionGrant(retiredGrant); !errors.Is(err, errRF3MembershipGrant) {
+			t.Fatalf("retired grant restored: %v", err)
+		}
+		if _, found, err := readRF3MembershipGrant(filepath.Join(root, "retired.grant")); err != nil || !found {
+			t.Fatalf("retirement evidence was changed: found=%t err=%v", found, err)
+		}
 	}
 }
 

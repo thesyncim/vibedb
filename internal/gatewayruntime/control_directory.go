@@ -427,7 +427,6 @@ func (runtime *Runtime) openControlDirectory() error {
 			}
 		}
 	}
-	var sourceProof *frontenddrain.PreparedAckCut
 	if source := runtime.config.CanonicalFrontendDrainRuntimeSource; source != nil {
 		proof, sourceErr := source.ReadLatestFrontendDrainCut(runtime.ctx)
 		if sourceErr != nil {
@@ -441,7 +440,24 @@ func (runtime *Runtime) openControlDirectory() error {
 			return fmt.Errorf("install initial canonical frontend drain source proof: %w", bindErr)
 		}
 		runtime.serviceDirectory = bound
-		sourceProof = &proof
+		canonical, readErr := readCanonicalFrontendDrainRuntimeCutFromSourceProof(
+			runtime.ctx, proof, runtime.authority, runtime.config.TLSProfile,
+			runtime.config.Authorization.Generation(),
+		)
+		if readErr != nil {
+			return fmt.Errorf("read initial canonical frontend drain source authority cut: %w", readErr)
+		}
+		// The proof is a floor, not a promise that another frontend cannot
+		// publish while we open. Derive both directories from this one verified
+		// authority cut rather than comparing two independently timed reads.
+		return runtime.installControlDirectoryFromRuntimeCut(canonical)
+	}
+	if coherent, ok := reader.(frontendDrainRuntimeCutReader); ok {
+		source, readErr := coherent.ReadFrontendDrainRuntimeCut(runtime.ctx)
+		if readErr != nil {
+			return fmt.Errorf("read initial canonical frontend drain cut: %w", readErr)
+		}
+		return runtime.installControlDirectoryFromRuntimeCut(source)
 	}
 	cut, err := readGatewayControlDirectoryCut(runtime.ctx, reader)
 	if err != nil {
@@ -452,41 +468,8 @@ func (runtime *Runtime) openControlDirectory() error {
 		return fmt.Errorf("validate initial control directory: %w", err)
 	}
 	runtime.controlDirectory = directory
-	var (
-		serviceCut serviceauthz.ServiceDirectoryCut
-		fullCut    frontenddrain.PreparedAckCut
-	)
-	if sourceProof != nil {
-		source, readErr := readCanonicalFrontendDrainRuntimeCutFromSourceProof(
-			runtime.ctx, *sourceProof, runtime.authority, runtime.config.TLSProfile,
-			runtime.config.Authorization.Generation(),
-		)
-		if readErr != nil {
-			return fmt.Errorf("read initial canonical frontend drain source authority cut: %w", readErr)
-		}
-		if source.Nodes.Revision != cut.Revision || source.Nodes.CatalogGeneration != cut.CatalogGeneration ||
-			!reflect.DeepEqual(source.Nodes.CurrentNodes(), cut.Nodes) {
-			return fmt.Errorf("%w: source authority cut does not match initial control directory", errGatewayControlDirectory)
-		}
-		serviceCut, err = runtimeServiceDirectoryCutFromFrontendDrainRuntimeCut(
-			runtime.ctx, source, runtime.config.TLSProfile, runtime.config.Authorization.Generation())
-		if err == nil {
-			fullCut, err = frontendDrainPreparedAckCutFromRuntimeCut(source, serviceCut)
-		}
-	} else if _, coherent := reader.(frontendDrainRuntimeCutReader); coherent {
-		source, readErr := readCanonicalFrontendDrainRuntimeCut(runtime.ctx, reader, cut)
-		if readErr != nil {
-			return fmt.Errorf("read initial canonical frontend drain cut: %w", readErr)
-		}
-		serviceCut, err = runtimeServiceDirectoryCutFromFrontendDrainRuntimeCut(
-			runtime.ctx, source, runtime.config.TLSProfile, runtime.config.Authorization.Generation())
-		if err == nil {
-			fullCut, err = frontendDrainPreparedAckCutFromRuntimeCut(source, serviceCut)
-		}
-	} else {
-		serviceCut, err = runtimeServiceDirectoryCut(runtime.ctx, reader, cut,
-			runtime.config.TLSProfile, runtime.config.Authorization.Generation())
-	}
+	serviceCut, err := runtimeServiceDirectoryCut(runtime.ctx, reader, cut,
+		runtime.config.TLSProfile, runtime.config.Authorization.Generation())
 	if err != nil {
 		return fmt.Errorf("read initial service directory: %w", err)
 	}
@@ -494,16 +477,7 @@ func (runtime *Runtime) openControlDirectory() error {
 	if err != nil {
 		return fmt.Errorf("validate initial service directory: %w", err)
 	}
-	if fullCut.Valid() {
-		bound, bindErr := bindRuntimeServiceDirectory(runtime.ctx, runtime.config.Transport, fullCut,
-			runtime.config.RequireServiceDirectoryBinding)
-		if bindErr != nil {
-			return bindErr
-		}
-		if bound != nil {
-			runtime.serviceDirectory = bound
-		}
-	} else if runtime.config.RequireServiceDirectoryBinding {
+	if runtime.config.RequireServiceDirectoryBinding {
 		return fmt.Errorf("%w: complete canonical frontend drain cut is required for the local semantic transport", errGatewayControlDirectory)
 	}
 	return nil

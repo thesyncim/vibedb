@@ -32,9 +32,6 @@ func (authority *rf3NativeAuthorities) registerEnrolled(identity raftmember.Runt
 	}}
 	authority.dynamicMu.Lock()
 	defer authority.dynamicMu.Unlock()
-	if _, exists := authority.groups[identity.Group]; exists {
-		return raftservice.ErrServingFence
-	}
 	current := authority.dynamic.Load()
 	count := 0
 	if current != nil {
@@ -46,7 +43,7 @@ func (authority *rf3NativeAuthorities) registerEnrolled(identity raftmember.Runt
 			return raftservice.ErrServingFence
 		}
 	}
-	if count+len(authority.groups) >= maxRF3ManifestGroups {
+	if count >= maxRF3ManifestGroups {
 		return errRF3Serving
 	}
 	next := make(rf3NativeDynamicGroups, count+1)

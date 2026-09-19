@@ -15,7 +15,7 @@ import (
 // The prepared set has already excluded exact durable source retirements.
 // Adopted children retain their separate certified WALs while ordinary moved
 // groups are recovered afterwards from the physical node log.
-func recoverRF3EmptySplitChildren(ctx context.Context, runtime *rf3EmptyNodeRuntime,
+func recoverRF3EmptySplitChildren(ctx context.Context, runtime *rf3NodeRuntime,
 	prepared *preparedRF3Set, inventory *rf3AdoptedGroupInventory, profile *rafttransport.PeerTLS,
 ) error {
 	if ctx == nil || runtime == nil || prepared == nil || inventory == nil || profile == nil ||
@@ -116,7 +116,7 @@ func (inventory *rf3AdoptedGroupInventory) recoveredChildResources(item *prepare
 	return rf3AdoptedGroupEntry{}, rf3SplitChildResources{}, errRF3Serving
 }
 
-func enrollRF3RetainedChildPeers(ctx context.Context, runtime *rf3EmptyNodeRuntime,
+func enrollRF3RetainedChildPeers(ctx context.Context, runtime *rf3NodeRuntime,
 	resources rf3SplitChildResources, receipt [32]byte, profile *rafttransport.PeerTLS, incarnation uint64,
 ) error {
 	if len(resources.Peers) == 0 || receipt == ([32]byte{}) {

@@ -604,7 +604,6 @@ func mergeChildPlanObservations(
 	results []planObservationMemberResult,
 ) (ChildPlanObservation, error) {
 	var merged ChildPlanObservation
-	var stageRaw []byte
 	var failures error
 	successes := 0
 	for index := range results {
@@ -622,11 +621,24 @@ func mergeChildPlanObservations(
 			return ChildPlanObservation{}, err
 		}
 		if len(candidateStage) != 0 {
-			if len(stageRaw) != 0 && !bytes.Equal(stageRaw, candidateStage) {
-				return ChildPlanObservation{}, ErrPlanObservation
+			stage := *cut.Stage
+			// Check every pair, not just the selected floor: an earlier cursor
+			// must not conceal two conflicting receipts or same-index results.
+			for prior := 0; prior < index; prior++ {
+				if results[prior].err == nil && results[prior].cut.Stage != nil {
+					if _, compatible := results[prior].cut.Stage.TailReplayFloor(stage); !compatible {
+						return ChildPlanObservation{}, ErrPlanObservation
+					}
+				}
 			}
-			stageRaw = candidateStage
-			merged.Stage = cloneObservationPointer(cut.Stage)
+			if merged.Stage != nil {
+				var compatible bool
+				stage, compatible = merged.Stage.TailReplayFloor(stage)
+				if !compatible {
+					return ChildPlanObservation{}, ErrPlanObservation
+				}
+			}
+			merged.Stage = &stage
 		}
 		if cut.Runtime == nil {
 			continue

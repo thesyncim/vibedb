@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -254,6 +255,9 @@ func TestReplicatedFrontendDrainPreparedCatalogOnlyAckThenEnforce(t *testing.T) 
 	if err := authority.PutFrontendDrainRecord(ctx, record, 0); err != nil {
 		t.Fatalf("persist prepared drain: %v", err)
 	}
+	if err := authority.EnforceFrontendDrain(ctx, drainID, active.NodeID, active.Incarnation, active.Revision); !errors.Is(err, ErrScalingRevision) {
+		t.Fatalf("unacknowledged receiver cut accepted: %v", err)
+	}
 
 	prepared, err := authority.ReadFrontendDrainRuntimeCut(ctx)
 	if err != nil || prepared.Catalog == nil || len(prepared.DrainFences) != 1 ||
@@ -282,8 +286,47 @@ func TestReplicatedFrontendDrainPreparedCatalogOnlyAckThenEnforce(t *testing.T) 
 	if err := authority.PutFrontendDrainRecord(ctx, acked, record.Revision); err != nil {
 		t.Fatalf("persist catalog-only ACK fence: %v", err)
 	}
-	if err := authority.EnforceFrontendDrain(ctx, drainID, active.NodeID, active.Incarnation, active.Revision); err != nil {
-		t.Fatalf("catalog-only Prepared ACK then Enforce: %v", err)
+	for _, change := range []struct {
+		name  string
+		apply func(*FrontendDrainRecord)
+	}{
+		{"directory revision", func(r *FrontendDrainRecord) { r.ReceiverDirectoryRevision++ }},
+		{"directory digest", func(r *FrontendDrainRecord) { r.ReceiverDirectoryDigest[0]++ }},
+		{"catalog generation", func(r *FrontendDrainRecord) { r.ReceiverCatalogGeneration++ }},
+		{"catalog digest", func(r *FrontendDrainRecord) { r.ReceiverCatalogHeadDigest[0]++ }},
+	} {
+		stale := acked
+		stale.Revision++
+		change.apply(&stale)
+		if err := authority.PutFrontendDrainRecord(ctx, stale, acked.Revision); err != nil {
+			t.Fatal(err)
+		}
+		if err := authority.EnforceFrontendDrain(ctx, drainID, active.NodeID, active.Incarnation, active.Revision); !errors.Is(err, ErrScalingRevision) {
+			t.Fatalf("changed %s accepted: %v", change.name, err)
+		}
+		acked.Revision = stale.Revision + 1
+		if err := authority.PutFrontendDrainRecord(ctx, acked, stale.Revision); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Production authorities attest reads through the durable route tracker.
+	// Enforce already owns authority.mu: rebuilding a runtime cut under that
+	// lock used to deadlock when attestation tried to acquire it again.
+	authority.routeSeed.Store(&replicatedCatalogRouteSeedTracker{
+		immutable: testCatalogAuthoritySnapshot(t, 1), active: ackCut.Catalog,
+		activeExists: true, shutdown: make(chan struct{}),
+	})
+	done := make(chan error, 1)
+	go func() {
+		done <- authority.EnforceFrontendDrain(ctx, drainID, active.NodeID, active.Incarnation, active.Revision)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("catalog-only Prepared ACK then Enforce: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Enforce reentered the catalog authority lock")
 	}
 	draining, err := authority.ReadNode(ctx, active.NodeID, active.Incarnation)
 	if err != nil || draining.Lifecycle != NodeDraining || draining.Revision != active.Revision+1 {
@@ -506,7 +549,9 @@ func TestReplicatedGatewayRetirementRequiresCanonicalChild(t *testing.T) {
 		// invalid state that a legacy/broken writer could leave behind. The
 		// production PutNode path rejects the same gateway transition.
 		if err := authority.putNodeWithExtra(t.Context(), draining, active.Revision, nil, nil,
-			func(context.Context, NodeRecord, NodeRecord) ([]NativeMutation, error) { return nil, nil }); err != nil {
+			func(context.Context, NodeRecord, NodeRecord, uint64, replication.Digest) ([]NativeMutation, error) {
+				return nil, nil
+			}); err != nil {
 			t.Fatal(err)
 		}
 		scanner := frontendDrainStorageScanner{evidence: GatewayParticipantEvidence{

@@ -101,7 +101,7 @@ func TestMembershipRemovalUsesAnyNonSourceLeaderWithCaughtUpTarget(t *testing.T)
 	request := MembershipRequest{Fence: ServingFence{Group: authority.Group}, Kind: MembershipRemoveVoter,
 		TransitionID: authority.TransitionID, MetadataEpoch: authority.MetadataEpoch,
 		CatalogGeneration: authority.CatalogGeneration, ExpectedReplicaSetVersion: 9,
-		SourceMember: 1, TargetMember: 3, TransferTerm: 4}
+		SourceMember: 1, TargetMember: 3}
 	publication := raftmodel.Publication{Applied: 9, ReplicaSetVersion: 9,
 		ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}}
 	status := raftmember.RuntimeStatus{MemberID: 1, LeaderID: 1, Term: 4, Commit: 9, Applied: 9}
@@ -111,15 +111,24 @@ func TestMembershipRemovalUsesAnyNonSourceLeaderWithCaughtUpTarget(t *testing.T)
 		t.Fatalf("leader self-removal = %v", err)
 	}
 	status.MemberID, status.LeaderID = 2, 2
-	wrongTerm := request
-	wrongTerm.TransferTerm++
-	if err := validateMembershipTransition(wrongTerm, authority, publication, status,
-		caught, true); !errors.Is(err, ErrMembershipStale) {
-		t.Fatalf("wrong transfer witness = %v", err)
-	}
+	// A controller replay after another election uses the current serving
+	// fence; the original transfer term is not durable removal authority.
+	status.Term++
 	if err := validateMembershipTransition(request, authority, publication, status,
 		caught, true); err != nil {
 		t.Fatalf("other-leader removal: %v", err)
+	}
+	wrongGrant := request
+	wrongGrant.MetadataEpoch++
+	if err := validateMembershipTransition(wrongGrant, authority, publication, status,
+		caught, true); !errors.Is(err, ErrMembershipUnauthorized) {
+		t.Fatalf("new-term removal with stale grant = %v", err)
+	}
+	wrongVersion := request
+	wrongVersion.ExpectedReplicaSetVersion++
+	if err := validateMembershipTransition(wrongVersion, authority, publication, status,
+		caught, true); !errors.Is(err, ErrMembershipStale) {
+		t.Fatalf("new-term removal with stale membership = %v", err)
 	}
 	status.MemberID, status.LeaderID = 3, 3
 	if err := validateMembershipTransition(request, authority, publication, status,
@@ -137,6 +146,12 @@ func TestMembershipRemovalUsesAnyNonSourceLeaderWithCaughtUpTarget(t *testing.T)
 	if err := validateMembershipTransition(request, authority, publication, status,
 		caught, true); !errors.Is(err, ErrMembershipStale) {
 		t.Fatalf("non-RF4 removal = %v", err)
+	}
+	publication.ConfState.Voters = []uint64{2, 3, 4}
+	publication.ReplicaSetVersion++
+	if err := validateMembershipTransition(request, authority, publication, status,
+		caught, true); !errors.Is(err, ErrMembershipStale) {
+		t.Fatalf("already-applied removal proposed twice = %v", err)
 	}
 }
 

@@ -104,7 +104,7 @@ func (ledger *ackCollectorLedger) ReadRow(
 
 func TestDurableRequestAckCollectorResumesAmbiguousAckAndCollection(t *testing.T) {
 	terminalPlan, head, continuation, pin := terminalCoordinatorFixture(t)
-	terminalLedger := &terminalCoordinatorLedger{head: head, continuation: continuation}
+	terminalLedger := &terminalCoordinatorLedger{pin: pin, head: head, continuation: continuation}
 	coordinator, err := newDurableRequestTerminalCoordinator(terminalLedger, pin)
 	if err != nil {
 		t.Fatal(err)

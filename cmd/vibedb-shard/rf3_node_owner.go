@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftstore"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -22,7 +24,7 @@ type rf3NodeOwner struct {
 	sequencer        *raftstore.NodeSubmissionSequencer
 	checkpoints      *raftmember.NodeCheckpointCoordinator
 	controlMu        sync.Mutex
-	emptyRuntime     *rf3EmptyNodeRuntime
+	emptyRuntime     *rf3NodeRuntime
 	migrationBudget  *migrationbudget.Budget
 	pressureStop     chan struct{}
 	pressureDone     chan struct{}
@@ -38,7 +40,7 @@ type rf3NodeOwner struct {
 // adapter. It never publishes authority; it only exposes the already-created
 // fail-closed reader slot and dynamic receiver registry while this owner is
 // alive. A second runtime cannot replace a live physical-node owner.
-func (owner *rf3NodeOwner) bindEmptyRuntime(runtime *rf3EmptyNodeRuntime) error {
+func (owner *rf3NodeOwner) bindEmptyRuntime(runtime *rf3NodeRuntime) error {
 	if owner == nil || runtime == nil {
 		return raftmember.ErrRuntimeOwnership
 	}
@@ -67,7 +69,7 @@ func (owner *rf3NodeOwner) emptyIntentReader() *nodecontrol.IntentReaderSlot {
 // emptyRuntimeHandle returns the live physical-node runtime while it is
 // owned by this process. Callers use it only to complete a certified learner
 // install; the runtime itself still performs the serialized publication.
-func (owner *rf3NodeOwner) emptyRuntimeHandle() *rf3EmptyNodeRuntime {
+func (owner *rf3NodeOwner) emptyRuntimeHandle() *rf3NodeRuntime {
 	if owner == nil {
 		return nil
 	}
@@ -77,7 +79,7 @@ func (owner *rf3NodeOwner) emptyRuntimeHandle() *rf3EmptyNodeRuntime {
 	return runtime
 }
 
-func (owner *rf3NodeOwner) unbindEmptyRuntime(runtime *rf3EmptyNodeRuntime) {
+func (owner *rf3NodeOwner) unbindEmptyRuntime(runtime *rf3NodeRuntime) {
 	if owner == nil || runtime == nil {
 		return
 	}
@@ -213,6 +215,37 @@ func (owner *rf3NodeOwner) registerAndAdoptDynamic(
 	if err := submission.PrepareRegisterGroupWithSnapshotAt(descriptor, snapshot, expectedIncarnation); err != nil {
 		return nil, err
 	}
+	if existing, found := owner.store.GroupByID(descriptor.GroupID); found {
+		previous, err := existing.Descriptor()
+		if err != nil {
+			return nil, err
+		}
+		if previous.MemberID != descriptor.MemberID || previous.StoreID != descriptor.StoreID {
+			retired, err := owner.descriptorRetired(context.Background(), previous)
+			if err != nil {
+				return nil, err
+			}
+			if !retired {
+				return nil, nodecontrol.ErrConflict
+			}
+			// Withdrawal follows the serialized source close. Its absence
+			// prevents replacing a still-owned runtime, even after its durable
+			// retirement proof has been journaled.
+			runtime := owner.emptyRuntimeHandle()
+			if runtime == nil {
+				return nil, nodecontrol.ErrControl
+			}
+			node := owner.store.NodeIdentity()
+			group := raftmember.GroupKey{ClusterID: node.ClusterID, ClusterIncarnation: node.ClusterIncarnation,
+				TopologyRecoveryEpoch: descriptor.TopologyRecoveryEpoch, ShardIncarnation: descriptor.ShardIncarnation, GroupID: descriptor.GroupID}
+			if _, err := runtime.registry.LocalMember(group); !errors.Is(err, rafttransport.ErrGroupNotFound) {
+				return nil, nodecontrol.ErrConflict
+			}
+			if err := submission.PrepareReplaceGroupWithSnapshotAt(previous, descriptor, snapshot, expectedIncarnation); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if _, err := owner.sequencer.TrySubmit(&submission); err != nil {
 		return nil, err
 	}
@@ -230,6 +263,21 @@ func (owner *rf3NodeOwner) registerAndAdoptDynamic(
 		return nil, raftmember.ErrNodePersistenceBinding
 	}
 	return owner.adoptRegistered(group, database, apply)
+}
+
+func (owner *rf3NodeOwner) descriptorRetired(ctx context.Context, descriptor raftstore.GroupDescriptor) (bool, error) {
+	runtime := owner.emptyRuntimeHandle()
+	if runtime == nil || runtime.actionJournal == nil {
+		return false, nodecontrol.ErrControl
+	}
+	records, err := runtime.actionJournal.SourceRetirements(ctx)
+	if err != nil {
+		return false, err
+	}
+	node := owner.store.NodeIdentity()
+	group := raftmember.GroupKey{ClusterID: node.ClusterID, ClusterIncarnation: node.ClusterIncarnation,
+		TopologyRecoveryEpoch: descriptor.TopologyRecoveryEpoch, ShardIncarnation: descriptor.ShardIncarnation, GroupID: descriptor.GroupID}
+	return rf3ReplicaSourceRetired(records, group, descriptor.MemberID, descriptor.StoreID, descriptor.AllocationGeneration), nil
 }
 
 // adoptRegistered is the node-log counterpart to adopt. The group registration

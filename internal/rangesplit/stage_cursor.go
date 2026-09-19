@@ -124,6 +124,56 @@ func (c ChildStageCursor) LastBatchDigest() [sha256.Size]byte {
 	return c.lastBatchDigest
 }
 
+// CanApplyTailBatch permits only the next authenticated entry, including an
+// exact pending receipt after a crash. It never permits a gap or another batch
+// to replace a durable receipt. The caller must verify the batch itself first.
+func (c ChildStageCursor) CanApplyTailBatch(batch TailBatch) bool {
+	return batch.Digest != ([sha256.Size]byte{}) &&
+		(c.pendingBatchDigest == ([sha256.Size]byte{}) || c.pendingBatchDigest == batch.Digest) &&
+		c.child == batch.Child && c.planDigest == batch.PlanDigest &&
+		c.placementDigest == batch.PlacementDigest && c.artifactDigest == batch.ChildBaseDigest &&
+		c.SourceCut().BaseDigest == batch.SourceBaseDigest && cursorImmediatelyPrecedesBatch(c, batch)
+}
+
+// TailReplayFloor combines authenticated observations of the same staged
+// artifact. One batch may be partially acknowledged across replicas; select
+// its predecessor only to schedule replay. This is not apply or cutover
+// authority: each receiver must verify the source batch against its own cursor.
+func (c ChildStageCursor) TailReplayFloor(other ChildStageCursor) (ChildStageCursor, bool) {
+	if c == other {
+		return c, true
+	}
+	if c.phase < ChildStageTail || other.phase < ChildStageTail ||
+		c.child != other.child || c.planDigest != other.planDigest ||
+		c.placementDigest != other.placementDigest || c.artifactDigest != other.artifactDigest ||
+		c.headerDigest != other.headerDigest || c.lastChunkDigest != other.lastChunkDigest ||
+		c.artifactChunks != other.artifactChunks || c.artifactRows != other.artifactRows ||
+		c.artifactPayload != other.artifactPayload || c.artifactOffset != other.artifactOffset ||
+		c.baseDigest != other.baseDigest {
+		return ChildStageCursor{}, false
+	}
+	if c.applied == other.applied {
+		left, right := c, other
+		left.pendingBatchDigest, right.pendingBatchDigest = [sha256.Size]byte{}, [sha256.Size]byte{}
+		if left != right || (c.pendingBatchDigest != ([sha256.Size]byte{}) && other.pendingBatchDigest != ([sha256.Size]byte{})) {
+			return ChildStageCursor{}, false
+		}
+		if c.pendingBatchDigest != ([sha256.Size]byte{}) {
+			return c, true
+		}
+		return other, true
+	}
+	if c.applied > other.applied {
+		c, other = other, c
+	}
+	if other.applied-c.applied != 1 || c.phase != ChildStageTail || c.term > other.term ||
+		c.routeGeneration > other.routeGeneration || other.lastBatchDigest == ([sha256.Size]byte{}) ||
+		(c.pendingBatchDigest != ([sha256.Size]byte{}) && c.pendingBatchDigest != other.lastBatchDigest) {
+		return ChildStageCursor{}, false
+	}
+	return c, true
+}
+
 // ResumesTailBatch reports whether c is the exact durable preimage receipt for
 // batch and before. It grants no authority to replay a different entry.
 func (c ChildStageCursor) ResumesTailBatch(before ChildStageCursor, batch TailBatch) bool {

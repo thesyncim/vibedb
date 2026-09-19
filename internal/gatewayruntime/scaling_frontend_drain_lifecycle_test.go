@@ -13,13 +13,29 @@ import (
 
 type lifecycleBarrierDrainTest struct {
 	prepareCalls int
+	prepareErr   error
 	ackNodes     []gateway.NodeLifecycle
 	failTerminal bool
 }
 
 func (drain *lifecycleBarrierDrainTest) PrepareFrontendDrain(context.Context, gateway.NodeRecord) error {
 	drain.prepareCalls++
-	return nil
+	return drain.prepareErr
+}
+
+func TestScalingRetirementPreservesPreparationFailureBeforePlanning(t *testing.T) {
+	directory, drain, intent := lifecycleBarrierRetirementFixture(t)
+	drain.prepareErr = errors.New("prepared receiver is unreachable")
+	controller := &ScalingController{directory: directory, writer: directory, drain: drain}
+	done, err := controller.reconcileRetirement(t.Context(), intent)
+	if done || !errors.Is(err, drain.prepareErr) {
+		t.Fatalf("preparation must stop this pass: done=%t err=%v", done, err)
+	}
+	if directory.node.Lifecycle != gateway.NodeActive || len(directory.intent.Blockers) != 1 ||
+		directory.intent.Blockers[0].Code != "frontend_drain_unavailable" ||
+		directory.intent.Blockers[0].Detail != drain.prepareErr.Error() {
+		t.Fatalf("preparation failure lost: node=%+v blockers=%+v", directory.node, directory.intent.Blockers)
+	}
 }
 
 func (drain *lifecycleBarrierDrainTest) AcknowledgeFrontendDrainLifecycle(

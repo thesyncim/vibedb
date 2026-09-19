@@ -57,6 +57,7 @@ type Submission struct {
 	groups       [MaxPersistGroupBatches]uint64
 	incarnations [MaxPersistGroupBatches]GroupIncarnation
 	descriptor   GroupDescriptor
+	replaces     *GroupDescriptor
 	// registerIncarnation is the exact node incarnation reserved by a
 	// dynamically enrolled group. Zero keeps the historical registration
 	// grammar, which starts a fresh group at incarnation one.
@@ -246,7 +247,7 @@ func (s *Submission) PrepareRegisterGroup(descriptor GroupDescriptor) error {
 		s.invalidatePrepare()
 		return ErrInvalid
 	}
-	s.descriptor = descriptor
+	s.descriptor, s.replaces = descriptor, nil
 	s.registerIncarnation = 1
 	return nil
 }
@@ -277,6 +278,20 @@ func (s *Submission) PrepareRegisterGroupWithSnapshotAt(
 		return err
 	}
 	s.snapshot, s.registerIncarnation = snapshot, incarnation
+	return nil
+}
+
+// PrepareReplaceGroupWithSnapshotAt accepts a new replica only against the
+// exact previous local descriptor. The caller proves durable source retirement;
+// the store atomically fences its old log and installs the certified checkpoint.
+func (s *Submission) PrepareReplaceGroupWithSnapshotAt(previous, descriptor GroupDescriptor, snapshot *pb.Snapshot, incarnation uint64) error {
+	if previous.LogKey == 0 || !replacementDescriptor(previous, descriptor) {
+		return ErrIdentityMismatch
+	}
+	if err := s.PrepareRegisterGroupWithSnapshotAt(descriptor, snapshot, incarnation); err != nil {
+		return err
+	}
+	s.replaces = &previous
 	return nil
 }
 
@@ -956,7 +971,7 @@ func (q *NodeSubmissionSequencer) observeControlPersist(s *Submission) (err erro
 	case submissionPersistIncarnations:
 		return q.store.persistIncarnationsSequenced(s.incarnations[:s.count])
 	case submissionRegisterGroup:
-		incarnation, registerErr := q.store.registerGroupSequencedAt(s.descriptor, s.snapshot, s.registerIncarnation)
+		incarnation, registerErr := q.store.registerGroupSequencedAt(s.descriptor, s.snapshot, s.registerIncarnation, s.replaces)
 		if registerErr == nil {
 			s.incarnations[0] = incarnation
 			d, ok := q.store.descriptorForLogKey(incarnation.GroupID)

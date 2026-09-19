@@ -83,7 +83,7 @@ func TestRF3DynamicLearnerRecoveryBoundsLiveGroupsInsteadOfHistory(t *testing.T)
 			t.Fatal(err)
 		}
 	}
-	factory := &rf3DynamicLearnerFactory{root: root, runtime: &rf3EmptyNodeRuntime{reader: new(nodecontrol.IntentReaderSlot)}}
+	factory := &rf3DynamicLearnerFactory{root: root, runtime: &rf3NodeRuntime{reader: new(nodecontrol.IntentReaderSlot)}}
 	if err := factory.Recover(t.Context()); err != nil {
 		t.Fatalf("historical reservations prevented startup: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestRF3DynamicLearnerRecoverySkipsOnlyCertifiedMissingHistory(t *testing.T)
 			})); err != nil {
 				t.Fatal(err)
 			}
-			factory := &rf3DynamicLearnerFactory{root: root, runtime: &rf3EmptyNodeRuntime{reader: slot}}
+			factory := &rf3DynamicLearnerFactory{root: root, runtime: &rf3NodeRuntime{reader: slot}}
 			if err := factory.Recover(t.Context()); !errors.Is(err, test.want) {
 				t.Fatalf("recovery=%v want=%v", err, test.want)
 			}
@@ -208,7 +208,7 @@ func TestRF3DynamicLearnerRecoveryRetriesTransientBootstrapRead(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	factory := &rf3DynamicLearnerFactory{root: root, runtime: &rf3EmptyNodeRuntime{reader: slot}}
+	factory := &rf3DynamicLearnerFactory{root: root, runtime: &rf3NodeRuntime{reader: slot}}
 	if err := factory.Recover(t.Context()); err != nil {
 		t.Fatalf("transient bootstrap read prevented recovery: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestRF3DynamicLearnerRecoveryDoesNotRetryDefinitiveReadFailure(t *testing.T
 	})); err != nil {
 		t.Fatal(err)
 	}
-	factory := &rf3DynamicLearnerFactory{runtime: &rf3EmptyNodeRuntime{reader: slot}}
+	factory := &rf3DynamicLearnerFactory{runtime: &rf3NodeRuntime{reader: slot}}
 	_, err := factory.readEnrollmentRecovery(t.Context(), [32]byte{1})
 	if !errors.Is(err, nodecontrol.ErrBootstrapReadStale) || calls != 1 {
 		t.Fatalf("definitive read failure retried or changed: err=%v calls=%d", err, calls)
@@ -245,7 +245,7 @@ func TestRF3DynamicLearnerRecoveryStopsOnContextCancellation(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	factory := &rf3DynamicLearnerFactory{runtime: &rf3EmptyNodeRuntime{reader: slot}}
+	factory := &rf3DynamicLearnerFactory{runtime: &rf3NodeRuntime{reader: slot}}
 	_, err := factory.readEnrollmentRecovery(ctx, [32]byte{1})
 	if !errors.Is(err, context.Canceled) || calls != 1 {
 		t.Fatalf("cancellation was retried or changed: err=%v calls=%d", err, calls)
@@ -385,6 +385,53 @@ func TestRF3RecoveredRosterUsesLocalMembershipAndCurrentPlacement(t *testing.T) 
 	spec := nodecontrol.PreparationSpec{InitialVoters: [3]nodecontrol.PreparationMember{
 		{MemberID: 1, Node: intent.Source.Node}, {MemberID: 2, Node: rafttransport.NodeID{2}}, {MemberID: 3, Node: rafttransport.NodeID{3}},
 	}, Target: nodecontrol.PreparationMember{MemberID: 4, Node: intent.Target.Node}}
+	cut := rf3RecoveryServingCut(t, intent)
+	for _, conf := range []*pb.ConfState{{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}, {Voters: []uint64{1, 2, 3, 4}}, {Voters: []uint64{2, 3, 4}}} {
+		publication := raftmodel.Publication{Applied: 25, ReplicaSetVersion: 10, ConfState: conf}
+		roster, command, err := rf3RecoveredRoster(spec, descriptor, publication, intent.ExpectedCommand, &cut, membershipgrant.Grant{})
+		if err != nil || command != cut.CurrentRoute.Serving.Command {
+			t.Fatalf("recover roster=%+v command=%+v err=%v", roster, command, err)
+		}
+		var restored pb.ConfState
+		for _, member := range roster {
+			if member.ReplicaSetVersion != publication.ReplicaSetVersion {
+				t.Fatal("catalog membership replaced durable local publication")
+			}
+			switch member.Role {
+			case rafttransport.MemberVoter:
+				restored.Voters = append(restored.Voters, member.MemberID)
+			case rafttransport.MemberLearner:
+				restored.Learners = append(restored.Learners, member.MemberID)
+			}
+		}
+		if err := restored.Equivalent(conf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A removed member's physical node returns as a distinct enrolled replica.
+	// Keeping the original mapping would make this valid cut unstartable.
+	returning := cut.CurrentRoute.Serving.Replicas[0]
+	returning.Member, returning.Node, returning.StoreID = 5, intent.Source.Node, [16]byte{15}
+	cut.CurrentRoute.HasEnrolledTarget, cut.CurrentRoute.EnrolledTarget = true, returning
+	node := cut.CurrentNodes[0]
+	node.NodeID = returning.Node
+	cut.CurrentNodes = append(cut.CurrentNodes, node)
+	publication := raftmodel.Publication{Applied: 30, ReplicaSetVersion: 11, ConfState: &pb.ConfState{Voters: []uint64{2, 3, 4}, Learners: []uint64{5}}}
+	roster, _, err := rf3RecoveredRoster(spec, descriptor, publication, intent.ExpectedCommand, &cut, membershipgrant.Grant{})
+	if err != nil || len(roster) != 4 {
+		t.Fatalf("returning node roster=%+v err=%v", roster, err)
+	}
+	seen := make(map[rafttransport.NodeID]bool)
+	for _, member := range roster {
+		if member.MemberID == 1 || seen[member.Node] {
+			t.Fatalf("obsolete physical membership: %+v", roster)
+		}
+		seen[member.Node] = true
+	}
+}
+
+func rf3RecoveryServingCut(t *testing.T, intent gateway.GroupEnrollmentIntent) nodecontrol.BootstrapReadReply {
+	t.Helper()
 	cut := nodecontrol.BootstrapReadReply{Nonce: [16]byte{1}, Operation: nodecontrol.OpReadOwnEnrollmentRecovery,
 		PhysicalNode: intent.Target.Node, Incarnation: intent.Target.NodeIncarnation, IntentID: intent.IntentID, Intent: intent, IntentDigest: intent.Digest(),
 		DirectoryCutRevision: 1, DirectoryCutDigest: replication.Digest{1}, CatalogGeneration: 1, CatalogHeadDigest: replication.Digest{2}, EnrollmentDirectoryDigest: replication.Digest{3},
@@ -413,26 +460,5 @@ func TestRF3RecoveredRosterUsesLocalMembershipAndCurrentPlacement(t *testing.T) 
 	if !cut.TargetServing() {
 		t.Fatal("invalid current placement fixture")
 	}
-	for _, conf := range []*pb.ConfState{{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}, {Voters: []uint64{1, 2, 3, 4}}, {Voters: []uint64{2, 3, 4}}} {
-		publication := raftmodel.Publication{Applied: 25, ReplicaSetVersion: 10, ConfState: conf}
-		roster, command, err := rf3RecoveredRoster(spec, descriptor, publication, intent.ExpectedCommand, &cut, membershipgrant.Grant{})
-		if err != nil || command != cut.CurrentRoute.Serving.Command {
-			t.Fatalf("recover roster=%+v command=%+v err=%v", roster, command, err)
-		}
-		var restored pb.ConfState
-		for _, member := range roster {
-			if member.ReplicaSetVersion != publication.ReplicaSetVersion {
-				t.Fatal("catalog membership replaced durable local publication")
-			}
-			switch member.Role {
-			case rafttransport.MemberVoter:
-				restored.Voters = append(restored.Voters, member.MemberID)
-			case rafttransport.MemberLearner:
-				restored.Learners = append(restored.Learners, member.MemberID)
-			}
-		}
-		if err := restored.Equivalent(conf); err != nil {
-			t.Fatal(err)
-		}
-	}
+	return cut
 }

@@ -10,11 +10,13 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicaaction"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -604,7 +606,8 @@ func initializeRF3CatalogGenesisWithDependencies(
 	}
 	if state.Identity.Group != identity.Group || state.Identity.AllocationGeneration != identity.AllocationGeneration ||
 		state.Identity.MemberID != identity.MemberID || state.Identity.StoreID != identity.StoreID ||
-		state.Identity.NodeIncarnation != identity.NodeIncarnation || state.Command != command {
+		state.Identity.NodeIncarnation != identity.NodeIncarnation ||
+		!gateway.CatalogCommandProgression(command, state.Command) {
 		return errRF3CatalogGenesis
 	}
 	if state.Status.LeaderID != identity.MemberID {
@@ -832,6 +835,7 @@ func startRF3CatalogGenesis(
 	parent context.Context,
 	config *rf3CatalogGenesisConfig,
 	owners *raftservice.ExecutionOwners,
+	journal *replicaaction.FileJournal,
 	localNode rafttransport.NodeID,
 	identity raftmember.RuntimeIdentity,
 	command raftservice.CommandFence,
@@ -840,8 +844,26 @@ func startRF3CatalogGenesis(
 		return nil
 	}
 	done := make(chan error, 1)
-	go func() { done <- runRF3CatalogGenesis(parent, config, owners, localNode, identity, command) }()
+	go func() {
+		err := runRF3CatalogGenesis(parent, config, owners, localNode, identity, command)
+		done <- finishRF3CatalogGenesis(parent, journal, identity, err)
+	}()
 	return done
+}
+
+func finishRF3CatalogGenesis(ctx context.Context, journal *replicaaction.FileJournal, identity raftmember.RuntimeIdentity, err error) error {
+	if !errors.Is(err, multiraft.ErrGroupNotFound) {
+		return err
+	}
+	// A follower may never lead before a catalog self-move retires its local
+	// owner. Only the durable removal proof for this exact storage identity
+	// ends that initializer; a missing group alone remains a node failure.
+	records, readErr := journal.SourceRetirements(ctx)
+	if readErr == nil && rf3ReplicaSourceRetired(records, identity.Group, identity.MemberID,
+		identity.StoreID, identity.AllocationGeneration) {
+		return nil
+	}
+	return errors.Join(err, readErr)
 }
 
 // runRF3CatalogGenesis keeps the private initializer live across elections.
@@ -884,6 +906,7 @@ func runRF3CatalogGenesis(
 func rf3CatalogGenesisRetryable(err error) bool {
 	return errors.Is(err, errRF3CatalogGenesisNotLeader) ||
 		errors.Is(err, raftmodel.ErrNotLeader) ||
+		errors.Is(err, raftmodel.ErrReadLeadershipLost) ||
 		errors.Is(err, raftservice.ErrOwnerClosed) ||
 		errors.Is(err, raftservice.ErrOutcomeUnknown)
 }

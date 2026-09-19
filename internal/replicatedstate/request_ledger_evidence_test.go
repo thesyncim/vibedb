@@ -51,7 +51,7 @@ func requestLedgerPreparedForExecutionPinRows(t testing.TB) (
 		TargetAuthorityRoot:       executionpin.Digest(requestLedgerStateTestDigest("participant authority")),
 		TargetCount:               2,
 		ExecutionContractDigest:   executionpin.Digest(requestLedgerStateTestDigest("execution contract")),
-		LedgerHomeGroup:           executionpin.ID{0x41},
+		LedgerHomeGroup:           executionpin.ID(testBinding().GroupID),
 	}
 	pinDigest, err := executionpin.BindingDigest(binding)
 	if err != nil {
@@ -361,7 +361,10 @@ func TestRequestLedgerSchemaReleaseEvidenceBindsFullExecutionPinProof(t *testing
 		PrepareTerminalDigest:    executionpin.Digest(prepared.PreparedDigest),
 		AcquireCertificateDigest: acquireDigest,
 	}
-	releaseBytes := executionPinCommand(fixture.binding, client, 2, 3, release)
+	releaseBytes, err := executionpin.AppendCommand(nil, release)
+	if err != nil {
+		t.Fatal(err)
+	}
 	intent, err := requestledger.NewSchemaPinRelease(
 		head, prepared, head.Revision+1, releaseBytes,
 	)
@@ -383,7 +386,10 @@ func TestRequestLedgerSchemaReleaseEvidenceBindsFullExecutionPinProof(t *testing
 			if err != nil {
 				t.Fatal(err)
 			}
-			command := executionPinCommand(fixture.binding, client, 2, 3, foreign)
+			command, err := executionpin.AppendCommand(nil, foreign)
+			if err != nil {
+				t.Fatal(err)
+			}
 			row, err := requestledger.NewSchemaPinRelease(head, prepared, head.Revision+1, command)
 			if err != nil {
 				t.Fatal(err)
@@ -393,16 +399,24 @@ func TestRequestLedgerSchemaReleaseEvidenceBindsFullExecutionPinProof(t *testing
 			}
 		})
 	}
-	if _, err = fixture.machine.ApplyNormal(normalMeta(4), releaseBytes); err != nil {
+	record, found, err := fixture.machine.LookupExecutionPin(fullPin)
+	if err != nil || !found {
 		t.Fatal(err)
 	}
-	settlement, err := fixture.machine.LookupCompletion(releaseBytes)
+	authority, err := executionpin.ReleaseAuthorityDigest(releaseBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	released, err := requestledger.RecordVerifiedSchemaPinReleased(
-		intent, intent.Revision+1, settlement.Bytes,
-	)
+	transition := executionpin.Apply(record, true, release, 4, authority, executionpin.Digest{9})
+	proof, err := executionpin.CompletionFromRecord(executionpin.OperationRelease, transition.Record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofBytes, err := executionpin.AppendCompletion(nil, proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, released, err := requestledger.CompleteSchemaPinRelease(head, prepared, intent, proofBytes)
 	if err != nil || !requestLedgerSchemaReleaseEvidenceAvailable(released) {
 		t.Fatalf("schema release completion evidence = %v", err)
 	}
@@ -412,11 +426,10 @@ func TestRequestLedgerSchemaReleaseEvidenceBindsFullExecutionPinProof(t *testing
 		t.Fatal("schema release accepted another execution binding digest")
 	}
 	wrongCompletion := released
-	acquireSettlement, err := fixture.machine.LookupCompletion(acquireBytes)
+	wrongCompletion.Completion, err = executionpin.AppendCompletion(nil, acquireProof)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrongCompletion.Completion = acquireSettlement.Bytes
 	if requestLedgerSchemaReleaseEvidenceAvailable(wrongCompletion) {
 		t.Fatal("schema release accepted an acquire proof as terminal release evidence")
 	}

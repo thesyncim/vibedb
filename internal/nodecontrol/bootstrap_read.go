@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/membershipgrant"
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibejson"
@@ -145,6 +147,9 @@ type BootstrapReadReply struct {
 	// CurrentNodes supplies the physical identities for the bounded current
 	// roster in the same order, followed by its optional enrolled target.
 	CurrentNodes []gateway.NodeRecord `json:"current_nodes,omitempty"`
+	// CurrentGrant is the current catalog authority, including witnessed
+	// absence. A local historical grant file cannot override this recovery cut.
+	CurrentGrant *membershipgrant.Grant `json:"current_grant,omitempty"`
 }
 
 func (reply BootstrapReadReply) valid() bool {
@@ -161,7 +166,7 @@ func (reply BootstrapReadReply) valid() bool {
 	}
 	if reply.IntentMissing {
 		return reply.Operation == OpReadOwnEnrollmentRecovery && reply.Intent == (gateway.GroupEnrollmentIntent{}) &&
-			reply.IntentDigest == (replication.Digest{}) && reply.CurrentRoute == nil && len(reply.CurrentNodes) == 0
+			reply.IntentDigest == (replication.Digest{}) && reply.CurrentRoute == nil && len(reply.CurrentNodes) == 0 && reply.CurrentGrant == nil
 	}
 	return reply.Intent.Valid() && reply.Intent.State != gateway.EnrollmentCancelled &&
 		reply.Intent.IntentID == reply.IntentID && reply.Intent.Target.Node == reply.PhysicalNode &&
@@ -177,7 +182,10 @@ func (reply BootstrapReadReply) EnrollmentMissing() bool {
 
 func (reply BootstrapReadReply) validRecoveryRoute() bool {
 	if reply.CurrentRoute == nil {
-		return len(reply.CurrentNodes) == 0
+		return len(reply.CurrentNodes) == 0 && reply.CurrentGrant == nil
+	}
+	if grant := reply.CurrentGrant; grant != nil && (!grant.Valid() || grant.Group != reply.Intent.Group || grant.CatalogGeneration > reply.CatalogGeneration) {
+		return false
 	}
 	if reply.Operation != OpReadOwnEnrollmentRecovery {
 		return false
@@ -394,6 +402,7 @@ type BootstrapReadAuthority interface {
 
 type bootstrapRecoveryAuthority interface {
 	ReadReplicatedCatalogHead(context.Context) (*gateway.Snapshot, replication.Digest, error)
+	ReadMembershipGrant(context.Context, raftmember.GroupKey) (membershipgrant.Grant, bool, error)
 }
 
 // EnrollmentRecoveryReader returns the intent and its current placement from
@@ -523,6 +532,7 @@ func (service *BootstrapReadService) readStable(
 	}
 	var currentRoute *gateway.ReplicatedMembershipRoute
 	var currentNodes []gateway.NodeRecord
+	var currentGrant *membershipgrant.Grant
 	var catalogGeneration uint64
 	var catalogDigest replication.Digest
 	if request.Operation == OpReadOwnEnrollmentRecovery {
@@ -538,6 +548,13 @@ func (service *BootstrapReadService) readStable(
 		route, found := snapshot.ResolveReplicatedMembershipRoute(intent.Distribution, intent.Shard, nil)
 		if !intentMissing && found && route.Serving.Group == intent.Group && route.Serving.AllocationGeneration == uint64(intent.AllocationGeneration) {
 			currentRoute = &route
+			grant, found, err := authority.ReadMembershipGrant(ctx, intent.Group)
+			if err != nil {
+				return BootstrapReadReply{}, fmt.Errorf("bootstrap current membership grant: %w", err)
+			}
+			if found {
+				currentGrant = &grant
+			}
 			replicas := slices.Clone(route.Serving.Replicas)
 			if route.HasEnrolledTarget {
 				replicas = append(replicas, route.EnrolledTarget)
@@ -606,6 +623,12 @@ func (service *BootstrapReadService) readStable(
 	if err != nil || verification != evidence {
 		return BootstrapReadReply{}, fmt.Errorf("bootstrap reference scan changed: %w", ErrBootstrapReadStale)
 	}
+	if currentRoute != nil {
+		grant, found, err := service.authority.(bootstrapRecoveryAuthority).ReadMembershipGrant(ctx, intent.Group)
+		if err != nil || found != (currentGrant != nil) || found && grant != *currentGrant {
+			return BootstrapReadReply{}, fmt.Errorf("bootstrap membership grant changed: %w", errors.Join(ErrBootstrapReadStale, err))
+		}
+	}
 	reply := BootstrapReadReply{
 		Nonce: request.Nonce, Operation: request.Operation, PhysicalNode: request.PhysicalNode,
 		Incarnation: request.Incarnation, IntentID: request.IntentID, Intent: finalIntent,
@@ -615,6 +638,7 @@ func (service *BootstrapReadService) readStable(
 		EnrollmentDirectoryDigest: evidence.EnrollmentDirectoryDigest,
 		CurrentRoute:              currentRoute,
 		CurrentNodes:              currentNodes,
+		CurrentGrant:              currentGrant,
 		IntentMissing:             intentMissing,
 	}
 	if intentMissing {

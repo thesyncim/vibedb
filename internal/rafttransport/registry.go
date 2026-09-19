@@ -589,6 +589,28 @@ func NewStaticRegistryFromAuthority(
 	return NewStaticRegistryWithDirectory(local, members, peers, directoryRevision, limits)
 }
 
+// NewNodeRegistryWithDirectory installs initial groups into the same mutable
+// inventory used for later adoption. Retiring an initial replica can therefore
+// withdraw its exact mapping before the node receives a new member of that
+// group. Validation and all subsequent publications use the ordinary registry
+// rules; there is no immutable bootstrap roster to resurrect.
+func NewNodeRegistryWithDirectory(local NodeID, members []Member, peers []PhysicalPeer,
+	directoryRevision uint64, limits Limits,
+) (*StaticRegistry, error) {
+	registry, err := NewStaticRegistryWithDirectory(local, members, peers, directoryRevision, limits)
+	if err != nil {
+		return nil, err
+	}
+	current := cloneDynamicEnrollment(registry.dynamic.Load())
+	current.nodes, current.members = registry.nodes, registry.members
+	current.localMembers, current.digests, current.authorities = registry.localMembers, registry.digests, registry.authorities
+	current.memberCount = len(registry.nodes)
+	registry.nodes, registry.members, registry.physical = nil, nil, nil
+	registry.localMembers, registry.digests, registry.authorities = nil, nil, nil
+	registry.dynamic.Store(current)
+	return registry, nil
+}
+
 // NewEmptyRegistry creates a node-scoped registry before any Raft group is
 // known.  The trust domain is explicit because there is no roster from which
 // to infer it.  The local physical identity is trusted as the process owner;
@@ -1088,9 +1110,9 @@ func (registry *StaticRegistry) enrollMemberWithCommitContext(
 	if view == nil || intent.Member.ReplicaSetVersion > view.version {
 		return ErrPeerConflict
 	}
-	memberKey := memberKey{group: intent.Group, memberID: intent.Member.MemberID}
-	nodeKey := nodeKey{group: intent.Group, node: intent.Peer.NodeID}
-	if registry.memberIsRetired(current, memberKey) {
+	enrollmentKey := memberKey{group: intent.Group, memberID: intent.Member.MemberID}
+	enrollmentNodeKey := nodeKey{group: intent.Group, node: intent.Peer.NodeID}
+	if registry.memberIsRetired(current, enrollmentKey) {
 		return ErrEnrollmentConflict
 	}
 	if existing, ok := registry.memberRecord(intent.Group, intent.Member.MemberID, current); ok {
@@ -1142,7 +1164,7 @@ func (registry *StaticRegistry) enrollMemberWithCommitContext(
 			certifiedPeer = peer
 		}
 		next.physical[intent.Peer.NodeID] = certifiedPeer
-		next.nodes[memberKey] = memberRecord{
+		next.nodes[enrollmentKey] = memberRecord{
 			node: intent.Peer.NodeID, enrollmentDigest: intent.Digest,
 			revision: intent.DirectoryRevision,
 		}
@@ -1156,15 +1178,17 @@ func (registry *StaticRegistry) enrollMemberWithCommitContext(
 		registry.dynamic.Store(next)
 		return nil
 	}
-	if expected, ok := registry.rosterDigest(intent.Group); !ok ||
-		expected != intent.ExpectedRosterDigest {
+	base, successor := registry.certifiedEnrollmentBase(intent.Group, intent.Grant, intent.ExpectedRosterDigest)
+	if expected, ok := registry.rosterDigest(intent.Group); !successor && (!ok || expected != intent.ExpectedRosterDigest) {
 		return ErrEnrollmentConflict
 	}
 	if intent.DirectoryRevision != registry.currentDirectoryRevision(current) {
 		return ErrPeerConflict
 	}
-	if _, err := registry.Member(intent.Group, intent.Peer.NodeID); err == nil {
-		return ErrDuplicateNode
+	if oldMember, err := registry.Member(intent.Group, intent.Peer.NodeID); err == nil {
+		if !successor || view.roles[oldMember] != MemberEnrolled {
+			return ErrDuplicateNode
+		}
 	}
 	if _, ok := registry.localMembers[intent.Group]; ok && intent.Peer.NodeID == registry.local {
 		return ErrLocalMember
@@ -1172,8 +1196,13 @@ func (registry *StaticRegistry) enrollMemberWithCommitContext(
 	if _, ok := current.localMembers[intent.Group]; ok && intent.Peer.NodeID == registry.local {
 		return ErrLocalMember
 	}
-	if len(registry.membersForGroup(intent.Group, current)) >= raftmodel.MaxConfStateMembers ||
-		registry.effectiveMemberCount(current) >= registry.limits.MaxMembers {
+	oldMembers := registry.membersForGroup(intent.Group, current)
+	removed := 0
+	if successor {
+		removed = len(oldMembers) - len(base)
+	}
+	if len(oldMembers)-removed >= raftmodel.MaxConfStateMembers ||
+		registry.effectiveMemberCount(current)-removed >= registry.limits.MaxMembers {
 		return ErrRegistryBound
 	}
 	if existingPeer, ok := registry.physicalPeerFrom(current, intent.Peer.NodeID); ok {
@@ -1195,6 +1224,26 @@ func (registry *StaticRegistry) enrollMemberWithCommitContext(
 		return ErrRegistryBound
 	}
 	next := cloneDynamicEnrollment(current)
+	if successor {
+		// The authenticated successor names the exact current RF3. Older
+		// mappings and their one previous handoff have no remaining role.
+		for _, member := range oldMembers {
+			if view.roles[member.MemberID] != MemberEnrolled {
+				continue
+			}
+			key := memberKey{group: intent.Group, memberID: member.MemberID}
+			delete(next.nodes, key)
+			delete(next.members, nodeKey{group: intent.Group, node: member.Node})
+			if _, immutable := registry.nodes[key]; immutable {
+				next.retiredMembers[key] = struct{}{}
+				next.retiredCount++
+			} else {
+				next.memberCount--
+			}
+		}
+		delete(next.legacyDigests, intent.Group)
+		delete(next.legacyMembers, intent.Group)
+	}
 	if next.physical == nil {
 		next.physical = make(map[NodeID]PhysicalPeer)
 	}
@@ -1208,12 +1257,15 @@ func (registry *StaticRegistry) enrollMemberWithCommitContext(
 		peer = existingPeer
 	}
 	next.physical[intent.Peer.NodeID] = peer
-	next.nodes[memberKey] = memberRecord{
+	next.nodes[enrollmentKey] = memberRecord{
 		node: intent.Peer.NodeID, enrollmentDigest: intent.Digest,
 		revision: intent.DirectoryRevision,
 	}
-	next.members[nodeKey] = intent.Member.MemberID
+	next.members[enrollmentNodeKey] = intent.Member.MemberID
 	priorMembers := registry.membersForGroup(intent.Group, current)
+	if successor {
+		priorMembers = base
+	}
 	allMembers := slices.Clone(priorMembers)
 	allMembers = append(allMembers, intent.Member)
 	slices.SortFunc(allMembers, compareMembers)
@@ -2870,8 +2922,35 @@ func (registry *StaticRegistry) AcceptsEnrollmentRosterDigest(
 	if registry == nil || digest == ([sha256.Size]byte{}) || targetMember == 0 || targetNode == (NodeID{}) {
 		return false
 	}
+	if known, err := registry.Node(group, targetMember); err == nil && known != targetNode {
+		return false
+	}
 	if registry.AcceptsRosterDigest(group, digest) {
 		return true
+	}
+	view, ok := registry.currentAuthority(group)
+	if ok && view != nil && len(view.roles) == 3 && view.roles[targetMember] == MemberEnrolled {
+		for _, member := range registry.membersForGroup(group, registry.dynamic.Load()) {
+			if view.roles[member.MemberID] == MemberEnrolled && member.MemberID != targetMember &&
+				(view.grant == (membershipgrant.Grant{}) || !exactCompletedGrantCut(view.roles, view.grant) || member.MemberID != view.grant.SourceMember) {
+				return false
+			}
+		}
+		serving := make([]Member, 0, 3)
+		for _, id := range initialVoters {
+			if view.roles[id] != MemberVoter {
+				return false
+			}
+			node, err := registry.Node(group, id)
+			if err != nil {
+				return false
+			}
+			serving = append(serving, Member{Group: group, MemberID: id, Node: node, ReplicaSetVersion: view.version, Role: MemberVoter})
+		}
+		expected, err := StableRosterDigest(serving)
+		if err == nil && expected == digest {
+			return true
+		}
 	}
 	members := registry.membersForGroup(group, registry.dynamic.Load())
 	if len(members) != len(initialVoters)+1 {
@@ -3065,4 +3144,32 @@ func rosterDigest(members []Member) [sha256.Size]byte {
 	var digest [sha256.Size]byte
 	copy(digest[:], hash.Sum(nil))
 	return digest
+}
+
+// certifiedEnrollmentBase is a complete proof of the next RF3 membership
+// transition. Historical mappings are not authority and cannot veto this cut.
+func (registry *StaticRegistry) certifiedEnrollmentBase(group raftmember.GroupKey, grant membershipgrant.Grant, digest [sha256.Size]byte) ([]Member, bool) {
+	view, ok := registry.currentAuthority(group)
+	if !ok || view == nil || !grant.Valid() || grant.Group != group || view.version != grant.InitialReplicaSetVersion || !exactInitialGrantCut(view.roles, grant) || view.promotion != nil {
+		return nil, false
+	}
+	if prior := view.grant; prior != (membershipgrant.Grant{}) && prior != grant &&
+		(!exactCompletedGrantCut(view.roles, prior) || grant.CatalogGeneration <= prior.CatalogGeneration || grant.InitialReplicaSetVersion <= prior.InitialReplicaSetVersion) {
+		return nil, false
+	}
+	members := make([]Member, 3)
+	var voters [3]membershipgrant.RosterMember
+	for i, id := range grant.InitialVoters {
+		node, err := registry.Node(group, id)
+		if err != nil {
+			return nil, false
+		}
+		members[i] = Member{Group: group, MemberID: id, Node: node, ReplicaSetVersion: view.version, Role: MemberVoter}
+		voters[i] = membershipgrant.RosterMember{Member: id, Node: [16]byte(node)}
+	}
+	if membershipgrant.CertifiedRosterDigest(group, view.version, voters) != grant.InitialRosterDigest {
+		return nil, false
+	}
+	expected, err := StableRosterDigest(members)
+	return members, err == nil && expected == digest
 }

@@ -857,7 +857,6 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 			ExpectedReplicaSetVersion: request.Membership.ExpectedReplicaSetVersion,
 			SourceMember:              request.Membership.SourceMember,
 			TargetMember:              request.Membership.TargetMember,
-			TransferTerm:              request.Membership.TransferTerm,
 		})
 		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
 			wireState = replicatedWireState(refreshed)
