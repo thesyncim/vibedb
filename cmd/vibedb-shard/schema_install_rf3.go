@@ -12,6 +12,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/multiraft"
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -36,6 +37,7 @@ type rf3SchemaArtifactSource interface {
 }
 
 type rf3SchemaGeneration struct {
+	manifest rf3Manifest
 	mu       sync.Mutex
 	identity raftmember.RuntimeIdentity
 	path     string
@@ -43,6 +45,9 @@ type rf3SchemaGeneration struct {
 	base     sqldriver.ReplicatedShardStoreIdentity
 	applyID  sqldriver.ReplicatedApplyIdentity
 	apply    *sqldriver.ReplicatedApply
+	// An adopted learner retains the certified portable preparation input.
+	// Cold donor preparation reads this alongside the live schema generation.
+	preparation *nodecontrol.PreparationSpec
 	// Closed after staging: retains only the opaque image audit/target proof,
 	// never open files. Process recovery may reconstruct it by auditing again.
 	verified *sqldriver.VerifiedReplicatedSchemaTarget
@@ -80,7 +85,7 @@ func rf3SchemaTransitionAuthority(request schemainstall.Request,
 func newRF3SchemaActivator(
 	owners rf3SchemaOwner, groups []preparedRF3Group, identities []raftmember.RuntimeIdentity,
 ) (*rf3SchemaActivator, error) {
-	if owners == nil || len(groups) == 0 || len(groups) != len(identities) {
+	if owners == nil || len(groups) != len(identities) {
 		return nil, errRF3Serving
 	}
 	result := &rf3SchemaActivator{owners: owners,
@@ -98,7 +103,7 @@ func newRF3SchemaActivator(
 		if identities[i].Group != group {
 			return nil, errRF3Serving
 		}
-		result.groups[group] = &rf3SchemaGeneration{identity: identities[i], path: item.manifest.SQL.Path,
+		result.groups[group] = &rf3SchemaGeneration{manifest: item.manifest, identity: identities[i], path: item.manifest.SQL.Path,
 			wal: item.recoveryLog(), base: item.base.Clone(), applyID: item.applyIdentity,
 			apply: item.apply}
 	}
@@ -746,6 +751,7 @@ func (a *rf3SchemaActivator) activate(
 		return fmt.Errorf("schema activation install target generation: %w", err)
 	}
 	state.base, state.applyID, state.apply = targetBase, targetApply, apply
+	state.identity.RelationManifestDigest = request.ToRelationManifestDigest
 	state.verified = nil
 	state.quiesced = false
 	return nil

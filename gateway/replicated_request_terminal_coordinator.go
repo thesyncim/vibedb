@@ -5,10 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
-	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
@@ -40,202 +38,43 @@ type DurableRequestTerminalResult struct {
 }
 
 type durableExecutionPinClient interface {
-	BuildRelease(executionpin.Command) ([]byte, error)
-	ProposeNew(context.Context, executionpin.Command, []byte) (ReplicatedResult, error)
-	RetryExact(context.Context, []byte) (ReplicatedResult, error)
-	ValidateFence(context.Context, executionpin.LeaseCertificate) error
-}
-
-func (client *nativeDurableExecutionPinClient) ValidateFence(
-	ctx context.Context,
-	lease executionpin.LeaseCertificate,
-) error {
-	if client == nil || client.executor == nil || client.session == nil {
-		return ErrDurableRequest
-	}
-	_, err := client.executor.ValidateExecutionPinFence(
-		ctx, client.session.route, lease, lease.Applied,
-	)
-	return err
+	ValidateFence(context.Context, ReplicatedRoute, executionpin.LeaseCertificate) error
 }
 
 type nativeDurableExecutionPinClient struct {
-	session  *NativeSession
-	executor *ReplicatedExecutor
+	executor  *ReplicatedExecutor
+	principal serviceauthz.Authority
 }
 
-func newNativeDurableExecutionPinClient(
-	session *NativeSession,
-	executor *ReplicatedExecutor,
-) (*nativeDurableExecutionPinClient, error) {
-	if session == nil || executor == nil || session.executor != executor ||
-		session.proposalCapability != serviceauthz.CapabilityExecutionPin {
-		return nil, ErrDurableRequest
-	}
-	return &nativeDurableExecutionPinClient{session: session, executor: executor}, nil
-}
-
-// BuildRelease creates the byte-identical command which ExecutionPin will
-// submit, without changing session sequence or pending state. This permits the
-// request ledger to own the exact bytes before any network admission.
-func (client *nativeDurableExecutionPinClient) BuildRelease(
-	transition executionpin.Command,
-) ([]byte, error) {
-	session := client.session
-	if client == nil || session == nil || session.phase != nativeSessionActive ||
-		session.pending || session.nextSequence == 0 ||
-		session.nextSequence == math.MaxUint64 || !transition.Valid() ||
-		transition.Operation != executionpin.OperationRelease {
-		return nil, ErrDurableRequest
-	}
-	var nestedStorage [executionpin.CommandBytes]byte
-	nested, err := executionpin.AppendCommand(nestedStorage[:0], transition)
+func (client nativeDurableExecutionPinClient) ValidateFence(ctx context.Context, route ReplicatedRoute, lease executionpin.LeaseCertificate) error {
+	ctx, err := serviceauthz.WithAuthority(ctx, client.principal)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	command := session.commandHeader(
-		replication.CommandExecutionPin, session.epoch,
-		session.nextSequence, session.ackThrough,
-	)
-	command.ExecutionPin = nested
-	command.Fingerprint = nativeCommandFingerprint(command)
-	return replication.AppendCommand(nil, command)
+	_, err = client.executor.ValidateExecutionPinFence(ctx, route, lease, lease.Applied)
+	return err
 }
 
-func (client *nativeDurableExecutionPinClient) ProposeNew(
-	ctx context.Context,
-	transition executionpin.Command,
-	exact []byte,
-) (ReplicatedResult, error) {
-	if client == nil || client.session == nil || ctx == nil {
-		return ReplicatedResult{}, ErrDurableRequest
-	}
-	built, err := client.BuildRelease(transition)
-	if err != nil || !bytes.Equal(built, exact) {
-		return ReplicatedResult{}, errors.Join(err, ErrDurableRequestConflict)
-	}
-	result, err := client.session.ExecutionPin(ctx, transition)
-	if err != nil {
-		return ReplicatedResult{}, err
-	}
-	return ReplicatedResult{
-		Outcome: result.Outcome, Completion: bytes.Clone(result.Completion.Bytes()),
-	}, nil
-}
-
-func (client *nativeDurableExecutionPinClient) RetryExact(
-	ctx context.Context,
-	exact []byte,
-) (ReplicatedResult, error) {
-	if client == nil || client.executor == nil || client.session == nil || ctx == nil ||
-		!commandMatchesRoute(exact, client.session.route) {
-		return ReplicatedResult{}, ErrDurableRequestConflict
-	}
-	if client.session.pending {
-		if !bytes.Equal(client.session.command, exact) {
-			return ReplicatedResult{}, ErrDurableRequestConflict
-		}
-		result, err := client.session.RetryPending(ctx)
-		if err != nil {
-			return ReplicatedResult{}, err
-		}
-		return ReplicatedResult{
-			Outcome: result.Outcome, Completion: bytes.Clone(result.Completion.Bytes()),
-		}, nil
-	}
-	return client.executor.propose(
-		ctx, client.session.route, exact, nil, true,
-		serviceauthz.CapabilityExecutionPin, replicatedUnknownCommandClone,
-	)
-}
-
-// DurableRequestTerminalCoordinator publishes a terminal result only after
-// its complete client result is durable and the catalog execution pin has an
-// authenticated release certificate.
+// DurableRequestTerminalCoordinator seals a result and releases its co-located
+// execution pin through the authenticated request ledger. It owns no native
+// session or process-local retry state.
 type DurableRequestTerminalCoordinator struct {
-	ledger     DurableRequestLedger
-	pin        durableExecutionPinClient
-	pinFactory durableExecutionPinClientFactory
+	ledger DurableRequestLedger
+	pin    durableExecutionPinClient
 }
 
-type durableExecutionPinClientFactory interface {
-	OpenTerminalExecutionPinClient(
-		context.Context,
-		DurableRequestTypedExecutionContext,
-	) (durableExecutionPinClient, context.Context, func(), error)
+func NewDurableRequestTerminalCoordinator(ledger DurableRequestLedger, executor *ReplicatedExecutor, principal serviceauthz.Authority) (*DurableRequestTerminalCoordinator, error) {
+	if executor == nil || !principal.Valid() {
+		return nil, ErrDurableRequest
+	}
+	return newDurableRequestTerminalCoordinator(ledger, nativeDurableExecutionPinClient{executor: executor, principal: principal})
 }
 
-type nativeDurableExecutionPinClientFactory struct {
-	executor *ReplicatedExecutor
-	sessions DurableRequestExecutionPinSessionFactory
-}
-
-func (factory nativeDurableExecutionPinClientFactory) OpenTerminalExecutionPinClient(
-	ctx context.Context,
-	execution DurableRequestTypedExecutionContext,
-) (durableExecutionPinClient, context.Context, func(), error) {
-	if factory.executor == nil || factory.sessions == nil || ctx == nil ||
-		!validReplicatedRoute(execution.ExecutionPinRoute) {
-		return nil, nil, nil, ErrDurableRequest
-	}
-	session, principal, release, err := factory.sessions.OpenExecutionPinSession(
-		ctx, execution, execution.ExecutionPinRoute,
-	)
-	if err != nil {
-		if release != nil {
-			release()
-		}
-		return nil, nil, nil, err
-	}
-	client, err := newNativeDurableExecutionPinClient(session, factory.executor)
-	if err != nil || !principal.Valid() || !sameReplicatedCatalogRoute(session.route, execution.ExecutionPinRoute) {
-		if release != nil {
-			release()
-		}
-		return nil, nil, nil, errors.Join(err, ErrDurableRequestConflict)
-	}
-	authorized, err := serviceauthz.WithAuthority(ctx, principal)
-	if err != nil && release != nil {
-		release()
-		release = nil
-	}
-	return client, authorized, release, err
-}
-
-func NewDurableRequestTerminalCoordinator(
-	ledger DurableRequestLedger,
-	session *NativeSession,
-	executor *ReplicatedExecutor,
-) (*DurableRequestTerminalCoordinator, error) {
-	pin, err := newNativeDurableExecutionPinClient(session, executor)
-	if err != nil || ledger == nil {
-		return nil, errors.Join(err, ErrDurableRequest)
-	}
-	return &DurableRequestTerminalCoordinator{ledger: ledger, pin: pin}, nil
-}
-
-func newDurableRequestTerminalCoordinator(
-	ledger DurableRequestLedger,
-	pin durableExecutionPinClient,
-) (*DurableRequestTerminalCoordinator, error) {
+func newDurableRequestTerminalCoordinator(ledger DurableRequestLedger, pin durableExecutionPinClient) (*DurableRequestTerminalCoordinator, error) {
 	if ledger == nil || pin == nil {
 		return nil, ErrDurableRequest
 	}
 	return &DurableRequestTerminalCoordinator{ledger: ledger, pin: pin}, nil
-}
-
-func NewDurableRequestTerminalCoordinatorWithSessionFactory(
-	ledger DurableRequestLedger,
-	executor *ReplicatedExecutor,
-	sessions DurableRequestExecutionPinSessionFactory,
-) (*DurableRequestTerminalCoordinator, error) {
-	if ledger == nil || executor == nil || sessions == nil {
-		return nil, ErrDurableRequest
-	}
-	return &DurableRequestTerminalCoordinator{
-		ledger:     ledger,
-		pinFactory: nativeDurableExecutionPinClientFactory{executor: executor, sessions: sessions},
-	}, nil
 }
 
 func (coordinator *DurableRequestTerminalCoordinator) Complete(
@@ -248,7 +87,7 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 			failure = fmt.Errorf("gateway: terminal %s: %w", stage, failure)
 		}
 	}()
-	if coordinator == nil || coordinator.ledger == nil || (coordinator.pin == nil && coordinator.pinFactory == nil) ||
+	if coordinator == nil || coordinator.ledger == nil || coordinator.pin == nil ||
 		ctx == nil || !validDurableRequestTerminalPlan(plan) {
 		return DurableRequestTerminalResult{}, ErrDurableRequest
 	}
@@ -269,28 +108,9 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 			Terminal: terminal, Revision: head.Revision, Applied: applied,
 		}, nil
 	}
-	pin, pinCtx := coordinator.pin, ctx
-	var releasePinSession func()
-	stage = "pin session"
-	if coordinator.pinFactory != nil && release.Phase != requestledger.SchemaPinReleased {
-		if plan.Execution.Key.RequestKey != plan.Key ||
-			plan.Execution.Home.Identity != plan.Home.Identity ||
-			plan.Execution.Home.Point != plan.Home.Point ||
-			plan.Execution.ExecutionPinLease != plan.Lease ||
-			!plan.Execution.ExecutionPinAcquire.Valid() {
-			return DurableRequestTerminalResult{}, ErrDurableRequestConflict
-		}
-		pin, pinCtx, releasePinSession, err = coordinator.pinFactory.OpenTerminalExecutionPinClient(ctx, plan.Execution)
-		if err != nil {
-			return DurableRequestTerminalResult{}, err
-		}
-		if releasePinSession != nil {
-			defer releasePinSession()
-		}
-	}
 	if prepared.Revision == 0 || release.Phase == requestledger.SchemaPinReleaseInvalid {
 		stage = "pin fence"
-		if err = pin.ValidateFence(pinCtx, plan.Lease); err != nil {
+		if err = coordinator.pin.ValidateFence(ctx, plan.Execution.ExecutionPinRoute, plan.Lease); err != nil {
 			return DurableRequestTerminalResult{}, errors.Join(err, ErrDurableRequestConflict)
 		}
 	}
@@ -332,112 +152,48 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 		return DurableRequestTerminalResult{}, ErrDurableRequestConflict
 	}
 
-	createdRelease := false
-	stage = "release authority"
-	transition := plan.Release
-	transition.PrepareTerminalDigest = executionpin.Digest(prepared.PreparedDigest)
-	if !transition.Valid() || transition.Operation != executionpin.OperationRelease {
-		return DurableRequestTerminalResult{}, ErrDurableRequestConflict
-	}
-	if release.Phase != requestledger.SchemaPinReleaseInvalid {
-		if plan.Execution.terminalCut != nil {
-			_, persisted, openErr := durableRequestTerminalReleaseCommand(plan.Execution,
-				durableRequestTerminalReadCut{Head: head, Continuation: continuation,
-					Prepared: prepared, SchemaPin: release, Applied: applied})
-			if openErr != nil {
-				return DurableRequestTerminalResult{}, openErr
-			}
-			transition = persisted
-			// Existing Delegate authorization forwards this exact retained
-			// principal. The server still checks current policy for both the
-			// authenticated gateway peer and the command's original authority.
-			pinCtx, err = serviceauthz.WithAuthority(pinCtx, serviceauthz.Authority{
-				Node: rafttransport.NodeID(persisted.AuthorityNode), Generation: persisted.AuthorityGeneration,
-			})
-			if err != nil {
-				return DurableRequestTerminalResult{}, err
-			}
-		} else {
-			outer, openErr := replication.OpenCommand(release.Command)
-			persisted, nestedErr := outer.OpenExecutionPin()
-			if openErr != nil || nestedErr != nil || persisted != transition {
-				return DurableRequestTerminalResult{}, ErrDurableRequestConflict
-			}
-		}
-	}
 	if release.Phase == requestledger.SchemaPinReleaseInvalid {
-		stage = "release intent"
-		exact, buildErr := pin.BuildRelease(transition)
+		stage = "release proposal"
+		transition := plan.Release
+		transition.PrepareTerminalDigest = executionpin.Digest(prepared.PreparedDigest)
+		exact, buildErr := executionpin.AppendCommand(nil, transition)
 		if buildErr != nil {
 			return DurableRequestTerminalResult{}, buildErr
 		}
-		release, err = requestledger.NewSchemaPinRelease(
-			head, prepared, head.Revision+1, exact,
-		)
-		if err != nil {
-			return DurableRequestTerminalResult{}, errors.Join(err, ErrDurableRequestConflict)
+		intent, buildErr := requestledger.NewSchemaPinRelease(head, prepared, head.Revision+1, exact)
+		if buildErr != nil {
+			return DurableRequestTerminalResult{}, buildErr
 		}
-		stage = "release intent CAS"
+		stage = "atomic pin release"
 		cas, applyErr := coordinator.ledger.ApplyCAS(ctx, plan.Home, plan.Key,
-			DurableRequestLifecycleCAS{
-				Operation:        requestledger.OperationBeginSchemaPinRelease,
-				ExpectedRevision: head.Revision, Revision: release.Revision,
-				SchemaPin: release,
-			})
+			DurableRequestLifecycleCAS{Operation: requestledger.OperationReleaseSchemaPin,
+				ExpectedRevision: head.Revision, Revision: intent.Revision, SchemaPin: intent})
 		if applyErr != nil {
 			return DurableRequestTerminalResult{}, applyErr
 		}
 		if cas.Ledger.ResultCode != replicatedstate.ResultApplied {
 			return DurableRequestTerminalResult{}, ErrDurableRequestConflict
 		}
-		applied = cas.Applied
-		head, err = requestledger.InstallSchemaPinRelease(head, prepared, release)
-		if err != nil {
-			return DurableRequestTerminalResult{}, errors.Join(err, ErrDurableRequestConflict)
-		}
-		createdRelease = true
-	}
-
-	if release.Phase == requestledger.SchemaPinReleasing {
-		stage = "release proposal"
-		var settled ReplicatedResult
-		if createdRelease {
-			settled, err = pin.ProposeNew(pinCtx, transition, release.Command)
-		} else {
-			settled, err = pin.RetryExact(pinCtx, release.Command)
-		}
+		// The RF3 apply releases the co-located pin and seals its proof into
+		// this ledger row. Reopen that committed cut; a local proposal payload
+		// is not release evidence, and no old gateway identity is replayed.
+		refreshPlan := plan
+		refreshPlan.Execution.terminalCut = nil
+		head, continuation, prepared, release, terminal, applied, err = coordinator.openTerminalRows(ctx, refreshPlan)
 		if err != nil {
 			return DurableRequestTerminalResult{}, err
 		}
-		stage = "release settlement"
-		if !validDurableRequestSettlement(release.Command, settled) {
-			return DurableRequestTerminalResult{}, ErrDurableRequestConflict
+		if terminal.Revision != 0 {
+			if terminal.Outcome != plan.Outcome || terminal.AffectedRows != plan.AffectedRows ||
+				terminal.AffectedRowsValid != plan.AffectedRowsValid || terminal.RetirementWitnessDigest != plan.RetirementWitness ||
+				!bytes.Equal(terminal.Result, plan.Result) {
+				return DurableRequestTerminalResult{}, ErrDurableRequestConflict
+			}
+			return DurableRequestTerminalResult{Terminal: terminal, Revision: head.Revision, Applied: applied}, nil
 		}
-		next, recordErr := requestledger.RecordVerifiedSchemaPinReleased(
-			release, release.Revision+1, settled.Completion,
-		)
-		if recordErr != nil {
-			return DurableRequestTerminalResult{}, errors.Join(recordErr, ErrDurableRequestConflict)
-		}
-		stage = "release proof CAS"
-		cas, applyErr := coordinator.ledger.ApplyCAS(ctx, plan.Home, plan.Key,
-			DurableRequestLifecycleCAS{
-				Operation:        requestledger.OperationRecordSchemaPinReleased,
-				ExpectedRevision: head.Revision, Revision: next.Revision,
-				SchemaPin: next,
-			})
-		if applyErr != nil {
-			return DurableRequestTerminalResult{}, applyErr
-		}
-		if cas.Ledger.ResultCode != replicatedstate.ResultApplied {
-			return DurableRequestTerminalResult{}, ErrDurableRequestConflict
-		}
-		applied = cas.Applied
-		head, err = requestledger.MarkSchemaPinReleased(head, prepared, release, next)
-		if err != nil {
-			return DurableRequestTerminalResult{}, errors.Join(err, ErrDurableRequestConflict)
-		}
-		release = next
+	}
+	if release.Phase != requestledger.SchemaPinReleased {
+		return DurableRequestTerminalResult{}, ErrDurableRequestConflict
 	}
 
 	stage = "terminal result"
@@ -491,7 +247,7 @@ func (coordinator *DurableRequestTerminalCoordinator) openTerminalRows(
 	if cut := plan.Execution.terminalCut; cut != nil {
 		err := validateDurableRequestPreparedCut(plan.Execution, *cut)
 		if err == nil && cut.SchemaPin.Revision != 0 {
-			_, _, err = durableRequestTerminalReleaseCommand(plan.Execution, *cut)
+			_, err = durableRequestTerminalReleaseCommand(plan.Execution, *cut)
 		}
 		if err != nil {
 			return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},

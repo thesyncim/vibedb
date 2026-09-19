@@ -346,7 +346,7 @@ func runClient(mode string, options clientOptions) error {
 	defer connection.Close()
 	wire := &qualificationWire{connection: connection,
 		reader: bufio.NewReaderSize(connection, qualificationMaxResponseBytes+1)}
-	request, err := loadOrCreateRequest(mode, options.state, wire)
+	request, err := loadOrCreateRequest(ctx, mode, options.state, wire)
 	if err != nil {
 		return err
 	}
@@ -434,7 +434,7 @@ func (wire *qualificationWire) roundTrip(request []byte) ([]byte, time.Duration,
 	return bytes.TrimSpace(response), latency, nil
 }
 
-func loadOrCreateRequest(mode, path string, wire *qualificationWire) ([]byte, error) {
+func loadOrCreateRequest(ctx context.Context, mode, path string, wire *qualificationWire) ([]byte, error) {
 	if mode == "verify" {
 		file, err := os.Open(path)
 		if err != nil {
@@ -452,22 +452,39 @@ func loadOrCreateRequest(mode, path string, wire *qualificationWire) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
-	response, _, err := wire.roundTrip(open)
-	var grant issuerOpenResponse
-	if err != nil || vibejson.Unmarshal(response, &grant) != nil || !grant.OK || grant.Error != "" ||
-		grant.InstallationID != installation || grant.IssuerEpoch != 1 || grant.LaneOrdinal != 0 ||
-		len(grant.GrantDigest) != 64 {
-		return nil, errors.Join(qualificationResponseError("issuer_open", response), err)
+	// Native TCP readiness is not a serving cut. Catalog genesis and the first
+	// canonical drain install regularly finish after the gateway listener is
+	// already reachable; retry issuer_open until native admits a leader.
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var last error
+	for {
+		response, _, roundErr := wire.roundTrip(open)
+		if roundErr != nil {
+			last = errors.Join(qualificationResponseError("issuer_open", response), roundErr)
+		} else {
+			var grant issuerOpenResponse
+			if vibejson.Unmarshal(response, &grant) == nil && grant.OK && grant.Error == "" &&
+				grant.InstallationID == installation && grant.IssuerEpoch == 1 && grant.LaneOrdinal == 0 &&
+				len(grant.GrantDigest) == 64 {
+				request, marshalErr := vibejson.Marshal(&execBatchRequest{Op: "exec_batch",
+					RequestID: "91000000000000000000000000000000", InstallationID: installation,
+					IssuerEpoch: 1, LaneOrdinal: 0, GrantDigest: grant.GrantDigest, IssuerSequence: 1,
+					Class: "interactive", Statements: []qualifyStatement{{SQL: "INSERT INTO documents VALUES (?)",
+						Params: []qualifyParam{{Kind: "document", Text: `{"id":"kind-proof"}`}}}}})
+				if marshalErr != nil {
+					return nil, marshalErr
+				}
+				return request, writeExclusive(path, request)
+			}
+			last = qualificationResponseError("issuer_open", response)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, errors.Join(last, context.Cause(ctx))
+		case <-ticker.C:
+		}
 	}
-	request, err := vibejson.Marshal(&execBatchRequest{Op: "exec_batch",
-		RequestID: "91000000000000000000000000000000", InstallationID: installation,
-		IssuerEpoch: 1, LaneOrdinal: 0, GrantDigest: grant.GrantDigest, IssuerSequence: 1,
-		Class: "interactive", Statements: []qualifyStatement{{SQL: "INSERT INTO documents VALUES (?)",
-			Params: []qualifyParam{{Kind: "document", Text: `{"id":"kind-proof"}`}}}}})
-	if err != nil {
-		return nil, err
-	}
-	return request, writeExclusive(path, request)
 }
 
 func qualificationQuery() []byte {

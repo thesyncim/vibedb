@@ -3,11 +3,13 @@ package rafttransport
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -228,6 +230,32 @@ func TestOrdinaryTransportFailsFastAtPerPeerAndGlobalBounds(t *testing.T) {
 	}
 	if frames, _ := transport.GlobalQueueStats(); frames != 3 {
 		t.Fatalf("global frames = %d, want 3", frames)
+	}
+}
+
+func TestOrdinaryTransportSendErrorIncludesSafeOutboundContext(t *testing.T) {
+	fixture := newTransportTestFixture(t)
+	transport, err := NewOrdinaryTransport(transportTestOptions(fixture, ordinaryDialFunc(func(context.Context, NodeID) (PeerConnection, error) {
+		return nil, io.ErrClosedPipe
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel, done := runTransportTest(t, transport)
+	defer stopTransportTest(t, transport, cancel, done)
+	outbound := fixture.outbound(0, 7)
+	outbound.Message.To = frameU64(outbound.Message.GetTo() + 1)
+	err = transport.Send(outbound)
+	if !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("send error=%v, want ErrInvalidFrame", err)
+	}
+	for _, field := range []string{
+		"group=", "from=13", "to=11", "kind=ordinary", "message_type=8",
+		"index=7", "term=5",
+	} {
+		if !strings.Contains(err.Error(), field) {
+			t.Fatalf("send error=%q missing %q", err, field)
+		}
 	}
 }
 
@@ -744,6 +772,14 @@ func TestOrdinaryTransportReconnectUsesInjectedBackoffAndRetainsFrame(t *testing
 	if stats.DialAttempts != 3 || stats.DialFailures != 2 || stats.Connections != 1 {
 		t.Fatalf("reconnect stats = %+v", stats)
 	}
+	failure := stats.LastFailure
+	if failure.Node != fixture.remote[0].Node || failure.Phase != peerFailurePhaseDial ||
+		failure.Cause != "closed-pipe" || failure.Group != fixture.group ||
+		failure.From != fixture.local.MemberID || failure.To != fixture.remote[0].MemberID ||
+		failure.Version != 1 || failure.Kind != "ordinary" || failure.MessageType != int32(pb.MsgHeartbeat) ||
+		failure.Index != 9 || failure.Term != 5 {
+		t.Fatalf("dial failure snapshot = %+v", failure)
+	}
 	delayMu.Lock()
 	gotDelays := append([]time.Duration(nil), delays...)
 	delayMu.Unlock()
@@ -794,6 +830,14 @@ func TestOrdinaryTransportHandlesPartialWritesAndRetriesFailedWrite(t *testing.T
 	stats, _ := transport.Stats(fixture.remote[0].Node)
 	if stats.WriteFailures != 1 || stats.Connections != 2 {
 		t.Fatalf("write retry stats = %+v", stats)
+	}
+	failure := stats.LastFailure
+	if failure.Node != fixture.remote[0].Node || failure.Phase != peerFailurePhaseWrite ||
+		failure.Cause != "unexpected-eof" || failure.Group != fixture.group ||
+		failure.From != fixture.local.MemberID || failure.To != fixture.remote[0].MemberID ||
+		failure.Version != 1 || failure.Kind != "ordinary" || failure.MessageType != int32(pb.MsgHeartbeat) ||
+		failure.Index != 17 || failure.Term != 5 {
+		t.Fatalf("write failure snapshot = %+v", failure)
 	}
 	if len(failed.writtenBytes()) != failed.failAfter {
 		t.Fatalf("failed stream bytes = %d, want %d", len(failed.writtenBytes()), failed.failAfter)
@@ -1129,6 +1173,9 @@ func newTransportTestConnection(
 
 func (connection *transportTestConnection) PeerIdentity() PeerIdentity {
 	return connection.identity
+}
+func (connection *transportTestConnection) PeerKeyDigest() [sha256.Size]byte {
+	return [sha256.Size]byte{}
 }
 func (connection *transportTestConnection) TrafficClass() TrafficClass {
 	return connection.class

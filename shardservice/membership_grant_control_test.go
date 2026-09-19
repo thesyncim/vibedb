@@ -25,6 +25,7 @@ type membershipGrantTestConnection struct {
 func (connection *membershipGrantTestConnection) PeerIdentity() rafttransport.PeerIdentity {
 	return connection.identity
 }
+func (*membershipGrantTestConnection) PeerKeyDigest() [32]byte { return [32]byte{} }
 
 func (connection *membershipGrantTestConnection) TrafficClass() rafttransport.TrafficClass {
 	return connection.class

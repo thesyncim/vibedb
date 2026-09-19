@@ -3,6 +3,7 @@ package raftmember
 import (
 	"errors"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -706,6 +707,106 @@ func TestRuntimeReadAuthorityRoundInvalidatesOnTermAndConfigChange(t *testing.T)
 		}
 		drainRuntime(t, fixture.fixture.runtime, nil)
 	})
+}
+
+func TestRuntimeReadAuthorityDisablesAfterLiveStableRosterChange(t *testing.T) {
+	const seed byte = 194
+	identity := testWALIdentity(seed)
+	removed := identity.MemberID + 1
+	remaining := identity.MemberID + 2
+	fixture := newRuntimeFixture(t, seed, []uint64{identity.MemberID, removed, remaining})
+	runtime := fixture.runtime
+	drainRuntime(t, runtime, nil)
+	electRuntimeWithPeer(t, runtime, identity.MemberID, removed)
+
+	clock := &readAuthorityRuntimeClock{}
+	policy := readAuthorityRuntimePolicy([]uint64{identity.MemberID, removed, remaining}, time.Second)
+	checked := raftauthority.NewCheckedClock(clock)
+	if err := runtime.ConfigureReadAuthority(ReadAuthorityOptions{
+		Policy: policy, Clock: checked,
+		LeaderIncarnation: func(memberID uint64) (uint64, bool, error) {
+			switch memberID {
+			case removed:
+				return 77, true, nil
+			case remaining:
+				return 88, true, nil
+			default:
+				return 0, false, nil
+			}
+		},
+	}); err != nil {
+		t.Fatalf("ConfigureReadAuthority: %v", err)
+	}
+	quarantine, err := policy.QuarantineDuration()
+	if err != nil {
+		t.Fatalf("QuarantineDuration: %v", err)
+	}
+	clock.now = quarantine
+	fixtureForRound := readAuthorityFollowerFixture{
+		fixture: fixture, local: identity.MemberID, peer: removed,
+		clock: clock, checked: checked, policy: policy,
+	}
+	token := startReadAuthorityRoundWithQuorum(t, fixtureForRound)
+	before := runtime.ReadAuthorityEvidence()
+	if !before.Holder.Available || !before.Promise.HasRecord {
+		t.Fatalf("pre-change evidence = %+v, want holder and promise", before)
+	}
+
+	digest := MembershipTransitionDigest(runtime.identity.Group, [16]byte{seed}, 2, 3, removed, remaining)
+	change := &pb.ConfChange{
+		Type: pb.ConfChangeRemoveNode.Enum(), NodeId: runtimeUint64Ptr(removed),
+		Context: append([]byte(nil), digest[:]...),
+	}
+	if err := runtime.ProposeConfChange(change); err != nil {
+		t.Fatalf("ProposeConfChange: %v", err)
+	}
+	var appendMessage *pb.Message
+	drainRuntime(t, runtime, func(outbound OutboundMessage) error {
+		if outbound.To == removed && outbound.Message.GetType() == pb.MsgApp &&
+			len(outbound.Message.GetEntries()) != 0 {
+			appendMessage = proto.Clone(outbound.Message).(*pb.Message)
+		}
+		return nil
+	})
+	if appendMessage == nil {
+		t.Fatal("roster change produced no append to the committing peer")
+	}
+	last := appendMessage.GetEntries()[len(appendMessage.GetEntries())-1].GetIndex()
+	if err := runtime.StepMessage(&pb.Message{
+		Type: pb.MsgAppResp.Enum(), From: runtimeUint64Ptr(removed),
+		To: runtimeUint64Ptr(identity.MemberID), Term: runtimeUint64Ptr(appendMessage.GetTerm()),
+		Index: runtimeUint64Ptr(last),
+	}); err != nil {
+		t.Fatalf("roster change commit response: %v", err)
+	}
+	drainRuntime(t, runtime, nil)
+
+	publication, err := runtime.Publication()
+	if err != nil {
+		t.Fatalf("Publication: %v", err)
+	}
+	if !slices.Equal(publication.ConfState.GetVoters(), []uint64{identity.MemberID, remaining}) {
+		t.Fatalf("published voters = %v, want [%d %d]", publication.ConfState.GetVoters(), identity.MemberID, remaining)
+	}
+	if !slices.Equal(runtime.authority.policy.Voters, policy.Voters) {
+		t.Fatalf("authority policy changed with roster: %v, want %v", runtime.authority.policy.Voters, policy.Voters)
+	}
+	if runtime.ReadAuthorityEnabled() {
+		t.Fatal("stale survivor authority remained enabled after committed roster change")
+	}
+	if _, err := runtime.ReadAuthorityToken(); !errors.Is(err, raftauthority.ErrPolicyDisabled) {
+		t.Fatalf("stale survivor token = %v, want ErrPolicyDisabled", err)
+	}
+	if err := runtime.ValidateReadAuthorityToken(token); !errors.Is(err, raftauthority.ErrPolicyDisabled) {
+		t.Fatalf("pre-change token validation = %v, want ErrPolicyDisabled", err)
+	}
+	after := runtime.ReadAuthorityEvidence()
+	if after.Status != ReadAuthorityEvidenceDisabled || after.Holder.Available {
+		t.Fatalf("post-change evidence = %+v, want disabled without holder", after)
+	}
+	if !reflect.DeepEqual(after.Promise, before.Promise) {
+		t.Fatalf("post-change promise = %+v, before = %+v", after.Promise, before.Promise)
+	}
 }
 
 func TestRuntimeReadAuthorityPolicyChecksAndDisableReenableSafety(t *testing.T) {

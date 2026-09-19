@@ -3,7 +3,6 @@ package splitcontroller
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -49,6 +48,7 @@ type tailStreamPeerConn struct {
 func (connection *tailStreamPeerConn) PeerIdentity() rafttransport.PeerIdentity {
 	return connection.identity
 }
+func (*tailStreamPeerConn) PeerKeyDigest() [32]byte { return [32]byte{} }
 
 func (connection *tailStreamPeerConn) TrafficClass() rafttransport.TrafficClass {
 	return connection.class
@@ -71,7 +71,7 @@ func (connection *tailStreamPeerConn) bytesWritten() []byte {
 	return bytes.Clone(connection.written)
 }
 
-func TestTailStreamTransportRetriesByteIdenticallyAfterLostResponse(t *testing.T) {
+func TestTailStreamTransportRestartsSenderAfterDurableApplyAndLostResponse(t *testing.T) {
 	plan, artifacts, childActions, before, batch := testTailStreamTransportFixture(t)
 	resolved, err := ResolveLocalTailStreamTarget(plan, artifacts, 1, childActions)
 	if err != nil {
@@ -128,10 +128,11 @@ func TestTailStreamTransportRetriesByteIdenticallyAfterLostResponse(t *testing.T
 			failWrite: opens == 1,
 		}
 		go func() {
-			serveResults <- service.Serve(context.Background(), serverConnection)
+			serveErr := service.Serve(context.Background(), serverConnection)
 			attemptsMu.Lock()
 			attempts = append(attempts, clientConnection.bytesWritten())
 			attemptsMu.Unlock()
+			serveResults <- serveErr
 		}()
 		return clientConnection, nil
 	})
@@ -161,14 +162,14 @@ func TestTailStreamTransportRetriesByteIdenticallyAfterLostResponse(t *testing.T
 		t.Fatal(err)
 	}
 	_, wrongErr := wrongClient.Apply(context.Background(), destination, resolved.TrustDomain, rangesplit.TailStreamRequest{
-		Binding: binding, Before: before, Batch: batch,
+		Binding: binding, Batch: batch,
 	})
 	_ = wrongServerSide.Close()
 	if !errors.Is(wrongErr, ErrTailStreamUnauthorized) {
 		t.Fatalf("wrong peer error=%v", wrongErr)
 	}
 	sink, err := NewRemoteTailSink(
-		context.Background(), client, destination, resolved.TrustDomain, binding, before,
+		context.Background(), client, destination, resolved.TrustDomain, binding,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -176,12 +177,19 @@ func TestTailStreamTransportRetriesByteIdenticallyAfterLostResponse(t *testing.T
 	if applyErr := sink.Apply(batch); !errors.Is(applyErr, ErrTailStreamOutcomeUnknown) {
 		t.Fatalf("first apply error=%v", applyErr)
 	}
-	if sink.Cursor() != before {
-		t.Fatal("outcome-unknown advanced client cursor")
-	}
 	firstServeErr := <-serveResults
 	if firstServeErr == nil {
 		t.Fatal("lost response did not fail server write")
+	}
+	afterLostResponse, ok, err := resolved.Target.ObserveTail(context.Background())
+	if err != nil || !ok || afterLostResponse == before || afterLostResponse.LastBatchDigest() != batch.Digest {
+		t.Fatalf("lost response must follow durable apply: cursor=%+v error=%v", afterLostResponse, err)
+	}
+	// The controller restarts before persisting its source acknowledgement.
+	// Replaying the batch must work when a child is already ahead of that ack.
+	sink, err = NewRemoteTailSink(context.Background(), client, destination, resolved.TrustDomain, binding)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if applyErr := sink.Apply(batch); applyErr != nil {
 		t.Fatalf("retry apply: %v", applyErr)
@@ -189,9 +197,9 @@ func TestTailStreamTransportRetriesByteIdenticallyAfterLostResponse(t *testing.T
 	if secondServeErr := <-serveResults; secondServeErr != nil {
 		t.Fatalf("retry serve: %v", secondServeErr)
 	}
-	after := sink.Cursor()
-	if after.SourceCut().Applied != batch.Applied || after.LastBatchDigest() != batch.Digest {
-		t.Fatalf("after=%+v", after)
+	after, ok, err := resolved.Target.ObserveTail(context.Background())
+	if err != nil || !ok || after != afterLostResponse {
+		t.Fatalf("retry changed durable result: after=%+v error=%v", after, err)
 	}
 	attemptsMu.Lock()
 	defer attemptsMu.Unlock()
@@ -230,7 +238,6 @@ func TestTailStreamServiceRejectsBeforeVariableAllocation(t *testing.T) {
 	total := uint32(rangesplit.MaxTailStreamRequestBytes)
 	header[12], header[13], header[14], header[15] = byte(total), byte(total>>8), byte(total>>16), byte(total>>24)
 	header[16], header[17] = 0, 1 // 256
-	binary.LittleEndian.PutUint32(header[20:24], rangesplit.ChildStageCursorEncodedBytes)
 	batch := uint32(rangesplit.MaxTailBatchWireBytes)
 	header[24], header[25], header[26], header[27] = byte(batch), byte(batch>>8), byte(batch>>16), byte(batch>>24)
 	if _, err = clientSide.Write(header); err != nil {

@@ -47,7 +47,10 @@ func TestRestoreCatalogPreparingAuthorityIsNarrowAndRestoreOnly(t *testing.T) {
 		func(raftservice.ServingState) bool { return true })
 	request := shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
 		Authority: operator, Capability: serviceauthz.CapabilityTopology,
-		Fence: shardservice.ReplicatedFence{Group: group}}
+		Fence: shardservice.ReplicatedFence{Group: group, AllocationGeneration: base.Binding.AllocationGeneration,
+			Command: raftservice.CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
+				ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
+				RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1}}}
 	if !allows(state, &request) {
 		t.Fatal("authenticated restore bootstrap probe rejected")
 	}

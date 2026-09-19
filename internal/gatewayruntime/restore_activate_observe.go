@@ -61,7 +61,7 @@ func probeGatewayRestoreCatalogReplica(parent context.Context, profile *rafttran
 	defer connection.Close()
 	response, err := shardservice.RoundTripReplicated(ctx, connection, &shardservice.ReplicatedRequest{
 		Operation: shardservice.ReplicatedProbe, Authority: operator, Capability: serviceauthz.CapabilityTopology,
-		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration},
+		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration, Command: route.Command},
 	})
 	if err != nil || response == nil {
 		return gateway.ReplicatedEndpoint{}, fmt.Errorf("restore catalog probe transport: %w", errors.Join(gateway.ErrRestoreActivation, err))

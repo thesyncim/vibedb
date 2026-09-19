@@ -26,6 +26,7 @@ type requestLedgerCommandPlan struct {
 	rows       []transactionRowMutation
 	delta      requestLedgerStateDelta
 	completion RequestLedgerCompletionResult
+	pinDelta   executionPinStateDelta
 }
 
 type requestLedgerRows struct {
@@ -61,6 +62,7 @@ type requestLedgerRows struct {
 
 func (m *Machine) planRequestLedgerCommand(
 	outer replication.CommandView,
+	applied uint64,
 	state State,
 	snapshot pointSnapshot,
 ) (requestLedgerCommandPlan, error) {
@@ -190,10 +192,8 @@ func (m *Machine) planRequestLedgerCommand(
 		return planRequestLedgerCleanupPayload(plan, command, rows, snapshot)
 	case requestledger.OperationPrepareTerminal:
 		return planRequestLedgerPrepareTerminal(plan, command, rows)
-	case requestledger.OperationBeginSchemaPinRelease:
-		return planRequestLedgerBeginSchemaPinRelease(plan, command, rows, snapshot)
-	case requestledger.OperationRecordSchemaPinReleased:
-		return planRequestLedgerRecordSchemaPinReleased(plan, command, rows)
+	case requestledger.OperationReleaseSchemaPin:
+		return planRequestLedgerReleaseSchemaPin(plan, outer, command, rows, snapshot, applied)
 	case requestledger.OperationBeginRoutePinAcquire,
 		requestledger.OperationRecordRoutePinAcquired,
 		requestledger.OperationBeginRoutePinRelease,
@@ -1196,120 +1196,88 @@ func planRequestLedgerPrepareTerminal(
 	return replaceRequestLedgerHead(plan, rows, next)
 }
 
-func planRequestLedgerBeginSchemaPinRelease(
+func planRequestLedgerReleaseSchemaPin(
 	plan requestLedgerCommandPlan,
+	outer replication.CommandView,
 	command requestledger.CommandView,
 	rows requestLedgerRows,
 	snapshot pointSnapshot,
+	applied uint64,
 ) (requestLedgerCommandPlan, error) {
-	release, _ := command.SchemaPinRelease()
+	intent, _ := command.SchemaPinRelease()
 	if rows.head.Revision == command.Revision && rows.schemaPinFound &&
-		bytes.Equal(rows.schemaPinRaw, command.Payload) {
+		rows.schemaPin.Phase == requestledger.SchemaPinReleased &&
+		rows.schemaPin.PriorRecordDigest == intent.RecordDigest {
 		return witnessedRequestLedgerApplied(plan, rows.head.Revision, rows.head.Phase, rows.schemaPinRaw, true), nil
 	}
 	if rows.head.Revision != command.ExpectedRevision || rows.head.Phase != requestledger.PhasePrepared ||
 		!rows.preparedFound || rows.schemaPinFound || rows.routePinFound {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
-	expected, err := requestledger.NewSchemaPinRelease(
-		rows.head, rows.prepared, command.Revision, release.Command,
-	)
-	if err != nil || expected.RecordDigest != release.RecordDigest ||
-		!requestLedgerSchemaReleaseCommandAvailable(release) {
+	expected, err := requestledger.NewSchemaPinRelease(rows.head, rows.prepared, command.Revision, intent.Command)
+	if err != nil || expected.RecordDigest != intent.RecordDigest || !requestLedgerSchemaReleaseCommandAvailable(intent) {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
-	// The release intent and its exact pin lease are one atomic system-row
-	// publication. A concurrent Recover either wins first and invalidates this
-	// intent, or observes the irreversible freeze; no read/CAS gap is exposed.
-	outer, openErr := replication.OpenCommand(release.Command)
-	nested, nestedErr := outer.OpenExecutionPin()
-	if openErr != nil || nestedErr != nil {
+	nested, err := executionpin.OpenCommand(intent.Command)
+	if err != nil || applied == 0 || nested.AuthorityNode != executionpin.ID(outer.ClientID) ||
+		nested.Binding.LedgerHomeGroup != executionpin.ID(outer.GroupID) {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
 	pin, found, err := executionPinRecordAt(snapshot, nested.PinID)
 	if err != nil {
 		return plan, err
 	}
-	frozen, freezeErr := executionpin.FreezeRelease(pin, nested)
-	if !found || freezeErr != nil {
+	// Release and receipt are one RF3 apply. A concurrent Recover either wins
+	// first and invalidates this lease, or observes its terminal release. There
+	// is no pending native command for another gateway to replay.
+	if !found || pin.Status != executionpin.StatusActive {
 		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
 	}
-	encodedPin, err := executionpin.AppendRecord(nil, frozen)
+	authority, err := executionpin.ReleaseAuthorityDigest(intent.Command)
+	if err != nil {
+		return plan, err
+	}
+	transition := executionpin.Apply(pin, true, nested, applied, authority, executionpin.Digest(sha256.Sum256(intent.Command)))
+	if transition.Reason != executionpin.ReasonApplied || !transition.Mutated || transition.Record.Status != executionpin.StatusReleased {
+		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
+	}
+	proof, err := executionpin.CompletionFromRecord(executionpin.OperationRelease, transition.Record)
+	if err != nil {
+		return plan, err
+	}
+	proofBytes, err := executionpin.AppendCompletion(nil, proof)
+	if err != nil {
+		return plan, err
+	}
+	next, released, err := requestledger.CompleteSchemaPinRelease(rows.head, rows.prepared, intent, proofBytes)
+	if err != nil {
+		return plan, err
+	}
+	encodedRelease, err := requestledger.AppendSchemaPinRelease(nil, released)
+	if err != nil {
+		return plan, err
+	}
+	encodedPin, err := executionpin.AppendRecord(nil, transition.Record)
 	if err != nil {
 		return plan, ErrExecutionPinStateCorrupt
 	}
-	next, err := requestledger.InstallSchemaPinRelease(rows.head, rows.prepared, release)
-	if err != nil {
-		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
-	}
 	materialized := materializedRequestLedgerRows(rows)
 	beforeReserved, ok := requestLedgerReservedBytes(rows.head, materialized)
 	if !ok {
 		return plan, ErrStateCorrupt
 	}
-	materialized.schemaPinBytes = len(command.Payload)
+	materialized.schemaPinBytes = len(encodedRelease)
 	afterReserved, ok := requestLedgerReservedBytes(next, materialized)
 	if !ok {
 		return plan, ErrStateCorrupt
 	}
 	key := requestledger.AppendSchemaPinReleaseKey(nil, command.Home, command.KeyDigest)
-	plan.rows = append(plan.rows, newTransactionPut(key, command.Payload))
-	// Both existing values have fixed size: no new retained row or byte is
-	// charged, and the active-index hash must track the frozen record exactly.
-	pinKey, activeKey := executionPinRecordStorageKey(frozen.PinID), executionPinActiveStorageKey(frozen)
-	activeDigest := sha256.Sum256(encodedPin)
-	plan.rows = append(plan.rows, newTransactionPut(pinKey[:], encodedPin), newTransactionPut(activeKey[:], activeDigest[:]))
+	pinKey, activeKey := executionPinRecordStorageKey(pin.PinID), executionPinActiveStorageKey(pin)
+	plan.rows = append(plan.rows, newTransactionPut(key, encodedRelease), newTransactionPut(pinKey[:], encodedPin), newTransactionDelete(activeKey[:]))
+	plan.pinDelta.active = -1
+	plan.pinDelta.resident = -int64(executionPinActiveStorageKeyBytes + executionPinActiveValueBytes)
 	plan.delta.rows++
-	plan.delta.residentBytes += int64(len(key) + len(command.Payload))
-	plan.delta.reservedBytes += int64(afterReserved) - int64(beforeReserved)
-	return replaceRequestLedgerHead(plan, rows, next)
-}
-
-func planRequestLedgerRecordSchemaPinReleased(
-	plan requestLedgerCommandPlan,
-	command requestledger.CommandView,
-	rows requestLedgerRows,
-) (requestLedgerCommandPlan, error) {
-	release, _ := command.SchemaPinRelease()
-	if rows.head.Revision == command.Revision && rows.schemaPinFound &&
-		bytes.Equal(rows.schemaPinRaw, command.Payload) {
-		return witnessedRequestLedgerApplied(plan, rows.head.Revision, rows.head.Phase, rows.schemaPinRaw, true), nil
-	}
-	if rows.head.Revision != command.ExpectedRevision || rows.head.Phase != requestledger.PhasePrepared ||
-		!rows.preparedFound || !rows.schemaPinFound ||
-		rows.schemaPin.Phase != requestledger.SchemaPinReleasing {
-		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
-	}
-	expected, err := requestledger.RecordVerifiedSchemaPinReleased(
-		rows.schemaPin, release.Revision, release.Completion,
-	)
-	if err != nil || expected.RecordDigest != release.RecordDigest {
-		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
-	}
-	// Exact execution-pin release command/completion semantics are verified at
-	// this hook once the dependency-clean executionpin parser is integrated.
-	if !requestLedgerSchemaReleaseEvidenceAvailable(release) {
-		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
-	}
-	next, err := requestledger.MarkSchemaPinReleased(
-		rows.head, rows.prepared, rows.schemaPin, release,
-	)
-	if err != nil {
-		return witnessedRequestLedgerConflict(plan, rows.head.Revision, rows.head.Phase, rows.headRaw), nil
-	}
-	materialized := materializedRequestLedgerRows(rows)
-	beforeReserved, ok := requestLedgerReservedBytes(rows.head, materialized)
-	if !ok {
-		return plan, ErrStateCorrupt
-	}
-	materialized.schemaPinBytes = len(command.Payload)
-	afterReserved, ok := requestLedgerReservedBytes(next, materialized)
-	if !ok {
-		return plan, ErrStateCorrupt
-	}
-	key := requestledger.AppendSchemaPinReleaseKey(nil, command.Home, command.KeyDigest)
-	plan.rows = append(plan.rows, newTransactionPut(key, command.Payload))
-	plan.delta.residentBytes += int64(len(command.Payload) - len(rows.schemaPinRaw))
+	plan.delta.residentBytes += int64(len(key) + len(encodedRelease))
 	plan.delta.reservedBytes += int64(afterReserved) - int64(beforeReserved)
 	return replaceRequestLedgerHead(plan, rows, next)
 }

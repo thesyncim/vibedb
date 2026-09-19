@@ -61,6 +61,18 @@ type durableRequestWaveProposer interface {
 	Propose(context.Context, ReplicatedRoute, []byte) (ReplicatedResult, error)
 }
 
+type durableRequestReleaseReceiptReader interface {
+	ReadRouteReleaseReceipt(
+		context.Context, ReplicatedRoute, []byte, uint64,
+	) (ReplicatedResult, error)
+}
+
+type durableRequestReleaseReceiptResolver interface {
+	resolveDurableReleaseReceiptRoute(
+		context.Context, DurableRequestLogicalTarget, []byte,
+	) (ReplicatedRoute, error)
+}
+
 type durableRequestExecutionPinFencer interface {
 	ValidateExecutionPinFence(
 		context.Context,
@@ -519,29 +531,74 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 
 	if routePin.Phase == requestledger.RoutePinReleasing {
 		stage = "release proposal and proof"
-		route, err = runner.resolvePersistedRoute(ctx, wave, routePin.Command)
+		route, resolveErr := runner.resolvePersistedRoute(ctx, wave, routePin.Command)
+		var settled ReplicatedResult
+		receiptRecovered := false
+		if resolveErr == nil {
+			settled, err = runner.proposer.Propose(ctx, route, routePin.Command)
+		} else {
+			stage = "release receipt"
+			receiptResolver, resolverOK := runner.resolver.(durableRequestReleaseReceiptResolver)
+			receiptReader, readerOK := runner.proposer.(durableRequestReleaseReceiptReader)
+			if !resolverOK || !readerOK {
+				return DurableRequestWaveResult{}, resolveErr
+			}
+			route, err = receiptResolver.resolveDurableReleaseReceiptRoute(
+				ctx, wave.LogicalTarget, routePin.Command,
+			)
+			if err == nil {
+				receiptCtx := ctx
+				if runner.pinAuthority.Valid() {
+					receiptCtx, err = serviceauthz.WithAuthority(ctx, runner.pinAuthority)
+				}
+				if err == nil {
+					settled, err = receiptReader.ReadRouteReleaseReceipt(
+						receiptCtx, route, routePin.Command, 1,
+					)
+				}
+			}
+			if err != nil {
+				// A concurrent gateway may have recorded Released while this
+				// source read was in flight. Reopen the canonical cut once so
+				// that case reaches deterministic cleanup; a still-Releasing
+				// row remains unresolved and can never infer success.
+				stage = "release receipt canonical reread"
+				refreshedHead, refreshedPin, refreshedPending, refreshedApplied, refreshErr :=
+					runner.openWaveRows(ctx, wave, keyDigest)
+				if refreshErr == nil && refreshedPin.Phase == requestledger.RoutePinReleased &&
+					refreshedPin.WaveOrdinal == wave.Ordinal &&
+					refreshedHead.NextStepOrdinal == wave.Ordinal+1 &&
+					refreshedHead.OutstandingRoutePinDigest == (requestledger.Digest{}) &&
+					refreshedPending.Revision == 0 {
+					head, routePin, pending, readApplied =
+						refreshedHead, refreshedPin, refreshedPending, refreshedApplied
+					receiptRecovered = true
+					err = nil
+				} else {
+					return DurableRequestWaveResult{}, errors.Join(resolveErr, err, refreshErr, ErrDurableRequestUnresolved)
+				}
+			}
+		}
 		if err != nil {
-			return DurableRequestWaveResult{}, err
+			return DurableRequestWaveResult{}, errors.Join(resolveErr, err)
 		}
-		settled, proposeErr := runner.proposer.Propose(ctx, route, routePin.Command)
-		if proposeErr != nil {
-			return DurableRequestWaveResult{}, proposeErr
+		if !receiptRecovered {
+			if !validDurableRequestSettlement(routePin.Command, settled) {
+				return DurableRequestWaveResult{}, ErrDurableRequestConflict
+			}
+			next, recordErr := requestledger.RecordVerifiedRoutePinReleased(
+				routePin, routePin.Revision+1, settled.Completion,
+			)
+			if recordErr != nil {
+				return DurableRequestWaveResult{}, errors.Join(recordErr, ErrDurableRequestConflict)
+			}
+			head, err = runner.applyRoutePin(ctx, wave, head, routePin, next,
+				requestledger.OperationRecordRoutePinReleased)
+			if err != nil {
+				return DurableRequestWaveResult{}, err
+			}
+			routePin = next
 		}
-		if !validDurableRequestSettlement(routePin.Command, settled) {
-			return DurableRequestWaveResult{}, ErrDurableRequestConflict
-		}
-		next, recordErr := requestledger.RecordVerifiedRoutePinReleased(
-			routePin, routePin.Revision+1, settled.Completion,
-		)
-		if recordErr != nil {
-			return DurableRequestWaveResult{}, errors.Join(recordErr, ErrDurableRequestConflict)
-		}
-		head, err = runner.applyRoutePin(ctx, wave, head, routePin, next,
-			requestledger.OperationRecordRoutePinReleased)
-		if err != nil {
-			return DurableRequestWaveResult{}, err
-		}
-		routePin = next
 	}
 
 	if routePin.Phase != requestledger.RoutePinReleased ||

@@ -36,8 +36,7 @@ const (
 	OperationRecordRoutePinReleased
 	OperationCleanupPayload
 	OperationPrepareTerminal
-	OperationBeginSchemaPinRelease
-	OperationRecordSchemaPinReleased
+	OperationReleaseSchemaPin
 	OperationRestartPlanning
 	OperationCleanupPlanning
 	OperationAdvanceIssuerHighwater
@@ -174,8 +173,7 @@ func (view CommandView) PreparedTerminal() (PreparedTerminalRecord, bool) {
 	return view.prepared, view.Operation == OperationPrepareTerminal
 }
 func (view CommandView) SchemaPinRelease() (SchemaPinReleaseRecord, bool) {
-	return view.schemaPin, view.Operation == OperationBeginSchemaPinRelease ||
-		view.Operation == OperationRecordSchemaPinReleased
+	return view.schemaPin, view.Operation == OperationReleaseSchemaPin
 }
 func (view CommandView) PlanningRestart() (PlanningRestartRequest, bool) {
 	return view.restart, view.Operation == OperationRestartPlanning
@@ -376,12 +374,9 @@ func OpenCommandInto(raw []byte, stepScratch []StepRef) (CommandView, error) {
 			view.prepared.Revision != command.Revision) {
 			err = ErrCorrupt
 		}
-	case OperationBeginSchemaPinRelease, OperationRecordSchemaPinReleased:
+	case OperationReleaseSchemaPin:
 		view.schemaPin, err = OpenSchemaPinRelease(payload)
-		wantPhase := SchemaPinReleasing
-		if command.Operation == OperationRecordSchemaPinReleased {
-			wantPhase = SchemaPinReleased
-		}
+		wantPhase := SchemaPinReleaseProposal
 		if err == nil && (view.schemaPin.KeyDigest != command.KeyDigest ||
 			view.schemaPin.RequestDigest != command.RequestDigest ||
 			view.schemaPin.PlanRoot != command.PlanRoot ||
@@ -504,7 +499,7 @@ func semanticsDigestWithPerturbAndCount(perturb int, xor uint64) (Digest, int) {
 	hash := sha256.New()
 	_, _ = hash.Write([]byte("vibedb/request-ledger/semantics\x00"))
 	_, _ = hash.Write([]byte("payload-build-command-epoch-u64-reserved288-digest-bound;"))
-	_, _ = hash.Write([]byte("schema-release-intent-atomic-exact-pin-lease-freeze;"))
+	_, _ = hash.Write([]byte("schema-release-atomic-local-pin-and-certificate-current-gateway;"))
 	for _, magic := range [...][4]byte{
 		commandMagic, headMagic, pageMagic, planMagic, pageBatchMagic,
 		pendingWaveMagic, continuationMagic, terminalMagic, ackMagic,
@@ -567,8 +562,7 @@ func semanticsDigestWithPerturbAndCount(perturb int, xor uint64) (Digest, int) {
 		uint64(OperationBeginRoutePinAcquire), uint64(OperationRecordRoutePinAcquired),
 		uint64(OperationBeginRoutePinRelease), uint64(OperationRecordRoutePinReleased),
 		uint64(OperationCleanupPayload),
-		uint64(OperationPrepareTerminal), uint64(OperationBeginSchemaPinRelease),
-		uint64(OperationRecordSchemaPinReleased),
+		uint64(OperationPrepareTerminal), uint64(OperationReleaseSchemaPin),
 		uint64(OperationRestartPlanning), uint64(OperationCleanupPlanning),
 		uint64(OperationAdvanceIssuerHighwater),
 		uint64(OperationOpenIssuerLane),
@@ -576,7 +570,7 @@ func semanticsDigestWithPerturbAndCount(perturb int, xor uint64) (Digest, int) {
 		uint64(OperationAdvanceBeginRoutePinRelease),
 		uint64(RoutePinAcquiring), uint64(RoutePinAcquired),
 		uint64(RoutePinReleasing), uint64(RoutePinReleased),
-		uint64(SchemaPinReleasing), uint64(SchemaPinReleased),
+		uint64(SchemaPinReleaseProposal), uint64(SchemaPinReleased),
 		uint64(IssuerSequenceActive), uint64(IssuerSequenceGCComplete),
 		uint64(IssuerHighwaterStoragePrefix), uint64(IssuerSequenceStoragePrefix),
 		uint64(ReadyStoragePrefix), uint64(PlanningExpiryStoragePrefix), uint64(PrincipalQuotaStoragePrefix),

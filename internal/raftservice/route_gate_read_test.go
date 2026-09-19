@@ -130,8 +130,10 @@ func TestRF3RouteGateReadRejectsFollowerAndIsolatedLeader(t *testing.T) {
 	// genuine quorum-loss stepdown first; both prove the read cannot
 	// complete. Faster store paths park the read in the ReadIndex wait
 	// sooner, so the stepdown increasingly wins this race — assert
-	// non-completion, not which loss surfaces first.
-	if result, lease, err := cluster.owners[leader].ReadRouteGate(isolated, request); !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, raftmodel.ErrReadLeadershipLost) || lease != nil || result != (RouteGateReadResult{}) {
+	// non-completion, not which loss surfaces first. Quorum checking may also
+	// demote the isolated leader before the read deadline, so a rejected
+	// stale leadership barrier (ErrNotLeader) is likewise acceptable.
+	if result, lease, err := cluster.owners[leader].ReadRouteGate(isolated, request); (!errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, raftmodel.ErrReadLeadershipLost) && !errors.Is(err, raftmodel.ErrNotLeader)) || lease != nil || result != (RouteGateReadResult{}) {
 		t.Fatalf("isolated %+v %v", result, err)
 	}
 }

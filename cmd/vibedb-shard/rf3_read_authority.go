@@ -15,6 +15,8 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -354,6 +356,43 @@ func preflightRF3ReadAuthorityRoster(
 	return slices.Equal(confState.GetVoters(), policy.Voters), nil
 }
 
+// rf3ReadAuthorityDynamicCut classifies a stable membership cut reconstructed
+// from a durable, authenticated enrollment receipt. The static authority
+// marker remains bound to the original voter policy, so accepting that old
+// policy after a post-remove cut would make every local observation fail (and
+// would leave a retired member with a serving authority). Keep the runtime
+// alive for ordinary Raft and retired-control replay, but leave its read
+// authority disabled until deployment publishes a policy for the new voters.
+// A dynamic target is deliberately required to be present in the current
+// voter set and absent from the static policy; otherwise the receipt cannot
+// explain this cut and startup must remain fail-closed.
+func rf3ReadAuthorityDynamicCut(
+	item preparedRF3Group, publication raftmodel.Publication, localMember uint64,
+	policy raftauthority.ReadAuthorityPolicy,
+) (skip, localRetired bool, err error) {
+	if item.readAuthorityDynamicMember == 0 {
+		return false, false, nil
+	}
+	if publication.ConfState == nil || publication.ReplicaSetVersion == 0 {
+		return false, false, errRF3ReadAuthority
+	}
+	confState := publication.ConfState
+	if len(confState.GetVoters()) == 0 || len(confState.GetVotersOutgoing()) != 0 ||
+		len(confState.GetLearnersNext()) != 0 || confState.GetAutoLeave() {
+		return false, false, errRF3ReadAuthority
+	}
+	if slices.Equal(confState.GetVoters(), policy.Voters) {
+		// A target that is still a learner does not alter the authority voter
+		// contract; the exact static policy may be configured normally.
+		return false, false, nil
+	}
+	if slices.Contains(policy.Voters, item.readAuthorityDynamicMember) ||
+		!slices.Contains(confState.GetVoters(), item.readAuthorityDynamicMember) {
+		return false, false, errRF3ReadAuthority
+	}
+	return true, !slices.Contains(confState.GetVoters(), localMember), nil
+}
+
 func ensureRF3ReadAuthorityDisabled(memberRoot string) error {
 	path := rf3ReadAuthorityMarkerPath(memberRoot)
 	_, err := os.Lstat(path)
@@ -377,6 +416,7 @@ type rf3ReadAuthorityCacheKey struct {
 type rf3ReadAuthorityProbeTarget struct {
 	key        rf3ReadAuthorityCacheKey
 	allocation uint64
+	command    raftservice.CommandFence
 	address    string
 	// generation is an in-process registration generation. It is deliberately
 	// separate from the durable allocation so a late probe from a removed
@@ -545,6 +585,10 @@ func rf3ReadAuthorityGroupTargetsForPrepared(
 		identity.AllocationGeneration == 0 || identity.NodeIncarnation == 0 {
 		return rf3ReadAuthorityGroupTargets{}, errRF3ReadAuthority
 	}
+	command, err := currentRF3CommandFence(item.apply, identity, item.publication)
+	if err != nil {
+		return rf3ReadAuthorityGroupTargets{}, errRF3ReadAuthority
+	}
 	members := item.manifest.memberRoster()
 	if len(members) != rf3ManifestMembers {
 		return rf3ReadAuthorityGroupTargets{}, errRF3ReadAuthority
@@ -561,6 +605,7 @@ func rf3ReadAuthorityGroupTargetsForPrepared(
 				store: member.StoreID, allocation: identity.AllocationGeneration,
 			},
 			allocation: identity.AllocationGeneration,
+			command:    command,
 			address:    member.NativeAddress,
 		})
 	}
@@ -922,7 +967,7 @@ func (cache *rf3ReadAuthorityIncarnationCache) probeResult(
 	response, err := entry.encoder.RoundTripReplicated(ctx, entry.conn, &shardservice.ReplicatedRequest{
 		Operation: shardservice.ReplicatedProbe, Authority: cache.authority,
 		Capability: serviceauthz.CapabilityDataRead,
-		Fence:      shardservice.ReplicatedFence{Group: target.key.group, AllocationGeneration: target.allocation},
+		Fence:      shardservice.ReplicatedFence{Group: target.key.group, AllocationGeneration: target.allocation, Command: target.command},
 	})
 	if err != nil || response == nil {
 		_ = entry.conn.Close()
@@ -1165,6 +1210,9 @@ func configureRF3ReadAuthorityGroup(
 	if err := ensureRF3ReadAuthorityState(item.manifest.Route.MemberRoot, policy); err != nil {
 		return rf3ReadAuthorityRegistration{}, err
 	}
+	if err := runtime.Failure(); errors.Is(err, raftmember.ErrRuntimeClosed) {
+		return rf3ReadAuthorityRegistration{}, err
+	}
 	identity := runtime.Identity()
 	targets, err := rf3ReadAuthorityGroupTargetsForPrepared(item, identity)
 	if err != nil {
@@ -1234,15 +1282,48 @@ func configureRF3ReadAuthorities(
 	}
 	configuredPrepared := make([]preparedRF3Group, 0, len(prepared))
 	configuredRuntimes := make([]*raftmember.Runtime, 0, len(runtimes))
+	dynamicCut := make([]bool, len(prepared))
 	for index, item := range prepared {
 		if item.adoptedChild {
+			continue
+		}
+		var publication raftmodel.Publication
+		if item.readAuthorityDynamicMember != 0 {
+			if runtimes[index] == nil {
+				return nil, nil, errRF3ReadAuthority
+			}
+			publication, err = runtimes[index].Publication()
+			if err != nil {
+				return nil, nil, errors.Join(errRF3ReadAuthority, err)
+			}
+		}
+		localMember := uint64(0)
+		if runtimes[index] != nil {
+			localMember = runtimes[index].Identity().MemberID
+		}
+		dynamicCut[index], _, err = rf3ReadAuthorityDynamicCut(item, publication, localMember, policy)
+		if err != nil {
+			return nil, nil, err
+		}
+		if dynamicCut[index] {
+			// Validate a retained marker when present, but never create a new
+			// marker for a roster that has no corresponding policy. This keeps
+			// the durable downgrade fence intact while allowing a source whose
+			// local member was removed to restart for control replay.
+			if _, markerErr := inspectRF3ReadAuthorityState(item.manifest.Route.MemberRoot, policy); markerErr != nil {
+				return nil, nil, markerErr
+			}
 			continue
 		}
 		configuredPrepared = append(configuredPrepared, item)
 		configuredRuntimes = append(configuredRuntimes, runtimes[index])
 	}
 	if len(configuredPrepared) == 0 {
-		return nil, nil, errRF3ReadAuthority
+		startup := make([]raftmember.ReadAuthorityEvidence, 0, len(runtimes))
+		for _, runtime := range runtimes {
+			startup = append(startup, runtime.ReadAuthorityEvidence())
+		}
+		return nil, startup, nil
 	}
 	cache, err := newRF3ReadAuthorityCache(profile, authPolicy, configuredPrepared, configuredRuntimes, localNode)
 	if err != nil {

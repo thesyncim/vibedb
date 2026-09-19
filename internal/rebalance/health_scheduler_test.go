@@ -1,6 +1,7 @@
 package rebalance
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
@@ -316,4 +318,158 @@ func cloneFailedReplicaCut(cut FailedReplicaPlanningCut) FailedReplicaPlanningCu
 	clone.Healthy = append([]HealthyReplica(nil), cut.Healthy...)
 	clone.Candidates = append([]ReplacementCandidate(nil), cut.Candidates...)
 	return clone
+}
+
+func failedReplicaEnrolledTestCut(t testing.TB) FailedReplicaPlanningCut {
+	t.Helper()
+	cut := failedReplicaTestCut(t, 1)
+	descriptor := cut.Catalog.ReplicatedShardDescriptors()[0]
+	descriptor.LogicalSchemaDigest = [32]byte{99}
+	descriptor.RequestLedgerRanges = []gateway.DurableRequestLedgerRangeDescriptor{{Identity: [32]byte{98}}}
+	target := cut.Candidates[0]
+	descriptor.EnrolledTarget = &gateway.ReplicatedReplicaDescriptor{Member: target.Member, Node: target.Node, StoreID: target.StoreID, NodeIncarnation: target.NodeIncarnation, Endpoint: target.Endpoint, NativeEndpoint: target.Endpoint + "-native", ControlEndpoint: target.Endpoint + "-control"}
+	endpoints := make(map[distribution.EndpointID]string)
+	for _, replica := range descriptor.Replicas {
+		for _, endpoint := range []distribution.EndpointID{replica.Endpoint, replica.NativeEndpoint, replica.ControlEndpoint} {
+			address, err := cut.Catalog.Address(endpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			endpoints[endpoint] = address
+		}
+	}
+	endpoints[target.Endpoint], _ = cut.Catalog.Address(target.Endpoint)
+	endpoints[descriptor.EnrolledTarget.NativeEndpoint] = "127.0.1.1:9000"
+	endpoints[descriptor.EnrolledTarget.ControlEndpoint] = "127.0.1.1:9001"
+	manifest, _ := cut.Catalog.Manifest("data")
+	config := distribution.ClusterConfig{Distributions: []distribution.DistributionSpec{{Name: "data", Arity: 1, MapperVersion: 1}}, Placements: []distribution.TablePlacement{{Table: "docs", Distribution: "data", Columns: []string{"/id"}}}, Manifests: []*distribution.Manifest{manifest}}
+	var err error
+	cut.Catalog, err = gateway.NewSnapshotWithReplicatedMetadata(config, endpoints, 9, nil, nil, []gateway.ReplicatedShardDescriptor{descriptor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cut
+}
+
+func TestFailedReplicaPlanTransitionUsesAuthorizedOperationIdentity(t *testing.T) {
+	cut := failedReplicaEnrolledTestCut(t)
+	planned, err := PlanFailedReplicaReplacement(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition, found := planned.Plan.TransitionIntent()
+	if !found {
+		t.Fatal("enrolled RF3 plan has no durable transition")
+	}
+	if transition.Key.OperationID != [32]byte(planned.Operation) {
+		t.Fatal("failure authorization changed operation without updating transition ownership")
+	}
+	recovered, err := OpenReplicaMoveIntent(planned.Intent, cut.Catalog, cut.Publication, nil)
+	if err != nil {
+		t.Fatalf("recover authorized transition: %v", err)
+	}
+	if recovered.OperationID() != planned.Operation {
+		t.Fatal("recovery changed authorized operation")
+	}
+}
+
+func TestOwnedReplicaMoveRecoverySurvivesUnrelatedHeadAdvance(t *testing.T) {
+	cut := failedReplicaEnrolledTestCut(t)
+	planned, err := PlanFailedReplicaReplacement(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := gateway.AppendSnapshotDocument(nil, cut.Catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Advance the head and its request-ledger topology revision while retaining
+	// this group's exact descriptor, route, and command fences.
+	raw = bytes.ReplaceAll(raw, []byte(`"generation":9`), []byte(`"generation":19`))
+	advanced, err := gateway.OpenSnapshotDocument(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if advanced.Generation() != 19 {
+		t.Fatal("fixture did not advance the catalog head")
+	}
+	if gateway.DigestReplicatedShardDescriptor(advanced.ReplicatedShardDescriptors()[0]) != gateway.DigestReplicatedShardDescriptor(cut.Catalog.ReplicatedShardDescriptors()[0]) {
+		t.Fatal("fixture changed the owned group")
+	}
+	recovered, err := OpenReplicaMoveIntent(planned.Intent, advanced, cut.Publication, nil)
+	if err != nil {
+		t.Fatalf("unrelated head publication stranded owned intent: %v", err)
+	}
+	if recovered.OperationID() != planned.Operation || recovered.CatalogGeneration() != 9 {
+		t.Fatal("recovery rewrote immutable operation provenance")
+	}
+	if _, err := recovered.catalogStage(advanced); err != nil {
+		t.Fatalf("recovered source stage: %v", err)
+	}
+}
+
+func advanceOwnedTestHead(t testing.TB, snapshot *gateway.Snapshot, generation uint64) *gateway.Snapshot {
+	t.Helper()
+	raw, err := gateway.AppendSnapshotDocument(nil, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = bytes.ReplaceAll(raw, []byte(fmt.Sprintf(`"generation":%d`, snapshot.Generation())), []byte(fmt.Sprintf(`"generation":%d`, generation)))
+	advanced, err := gateway.OpenSnapshotDocument(raw)
+	if err != nil || advanced.Generation() != generation {
+		t.Fatalf("advance fixture head: %v", err)
+	}
+	return advanced
+}
+
+func TestOwnedReplicaMoveCertificateUsesGroupFenceAcrossHeadPublications(t *testing.T) {
+	cut := failedReplicaEnrolledTestCut(t)
+	candidate, err := PlanFailedReplicaReplacement(cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := advanceOwnedTestHead(t, cut.Catalog, 19)
+	plan, err := PlanReplicaMove(source, cut.Publication, candidate.Plan.Request())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := AppendReplicaMoveIntent(nil, source, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := bindMoveTestPlan(plan)
+	certificate := &replicatedstate.SnapshotBaseCertificate{Manifest: replicatedstate.SnapshotArtifactManifest{State: bound.baseState}, Digest: bound.baseDigest}
+	current := advanceOwnedTestHead(t, source, 29)
+	publication := raftmodel.Publication{Applied: 40, ReplicaSetVersion: 40, ConfState: plan.voterConf}
+	recovered, err := OpenReplicaMoveIntent(raw, current, publication, certificate)
+	if err != nil {
+		t.Fatalf("group route generation 9 at global head 29: %v", err)
+	}
+	command := plan.transition.SourceDescriptor.Command
+	command.ReplicaSetVersion = 40
+	command.OwnershipEpoch++
+	command.RoutingVersion++
+	command.RouteGeneration++
+	next, err := recovered.CatalogSnapshotAtHead(current, gateway.TransitionPhasePreRemove, plan.transition.Replacement, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Generation() != 30 || next.ReplicatedShardDescriptors()[0].Command.RouteGeneration != 10 {
+		t.Fatal("publication conflated group and shared-head generations")
+	}
+	recovered, err = OpenReplicaMoveIntent(raw, next, publication, certificate)
+	if err != nil {
+		t.Fatalf("recover after unrelated heads and owned publication: %v", err)
+	}
+	if recovered.OperationID() != plan.OperationID() || recovered.CatalogGeneration() != 19 {
+		t.Fatal("recovery changed immutable source identity")
+	}
+	if _, err := recovered.catalogStage(next); err == nil {
+		t.Fatal("target placement accepted without its committed receipt")
+	}
+	forged := *certificate
+	forged.Manifest.State.Binding.RouteGeneration = 19
+	if _, err := OpenReplicaMoveIntent(raw, next, publication, &forged); err == nil {
+		t.Fatal("accepted shared-head generation as the group's snapshot fence")
+	}
 }

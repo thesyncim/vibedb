@@ -86,15 +86,7 @@ func TestDurableRequestProgramExactContinuationAndTerminalBounds(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			head, err = requestledger.InstallSchemaPinRelease(head, prepared, release)
-			if err != nil {
-				t.Fatal(err)
-			}
-			released, err := requestledger.RecordVerifiedSchemaPinReleased(release, release.Revision+1, []byte{2})
-			if err != nil {
-				t.Fatal(err)
-			}
-			head, err = requestledger.MarkSchemaPinReleased(head, prepared, release, released)
+			head, released, err := requestledger.CompleteSchemaPinRelease(head, prepared, release, []byte{2})
 			if err != nil {
 				t.Fatal(err)
 			}

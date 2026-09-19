@@ -314,7 +314,7 @@ func newNode(
 	// InitialState ConfState is not authoritative after later config entries.
 	recovery := recoveryStorage{
 		StableStore: stable, confState: cloneConfState(pub.ConfState),
-		commitFloor: pub.Applied,
+		commitFloor: pub.Applied, async: async,
 	}
 	cfg := NewConfig(id, recovery, pub.Applied)
 	if async {
@@ -1877,14 +1877,46 @@ type recoveryStorage struct {
 	StableStore
 	confState   *pb.ConfState
 	commitFloor uint64
+	async       bool
 }
 
-// Snapshot is intentionally unavailable through the RawNode recovery view.
-// NewNode has already consumed the durable snapshot before wrapping the store;
-// this method only prevents Raft from advertising a snapshot that the
-// immutable-base WAL runtime cannot transfer and acknowledge.
+// Snapshot is unavailable through the RawNode recovery view on a synchronous
+// node: NewNode has already consumed the durable snapshot before wrapping the
+// store, and the synchronous runtime has no mechanism to transfer or
+// acknowledge one (see the HasSnapshot guard in Runtime.DriveReady).
+//
+// A pipelined node instead advertises a metadata-only snapshot describing the
+// live immutable base (StableStore's current FirstIndex-1), with no Data.
+// This lets Raft's internal sendAppend proceed past ErrSnapshotTemporarilyUnavailable
+// when a peer's progress falls below FirstIndex, which is required for
+// pipelinedRuntime.sendSnapshotBaseProbe to ever run: that method locally
+// intercepts the resulting MsgSnap and converts it into an ordinary MsgApp
+// probe, so the snapshot's Data and ConfState are never transferred to the
+// peer or trusted as a real installation - only Metadata.Index/Term reach the
+// wire. Without this, a peer whose progress regresses below the base (e.g.
+// after a restart) can never resume: Raft silently stops sending it anything.
 func (s recoveryStorage) Snapshot() (*pb.Snapshot, error) {
-	return nil, raft.ErrSnapshotTemporarilyUnavailable
+	if !s.async {
+		return nil, raft.ErrSnapshotTemporarilyUnavailable
+	}
+	first, err := s.StableStore.FirstIndex()
+	if err != nil || first == 0 {
+		return nil, raft.ErrSnapshotTemporarilyUnavailable
+	}
+	base := first - 1
+	if base == 0 {
+		return nil, raft.ErrSnapshotTemporarilyUnavailable
+	}
+	term, err := s.StableStore.Term(base)
+	if err != nil || term == 0 || term == math.MaxUint64 {
+		return nil, raft.ErrSnapshotTemporarilyUnavailable
+	}
+	confState := cloneConfState(s.confState)
+	if err := ValidateConfState(confState, base); err != nil {
+		return nil, raft.ErrSnapshotTemporarilyUnavailable
+	}
+	index := base
+	return &pb.Snapshot{Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: confState}}, nil
 }
 
 func (s recoveryStorage) InitialState() (*pb.HardState, *pb.ConfState, error) {

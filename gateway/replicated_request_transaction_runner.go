@@ -325,7 +325,7 @@ func (runner *DurableRequestDistributedRunner) completeTerminalAttempt(
 	state durableDistributedState,
 ) (DurableRequestTerminalResult, error) {
 	// Terminal recovery owns an immutable prepared ACK and, when present, an
-	// exact release intent. Read that cut before any attempted lease takeover.
+	// committed release certificate. Read that cut before any lease takeover.
 	if runner.pins != nil {
 		reader, ok := runner.ledger.(durableRequestTerminalCutReader)
 		if !ok {

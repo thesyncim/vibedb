@@ -92,13 +92,31 @@ type ReplicatedCatalogAuthority struct {
 	scratch                            []byte
 	pendingCatalog                     *Snapshot
 	pendingExpected                    uint64
+	pendingOwned                       bool
 	pendingGrant                       membershipgrant.Grant
 	pendingReplacementSet              []membershipgrant.Grant
 	pendingReplacementSetPostRemove    bool
 	pendingPostRemoveReplicaSetVersion uint64
 	issuerGrants                       *replicatedIssuerGrantCache
+	gatewayParticipants                GatewayParticipantScanner
 	routeSeed                          atomic.Pointer[replicatedCatalogRouteSeedTracker]
+	rollover                           ReplicatedCatalogSessionRollover
+	rolloverMu                         sync.Mutex
 }
+
+// ReplicatedCatalogSessionRollover performs the only legal transition between
+// two catalog session bindings. The callback must settle the old exact journal
+// (including an outcome-unknown command), open a distinct exact-next journal,
+// and return the new active session. Route-seed promotion happens only after
+// this callback returns successfully.
+type ReplicatedCatalogSessionRolloverResult struct {
+	Session  *NativeSession
+	Complete func() error
+}
+
+type ReplicatedCatalogSessionRollover func(
+	context.Context, ReplicatedRoute, ReplicatedRoute, *Snapshot,
+) (ReplicatedCatalogSessionRolloverResult, error)
 
 type ReplicatedCatalogAuthorityOptions struct {
 	Executor *ReplicatedExecutor
@@ -113,6 +131,15 @@ type ReplicatedCatalogAuthorityOptions struct {
 	// proposal, and byte-identical retry. Callers cannot accidentally fall back
 	// to an unclassified DataWrite request.
 	Authority serviceauthz.Authority
+	// SessionRollover is required for a live catalog route change. Without it,
+	// a changed certified candidate remains staged and the caller receives
+	// ErrReplicatedCatalogRouteRestartRequired rather than observing a seed or
+	// journal binding out of sync.
+	SessionRollover ReplicatedCatalogSessionRollover
+	// GatewayParticipants is the authenticated live-session directory used by
+	// safe-to-stop scans. Leaving it nil keeps gateway nodes conservatively
+	// blocked; role bits are never accepted as retirement evidence.
+	GatewayParticipants GatewayParticipantScanner
 }
 
 func NewReplicatedCatalogAuthority(options ReplicatedCatalogAuthorityOptions) (*ReplicatedCatalogAuthority, error) {
@@ -138,9 +165,11 @@ func NewReplicatedCatalogAuthority(options ReplicatedCatalogAuthorityOptions) (*
 	return &ReplicatedCatalogAuthority{
 		executor: options.Executor, route: route, relation: options.Relation,
 		holder: options.Holder, session: options.Session,
-		authority:    options.Authority,
-		scratch:      make([]byte, 0, 4<<10),
-		issuerGrants: newReplicatedIssuerGrantCache(MaxCachedReplicatedIssuerGrants),
+		authority:           options.Authority,
+		gatewayParticipants: options.GatewayParticipants,
+		rollover:            options.SessionRollover,
+		scratch:             make([]byte, 0, 4<<10),
+		issuerGrants:        newReplicatedIssuerGrantCache(MaxCachedReplicatedIssuerGrants),
 	}, nil
 }
 
@@ -231,7 +260,19 @@ func (authority *ReplicatedCatalogAuthority) readRaw(
 		// Membership may advance again after discovery but before ReadIndex.
 		// Retry only the read, with a fresh fully authenticated placement cut.
 		// Discovery still fails closed on unrelated authority or identity changes.
-		route, discoverErr := authority.executor.catalogOperationalRoute(ctx, authority.route, authority.holder.Current())
+		var snapshot *Snapshot
+		if authority.holder != nil {
+			snapshot = authority.holder.Current()
+		}
+		// During startup the holder is intentionally empty: the first
+		// authoritative read happens before the attested route seed can be
+		// published into it. Keep the route-seed snapshot's authenticated
+		// enrolled target available for that discovery sweep. Once a live
+		// snapshot is installed, it remains the source of placement truth.
+		if snapshot == nil && authority.session != nil {
+			snapshot = authority.session.catalogBootstrap
+		}
+		route, discoverErr := authority.executor.catalogOperationalRoute(ctx, authority.route, snapshot)
 		if discoverErr != nil {
 			return ReplicatedPointResult{}, discoverErr
 		}
@@ -433,14 +474,18 @@ func (authority *ReplicatedCatalogAuthority) readAttested(
 		headBytes: uint64(len(cut.head)), headDigest: sha256.Sum256(cut.head),
 	}
 	if tracker := authority.routeSeed.Load(); tracker != nil {
-		if err = tracker.observe(receipt); err != nil {
+		authority.mu.Lock()
+		err = authority.observeCatalogReceiptLocked(ctx, receipt)
+		authority.mu.Unlock()
+		if err != nil {
 			return ReplicatedCatalogSeedReceipt{}, err
 		}
 	}
 	if err = publish(); err != nil {
 		return ReplicatedCatalogSeedReceipt{}, err
 	}
-	receipt.snapshot = authority.holder.Current()
+	// The holder can advance again while this read publishes. Keep the exact
+	// certified snapshot paired with this receipt's canonical bytes and witness.
 	return receipt, nil
 }
 
@@ -487,7 +532,26 @@ func (authority *ReplicatedCatalogAuthority) prepareReadCatalogCut(
 		}
 		if currentErr == nil && advanceErr == nil {
 			return certified, func() error {
-				return authority.holder.publishNewerChecked(certified)
+				publishErr := authority.holder.publishNewerChecked(certified)
+				if publishErr == nil {
+					return nil
+				}
+				// Two authenticated reads can certify the same next generation
+				// before either publishes. Accept the losing reader only when the
+				// winner installed its exact head; a generation match alone cannot
+				// certify a different catalog image or hide a transition failure.
+				installed := authority.holder.Current()
+				if !errors.Is(publishErr, ErrCatalogGenerationNotNewer) ||
+					installed == nil || installed.Generation() != certified.Generation() {
+					return publishErr
+				}
+				installedRaw, encodeErr := appendReplicatedCatalogDocument(
+					nil, installed, maxReplicatedCatalogBytes,
+				)
+				if encodeErr != nil || !bytes.Equal(installedRaw, raw) {
+					return errors.Join(publishErr, encodeErr, ErrReplicatedCatalogConflict)
+				}
+				return nil
 			}, nil
 		}
 		certified, publish, replacementErr := authority.prepareCertifiedReplicaReplacementRead(
@@ -528,6 +592,9 @@ func (authority *ReplicatedCatalogAuthority) publishCertifiedReplicaReplacementR
 func (authority *ReplicatedCatalogAuthority) prepareCertifiedReplicaReplacementRead(
 	ctx context.Context, current, next *Snapshot, nextRaw []byte,
 ) (*Snapshot, func() error, error) {
+	if certified, publish, handled, err := authority.prepareOwnedGroupRead(ctx, current, next, nextRaw); handled || err != nil {
+		return certified, publish, err
+	}
 	if authority == nil || ctx == nil || current == nil || next == nil ||
 		current.Generation() == ^uint64(0) ||
 		next.Generation() != current.Generation()+1 {
@@ -948,7 +1015,7 @@ func (authority *ReplicatedCatalogAuthority) Publish(
 	// reachability coordinate before making the head visible to any in-process
 	// consumer. A binding-changing route closes ShutdownRequired and leaves the
 	// holder on the old cut until the process is fully quiesced.
-	if err = authority.observePublishedCatalog(next); err != nil {
+	if err = authority.observePublishedCatalog(ctx, next); err != nil {
 		return err
 	}
 	return authority.publishCommittedCatalogAfter(expectedGeneration, next)
@@ -1002,6 +1069,7 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 		authority.pendingReplacementSet = nil
 		authority.pendingReplacementSetPostRemove = false
 		authority.pendingExpected = 0
+		authority.pendingOwned = false
 		authority.pendingGrant = membershipgrant.Grant{}
 		authority.pendingPostRemoveReplicaSetVersion = 0
 		return ErrReplicatedCatalogConflict
@@ -1011,12 +1079,14 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 		authority.pendingReplacementSet = nil
 		authority.pendingReplacementSetPostRemove = false
 		authority.pendingExpected = 0
+		authority.pendingOwned = false
 		authority.pendingGrant = membershipgrant.Grant{}
 		authority.pendingPostRemoveReplicaSetVersion = 0
 		return ErrReplicatedCatalog
 	}
 	if authority.pendingCatalog != nil {
 		published := authority.pendingCatalog
+		owned := authority.pendingOwned
 		expected := authority.pendingExpected
 		grant := authority.pendingGrant
 		set, setPostRemove := authority.pendingReplacementSet, authority.pendingReplacementSetPostRemove
@@ -1028,12 +1098,19 @@ func (authority *ReplicatedCatalogAuthority) RetryPending(ctx context.Context) e
 		authority.pendingReplacementSet = nil
 		authority.pendingReplacementSetPostRemove = false
 		authority.pendingExpected = 0
+		authority.pendingOwned = false
 		authority.pendingGrant = membershipgrant.Grant{}
 		authority.pendingPostRemoveReplicaSetVersion = 0
-		if err = authority.observePublishedCatalog(published); err != nil {
+		if err = authority.observePublishedCatalog(ctx, published); err != nil {
 			return err
 		}
-		if len(set) != 0 {
+		if owned {
+			raw, encodeErr := appendReplicatedCatalogDocument(nil, published, maxReplicatedCatalogBytes)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			_, err = authority.publishReadCatalogCut(ctx, published, raw)
+		} else if len(set) != 0 {
 			err = authority.holder.publishReplicaReplacementSetAfter(expected, published, set, setPostRemove)
 		} else if postRemoveReplicaSetVersion != 0 && grant.Valid() {
 			err = authority.holder.publishReplicaReplacementPostRemoveAfter(
@@ -1368,21 +1445,47 @@ func (authority *ReplicatedCatalogAuthority) submitOperations(
 	if authority.session.Status().Pending {
 		return ErrReplicatedCatalogPending
 	}
+	mutations, err := authority.prepareOperationAdmission(ctx, ordered, expected, checkDirectory)
+	if err != nil {
+		return err
+	}
+	result, err := authority.session.MutateBatch(ctx, mutations)
+	if err != nil {
+		if authority.session.Status().Pending {
+			return errors.Join(ErrReplicatedCatalogPending, err)
+		}
+		return err
+	}
+	if result.Completion.ResultCode == replicatedstate.ResultIndexConflict {
+		return ErrReplicatedCatalogConflict
+	}
+	if result.Completion.ResultCode != replicatedstate.ResultApplied {
+		return ErrReplicatedCatalog
+	}
+	return nil
+}
+
+// prepareOperationAdmission builds a directory-fenced admission batch while
+// authority.mu is held. It is shared with enrollment handoff so the move and
+// its parent reference become visible at the same durable boundary.
+func (authority *ReplicatedCatalogAuthority) prepareOperationAdmission(
+	ctx context.Context, ordered []ReplicatedOperationRecord, expected [][32]byte, checkDirectory bool,
+) ([]NativeMutation, error) {
 	directoryResult, err := authority.readRaw(
 		ctx, replicatedOperationDirectoryKey[:], maxReplicatedOperationDirectoryBytes,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var ids [][32]byte
 	if directoryResult.Found {
 		ids, err = openReplicatedOperationDirectory(directoryResult.Value)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if checkDirectory && !slices.Equal(ids, expected) {
-		return ErrReplicatedCatalogConflict
+		return nil, ErrReplicatedCatalogConflict
 	}
 	for _, record := range ordered {
 		position := 0
@@ -1391,7 +1494,7 @@ func (authority *ReplicatedCatalogAuthority) submitOperations(
 		}
 		if position == len(ids) || ids[position] != record.ID {
 			if len(ids) == maxReplicatedOperations {
-				return ErrReplicatedCatalog
+				return nil, ErrReplicatedCatalog
 			}
 			ids = append(ids, [32]byte{})
 			copy(ids[position+1:], ids[position:])
@@ -1403,14 +1506,14 @@ func (authority *ReplicatedCatalogAuthority) submitOperations(
 	for index, record := range ordered {
 		authority.scratch, err = appendReplicatedOperation(authority.scratch, record)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		ends[index] = len(authority.scratch)
 	}
 	recordBytes := len(authority.scratch)
 	authority.scratch, err = appendReplicatedOperationDirectory(authority.scratch, ids)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	directoryBytes := authority.scratch[recordBytes:]
 	directoryMutation := NativeMutation{
@@ -1432,20 +1535,7 @@ func (authority *ReplicatedCatalogAuthority) submitOperations(
 		start = ends[index]
 	}
 	mutations = append(mutations, directoryMutation)
-	result, err := authority.session.MutateBatch(ctx, mutations)
-	if err != nil {
-		if authority.session.Status().Pending {
-			return errors.Join(ErrReplicatedCatalogPending, err)
-		}
-		return err
-	}
-	if result.Completion.ResultCode == replicatedstate.ResultIndexConflict {
-		return ErrReplicatedCatalogConflict
-	}
-	if result.Completion.ResultCode != replicatedstate.ResultApplied {
-		return ErrReplicatedCatalog
-	}
-	return nil
+	return mutations, nil
 }
 
 // PublishOperation creates revision one idempotently or CAS-replaces exactly

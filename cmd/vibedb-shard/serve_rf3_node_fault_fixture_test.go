@@ -11,10 +11,12 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/servicetls"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibejson"
 )
@@ -36,7 +38,7 @@ func prepareRF3FaultNodeMember(t testing.TB, fixture *rf3FaultFixture, member in
 		WAL:       prepareRF3WAL{KeyID: "rf3-command-key", KeyMaterialPath: keySource, WrappedKey: "explicit-test-wrapped-key", MaxFileBytes: geometry.MaxFileBytes, MaxRecordBytes: geometry.MaxRecordBytes, MaxRecords: geometry.MaxRecords, MaxEntries: geometry.MaxEntries, MaxLiveBytes: geometry.MaxLiveBytes},
 		Apply:     prepareRF3Apply{MaxSessions: 32, RetryWindow: 8, MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20, ShardKey: gateway.ReplicatedCatalogPrimaryKey},
 		Listeners: rf3ManifestListeners{Peer: fixture.peerAddresses[member], Native: fixture.nativeAddresses[member], Snapshot: fixture.snapshotAddresses[member], Control: fixture.controlAddresses[member]},
-		TLS:       rf3ManifestTLS{Certificate: fixture.credentials[member].Certificate, Key: fixture.credentials[member].Key, Roots: fixture.roots, IdentityOID: rf3CommandIdentityOID.String()}, AuthorizationPolicy: policy,
+		TLS:       rf3ManifestTLS{PeerKeys: rf3CommandPeerKeys(fixture.credentials[member]), Certificate: fixture.credentials[member].Certificate, Key: fixture.credentials[member].Key, Roots: fixture.roots, IdentityOID: rf3CommandIdentityOID.String()}, AuthorizationPolicy: policy,
 		SplitControl: prepareRF3SplitControl{MaxRecords: 4096, MaxFileBytes: 64 << 20, MaxChildOperations: 8, StageCheckpointBytes: 32 << 20},
 	}
 	for i, node := range fixture.nodes {
@@ -65,6 +67,36 @@ func prepareRF3FaultNodeMember(t testing.TB, fixture *rf3FaultFixture, member in
 	fixture.maxReadValueBytes = uint32(maximum)
 	fixture.walPaths[member] = node.NodeLog.Path
 	fixture.manifestPaths[member] = filepath.Join(root, "serve-rf3.vibejson")
+	manifest, err := loadRF3Manifest(fixture.manifestPaths[member])
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := servicetls.LoadProfile(manifest.TLS.Certificate, manifest.TLS.Key, manifest.TLS.Roots, manifest.TLS.IdentityOID, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := openRF3NodeOwner(manifest, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := prepareRF3GroupSetOnNode(manifest, profile, sqldriver.ReplicatedOpenOptions{}, owner)
+	if err != nil {
+		_ = owner.Close()
+		t.Fatal(err)
+	}
+	if len(set.groups) != 1 {
+		_ = owner.Close()
+		t.Fatalf("node fault command fence groups=%d, want one", len(set.groups))
+	}
+	candidateCommand := rf3CommandFenceFromApply(t, set.groups[0].apply)
+	if err := closePreparedRF3Groups(set.groups, owner.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if member == 0 {
+		fixture.probeCommand = candidateCommand
+	} else if candidateCommand != fixture.probeCommand {
+		t.Fatalf("RF3 node fault member %d command differs from member 1: %+v != %+v", member+1, candidateCommand, fixture.probeCommand)
+	}
 }
 
 func (fixture *rf3FaultFixture) allocatedLogBytes(t testing.TB) int64 {

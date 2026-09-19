@@ -71,6 +71,7 @@ func TestAuthenticatedServiceReturnsNonDurableNotLeader(t *testing.T) {
 func (connection testPeerConnection) PeerIdentity() rafttransport.PeerIdentity {
 	return connection.identity
 }
+func (testPeerConnection) PeerKeyDigest() [32]byte { return [32]byte{} }
 func (connection testPeerConnection) TrafficClass() rafttransport.TrafficClass {
 	return connection.class
 }

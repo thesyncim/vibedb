@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -65,16 +66,25 @@ type rf3NodeRecoveryFixture struct {
 }
 
 func newRF3NodeRecoveryFixture(t *testing.T) *rf3NodeRecoveryFixture {
+	return newRF3NodeRecoveryFixtureWithLearner(t, false)
+}
+
+func newRF3NodeRecoveryFixtureWithLearner(t *testing.T, learner bool) *rf3NodeRecoveryFixture {
 	t.Helper()
 	root := t.TempDir()
 	node := raftstore.NodeIdentity{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}, NodeID: [16]byte{3}}
 	key := raftstore.Key{ID: "recovery-node-key", Wrapped: []byte("test-wrapped-key"), Material: [32]byte{4}}
 	index, term := uint64(1), uint64(1)
 	snapshot := &pb.Snapshot{Data: []byte("rf3-recovery-bootstrap"), Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}}}}
+	member := uint64(1)
+	if learner {
+		member = 4
+		snapshot.Metadata.ConfState.Learners = []uint64{member}
+	}
 	boots := make([]raftstore.NodeBootstrap, 2)
 	for i := range boots {
 		boots[i] = raftstore.NodeBootstrap{Descriptor: raftstore.GroupDescriptor{
-			TopologyRecoveryEpoch: 1, AllocationGeneration: 1, MemberID: 1,
+			TopologyRecoveryEpoch: 1, AllocationGeneration: 1, MemberID: member,
 			GroupID: [16]byte{byte(10 + i)}, ShardIncarnation: [16]byte{byte(20 + i)}, StoreID: [16]byte{byte(30 + i)},
 			Distribution: "data", Shard: fmt.Sprint(i),
 		}, Snapshot: snapshot}
@@ -97,6 +107,13 @@ func newRF3NodeRecoveryFixture(t *testing.T) *rf3NodeRecoveryFixture {
 			t.Fatal("missing prepared group")
 		}
 		paths[i] = filepath.Join(root, fmt.Sprintf("group-%d.vdb", i))
+		if learner {
+			reservation := filepath.Join(root, fmt.Sprintf("group-%d", i))
+			if err := os.Mkdir(reservation, 0700); err != nil {
+				t.Fatal(err)
+			}
+			paths[i] = filepath.Join(reservation, "member.vdb")
+		}
 		db, err := sqldriver.InitializeShardStore(paths[i], sqldriver.ShardStoreBinding{Distribution: "data", Shard: distribution.ShardID(fmt.Sprint(i)), AllocationGeneration: 1})
 		if err != nil {
 			t.Fatal(err)

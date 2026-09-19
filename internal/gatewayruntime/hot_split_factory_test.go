@@ -183,6 +183,72 @@ func TestGatewayHotSplitFactoryRegistersProvisionedSourceByVersion(t *testing.T)
 	}
 }
 
+func TestGatewayHotSplitFactoryAcceptsPendingTargetOutsideServingRoster(t *testing.T) {
+	catalog, descriptor, profile, _ := gatewayHotSplitFactoryFixture(t)
+	target := descriptor.Replicas[0]
+	target.Member = 4
+	target.Node = [16]byte{4}
+	target.StoreID = [16]byte{14}
+	target.NodeIncarnation = 24
+	target.Endpoint = "peer-d"
+	target.NativeEndpoint = "native-d"
+	target.ControlEndpoint = "control-d"
+	descriptor.EnrolledTarget = &target
+
+	spec, ok := catalog.Spec(descriptor.Distribution)
+	if !ok {
+		t.Fatal("missing distribution spec")
+	}
+	placement, ok := catalog.Placement(profile.Table)
+	if !ok {
+		t.Fatal("missing table placement")
+	}
+	manifest, ok := catalog.Manifest(descriptor.Distribution)
+	if !ok {
+		t.Fatal("missing distribution manifest")
+	}
+	endpoints := make(map[distribution.EndpointID]string)
+	for _, replica := range descriptor.Replicas {
+		for _, endpoint := range []distribution.EndpointID{replica.Endpoint, replica.NativeEndpoint, replica.ControlEndpoint} {
+			address, err := catalog.Address(endpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			endpoints[endpoint] = address
+		}
+	}
+	endpoints[target.Endpoint] = "127.0.0.1:4"
+	endpoints[target.NativeEndpoint] = "127.0.0.1:14"
+	endpoints[target.ControlEndpoint] = "127.0.0.1:24"
+	withPendingTarget, err := gateway.NewSnapshotWithReplicatedTableMetadata(distribution.ClusterConfig{
+		Distributions: []distribution.DistributionSpec{spec},
+		Placements:    []distribution.TablePlacement{placement},
+		Manifests:     []*distribution.Manifest{manifest},
+	}, endpoints, catalog.Generation()+1, nil, nil,
+		[]gateway.ReplicatedShardDescriptor{descriptor}, []gateway.ReplicatedTableProfile{profile})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	control := gatewayReplicaControlManifest{}
+	for index, replica := range descriptor.Replicas {
+		control.Shards = append(control.Shards, gateway.ReplicatedEndpoint{Node: replica.Node,
+			ControlAddress: "127.0.0.1:" + strconv.Itoa(21+index)})
+		control.SplitSnapshots = append(control.SplitSnapshots, "127.0.0.1:"+strconv.Itoa(9401+index))
+	}
+	source := gatewaySplitSourceFixture(t, descriptor, profile)
+	if err := control.ValidateCatalog(withPendingTarget); err != nil {
+		t.Fatalf("pending target outside serving roster rejected: %v", err)
+	}
+	factory, err := newGatewayHotSplitFactory(control, withPendingTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := factory.RegisterProvisionedSource(withPendingTarget, source); err != nil {
+		t.Fatalf("provisioned source with pending target rejected: %v", err)
+	}
+}
+
 func TestGatewayHotSplitFactoryRegistryBoundsAndPendingVersions(t *testing.T) {
 	catalog, manifest, first, second, firstDescriptor, work := gatewayHotSplitFactoryRegistrationPairFixture(t)
 	factory, err := newGatewayHotSplitFactory(manifest, catalog)

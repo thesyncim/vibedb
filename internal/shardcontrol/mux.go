@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
@@ -14,11 +15,16 @@ var ErrMux = errors.New("shardcontrol: invalid service discriminator")
 
 const (
 	DiscriminatorBytes = 8
+	// DefaultDiscriminatorTimeout bounds the small protocol phase between
+	// authenticated TLS and service dispatch.  Handlers clear this phase
+	// deadline before they receive the connection, so long snapshot/control
+	// transfers retain their own request deadlines.
+	DefaultDiscriminatorTimeout = 5 * time.Second
 	// MaxRoutes bounds construction work while leaving room for the complete
 	// RF3 control plane. One logical service may own multiple fixed wire
 	// grammars (for example schema build, resume, and shadow build), so the
 	// route bound must cover discriminators rather than handler arguments.
-	MaxRoutes = 24
+	MaxRoutes = 25
 )
 
 // Handler owns one already-authenticated connection. Implementations consume
@@ -32,11 +38,13 @@ type Route struct {
 	Handler       Handler
 }
 
-// Mux is immutable after construction and performs no per-request allocation.
-// The caller's TLS listener remains the sole concurrency bound.
+// Mux is immutable after construction. The caller's TLS listener remains the
+// sole concurrency bound; each dispatched stream gets a cancellation hook so
+// an authenticated idle connection cannot outlive its owning context.
 type Mux struct {
-	routes  []Route
-	traffic rafttransport.TrafficClass
+	routes               []Route
+	traffic              rafttransport.TrafficClass
+	discriminatorTimeout time.Duration
 }
 
 func New(routes ...Route) (*Mux, error) {
@@ -65,7 +73,8 @@ func NewForTraffic(traffic rafttransport.TrafficClass, routes ...Route) (*Mux, e
 			}
 		}
 	}
-	return &Mux{routes: owned, traffic: traffic}, nil
+	return &Mux{routes: owned, traffic: traffic,
+		discriminatorTimeout: DefaultDiscriminatorTimeout}, nil
 }
 
 func (mux *Mux) Serve(ctx context.Context, connection rafttransport.PeerConnection) error {
@@ -76,8 +85,32 @@ func (mux *Mux) Serve(ctx context.Context, connection rafttransport.PeerConnecti
 		}
 		return ErrMux
 	}
+	if mux.discriminatorTimeout <= 0 {
+		_ = connection.Close()
+		return ErrMux
+	}
+	// TLS deliberately hands an authenticated stream to this layer with its
+	// handshake deadline cleared.  Keep the socket bounded while waiting for
+	// the fixed discriminator, and make cancellation close a blocked ReadFull.
+	deadline := time.Now().Add(mux.discriminatorTimeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := connection.SetReadDeadline(deadline); err != nil {
+		_ = connection.Close()
+		return errors.Join(ErrMux, err)
+	}
+	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stop()
 	var discriminator [DiscriminatorBytes]byte
 	if _, err := io.ReadFull(connection, discriminator[:]); err != nil {
+		_ = connection.Close()
+		return errors.Join(ErrMux, err)
+	}
+	// The discriminator is the only bytes owned by Mux.  Clear its short
+	// admission deadline before dispatch so a valid handler can install the
+	// transfer-specific deadline appropriate for its complete grammar.
+	if err := connection.SetReadDeadline(time.Time{}); err != nil {
 		_ = connection.Close()
 		return errors.Join(ErrMux, err)
 	}

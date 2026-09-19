@@ -860,7 +860,7 @@ func TestRequestLedgerRangeAdmissionPrecedesSnapshotReads(t *testing.T) {
 	}
 	fixture.machine.options.RequestLedgerRange.Identity[0] ^= 0xff
 	// A zero pointSnapshot would panic if planning attempted any durable read.
-	plan, err := fixture.machine.planRequestLedgerCommand(outer, State{}, pointSnapshot{})
+	plan, err := fixture.machine.planRequestLedgerCommand(outer, 1, State{}, pointSnapshot{})
 	if err != nil || plan.completion.ResultCode != ResultRequestLedgerWrongRange || len(plan.rows) != 0 {
 		t.Fatalf("wrong range plan = %+v, %v", plan.completion, err)
 	}
@@ -899,12 +899,12 @@ func TestRequestLedgerSequencedHomeNotKeyDigestOwnsRange(t *testing.T) {
 	}
 	defer snapshot.Close()
 	fixture.machine.options.RequestLedgerRange = unitRange(home)
-	plan, err := fixture.machine.planRequestLedgerCommand(outer, State{}, pointSnapshot{value: snapshot})
+	plan, err := fixture.machine.planRequestLedgerCommand(outer, 1, State{}, pointSnapshot{value: snapshot})
 	if err != nil || plan.completion.ResultCode != ResultApplied || len(plan.rows) == 0 {
 		t.Fatalf("home-owned create = %+v rows=%d, %v", plan.completion, len(plan.rows), err)
 	}
 	fixture.machine.options.RequestLedgerRange = unitRange(keyHome)
-	plan, err = fixture.machine.planRequestLedgerCommand(outer, State{}, pointSnapshot{})
+	plan, err = fixture.machine.planRequestLedgerCommand(outer, 1, State{}, pointSnapshot{})
 	if err != nil || plan.completion.ResultCode != ResultRequestLedgerWrongRange || len(plan.rows) != 0 {
 		t.Fatalf("digest-owned create = %+v rows=%d, %v", plan.completion, len(plan.rows), err)
 	}

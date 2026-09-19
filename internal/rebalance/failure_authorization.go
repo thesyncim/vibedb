@@ -65,6 +65,11 @@ func authorizeFailedReplicaMove(
 	}
 	plan.failureAuthorization = raw
 	plan.operation = replicaMoveOperationID(plan)
+	// Failure evidence is part of the operation identity. Keep the still-local
+	// transition ownership on that final identity before either is persisted.
+	if plan.transitionReady {
+		plan.transition.Key.OperationID = [32]byte(plan.operation)
+	}
 	if plan.operation == (OperationID{}) {
 		return ErrFailureEvidence
 	}
@@ -81,6 +86,11 @@ func restoreFailedReplicaAuthorization(plan *Plan, raw []byte) error {
 	}
 	plan.failureAuthorization = bytes.Clone(raw)
 	plan.operation = replicaMoveOperationID(plan)
+	// Failure evidence is part of the operation identity. Keep the still-local
+	// transition ownership on that final identity before either is persisted.
+	if plan.transitionReady {
+		plan.transition.Key.OperationID = [32]byte(plan.operation)
+	}
 	return nil
 }
 

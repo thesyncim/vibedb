@@ -118,11 +118,11 @@ func TestActivePermitIsSharedAndCancellationReleasesWaiter(t *testing.T) {
 	if acquireErr := <-result; !errors.Is(acquireErr, context.Canceled) {
 		t.Fatalf("canceled acquire = %v", acquireErr)
 	}
-	if metrics := budget.Metrics(); metrics.Active != 1 || metrics.Waiting != 0 {
+	if metrics := budget.Metrics(); metrics.Active != 1 || metrics.Waiting != 0 || metrics.PeakActive != 1 {
 		t.Fatalf("metrics after canceled waiter = %+v", metrics)
 	}
 	first.Release()
-	if metrics := budget.Metrics(); metrics.Active != 0 || metrics.Releases != 1 {
+	if metrics := budget.Metrics(); metrics.Active != 0 || metrics.Releases != 1 || metrics.PeakActive != 1 {
 		t.Fatalf("metrics after release = %+v", metrics)
 	}
 }
@@ -153,6 +153,9 @@ func TestOversizedCostIsPacedInBoundedBursts(t *testing.T) {
 	}
 	if got := budget.Metrics().CPU.ConsumedBytes; got != 10 {
 		t.Fatalf("consumed %d, want 10", got)
+	}
+	if got := budget.Metrics().CPU.ThrottledBytes; got == 0 {
+		t.Fatal("paced cost did not report delayed bytes")
 	}
 }
 

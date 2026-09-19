@@ -1823,15 +1823,20 @@ func validateBatch(g *engineGroup, b *ReadyBatch) (byte, error) {
 		return 0, ErrRaftState
 	}
 	if flags&batchBegin != 0 {
-		if b.BeginIncarnation != g.NodeIncarnation+1 || len(b.Entries) != 0 || b.ReplaceFrom != 0 || b.TruncateIndex != 0 || b.TruncateTerm != 0 {
+		if len(b.Entries) != 0 || b.ReplaceFrom != 0 || b.TruncateIndex != 0 || b.TruncateTerm != 0 {
 			return 0, ErrRaftState
 		}
 		if flags == batchBegin {
+			if g.NodeIncarnation == ^uint64(0) || b.BeginIncarnation != g.NodeIncarnation+1 {
+				return 0, ErrRaftState
+			}
 			return flags, nil
 		}
 		// Only a virgin group may combine its first incarnation fence with a
-		// checkpoint and initial HardState. Existing groups still require a
-		// standalone fence: no append, vote change or reset can hitch a ride.
+		// checkpoint and initial HardState. Its first fence can be the physical
+		// incarnation certified by enrollment. Existing groups still require a
+		// consecutive standalone fence: no append, vote change or reset can
+		// hitch a ride.
 		if flags != batchBegin|batchCheckpoint|batchHard || g.NodeIncarnation != 0 ||
 			g.Hard != (HardState{}) || durableLast(g) != 0 || g.Checkpoint != (Checkpoint{}) ||
 			g.TruncateIndex != 0 || g.ReadyID != 0 ||
@@ -2064,7 +2069,12 @@ func (e *Engine) applyEvent(event segmentEvent, segmentID uint64) error {
 		}
 		g.latestWaveID, g.latestWaveDigest, g.latestWaveSequence = id, event.Digest, event.Index
 	case eventIncarnation:
-		if event.Incarnation != g.NodeIncarnation+1 {
+		// Batch validation already restricts a nonconsecutive first fence to
+		// a virgin checkpoint bootstrap. Replaying its individual events must
+		// preserve the same certified physical incarnation.
+		virgin := g.NodeIncarnation == 0 && g.Hard == (HardState{}) && durableLast(g) == 0 &&
+			g.Checkpoint == (Checkpoint{}) && g.TruncateIndex == 0 && g.ReadyID == 0
+		if event.Incarnation == 0 || !virgin && (g.NodeIncarnation == ^uint64(0) || event.Incarnation != g.NodeIncarnation+1) {
 			return ErrRaftState
 		}
 		g.NodeIncarnation, g.ReadyID, g.ReadyDigest, g.ReadyWaveID = event.Incarnation, 0, [16]byte{}, WaveID{}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -14,6 +15,9 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/gatewayruntime"
+	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -30,6 +34,211 @@ type rf3EmbeddedGateway struct {
 	remote  *gateway.AuthenticatedReplicatedClient
 	client  *gateway.ReplicatedNodeClient
 }
+
+// bindRF3EmbeddedGatewayCanonicalRows attaches the local catalog-owner source
+// only when this process actually owns the reserved catalog group. The route
+// seed is the durable reachability coordinate; an absent active seed uses the
+// immutable catalog snapshot for genuine first start. No source is attached to
+// a storage-only process, and an absent catalog during explicit bootstrap is
+// left to the normal catalog genesis path.
+func bindRF3EmbeddedGatewayCanonicalRows(
+	state *rf3EmbeddedGateway, peer *raftservice.AuthenticatedExecutionPeerRuntime,
+	identities []raftmember.RuntimeIdentity,
+) error {
+	if state == nil || peer == nil || peer.Owners() == nil {
+		return errRF3Serving
+	}
+	config := state.config
+	catalog, catalogErr := gateway.LoadSnapshot(config.CatalogPath)
+	if catalogErr != nil && !errors.Is(catalogErr, os.ErrNotExist) {
+		return fmt.Errorf("%w: load local catalog source snapshot: %v", errRF3Serving, catalogErr)
+	}
+	seed, seedErr := gateway.LoadReplicatedCatalogRouteSeed(config.CatalogRouteSeedPath)
+	if seedErr != nil && !errors.Is(seedErr, os.ErrNotExist) {
+		return fmt.Errorf("%w: load local catalog route seed: %v", errRF3Serving, seedErr)
+	}
+	active, activeFound := seed.Active()
+	if !activeFound {
+		active = catalog
+	}
+	if active == nil {
+		// Genuine catalog genesis and an explicit Open of a missing catalog
+		// still own creation. This binder only attaches an already committed
+		// local source route.
+		return nil
+	}
+	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	route, ok := active.ResolveReplicatedRoute(
+		gateway.ReplicatedCatalogDistribution, gateway.ReplicatedCatalogShard, replicas[:0],
+	)
+	if !ok {
+		return fmt.Errorf("%w: local catalog source route is absent", errRF3Serving)
+	}
+	for _, identity := range identities {
+		if identity.Group != route.Group || identity.AllocationGeneration != route.AllocationGeneration {
+			continue
+		}
+		probeCtx, cancel := context.WithTimeout(context.Background(), rf3NetworkTimeout)
+		serving, probeErr := peer.Owners().Probe(probeCtx, route.Group)
+		cancel()
+		if probeErr != nil {
+			return fmt.Errorf("%w: probe local catalog source owner: %v", errRF3Serving, probeErr)
+		}
+		if serving.Identity.Group != route.Group ||
+			serving.Identity.AllocationGeneration != route.AllocationGeneration ||
+			serving.Identity.MemberID == 0 || serving.Identity.StoreID == ([16]byte{}) ||
+			serving.Status.MemberID != serving.Identity.MemberID {
+			return fmt.Errorf("%w: local catalog source owner identity does not match route", errRF3Serving)
+		}
+		if serving.Status.LeaderID != serving.Identity.MemberID {
+			// A catalog follower cannot satisfy the local linearizable row
+			// contract. Leave the local fast path unset; the caller attaches the
+			// authenticated physical ReadLatest source below so this process does
+			// not fall back to a static gateway policy or serve with stale rows.
+			return nil
+		}
+		reader, readerErr := gateway.NewFrontendDrainRuntimeCatalogRowReader(
+			peer.Owners(), route, config.CatalogRelation,
+		)
+		if readerErr != nil {
+			return fmt.Errorf("%w: bind local catalog source rows: %v", errRF3Serving, readerErr)
+		}
+		state.config.CanonicalFrontendDrainRuntimeRows = reader
+		return nil
+	}
+	return nil
+}
+
+// bindRF3RetainedCatalogRows constructs the pre-open source for a physical
+// storage node. The retained RF3 group and its current command fence are
+// already certified before a gateway manifest is available, so this path uses
+// only those coordinates and the canonical catalog base relation (relation 1).
+// NewFrontendDrainRuntimeCatalogRowReaderForCatalogRoute still probes the
+// owner on every read and fails closed on followers or retired groups.
+func bindRF3RetainedCatalogRows(
+	peer *raftservice.AuthenticatedExecutionPeerRuntime,
+	prepared *preparedRF3Set,
+	commands []raftservice.CommandFence,
+) (gateway.FrontendDrainRuntimeCutRowReader, error) {
+	if peer == nil || peer.Owners() == nil || prepared == nil || len(commands) != len(prepared.groups) {
+		return nil, errRF3Serving
+	}
+	for index, item := range prepared.groups {
+		if item.base.Binding.Distribution != string(gateway.ReplicatedCatalogDistribution) ||
+			item.base.Binding.Shard != string(gateway.ReplicatedCatalogShard) {
+			continue
+		}
+		if !commands[index].Valid() {
+			return nil, fmt.Errorf("%w: retained catalog command fence differs from group binding", errRF3Serving)
+		}
+		return gateway.NewFrontendDrainRuntimeCatalogRowReaderForCatalogRoute(
+			peer.Owners(), gateway.FrontendDrainRuntimeCatalogRoute{
+				Group:                groupFromBinding(item.base.Binding),
+				AllocationGeneration: item.base.Binding.AllocationGeneration,
+				Command:              commands[index],
+				Relation:             replication.RelationID(1),
+			},
+		)
+	}
+	return nil, nil
+}
+
+// rf3DynamicCatalogRows resolves the physical catalog source from the
+// persisted node descriptor catalog and the serialized execution owners on
+// every source read. A source group may be newly adopted or have moved away
+// from this node after the process started; retaining one manifest route would
+// strand a gateway-free recovery on the old catalog voter.
+type rf3DynamicCatalogRows struct {
+	owners   *raftservice.ExecutionOwners
+	store    *raftstore.NodeStore
+	relation replication.RelationID
+	mu       sync.Mutex
+	active   *gateway.FrontendDrainRuntimeCatalogRowReader
+}
+
+func newRF3DynamicCatalogRows(
+	owners *raftservice.ExecutionOwners, store *raftstore.NodeStore,
+) *rf3DynamicCatalogRows {
+	return &rf3DynamicCatalogRows{owners: owners, store: store, relation: replication.RelationID(1)}
+}
+
+func (reader *rf3DynamicCatalogRows) resolve(
+	ctx context.Context,
+) (*gateway.FrontendDrainRuntimeCatalogRowReader, error) {
+	if reader == nil || ctx == nil || reader.owners == nil || reader.store == nil {
+		return nil, errRF3Serving
+	}
+	reader.mu.Lock()
+	active := reader.active
+	reader.mu.Unlock()
+	if active != nil {
+		if _, err := active.ReadFrontendDrainRuntimeCatalogRoute(ctx); err == nil {
+			return active, nil
+		}
+	}
+	descriptors, err := reader.store.GroupDescriptors()
+	if err != nil {
+		return nil, err
+	}
+	nodeIdentity := reader.store.NodeIdentity()
+	for _, descriptor := range descriptors {
+		if descriptor.Distribution != string(gateway.ReplicatedCatalogDistribution) ||
+			descriptor.Shard != string(gateway.ReplicatedCatalogShard) {
+			continue
+		}
+		group := raftmember.GroupKey{
+			ClusterID: nodeIdentity.ClusterID, ClusterIncarnation: nodeIdentity.ClusterIncarnation,
+			TopologyRecoveryEpoch: descriptor.TopologyRecoveryEpoch,
+			ShardIncarnation:      descriptor.ShardIncarnation, GroupID: descriptor.GroupID,
+		}
+		state, probeErr := reader.owners.Probe(ctx, group)
+		if probeErr != nil || state.Identity.Group != group ||
+			state.Identity.AllocationGeneration != descriptor.AllocationGeneration ||
+			state.Identity.MemberID != descriptor.MemberID || state.Identity.StoreID != descriptor.StoreID ||
+			state.Status.MemberID != state.Identity.MemberID || state.Status.LeaderID != state.Identity.MemberID {
+			if cause := context.Cause(ctx); cause != nil {
+				return nil, cause
+			}
+			continue
+		}
+		candidate, readerErr := gateway.NewFrontendDrainRuntimeCatalogRowReaderForCatalogRoute(
+			reader.owners, gateway.FrontendDrainRuntimeCatalogRoute{
+				Group: group, AllocationGeneration: descriptor.AllocationGeneration,
+				Command: state.Command, Relation: reader.relation,
+			},
+		)
+		if readerErr != nil {
+			return nil, readerErr
+		}
+		reader.mu.Lock()
+		reader.active = candidate
+		reader.mu.Unlock()
+		return candidate, nil
+	}
+	return nil, errRF3Serving
+}
+
+func (reader *rf3DynamicCatalogRows) ReadFrontendDrainRuntimeCatalogRoute(
+	ctx context.Context,
+) (gateway.FrontendDrainRuntimeCatalogRoute, error) {
+	active, err := reader.resolve(ctx)
+	if err != nil {
+		return gateway.FrontendDrainRuntimeCatalogRoute{}, err
+	}
+	return active.ReadFrontendDrainRuntimeCatalogRoute(ctx)
+}
+
+func (reader *rf3DynamicCatalogRows) ReadFrontendDrainRuntimeRow(
+	ctx context.Context, key gateway.FrontendDrainRuntimeRowKey,
+) (gateway.FrontendDrainRuntimeRow, error) {
+	active, err := reader.resolve(ctx)
+	if err != nil {
+		return gateway.FrontendDrainRuntimeRow{}, err
+	}
+	return active.ReadFrontendDrainRuntimeRow(ctx, key)
+}
+
+var _ gateway.FrontendDrainRuntimeCutRowReader = (*rf3DynamicCatalogRows)(nil)
 
 // Entering Accept proves the service finished installing its cancellation,
 // authentication and worker bounds. Binding a socket alone does not prove
@@ -78,8 +287,8 @@ func runServeNode(args []string) int {
 		fmt.Fprintf(os.Stderr, "error RF3 node manifest: %v\n", err)
 		return 2
 	}
-	if manifest.NodeLog == nil || len(manifest.Groups) == 0 || manifest.Gateway == nil {
-		fmt.Fprintln(os.Stderr, "error RF3 node manifest: serve-node requires grouped node_log and explicit gateway configuration")
+	if manifest.NodeLog == nil || len(manifest.Groups) == 0 && manifest.NodeIncarnation == 0 {
+		fmt.Fprintln(os.Stderr, "error RF3 node manifest: serve-node requires a grouped node_log and empty-node incarnation when groups are absent")
 		return 2
 	}
 	stopReload := configureRF3ManifestReload(&manifest, *manifestPath, *reload)
@@ -216,7 +425,7 @@ func prepareRF3EmbeddedGateway(
 		CatalogSessionLease:       rf3GatewayDuration(encoded.CatalogSessionLeaseMillis, 24*time.Hour),
 		CatalogSessionJournal:     encoded.CatalogSessionJournal, CatalogClientID: clientID,
 		CatalogRetryHome: retryHome, DurableAckKeyPath: encoded.DurableAckKeyPath,
-		Transport:      client,
+		Transport: client, RequireServiceDirectoryBinding: true,
 		ListenAddress:  encoded.ListenAddress,
 		TLSCertificate: encoded.TLS.Certificate, TLSKey: encoded.TLS.Key,
 		TLSRoots: encoded.TLS.Roots, TLSIdentityOID: encoded.TLS.IdentityOID,
@@ -263,6 +472,13 @@ func validateRF3EmbeddedGatewayLocalNative(manifest rf3Manifest, localNode raftt
 	if validateRF3Address(manifest.Listeners.Native, false) != nil {
 		return fmt.Errorf("%w: embedded gateway local native listener is invalid", errRF3Serving)
 	}
+	if len(manifest.groupBundles()) == 0 && len(peers) == 0 {
+		// A cold capacity node has no committed group roster yet. Its native
+		// listener is still started as an authenticated fail-closed endpoint;
+		// the directory and later learner installation publish the first local
+		// route without restarting this process.
+		return nil
+	}
 	for _, peer := range peers {
 		if peer.Node != localNode {
 			continue
@@ -289,7 +505,14 @@ func rf3EmbeddedGatewayPeers(manifest rf3Manifest, configured []rf3ManifestGatew
 		}
 	}
 	if len(expected) == 0 {
-		return nil, fmt.Errorf("%w: embedded gateway has no shard roster", errRF3Serving)
+		// An empty physical node may start its gateway/control plane before any
+		// group has been admitted. The replicated control directory supplies
+		// native peers after enrollment; requiring a fabricated shard roster
+		// here would make the node impossible to bootstrap safely.
+		if len(configured) != 0 {
+			return nil, fmt.Errorf("%w: empty node cannot carry a static shard peer roster", errRF3Serving)
+		}
+		return []servicetls.Endpoint{}, nil
 	}
 	if len(configured) == 0 {
 		return nil, fmt.Errorf("%w: embedded gateway requires an explicit native shard peer roster", errRF3Serving)

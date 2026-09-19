@@ -3,6 +3,7 @@ package rebalance
 import (
 	"encoding/binary"
 	"errors"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -496,6 +497,34 @@ func TestReplicaMoveRejectsWrongPostRemoveCatalogFence(t *testing.T) {
 	observed.TargetState.ConfState = plan.removedConf
 	if _, err := Reconcile(plan, observed); !errors.Is(err, ErrTopologyConflict) {
 		t.Fatalf("wrong post-remove catalog fence error = %v", err)
+	}
+}
+
+func TestTargetManifestForMoveReplacesNonFirstSourceLeader(t *testing.T) {
+	manifest, err := distribution.NewManifest("data", 7, []distribution.Shard{{
+		ID: "all", AllocationGeneration: 11,
+		Range:   distribution.KeyRange{Start: moveTestPoint(0), End: distribution.KeyspaceEnd{Max: true}},
+		Leaders: []distribution.EndpointID{"source", "donor", "other"}, Epoch: 13,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := MoveRequest{Distribution: "data", Shard: "all", Source: "donor", Target: "target"}
+	target, err := targetManifestForMove(manifest, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shard, ok := target.ShardInfo(0)
+	if !ok || !slices.Equal(shard.Leaders, []distribution.EndpointID{"source", "target", "other"}) {
+		t.Fatalf("target leaders=%v", shard.Leaders)
+	}
+	recovered, err := sourceManifestForRecovery(target, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shard, ok = recovered.ShardInfo(0)
+	if !ok || !slices.Equal(shard.Leaders, []distribution.EndpointID{"source", "donor", "other"}) {
+		t.Fatalf("recovered leaders=%v", shard.Leaders)
 	}
 }
 

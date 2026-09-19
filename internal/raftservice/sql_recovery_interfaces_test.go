@@ -11,4 +11,5 @@ var (
 	_ raftservice.TransactionRecoverySource = (*sqldriver.ReplicatedApply)(nil)
 	_ raftservice.RequestLedgerSource       = (*sqldriver.ReplicatedApply)(nil)
 	_ raftservice.ExecutionPinSource        = (*sqldriver.ReplicatedApply)(nil)
+	_ raftservice.RouteReleaseReceiptSource = (*sqldriver.ReplicatedApply)(nil)
 )

@@ -268,7 +268,7 @@ func TestDurableRequestServiceReplaysTerminalFromReplicatedStateOnly(t *testing.
 
 func TestDurableRequestServiceExistingAckResumesGCAndRetiresLocalPinJournal(t *testing.T) {
 	terminalPlan, head, continuation, terminalPin := terminalCoordinatorFixture(t)
-	terminalLedger := &terminalCoordinatorLedger{head: head, continuation: continuation}
+	terminalLedger := &terminalCoordinatorLedger{pin: terminalPin, head: head, continuation: continuation}
 	coordinator, err := newDurableRequestTerminalCoordinator(terminalLedger, terminalPin)
 	if err != nil {
 		t.Fatal(err)
@@ -286,11 +286,10 @@ func TestDurableRequestServiceExistingAckResumesGCAndRetiresLocalPinJournal(t *t
 	ledger := &ackCollectorLedger{
 		head: terminalLedger.head, terminal: terminal.Terminal, ack: ack,
 	}
-	terminalPlan.Home.route = terminalPin.route
 	topology, err := NewDurableRequestLedgerTopologyHolder(DurableRequestLedgerTopology{
 		Generation: 1,
 		Ranges: []DurableRequestLedgerRange{{
-			Identity: terminalPlan.Home.Identity, Route: terminalPin.route,
+			Identity: terminalPlan.Home.Identity, Route: terminalPlan.Home.route,
 		}},
 	})
 	if err != nil {

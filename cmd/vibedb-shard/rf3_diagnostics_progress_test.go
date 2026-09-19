@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,7 +10,72 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
+
+type rf3DiagnosticTransportStatsStub struct {
+	byNode map[rafttransport.NodeID]rafttransport.PeerStats
+}
+
+func (stub rf3DiagnosticTransportStatsStub) TransportStats(
+	node rafttransport.NodeID,
+) (rafttransport.PeerStats, error) {
+	stats, ok := stub.byNode[node]
+	if !ok {
+		return rafttransport.PeerStats{}, rafttransport.ErrNodeNotFound
+	}
+	return stats, nil
+}
+
+func TestRF3DiagnosticTransportFailuresProjectBoundedMetadata(t *testing.T) {
+	group := raftmember.GroupKey{
+		ClusterID:             [16]byte{1},
+		ClusterIncarnation:    [16]byte{2},
+		TopologyRecoveryEpoch: 3,
+		ShardIncarnation:      [16]byte{4},
+		GroupID:               [16]byte{5},
+	}
+	local, remote := rafttransport.NodeID{1}, rafttransport.NodeID{2}
+	registry, err := rafttransport.NewStaticRegistry(local, []rafttransport.Member{
+		{Group: group, ReplicaSetVersion: 1, MemberID: 11, Node: local, Role: rafttransport.MemberVoter},
+		{Group: group, ReplicaSetVersion: 1, MemberID: 12, Node: remote, Role: rafttransport.MemberVoter},
+	}, rafttransport.Limits{MaxGroups: 1, MaxMembers: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := new(rf3NodeOwner)
+	bindRF3TransportFailureDiagnostics(owner, rf3DiagnosticTransportStatsStub{byNode: map[rafttransport.NodeID]rafttransport.PeerStats{
+		remote: {LastFailure: rafttransport.PeerFailure{
+			Node: remote, Phase: "write", Cause: "unexpected-eof", Group: group,
+			From: 11, To: 12, Version: 7, Kind: "ordinary", MessageType: 8,
+			Index: 19, Term: 23,
+		}},
+	}}, registry)
+	owner.controlMu.Lock()
+	source := owner.transportFailures
+	owner.controlMu.Unlock()
+	if source == nil {
+		t.Fatal("transport diagnostic source was not bound")
+	}
+	failures := source()
+	if len(failures) != 1 {
+		t.Fatalf("transport failures = %+v, want one remote failure", failures)
+	}
+	failure := failures[0]
+	if failure.NodeID != "02000000000000000000000000000000" || failure.Phase != "write" ||
+		failure.Cause != "unexpected-eof" || failure.Group.GroupID != "05000000000000000000000000000000" ||
+		failure.From != 11 || failure.To != 12 || failure.Version != 7 || failure.MessageType != 8 ||
+		failure.Index != 19 || failure.Term != 23 {
+		t.Fatalf("projected transport failure = %+v", failure)
+	}
+	raw, err := json.Marshal(failures)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) == "" || string(raw) == "null" || !strings.Contains(string(raw), "unexpected-eof") {
+		t.Fatalf("transport failure JSON = %s", raw)
+	}
+}
 
 func TestRF3DiagnosticCanaryCountersMapExactSnapshots(t *testing.T) {
 	snapshot := rf3DiagnosticSnapshot{

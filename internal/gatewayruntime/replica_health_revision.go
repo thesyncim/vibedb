@@ -201,12 +201,20 @@ func (controller *gatewayReplicaHealthRevisionController) observeGroup(
 	return revisions, nil
 }
 
+// rsv is the catalog's last-published replica-set version for this group, a
+// floor the live observation must have already reached - not a value it must
+// still match exactly. quorumHealthAgreement separately requires every
+// reporter to agree with each other on the live value, which is the actual
+// self-consistency guarantee; comparing against the catalog's own frozen
+// snapshot here would reject every cut once an unrelated or already-in-
+// flight config change advances the live version past it, since the live
+// version can never regress back to match a stale catalog read.
 func validHealthCut(cut gatewayHealthCut, rsv uint64) bool {
 	observation := cut.observation
 	return cut.member != 0 && cut.endpoint.Member == cut.member &&
 		observation.MemberID == cut.member && observation.LeaderID != 0 &&
 		observation.Term != 0 && observation.Commit != 0 && observation.Applied != 0 &&
-		observation.ReplicaSetVersion == rsv && observation.Applied <= observation.Commit
+		observation.ReplicaSetVersion >= rsv && observation.Applied <= observation.Commit
 }
 
 func quorumHealthAgreement(cuts []gatewayHealthCut) (gatewayHealthAgreement, []gatewayHealthCut, bool) {

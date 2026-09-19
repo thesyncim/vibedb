@@ -573,20 +573,11 @@ func lifecycleRowFixture(t testing.TB) lifecycleRows {
 	if err != nil {
 		t.Fatal(err)
 	}
-	head, err = requestledger.InstallSchemaPinRelease(head, prepared, schema)
+	head, schema, err = requestledger.CompleteSchemaPinRelease(head, prepared, schema, []byte("schema-release-completion"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent := schema
-	schema, err = requestledger.RecordVerifiedSchemaPinReleased(schema, 7, []byte("schema-release-completion"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	head, err = requestledger.MarkSchemaPinReleased(head, prepared, intent, schema)
-	if err != nil {
-		t.Fatal(err)
-	}
-	terminal, err := requestledger.NewTerminal(head, prepared, schema, 8)
+	terminal, err := requestledger.NewTerminal(head, prepared, schema, head.Revision+1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +585,7 @@ func lifecycleRowFixture(t testing.TB) lifecycleRows {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ack, err := requestledger.NewAck(terminalHead, terminal, 9, 4096)
+	ack, err := requestledger.NewAck(terminalHead, terminal, terminalHead.Revision+1, 4096)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -35,8 +35,12 @@ type RetainedSourceExportOptions struct {
 	// receive the same pointer; nil keeps the package usable by offline tools.
 	Budget *migrationbudget.Budget
 
-	RuntimeIdentity   raftmember.RuntimeIdentity
-	SourceNode        rafttransport.NodeID
+	RuntimeIdentity raftmember.RuntimeIdentity
+	SourceNode      rafttransport.NodeID
+	// DynamicTarget admits the exact target carried by an authenticated
+	// membership request. Static replacement manifests instead seal the three
+	// target fields below at provider construction.
+	DynamicTarget     bool
 	TargetMember      uint64
 	TargetStore       [16]byte
 	TargetIncarnation uint64
@@ -117,14 +121,17 @@ func (provider *RetainedSourceExportProvider) NewDataService(
 func OpenRetainedSourceExportProvider(
 	options RetainedSourceExportOptions,
 ) (*RetainedSourceExportProvider, error) {
+	staticTarget := options.TargetMember != 0 && options.TargetMember != options.RuntimeIdentity.MemberID &&
+		options.TargetStore != ([16]byte{}) && options.TargetIncarnation != 0
+	dynamicTarget := options.DynamicTarget && options.TargetMember == 0 &&
+		options.TargetStore == ([16]byte{}) && options.TargetIncarnation == 0
 	if options.Cut == nil || options.RuntimeIdentity.Group == (raftmember.GroupKey{}) ||
 		options.RuntimeIdentity.AllocationGeneration == 0 ||
 		options.RuntimeIdentity.MemberID == 0 || options.RuntimeIdentity.StoreID == ([16]byte{}) ||
 		options.RuntimeIdentity.NodeIncarnation == 0 ||
 		options.RuntimeIdentity.RelationManifestDigest == ([32]byte{}) ||
 		options.SourceNode == (rafttransport.NodeID{}) ||
-		options.TargetMember == 0 || options.TargetMember == options.RuntimeIdentity.MemberID ||
-		options.TargetStore == ([16]byte{}) || options.TargetIncarnation == 0 ||
+		(!staticTarget && !dynamicTarget) ||
 		options.ChunkBytes < MinChunkBytes || options.ChunkBytes > AbsoluteMaxChunkBytes ||
 		options.MaxConcurrent <= 0 || options.MaxConcurrent > AbsoluteMaxSourceConcurrency {
 		return nil, ErrSourceControl
@@ -378,10 +385,13 @@ func (provider *RetainedSourceExportProvider) releasePlan() {
 func (provider *RetainedSourceExportProvider) matchesRequest(request SourceControlRequest) bool {
 	options := provider.options
 	identity := options.RuntimeIdentity
-	return validSourceControlRequest(request) && request.Group == identity.Group &&
-		request.SourceMember == identity.MemberID && request.SourceNode == options.SourceNode &&
+	if !validSourceControlRequest(request) || request.Group != identity.Group ||
+		request.SourceMember != identity.MemberID || request.SourceNode != options.SourceNode {
+		return false
+	}
+	return options.DynamicTarget ||
 		request.TargetMember == options.TargetMember && request.TargetStore == options.TargetStore &&
-		request.TargetIncarnation == options.TargetIncarnation
+			request.TargetIncarnation == options.TargetIncarnation
 }
 
 func (provider *RetainedSourceExportProvider) ReleaseSourceExport(

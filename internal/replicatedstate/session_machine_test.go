@@ -2,13 +2,209 @@ package replicatedstate
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"math"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
 )
+
+// TestRouteSessionRetireAfterSchemaAlterKeepsExactReleaseProof exercises the
+// F9 apply boundary. The seq3 route release is committed before the schema
+// transition, its completion is reopened from the target generation, and the
+// old exact seq4 retire must still be admitted from the retained route-session
+// proof. A generic stale retire remains covered by TestStaleSessionRetireDoesNotSealLiveEpoch.
+func TestRouteSessionRetireAfterSchemaAlterKeepsExactReleaseProof(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	prototype := commandValue(fixture.binding, 1)
+	prototype.AuthorityClass = replication.CommandAuthorityRouteSession
+	_, _, epoch := applySessionOpen(t, fixture.machine, 2, prototype)
+	identity := routegate.Identity{1}
+	binding := routegate.Binding{2}
+	acquire := commandValue(fixture.binding, 1)
+	acquire.AuthorityClass, acquire.ClientEpoch, acquire.AckThrough = replication.CommandAuthorityRouteSession, epoch, 1
+	acquireBytes := applyRouteSessionGate(t, fixture.machine, 3, acquire, routegate.Command{
+		Operation: routegate.OperationAcquireShared, Epoch: 1, Identity: identity, Binding: binding,
+	}, routegate.ReasonAcquired)
+	if len(acquireBytes) == 0 {
+		t.Fatal("missing acquire bytes")
+	}
+	release := commandValue(fixture.binding, 2)
+	release.AuthorityClass, release.ClientEpoch, release.AckThrough = replication.CommandAuthorityRouteSession, epoch, 2
+	releaseBytes := applyRouteSessionGate(t, fixture.machine, 4, release, routegate.Command{
+		Operation: routegate.OperationReleaseShared, Epoch: 1, Identity: identity, Binding: binding,
+	}, routegate.ReasonReleased)
+	originalRelease := bytes.Clone(releaseBytes)
+	firstRelease, err := fixture.machine.LookupCompletion(releaseBytes)
+	if err != nil || len(firstRelease.Bytes) == 0 {
+		t.Fatalf("release completion before alter = %+v,%v", firstRelease, err)
+	}
+
+	// Commit an actual schema generation transition while the released
+	// route-session rows remain in the system collection.
+	toBinding := fixture.binding
+	toBinding.SchemaGeneration++
+	relationSpecs := []RelationCollection{{
+		Relation: 1, Kind: RelationJSON, Name: "docs", Target: fixture.user,
+	}}
+	toRelations, toManifest, err := prepareRelationCollections(toBinding, relationSpecs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toContract, err := bundleApplyContractDigest(
+		toManifest, toRelations, fixture.machine.options.MaxSessions,
+		fixture.machine.options.RetryWindow,
+		fixture.machine.options.RequestLedgerCapacityBytes,
+		fixture.machine.options.RequestLedgerCleanupReserveBytes,
+		fixture.machine.options.RequestLedgerRange, routeGateRecordLimit(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition := testSchemaTransition(
+		fixture.binding, fixture.machine.manifestDigest, fixture.machine.applyContract,
+		toManifest, toContract, fixture.machine.state.ReplicaSetVersion,
+	)
+	schemaBytes, err := AppendSchemaTransition(nil, transition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.machine.AdmitCommand(schemaBytes); err != nil {
+		t.Fatalf("admit schema alter: %v", err)
+	}
+	if _, err := fixture.machine.ApplyNormal(normalMeta(5), schemaBytes); err != nil {
+		t.Fatalf("apply schema alter: %v", err)
+	}
+	targetOptions := fixture.machine.options
+	targetOptions.SchemaTransition = schemaBytes
+	targetOptions.SchemaMembershipWitness = durable.CheckpointMembershipWitness{
+		Sequence: transition.MembershipSequence, Source: transition.MembershipSource, Target: transition.MembershipTarget,
+	}
+	targetOptions.SchemaAuthorizationDigest = transition.AuthorizationDigest
+	targetOptions.SchemaCatalogCASDigest = transition.CatalogCASDigest
+	target, err := OpenBundle(
+		toBinding, fixture.bootstrap, fixture.system, relationSpecs,
+		fixture.log, targetOptions,
+	)
+	if err != nil {
+		t.Fatalf("reopen altered target: %v", err)
+	}
+	if _, err := target.ApplyNormal(normalMeta(6), nil); err != nil {
+		t.Fatalf("resume altered target: %v", err)
+	}
+	reopenedRelease, err := target.LookupCompletion(releaseBytes)
+	if err != nil || !bytes.Equal(reopenedRelease.Bytes, firstRelease.Bytes) ||
+		!bytes.Equal(releaseBytes, originalRelease) {
+		t.Fatalf("reopened release completion=%+v,%v bytesChanged=%t", reopenedRelease, err,
+			!bytes.Equal(releaseBytes, originalRelease))
+	}
+
+	retire := commandValue(fixture.binding, 3)
+	retire.AuthorityClass, retire.ClientEpoch = replication.CommandAuthorityRouteSession, epoch
+	retire.Kind, retire.Batches, retire.AckThrough = replication.CommandSessionRetire, nil, 3
+	retireBytes := encodeCommand(t, retire)
+	for name, mutate := range map[string]func(*replication.Command){
+		"policy":     func(command *replication.Command) { command.ActivePolicyGeneration++ },
+		"protection": func(command *replication.Command) { command.ProtectionEpoch++ },
+	} {
+		invalid := retire
+		mutate(&invalid)
+		if err := target.AdmitCommand(encodeCommand(t, invalid)); !errors.Is(err, ErrStaleCommand) {
+			t.Fatalf("route-session retire with changed %s fence=%v, want stale refusal", name, err)
+		}
+	}
+	foreign := retire
+	foreign.GroupID = id128(201)
+	if err := target.AdmitCommand(encodeCommand(t, foreign)); !errors.Is(err, ErrWrongBinding) {
+		t.Fatalf("route-session retire with changed immutable identity=%v, want wrong binding", err)
+	}
+	if err := target.AdmitCommand(retireBytes); err != nil {
+		t.Fatalf("exact route-session retire after alter rejected: %v", err)
+	}
+	publication, err := target.ApplyNormal(normalMeta(7), retireBytes)
+	if err != nil || publication.Applied != 7 {
+		t.Fatalf("route-session retire after alter = %+v,%v", publication, err)
+	}
+	retired, err := target.LookupCompletion(retireBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retiredResult, err := replication.OpenCompletion(retired.Bytes)
+	if err != nil || retiredResult.ResultCode != ResultSessionRetired {
+		t.Fatalf("retire completion=%+v,%v", retiredResult, err)
+	}
+	releaseSession := encodeCommand(t, sessionRelease(retire))
+	if err := target.AdmitCommand(releaseSession); err != nil {
+		t.Fatalf("route-session release after alter: %v", err)
+	}
+	if _, err := target.ApplyNormal(normalMeta(8), releaseSession); err != nil {
+		t.Fatalf("apply route-session release after alter: %v", err)
+	}
+	status, err := target.RouteGateStatus()
+	if err != nil || status.ActivePins != 0 || status.ReleasedPins != 1 {
+		t.Fatalf("route gate after exact cleanup=%+v,%v", status, err)
+	}
+}
+
+func TestRouteSessionStaleRetireWithoutReleaseProofRemainsRefused(t *testing.T) {
+	fixture := newMachineFixture(t)
+	if _, err := fixture.machine.InstallSnapshot(fixture.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	prototype := commandValue(fixture.binding, 1)
+	prototype.AuthorityClass = replication.CommandAuthorityRouteSession
+	_, _, epoch := applySessionOpen(t, fixture.machine, 2, prototype)
+	acquire := commandValue(fixture.binding, 1)
+	acquire.AuthorityClass, acquire.ClientEpoch, acquire.AckThrough = replication.CommandAuthorityRouteSession, epoch, 1
+	applyRouteSessionGate(t, fixture.machine, 3, acquire, routegate.Command{
+		Operation: routegate.OperationAcquireShared, Epoch: 1, Identity: routegate.Identity{3}, Binding: routegate.Binding{4},
+	}, routegate.ReasonAcquired)
+	fixture.machine.state.Binding.SchemaGeneration++
+	fixture.machine.binding.SchemaGeneration++
+	retire := commandValue(fixture.binding, 2)
+	retire.AuthorityClass, retire.ClientEpoch, retire.AckThrough = replication.CommandAuthorityRouteSession, epoch, 2
+	retire.Kind, retire.Batches = replication.CommandSessionRetire, nil
+	if err := fixture.machine.AdmitCommand(encodeCommand(t, retire)); !errors.Is(err, ErrStaleCommand) {
+		t.Fatalf("route-session retire without release proof=%v, want stale refusal", err)
+	}
+}
+
+func applyRouteSessionGate(
+	t testing.TB, machine *Machine, index uint64, outer replication.Command,
+	gate routegate.Command, want routegate.Reason,
+) []byte {
+	t.Helper()
+	gateBytes, err := routegate.AppendCommand(nil, gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer.Kind, outer.Batches, outer.RouteGate = replication.CommandRouteGate, nil, gateBytes
+	outer.Fingerprint = sha256.Sum256(append([]byte("route-session-gate/"), gateBytes...))
+	encoded := encodeCommand(t, outer)
+	publication, err := machine.ApplyNormal(normalMeta(index), encoded)
+	if err != nil || publication.Applied != index {
+		t.Fatalf("route-session gate apply=%+v,%v", publication, err)
+	}
+	lookup, err := machine.LookupCompletion(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion, err := replication.OpenCompletion(lookup.Bytes)
+	if err != nil || completion.ResultCode != ResultRouteGate {
+		t.Fatalf("route-session gate completion=%+v,%v", completion, err)
+	}
+	outcome, err := routegate.OpenOutcome(completion.InlineResult)
+	if err != nil || outcome.Reason != want {
+		t.Fatalf("route-session gate outcome=%+v,%v want=%d", outcome, err, want)
+	}
+	return encoded
+}
 
 func TestBoundedSessionWindowAckRetireAndEpochReuse(t *testing.T) {
 	fixture := newMachineFixture(t)

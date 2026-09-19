@@ -14,8 +14,8 @@ import (
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
-// Seed the fixture at a fully authenticated prepared cut; the tested release
-// intent and takeover both execute through the real Machine.ApplyNormal and
+// Seed the fixture at a fully authenticated prepared cut; the tested atomic
+// release and takeover both execute through the real Machine.ApplyNormal and
 // its single durable system transaction, not through a fake CAS implementation.
 func seedPreparedPinLedger(t *testing.T, f machineFixture) (requestledger.HeadRecord, requestledger.PreparedTerminalRecord, executionpin.Record) {
 	t.Helper()
@@ -62,9 +62,9 @@ func seedPreparedPinLedger(t *testing.T, f machineFixture) (requestledger.HeadRe
 	return head, prepared, pin
 }
 
-func TestRequestLedgerReleaseFreezeOrdersTakeoverAtomically(t *testing.T) {
+func TestRequestLedgerReleaseOrdersTakeoverAtomically(t *testing.T) {
 	for _, recoverFirst := range []bool{false, true} {
-		t.Run(map[bool]string{false: "freeze-first", true: "recover-first"}[recoverFirst], func(t *testing.T) {
+		t.Run(map[bool]string{false: "release-first", true: "recover-first"}[recoverFirst], func(t *testing.T) {
 			f := newRequestLedgerMachineFixture(t, 64<<20)
 			head, prepared, pin := seedPreparedPinLedger(t, f)
 			acquire, _ := pin.AcquireCertificate()
@@ -74,34 +74,47 @@ func TestRequestLedgerReleaseFreezeOrdersTakeoverAtomically(t *testing.T) {
 				ExpectedController: pin.Controller, ExpectedControllerEpoch: pin.ControllerEpoch,
 				ExpectedLeaseAppliedThrough: pin.LeaseAppliedThrough, ExpectedLeaseRevision: pin.LeaseRevision,
 				PrepareTerminalDigest: executionpin.Digest(prepared.PreparedDigest), AcquireCertificateDigest: acquireDigest}
-			releaseBytes := executionPinCommand(f.binding, id128(0xd0), 2, 4, release)
+			releaseBytes, err := executionpin.AppendCommand(nil, release)
+			if err != nil {
+				t.Fatal(err)
+			}
 			intent, err := requestledger.NewSchemaPinRelease(head, prepared, head.Revision+1, releaseBytes)
 			if err != nil {
 				t.Fatal(err)
 			}
 			payload, _ := requestledger.AppendSchemaPinRelease(nil, intent)
 			home, _ := requestledger.Home(head.Key)
-			inner, err := requestledger.AppendCommand(nil, requestledger.Command{Operation: requestledger.OperationBeginSchemaPinRelease,
+			inner, err := requestledger.AppendCommand(nil, requestledger.Command{Operation: requestledger.OperationReleaseSchemaPin,
 				ExpectedRevision: head.Revision, Revision: intent.Revision, KeyDigest: head.KeyDigest, RequestDigest: head.RequestDigest, PlanRoot: head.PlanRoot,
 				SubjectDigest: intent.RecordDigest, ExpectedRangeIdentity: f.machine.options.RequestLedgerRange.Identity, Home: home, Payload: payload})
 			if err != nil {
 				t.Fatal(err)
 			}
 			outer := commandValue(f.binding, 1)
+			outer.ClientID = id128(0xd0)
 			outer.Kind, outer.AuthorityClass, outer.Batches, outer.RequestLedger = replication.CommandRequestLedger, replication.CommandAuthorityRequestLedger, nil, inner
 			outer.Fingerprint = sha256.Sum256(inner)
-			freezeBytes := encodeCommand(t, outer)
+			atomicReleaseBytes := encodeCommand(t, outer)
 			recover := release
 			recover.Operation, recover.PrepareTerminalDigest = executionpin.OperationRecover, executionpin.Digest{}
 			recover.NextController, recover.NextControllerEpoch, recover.NextLeaseSpan = executionpin.ID(id128(0xe1)), 2, 1
 			recoverBytes := executionPinCommand(f.binding, id128(0xd0), 2, 3, recover)
-			first, second := freezeBytes, recoverBytes
+			first, second := atomicReleaseBytes, recoverBytes
 			if recoverFirst {
-				first, second = recoverBytes, freezeBytes
+				first, second = recoverBytes, atomicReleaseBytes
 			}
 			before := f.machine.state
+			foreign := outer
+			foreign.ClientID = id128(0xfa)
+			if _, err = f.machine.ApplyNormal(normalMeta(5), encodeCommand(t, foreign)); err != nil {
+				t.Fatal(err)
+			}
+			unchanged, found, err := f.machine.LookupExecutionPin(pin.PinID)
+			if err != nil || !found || unchanged != pin || f.machine.state.RequestLedgerRows != before.RequestLedgerRows {
+				t.Fatal("another gateway released a pin using the original gateway's authority", err)
+			}
 			for i, command := range [][]byte{first, second} {
-				if _, err = f.machine.ApplyNormal(normalMeta(uint64(5+i)), command); err != nil {
+				if _, err = f.machine.ApplyNormal(normalMeta(uint64(6+i)), command); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -110,7 +123,7 @@ func TestRequestLedgerReleaseFreezeOrdersTakeoverAtomically(t *testing.T) {
 				t.Fatal(err)
 			}
 			intentKey := requestledger.AppendSchemaPinReleaseKey(nil, home, head.KeyDigest)
-			_, intentFound, err := f.system.Collection.AppendRaw(nil, intentKey)
+			receiptBytes, intentFound, err := f.system.Collection.AppendRaw(nil, intentKey)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -123,11 +136,15 @@ func TestRequestLedgerReleaseFreezeOrdersTakeoverAtomically(t *testing.T) {
 				}
 				return
 			}
-			if !intentFound || got.ControllerEpoch != 1 || got.PrepareTerminalDigest != release.PrepareTerminalDigest {
-				t.Fatal("freeze did not fence takeover")
+			if !intentFound || got.Status != executionpin.StatusReleased || got.ControllerEpoch != 1 || got.PrepareTerminalDigest != release.PrepareTerminalDigest {
+				t.Fatal("atomic release did not fence takeover")
 			}
-			if f.machine.state.ExecutionPinRecordCount != before.ExecutionPinRecordCount || f.machine.state.ActiveExecutionPinCount != before.ActiveExecutionPinCount || f.machine.state.ExecutionPinResidentBytes != before.ExecutionPinResidentBytes {
-				t.Fatal("freeze grew pin space")
+			receipt, err := requestledger.OpenSchemaPinRelease(receiptBytes)
+			if err != nil || receipt.Phase != requestledger.SchemaPinReleased || !requestLedgerSchemaReleaseEvidenceAvailable(receipt) {
+				t.Fatal("atomic release lost its authenticated certificate", err)
+			}
+			if f.machine.state.ExecutionPinRecordCount != before.ExecutionPinRecordCount || f.machine.state.ActiveExecutionPinCount != 0 || f.machine.state.ExecutionPinResidentBytes != before.ExecutionPinResidentBytes-executionPinActiveStorageKeyBytes-executionPinActiveValueBytes {
+				t.Fatal("atomic release did not retire active-pin accounting")
 			}
 			// Close the actual system collection and reopen its journal/image.
 			if err = f.system.Collection.Close(); err != nil {
@@ -149,15 +166,16 @@ func TestRequestLedgerReleaseFreezeOrdersTakeoverAtomically(t *testing.T) {
 				t.Fatal("machine reopen", err)
 			}
 			active, err := reopened.ScanActiveExecutionPins(pin.Binding.LedgerHomeGroup, executionpin.PinID{}, 1)
-			if err != nil || len(active) != 1 || active[0] != got {
-				t.Fatal("frozen active index reopen", err)
+			if err != nil || len(active) != 0 {
+				t.Fatal("released pin reappeared in active index after reopen", err)
 			}
-			if _, err = reopened.ApplyNormal(normalMeta(7), releaseBytes); err != nil {
+			beforeRetry := reopened.state
+			if _, err = reopened.ApplyNormal(normalMeta(8), atomicReleaseBytes); err != nil {
 				t.Fatal(err)
 			}
 			final, found, err := reopened.LookupExecutionPin(pin.PinID)
-			if err != nil || !found || final.Status != executionpin.StatusReleased || reopened.state.ActiveExecutionPinCount != 0 {
-				t.Fatal("exact release after restart", err)
+			if err != nil || !found || final != got || reopened.state.ActiveExecutionPinCount != 0 || reopened.state.RequestLedgerResidentBytes != beforeRetry.RequestLedgerResidentBytes || reopened.state.RequestLedgerRows != beforeRetry.RequestLedgerRows {
+				t.Fatal("lost-reply replay after restart changed release or budgets", err)
 			}
 		})
 	}

@@ -126,12 +126,12 @@ func TestRF3ReloadOnlyAppendsIndependentPreparedGroups(t *testing.T) {
 
 func TestRF3ReloadDefaultOffMarkerRejectedBeforePreparation(t *testing.T) {
 	root := t.TempDir()
-	currentRaw := []byte(strings.ReplaceAll(canonicalRF3Manifest, "/srv/vibedb", root))
+	currentRaw := []byte(strings.ReplaceAll(managedRF3Manifest(t, 1), "/srv/vibedb", root))
 	current, err := parseRF3Manifest(currentRaw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	nextRaw := []byte(strings.ReplaceAll(multiGroupRF3Manifest(t), "/srv/vibedb", root))
+	nextRaw := []byte(strings.ReplaceAll(managedRF3Manifest(t, 2), "/srv/vibedb", root))
 	next, err := parseRF3Manifest(nextRaw)
 	if err != nil {
 		t.Fatal(err)
@@ -286,7 +286,7 @@ func TestRF3RetirementReopenAcceptsRetainedPredecessorManifest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nextRaw := []byte(strings.ReplaceAll(canonicalRF3Manifest, "/srv/vibedb", root))
+	nextRaw := []byte(strings.ReplaceAll(managedRF3Manifest(t, 1), "/srv/vibedb", root))
 	next, err := parseRF3Manifest(nextRaw)
 	if err != nil {
 		t.Fatal(err)

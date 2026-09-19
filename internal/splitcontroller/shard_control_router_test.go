@@ -191,3 +191,22 @@ func mustRemoteStepPayload(t *testing.T, payload remoteStepPayload) []byte {
 	}
 	return raw
 }
+
+func TestRoutedSourceActionDoesNotCrossWitnessedMember(t *testing.T) {
+	request, route := testShardControlRequestRoute()
+	payload, err := openRemoteStepPayload(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.Target.Member = 2
+	request.Payload = mustRemoteStepPayload(t, payload)
+	client := &scriptedShardControlClient{responses: map[uint64][]shardcontrol.Response{2: {{Code: shardcontrol.ResultNotLeader, Operation: request.Operation, Step: request.Step}}}}
+	router, err := NewRoutedShardControl(ShardControlRouterOptions{Resolver: fixedShardControlResolver{route: route}, Client: client, MaxAttempts: 3, AttemptTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = router.ExecuteShardControl(t.Context(), Action{Kind: ActionSealSource}, request)
+	if !errors.Is(err, ErrShardControlNotLeader) || len(client.calls) != 1 || client.calls[0] != 2 {
+		t.Fatalf("calls=%v err=%v", client.calls, err)
+	}
+}

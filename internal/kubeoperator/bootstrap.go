@@ -25,6 +25,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
@@ -125,6 +126,59 @@ type bootstrapPrepare struct {
 	SplitControl          bootstrapSplit     `json:"split_control"`
 	Members               []bootstrapMember  `json:"members"`
 }
+
+// bootstrapNodePrepare is the canonical physical-node input consumed by
+// prepare-node-rf3. Kubernetes schedules one pod per role/member, so each
+// document owns one role group while still publishing the node log and source
+// identity atomically with that group.
+type bootstrapNodePrepare struct {
+	Root                 string                             `json:"root"`
+	NodeLog              bootstrapNodeLog                   `json:"node_log"`
+	CatalogGenesis       *bootstrapCatalogGenesis           `json:"catalog_genesis,omitempty"`
+	CanonicalSourceSeeds []nodecontrol.BootstrapGatewaySeed `json:"canonical_source_seeds,omitempty"`
+	Groups               []bootstrapPrepare                 `json:"groups"`
+}
+
+type bootstrapNodeLog struct {
+	Format          uint16                     `json:"format"`
+	Path            string                     `json:"path"`
+	KeyID           string                     `json:"key_id"`
+	WrappedKey      string                     `json:"wrapped_key,omitempty"`
+	KeyMaterialPath string                     `json:"key_material_path"`
+	Options         raftstore.NodeStoreOptions `json:"options"`
+}
+
+type bootstrapCatalogGenesis struct {
+	PlanPath                 string `json:"plan_path"`
+	CatalogPath              string `json:"catalog_path"`
+	InitialNodeDirectoryPath string `json:"initial_node_directory"`
+	SessionJournal           string `json:"session_journal"`
+	ClientID                 string `json:"client_id"`
+	RetryHome                string `json:"retry_home"`
+	Distribution             string `json:"distribution"`
+	Shard                    string `json:"shard"`
+	ClusterID                string `json:"cluster_id"`
+	ClusterIncarnation       string `json:"cluster_incarnation"`
+	TopologyRecoveryEpoch    uint64 `json:"topology_recovery_epoch"`
+	AllocationGeneration     uint64 `json:"allocation_generation"`
+	ShardIncarnation         string `json:"shard_incarnation"`
+	GroupID                  string `json:"group_id"`
+	MemberID                 uint64 `json:"member_id"`
+	StoreID                  string `json:"store_id"`
+	NodeID                   string `json:"node_id"`
+	NodeIncarnation          uint64 `json:"node_incarnation"`
+	Relation                 uint64 `json:"relation"`
+}
+
+type bootstrapCatalogGenesisPlan struct {
+	Format                     uint16 `json:"format"`
+	CatalogPath                string `json:"catalog_path"`
+	InitialNodeDirectoryPath   string `json:"initial_node_directory"`
+	CatalogDigest              string `json:"catalog_digest"`
+	InitialNodeDirectoryDigest string `json:"initial_node_directory_digest"`
+	ConfigDigest               string `json:"config_digest"`
+	CombinedDigest             string `json:"combined_digest"`
+}
 type bootstrapAuthority struct {
 	ActivePolicyGeneration uint64 `json:"active_policy_generation"`
 	ProtectionEpoch        uint64 `json:"protection_epoch"`
@@ -162,11 +216,16 @@ type bootstrapListeners struct {
 	Snapshot string `json:"snapshot"`
 	Control  string `json:"control"`
 }
+type bootstrapPeerKey struct {
+	NodeID    string `json:"node_id"`
+	KeyDigest string `json:"key_digest"`
+}
 type bootstrapTLS struct {
-	Certificate string `json:"certificate"`
-	Key         string `json:"key"`
-	Roots       string `json:"roots"`
-	IdentityOID string `json:"identity_oid"`
+	Certificate string             `json:"certificate"`
+	Key         string             `json:"key"`
+	Roots       string             `json:"roots"`
+	IdentityOID string             `json:"identity_oid"`
+	PeerKeys    []bootstrapPeerKey `json:"peer_keys"`
 }
 type bootstrapMember struct {
 	MemberID    uint64 `json:"member_id"`
@@ -526,6 +585,26 @@ func buildBootstrap(c BootstrapConfig, random io.Reader) ([]byte, bootstrapState
 	shardSecret := map[string][]byte{"cluster-roots.pem": roots, "wal-key-source": walKey[:]}
 	gatewaySecret := map[string][]byte{"cluster-roots.pem": roots, "gateway-cert.pem": certs[9].cert, "gateway-key.pem": certs[9].key, "durable-ack-key": []byte(hex.EncodeToString(ack[:]))}
 	clientSecret := map[string][]byte{"cluster-roots.pem": roots, "client-cert.pem": certs[10].cert, "client-key.pem": certs[10].key}
+	var peerKeys [3][]bootstrapPeerKey
+	for ri := range roles {
+		for mi := 0; mi < 3; mi++ {
+			block, _ := pem.Decode(certs[ri*3+mi].cert)
+			if block == nil {
+				return nil, state, errors.New("bootstrap: missing peer certificate")
+			}
+			certificate, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				return nil, state, err
+			}
+			digest := sha256.Sum256(certificate.RawSubjectPublicKeyInfo)
+			peerKeys[ri] = append(peerKeys[ri], bootstrapPeerKey{state.ShardNodeIDs[ri*3+mi], hex.EncodeToString(digest[:])})
+		}
+		sort.Slice(peerKeys[ri], func(i, j int) bool { return peerKeys[ri][i].NodeID < peerKeys[ri][j].NodeID })
+	}
+	directoryRaw, err := bootstrapNodeDirectory(roles, state, certs, random)
+	if err != nil {
+		return nil, state, err
+	}
 	for ri := range roles {
 		members := make([]bootstrapMember, 3)
 		grants := make([]bootstrapGrant, 3)
@@ -533,6 +612,10 @@ func buildBootstrap(c BootstrapConfig, random io.Reader) ([]byte, bootstrapState
 			host := fmt.Sprintf("vibedb-%s-%d.vibedb-%s-peer", roles[ri].name, mi, roles[ri].name)
 			members[mi] = bootstrapMember{MemberID: uint64(mi + 1), NodeID: state.ShardNodeIDs[ri*3+mi], PeerAddress: host + ":7411"}
 			grants[mi] = bootstrapGrant{NodeID: state.ShardNodeIDs[ri*3+mi], Actions: ^uint16(0)}
+		}
+		sourceSeeds, seedErr := bootstrapCatalogSourceSeeds(certs, state)
+		if seedErr != nil {
+			return nil, state, seedErr
 		}
 		for mi := 0; mi < 3; mi++ {
 			prefix := roles[ri].name + "-" + fmt.Sprint(mi)
@@ -547,8 +630,24 @@ func buildBootstrap(c BootstrapConfig, random io.Reader) ([]byte, bootstrapState
 				apply.RequestLedgerRangeEnd = z
 				apply.RequestLedgerRangeIdentity = hex.EncodeToString(ledgerIdentity[:])
 			}
-			p := bootstrapPrepare{Root: "/var/lib/vibedb/member", Distribution: string(roles[ri].distribution), Shard: string(roles[ri].shard), ClusterID: hex.EncodeToString(cluster[:]), ClusterIncarnation: hex.EncodeToString(incarnation[:]), TopologyRecoveryEpoch: 1, AllocationGeneration: 1, ShardIncarnation: hex.EncodeToString(roles[ri].group.ShardIncarnation[:]), GroupID: hex.EncodeToString(roles[ri].group.GroupID[:]), MemberID: uint64(mi + 1), StoreID: hex.EncodeToString(roles[ri].stores[mi][:]), Table: roles[ri].table, CreateTable: roles[ri].create, Authority: bootstrapAuthority{1, 1, 1, 1, 1, 1}, WAL: bootstrapWAL{"kubernetes-test-key", "/run/secrets/vibedb/wal-key-source", "development-only", raftstore.DefaultMaxFileBytes, raftstore.DefaultMaxRecordBytes, raftstore.DefaultMaxRecords, raftstore.DefaultMaxEntries, raftstore.DefaultMaxLiveBytes}, Apply: apply, Listeners: bootstrapListeners{"0.0.0.0:7411", "0.0.0.0:7511", "0.0.0.0:7611", "0.0.0.0:7711"}, TLS: bootstrapTLS{"/run/secrets/vibedb/" + certName, "/run/secrets/vibedb/" + keyName, "/run/secrets/vibedb/cluster-roots.pem", bootstrapOID}, AuthorizationPolicy: "/bootstrap/authorization-policy.vibejson", SplitControl: bootstrapSplit{4096, 64 << 20, grants, 8, 32 << 20}, Members: members}
-			raw, e := vibejson.Marshal(&p)
+			p := bootstrapPrepare{Root: filepath.Join("/var/lib/vibedb/member", "group-0"), Distribution: string(roles[ri].distribution), Shard: string(roles[ri].shard), ClusterID: hex.EncodeToString(cluster[:]), ClusterIncarnation: hex.EncodeToString(incarnation[:]), TopologyRecoveryEpoch: 1, AllocationGeneration: 1, ShardIncarnation: hex.EncodeToString(roles[ri].group.ShardIncarnation[:]), GroupID: hex.EncodeToString(roles[ri].group.GroupID[:]), MemberID: uint64(mi + 1), StoreID: hex.EncodeToString(roles[ri].stores[mi][:]), Table: roles[ri].table, CreateTable: roles[ri].create, Authority: bootstrapAuthority{1, 1, 1, 1, 1, 1}, WAL: bootstrapWAL{"kubernetes-test-key", "/run/secrets/vibedb/wal-key-source", "development-only", raftstore.DefaultMaxFileBytes, raftstore.DefaultMaxRecordBytes, raftstore.DefaultMaxRecords, raftstore.DefaultMaxEntries, raftstore.DefaultMaxLiveBytes}, Apply: apply, Listeners: bootstrapListeners{"0.0.0.0:7411", "0.0.0.0:7511", "0.0.0.0:7611", "0.0.0.0:7711"}, TLS: bootstrapTLS{"/run/secrets/vibedb/" + certName, "/run/secrets/vibedb/" + keyName, "/run/secrets/vibedb/cluster-roots.pem", bootstrapOID, peerKeys[ri]}, AuthorizationPolicy: "/bootstrap/authorization-policy.vibejson", SplitControl: bootstrapSplit{4096, 64 << 20, grants, 8, 32 << 20}, Members: members}
+			node := bootstrapNodePrepare{Root: "/var/lib/vibedb/member",
+				NodeLog: bootstrapNodeLog{Format: 1, Path: "/var/lib/vibedb/member/node-log",
+					KeyID: "kubernetes-test-key", WrappedKey: "development-only",
+					KeyMaterialPath: "/run/secrets/vibedb/wal-key-source",
+					Options:         raftstore.NodeStoreOptions{MaxGroups: 64}},
+				CanonicalSourceSeeds: sourceSeeds, Groups: []bootstrapPrepare{p}}
+			if ri == 0 {
+				config, plan, planErr := bootstrapCatalogGenesisForMember(
+					roles[ri], mi, state, catalogRaw, directoryRaw,
+				)
+				if planErr != nil {
+					return nil, state, planErr
+				}
+				node.CatalogGenesis = &config
+				manifests[fmt.Sprintf("catalog-genesis-plan-catalog-%d.vibejson", mi)] = plan
+			}
+			raw, e := vibejson.Marshal(&node)
 			if e != nil {
 				return nil, state, e
 			}
@@ -559,7 +658,9 @@ func buildBootstrap(c BootstrapConfig, random io.Reader) ([]byte, bootstrapState
 	if err != nil {
 		return nil, state, err
 	}
-	gatewayConfig := map[string][]byte{"cluster.vibejson": catalogRaw, "authorization-policy.vibejson": policyRaw, "replica-control.vibejson": controlRaw}
+	manifests["cluster.vibejson"] = catalogRaw
+	manifests["initial-node-directory.vibejson"] = directoryRaw
+	gatewayConfig := map[string][]byte{"cluster.vibejson": catalogRaw, "authorization-policy.vibejson": policyRaw, "replica-control.vibejson": controlRaw, "initial-node-directory.vibejson": directoryRaw}
 	manifests["authorization-policy.vibejson"] = policyRaw
 	var out bytes.Buffer
 	appendConfigMap(&out, c.Namespace, c.ManifestConfigMap, manifests)
@@ -568,6 +669,102 @@ func buildBootstrap(c BootstrapConfig, random io.Reader) ([]byte, bootstrapState
 	appendSecret(&out, c.Namespace, c.GatewayTLSSecret, gatewaySecret)
 	appendSecret(&out, c.Namespace, "vibedb-qualification-client-tls", clientSecret)
 	return out.Bytes(), state, nil
+}
+
+func bootstrapCatalogSourceSeeds(
+	certs []bootstrapCert, state bootstrapState,
+) ([]nodecontrol.BootstrapGatewaySeed, error) {
+	seeds := make([]nodecontrol.BootstrapGatewaySeed, 3)
+	for member := range seeds {
+		nodeRaw, err := hex.DecodeString(state.ShardNodeIDs[member])
+		if err != nil || len(nodeRaw) != 16 {
+			return nil, errors.New("bootstrap: invalid role node identity")
+		}
+		var node rafttransport.NodeID
+		copy(node[:], nodeRaw)
+		block, _ := pem.Decode(certs[member].cert)
+		if block == nil {
+			return nil, errors.New("bootstrap: missing source certificate")
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		digest := sha256.Sum256(certificate.RawSubjectPublicKeyInfo)
+		seeds[member] = nodecontrol.BootstrapGatewaySeed{
+			NodeID: node, Incarnation: 1,
+			ControlAddress: fmt.Sprintf("vibedb-catalog-%d.vibedb-catalog-peer:7711", member),
+			SPKIPinDigest:  replication.Digest(digest),
+		}
+		if !seeds[member].Valid() {
+			return nil, errors.New("bootstrap: invalid canonical source seed")
+		}
+	}
+	return seeds, nil
+}
+
+func bootstrapCatalogGenesisForMember(
+	role bootstrapRole, member int, state bootstrapState, catalogRaw, directoryRaw []byte,
+) (bootstrapCatalogGenesis, []byte, error) {
+	if member < 0 || member >= len(role.stores) || role.group.ClusterID == ([16]byte{}) ||
+		role.group.ClusterIncarnation == ([16]byte{}) || role.group.ShardIncarnation == ([16]byte{}) ||
+		role.group.GroupID == ([16]byte{}) || role.stores[member] == ([16]byte{}) {
+		return bootstrapCatalogGenesis{}, nil, ErrBootstrap
+	}
+	nodeID := state.ShardNodeIDs[member]
+	if len(nodeID) != 32 {
+		return bootstrapCatalogGenesis{}, nil, ErrBootstrap
+	}
+	config := bootstrapCatalogGenesis{
+		PlanPath:                 fmt.Sprintf("/bootstrap/catalog-genesis-plan-catalog-%d.vibejson", member),
+		CatalogPath:              "/bootstrap/cluster.vibejson",
+		InitialNodeDirectoryPath: "/bootstrap/initial-node-directory.vibejson",
+		SessionJournal:           fmt.Sprintf("/var/lib/vibedb/member/gateway/catalog-genesis-session-%d", member),
+		ClientID:                 nodeID, RetryHome: nodeID[:16],
+		Distribution: string(role.distribution), Shard: string(role.shard),
+		ClusterID:             hex.EncodeToString(role.group.ClusterID[:]),
+		ClusterIncarnation:    hex.EncodeToString(role.group.ClusterIncarnation[:]),
+		TopologyRecoveryEpoch: role.group.TopologyRecoveryEpoch,
+		AllocationGeneration:  1,
+		ShardIncarnation:      hex.EncodeToString(role.group.ShardIncarnation[:]),
+		GroupID:               hex.EncodeToString(role.group.GroupID[:]), MemberID: uint64(member + 1),
+		StoreID: hex.EncodeToString(role.stores[member][:]), NodeID: nodeID,
+		NodeIncarnation: 1, Relation: 1,
+	}
+	configRaw, err := vibejson.Marshal(&config)
+	if err != nil {
+		return bootstrapCatalogGenesis{}, nil, err
+	}
+	catalogDigest := sha256.Sum256(catalogRaw)
+	directoryDigest := sha256.Sum256(directoryRaw)
+	combinedDigest := bootstrapCatalogGenesisCombinedDigest(catalogRaw, directoryRaw)
+	configDigest := sha256.Sum256(configRaw)
+	plan := bootstrapCatalogGenesisPlan{
+		Format: 1, CatalogPath: config.CatalogPath,
+		InitialNodeDirectoryPath:   config.InitialNodeDirectoryPath,
+		CatalogDigest:              hex.EncodeToString(catalogDigest[:]),
+		InitialNodeDirectoryDigest: hex.EncodeToString(directoryDigest[:]),
+		ConfigDigest:               hex.EncodeToString(configDigest[:]),
+		CombinedDigest:             hex.EncodeToString(combinedDigest[:]),
+	}
+	planRaw, err := vibejson.Marshal(&plan)
+	if err != nil {
+		return bootstrapCatalogGenesis{}, nil, err
+	}
+	return config, planRaw, nil
+}
+
+func bootstrapCatalogGenesisCombinedDigest(catalog, directory []byte) [sha256.Size]byte {
+	input := make([]byte, 0, len(catalog)+len(directory)+64)
+	input = append(input, []byte("vibedb/catalog-genesis-plan\x00")...)
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(catalog)))
+	input = append(input, length[:]...)
+	input = append(input, catalog...)
+	binary.BigEndian.PutUint64(length[:], uint64(len(directory)))
+	input = append(input, length[:]...)
+	input = append(input, directory...)
+	return sha256.Sum256(input)
 }
 
 type bootstrapCert struct{ cert, key []byte }
@@ -809,4 +1006,67 @@ func bootstrapReplicaControl(roles [3]bootstrapRole, state bootstrapState) ([]by
 	sort.Slice(m.ShardEndpoints, func(i, j int) bool { return m.ShardEndpoints[i].Node < m.ShardEndpoints[j].Node })
 	sort.Slice(m.Candidates, func(i, j int) bool { return m.Candidates[i].Node < m.Candidates[j].Node })
 	return vibejson.Marshal(&m)
+}
+
+func bootstrapNodeDirectory(roles [3]bootstrapRole, state bootstrapState, certs []bootstrapCert, random io.Reader) ([]byte, error) {
+	records := make([]gateway.NodeRecord, 0, 9)
+	certificateDigest := func(index int) ([32]byte, error) {
+		block, _ := pem.Decode(certs[index].cert)
+		if block == nil {
+			return [32]byte{}, errors.New("bootstrap: missing service certificate")
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		return sha256.Sum256(certificate.RawSubjectPublicKeyInfo), nil
+	}
+	for ri := range roles {
+		for mi := 0; mi < 3; mi++ {
+			host := fmt.Sprintf("vibedb-%s-%d.vibedb-%s-peer", roles[ri].name, mi, roles[ri].name)
+			pin, err := certificateDigest(ri*3 + mi)
+			if err != nil {
+				return nil, err
+			}
+			prefix := fmt.Sprintf("%s-member-%d", roles[ri].name, mi+1)
+			record := gateway.NodeRecord{NodeID: roles[ri].nodes[mi], Incarnation: 1, ServiceKeyDigest: replication.Digest(pin),
+				DataEndpoint: distribution.EndpointID(prefix), NativeEndpoint: distribution.EndpointID(prefix + "-native"), ControlEndpoint: distribution.EndpointID(prefix + "-control"),
+				DataAddress: host + ":7411", NativeAddress: host + ":7511", ControlAddress: host + ":7711",
+				FailureDomain: host, Roles: gateway.NodeRoleStorage | gateway.NodeRoleControl, Lifecycle: gateway.NodeActive, Revision: 1, CatalogGeneration: 1}
+			if ri == 0 {
+				record.Roles |= gateway.NodeRoleCatalog
+			}
+			records = append(records, record)
+		}
+	}
+	gatewayPin, err := certificateDigest(9)
+	if err != nil {
+		return nil, err
+	}
+	var gatewayNode rafttransport.NodeID
+	rawNode, err := hex.DecodeString(state.GatewayNodeID)
+	if err != nil || len(rawNode) != len(gatewayNode) {
+		return nil, errors.New("bootstrap: invalid gateway identity")
+	}
+	copy(gatewayNode[:], rawNode)
+	serviceID, err := readBootstrap16(random)
+	if err != nil {
+		return nil, err
+	}
+	sessionID, err := readBootstrap16(random)
+	if err != nil {
+		return nil, err
+	}
+	records[0].Roles |= gateway.NodeRoleGateway
+	records[0].GatewayEndpoint = "vibedb-gateway-0.vibedb-gateway-peer:7401"
+	records[0].GatewayAddress = string(records[0].GatewayEndpoint)
+	records[0].Gateway = gateway.GatewayIdentity{NodeID: gatewayNode, Incarnation: 1, ServiceKeyDigest: replication.Digest(gatewayPin),
+		ServiceID: serviceID, SessionID: sessionID, SessionRevision: 1, ParticipantDigest: replication.Digest(sha256.Sum256(sessionID[:]))}
+	sort.Slice(records, func(i, j int) bool { return bytes.Compare(records[i].NodeID[:], records[j].NodeID[:]) < 0 })
+	for _, record := range records {
+		if !record.Valid() {
+			return nil, errors.New("bootstrap: invalid initial physical directory")
+		}
+	}
+	return vibejson.Marshal(&records)
 }

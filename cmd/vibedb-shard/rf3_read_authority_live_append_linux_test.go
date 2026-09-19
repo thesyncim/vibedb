@@ -20,6 +20,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
@@ -112,6 +113,7 @@ func TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart(t *testing.T) {
 			Snapshot: addresses[member][2], Control: addresses[member][3],
 		}
 		group.TLS = rf3ManifestTLS{
+			PeerKeys:    rf3CommandPeerKeys(credentials[member]),
 			Certificate: credentials[member].Certificate, Key: credentials[member].Key,
 			Roots: roots, IdentityOID: rf3CommandIdentityOID.String(),
 		}
@@ -283,12 +285,16 @@ func TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart(t *testing.T) {
 	rf3WaitForGatewayAvailable(t, diagnostics, [rf3CommandMembers]string{
 		inputs[0].Root, inputs[1].Root, inputs[2].Root,
 	}, startupErrors)
+	commands := make(map[raftmember.GroupKey]raftservice.CommandFence, len(manifests[0].Groups))
+	for index, bundle := range manifests[0].Groups {
+		commands[bundle.Route.Group] = rf3CommandFenceFromManifestGroup(t, manifests[0], index)
+	}
 	for _, bundle := range manifests[0].Groups {
-		waitRF3CommandLeader(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], bundle.Route.Group, bundle.Route.AllocationGeneration, authorityGeneration, startupErrors)
+		waitRF3CommandLeaderWithProbeCommand(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], bundle.Route.Group, bundle.Route.AllocationGeneration, authorityGeneration, commands[bundle.Route.Group], startupErrors)
 	}
 	oldGroup := manifests[0].Groups[0].Route.Group
 	oldAllocation := manifests[0].Groups[0].Route.AllocationGeneration
-	if _, err := probeRF3CommandMember(t.Context(), addresses[0][1], nodes[0], profiles[1], nodes[1], oldGroup, oldAllocation, authorityGeneration); err != nil {
+	if _, err := probeRF3CommandMemberWithCommand(t.Context(), addresses[0][1], nodes[0], profiles[1], nodes[1], oldGroup, oldAllocation, authorityGeneration, commands[oldGroup]); err != nil {
 		t.Fatalf("initial old group probe: %v", err)
 	}
 
@@ -302,9 +308,12 @@ func TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart(t *testing.T) {
 		reloads[member] <- syscall.SIGHUP
 		newGroup := manifests[member].Groups[1].Route.Group
 		newAllocation := manifests[member].Groups[1].Route.AllocationGeneration
-		waitRF3AuthorityGroupPresent(t, addresses[member][1], nodes[member], profiles[(member+1)%rf3CommandMembers], nodes[(member+1)%rf3CommandMembers], newGroup, newAllocation, authorityGeneration)
 		if member == 0 {
-			state, err := probeRF3CommandMember(t.Context(), addresses[member][1], nodes[member], profiles[(member+1)%rf3CommandMembers], nodes[(member+1)%rf3CommandMembers], newGroup, newAllocation, authorityGeneration)
+			commands[newGroup] = rf3CommandFenceFromManifestGroup(t, manifests[member], 1)
+		}
+		waitRF3AuthorityGroupPresent(t, addresses[member][1], nodes[member], profiles[(member+1)%rf3CommandMembers], nodes[(member+1)%rf3CommandMembers], newGroup, newAllocation, authorityGeneration, commands[newGroup])
+		if member == 0 {
+			state, err := probeRF3CommandMemberWithCommand(t.Context(), addresses[member][1], nodes[member], profiles[(member+1)%rf3CommandMembers], nodes[(member+1)%rf3CommandMembers], newGroup, newAllocation, authorityGeneration, commands[newGroup])
 			if err != nil {
 				t.Fatalf("initially quarantined group probe: %v", err)
 			}
@@ -312,13 +321,13 @@ func TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart(t *testing.T) {
 				t.Fatalf("single-voter group %x elected leader %d before another registration", newGroup.GroupID, state.LeaderID)
 			}
 		}
-		waitRF3CommandLeader(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], oldGroup, oldAllocation, authorityGeneration, startupErrors)
+		waitRF3CommandLeaderWithProbeCommand(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], oldGroup, oldAllocation, authorityGeneration, commands[oldGroup], startupErrors)
 	}
 
 	newGroup := manifests[0].Groups[1].Route.Group
 	newAllocation := manifests[0].Groups[1].Route.AllocationGeneration
-	waitRF3CommandLeader(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], newGroup, newAllocation, authorityGeneration, startupErrors)
-	leader, state := rf3CommandFindLeader(t, []string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes[:], gatewayProfile, gatewayNode, newGroup, newAllocation, authorityGeneration)
+	waitRF3CommandLeaderWithProbeCommand(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], newGroup, newAllocation, authorityGeneration, commands[newGroup], startupErrors)
+	leader, state := rf3CommandFindLeaderWithProbeCommand(t, []string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes[:], gatewayProfile, gatewayNode, newGroup, newAllocation, authorityGeneration, commands[newGroup])
 	newBundle := manifests[leader].Groups[1]
 	readAuthority := serviceauthz.Authority{Node: nodes[(leader+1)%rf3CommandMembers], Generation: authorityGeneration}
 	state, beforeRead, err := rf3WaitForReadAuthoritySQLReady(t, addresses[leader][1], nodes[leader], profiles[(leader+1)%rf3CommandMembers], newBundle, state, readAuthority, diagnostics[leader], inputs[leader].Root, newGroup)
@@ -368,13 +377,13 @@ func TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart(t *testing.T) {
 	manifests[retireMember] = rf3ReplaceServingManifest(t, retiredPath, withdrawnRaw)
 	reloads[retireMember] <- syscall.SIGHUP
 	retireAuthority := nodes[(retireMember+1)%rf3CommandMembers]
-	waitRF3AuthorityGroupAbsent(t, addresses[retireMember][1], nodes[retireMember], profiles[(retireMember+1)%rf3CommandMembers], retireAuthority, newGroup, newAllocation, authorityGeneration)
-	waitRF3CommandLeader(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], oldGroup, oldAllocation, authorityGeneration, startupErrors)
+	waitRF3AuthorityGroupAbsent(t, addresses[retireMember][1], nodes[retireMember], profiles[(retireMember+1)%rf3CommandMembers], retireAuthority, newGroup, newAllocation, authorityGeneration, commands[newGroup])
+	waitRF3CommandLeaderWithProbeCommand(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], oldGroup, oldAllocation, authorityGeneration, commands[oldGroup], startupErrors)
 
 	manifests[retireMember] = rf3ReplaceServingManifest(t, retiredPath, retiredRaw)
 	reloads[retireMember] <- syscall.SIGHUP
-	waitRF3AuthorityGroupPresent(t, addresses[retireMember][1], nodes[retireMember], profiles[(retireMember+1)%rf3CommandMembers], retireAuthority, newGroup, newAllocation, authorityGeneration)
-	waitRF3CommandLeader(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], newGroup, newAllocation, authorityGeneration, startupErrors)
+	waitRF3AuthorityGroupPresent(t, addresses[retireMember][1], nodes[retireMember], profiles[(retireMember+1)%rf3CommandMembers], retireAuthority, newGroup, newAllocation, authorityGeneration, commands[newGroup])
+	waitRF3CommandLeaderWithProbeCommand(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], newGroup, newAllocation, authorityGeneration, commands[newGroup], startupErrors)
 	if incarnation := rf3WaitForRF3ReadAuthorityNodeIncarnation(t, diagnostics[retireMember], inputs[retireMember].Root, newGroup, retiredIncarnation); incarnation <= retiredIncarnation {
 		t.Fatalf("re-enrolled group incarnation = %d, want > %d", incarnation, retiredIncarnation)
 	}
@@ -405,9 +414,9 @@ func TestServeRF3ReadAuthorityLiveAppendAndRetainedRestart(t *testing.T) {
 		inputs[0].Root, inputs[1].Root, inputs[2].Root,
 	}, startupErrors)
 	for _, bundle := range manifests[0].Groups {
-		waitRF3CommandLeader(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], bundle.Route.Group, bundle.Route.AllocationGeneration, authorityGeneration, startupErrors)
+		waitRF3CommandLeaderWithProbeCommand(t, [rf3CommandMembers]string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes, profiles[:], bundle.Route.Group, bundle.Route.AllocationGeneration, authorityGeneration, commands[bundle.Route.Group], startupErrors)
 	}
-	restartLeader, restartState := rf3CommandFindLeader(t, []string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes[:], gatewayProfile, gatewayNode, newGroup, newAllocation, authorityGeneration)
+	restartLeader, restartState := rf3CommandFindLeaderWithProbeCommand(t, []string{addresses[0][1], addresses[1][1], addresses[2][1]}, nodes[:], gatewayProfile, gatewayNode, newGroup, newAllocation, authorityGeneration, commands[newGroup])
 	restartBundle := manifests[restartLeader].Groups[1]
 	restartAuthority := serviceauthz.Authority{Node: nodes[(restartLeader+1)%rf3CommandMembers], Generation: authorityGeneration}
 	restartState, beforeRestartRead, err := rf3WaitForReadAuthoritySQLReady(t, addresses[restartLeader][1], nodes[restartLeader], profiles[(restartLeader+1)%rf3CommandMembers], restartBundle, restartState, restartAuthority, diagnostics[restartLeader], inputs[restartLeader].Root, newGroup)
@@ -467,6 +476,10 @@ func TestRF3ReadAuthorityConfigureFailureUnregistersCache(t *testing.T) {
 	item.manifest.ReadAuthority = testRF3ReadAuthorityConfig()
 	cache := testRF3ReadAuthorityCache(identity.NodeIncarnation)
 	cache.localNode = profile.LocalIdentity().Node
+	targetsForRetry, err := rf3ReadAuthorityGroupTargetsForPrepared(*item, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -481,10 +494,6 @@ func TestRF3ReadAuthorityConfigureFailureUnregistersCache(t *testing.T) {
 	}
 	if _, err := os.Stat(rf3ReadAuthorityMarkerPath(item.manifest.Route.MemberRoot)); err != nil {
 		t.Fatalf("failed configuration removed durable marker: %v", err)
-	}
-	targetsForRetry, err := rf3ReadAuthorityGroupTargetsForPrepared(*item, identity)
-	if err != nil {
-		t.Fatal(err)
 	}
 	retryRegistrations, err := cache.RegisterGroups([]rf3ReadAuthorityGroupTargets{targetsForRetry})
 	if err != nil || len(retryRegistrations) != 1 {
@@ -578,12 +587,13 @@ func rf3WaitForRF3ReadAuthorityNodeIncarnation(
 func waitRF3AuthorityGroupAbsent(
 	t testing.TB, address string, node rafttransport.NodeID, profile *rafttransport.PeerTLS,
 	authorityNode rafttransport.NodeID, group raftmember.GroupKey, allocation, generation uint64,
+	probeCommand raftservice.CommandFence,
 ) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	for ctx.Err() == nil {
-		if _, err := probeRF3CommandMember(ctx, address, node, profile, authorityNode, group, allocation, generation); err != nil {
+		if _, err := probeRF3CommandMemberWithCommand(ctx, address, node, profile, authorityNode, group, allocation, generation, probeCommand); err != nil {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -734,11 +744,12 @@ func rf3ReadAuthorityPhysicalPolicy(nodes [rf3CommandMembers]rafttransport.NodeI
 func waitRF3AuthorityGroupPresent(
 	t testing.TB, address string, node rafttransport.NodeID, profile *rafttransport.PeerTLS,
 	authorityNode rafttransport.NodeID, group raftmember.GroupKey, allocation, generation uint64,
+	probeCommand raftservice.CommandFence,
 ) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := probeRF3CommandMember(context.Background(), address, node, profile, authorityNode, group, allocation, generation); err == nil {
+		if _, err := probeRF3CommandMemberWithCommand(context.Background(), address, node, profile, authorityNode, group, allocation, generation, probeCommand); err == nil {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

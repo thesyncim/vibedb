@@ -15,6 +15,35 @@ import (
 	"github.com/thesyncim/vibedb/internal/servicetls"
 )
 
+// bindReplicaControlManifestToLiveDirectory repairs a static startup roster
+// after a catalog membership transition.  The static manifest remains the
+// seed; a current endpoint is admitted only from the authenticated directory
+// cut and is still checked against the catalog's group-local address.
+func (runtime *Runtime) bindReplicaControlManifestToLiveDirectory(
+	manifest gatewayReplicaControlManifest,
+	catalog *gateway.Snapshot,
+) (gatewayReplicaControlManifest, error) {
+	if manifest.ValidateCatalog(catalog) == nil {
+		return manifest, nil
+	}
+	if runtime == nil || runtime.ctx == nil {
+		return gatewayReplicaControlManifest{}, errGatewayReplicaControlManifest
+	}
+	if runtime.controlDirectory != nil {
+		return bindGatewayReplicaControlManifestToDirectory(manifest, catalog,
+			runtime.controlDirectory.Nodes())
+	}
+	reader := runtime.config.ControlDirectory
+	if reader == nil {
+		reader = runtime.authority
+	}
+	cut, err := readGatewayControlDirectoryCut(runtime.ctx, reader)
+	if err != nil {
+		return gatewayReplicaControlManifest{}, errors.Join(errGatewayReplicaControlManifest, err)
+	}
+	return bindGatewayReplicaControlManifestToDirectory(manifest, catalog, cut.Nodes)
+}
+
 func (runtime *Runtime) open() error {
 	config := runtime.config
 	var (
@@ -139,7 +168,7 @@ func (runtime *Runtime) open() error {
 			config.CatalogBootstrapIfMissing, config.CatalogRelation, config.CatalogAttempts,
 			config.CatalogAttemptTimeout, config.TLSHandshakeTimeout, config.MaxShardConnections,
 			config.MaxShardHandshakes, config.CatalogSessionJournal, clientID, retryHome,
-			config.CatalogSessionLease, config.Transport,
+			config.CatalogSessionLease, runtime, config.Transport,
 		)
 		if err != nil {
 			return fmt.Errorf("open replicated catalog: %w", err)
@@ -182,6 +211,12 @@ func (runtime *Runtime) open() error {
 		}
 	}
 	if startupManifest != nil && len(runtime.provisionedSplitSources) != 0 {
+		boundManifest, bindErr := runtime.bindReplicaControlManifestToLiveDirectory(
+			*startupManifest, runtime.holder.Current())
+		if bindErr != nil {
+			return fmt.Errorf("bind table provision bundle roster: %w", bindErr)
+		}
+		startupManifest = &boundManifest
 		// Validate every paired fragment/source, including aggregate root and
 		// capacity constraints, before any catalog CAS can publish one table.
 		if _, preflightErr := newGatewayHotSplitFactory(*startupManifest, runtime.holder.Current(), runtime.provisionedSplitSources...); preflightErr != nil {
@@ -252,6 +287,9 @@ func (runtime *Runtime) open() error {
 		if err != nil {
 			return fmt.Errorf("listen gateway %q: %w", config.ListenAddress, err)
 		}
+	}
+	if err = runtime.restoreFrontendDrainFromDirectory(runtime.ctx); err != nil {
+		return fmt.Errorf("restore frontend admission lifecycle: %w", err)
 	}
 	return nil
 }

@@ -129,11 +129,16 @@ func TestRF3FaultDiagnosticProbeUsesSharedAbsoluteDeadline(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
+	diagnosticCommand := raftservice.CommandFence{
+		ReplicaSetVersion: 2, ActivePolicyGeneration: 3, ProtectionEpoch: 4,
+		OwnershipEpoch: 5, SchemaGeneration: 6, RoutingVersion: 7, RouteGeneration: 8,
+		RelationManifestDigest: [32]byte{0xcd},
+	}
 	started := time.Now()
 	result := make(chan error, 1)
 	go func() {
 		_, probeErr := probeRF3CommandMemberAtContextDeadline(ctx, listener.Addr().String(), nodes[0], clientProfile,
-			nodes[1], group, rf3CommandStoreIdentity(1).AllocationGeneration, 5)
+			nodes[1], group, rf3CommandStoreIdentity(1).AllocationGeneration, 5, diagnosticCommand)
 		result <- probeErr
 	}()
 	var probeErr error

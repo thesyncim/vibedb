@@ -16,7 +16,7 @@ func (m *Machine) lookupRequestLedgerCompletionAtSnapshot(
 		return CompletionLookup{}, ErrCompletionWorkspaceBusy
 	}
 	plan, err := m.planRequestLedgerCommand(
-		command, m.state, workspace.snapshot,
+		command, m.state.Applied+1, m.state, workspace.snapshot,
 	)
 	if err != nil {
 		if errors.Is(err, ErrAdmissionBound) {

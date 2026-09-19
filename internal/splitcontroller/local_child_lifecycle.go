@@ -32,6 +32,9 @@ type ChildRuntimeAdopter interface {
 type PreparedChildRuntime struct {
 	Runtime *raftmember.Runtime
 	Apply   *sqldriver.ReplicatedApply
+	// WAL is the exact file handle adopted into Runtime at this certified
+	// handoff. Serving metadata may borrow it; ownership stays with Runtime.
+	WAL *raftstore.Store
 }
 
 // LocalChildLifecycleOptions freezes every local resource needed to transfer a
@@ -237,7 +240,7 @@ func (l *LocalChildLifecycle) ExecuteAdoptChildRuntime(
 	}
 	if err = l.options.Adopter.AdoptSplitChild(
 		ctx, plan.OperationID(), l.options.Child, PreparedChildRuntime{
-			Runtime: runtime, Apply: l.activation.Apply,
+			Runtime: runtime, Apply: l.activation.Apply, WAL: l.wal,
 		},
 	); err != nil {
 		return errors.Join(err, runtime.Close())

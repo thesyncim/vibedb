@@ -2,14 +2,22 @@ package kubeoperator
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
+	"fmt"
+	"github.com/thesyncim/vibedb/gateway"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibejson"
 )
@@ -93,6 +101,7 @@ func TestBootstrapCreatesCanonicalResumableRF3Authority(t *testing.T) {
 		!bytes.Contains(first.Bytes(), []byte("name: vibedb-qualification-client-tls")) {
 		t.Fatalf("bootstrap result=%+v bytes=%d", result, first.Len())
 	}
+	verifyBootstrapProvisioning(t, first.Bytes())
 	seen := map[string]struct{}{result.GatewayNodeID: {}, result.ClientNodeID: {}}
 	for _, node := range result.ShardNodeIDs {
 		if len(node) != 32 {
@@ -259,4 +268,132 @@ func TestBootstrapRejectsUnsafeAuthorityDirectory(t *testing.T) {
 			t.Fatalf("symlink err=%v", err)
 		}
 	})
+}
+
+func verifyBootstrapProvisioning(t *testing.T, bundle []byte) {
+	t.Helper()
+	documents := make(map[string][]byte)
+	for _, line := range strings.Split(string(bundle), "\n") {
+		if !strings.HasPrefix(line, "  ") {
+			continue
+		}
+		key, value, ok := strings.Cut(strings.TrimSpace(line), ": ")
+		if !ok {
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(value)
+		if err == nil {
+			documents[key] = raw
+		}
+	}
+	var directory []gateway.NodeRecord
+	if err := vibejson.Unmarshal(documents["initial-node-directory.vibejson"], &directory); err != nil || len(directory) != 9 {
+		t.Fatalf("initial directory: %d records: %v", len(directory), err)
+	}
+	for _, record := range directory {
+		if !record.Valid() {
+			t.Fatal("invalid generated directory record")
+		}
+	}
+	catalogPath := filepath.Join(t.TempDir(), "catalog.vibejson")
+	if err := os.WriteFile(catalogPath, documents["cluster.vibejson"], 0600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := gateway.LoadSnapshot(catalogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, descriptor := range snapshot.ReplicatedShardDescriptors() {
+		for _, replica := range descriptor.Replicas {
+			found := false
+			for _, record := range directory {
+				if record.NodeID == replica.Node {
+					found = record.Incarnation == replica.NodeIncarnation && record.DataEndpoint == replica.Endpoint && record.NativeEndpoint == replica.NativeEndpoint && record.ControlEndpoint == replica.ControlEndpoint
+				}
+			}
+			if !found {
+				t.Fatal("directory and serving catalog identify different physical endpoints")
+			}
+		}
+	}
+	var catalogSourceSeeds []nodecontrol.BootstrapGatewaySeed
+	for _, role := range []string{"catalog", "ledger", "data"} {
+		for member := 0; member < 3; member++ {
+			var node bootstrapNodePrepare
+			if err := vibejson.Unmarshal(documents[fmt.Sprintf("%s-%d.vibejson", role, member)], &node); err != nil {
+				t.Fatal(err)
+			}
+			if node.NodeLog.Format != 1 || node.NodeLog.Path == "" || node.NodeLog.KeyID == "" || node.NodeLog.KeyMaterialPath == "" {
+				t.Fatalf("%s-%d missing canonical physical node log", role, member)
+			}
+			if len(node.CanonicalSourceSeeds) != 3 {
+				t.Fatalf("%s-%d missing canonical source seeds", role, member)
+			}
+			if role == "catalog" && member == 0 {
+				catalogSourceSeeds = slices.Clone(node.CanonicalSourceSeeds)
+			} else if !slices.Equal(node.CanonicalSourceSeeds, catalogSourceSeeds) {
+				t.Fatalf("%s-%d canonical source set differs from physical catalog voters", role, member)
+			}
+			if len(node.Groups) != 1 {
+				t.Fatalf("%s-%d has %d groups, want one role group", role, member, len(node.Groups))
+			}
+			manifest := node.Groups[0]
+			if len(manifest.TLS.PeerKeys) != 3 {
+				t.Fatal("missing initial certificate pins")
+			}
+			for _, peer := range manifest.Members {
+				certPEM := documents[fmt.Sprintf("%s-%d-cert.pem", role, peer.MemberID-1)]
+				block, _ := pem.Decode(certPEM)
+				if block == nil {
+					t.Fatal("missing peer certificate")
+				}
+				certificate, err := x509.ParseCertificate(block.Bytes)
+				if err != nil {
+					t.Fatal(err)
+				}
+				digest := sha256.Sum256(certificate.RawSubjectPublicKeyInfo)
+				found := false
+				for _, pin := range manifest.TLS.PeerKeys {
+					if pin.NodeID == peer.NodeID {
+						found = pin.KeyDigest == hex.EncodeToString(digest[:])
+					}
+				}
+				if !found {
+					t.Fatal("manifest pin does not match the issued peer certificate")
+				}
+			}
+			if role == "catalog" {
+				if node.CatalogGenesis == nil {
+					t.Fatalf("catalog-%d missing canonical catalog genesis config", member)
+				}
+				if len(documents[fmt.Sprintf("catalog-genesis-plan-catalog-%d.vibejson", member)]) == 0 {
+					t.Fatalf("catalog-%d missing canonical catalog genesis plan", member)
+				}
+			}
+		}
+	}
+	var catalogNode bootstrapNodePrepare
+	if err := vibejson.Unmarshal(documents["catalog-0.vibejson"], &catalogNode); err != nil || len(catalogNode.Groups) != 1 {
+		t.Fatalf("catalog source manifest: %v", err)
+	}
+	for index, seed := range catalogSourceSeeds {
+		peer := catalogNode.Groups[0].Members[index]
+		if hex.EncodeToString(seed.NodeID[:]) != peer.NodeID ||
+			seed.ControlAddress != fmt.Sprintf("vibedb-catalog-%d.vibedb-catalog-peer:7711", index) {
+			t.Fatalf("catalog source seed %d=%+v does not bind catalog peer=%+v", index, seed, peer)
+		}
+		certPEM := documents[fmt.Sprintf("catalog-%d-cert.pem", peer.MemberID-1)]
+		block, _ := pem.Decode(certPEM)
+		if block == nil {
+			t.Fatal("missing catalog source certificate")
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(certificate.RawSubjectPublicKeyInfo)
+		if seed.SPKIPinDigest != digest {
+			t.Fatalf("catalog source seed %d pin does not match physical catalog certificate", index)
+		}
+	}
 }

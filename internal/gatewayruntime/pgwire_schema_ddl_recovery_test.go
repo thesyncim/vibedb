@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/schemainstall"
+	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
@@ -27,6 +28,29 @@ type schemaDDLResumeResult struct {
 }
 
 type schemaDDLResumeFake map[rafttransport.NodeID]schemaDDLResumeResult
+
+func TestGatewaySchemaDDLDirectoryAuthorizationRetryIsNarrow(t *testing.T) {
+	refreshes, attempts := 0, 0
+	runtime := &gatewaySchemaDDLRuntime{refresh: func(context.Context) error {
+		refreshes++
+		return nil
+	}}
+	err := runtime.retryDirectoryAuthorization(t.Context(), func() error {
+		attempts++
+		if attempts < 3 {
+			return &gateway.ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalUnauthorized}
+		}
+		return nil
+	})
+	if err != nil || attempts != 3 || refreshes != 2 {
+		t.Fatalf("authorization retry err=%v attempts=%d refreshes=%d", err, attempts, refreshes)
+	}
+	refused := errors.New("deterministic refusal")
+	err = runtime.retryDirectoryAuthorization(t.Context(), func() error { return refused })
+	if !errors.Is(err, refused) || attempts != 3 || refreshes != 2 {
+		t.Fatalf("non-authorization refusal retried: err=%v attempts=%d refreshes=%d", err, attempts, refreshes)
+	}
+}
 
 func (f schemaDDLResumeFake) ResumeBuild(_ context.Context, node rafttransport.NodeID,
 	_ [32]byte, _ raftmember.GroupKey,

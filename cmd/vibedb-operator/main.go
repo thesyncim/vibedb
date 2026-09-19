@@ -198,14 +198,14 @@ func prepare(arguments []string) error {
 		return statErr
 	}
 	manifest := filepath.Join(*manifestDirectory, role+"-"+strconv.Itoa(ordinal)+".vibejson")
-	command := exec.Command("vibedb-shard", "prepare-rf3", "-manifest", manifest)
+	command := exec.Command("vibedb-shard", "prepare-node-rf3", "-manifest", manifest)
 	command.Stdout, command.Stderr = os.Stdout, os.Stderr
 	if err = command.Run(); err != nil {
 		return err
 	}
 	info, err := os.Lstat(serve)
 	if err != nil || !info.Mode().IsRegular() {
-		return errors.Join(err, errors.New("prepare-rf3 did not publish the expected member root"))
+		return errors.Join(err, errors.New("prepare-node-rf3 did not publish the expected member root"))
 	}
 	return nil
 }

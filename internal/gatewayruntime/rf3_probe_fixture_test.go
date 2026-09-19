@@ -9,6 +9,7 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -86,7 +87,8 @@ func rf3FixtureProbeRequest(route gateway.ReplicatedRoute, authority serviceauth
 	capability serviceauthz.Capability) *shardservice.ReplicatedRequest {
 	return &shardservice.ReplicatedRequest{
 		Operation: shardservice.ReplicatedProbe, Authority: authority, Capability: capability,
-		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration},
+		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+			Command: route.Command},
 	}
 }
 
@@ -128,6 +130,9 @@ func TestRF3FixtureProbeCarriesExactObserverAuthority(t *testing.T) {
 		Group: raftmember.GroupKey{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},
 			TopologyRecoveryEpoch: 3, ShardIncarnation: [16]byte{4}, GroupID: [16]byte{5}},
 		AllocationGeneration: 6,
+		Command: raftservice.CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
+			ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
+			RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1},
 	}
 	authority := serviceauthz.Authority{Node: rafttransport.NodeID{7}, Generation: 5}
 	for _, capability := range []serviceauthz.Capability{serviceauthz.CapabilityTopology,

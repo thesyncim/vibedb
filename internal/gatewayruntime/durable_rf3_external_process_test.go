@@ -6,7 +6,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/asn1"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -23,6 +25,7 @@ import (
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
@@ -37,6 +40,7 @@ import (
 	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	vibejson "github.com/thesyncim/vibejson"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 const durableRF3ExternalEnvironment = "VIBEDB_DURABLE_RF3_PROCESS_E2E"
@@ -56,7 +60,9 @@ const (
 	// cannot hide inside the whole-tree ceiling.
 	durableRF3ExternalRecoveryFiles         = 42
 	durableRF3ExternalRecoveryBudget uint64 = 506 << 20
-	durableRF3ExternalBaselineBudget uint64 = 2188 << 20
+	// Node-directory and frontend-drain files at genesis sit ~290MiB above the
+	// original 2188MiB ceiling measured before physical-node scaling.
+	durableRF3ExternalBaselineBudget uint64 = 2560 << 20
 	// Shards plus gateway A, gateway B, the stable user principal, and an
 	// independent observation principal all carry distinct certificate IDs.
 	durableRF3ExternalNodes = 7
@@ -465,9 +471,10 @@ type durableRF3ExternalFixture struct {
 	gatewayARouteSeed string
 	gatewayBRouteSeed string
 	catalogPath       string
+	initialDirectory  string
 
 	userProfile      *rafttransport.PeerTLS
-	observerProfile  *rafttransport.PeerTLS
+	gatewayProfile   *rafttransport.PeerTLS
 	probeClient      *gateway.AuthenticatedReplicatedClient
 	catalogAuthority *gateway.ReplicatedCatalogAuthority
 	ledger           *gateway.DurableRequestLedgerRF3
@@ -649,10 +656,17 @@ func newDurableRF3ExternalFixtureWithPeerFaults(t *testing.T, ctx context.Contex
 		t.Fatal(err)
 	}
 	fixture.catalogPath = catalogPath
+	fixture.initialDirectory = filepath.Join(fixture.root, "initial-node-directory.vibejson")
+	if err := durableRF3ExternalWriteInitialNodeDirectory(t, fixture.initialDirectory,
+		built.Snapshot, fixture.nodes, fixture.credentials,
+		fixture.listeners, fixture.gatewayAAddress, fixture.gatewayBAddress); err != nil {
+		t.Fatal(err)
+	}
 	ackPath := filepath.Join(fixture.root, "durable-ack-key")
 	if err = os.WriteFile(ackPath, []byte(strings.Repeat("3a", 32)), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	nodeMetadata := durableRF3ExternalPrepareNodeMetadata(t, fixture, key)
 
 	shardBinary, gatewayBinary := durableRF3ExternalBinaryPaths(t, fixture.root)
 	for member := 0; member < durableRF3ExternalVoters; member++ {
@@ -664,7 +678,7 @@ func newDurableRF3ExternalFixtureWithPeerFaults(t *testing.T, ctx context.Contex
 			}
 			fixture.walPaths[group][member] = prepared[group][member].WALPath
 		}
-		bundle, bundleErr := rf3testfixture.CombineProcessManifests(documents...)
+		bundle, bundleErr := rf3testfixture.CombineProcessManifestsWithNodeMetadata(nodeMetadata[member], documents...)
 		if bundleErr != nil {
 			t.Fatalf("combine member %d process groups: %v", member+1, bundleErr)
 		}
@@ -702,26 +716,29 @@ func newDurableRF3ExternalFixtureWithPeerFaults(t *testing.T, ctx context.Contex
 		fixture.gatewayARouteSeed,
 		fixture.gatewayAAddress, fixture.credentials[fixture.gatewayANode], fixture.roots,
 		fixture.policy, ackPath, fixture.gatewayAJournal, "1a", "2b", fixture.listeners,
-		fixture.nodes, true)
+		fixture.nodes)
 	fixture.gatewayB = durableRF3ExternalGatewayProcess(gatewayBinary, catalogPath,
 		fixture.gatewayBRouteSeed,
 		fixture.gatewayBAddress, fixture.credentials[fixture.gatewayBNode], fixture.roots,
 		fixture.policy, ackPath, fixture.gatewayBJournal, "3c", "4d", fixture.listeners,
-		fixture.nodes, true)
+		fixture.nodes)
 	fixture.userProfile, err = servicetls.LoadProfile(fixture.credentials[fixture.userNode].Certificate,
 		fixture.credentials[fixture.userNode].Key, fixture.roots, rf3testfixture.ProcessIdentityOID, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture.observerProfile, err = servicetls.LoadProfile(
-		fixture.credentials[fixture.observerNode].Certificate,
-		fixture.credentials[fixture.observerNode].Key, fixture.roots,
+	fixture.gatewayProfile, err = servicetls.LoadProfile(
+		fixture.credentials[fixture.gatewayANode].Certificate,
+		fixture.credentials[fixture.gatewayANode].Key, fixture.roots,
 		rf3testfixture.ProcessIdentityOID, time.Now,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture.probeClient = durableRF3ExternalReplicatedClient(t, fixture.observerProfile)
+	// Native receivers with a committed service directory only admit gateway
+	// delegates. Probe TLS and request authority must be that same principal;
+	// a directory-managed observer on the request is denied.
+	fixture.probeClient = durableRF3ExternalReplicatedClient(t, fixture.gatewayProfile)
 	fixture.measurements = &durableRF3ExternalMeasurements{}
 	fixture.snapshot = built.Snapshot
 	return fixture
@@ -818,7 +835,6 @@ func durableRF3ExternalGatewayProcess(
 	roots, policy, ack, journal, clientByte, retryByte string,
 	listeners [4]rf3testfixture.ProcessListeners,
 	nodes [durableRF3ExternalNodes]rafttransport.NodeID,
-	bootstrap bool,
 ) *rf3testfixture.ExternalProcess {
 	args := []string{"serve", "-catalog", catalog, "-catalog-route-seed", routeSeed,
 		"-catalog-relation", "1",
@@ -833,13 +849,285 @@ func durableRF3ExternalGatewayProcess(
 		"-tls-key", credential.Key, "-tls-roots", roots,
 		"-tls-identity-oid", rf3testfixture.ProcessIdentityOID,
 		"-authorization-policy", policy}
-	if bootstrap {
-		args = append(args, "-catalog-bootstrap-if-missing")
-	}
 	for member := 0; member < durableRF3ExternalVoters; member++ {
 		args = append(args, "-shard-peer", listeners[member].Native+"="+fmt.Sprintf("%x", nodes[member]))
 	}
 	return &rf3testfixture.ExternalProcess{Binary: binary, Args: args}
+}
+
+func durableRF3ExternalWriteInitialNodeDirectory(
+	t testing.TB,
+	path string,
+	snapshot *gateway.Snapshot,
+	nodes [durableRF3ExternalNodes]rafttransport.NodeID,
+	credentials []rf3testfixture.Credential,
+	listeners [4]rf3testfixture.ProcessListeners,
+	gatewayAAddress, gatewayBAddress string,
+) error {
+	t.Helper()
+	if snapshot == nil || path == "" || len(credentials) < durableRF3ExternalNodes {
+		return gateway.ErrInvalidScalingMetadata
+	}
+	profiles := make([]*rafttransport.PeerTLS, durableRF3ExternalNodes)
+	for index := range profiles {
+		profile, err := servicetls.LoadProfile(credentials[index].Certificate, credentials[index].Key,
+			filepath.Join(filepath.Dir(credentials[index].Certificate), "cluster-roots.pem"),
+			rf3testfixture.ProcessIdentityOID, time.Now)
+		if err != nil {
+			return err
+		}
+		profiles[index] = profile
+		if profile.LocalIdentity().Node != nodes[index] {
+			return fmt.Errorf("credential %d node=%x want=%x", index, profile.LocalIdentity().Node, nodes[index])
+		}
+	}
+	// The fixture's route descriptors are the exact catalog voter endpoints.
+	// Keep these records in the same generation-one cut as the immutable
+	// catalog; BootstrapNodeDirectory validates every voter address against it.
+	records := make([]gateway.NodeRecord, 0, durableRF3ExternalNodes)
+	for member := 0; member < durableRF3ExternalVoters; member++ {
+		address := listeners[member]
+		record := gateway.NodeRecord{
+			NodeID: nodes[member], Incarnation: 1,
+			ServiceKeyDigest: replication.Digest(profiles[member].LocalServiceKeyDigest()),
+			DataEndpoint:     distribution.EndpointID(fmt.Sprintf("fixture-node-%d-data", member+1)),
+			NativeEndpoint:   distribution.EndpointID(fmt.Sprintf("fixture-node-%d-native", member+1)),
+			ControlEndpoint:  distribution.EndpointID(fmt.Sprintf("fixture-node-%d-control", member+1)),
+			DataAddress:      address.Peer, NativeAddress: address.Native, ControlAddress: address.Control,
+			FailureDomain: fmt.Sprintf("rf3-member-%d", member+1),
+			Roles:         gateway.NodeRoleStorage | gateway.NodeRoleControl | gateway.NodeRoleCatalog,
+			Lifecycle:     gateway.NodeActive, Revision: 1, CatalogGeneration: snapshot.Generation(),
+		}
+		if !record.Valid() {
+			return fmt.Errorf("invalid RF3 voter node record member=%d", member+1)
+		}
+		records = append(records, record)
+	}
+	for offset, address := range []string{gatewayAAddress, gatewayBAddress} {
+		index := durableRF3ExternalVoters + offset
+		profile := profiles[index]
+		name := string(rune('a' + offset))
+		record := gateway.NodeRecord{
+			NodeID: nodes[index], Incarnation: 1,
+			ServiceKeyDigest: replication.Digest(profile.LocalServiceKeyDigest()),
+			DataEndpoint:     distribution.EndpointID("fixture-gateway-" + name + "-data"),
+			NativeEndpoint:   distribution.EndpointID("fixture-gateway-" + name + "-native"),
+			ControlEndpoint:  distribution.EndpointID("fixture-gateway-" + name + "-control"),
+			DataAddress:      "fixture-gateway-" + name + "-data",
+			NativeAddress:    "fixture-gateway-" + name + "-native",
+			ControlAddress:   "fixture-gateway-" + name + "-control",
+			GatewayEndpoint:  distribution.EndpointID("fixture-gateway-" + name),
+			GatewayAddress:   address,
+			FailureDomain:    "rf3-gateway-" + name,
+			Roles:            gateway.NodeRoleGateway,
+			Lifecycle:        gateway.NodeActive, Revision: 1, CatalogGeneration: snapshot.Generation(),
+			Gateway: gateway.GatewayIdentity{
+				NodeID: nodes[index], Incarnation: 1,
+				ServiceKeyDigest: replication.Digest(profile.LocalServiceKeyDigest()),
+				ServiceID:        [16]byte{0x81, byte(offset + 1)},
+				SessionID:        [16]byte{0x91, byte(offset + 1)}, SessionRevision: 1,
+				ParticipantDigest: replication.Digest{0xa1, byte(offset + 1)},
+			},
+		}
+		if !record.Valid() {
+			return fmt.Errorf("invalid RF3 gateway node record offset=%d", offset)
+		}
+		records = append(records, record)
+	}
+	slices.SortFunc(records, func(left, right gateway.NodeRecord) int {
+		return bytes.Compare(left.NodeID[:], right.NodeID[:])
+	})
+	raw, err := vibejson.Marshal(&records)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, raw, 0o600)
+}
+
+// durableRF3ExternalPrepareNodeMetadata creates the same physical-node
+// artifacts that prepare-node-rf3 publishes: one authenticated node log per
+// process, an explicit node incarnation, the pinned canonical-source roster,
+// and a digest-bound catalog-genesis witness.  The external fixture used to
+// compose only group WALs, which let serve-rf3 infer a missing physical
+// identity and fall back to its old gateway bootstrap path.
+func durableRF3ExternalPrepareNodeMetadata(
+	t testing.TB, fixture *durableRF3ExternalFixture, key raftstore.Key,
+) [durableRF3ExternalVoters]rf3testfixture.ProcessNodeMetadata {
+	t.Helper()
+	if fixture == nil || fixture.catalogPath == "" || fixture.initialDirectory == "" {
+		t.Fatal("external fixture is missing canonical catalog inputs")
+	}
+	catalogRaw, err := os.ReadFile(fixture.catalogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directoryRaw, err := os.ReadFile(fixture.initialDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles := make([]*rafttransport.PeerTLS, durableRF3ExternalVoters)
+	seeds := make([]nodecontrol.BootstrapGatewaySeed, durableRF3ExternalVoters)
+	for member := range profiles {
+		profiles[member], err = servicetls.LoadProfile(
+			fixture.credentials[member].Certificate, fixture.credentials[member].Key,
+			fixture.roots, rf3testfixture.ProcessIdentityOID, time.Now,
+		)
+		if err != nil {
+			t.Fatalf("load physical credential %d: %v", member+1, err)
+		}
+		if profiles[member].LocalIdentity().Node != fixture.nodes[member] {
+			t.Fatalf("physical credential %d node=%x want=%x", member+1,
+				profiles[member].LocalIdentity().Node, fixture.nodes[member])
+		}
+		seeds[member] = nodecontrol.BootstrapGatewaySeed{
+			NodeID: fixture.nodes[member], Incarnation: 1,
+			ControlAddress: fixture.listeners[member].Control,
+			SPKIPinDigest:  replication.Digest(profiles[member].LocalServiceKeyDigest()),
+		}
+		if !seeds[member].Valid() {
+			t.Fatalf("invalid canonical source seed %d", member+1)
+		}
+	}
+
+	var result [durableRF3ExternalVoters]rf3testfixture.ProcessNodeMetadata
+	for member := range result {
+		identity := fixture.identities[durableRF3CatalogGroup][member]
+		controlRoot := filepath.Join(fixture.root, fmt.Sprintf("node-%d-control", member+1))
+		nodeLogPath := filepath.Join(controlRoot, "node-log")
+		keyMaterialPath := filepath.Join(controlRoot, "node-key")
+		if err := os.WriteFile(keyMaterialPath, key.Material[:], 0o600); err != nil {
+			t.Fatalf("write node key %d: %v", member+1, err)
+		}
+		boots := make([]raftstore.NodeBootstrap, durableRF3ExternalGroups)
+		for group := range boots {
+			groupIdentity := fixture.identities[group][member]
+			index, term := uint64(1), uint64(1)
+			boots[group] = raftstore.NodeBootstrap{
+				Descriptor: raftstore.GroupDescriptor{
+					TopologyRecoveryEpoch: 3,
+					AllocationGeneration:  groupIdentity.AllocationGeneration,
+					MemberID:              groupIdentity.MemberID,
+					GroupID:               groupIdentity.GroupID,
+					ShardIncarnation:      groupIdentity.ShardIncarnation,
+					StoreID:               groupIdentity.StoreID,
+					Distribution:          groupIdentity.Distribution,
+					Shard:                 groupIdentity.Shard,
+				},
+				Snapshot: &pb.Snapshot{
+					Data: []byte("rf3-command-bootstrap"),
+					Metadata: &pb.SnapshotMetadata{
+						Index: &index, Term: &term,
+						ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}},
+					},
+				},
+			}
+		}
+		store, createErr := raftstore.CreateNodeStore(nodeLogPath,
+			raftstore.NodeIdentity{ClusterID: identity.ClusterID,
+				ClusterIncarnation: identity.ClusterIncarnation, NodeID: [16]byte(fixture.nodes[member])},
+			key, boots, raftstore.NodeStoreOptions{MaxGroups: 64})
+		if createErr != nil {
+			t.Fatalf("create physical node log %d: %v", member+1, createErr)
+		}
+		if closeErr := store.Close(); closeErr != nil {
+			t.Fatalf("close physical node log %d: %v", member+1, closeErr)
+		}
+
+		config := durableRF3ExternalCatalogGenesisConfig{
+			PlanPath:    filepath.Join(fixture.root, fmt.Sprintf("catalog-genesis-plan-node-%d.vibejson", member+1)),
+			CatalogPath: fixture.catalogPath, InitialNodeDirectoryPath: fixture.initialDirectory,
+			SessionJournal:        filepath.Join(fixture.root, fmt.Sprintf("node-%d-catalog-genesis-session", member+1)),
+			ClientID:              fmt.Sprintf("%x", fixture.nodes[member]),
+			RetryHome:             fmt.Sprintf("%x", fixture.nodes[member][:8]),
+			Distribution:          string(gateway.ReplicatedCatalogDistribution),
+			Shard:                 string(gateway.ReplicatedCatalogShard),
+			ClusterID:             fmt.Sprintf("%x", identity.ClusterID),
+			ClusterIncarnation:    fmt.Sprintf("%x", identity.ClusterIncarnation),
+			TopologyRecoveryEpoch: 3, AllocationGeneration: identity.AllocationGeneration,
+			ShardIncarnation: fmt.Sprintf("%x", identity.ShardIncarnation),
+			GroupID:          fmt.Sprintf("%x", identity.GroupID), MemberID: identity.MemberID,
+			StoreID: fmt.Sprintf("%x", identity.StoreID), NodeID: fmt.Sprintf("%x", fixture.nodes[member]),
+			NodeIncarnation: 1, Relation: 1,
+		}
+		configRaw, marshalErr := vibejson.Marshal(&config)
+		if marshalErr != nil {
+			t.Fatalf("marshal catalog genesis config %d: %v", member+1, marshalErr)
+		}
+		catalogDigest := sha256.Sum256(catalogRaw)
+		directoryDigest := sha256.Sum256(directoryRaw)
+		combinedDigest := durableRF3ExternalCatalogGenesisCombinedDigest(catalogRaw, directoryRaw)
+		plan := durableRF3ExternalCatalogGenesisPlan{
+			Format: 1, CatalogPath: config.CatalogPath,
+			InitialNodeDirectoryPath:   config.InitialNodeDirectoryPath,
+			CatalogDigest:              fmt.Sprintf("%x", catalogDigest),
+			InitialNodeDirectoryDigest: fmt.Sprintf("%x", directoryDigest),
+			ConfigDigest:               fmt.Sprintf("%x", sha256.Sum256(configRaw)),
+			CombinedDigest:             fmt.Sprintf("%x", combinedDigest),
+		}
+		planRaw, marshalErr := vibejson.Marshal(&plan)
+		if marshalErr != nil {
+			t.Fatalf("marshal catalog genesis plan %d: %v", member+1, marshalErr)
+		}
+		if err := os.WriteFile(config.PlanPath, planRaw, 0o600); err != nil {
+			t.Fatalf("write catalog genesis plan %d: %v", member+1, err)
+		}
+
+		result[member] = rf3testfixture.ProcessNodeMetadata{
+			NodeLog: rf3testfixture.ProcessNodeLogManifest{
+				Format: 1, Path: nodeLogPath, KeyID: key.ID,
+				WrappedKey: fmt.Sprintf("%x", key.Wrapped), KeyMaterialPath: keyMaterialPath,
+				Options: raftstore.NodeStoreOptions{MaxGroups: 64},
+			},
+			NodeIncarnation: 1, CanonicalSourceSeeds: slices.Clone(seeds),
+			CatalogGenesis: configRaw,
+		}
+	}
+	return result
+}
+
+type durableRF3ExternalCatalogGenesisConfig struct {
+	PlanPath                 string `json:"plan_path"`
+	CatalogPath              string `json:"catalog_path"`
+	InitialNodeDirectoryPath string `json:"initial_node_directory"`
+	SessionJournal           string `json:"session_journal"`
+	ClientID                 string `json:"client_id"`
+	RetryHome                string `json:"retry_home"`
+	Distribution             string `json:"distribution"`
+	Shard                    string `json:"shard"`
+	ClusterID                string `json:"cluster_id"`
+	ClusterIncarnation       string `json:"cluster_incarnation"`
+	TopologyRecoveryEpoch    uint64 `json:"topology_recovery_epoch"`
+	AllocationGeneration     uint64 `json:"allocation_generation"`
+	ShardIncarnation         string `json:"shard_incarnation"`
+	GroupID                  string `json:"group_id"`
+	MemberID                 uint64 `json:"member_id"`
+	StoreID                  string `json:"store_id"`
+	NodeID                   string `json:"node_id"`
+	NodeIncarnation          uint64 `json:"node_incarnation"`
+	Relation                 uint64 `json:"relation"`
+}
+
+type durableRF3ExternalCatalogGenesisPlan struct {
+	Format                     uint16 `json:"format"`
+	CatalogPath                string `json:"catalog_path"`
+	InitialNodeDirectoryPath   string `json:"initial_node_directory"`
+	CatalogDigest              string `json:"catalog_digest"`
+	InitialNodeDirectoryDigest string `json:"initial_node_directory_digest"`
+	ConfigDigest               string `json:"config_digest"`
+	CombinedDigest             string `json:"combined_digest"`
+}
+
+func durableRF3ExternalCatalogGenesisCombinedDigest(catalog, directory []byte) [sha256.Size]byte {
+	input := make([]byte, 0, len(catalog)+len(directory)+64)
+	input = append(input, []byte("vibedb/catalog-genesis-plan\x00")...)
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(catalog)))
+	input = append(input, length[:]...)
+	input = append(input, catalog...)
+	binary.BigEndian.PutUint64(length[:], uint64(len(directory)))
+	input = append(input, length[:]...)
+	input = append(input, directory...)
+	return sha256.Sum256(input)
 }
 
 func durableRF3ExternalReplicatedClient(
@@ -874,15 +1162,19 @@ func mustDurableRF3ExternalExecutor(
 	return executor
 }
 
+func (fixture *durableRF3ExternalFixture) gatewayAuthority() serviceauthz.Authority {
+	return serviceauthz.Authority{Node: fixture.nodes[fixture.gatewayANode], Generation: 5}
+}
+
 func (fixture *durableRF3ExternalFixture) initializeObservers(t *testing.T) {
 	t.Helper()
-	// These readers use a third authenticated service principal and exact
-	// shipped RF3 codecs; neither reaches into a child process store.
-	fixture.catalogAuthority, fixture.catalogClose = hotMutationCatalogAuthority(t, fixture.observerProfile,
+	// After a service directory is installed, native catalog and ledger
+	// traffic must use a gateway delegate. Probe TLS already is gateway A;
+	// catalog session TLS and ledger Service must match that principal.
+	fixture.catalogAuthority, fixture.catalogClose = hotMutationCatalogAuthority(t, fixture.gatewayProfile,
 		fixture.snapshot, filepath.Join(fixture.root, "observer-catalog-session"))
-	observerAuthority := serviceauthz.Authority{Node: fixture.nodes[fixture.observerNode], Generation: 5}
 	ledgerRF3, err := gateway.NewReplicatedRequestLedgerRF3(gateway.ReplicatedRequestLedgerRF3Options{
-		Executor: mustDurableRF3ExternalExecutor(t, fixture.probeClient), Service: observerAuthority,
+		Executor: mustDurableRF3ExternalExecutor(t, fixture.probeClient), Service: fixture.gatewayAuthority(),
 		ServiceTenant: durableRequestServiceTenant[:],
 	})
 	if err != nil {
@@ -1076,7 +1368,7 @@ func (fixture *durableRF3ExternalFixture) probeMember(group, member int, require
 	defer cancel()
 	route := fixture.routes[group]
 	ctx, err := serviceauthz.WithAuthority(ctx, serviceauthz.Authority{
-		Node: fixture.nodes[fixture.observerNode], Generation: 5,
+		Node: fixture.nodes[fixture.gatewayANode], Generation: 5,
 	})
 	if err != nil {
 		return shardservice.ReplicatedMemberState{}, err

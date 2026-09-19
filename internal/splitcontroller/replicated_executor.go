@@ -163,11 +163,13 @@ func ExecuteReplicatedStep(
 			}
 			record = next
 		}
-		if err := execute(ctx, plan.OperationID(), action); err != nil {
-			return Action{}, err
-		}
+		execErr := execute(ctx, plan.OperationID(), action)
+		// Complete is already certified in the catalog. Retirement RPCs may
+		// race a stale fence; failing closed here leaves the operation in the
+		// directory forever. Collect regardless, and only surface execute
+		// errors when the delete itself cannot settle.
 		if err := settleReplicatedOperationDelete(ctx, journal, record); err != nil {
-			return Action{}, err
+			return Action{}, errors.Join(execErr, err)
 		}
 		return action, nil
 	}

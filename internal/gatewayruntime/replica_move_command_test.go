@@ -32,7 +32,7 @@ func TestReplicaMoveCommandUsesAuthenticatedPostOwnershipCut(t *testing.T) {
 		State:       replicatedstate.State{Binding: binding},
 	}
 	execution := rebalance.ReplicatedMoveExecution{PublicationApplied: 11, PublicationReplicaSet: 10, Proof: [32]byte{1}}
-	got, err := observeGatewayReplicaMoveCommand(t.Context(), gatewayTestObservationClient{observation}, cut,
+	got, err := observeGatewayReplicaMoveCommand(t.Context(), gatewayTestObservationClient{observation: observation}, cut,
 		rebalance.OperationID{1}, execution)
 	want := route.Command
 	want.ReplicaSetVersion, want.OwnershipEpoch, want.RoutingVersion, want.RouteGeneration = 10, 5, 8, 9
@@ -52,7 +52,7 @@ func TestReplicaMoveCommandUsesAuthenticatedPostOwnershipCut(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			wrong := observation
 			mutate(&wrong)
-			if _, err := observeGatewayReplicaMoveCommand(t.Context(), gatewayTestObservationClient{wrong}, cut,
+			if _, err := observeGatewayReplicaMoveCommand(t.Context(), gatewayTestObservationClient{observation: wrong}, cut,
 				rebalance.OperationID{1}, execution); err == nil {
 				t.Fatal("unrelated authority became a publication command")
 			}

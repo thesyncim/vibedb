@@ -162,7 +162,8 @@ func TestReplicatedRequestFrameBytesMatchesNativeEncoder(t *testing.T) {
 	}
 	requests := []*ReplicatedRequest{
 		{Operation: ReplicatedProbe, Authority: authority, Capability: serviceauthz.CapabilityDataRead,
-			Fence: ReplicatedFence{Group: fence.Group, AllocationGeneration: fence.AllocationGeneration}},
+			Fence: ReplicatedFence{Group: fence.Group, AllocationGeneration: fence.AllocationGeneration,
+				Command: fence.Command}},
 		{Operation: ReplicatedPropose, Authority: authority, Capability: serviceauthz.CapabilityDataWrite,
 			Fence: fence, Command: testReplicatedCommand(t, fence)},
 		{Operation: ReplicatedMembership, Authority: authority, Capability: serviceauthz.CapabilityMembership,
@@ -336,7 +337,8 @@ func bindSemanticServer(t *testing.T, owner replicatedOwner, timeout time.Durati
 func (fixture semanticServerFixture) probe() ReplicatedCall {
 	fence := testReplicatedFence()
 	return ReplicatedCall{Request: ReplicatedRequest{Operation: ReplicatedProbe, Authority: fixture.actor,
-		Capability: serviceauthz.CapabilityDataRead, Fence: ReplicatedFence{Group: fence.Group, AllocationGeneration: fence.AllocationGeneration}}}
+		Capability: serviceauthz.CapabilityDataRead, Fence: ReplicatedFence{Group: fence.Group,
+			AllocationGeneration: fence.AllocationGeneration, Command: fence.Command}}}
 }
 
 func requireSemanticResponse(t *testing.T, fixture semanticServerFixture, call ReplicatedCall, kind ReplicatedResponseKind, refusal ReplicatedRefusalCode) *ReplicatedReply {

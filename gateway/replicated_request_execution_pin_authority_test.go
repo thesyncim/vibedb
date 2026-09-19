@@ -165,7 +165,7 @@ func TestDurableRequestDefaultPinTakeoverRequiresLaterExactApply(t *testing.T) {
 		blocked := record
 		mutate(&blocked)
 		if durableRequestPinRecoverableAtNextApply(blocked, 20) {
-			t.Fatal("frozen or terminal pin became recoverable")
+			t.Fatal("invalid or terminal pin became recoverable")
 		}
 	}
 }

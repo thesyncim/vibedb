@@ -141,6 +141,68 @@ type rf3AuthorityDiagnostics struct {
 	Evidence     func() []raftmember.ReadAuthorityEvidence
 }
 
+// rf3TransportStatsProvider is intentionally narrower than the peer runtime:
+// diagnostics can observe detached transport counters without gaining a
+// queueing or lifecycle capability.
+type rf3TransportStatsProvider interface {
+	TransportStats(rafttransport.NodeID) (rafttransport.PeerStats, error)
+}
+
+// rf3DiagnosticTransportFailure is the JSON-safe projection of one transport
+// worker's last failure. It retains routing and Raft progress metadata plus a
+// stable cause class, never an error string, endpoint, payload, or credential.
+type rf3DiagnosticTransportFailure struct {
+	NodeID      string                              `json:"node_id"`
+	Phase       string                              `json:"phase"`
+	Cause       string                              `json:"cause"`
+	Group       rf3DiagnosticAuthorityGroupIdentity `json:"group"`
+	From        uint64                              `json:"from"`
+	To          uint64                              `json:"to"`
+	Version     uint64                              `json:"version"`
+	Kind        string                              `json:"kind"`
+	MessageType int32                               `json:"message_type"`
+	Index       uint64                              `json:"index"`
+	Term        uint64                              `json:"term"`
+}
+
+func bindRF3TransportFailureDiagnostics(
+	owner *rf3NodeOwner,
+	provider rf3TransportStatsProvider,
+	registry *rafttransport.StaticRegistry,
+) {
+	if owner == nil || provider == nil || registry == nil {
+		return
+	}
+	owner.controlMu.Lock()
+	owner.transportFailures = func() []rf3DiagnosticTransportFailure {
+		peers := registry.PeerDirectory()
+		failures := make([]rf3DiagnosticTransportFailure, 0, len(peers))
+		for _, physical := range peers {
+			node := physical.NodeID
+			if node == (rafttransport.NodeID{}) {
+				node = physical.Node
+			}
+			if node == (rafttransport.NodeID{}) {
+				continue
+			}
+			stats, err := provider.TransportStats(node)
+			if err != nil || stats.LastFailure.Phase == "" {
+				continue
+			}
+			failure := stats.LastFailure
+			failures = append(failures, rf3DiagnosticTransportFailure{
+				NodeID: hex.EncodeToString(failure.Node[:]), Phase: failure.Phase,
+				Cause: failure.Cause, Group: rf3DiagnosticAuthorityGroupIdentityJSON(authorityGroupIdentity(failure.Group)),
+				From: failure.From, To: failure.To, Version: failure.Version,
+				Kind: failure.Kind, MessageType: failure.MessageType,
+				Index: failure.Index, Term: failure.Term,
+			})
+		}
+		return failures
+	}
+	owner.controlMu.Unlock()
+}
+
 func rf3DiagnosticAuthorityGroupIdentityJSON(identity raftauthority.GroupIdentity) rf3DiagnosticAuthorityGroupIdentity {
 	return rf3DiagnosticAuthorityGroupIdentity{
 		ClusterID:             hex.EncodeToString(identity.ClusterID[:]),
@@ -414,14 +476,15 @@ type rf3DiagnosticSnapshot struct {
 	GatewaySQLRequestCount uint64 `json:"gateway_sql_request_encodings"`
 	GatewaySQLRequestBytes uint64 `json:"gateway_sql_request_encoded_bytes"`
 
-	RemoteDials             uint64 `json:"remote_dials"`
-	RemoteReuses            uint64 `json:"remote_reuses"`
-	RemotePoisoned          uint64 `json:"remote_poisoned"`
-	RemoteRejected          uint64 `json:"remote_rejected"`
-	RemoteHandshakeFailures uint64 `json:"remote_handshake_failures"`
-	RemoteConnections       int    `json:"remote_connections"`
-	RemoteIdle              int    `json:"remote_idle"`
-	RemoteWaiters           int    `json:"remote_waiters"`
+	RemoteDials             uint64                          `json:"remote_dials"`
+	RemoteReuses            uint64                          `json:"remote_reuses"`
+	RemotePoisoned          uint64                          `json:"remote_poisoned"`
+	RemoteRejected          uint64                          `json:"remote_rejected"`
+	RemoteHandshakeFailures uint64                          `json:"remote_handshake_failures"`
+	RemoteConnections       int                             `json:"remote_connections"`
+	RemoteIdle              int                             `json:"remote_idle"`
+	RemoteWaiters           int                             `json:"remote_waiters"`
+	RaftTransportFailures   []rf3DiagnosticTransportFailure `json:"raft_transport_failures,omitempty"`
 
 	RaftProposalBatches             uint64   `json:"raft_proposal_batches"`
 	RaftProposalCommands            uint64   `json:"raft_proposal_commands"`
@@ -844,6 +907,14 @@ func emitRF3DiagnosticSnapshotWithResources(
 	}
 	if nodeOwner != nil && nodeOwner.sequencer != nil {
 		applyRF3DiagnosticSequencer(&snapshot, nodeOwner.sequencer.Stats())
+	}
+	if nodeOwner != nil {
+		nodeOwner.controlMu.Lock()
+		transportFailures := nodeOwner.transportFailures
+		nodeOwner.controlMu.Unlock()
+		if transportFailures != nil {
+			snapshot.RaftTransportFailures = transportFailures()
+		}
 	}
 	if progressMetrics != nil {
 		applyRF3DiagnosticProgress(&snapshot, progressMetrics.Snapshot())

@@ -637,14 +637,7 @@ func composeDevGroupManifest(paths []string) ([]byte, error) {
 		return nil, err
 	}
 	process["groups"] = raw
-	order := []string{"listeners", "tls", "authorization_policy", "replica_control", "split_control"}
-	if len(process["read_authority"]) != 0 {
-		order = append(order, "read_authority")
-	}
-	order = append(order, "groups")
-	if len(process["node_log"]) != 0 {
-		order = append([]string{"node_log"}, order...)
-	}
+	order := devNodeRuntimeManifestOrder(process)
 	return orderedDevManifestObject(process, order)
 }
 

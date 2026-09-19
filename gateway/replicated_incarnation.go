@@ -49,10 +49,16 @@ func (client *AuthenticatedReplicatedClient) probeReplicatedBound(
 	if err != nil {
 		return nil, err
 	}
-	response, err := connection.encoder.RoundTripReplicated(ctx, connection.conn, &shardservice.ReplicatedRequest{
+	request := &shardservice.ReplicatedRequest{
 		Operation: shardservice.ReplicatedProbe, Authority: authority, Capability: capability,
-		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration},
-	})
+		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+			Command: route.Command},
+	}
+	if err := attachFrontendContinuation(ctx, request); err != nil {
+		client.release(connection, false)
+		return nil, err
+	}
+	response, err := connection.encoder.RoundTripReplicated(ctx, connection.conn, request)
 	healthy := err == nil && context.Cause(ctx) == nil
 	if err == nil && !validReplicatedUnauthorizedWithoutState(response) {
 		if catalog && response != nil && catalogCommandProgression(route.Command, response.State.Fence.Command) {
@@ -143,7 +149,8 @@ func (executor *ReplicatedExecutor) probeReplicated(ctx context.Context, route R
 	if !ok {
 		response, err := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
 			Operation: shardservice.ReplicatedProbe, Capability: capability,
-			Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration},
+			Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+				Command: route.Command},
 		})
 		return response, endpoint, err
 	}

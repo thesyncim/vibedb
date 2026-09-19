@@ -230,16 +230,23 @@ func TestReplicaHealthRevisionsScheduleExactDurableReplacement(t *testing.T) {
 	}
 	grantAuthority := &orderedFailedGrantAuthority{snapshot: snapshot, pending: true}
 	installer := &orderedFailedGrantInstaller{authority: grantAuthority}
+	nodes := gatewayTestNodeRecordReader{records: []gateway.NodeRecord{
+		{NodeID: rafttransport.NodeID{9}, Incarnation: 1, Revision: 1,
+			DataAddress: "127.0.0.1:1", Lifecycle: gateway.NodeActive},
+	}}
 	durableSink := gatewayFailedReplicaMoveSink{
 		controller: orderedFailedMoveSubmitter{authority: grantAuthority},
 		grants:     grantAuthority, installer: installer,
+		nodes: nodes, enroller: new(gatewayTestEnrollmentInstaller),
 	}
 	if err = durableSink.SubmitFailedReplicaMove(t.Context(), intent); err != nil {
 		t.Fatalf("durable failed-replica submission: %v", err)
 	}
+	// AddLearner installs the grant on current voters only. The empty target
+	// cannot accept membership-grant-control until RegisterExecutionGroup.
 	wantEvents := []string{"publish-grant", "settle-grant", "read-grant",
-		"install-grant", "install-grant", "install-grant", "install-grant", "submit-move"}
-	if !slices.Equal(grantAuthority.events, wantEvents) || len(installer.nodes) != 4 {
+		"install-grant", "install-grant", "install-grant", "submit-move"}
+	if !slices.Equal(grantAuthority.events, wantEvents) || len(installer.nodes) != 3 {
 		t.Fatalf("events=%v nodes=%x", grantAuthority.events, installer.nodes)
 	}
 	firstGrant := grantAuthority.grant
@@ -249,9 +256,9 @@ func TestReplicaHealthRevisionsScheduleExactDurableReplacement(t *testing.T) {
 		t.Fatalf("restart replay of durable failed-replica submission: %v", err)
 	}
 	wantReplayEvents := []string{"publish-grant", "read-grant",
-		"install-grant", "install-grant", "install-grant", "install-grant", "submit-move"}
+		"install-grant", "install-grant", "install-grant", "submit-move"}
 	if grantAuthority.grant != firstGrant ||
-		!slices.Equal(grantAuthority.events, wantReplayEvents) || len(installer.nodes) != 4 {
+		!slices.Equal(grantAuthority.events, wantReplayEvents) || len(installer.nodes) != 3 {
 		t.Fatalf("replay grant=%+v events=%v nodes=%x",
 			grantAuthority.grant, grantAuthority.events, installer.nodes)
 	}
@@ -264,7 +271,7 @@ func TestReplicaHealthRevisionsScheduleExactDurableReplacement(t *testing.T) {
 	}
 	grantAuthority.grant = retained
 	grantAuthority.events, installer.nodes = nil, nil
-	if err := durableSink.SubmitFailedReplicaMove(t.Context(), intent); err != nil || grantAuthority.grant != retained || len(installer.nodes) != 4 {
+	if err := durableSink.SubmitFailedReplicaMove(t.Context(), intent); err != nil || grantAuthority.grant != retained || len(installer.nodes) != 3 {
 		t.Fatalf("retained pre-admission grant did not resume: %v events=%v", err, grantAuthority.events)
 	}
 	// A grant for another descriptor must never be reused just because its
@@ -361,7 +368,7 @@ func (runner *oneReplicaHealthRevisionPass) RunPass(
 func TestReplicaHealthRuntimeFailsClosedWithoutAuthorityOrTransport(t *testing.T) {
 	if controller, err := newGatewayReplicaHealthRuntime(
 		testReplicaHealthCatalog{testReplicaHealthSnapshot(t)}, nil, nil,
-		testCandidateInventory{}, nil, nil, nil,
+		testCandidateInventory{}, nil, nil, nil, nil, nil,
 	); controller != nil || !errors.Is(err, errGatewayReplicaHealth) {
 		t.Fatalf("controller=%v err=%v", controller, err)
 	}
@@ -461,6 +468,8 @@ func testReplicatedHealthSnapshot(t testing.TB) (*gateway.Snapshot, rebalance.Fa
 		Distribution: "data", Shard: "all", Group: group, AllocationGeneration: 11,
 		RangeIdentity: [32]byte{2}, LineageDigest: [32]byte{3},
 		ForwardingRuleDigest: [32]byte{4},
+		LogicalSchemaDigest:  [32]byte{5},
+		RequestLedgerRanges:  []gateway.DurableRequestLedgerRangeDescriptor{{Identity: [32]byte{6}}},
 		Command: raftservice.CommandFence{ReplicaSetVersion: 7, OwnershipEpoch: 13,
 			RoutingVersion: 7, RouteGeneration: 9, ActivePolicyGeneration: 1,
 			ProtectionEpoch: 1, SchemaGeneration: 1, RelationManifestDigest: [32]byte{1}},

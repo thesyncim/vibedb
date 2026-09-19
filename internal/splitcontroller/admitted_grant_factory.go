@@ -109,7 +109,8 @@ func (factory *LocalAdmittedGrantFactory) RefreshSource(source AdmittedSourceRun
 			continue
 		}
 		a, b := prior.Target, source.Target
-		if prior.Registry != source.Registry || a.Group != b.Group || a.Member != b.Member || a.Allocation != b.Allocation || a.RelationManifestDigest != b.RelationManifestDigest ||
+		if prior.Registry != source.Registry || a.Group != b.Group || a.Member != b.Member || a.Allocation != b.Allocation ||
+			a.RelationManifestDigest != b.RelationManifestDigest && b.Authority.SchemaGeneration <= a.Authority.SchemaGeneration ||
 			b.Authority.ActivePolicyGeneration < a.Authority.ActivePolicyGeneration || b.Authority.ProtectionEpoch < a.Authority.ProtectionEpoch ||
 			b.Authority.OwnershipEpoch < a.Authority.OwnershipEpoch || b.Authority.SchemaGeneration < a.Authority.SchemaGeneration ||
 			b.Authority.RoutingVersion < a.Authority.RoutingVersion || b.Authority.RouteGeneration < a.Authority.RouteGeneration {

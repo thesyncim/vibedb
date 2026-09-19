@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibejson"
 )
@@ -67,7 +68,15 @@ const canonicalRF3Manifest = `{
     "max_source_concurrent": 2,
     "max_source_artifact_bytes": 1073741824,
     "max_source_disk_bytes": 4294967296,
-    "source_chunk_bytes": 1048576
+    "source_chunk_bytes": 1048576,
+    "migration_budget": {
+      "max_active": 2,
+      "cpu": {"bytes_per_second": 67108864, "burst_bytes": 4194304},
+      "disk_read": {"bytes_per_second": 67108864, "burst_bytes": 4194304},
+      "disk_write": {"bytes_per_second": 67108864, "burst_bytes": 4194304},
+      "network_send": {"bytes_per_second": 33554432, "burst_bytes": 2097152},
+      "network_receive": {"bytes_per_second": 33554432, "burst_bytes": 2097152}
+    }
   },
   "split_control": {
     "journal_path": "/srv/vibedb/split-control.journal",
@@ -292,13 +301,20 @@ func TestParseRF3ManifestCanonicalMultiGroupBundles(t *testing.T) {
 }
 
 func TestParseRF3ManifestSharedKeyRequiresExactNodeLogBinding(t *testing.T) {
-	shared := strings.ReplaceAll(multiGroupRF3Manifest(t), "/run/secrets/vibedb-wal-key-2", "/run/secrets/vibedb-wal-key")
+	shared := multiGroupRF3Manifest(t)
+	nodeLogStart := strings.Index(shared, "  \"node_log\":")
+	listenersStart := strings.Index(shared, "  \"listeners\":")
+	if nodeLogStart < 0 || listenersStart <= nodeLogStart {
+		t.Fatal("managed multi-group fixture lost physical node prefix")
+	}
+	shared = shared[:nodeLogStart] + shared[listenersStart:]
+	shared = strings.ReplaceAll(shared, "/run/secrets/vibedb-wal-key-2", "/run/secrets/vibedb-wal-key")
 	node := rf3NodeLogManifest{Format: 1, Path: "/srv/node/node-log", KeyID: "production-key-1", KeyMaterialPath: "/run/secrets/vibedb-wal-key"}
 	encoded, err := vibejson.Marshal(&node)
 	if err != nil {
 		t.Fatal(err)
 	}
-	document := strings.Replace(shared, "{\n", "{\n  \"node_log\": "+string(encoded)+",\n", 1)
+	document := strings.Replace(shared, "{\n", "{\n  \"node_log\": "+string(encoded)+",\n  \"node_incarnation\": 1,\n", 1)
 	parsed, err := parseRF3Manifest([]byte(document))
 	if err != nil || len(parsed.Groups) != 2 {
 		t.Fatalf("shared physical key refused: groups=%d err=%v", len(parsed.Groups), err)
@@ -319,7 +335,14 @@ func TestParseRF3ManifestSharedKeyRequiresExactNodeLogBinding(t *testing.T) {
 }
 
 func multiGroupRF3Manifest(t testing.TB) string {
+	return managedRF3Manifest(t, 2)
+}
+
+func managedRF3Manifest(t testing.TB, groups int) string {
 	t.Helper()
+	if groups != 1 && groups != 2 {
+		t.Fatalf("managed RF3 fixture groups=%d, want 1 or 2", groups)
+	}
 	listener := strings.Index(canonicalRF3Manifest, `  "listeners":`)
 	members := strings.Index(canonicalRF3Manifest, "\n  \"members\":")
 	if listener < 0 || members <= listener {
@@ -334,22 +357,32 @@ func multiGroupRF3Manifest(t testing.TB) string {
 	}
 	registry := common[registryStart:registryEnd]
 	common = common[:registryStart] + `    "max_operations": 8` + common[registryEnd:]
+	nodeLog, err := vibejson.Marshal(&rf3NodeLogManifest{Format: 1, Path: "/srv/vibedb/node-log",
+		KeyID: "production-key-1", KeyMaterialPath: "/run/secrets/vibedb-node-key",
+		Options: raftstore.NodeStoreOptions{MaxGroups: 64}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	roster := strings.TrimSuffix(canonicalRF3Manifest[members:], "\n}")
 	first := "{\n" + walSQL + registry + "," + roster + "\n  }"
-	second := strings.ReplaceAll(first, "/srv/vibedb/member", "/srv/vibedb/second/member")
-	second = strings.Replace(second, `"group_id": "3132333435363738393a3b3c3d3e3f40"`,
-		`"group_id": "5152535455565758595a5b5c5d5e5f60"`, 1)
-	second = strings.Replace(second, `"store_id": "4142434445464748494a4b4c4d4e4f50"`,
-		`"store_id": "6162636465666768696a6b6c6d6e6f70"`, 1)
-	second = strings.Replace(second, `"member_root": "/srv/vibedb"`,
-		`"member_root": "/srv/vibedb/second"`, 1)
-	second = strings.Replace(second, `"split_runtime_root": "/srv/vibedb/split-runtime"`,
-		`"split_runtime_root": "/srv/vibedb/second/split-runtime"`, 1)
-	second = strings.Replace(second, `"membership_grant_path": "/srv/vibedb/membership-grant"`,
-		`"membership_grant_path": "/srv/vibedb/second/membership-grant"`, 1)
-	second = strings.ReplaceAll(second, "/srv/vibedb/split-children", "/srv/vibedb/second/split-children")
-	second = strings.ReplaceAll(second, "/run/secrets/vibedb-wal-key", "/run/secrets/vibedb-wal-key-2")
-	return "{\n" + common + "  \"groups\": [\n  " + first + ",\n  " + second + "\n  ]\n}"
+	list := first
+	if groups == 2 {
+		second := strings.ReplaceAll(first, "/srv/vibedb/member", "/srv/vibedb/second/member")
+		second = strings.Replace(second, `"group_id": "3132333435363738393a3b3c3d3e3f40"`,
+			`"group_id": "5152535455565758595a5b5c5d5e5f60"`, 1)
+		second = strings.Replace(second, `"store_id": "4142434445464748494a4b4c4d4e4f50"`,
+			`"store_id": "6162636465666768696a6b6c6d6e6f70"`, 1)
+		second = strings.Replace(second, `"member_root": "/srv/vibedb"`,
+			`"member_root": "/srv/vibedb/second"`, 1)
+		second = strings.Replace(second, `"split_runtime_root": "/srv/vibedb/split-runtime"`,
+			`"split_runtime_root": "/srv/vibedb/second/split-runtime"`, 1)
+		second = strings.Replace(second, `"membership_grant_path": "/srv/vibedb/membership-grant"`,
+			`"membership_grant_path": "/srv/vibedb/second/membership-grant"`, 1)
+		second = strings.ReplaceAll(second, "/srv/vibedb/split-children", "/srv/vibedb/second/split-children")
+		second = strings.ReplaceAll(second, "/run/secrets/vibedb-wal-key", "/run/secrets/vibedb-wal-key-2")
+		list = first + ",\n  " + second
+	}
+	return "{\n  \"node_log\": " + string(nodeLog) + ",\n  \"node_incarnation\": 1,\n" + common + "  \"groups\": [\n  " + list + "\n  ]\n}"
 }
 
 func TestParseRF3ManifestRetainsOneEnrolledTargetOutsideServingRF3(t *testing.T) {
@@ -552,5 +585,31 @@ func TestParseRF3ManifestEnforcesInputBoundAndDepth(t *testing.T) {
 	deep := `{"wal":{"path":{"a":{"b":{"c":1}}}}}`
 	if _, err := parseRF3Manifest([]byte(deep)); !errors.Is(err, errInvalidRF3Manifest) {
 		t.Fatalf("deep parse error = %v", err)
+	}
+}
+
+func TestRF3GroupedManifestKeepsEmptyNodeExplicit(t *testing.T) {
+	document, err := vibejson.Parse([]byte(`[]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeLog := &rf3NodeLogManifest{Format: 1}
+	groups, err := parseRF3ManifestGroups(document.Node(), nodeLog)
+	if err != nil {
+		t.Fatalf("empty grouped node rejected: %v", err)
+	}
+	if groups == nil || len(groups) != 0 {
+		t.Fatalf("groups = %#v, want non-nil empty slice", groups)
+	}
+	if _, err = parseRF3ManifestGroups(document.Node(), nil); !errors.Is(err, errInvalidRF3Manifest) {
+		t.Fatalf("legacy empty groups accepted: %v", err)
+	}
+	manifest := rf3Manifest{NodeLog: nodeLog, Groups: []rf3ManifestGroup{}}
+	if got := manifest.groupBundles(); got == nil || len(got) != 0 {
+		t.Fatalf("empty grouped bundles = %#v", got)
+	}
+	legacy := rf3Manifest{}
+	if got := legacy.groupBundles(); len(got) != 1 {
+		t.Fatalf("legacy fallback bundles = %#v", got)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -96,6 +97,107 @@ func TestCatalogFreshDiscoveryOverridesOldSessionLeaderHint(t *testing.T) {
 	}
 	if traced.staleProposals != 0 {
 		t.Fatalf("fresh catalog discovery discarded in favor of stale session leader: %d proposals", traced.staleProposals)
+	}
+}
+
+// catalogEndpointLeaderClient returns an authenticated state for the endpoint
+// that was actually probed. This models a catalog whose committed leader has
+// moved to an enrolled target while the old serving seeds still answer.
+type catalogEndpointLeaderClient struct {
+	*catalogAuthorityClient
+	leader uint64
+	mu     sync.Mutex
+	probes []uint64
+}
+
+func (client *catalogEndpointLeaderClient) DoReplicated(
+	ctx context.Context, endpoint ReplicatedEndpoint, request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	response, err := client.catalogAuthorityClient.DoReplicated(ctx, endpoint, request)
+	if err != nil || response == nil {
+		return response, err
+	}
+	if request.Operation == shardservice.ReplicatedProbe {
+		client.mu.Lock()
+		client.probes = append(client.probes, endpoint.Member)
+		client.mu.Unlock()
+	}
+	response.State.Fence.MemberID = endpoint.Member
+	response.State.Fence.StoreID = endpoint.StoreID
+	response.State.Fence.NodeIncarnation = endpoint.NodeIncarnation
+	response.State.LeaderID = client.leader
+	return response, nil
+}
+
+func (client *catalogEndpointLeaderClient) probedMembers() []uint64 {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return append([]uint64(nil), client.probes...)
+}
+
+func TestCatalogAuthorityStartupDiscoversAuthenticatedEnrolledTarget(t *testing.T) {
+	authority, client, _, current, descriptor := newRouteSeedCatalogAuthorityFixture(t)
+	targetDescriptor := descriptor
+	testReplicatedCatalogEnrollTarget(&targetDescriptor)
+	bootstrap, err := NewSnapshotWithReplicatedMetadata(
+		current.config, current.endpoints, current.Generation(), nil, nil,
+		[]ReplicatedShardDescriptor{targetDescriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err = initialCatalogState(bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	membership, ok := bootstrap.ResolveReplicatedMembershipRoute(
+		ReplicatedCatalogDistribution, ReplicatedCatalogShard, nil,
+	)
+	if !ok || !membership.HasEnrolledTarget {
+		t.Fatal("fixture has no enrolled target")
+	}
+	// Authority discovery runs before the live holder is installed. The
+	// bootstrap snapshot is an attested route-seed image and is the only source
+	// from which the target endpoint may be admitted at this boundary.
+	authority.holder = NewCatalogHolder(nil)
+	authority.session.catalogBootstrap = bootstrap
+	traced := &catalogEndpointLeaderClient{
+		catalogAuthorityClient: client, leader: membership.EnrolledTarget.Member,
+	}
+	authority.executor.client = traced
+	got, err := authority.Read(t.Context())
+	if err != nil {
+		t.Fatalf("startup discovery rejected authenticated enrolled leader: %v", err)
+	}
+	if got == nil || got.Generation() != bootstrap.Generation() {
+		t.Fatalf("catalog generation=%v, want %d", got, bootstrap.Generation())
+	}
+	seen := traced.probedMembers()
+	foundTarget := false
+	for _, member := range seen {
+		if member == membership.EnrolledTarget.Member {
+			foundTarget = true
+			break
+		}
+	}
+	if !foundTarget {
+		t.Fatalf("startup discovery never probed authenticated target %d: %v", membership.EnrolledTarget.Member, seen)
+	}
+}
+
+func TestCatalogAuthorityStartupRejectsUnboundEnrolledLeader(t *testing.T) {
+	authority, client, _, bootstrap, _ := newRouteSeedCatalogAuthorityFixture(t)
+	authority.holder = NewCatalogHolder(nil)
+	authority.session.catalogBootstrap = bootstrap
+	traced := &catalogEndpointLeaderClient{catalogAuthorityClient: client, leader: 4}
+	authority.executor.client = traced
+	if _, err := authority.Read(t.Context()); !errors.Is(err, ErrReplicatedLeader) {
+		t.Fatalf("unbound target leader was accepted: %v", err)
+	}
+	for _, member := range traced.probedMembers() {
+		if member == 4 {
+			t.Fatal("discovery probed an unbound target endpoint")
+		}
 	}
 }
 

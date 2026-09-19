@@ -27,6 +27,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftserve"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -116,7 +117,8 @@ func runRF3ShippedFaultHarness(t *testing.T, nodeLog bool) {
 		Operation:  shardservice.ReplicatedProbe,
 		Authority:  serviceauthz.Authority{Node: fixture.nodes[(newLeader+1)%rf3CommandMembers], Generation: fixture.authority.ActivePolicyGeneration},
 		Capability: serviceauthz.CapabilityTopology,
-		Fence:      shardservice.ReplicatedFence{Group: fixture.group, AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration},
+		Fence: shardservice.ReplicatedFence{Group: fixture.group, AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration,
+			Command: fixture.probeCommand},
 	})
 	cancelDead()
 	if deadErr == nil {
@@ -606,6 +608,7 @@ type rf3FaultFixture struct {
 	roots                     string
 	profiles                  []*rafttransport.PeerTLS
 	authority                 sqldriver.ReplicatedAuthorityProfile
+	probeCommand              raftservice.CommandFence
 	manifestPaths             [rf3CommandMembers]string
 	walPaths                  [rf3CommandMembers]string
 	nodeLog                   bool
@@ -696,6 +699,12 @@ func newRF3FaultFixtureWithStorage(t testing.TB, maxRecords uint64, nodeLog bool
 		}
 		if prepareErr != nil {
 			t.Fatal(prepareErr)
+		}
+		candidateCommand := rf3CommandPreparedFence(t, prepared)
+		if member == 0 {
+			fixture.probeCommand = candidateCommand
+		} else if candidateCommand != fixture.probeCommand {
+			t.Fatalf("RF3 fault member %d command differs from member 1: %+v != %+v", member+1, candidateCommand, fixture.probeCommand)
 		}
 		maximum := prepared.Base.UserLimits.MaxDocumentBytes
 		if maximum <= 0 || maximum > replication.MaxMutationValueBytes ||
@@ -957,14 +966,14 @@ func (fixture *rf3FaultFixture) tryProbe(member int, timeout time.Duration) (sha
 
 func (fixture *rf3FaultFixture) tryProbeContext(ctx context.Context, member int) (shardservice.ReplicatedMemberState, error) {
 	client := (member + 1) % rf3CommandMembers
-	return probeRF3CommandMember(ctx, fixture.nativeAddresses[member], fixture.nodes[member], fixture.profiles[client], fixture.nodes[client],
-		fixture.group, rf3CommandStoreIdentity(1).AllocationGeneration, fixture.authority.ActivePolicyGeneration)
+	return probeRF3CommandMemberWithCommand(ctx, fixture.nativeAddresses[member], fixture.nodes[member], fixture.profiles[client], fixture.nodes[client],
+		fixture.group, rf3CommandStoreIdentity(1).AllocationGeneration, fixture.authority.ActivePolicyGeneration, fixture.probeCommand)
 }
 
 func (fixture *rf3FaultFixture) tryProbeContextAtDeadline(ctx context.Context, member int) (shardservice.ReplicatedMemberState, error) {
 	client := (member + 1) % rf3CommandMembers
 	return probeRF3CommandMemberAtContextDeadline(ctx, fixture.nativeAddresses[member], fixture.nodes[member], fixture.profiles[client], fixture.nodes[client],
-		fixture.group, rf3CommandStoreIdentity(1).AllocationGeneration, fixture.authority.ActivePolicyGeneration)
+		fixture.group, rf3CommandStoreIdentity(1).AllocationGeneration, fixture.authority.ActivePolicyGeneration, fixture.probeCommand)
 }
 
 // captureRF3FaultFailureDiagnostic records one bounded cut after an unexpected

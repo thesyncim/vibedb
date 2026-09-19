@@ -32,7 +32,7 @@ func TestDurableSQLGatewaySharedTypedLedgerRecoversLostTerminalAndAck(t *testing
 		t.Fatal(err)
 	}
 	plan.Result = result
-	terminalLedger := &terminalCoordinatorLedger{head: head, continuation: continuation}
+	terminalLedger := &terminalCoordinatorLedger{pin: pin, head: head, continuation: continuation}
 	coordinator, err := newDurableRequestTerminalCoordinator(terminalLedger, pin)
 	if err != nil {
 		t.Fatal(err)

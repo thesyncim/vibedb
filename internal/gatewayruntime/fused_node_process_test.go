@@ -353,14 +353,17 @@ func (process *fusedSupervisorProcess) Stop(ctx context.Context) error {
 		}
 	}
 	if process.PID() != 0 {
-		_ = process.command.Process.Kill()
+		if err := process.command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			stopErr = errors.Join(stopErr, fmt.Errorf("kill supervisor: %w", err))
+		}
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	select {
 	case <-process.exited:
 	case <-cleanupCtx.Done():
-		return errors.Join(stopErr, errors.New("supervisor did not reap within cleanup deadline"))
+		state, stateErr := fusedReadLinuxProcess(process.identity.PID)
+		return errors.Join(stopErr, fmt.Errorf("supervisor did not reap within cleanup deadline: state=%+v state_err=%v", state, stateErr))
 	}
 	stopErr = errors.Join(stopErr, waitFusedPIDsGone(cleanupCtx, remaining))
 	process.stopped = stopErr == nil

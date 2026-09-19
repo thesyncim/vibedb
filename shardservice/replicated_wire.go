@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/executionpin"
@@ -29,6 +30,7 @@ const (
 	tagReplicatedRequestLedgerRead = 'L'
 	tagReplicatedExecutionPinRead  = 'E'
 	tagReplicatedRouteGateRead     = 'G'
+	tagReplicatedRouteSettlement   = 'S'
 	tagReplicatedResponse          = 'A'
 	// A response with state has a 297-byte body before a completion. The fixed
 	// request digest is zero for nonterminal responses and binds terminal
@@ -46,7 +48,7 @@ const (
 // Membership is fixed-width: the original 279-byte control body plus the
 // forwarded 16-byte node identity, 8-byte authorization generation, and the
 // 8-byte exact requested capability.
-const replicatedMembershipRequestBodyBytes = 311
+const replicatedMembershipRequestBodyBytes = 303
 
 // Transaction recovery reads are fixed-width: the common 242-byte native
 // prefix followed by a one-byte closed read kind, one exact transaction ID,
@@ -62,6 +64,11 @@ const replicatedRequestLedgerReadRequestBodyBytes = 416
 const replicatedExecutionPinReadRequestBodyBytes = 282
 const replicatedRouteGateReadRequestBodyBytes = 250
 
+// Route settlement carries a closed read mode, a quorum-applied floor, and one
+// bounded exact retained route-session command. The variable command has an
+// explicit length so a decoder can bound it before reading caller-sized data.
+const replicatedRouteSettlementReadRequestBodyBytes = 242 + 1 + 8 + 4
+
 const (
 	MaxReplicatedTransactionReadBytes = replicatedstate.MaxTransactionRecoveryReadBytes
 	MaxReplicatedTransactionScanItems = replicatedstate.MaxTransactionRecoveryScanRows
@@ -69,6 +76,26 @@ const (
 )
 
 var ErrReplicatedWire = errors.New("shardservice: invalid replicated native frame")
+
+type replicatedBorrowedScratch struct {
+	bytes [replicatedBorrowedCoalesceBytes]byte
+}
+
+var replicatedBorrowedScratchPool = sync.Pool{
+	New: func() any { return new(replicatedBorrowedScratch) },
+}
+
+func releaseReplicatedBorrowedScratch(scratch *replicatedBorrowedScratch, used int) {
+	releaseReplicatedBorrowedScratchTo(scratch, used, &replicatedBorrowedScratchPool)
+}
+
+func releaseReplicatedBorrowedScratchTo(scratch *replicatedBorrowedScratch, used int, pool *sync.Pool) {
+	if scratch == nil {
+		return
+	}
+	clear(scratch.bytes[:min(max(used, 0), len(scratch.bytes))])
+	pool.Put(scratch)
+}
 
 // DecodeReplicatedSQLRequest validates the complete nested frame length against
 // its admitted outer payload before the general SQL decoder allocates a body.
@@ -110,7 +137,24 @@ const (
 	ReplicatedExecutionPinRead
 	ReplicatedRouteGateRead
 	ReplicatedQueryLeader
+	ReplicatedRouteSettlement
 )
+
+type ReplicatedRouteSettlementMode uint8
+
+const (
+	ReplicatedRouteSettlementReadReleaseReceipt ReplicatedRouteSettlementMode = iota + 1
+)
+
+func (mode ReplicatedRouteSettlementMode) valid() bool {
+	return mode == ReplicatedRouteSettlementReadReleaseReceipt
+}
+
+type ReplicatedRouteSettlementRequest struct {
+	Mode           ReplicatedRouteSettlementMode
+	MinimumApplied uint64
+	Command        []byte
+}
 
 // ReplicatedTransactionReadKind is the complete RF3 recovery-read surface.
 // These operations inspect only the replicated hidden system collection; they
@@ -153,7 +197,8 @@ type ReplicatedExecutionPinReadRequest struct {
 }
 
 // ReplicatedFence identifies one exact live Runtime and leadership term. Probe
-// requires only Group and AllocationGeneration; Propose requires every field.
+// carries the catalog command contract plus Group and AllocationGeneration;
+// MemberID, StoreID, NodeIncarnation, and Term are learned from the response.
 type ReplicatedFence struct {
 	Group                raftmember.GroupKey
 	AllocationGeneration uint64
@@ -167,21 +212,26 @@ type ReplicatedFence struct {
 // ReplicatedRequest carries an exact canonical command or asks for a live
 // serving handshake. Command aliases the decoded frame and is capacity-clamped.
 type ReplicatedRequest struct {
-	Operation         ReplicatedOperation
-	Authority         serviceauthz.Authority
-	Capability        serviceauthz.Capability
-	Fence             ReplicatedFence
-	Command           []byte
-	Membership        ReplicatedMembershipRequest
-	Relation          replication.RelationID
-	Key               []byte
-	MinimumApplied    uint64
-	MaxValueBytes     uint32
-	BatchRead         []byte
-	Query             []byte
+	Operation      ReplicatedOperation
+	Authority      serviceauthz.Authority
+	Capability     serviceauthz.Capability
+	Fence          ReplicatedFence
+	Command        []byte
+	Membership     ReplicatedMembershipRequest
+	Relation       replication.RelationID
+	Key            []byte
+	MinimumApplied uint64
+	MaxValueBytes  uint32
+	BatchRead      []byte
+	Query          []byte
+	// Continuation is an outer, connection-bound drain proof. It never
+	// changes the inner command/query bytes and is omitted on the ordinary
+	// Active path.
+	Continuation      *serviceauthz.FrontendContinuationEnvelope
 	TransactionRead   ReplicatedTransactionReadRequest
 	RequestLedgerRead ReplicatedRequestLedgerReadRequest
 	ExecutionPinRead  ReplicatedExecutionPinReadRequest
+	RouteSettlement   ReplicatedRouteSettlementRequest
 }
 
 // ReplicatedMembershipRequest is a fixed-width control envelope. It contains
@@ -194,7 +244,6 @@ type ReplicatedMembershipRequest struct {
 	ExpectedReplicaSetVersion uint64
 	SourceMember              uint64
 	TargetMember              uint64
-	TransferTerm              uint64
 }
 
 // ReplicatedResponseKind separates definite pre-admission refusals from an
@@ -216,6 +265,7 @@ const (
 	ReplicatedExecutionPinReadResult
 	ReplicatedRouteGateReadResult
 	ReplicatedQueryResult
+	ReplicatedRouteSettlementResult
 )
 
 // ReplicatedRefusalCode is a closed diagnostic class. Deterministic state-
@@ -294,6 +344,9 @@ func (f *FrameEncoder) EncodeReplicatedRequest(w io.Writer, request *ReplicatedR
 	if request.Operation == ReplicatedMembership {
 		payloadHint += 65
 	}
+	if request.Operation == ReplicatedRouteSettlement {
+		payloadHint += len(request.RouteSettlement.Command) + 13
+	}
 	e := newFrameEncoder(f.arena, payloadHint)
 	defer func() { f.arena = keepFrameArena(e.b) }()
 	e.u8(replicatedWireVersion)
@@ -328,6 +381,11 @@ func (f *FrameEncoder) EncodeReplicatedRequest(w io.Writer, request *ReplicatedR
 		e.u64(request.MinimumApplied)
 	case ReplicatedExecutionPinRead:
 		encodeReplicatedExecutionPinRead(&e, request.ExecutionPinRead)
+	case ReplicatedRouteSettlement:
+		encodeReplicatedRouteSettlement(&e, request.RouteSettlement)
+	}
+	if request.Continuation != nil {
+		encodeFrontendContinuation(&e, request.Continuation)
 	}
 	if e.err != nil {
 		return e.err
@@ -343,6 +401,8 @@ func (f *FrameEncoder) EncodeReplicatedRequest(w io.Writer, request *ReplicatedR
 		tag = tagReplicatedRouteGateRead
 	} else if request.Operation == ReplicatedExecutionPinRead {
 		tag = tagReplicatedExecutionPinRead
+	} else if request.Operation == ReplicatedRouteSettlement {
+		tag = tagReplicatedRouteSettlement
 	}
 	return writeEncodedFrame(w, tag, e.b)
 }
@@ -412,6 +472,16 @@ func ReplicatedRequestFrameBytes(request *ReplicatedRequest) (int, error) {
 		if err := add(8); err != nil {
 			return 0, err
 		}
+	case ReplicatedRouteSettlement:
+		if err := add(1 + 8); err != nil {
+			return 0, err
+		}
+		if err := addBytes(request.RouteSettlement.Command); err != nil {
+			return 0, err
+		}
+	}
+	if err := add(frontendContinuationTailBytes(request)); err != nil {
+		return 0, err
 	}
 	return total + 5, nil
 }
@@ -438,11 +508,12 @@ func ValidateReplicatedResponse(response *ReplicatedResponse) error {
 	return nil
 }
 
-// EncodeReplicatedRequestBorrowed emits a small complete frame from a fresh
-// arena in one Write. Larger requests borrow the immutable command or point
-// key as a second scatter buffer, avoiding a payload-sized userspace copy on
-// every retry. Persistent streams should use a FrameEncoder to reuse its
-// arena; this convenience function remains one-shot.
+// EncodeReplicatedRequestBorrowed emits the fixed request prefix and borrows
+// the immutable command or point key as a second buffer. Small payload-bearing
+// frames use a bounded cleared scratch so a TLS stream sees one Write; larger
+// frames retain the scatter/writev path without a payload-sized userspace copy.
+// Payload-free frames instead reuse a per-connection FrameEncoder arena,
+// cleared before every reuse so no prior request's bytes linger in it.
 func EncodeReplicatedRequestBorrowed(w io.Writer, request *ReplicatedRequest) error {
 	return (&FrameEncoder{}).EncodeReplicatedRequestBorrowed(w, request)
 }
@@ -456,27 +527,48 @@ func (f *FrameEncoder) EncodeReplicatedRequestBorrowed(w io.Writer, request *Rep
 	if w == nil || !validReplicatedRequest(request) {
 		return ErrReplicatedWire
 	}
-	payloadHint := 0
-	if request.Operation == ReplicatedMembership {
-		payloadHint = 65
+	var payload []byte
+	switch request.Operation {
+	case ReplicatedPropose:
+		payload = request.Command
+	case ReplicatedReadLeader, ReplicatedReadFollower:
+		payload = request.Key
+	case ReplicatedReadBatchLeader:
+		payload = request.BatchRead
+	case ReplicatedQueryLeader:
+		payload = request.Query
+	case ReplicatedRouteSettlement:
+		// Settlement's command is encoded into the arena below on the borrowed
+		// path, just like the other bounded variable request values.
 	}
-	e := newFrameEncoder(f.arena, payloadHint)
-	defer func() {
-		clear(e.b)
-		f.arena = keepFrameArena(e.b)
-	}()
+	var scratch *replicatedBorrowedScratch
+	var e encbuf
+	if len(payload) != 0 {
+		scratch = replicatedBorrowedScratchPool.Get().(*replicatedBorrowedScratch)
+		e = encbuf{b: scratch.bytes[:5]}
+	} else {
+		payloadHint := 0
+		if request.Operation == ReplicatedMembership {
+			payloadHint = 65
+		} else if request.Operation == ReplicatedRouteSettlement {
+			payloadHint = len(request.RouteSettlement.Command) + 13
+		}
+		e = newFrameEncoder(f.arena, payloadHint)
+		defer func() {
+			clear(e.b)
+			f.arena = keepFrameArena(e.b)
+		}()
+	}
 	e.u8(replicatedWireVersion)
 	e.u8(uint8(request.Operation))
 	e.b = append(e.b, request.Authority.Node[:]...)
 	e.u64(request.Authority.Generation)
 	e.u64(uint64(request.Capability))
 	encodeReplicatedFence(&e, request.Fence)
-	var payload []byte
 	tag := byte(tagReplicatedRequest)
 	switch request.Operation {
 	case ReplicatedProbe:
 	case ReplicatedPropose:
-		payload = request.Command
 		e.u32(uint32(len(payload)))
 	case ReplicatedMembership:
 		e.u32(0)
@@ -486,16 +578,13 @@ func (f *FrameEncoder) EncodeReplicatedRequestBorrowed(w io.Writer, request *Rep
 		e.u8(uint8(request.Relation))
 		e.u64(request.MinimumApplied)
 		e.u32(request.MaxValueBytes)
-		payload = request.Key
 		e.u32(uint32(len(payload)))
 	case ReplicatedReadBatchLeader:
 		e.u64(request.MinimumApplied)
 		e.u32(request.MaxValueBytes)
-		payload = request.BatchRead
 		e.u32(uint32(len(payload)))
 	case ReplicatedQueryLeader:
 		e.u32(request.MaxValueBytes)
-		payload = request.Query
 		e.u32(uint32(len(payload)))
 	case ReplicatedTransactionRead:
 		encodeReplicatedTransactionRead(&e, request.TransactionRead)
@@ -509,16 +598,27 @@ func (f *FrameEncoder) EncodeReplicatedRequestBorrowed(w io.Writer, request *Rep
 	case ReplicatedExecutionPinRead:
 		encodeReplicatedExecutionPinRead(&e, request.ExecutionPinRead)
 		tag = tagReplicatedExecutionPinRead
+	case ReplicatedRouteSettlement:
+		e.u8(uint8(request.RouteSettlement.Mode))
+		e.u64(request.RouteSettlement.MinimumApplied)
+		e.bytes(request.RouteSettlement.Command)
+		tag = tagReplicatedRouteSettlement
 	}
-	total := len(e.b) + len(payload)
-	if e.err != nil || total-5 > maxFrameBody {
+	var continuation encbuf
+	if request.Continuation != nil {
+		encodeFrontendContinuation(&continuation, request.Continuation)
+	}
+	if e.err != nil || continuation.err != nil || len(e.b)+len(payload)+len(continuation.b)-5 > maxFrameBody {
+		releaseReplicatedBorrowedScratch(scratch, len(e.b))
 		return errFrameTooLarge
 	}
 	e.b[0] = tag
-	binary.BigEndian.PutUint32(e.b[1:5], uint32(total-1))
-	if total <= replicatedBorrowedCoalesceBytes {
+	binary.BigEndian.PutUint32(e.b[1:5], uint32(len(e.b)+len(payload)+len(continuation.b)-1))
+	if scratch != nil && len(e.b)+len(payload)+len(continuation.b) <= replicatedBorrowedCoalesceBytes {
 		e.b = append(e.b, payload...)
+		e.b = append(e.b, continuation.b...)
 		written, err := w.Write(e.b)
+		releaseReplicatedBorrowedScratch(scratch, len(e.b))
 		if err == nil && written != len(e.b) {
 			return io.ErrShortWrite
 		}
@@ -528,8 +628,12 @@ func (f *FrameEncoder) EncodeReplicatedRequestBorrowed(w io.Writer, request *Rep
 	if len(payload) != 0 {
 		buffers = append(buffers, payload)
 	}
+	if len(continuation.b) != 0 {
+		buffers = append(buffers, continuation.b)
+	}
 	written, err := buffers.WriteTo(w)
-	if err == nil && written != int64(total) {
+	releaseReplicatedBorrowedScratch(scratch, len(e.b))
+	if err == nil && written != int64(len(e.b)+len(payload)+len(continuation.b)) {
 		return io.ErrShortWrite
 	}
 	return err
@@ -593,6 +697,15 @@ func decodeReplicatedRequest(
 		request.MinimumApplied = d.u64()
 	case ReplicatedExecutionPinRead:
 		request.ExecutionPinRead = decodeReplicatedExecutionPinRead(&d)
+	case ReplicatedRouteSettlement:
+		request.RouteSettlement = decodeReplicatedRouteSettlement(&d)
+	}
+	if len(d.b) != 0 {
+		if len(d.b) != continuationEnvelopeBytes {
+			d.fail(ErrInvalidFrontendContinuationEnvelope)
+		} else {
+			request.Continuation = decodeFrontendContinuation(&d)
+		}
 	}
 	if err := d.end(); err != nil {
 		if budget != nil {
@@ -604,6 +717,7 @@ func decodeReplicatedRequest(
 	request.Key = request.Key[:len(request.Key):len(request.Key)]
 	request.BatchRead = request.BatchRead[:len(request.BatchRead):len(request.BatchRead)]
 	request.Query = request.Query[:len(request.Query):len(request.Query)]
+	request.RouteSettlement.Command = request.RouteSettlement.Command[:len(request.RouteSettlement.Command):len(request.RouteSettlement.Command)]
 	if !validReplicatedRequest(request) {
 		if budget != nil {
 			budget.release(charged)
@@ -631,7 +745,7 @@ func readReplicatedRequestFrame(
 	size := int(length) - 4
 	switch tag {
 	case tagReplicatedMembershipRequest:
-		if size != replicatedMembershipRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedMembershipRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -656,7 +770,7 @@ func readReplicatedRequestFrame(
 		}
 		return body, charged, tag, nil
 	case tagReplicatedTransactionRead:
-		if size != replicatedTransactionReadRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedTransactionReadRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -681,7 +795,7 @@ func readReplicatedRequestFrame(
 		}
 		return body, charged, tag, nil
 	case tagReplicatedRequestLedgerRead:
-		if size != replicatedRequestLedgerReadRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedRequestLedgerReadRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -706,7 +820,7 @@ func readReplicatedRequestFrame(
 		}
 		return body, charged, tag, nil
 	case tagReplicatedRouteGateRead:
-		if size != replicatedRouteGateReadRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedRouteGateReadRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -730,8 +844,35 @@ func readReplicatedRequestFrame(
 			return nil, 0, tag, err
 		}
 		return body, charged, tag, nil
+	case tagReplicatedRouteSettlement:
+		if size < replicatedRouteSettlementReadRequestBodyBytes ||
+			size > replicatedRouteSettlementReadRequestBodyBytes+
+				replicatedstate.MaxRouteReleaseReceiptReadCommandBytes+continuationEnvelopeBytes {
+			return nil, 0, tag, ErrReplicatedWire
+		}
+		var prefix [2]byte
+		if _, err := io.ReadFull(r, prefix[:]); err != nil {
+			return nil, 0, tag, err
+		}
+		if prefix[0] != replicatedWireVersion ||
+			ReplicatedOperation(prefix[1]) != ReplicatedRouteSettlement {
+			return nil, 0, tag, ErrReplicatedWire
+		}
+		charged = int64(size)
+		if budget != nil && !budget.reserve(charged) {
+			return nil, 0, tag, errFrameBudget
+		}
+		body = make([]byte, size)
+		copy(body[:2], prefix[:])
+		if _, err := io.ReadFull(r, body[2:]); err != nil {
+			if budget != nil {
+				budget.release(charged)
+			}
+			return nil, 0, tag, err
+		}
+		return body, charged, tag, nil
 	case tagReplicatedExecutionPinRead:
-		if size != replicatedExecutionPinReadRequestBodyBytes {
+		if !validContinuationBodySize(size, replicatedExecutionPinReadRequestBodyBytes) {
 			return nil, 0, tag, ErrReplicatedWire
 		}
 		var prefix [2]byte
@@ -779,6 +920,10 @@ func readReplicatedRequestFrame(
 	return body, charged, tag, nil
 }
 
+func validContinuationBodySize(size, base int) bool {
+	return size == base || size == base+continuationEnvelopeBytes
+}
+
 // EncodeReplicatedResponse emits one canonical typed native response.
 func EncodeReplicatedResponse(w io.Writer, response *ReplicatedResponse) error {
 	return (&FrameEncoder{}).EncodeReplicatedResponse(w, response)
@@ -808,7 +953,8 @@ func (f *FrameEncoder) EncodeReplicatedResponse(w io.Writer, response *Replicate
 		response.Kind == ReplicatedReadBatchResult || response.Kind == ReplicatedQueryResult ||
 		response.Kind == ReplicatedTransactionReadResult ||
 		response.Kind == ReplicatedRequestLedgerReadResult ||
-		response.Kind == ReplicatedExecutionPinReadResult || response.Kind == ReplicatedRouteGateReadResult {
+		response.Kind == ReplicatedExecutionPinReadResult || response.Kind == ReplicatedRouteGateReadResult ||
+		response.Kind == ReplicatedRouteSettlementResult {
 		bodyHint = replicatedReadResponseFixedBodyBytes + len(response.Value)
 	}
 	e := newFrameEncoder(f.arena, bodyHint)
@@ -831,7 +977,8 @@ func (f *FrameEncoder) EncodeReplicatedResponse(w io.Writer, response *Replicate
 		response.Kind == ReplicatedReadBatchResult || response.Kind == ReplicatedQueryResult ||
 		response.Kind == ReplicatedTransactionReadResult ||
 		response.Kind == ReplicatedRequestLedgerReadResult ||
-		response.Kind == ReplicatedExecutionPinReadResult || response.Kind == ReplicatedRouteGateReadResult {
+		response.Kind == ReplicatedExecutionPinReadResult || response.Kind == ReplicatedRouteGateReadResult ||
+		response.Kind == ReplicatedRouteSettlementResult {
 		e.u64(response.ReadApplied)
 		e.bytes(response.Value)
 	}
@@ -878,7 +1025,8 @@ func decodeReplicatedResponseLimit(r io.Reader, maxBody int) (*ReplicatedRespons
 		response.Kind == ReplicatedReadBatchResult || response.Kind == ReplicatedQueryResult ||
 		response.Kind == ReplicatedTransactionReadResult ||
 		response.Kind == ReplicatedRequestLedgerReadResult ||
-		response.Kind == ReplicatedExecutionPinReadResult || response.Kind == ReplicatedRouteGateReadResult {
+		response.Kind == ReplicatedExecutionPinReadResult || response.Kind == ReplicatedRouteGateReadResult ||
+		response.Kind == ReplicatedRouteSettlementResult {
 		response.ReadApplied = d.u64()
 		response.Value = d.slice()
 		response.Value = response.Value[:len(response.Value):len(response.Value)]
@@ -918,6 +1066,8 @@ func maximumReplicatedResponseBody(request *ReplicatedRequest) (int, error) {
 		return replicatedReadResponseFixedBodyBytes + routegate.StatusBytes, nil
 	case ReplicatedExecutionPinRead:
 		return replicatedReadResponseFixedBodyBytes + replicatedExecutionPinReadValueBytes, nil
+	case ReplicatedRouteSettlement:
+		return replicatedReadResponseFixedBodyBytes + MaxReplicatedRouteSettlementValueBytes, nil
 	default:
 		return 0, ErrReplicatedWire
 	}
@@ -935,6 +1085,8 @@ func replicatedRequestTagMatches(operation ReplicatedOperation, tag byte) bool {
 		return tag == tagReplicatedRouteGateRead
 	case ReplicatedExecutionPinRead:
 		return tag == tagReplicatedExecutionPinRead
+	case ReplicatedRouteSettlement:
+		return tag == tagReplicatedRouteSettlement
 	default:
 		return tag == tagReplicatedRequest
 	}
@@ -1077,7 +1229,6 @@ func encodeReplicatedMembership(e *encbuf, request ReplicatedMembershipRequest) 
 	e.u64(request.ExpectedReplicaSetVersion)
 	e.u64(request.SourceMember)
 	e.u64(request.TargetMember)
-	e.u64(request.TransferTerm)
 }
 
 func decodeReplicatedMembership(d *deccur) ReplicatedMembershipRequest {
@@ -1085,7 +1236,6 @@ func decodeReplicatedMembership(d *deccur) ReplicatedMembershipRequest {
 		Kind: raftservice.MembershipKind(d.u8()), TransitionID: d.fixed16(),
 		MetadataEpoch: d.u64(), CatalogGeneration: d.u64(),
 		ExpectedReplicaSetVersion: d.u64(), SourceMember: d.u64(), TargetMember: d.u64(),
-		TransferTerm: d.u64(),
 	}
 }
 
@@ -1124,9 +1274,31 @@ func validReplicatedFence(fence ReplicatedFence, exact bool) bool {
 		fence.NodeIncarnation != 0 && fence.Term != 0
 }
 
+// validReplicatedProbeFence is the discovery grammar. A probe must carry the
+// caller's exact catalog-authorized command contract so the receiver can
+// derive internal owner scopes while it is Draining, but it cannot assert a
+// member, store, node incarnation, or term that only the response may prove.
+// Keep this separate from validReplicatedFence: actual operations still
+// require the complete observed serving fence.
+func validReplicatedProbeFence(fence ReplicatedFence) bool {
+	return validReplicatedGroup(fence.Group) && fence.AllocationGeneration != 0 &&
+		fence.Command.Valid() && fence.MemberID == 0 && fence.StoreID == ([16]byte{}) &&
+		fence.NodeIncarnation == 0 && fence.Term == 0
+}
+
 func validReplicatedRequest(request *ReplicatedRequest) bool {
 	if request == nil {
 		return false
+	}
+	if request.Continuation != nil {
+		if !request.Continuation.Valid() {
+			return false
+		}
+		scope, ok := FrontendContinuationScopeForReplicatedRequestWithProtocol(request,
+			request.Continuation.Scope.Protocol)
+		if !ok || !sameFrontendContinuationScope(scope, request.Continuation.Scope) {
+			return false
+		}
 	}
 	if request.Operation != ReplicatedQueryLeader && len(request.Query) != 0 {
 		return false
@@ -1136,6 +1308,10 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 	}
 	if request.Operation != ReplicatedExecutionPinRead &&
 		request.ExecutionPinRead != (ReplicatedExecutionPinReadRequest{}) {
+		return false
+	}
+	if request.Operation != ReplicatedRouteSettlement &&
+		!replicatedRouteSettlementRequestZero(request.RouteSettlement) {
 		return false
 	}
 	authorityPresent := request.Authority.Node != (rafttransport.NodeID{}) ||
@@ -1151,7 +1327,7 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 	switch request.Operation {
 	case ReplicatedProbe:
 		return validReplicatedProbeCapability(request.Capability) &&
-			validReplicatedFence(request.Fence, false) && len(request.Command) == 0 &&
+			validReplicatedProbeFence(request.Fence) && len(request.Command) == 0 &&
 			request.Membership == (ReplicatedMembershipRequest{}) &&
 			request.Relation == 0 && len(request.Key) == 0 && request.MinimumApplied == 0 &&
 			request.MaxValueBytes == 0 &&
@@ -1269,6 +1445,15 @@ func validReplicatedRequest(request *ReplicatedRequest) bool {
 			request.MaxValueBytes == 0 &&
 			request.TransactionRead == (ReplicatedTransactionReadRequest{}) &&
 			request.RequestLedgerRead == (ReplicatedRequestLedgerReadRequest{})
+	case ReplicatedRouteSettlement:
+		return request.Capability == serviceauthz.CapabilityRequestLedger &&
+			validReplicatedFence(request.Fence, true) && len(request.Command) == 0 &&
+			request.Membership == (ReplicatedMembershipRequest{}) && request.Relation == 0 &&
+			len(request.Key) == 0 && request.MinimumApplied == 0 && request.MaxValueBytes == 0 &&
+			request.TransactionRead == (ReplicatedTransactionReadRequest{}) &&
+			request.RequestLedgerRead == (ReplicatedRequestLedgerReadRequest{}) &&
+			request.ExecutionPinRead == (ReplicatedExecutionPinReadRequest{}) &&
+			validReplicatedRouteSettlementRequest(request.RouteSettlement)
 	default:
 		return false
 	}
@@ -1292,12 +1477,16 @@ func validReplicatedRequestLedgerPrincipal(
 	if command.ClientID != replication.ID128(request.Authority.Node) {
 		return false
 	}
-	// Admission inspects only Create's authenticated subject. Nil scratch
-	// fully validates pending bytes without putting a 256-entry StepRef array
+	// Nil scratch validates pending bytes without a 256-entry StepRef array
 	// on every shard-wire request stack.
 	inner, err := command.OpenRequestLedgerInto(nil)
 	if err != nil {
 		return false
+	}
+	if release, releases := inner.SchemaPinRelease(); releases {
+		nested, err := executionpin.OpenCommand(release.Command)
+		return err == nil && nested.AuthorityNode == executionpin.ID(request.Authority.Node) &&
+			nested.AuthorityGeneration == request.Authority.Generation
 	}
 	head, creates := inner.Head()
 	if !creates {
@@ -1514,6 +1703,20 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
 			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied &&
 			validReplicatedRouteGateReadValue(response.Value)
+	case ReplicatedRouteSettlementResult:
+		value, valueErr := OpenReplicatedRouteSettlementValue(response.Value)
+		if valueErr != nil || value.Mode != ReplicatedRouteSettlementReadReleaseReceipt {
+			return false
+		}
+		completion, completionErr := replication.OpenCompletion(value.Completion)
+		return response.HasState && response.Refusal == ReplicatedRefusalNone &&
+			response.RequestDigest == ([sha256.Size]byte{}) &&
+			response.Outcome == (raftserve.Outcome{}) && len(response.Completion) == 0 &&
+			response.ReadApplied != 0 && response.State.Applied >= response.ReadApplied &&
+			completionErr == nil && validReplicatedCompletionResult(completion) &&
+			completion.ResultCode == replicatedstate.ResultRouteGate &&
+			completion.ResultFormat == replicatedstate.ResultFormatRouteGate &&
+			completion.AppliedSequence == value.CompletionAppliedSequence
 	default:
 		return false
 	}

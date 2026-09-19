@@ -121,20 +121,11 @@ func issuerPlannerGCComplete(t testing.TB, key requestledger.RequestKey) (
 	if err != nil {
 		t.Fatal(err)
 	}
-	head, err = requestledger.InstallSchemaPinRelease(head, prepared, release)
+	head, release, err = requestledger.CompleteSchemaPinRelease(head, prepared, release, []byte("schema-release-completion"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent := release
-	release, err = requestledger.RecordVerifiedSchemaPinReleased(release, 7, []byte("schema-release-completion"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	head, err = requestledger.MarkSchemaPinReleased(head, prepared, intent, release)
-	if err != nil {
-		t.Fatal(err)
-	}
-	terminal, err := requestledger.NewTerminal(head, prepared, release, 8)
+	terminal, err := requestledger.NewTerminal(head, prepared, release, head.Revision+1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +133,7 @@ func issuerPlannerGCComplete(t testing.TB, key requestledger.RequestKey) (
 	if err != nil {
 		t.Fatal(err)
 	}
-	ack, err := requestledger.NewAck(head, terminal, 9, 10000)
+	ack, err := requestledger.NewAck(head, terminal, head.Revision+1, 10000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +145,7 @@ func issuerPlannerGCComplete(t testing.TB, key requestledger.RequestKey) (
 	if err != nil {
 		t.Fatal(err)
 	}
-	ack, err = requestledger.AdvanceAckGC(ack, collect, 10, 1, ack.PriorEncodedBytes, true)
+	ack, err = requestledger.AdvanceAckGC(ack, collect, ack.Revision+1, 1, ack.PriorEncodedBytes, true)
 	if err != nil {
 		t.Fatal(err)
 	}

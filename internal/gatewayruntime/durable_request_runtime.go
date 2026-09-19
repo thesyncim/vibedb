@@ -76,8 +76,8 @@ func newReplicatedDurableRuntime(
 	if err != nil {
 		return nil, errors.Join(err, errInvalidDurableRequestAdapter)
 	}
-	terminal, err := gateway.NewDurableRequestTerminalCoordinatorWithSessionFactory(
-		ledger, options.Replicated, sessions,
+	terminal, err := gateway.NewDurableRequestTerminalCoordinator(
+		ledger, options.Replicated, options.Authority,
 	)
 	if err != nil {
 		return nil, errors.Join(err, errInvalidDurableRequestAdapter)

@@ -113,7 +113,9 @@ func (router *RoutedShardControl) ExecuteShardControl(
 	key := shardControlRouteKey(route)
 	start := router.hintedReplica(key, route.Replicas)
 	attempts := router.attempts
-	if remoteActionTargetsChild(action.Kind) && target.Member != 0 {
+	// A witnessed source action is as member-specific as a child action.
+	// Only an explicitly leader-following target (Member == 0) may fan out.
+	if target.Member != 0 {
 		found := false
 		for index, replica := range route.Replicas {
 			if replica.Member == target.Member {

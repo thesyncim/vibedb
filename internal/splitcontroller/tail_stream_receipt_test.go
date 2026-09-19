@@ -124,7 +124,7 @@ func TestTailStreamResumesDurablePendingReceiptThroughRealChildActions(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, err := client.Apply(context.Background(), destination.Node, resolved.TrustDomain, rangesplit.TailStreamRequest{Binding: binding, Before: before, Batch: batch})
+	response, err := client.Apply(context.Background(), destination.Node, resolved.TrustDomain, rangesplit.TailStreamRequest{Binding: binding, Batch: batch})
 	if err != nil {
 		t.Fatal(err)
 	}

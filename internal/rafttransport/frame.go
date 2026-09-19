@@ -135,6 +135,7 @@ func (registry *StaticRegistry) preflightOutbound(
 		return outboundFramePlan{}, fmt.Errorf("%w: missing group roster", ErrUnauthorized)
 	}
 	if outbound.Authority != nil {
+		roster = registry.outboundRosterDigest(outbound.Group, outbound.From, outbound.To, roster)
 		return registry.preflightAuthorityOutbound(outbound, view, destination, roster)
 	}
 	size, err := raftmember.MeasureOrdinaryMessage(outbound.Message)
@@ -180,6 +181,7 @@ func (registry *StaticRegistry) preflightOutbound(
 	if size > raftmodel.MaxInboundMessageBytes {
 		return outboundFramePlan{}, fmt.Errorf("%w: payload bytes %d", ErrFrameTooLarge, size)
 	}
+	roster = registry.outboundRosterDigest(outbound.Group, outbound.From, outbound.To, roster)
 	return outboundFramePlan{
 		kind:        frameKindOrdinary,
 		destination: destination,
@@ -324,7 +326,7 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 		return Inbound{}, fmt.Errorf("%w: target member is not local", ErrUnauthorized)
 	}
 	roster, ok := registry.rosterDigest(header.group)
-	if !ok || roster != header.roster {
+	if !ok || !registry.acceptsRosterDigest(header.group, header.roster, header.from, header.to, authenticated.Node, registry.LocalNode(), roster) {
 		return Inbound{}, fmt.Errorf("%w: stable enrollment digest differs", ErrUnauthorized)
 	}
 	if header.kind == frameKindAuthority {
@@ -351,16 +353,18 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 			view, ok = certifiedPromotionElectionAuthority(current, message, header.version)
 		}
 	}
-	// Removal catch-up heartbeats and their responses can carry the exact
+	// Removal catch-up heartbeats and replication acknowledgements can carry the exact
 	// retired version before or after both survivors apply removal. This
 	// admits no old-view append or voting traffic and never restores a
 	// removed member's authority.
 	if !ok && currentOK && current.retiredVersion != 0 && header.version == current.retiredVersion &&
-		(message.GetType() == pb.MsgHeartbeat || message.GetType() == pb.MsgHeartbeatResp) && current.roles[header.from] == MemberVoter && current.roles[header.to] == MemberVoter {
+		(message.GetType() == pb.MsgHeartbeat || message.GetType() == pb.MsgHeartbeatResp || message.GetType() == pb.MsgAppResp) && current.roles[header.from] == MemberVoter && current.roles[header.to] == MemberVoter {
 		view, ok = current, true
 	}
+	prospectiveAppend := false
 	if !ok {
 		view, ok = registry.prospectiveAuthority(header.group, header.version, message)
+		prospectiveAppend = ok && message.GetType() == pb.MsgApp
 	}
 	if !ok {
 		if currentOK && current.retiredVersion != 0 &&
@@ -370,8 +374,28 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 		}
 		return Inbound{}, fmt.Errorf("%w: replica-set generation is outside bounded authority", ErrUnauthorized)
 	}
-	if err := registry.validateAuthorizedMessage(header.group, view, message); err != nil {
-		return Inbound{}, err
+	// An append whose preceding index is already below our applied membership
+	// cut cannot append anything: Raft answers with its committed index. Strip
+	// the entire suffix before handing it to Raft, including any untrusted
+	// configuration bytes. This also permits a compacted follower to answer a
+	// reconnect probe without retaining an unbounded history of old grants.
+	// A future generation qualifies only after its exact granted configuration
+	// sequence was proven above, and both current and projected roles permit the
+	// empty probe. Unknown and stale generations never gain this shortcut.
+	discardCommittedPrefix := currentOK && current.replay != nil && (header.version == current.version || prospectiveAppend) &&
+		message.GetType() == pb.MsgApp && message.GetIndex() < current.version
+	entries := message.Entries
+	var authorityErr error
+	if discardCommittedPrefix {
+		message.Entries = nil
+		authorityErr = registry.validateAuthorizedMessage(header.group, current, message)
+	}
+	if authorityErr == nil {
+		authorityErr = registry.validateAuthorizedMessage(header.group, view, message)
+	}
+	message.Entries = entries
+	if authorityErr != nil {
+		return Inbound{}, authorityErr
 	}
 	scratch := registry.canonical.get(len(payload))
 	canonical, err := (proto.MarshalOptions{Deterministic: true}).MarshalAppend(
@@ -386,6 +410,9 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 	registry.canonical.put(scratch)
 	if !equal {
 		return Inbound{}, fmt.Errorf("%w: noncanonical protobuf payload", ErrInvalidFrame)
+	}
+	if discardCommittedPrefix {
+		message.Entries = nil
 	}
 	return Inbound{Group: header.group, From: header.from, Message: message}, nil
 }
@@ -474,6 +501,15 @@ func (registry *StaticRegistry) prospectiveAuthority(
 	current, ok := registry.currentAuthority(group)
 	if !ok || version <= current.version || message == nil {
 		return nil, false
+	}
+	futureConfigurations := 0
+	for _, entry := range message.GetEntries() {
+		if entry.GetIndex() > current.version && entry.GetType() != pb.EntryNormal {
+			futureConfigurations++
+		}
+	}
+	if futureConfigurations > 1 {
+		return prospectiveGrantedAppend(current, version, message)
 	}
 	for _, entry := range message.GetEntries() {
 		if entry == nil || entry.GetIndex() != version ||
@@ -661,15 +697,31 @@ func (registry *StaticRegistry) validateAuthorizedMessage(
 
 func validateAuthorizedConfiguration(view *authorityView, entries []*pb.Entry) (bool, error) {
 	found := false
+	unprovenConfiguration := false
 	for index := range entries {
 		entry := entries[index]
 		if entry.GetType() == pb.EntryNormal {
 			continue
 		}
-		if found || (entry.GetType() != pb.EntryConfChange && entry.GetType() != pb.EntryConfChangeV2) {
+		if entry.GetType() != pb.EntryConfChange && entry.GetType() != pb.EntryConfChangeV2 {
 			return false, fmt.Errorf("%w: unsupported configuration batch", ErrUnauthorized)
 		}
 		change, member, digest, err := openSingleConfChange(entry)
+		if err == nil && authorizedProspectiveConfiguration(view, entry) {
+			found = true
+			continue
+		}
+		// Reconnect can replay several completed membership transitions in one
+		// append, even after grant rollover. The bounded durable log, not a past
+		// role or a caller-supplied index alone, proves each exact old entry.
+		if err == nil && entry.GetIndex() != 0 && entry.GetIndex() <= view.version &&
+			view.replay != nil && view.replay.MatchesCommittedConfiguration(entry, view.version) {
+			found = true
+			continue
+		}
+		if unprovenConfiguration {
+			return false, fmt.Errorf("%w: unsupported configuration batch", ErrUnauthorized)
+		}
 		authorized := err == nil && authorizedConfChange(view, change, member, digest)
 		if !authorized && view.previous != nil {
 			authorized = err == nil && authorizedConfChange(view.previous, change, member, digest)
@@ -680,6 +732,7 @@ func validateAuthorizedConfiguration(view *authorityView, entries []*pb.Entry) (
 		if !authorized {
 			return false, fmt.Errorf("%w: configuration differs from metadata grant", ErrUnauthorized)
 		}
+		unprovenConfiguration = true
 		found = true
 	}
 	return found, nil

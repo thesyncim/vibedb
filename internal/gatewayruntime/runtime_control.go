@@ -9,6 +9,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
 	"github.com/thesyncim/vibedb/internal/hotshard"
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalance"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -37,7 +38,8 @@ func (runtime *Runtime) openReplicaControl() error {
 	}) {
 		return fmt.Errorf("%w: replica control TLS references do not match frontend", errGatewayReplicaControlManifest)
 	}
-	if err = manifest.ValidateCatalog(runtime.holder.Current()); err != nil {
+	manifest, err = runtime.bindReplicaControlManifestToLiveDirectory(manifest, runtime.holder.Current())
+	if err != nil {
 		return fmt.Errorf("replica control catalog endpoints: %w", err)
 	}
 	required := serviceauthz.CapabilityTopology
@@ -52,21 +54,35 @@ func (runtime *Runtime) openReplicaControl() error {
 			return fmt.Errorf("%w: replica control roster contains a gateway without topology authority", ErrInvalidConfig)
 		}
 	}
+	// A replicated catalog authority always owns the node directory in a
+	// production control plane. ControlDirectory may override it for a
+	// supervisor adapter, but leaving it nil must not silently retain the
+	// manifest-only identity roster.
+	if config.ControlDirectory != nil || runtime.authority != nil {
+		if err := runtime.openControlDirectory(); err != nil {
+			return err
+		}
+	}
 	if err := runtime.openCatalogDrainService(manifest, runtime.authority); err != nil {
 		return err
 	}
-	if config.ControlParticipantOnly {
-		return nil
+	if err := runtime.openSourceTopologyService(manifest); err != nil {
+		return err
 	}
-
 	handshakeDeadline := servicetls.FixedDeadline(config.TLSHandshakeTimeout)
 	readDeadline := servicetls.FixedDeadline(time.Duration(manifest.Bounds.ReadTimeout) * time.Millisecond)
 	writeDeadline := servicetls.FixedDeadline(time.Duration(manifest.Bounds.WriteTimeout) * time.Millisecond)
 	dial := func(ctx context.Context, address string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "tcp", address)
 	}
+	shardEndpoints := manifest.Shards
+	if runtime.controlDirectory != nil {
+		shardEndpoints = mergeGatewayShardControlEndpoints(
+			shardEndpoints, controlDirectoryShardEndpoints(runtime.controlDirectory),
+		)
+	}
 	shardOpener, err := newGatewayShardControlOpener(
-		profile, handshakeDeadline, dial, manifest.Shards, int(manifest.Bounds.MaxConnections),
+		profile, handshakeDeadline, dial, shardEndpoints, int(manifest.Bounds.MaxConnections),
 	)
 	if err != nil {
 		return fmt.Errorf("open shard control transport: %w", err)
@@ -75,11 +91,65 @@ func (runtime *Runtime) openReplicaControl() error {
 	runtime.controlHandshakeDeadline = handshakeDeadline
 	runtime.controlReadDeadline = readDeadline
 	runtime.controlWriteDeadline = writeDeadline
+	// Participant-only gateways do not run replica controllers, but their
+	// catalog authority may still need to collect an authenticated live
+	// participant cut from another gateway while an operator drains a node.
+	// Build the exact-incarnation gateway-control opener before the early return
+	// so the participant scanner has the same endpoint and key fences as the
+	// controller-enabled runtime.
+	trust := profile.LocalIdentity().TrustDomain
+	gatewayEndpoints := manifest.Gateways
+	if runtime.controlDirectory != nil {
+		gatewayEndpoints = mergeGatewayControlEndpoints(
+			gatewayEndpoints, controlDirectoryGatewayEndpoints(runtime.controlDirectory),
+		)
+	}
+	drainer, clusterOpener, err := newGatewayClusterDrainCertifierWithOpener(
+		trust, profile, handshakeDeadline, readDeadline, writeDeadline, dial,
+		gatewayEndpoints, int(manifest.Bounds.MaxConcurrentDrains),
+	)
+	if err != nil {
+		return fmt.Errorf("open catalog drain certifier: %w", err)
+	}
+	runtime.clusterControlOpener, runtime.drainCoordinator = clusterOpener, drainer
+	if config.ControlParticipantOnly {
+		// Participants do not run the scaling controller, but their operator
+		// endpoint can still be the status reader. Keep the same authenticated
+		// node aggregate available there so status does not silently discard
+		// pacing evidence when a client is connected to a participant gateway.
+		runtime.distributedMetrics, err = newGatewayDistributedMetrics(runtime.holder.Current(), shardOpener)
+		if err != nil {
+			return fmt.Errorf("open distributed metrics: %w", err)
+		}
+		if runtime.distributedMetrics != nil {
+			if err := runtime.distributedMetrics.UpdateNodeAggregates(controlDirectoryMetricEndpoints(runtime.controlDirectory)); err != nil {
+				return fmt.Errorf("add control-directory metric nodes: %w", err)
+			}
+			runtime.distributedMetricsConcurrency = min(runtime.distributedMetrics.Len(), int(manifest.Bounds.MaxConnections), 64)
+		}
+		runtime.clusterControlBackend, err = newScalingOperatorBackend(runtime.authority, runtime.authority, runtime.authority)
+		if err == nil {
+			runtime.clusterControlBackend.distributedMetrics = runtime.distributedMetrics
+		}
+		return err
+	}
+	if runtime.config.ScalingReadiness == nil {
+		infoClient, infoErr := nodecontrol.NewNodeInfoClient(nodecontrol.NodeInfoClientOptions{Opener: shardOpener, TrustDomain: profile.LocalIdentity().TrustDomain, ReadDeadline: readDeadline, WriteDeadline: writeDeadline})
+		if infoErr != nil {
+			return infoErr
+		}
+		runtime.config.ScalingReadiness = scalingNodeReadiness{client: infoClient, domain: profile.LocalIdentity().TrustDomain}
+	}
+
+	if err := runtime.openScalingEnrollment(shardOpener, readDeadline, writeDeadline, manifest); err != nil {
+		return err
+	}
 	if config.PGDDLSocket != "" {
 		schemaDeadline := servicetls.FixedDeadline(2 * time.Minute)
 		runtime.schemaDDL, err = newGatewaySchemaDDLRuntime(
 			runtime.authority, runtime.replicated, shardOpener, schemaDeadline, schemaDeadline,
 			config.CatalogSessionJournal+".schema-ddl", runtime.config.InternalAuthority,
+			runtime.refreshLiveControlDirectory,
 		)
 		if err != nil {
 			return fmt.Errorf("open schema DDL runtime: %w", err)
@@ -90,20 +160,16 @@ func (runtime *Runtime) openReplicaControl() error {
 		return fmt.Errorf("open distributed metrics: %w", err)
 	}
 	if runtime.distributedMetrics != nil {
+		if err := runtime.distributedMetrics.UpdateNodeAggregates(controlDirectoryMetricEndpoints(runtime.controlDirectory)); err != nil {
+			return fmt.Errorf("add control-directory metric nodes: %w", err)
+		}
 		runtime.distributedMetricsConcurrency = min(runtime.distributedMetrics.Len(), int(manifest.Bounds.MaxConnections), 64)
-	}
-	trust := profile.LocalIdentity().TrustDomain
-	drainer, err := newGatewayClusterDrainCertifier(
-		trust, profile, handshakeDeadline, readDeadline, writeDeadline, dial,
-		manifest.Gateways, int(manifest.Bounds.MaxConcurrentDrains),
-	)
-	if err != nil {
-		return fmt.Errorf("open catalog drain certifier: %w", err)
 	}
 	runtime.splitRuntime, err = newGatewayServingSplitRuntime(gatewayServingSplitOptions{
 		catalog: runtime.authority, drain: drainer, opener: shardOpener, tls: profile,
 		shards: manifest.Shards, dial: dial, handshake: handshakeDeadline,
 		read: readDeadline, write: writeDeadline,
+		refresh: runtime.refreshLiveControlDirectory,
 		protocol: max(time.Duration(manifest.Bounds.ReadTimeout)*time.Millisecond,
 			time.Duration(manifest.Bounds.WriteTimeout)*time.Millisecond),
 		connections: int(manifest.Bounds.MaxConnections), handshakes: int(manifest.Bounds.MaxHandshakes),
@@ -157,6 +223,7 @@ func (runtime *Runtime) openReplicaControl() error {
 	healthController, err := newGatewayReplicaHealthRuntime(
 		runtime.authority, rebalance.ReplicatedFailureAuthority{Source: runtime.authority},
 		controls.HealthObservations, manifest, moveController, runtime.authority, controls.GrantInstaller,
+		runtime.authority, controls.Enroller,
 	)
 	if err != nil {
 		return fmt.Errorf("open replica health controller: %w", err)
@@ -173,12 +240,37 @@ func (runtime *Runtime) openReplicaControl() error {
 		return fmt.Errorf("open replica health revisions: %w", err)
 	}
 	runtime.healthRevisions = healthRevisions
+	if !runtime.config.ControlParticipantOnly {
+		scalingController, scalingErr := NewScalingController(ScalingControllerOptions{
+			Directory: runtime.authority, Writer: runtime.authority, Catalog: runtime.authority,
+			ControllerNode: runtime.config.TLSProfile.LocalIdentity().Node,
+			Moves:          runtime.moveController, Provisioner: runtime.config.ScalingProvisioner,
+			Capacity: controls.Capacity, Observation: controls.HealthObservations, Readiness: runtime.config.ScalingReadiness,
+			Enrollment: runtime.config.ScalingEnrollment, Drain: runtime,
+			Interval: time.Duration(manifest.Bounds.ControllerInterval) * time.Millisecond,
+			Logf:     runtime.config.Logf,
+		})
+		if scalingErr != nil {
+			return fmt.Errorf("open scaling controller: %w", scalingErr)
+		}
+		runtime.scalingController = scalingController
+		runtime.clusterControlBackend, scalingErr = NewScalingOperatorBackend(scalingController)
+		if scalingErr != nil {
+			return fmt.Errorf("open cluster control backend: %w", scalingErr)
+		}
+		runtime.clusterControlBackend.distributedMetrics = runtime.distributedMetrics
+	}
 	return nil
 }
 
 func (runtime *Runtime) startOptionalServices() error {
 	if runtime == nil {
 		return ErrInvalidConfig
+	}
+	if runtime.controlDirectory != nil && runtime.controlDirectoryDone == nil {
+		done := make(chan struct{})
+		runtime.controlDirectoryDone = done
+		go runtime.runControlDirectory()
 	}
 	if runtime.routeSeedControl != nil {
 		// A binding-changing catalog head revokes this frontend's route seed.
@@ -255,13 +347,21 @@ func (runtime *Runtime) startOptionalServices() error {
 				MaxHandshakes:     int(manifest.Bounds.MaxHandshakes),
 				HandshakeDeadline: runtime.controlHandshakeDeadline,
 			}, func(connectionContext context.Context, connection rafttransport.PeerConnection) {
-				if err := runtime.controlService.Serve(connectionContext, connection); err != nil &&
+				if err := runtime.serveGatewayControlConnection(connectionContext, connection); err != nil &&
 					!errors.Is(err, context.Canceled) {
 					runtime.config.Logf("gatewayruntime: catalog drain control: %v", err)
 				}
 			})
 			controlDone <- errors.Join(listener.acceptErr, nonCanceledError(serveErr, context.Cause(runtime.ctx)))
 			runtime.cancel()
+		}()
+	}
+	if runtime.scalingController != nil {
+		done := make(chan struct{})
+		runtime.scalingDone = done
+		go func() {
+			defer close(done)
+			runtime.scalingController.Run(controllerCtx)
 		}()
 	}
 	servingContext := runtime.ctx
@@ -295,6 +395,15 @@ func (runtime *Runtime) startOptionalServices() error {
 				runtime.cancel()
 			}
 		}()
+	}
+	if runtime.clusterControlBackend != nil {
+		server := &clusterControlServer{backend: runtime.clusterControlBackend}
+		if runtime.clientTLS != nil {
+			server.authorize = func(ctx context.Context, required serviceauthz.Capability) bool {
+				return runtime.clientTLS.Authorize(ctx, required, nil) == serviceauthz.DecisionAllow
+			}
+		}
+		servingContext = withClusterControlServer(servingContext, server)
 	}
 	if runtime.hotShardRuntime != nil {
 		runtime.hotShardDone = runGatewayHotShardPublisher(

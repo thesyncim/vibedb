@@ -198,11 +198,16 @@ func rf3AwaitTargetPublication(
 	}
 }
 
-func rf3MembershipNetworkObserver(observer *replicacontrol.Client, address string, node rafttransport.NodeID,
+func rf3MembershipNetworkObserverWithProbeCommand(observer *replicacontrol.Client, address string, node rafttransport.NodeID,
 	profile *rafttransport.PeerTLS, authority serviceauthz.Authority, allocation uint64, request replicacontrol.Request,
+	probeCommand raftservice.CommandFence,
 ) rf3MembershipObservationFunc {
+	if !probeCommand.Valid() {
+		panic("rf3MembershipNetworkObserverWithProbeCommand requires a valid command fence")
+	}
 	return func(ctx context.Context) (shardservice.ReplicatedMemberState, replicacontrol.Observation, error) {
-		state, err := probeRF3CommandMember(ctx, address, node, profile, authority.Node, request.Group, allocation, authority.Generation)
+		state, err := probeRF3CommandMemberWithCommand(ctx, address, node, profile,
+			authority.Node, request.Group, allocation, authority.Generation, probeCommand)
 		if err != nil {
 			return state, replicacontrol.Observation{}, err
 		}

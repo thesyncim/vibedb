@@ -350,6 +350,17 @@ func (q *NodeSubmissionSequencer) MaintainNodeLog() error {
 	metadata, exists := s.engine.Metadata(nodeDescriptorGroup)
 	through := uint64(len(s.descriptors))
 	s.mu.Unlock()
+	// A fresh capacity node has an authenticated descriptor-group genesis
+	// before it owns any groups. There is no descriptor prefix to checkpoint
+	// or reclaim yet. Match the complete genesis state, as recovery does, so
+	// a missing inventory or truncated descriptor log still fails closed.
+	if exists && through == 0 && metadata == (seglog.GroupMetadata{Hard: seglog.HardState{Term: 1}, FirstIndex: 1}) {
+		if failure := s.coordinateReadError(); failure != nil {
+			return failure
+		}
+		q.maintenanceRetry.Store(false)
+		return nil
+	}
 	if !exists || through == 0 || metadata.Checkpoint.Index > through {
 		if failure := s.coordinateReadError(); failure != nil {
 			return failure

@@ -38,6 +38,7 @@ type schemaBuildPeer struct {
 }
 
 func (c *schemaBuildPeer) PeerIdentity() rafttransport.PeerIdentity { return c.peer }
+func (*schemaBuildPeer) PeerKeyDigest() [32]byte                    { return [32]byte{} }
 func (c *schemaBuildPeer) TrafficClass() rafttransport.TrafficClass {
 	return rafttransport.TrafficShardControl
 }

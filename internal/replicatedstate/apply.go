@@ -435,14 +435,14 @@ func (m *Machine) applyNormal(meta raftmodel.ApplyMeta, data []byte, completion 
 	}
 	if command.Kind() == replication.CommandRequestLedger {
 		ledgerPlan, planErr := m.planRequestLedgerCommand(
-			command, m.state, pointSnapshot{value: systemSnapshot},
+			command, meta.Index, m.state, pointSnapshot{value: systemSnapshot},
 		)
 		err = errors.Join(planErr, m.applyCut.Close())
 		if err != nil {
 			return raftmodel.Publication{}, m.fail(err)
 		}
 		next := m.nextState(meta, RecordNormal, digest)
-		if err := applyRequestLedgerStateDelta(&next, ledgerPlan.delta); err != nil {
+		if err := errors.Join(applyRequestLedgerStateDelta(&next, ledgerPlan.delta), applyExecutionPinStateDelta(&next, ledgerPlan.pinDelta)); err != nil {
 			return raftmodel.Publication{}, m.fail(err)
 		}
 		if err := m.persistTransitionRows(
@@ -852,7 +852,7 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	}
 	if command.Kind() == replication.CommandRequestLedger {
 		ledgerPlan, planErr := m.planRequestLedgerCommand(
-			command, m.state, systemBase,
+			command, m.state.Applied+1, m.state, systemBase,
 		)
 		closeErr := m.applyCut.Close()
 		if planErr != nil || closeErr != nil {
@@ -869,7 +869,7 @@ func (m *Machine) AdmitCommand(data []byte) error {
 				command.Bytes(),
 			),
 		)
-		if stateErr := applyRequestLedgerStateDelta(&next, ledgerPlan.delta); stateErr != nil {
+		if stateErr := errors.Join(applyRequestLedgerStateDelta(&next, ledgerPlan.delta), applyExecutionPinStateDelta(&next, ledgerPlan.pinDelta)); stateErr != nil {
 			return m.fail(stateErr)
 		}
 		return m.checkTransitionCapacityWithCaptureRows(
@@ -1384,15 +1384,31 @@ func (m *Machine) planBundleCommandUnaccounted(
 			return plan, nil
 		}
 		if !m.mutableBindingMatchesState(command, state) {
-			// The terminal sequence cannot retain a stale completion because that
-			// would strand an active epoch at MaxUint64. Leave the session
-			// unchanged so the same sequence can be proposed with refreshed
-			// mutable fences. The Raft apply position still advances.
-			if command.ClientSequence == math.MaxUint64 {
-				plan.refusal = ErrStaleCommand
-				return plan, nil
+			// A released route-session pin is a narrow exception: its exact seq3
+			// route-gate outcome is retained beside the session ring, so seq4 can
+			// finish cleanup after a schema or placement fence advances. The
+			// predicate is derived entirely from replicated rows and the encoded
+			// seq4/ACK3 command; it is replay-stable and cannot be requested by an
+			// ordinary stale session.
+			settle, settleErr := m.routeSessionRetireCanSettleStale(
+				command, state, systemSnapshot, session, scratch,
+			)
+			if settleErr != nil {
+				return commandPlan{}, settleErr
 			}
-			plan.resultCode = ResultStaleFence
+			if !settle {
+				// The terminal sequence cannot retain a stale completion because that
+				// would strand an active epoch at MaxUint64. Leave the session
+				// unchanged so the same sequence can be proposed with refreshed
+				// mutable fences. The Raft apply position still advances.
+				if command.ClientSequence == math.MaxUint64 {
+					plan.refusal = ErrStaleCommand
+					return plan, nil
+				}
+				plan.resultCode = ResultStaleFence
+			} else {
+				plan.resultCode = ResultSessionRetired
+			}
 		} else {
 			plan.resultCode = ResultSessionRetired
 		}

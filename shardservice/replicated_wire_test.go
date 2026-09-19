@@ -36,6 +36,102 @@ func (meter *replicatedTLSWriteMeter) Write(p []byte) (int, error) {
 	return meter.Conn.Write(p)
 }
 
+type replicatedBorrowedWriteRecorder struct {
+	bytes    []byte
+	retained []byte
+	retain   bool
+	writes   int
+	maxWrite int
+	err      error
+}
+
+func (recorder *replicatedBorrowedWriteRecorder) Write(p []byte) (int, error) {
+	recorder.writes++
+	if recorder.retain {
+		recorder.retained = p
+		recorder.bytes = append(recorder.bytes, p...)
+	} else {
+		recorder.bytes = append(recorder.bytes, p...)
+	}
+	n := len(p)
+	if recorder.maxWrite >= 0 && recorder.maxWrite < n {
+		n = recorder.maxWrite
+	}
+	return n, recorder.err
+}
+
+func TestEncodeReplicatedRequestBorrowedCoalescesAndClearsSmallFrame(t *testing.T) {
+	request := &ReplicatedRequest{Operation: ReplicatedReadLeader, Fence: testReplicatedFence(),
+		Relation: 1, Key: []byte("key"), MinimumApplied: 1, MaxValueBytes: 1024}
+	var canonical bytes.Buffer
+	if err := EncodeReplicatedRequest(&canonical, request); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &replicatedBorrowedWriteRecorder{maxWrite: -1, retain: true}
+	if err := EncodeReplicatedRequestBorrowed(recorder, request); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.writes != 1 {
+		t.Fatalf("small frame writes=%d, want 1", recorder.writes)
+	}
+	if recorder.retained == nil {
+		t.Fatal("small frame did not use the retained writer")
+	}
+	if !bytes.Equal(recorder.bytes, canonical.Bytes()) {
+		t.Fatal("coalesced frame differs from canonical frame")
+	}
+	for _, value := range recorder.retained[:cap(recorder.retained)] {
+		if value != 0 {
+			t.Fatal("borrowed scratch retained frame bytes")
+		}
+	}
+}
+
+func TestEncodeReplicatedRequestBorrowedKeepsLargeScatter(t *testing.T) {
+	request := &ReplicatedRequest{Operation: ReplicatedQueryLeader, Authority: serviceauthz.Authority{Node: rafttransport.NodeID{1}, Generation: 1}, Capability: serviceauthz.CapabilityDataRead,
+		Fence: testReplicatedFence(), MaxValueBytes: 1024,
+		Query: bytes.Repeat([]byte{'q'}, replicatedBorrowedCoalesceBytes)}
+	var canonical bytes.Buffer
+	if err := EncodeReplicatedRequest(&canonical, request); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &replicatedBorrowedWriteRecorder{maxWrite: -1}
+	if err := EncodeReplicatedRequestBorrowed(recorder, request); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(recorder.bytes, canonical.Bytes()) {
+		t.Fatal("scatter frame differs from canonical frame")
+	}
+	if recorder.writes != 2 {
+		t.Fatalf("large frame writes=%d, want 2", recorder.writes)
+	}
+	if got := bytes.Count(recorder.bytes, []byte{'q'}); got != len(request.Query) {
+		t.Fatalf("scatter payload bytes=%d, want %d", got, len(request.Query))
+	}
+}
+
+func TestEncodeReplicatedRequestBorrowedPreservesWriteErrors(t *testing.T) {
+	request := &ReplicatedRequest{Operation: ReplicatedReadLeader, Fence: testReplicatedFence(),
+		Relation: 1, Key: []byte("key"), MinimumApplied: 1, MaxValueBytes: 1024}
+	wantErr := errors.New("write failed")
+	for _, test := range []struct {
+		name     string
+		maxWrite int
+		err      error
+		wantErr  error
+	}{
+		{name: "writer error", maxWrite: -1, err: wantErr, wantErr: wantErr},
+		{name: "short write", maxWrite: 1, wantErr: io.ErrShortWrite},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := &replicatedBorrowedWriteRecorder{maxWrite: test.maxWrite, err: test.err}
+			if err := EncodeReplicatedRequestBorrowed(recorder, request); !errors.Is(err, test.wantErr) {
+				t.Fatalf("error=%v, want %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func BenchmarkReplicatedRequestTLSOneMiB(b *testing.B) {
 	fence := testReplicatedFence()
 	request := &ReplicatedRequest{Operation: ReplicatedPropose, Fence: fence,
@@ -116,7 +212,7 @@ func TestReplicatedNativeWireRoundTripAndCanonicalFences(t *testing.T) {
 	authority := serviceauthz.Authority{Node: rafttransport.NodeID{31}, Generation: 17}
 	for _, request := range []*ReplicatedRequest{
 		{Operation: ReplicatedProbe, Authority: authority, Capability: serviceauthz.CapabilityDataRead, Fence: ReplicatedFence{
-			Group: fence.Group, AllocationGeneration: fence.AllocationGeneration,
+			Group: fence.Group, AllocationGeneration: fence.AllocationGeneration, Command: fence.Command,
 		}},
 		{Operation: ReplicatedPropose, Authority: authority, Capability: serviceauthz.CapabilityDataWrite, Fence: fence, Command: command},
 		{Operation: ReplicatedMembership, Authority: authority, Capability: serviceauthz.CapabilityMembership, Fence: fence, Membership: ReplicatedMembershipRequest{
@@ -408,6 +504,58 @@ func TestReplicatedNativeWireRejectsSQLShapedAndCrossGroupPayloads(t *testing.T)
 		if err := EncodeReplicatedRequest(&encoded, request); err == nil {
 			t.Fatalf("invalid request encoded: %+v", request)
 		}
+	}
+}
+
+func TestReplicatedProbeFenceRequiresExactCommandAndNoObservedIdentity(t *testing.T) {
+	fence := testReplicatedFence()
+	probe := &ReplicatedRequest{
+		Operation: ReplicatedProbe,
+		Authority: serviceauthz.Authority{Node: rafttransport.NodeID{9}, Generation: 1},
+		Capability: serviceauthz.CapabilityDataRead,
+		Fence: ReplicatedFence{Group: fence.Group, AllocationGeneration: fence.AllocationGeneration,
+			Command: fence.Command},
+	}
+	var encoded bytes.Buffer
+	if err := EncodeReplicatedRequest(&encoded, probe); err != nil {
+		t.Fatalf("canonical probe rejected: %v", err)
+	}
+	decoded, err := DecodeReplicatedRequest(bytes.NewReader(encoded.Bytes()))
+	if err != nil || decoded.Fence != probe.Fence {
+		t.Fatalf("canonical probe round trip=%+v err=%v", decoded, err)
+	}
+
+	invalid := []struct {
+		name   string
+		mutate func(*ReplicatedRequest)
+	}{
+		{name: "missing command", mutate: func(request *ReplicatedRequest) {
+			request.Fence.Command = raftservice.CommandFence{}
+		}},
+		{name: "member assertion", mutate: func(request *ReplicatedRequest) {
+			request.Fence.MemberID = fence.MemberID
+		}},
+		{name: "store assertion", mutate: func(request *ReplicatedRequest) {
+			request.Fence.StoreID = fence.StoreID
+		}},
+		{name: "incarnation assertion", mutate: func(request *ReplicatedRequest) {
+			request.Fence.NodeIncarnation = fence.NodeIncarnation
+		}},
+		{name: "term assertion", mutate: func(request *ReplicatedRequest) {
+			request.Fence.Term = fence.Term
+		}},
+		{name: "manifest invalid", mutate: func(request *ReplicatedRequest) {
+			request.Fence.Command.RelationManifestDigest = [32]byte{}
+		}},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := *probe
+			test.mutate(&candidate)
+			if err := ValidateReplicatedRequest(&candidate); err == nil {
+				t.Fatalf("invalid probe accepted: %+v", candidate.Fence)
+			}
+		})
 	}
 }
 

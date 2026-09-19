@@ -65,7 +65,7 @@ func TestRF3EmbeddedGatewayBindsBeforeNativeAdmissionWithIndependentRights(t *te
 		CatalogPath: filepath.Join(root, "absent-catalog"), CatalogRouteSeedPath: filepath.Join(root, "absent-route-seed"),
 		CatalogSessionJournal: filepath.Join(root, "absent-session"), DurableAckKeyPath: filepath.Join(root, "absent-ack-key"),
 		CatalogClientID: strings.Repeat("a", 32), CatalogRetryHome: strings.Repeat("b", 16),
-		TLS:                 rf3ManifestTLS{Certificate: credentials[1].Certificate, Key: credentials[1].Key, Roots: roots, IdentityOID: rf3CommandIdentityOID.String()},
+		TLS:                 rf3ManifestTLS{PeerKeys: rf3CommandPeerKeys(credentials[1]), Certificate: credentials[1].Certificate, Key: credentials[1].Key, Roots: roots, IdentityOID: rf3CommandIdentityOID.String()},
 		AuthorizationPolicy: policyPath,
 	}
 	for index, member := range group.Members {
@@ -128,7 +128,8 @@ func TestRF3EmbeddedGatewayBindsBeforeNativeAdmissionWithIndependentRights(t *te
 	}
 	request := shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
 		Authority: serviceauthz.Authority{Node: frontendNode, Generation: 1}, Capability: serviceauthz.CapabilityDataRead,
-		Fence: shardservice.ReplicatedFence{Group: group.Route.Group, AllocationGeneration: identity.AllocationGeneration}}
+		Fence: shardservice.ReplicatedFence{Group: group.Route.Group, AllocationGeneration: identity.AllocationGeneration,
+			Command: owner.state.Command}}
 	endpoint := gateway.ReplicatedEndpoint{Address: manifest.Listeners.Native, Node: storageNode, Member: identity.MemberID, StoreID: identity.StoreID, NodeIncarnation: identity.NodeIncarnation}
 	reply, err := prepared.client.DoReplicated(ctx, endpoint, &request)
 	if err != nil || reply == nil || reply.Kind != shardservice.ReplicatedHandshake {

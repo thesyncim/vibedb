@@ -59,6 +59,7 @@ const (
 	devClusterPhysicalNodes6                                   = 6
 	devClusterOID                                              = "1.3.6.1.4.1.32473.1.1"
 	devReadyTimeout                                            = 30 * time.Second
+	devStartupWriterLockWait                                   = 2 * time.Second
 	devChildDiagnosticBytes                                    = 64 << 10
 	devChildLogDrainTimeout                                    = 250 * time.Millisecond
 	devChildReadyMarkerBytes                                   = 256
@@ -300,6 +301,35 @@ type devGatewayConfig struct {
 	ControllerIntervalMillis    uint64                `json:"controller_interval_millis"`
 	SchemaRolloutPlan           string                `json:"schema_rollout_plan"`
 	SchemaRolloutOnce           bool                  `json:"schema_rollout_once"`
+	InitialNodeDirectoryPath    string                `json:"initial_node_directory"`
+}
+
+// devCatalogGenesisConfig is the closed, physical-only provisioning lane for
+// the reserved catalog relation. It is carried independently of Gateway so a
+// storage-only catalog voter can publish the first complete cut before any
+// frontend process opens. PlanPath is finalized after the catalog and initial
+// node directory are written; startup validates that immutable sidecar before
+// using this lane.
+type devCatalogGenesisConfig struct {
+	PlanPath                 string `json:"plan_path"`
+	CatalogPath              string `json:"catalog_path"`
+	InitialNodeDirectoryPath string `json:"initial_node_directory"`
+	SessionJournal           string `json:"session_journal"`
+	ClientID                 string `json:"client_id"`
+	RetryHome                string `json:"retry_home"`
+	Distribution             string `json:"distribution"`
+	Shard                    string `json:"shard"`
+	ClusterID                string `json:"cluster_id"`
+	ClusterIncarnation       string `json:"cluster_incarnation"`
+	TopologyRecoveryEpoch    uint64 `json:"topology_recovery_epoch"`
+	AllocationGeneration     uint64 `json:"allocation_generation"`
+	ShardIncarnation         string `json:"shard_incarnation"`
+	GroupID                  string `json:"group_id"`
+	MemberID                 uint64 `json:"member_id"`
+	StoreID                  string `json:"store_id"`
+	NodeID                   string `json:"node_id"`
+	NodeIncarnation          uint64 `json:"node_incarnation"`
+	Relation                 uint64 `json:"relation"`
 }
 
 type devGatewayTLS struct {
@@ -415,12 +445,13 @@ type devReplicaSplitTemplate struct {
 }
 
 type devPreparedRoute struct {
-	leaders          []distribution.EndpointID
-	replicas         []gateway.ReplicatedReplicaDescriptor
-	digest           [sha256.Size]byte
-	applyDigest      [sha256.Size]byte
-	schemaGeneration uint64
-	table            gateway.ReplicatedTableProfile
+	leaders             []distribution.EndpointID
+	replicas            []gateway.ReplicatedReplicaDescriptor
+	digest              [sha256.Size]byte
+	applyDigest         [sha256.Size]byte
+	logicalSchemaDigest replication.Digest
+	schemaGeneration    uint64
+	table               gateway.ReplicatedTableProfile
 }
 
 type devPrepareManifest struct {
@@ -525,6 +556,8 @@ type devClusterOptions struct {
 	physicalNodes                    int
 	pgListen                         string
 	pgListens                        []string
+	tlsCACertificate                 string
+	tlsCAKey                         string
 	readAuthority                    bool
 	readAuthoritySet                 bool
 }
@@ -541,6 +574,8 @@ func runClusterDev(args []string) int {
 	diagnosticsOnExit := fs.Bool("diagnostics-on-exit", false, "print bounded shard and gateway log tails when the development cluster stops")
 	pgListen := fs.String("pg-listen", "", "optional loopback PostgreSQL endpoint with durable auto-commit writes (RF3 only)")
 	pgListens := fs.String("pg-listens", "", "comma-separated PostgreSQL loopback endpoints, one per physical node (RF3 only)")
+	tlsCACertificate := fs.String("tls-ca-certificate", "", "optional PEM CA certificate used to sign this local cluster's leaf identities")
+	tlsCAKey := fs.String("tls-ca-key", "", "optional PEM CA private key paired with --tls-ca-certificate (never transmitted)")
 	readAuthority := fs.Bool("read-authority", false, "enable quorum read authority on every supported RF3 physical-node voter; omit to use the retained or platform default")
 	var tableSchemas []string
 	fs.Func("table-schema", "CREATE TABLE file to provision as an additional RF3 group; repeatable and retained on restart", func(path string) error {
@@ -551,10 +586,23 @@ func runClusterDev(args []string) int {
 		usage()
 		return 2
 	}
-	replicasSet, nodesSet, readAuthoritySet := false, false, false
+	if (*tlsCACertificate == "") != (*tlsCAKey == "") {
+		usage()
+		return 2
+	}
+	if *tlsCACertificate != "" {
+		for _, path := range []string{*tlsCACertificate, *tlsCAKey} {
+			if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+				usage()
+				return 2
+			}
+		}
+	}
+	replicasSet, nodesSet, physicalNodesSet, readAuthoritySet := false, false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		replicasSet = replicasSet || f.Name == "replicas"
 		nodesSet = nodesSet || f.Name == "nodes"
+		physicalNodesSet = physicalNodesSet || f.Name == "physical-nodes"
 		readAuthoritySet = readAuthoritySet || f.Name == "read-authority"
 	})
 	if nodesSet {
@@ -576,6 +624,10 @@ func runClusterDev(args []string) int {
 		}
 		*physicalNodes = 0
 	} else {
+		if physicalNodesSet && *physicalNodes == 0 {
+			fmt.Fprintln(os.Stderr, "cluster dev: --physical-nodes=0 is not a managed RF3 topology")
+			return 2
+		}
 		if *physicalNodes == 0 {
 			*physicalNodes = devClusterPhysicalNodes3
 		}
@@ -620,7 +672,7 @@ func runClusterDev(args []string) int {
 		return 1
 	}
 	defer unlock()
-	manifest, err := ensureDevCluster(devClusterOptions{root: abs, replicas: *replicas, shardBinary: shard, gatewayBinary: gw, nodeLog: *nodeLog, physicalNodes: *physicalNodes, pgListen: *pgListen, pgListens: listeners, readAuthority: *readAuthority, readAuthoritySet: readAuthoritySet})
+	manifest, err := ensureDevCluster(devClusterOptions{root: abs, replicas: *replicas, shardBinary: shard, gatewayBinary: gw, nodeLog: *nodeLog, physicalNodes: *physicalNodes, pgListen: *pgListen, pgListens: listeners, tlsCACertificate: *tlsCACertificate, tlsCAKey: *tlsCAKey, readAuthority: *readAuthority, readAuthoritySet: readAuthoritySet})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cluster dev: %v\n", err)
 		return 1
@@ -772,7 +824,7 @@ func initializeDevCluster(options devClusterOptions, manifestPath string) (devCl
 	if err != nil {
 		return devClusterManifest{}, err
 	}
-	credentials, roots, err := writeDevCredentials(options.root, rafttransport.TrustDomain{ClusterID: clusterID, ClusterIncarnation: clusterIncarnation}, nodes)
+	credentials, roots, err := writeDevCredentialsWithCA(options.root, rafttransport.TrustDomain{ClusterID: clusterID, ClusterIncarnation: clusterIncarnation}, nodes, options.tlsCACertificate, options.tlsCAKey)
 	if err != nil {
 		return devClusterManifest{}, err
 	}
@@ -1163,7 +1215,7 @@ func matchesExistingDevRoute(
 		route.Command.OwnershipEpoch != 1 ||
 		route.Command.SchemaGeneration != prepared.schemaGeneration ||
 		route.Command.RelationManifestDigest != prepared.digest ||
-		route.LogicalSchemaDigest != prepared.table.LogicalSchemaDigest ||
+		route.LogicalSchemaDigest != prepared.logicalSchemaDigest ||
 		route.Command.RoutingVersion != 1 || route.Command.RouteGeneration != 1 {
 		return false
 	}
@@ -1207,6 +1259,12 @@ func inspectDevPreparedRoute(
 		leaders:  make([]distribution.EndpointID, len(members)),
 		replicas: make([]gateway.ReplicatedReplicaDescriptor, len(members)),
 	}
+	// Cold supervisor validation opens the same SQL collections as serving
+	// startup. A killed io_uring owner can retain kernel file references after
+	// reaping, so share one bounded lock-admission deadline across this route.
+	// Only lock acquisition waits; schema validation and recovery run once.
+	opening := sqldriver.ReplicatedOpenOptions{WriterLockContext: context.Background(),
+		WriterLockDeadline: time.Now().Add(devStartupWriterLockWait)}
 	for index, member := range members {
 		prefix := fmt.Sprintf("%s-member-%d", role, index+1)
 		result.leaders[index] = distribution.EndpointID(prefix)
@@ -1240,7 +1298,7 @@ func inspectDevPreparedRoute(
 		}
 		profile, machineDigest, profileErr := readDevReplicatedTableProfile(
 			member, distributionName, shard, table, primaryKey, group,
-			requestLedgerIdentity, image,
+			requestLedgerIdentity, image, opening,
 		)
 		if profileErr != nil {
 			return devPreparedRoute{}, profileErr
@@ -1249,12 +1307,16 @@ func inspectDevPreparedRoute(
 			result.digest = machineDigest
 			result.applyDigest = image.ApplyProfileDigest
 			result.schemaGeneration = image.SchemaGeneration
+			// Private catalog and ledger tables still need their portable schema
+			// identity for durable group transitions and snapshot recovery.
+			result.logicalSchemaDigest = profile.LogicalSchemaDigest
 			if publishTable {
 				result.table = profile
 			}
 		} else if result.digest != machineDigest ||
 			result.applyDigest != image.ApplyProfileDigest ||
 			result.schemaGeneration != image.SchemaGeneration ||
+			result.logicalSchemaDigest != profile.LogicalSchemaDigest ||
 			publishTable && result.table != profile {
 			return devPreparedRoute{}, errDevCluster
 		}
@@ -1347,9 +1409,9 @@ func newDevCatalogSnapshot(
 		},
 		endpoints, 1, nil, nil,
 		[]gateway.ReplicatedShardDescriptor{
-			{Distribution: gateway.ReplicatedCatalogDistribution, Shard: gateway.ReplicatedCatalogShard, Group: catalogGroup, AllocationGeneration: 1, Command: command(catalogRoute), RangeIdentity: catalogRange, LineageDigest: catalogLineage, ForwardingRuleDigest: catalogForwarding, Replicas: catalogRoute.replicas},
-			{Distribution: devLedgerDistribution, Shard: devLedgerShard, Group: ledgerGroup, AllocationGeneration: 1, Command: command(ledgerRoute), RangeIdentity: ledgerRange, LineageDigest: ledgerLineage, ForwardingRuleDigest: ledgerForwarding, RequestLedgerRanges: []gateway.DurableRequestLedgerRangeDescriptor{{Identity: ledgerHomeIdentity}}, Replicas: ledgerRoute.replicas},
-			{Distribution: devDataDistribution, Shard: devDataShard, Group: dataGroup, AllocationGeneration: 1, Command: command(dataRoute), LogicalSchemaDigest: dataRoute.table.LogicalSchemaDigest, RangeIdentity: dataRange, LineageDigest: dataLineage, ForwardingRuleDigest: dataForwarding, Replicas: dataRoute.replicas},
+			{Distribution: gateway.ReplicatedCatalogDistribution, Shard: gateway.ReplicatedCatalogShard, Group: catalogGroup, AllocationGeneration: 1, Command: command(catalogRoute), LogicalSchemaDigest: catalogRoute.logicalSchemaDigest, RangeIdentity: catalogRange, LineageDigest: catalogLineage, ForwardingRuleDigest: catalogForwarding, Replicas: catalogRoute.replicas},
+			{Distribution: devLedgerDistribution, Shard: devLedgerShard, Group: ledgerGroup, AllocationGeneration: 1, Command: command(ledgerRoute), LogicalSchemaDigest: ledgerRoute.logicalSchemaDigest, RangeIdentity: ledgerRange, LineageDigest: ledgerLineage, ForwardingRuleDigest: ledgerForwarding, RequestLedgerRanges: []gateway.DurableRequestLedgerRangeDescriptor{{Identity: ledgerHomeIdentity}}, Replicas: ledgerRoute.replicas},
+			{Distribution: devDataDistribution, Shard: devDataShard, Group: dataGroup, AllocationGeneration: 1, Command: command(dataRoute), LogicalSchemaDigest: dataRoute.logicalSchemaDigest, RangeIdentity: dataRange, LineageDigest: dataLineage, ForwardingRuleDigest: dataForwarding, Replicas: dataRoute.replicas},
 		},
 		[]gateway.ReplicatedTableProfile{dataRoute.table},
 	)
@@ -1363,6 +1425,7 @@ func readDevReplicatedTableProfile(
 	group raftmember.GroupKey,
 	requestLedgerIdentity replication.Digest,
 	image sqldriver.ReplicatedSchemaCatalogImage,
+	opening ...sqldriver.ReplicatedOpenOptions,
 ) (gateway.ReplicatedTableProfile, [32]byte, error) {
 	root := devMemberRoot(member)
 	identityRaw, err := readDevFile(filepath.Join(root, "sql-identity.vibejson"), 1<<20)
@@ -1435,7 +1498,7 @@ func readDevReplicatedTableProfile(
 		return gateway.ReplicatedTableProfile{}, [32]byte{}, errDevCluster
 	}
 	database, err := sqldriver.OpenReplicatedShardStoreWithApply(
-		filepath.Join(root, "member.vdb"), identity, apply,
+		filepath.Join(root, "member.vdb"), identity, apply, opening...,
 	)
 	if err != nil {
 		return gateway.ReplicatedTableProfile{}, [32]byte{}, errors.Join(errDevCluster, err)
@@ -2007,19 +2070,103 @@ func reserveDevPortsUsing(count int, pgAddresses []string, listen func(string, s
 	return addresses, nil
 }
 func writeDevCredentials(root string, domain rafttransport.TrustDomain, nodes []rafttransport.NodeID) ([][2]string, string, error) {
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
-	if err != nil {
-		return nil, "", err
+	return writeDevCredentialsWithCA(root, domain, nodes, "", "")
+}
+
+// devCertificateSPKIPin derives the certificate-bound public-key pin emitted
+// for a physical shard-control source. The source seed carries no certificate
+// bytes; every dial still authenticates the complete trust domain and then
+// checks this exact digest against the pinned endpoint identity.
+func devCertificateSPKIPin(path string) (replication.Digest, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) == 0 || len(raw) > 1<<20 {
+		return replication.Digest{}, errors.Join(errDevCluster, err)
 	}
+	block, _ := pem.Decode(raw)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return replication.Digest{}, errDevCluster
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return replication.Digest{}, errors.Join(errDevCluster, err)
+	}
+	publicKey, err := x509.MarshalPKIXPublicKey(certificate.PublicKey)
+	if err != nil {
+		return replication.Digest{}, errors.Join(errDevCluster, err)
+	}
+	digest := sha256.Sum256(publicKey)
+	return replication.Digest(digest), nil
+}
+
+// writeDevCredentialsWithCA is the explicit local-development PKI seam used
+// by process qualification fixtures. With no CA paths it preserves the
+// historical self-generated CA behavior. When both paths are supplied, the
+// caller owns a CA that is read locally and used only to mint this cluster's
+// leaves; neither the certificate nor private key enters a manifest or wire
+// request. The CA key is never copied into the cluster root.
+func writeDevCredentialsWithCA(root string, domain rafttransport.TrustDomain, nodes []rafttransport.NodeID, caCertificatePath, caKeyPath string) ([][2]string, string, error) {
+	if (caCertificatePath == "") != (caKeyPath == "") {
+		return nil, "", errDevCluster
+	}
+	var (
+		caKey  *ecdsa.PrivateKey
+		caCert *x509.Certificate
+		caDER  []byte
+		err    error
+	)
 	now := time.Now().UTC()
-	ca := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "VibeDB local development CA"}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(30 * 24 * time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
-	caDER, err := x509.CreateCertificate(cryptorand.Reader, ca, ca, &caKey.PublicKey, caKey)
-	if err != nil {
-		return nil, "", err
-	}
-	caCert, err := x509.ParseCertificate(caDER)
-	if err != nil {
-		return nil, "", err
+	if caCertificatePath == "" {
+		caKey, err = ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+		if err != nil {
+			return nil, "", err
+		}
+		ca := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "VibeDB local development CA"}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(30 * 24 * time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
+		caDER, err = x509.CreateCertificate(cryptorand.Reader, ca, ca, &caKey.PublicKey, caKey)
+		if err != nil {
+			return nil, "", err
+		}
+		caCert, err = x509.ParseCertificate(caDER)
+		if err != nil {
+			return nil, "", err
+		}
+	} else {
+		certificatePEM, readErr := os.ReadFile(caCertificatePath)
+		if readErr != nil || len(certificatePEM) == 0 || len(certificatePEM) > 1<<20 {
+			return nil, "", errors.Join(errDevCluster, readErr)
+		}
+		block, rest := pem.Decode(certificatePEM)
+		if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
+			return nil, "", errDevCluster
+		}
+		caDER = append([]byte(nil), block.Bytes...)
+		caCert, err = x509.ParseCertificate(caDER)
+		if err != nil || !caCert.IsCA || !caCert.BasicConstraintsValid {
+			return nil, "", errors.Join(errDevCluster, err)
+		}
+		keyPEM, readErr := os.ReadFile(caKeyPath)
+		if readErr != nil || len(keyPEM) == 0 || len(keyPEM) > 1<<20 {
+			return nil, "", errors.Join(errDevCluster, readErr)
+		}
+		keyBlock, keyRest := pem.Decode(keyPEM)
+		if keyBlock == nil || len(bytes.TrimSpace(keyRest)) != 0 {
+			return nil, "", errDevCluster
+		}
+		if caKey, err = x509.ParseECPrivateKey(keyBlock.Bytes); err != nil {
+			parsed, parseErr := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+			if parseErr != nil {
+				return nil, "", errors.Join(errDevCluster, err, parseErr)
+			}
+			var ok bool
+			caKey, ok = parsed.(*ecdsa.PrivateKey)
+			if !ok {
+				return nil, "", errDevCluster
+			}
+		}
+		caPublic, ok := caCert.PublicKey.(*ecdsa.PublicKey)
+		if !ok || caKey.PublicKey.X == nil || caKey.PublicKey.Y == nil || caPublic.X == nil || caPublic.Y == nil ||
+			caKey.PublicKey.X.Cmp(caPublic.X) != 0 || caKey.PublicKey.Y.Cmp(caPublic.Y) != 0 {
+			return nil, "", errDevCluster
+		}
 	}
 	roots := filepath.Join(root, "roots.pem")
 	if err = writeDevExclusive(roots, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), 0o600); err != nil {
