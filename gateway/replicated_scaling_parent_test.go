@@ -5,7 +5,61 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/thesyncim/vibedb/distribution"
 )
+
+func TestScalingParentCompletionCountersSurviveRecoveryAndDuplicateCAS(t *testing.T) {
+	authority, _, current := newCatalogAuthorityFixture(t)
+	target := scalingTestNodeRecord([16]byte{0x93}, 1, NodeJoining, 1)
+	if err := authority.PutNode(t.Context(), target, 0); err != nil {
+		t.Fatal(err)
+	}
+	target.Lifecycle, target.Revision = NodeActive, 2
+	if err := authority.PutNode(t.Context(), target, 1); err != nil {
+		t.Fatal(err)
+	}
+	parent := scalingTestRunningParentWithBudget(t, authority, target, 3, 0)
+	parent.PlannedReplicas = 3
+	parent.Revision++
+	parent.DirectoryRevision++
+	if err := authority.PutScalingIntent(t.Context(), parent, parent.Revision-1); err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := authority.authorizedContext(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, name := range []distribution.DistributionName{"data", ReplicatedCatalogDistribution, "request-ledger"} {
+		prior := GroupEnrollmentIntent{ParentScalingIntentID: parent.ID, State: EnrollmentMoving,
+			Distribution: name, MoveOperationID: [32]byte{byte(index + 1)}}
+		complete := prior
+		complete.State = EnrollmentComplete
+		mutations, err := authority.enrollmentParentMutations(ctx, complete, prior, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := authority.session.MutateBatch(ctx, mutations)
+		if err = scalingMutationError(result, err, authority.session); err != nil {
+			t.Fatal(err)
+		}
+		// Replaying a stale prepared batch cannot count the completion twice.
+		result, err = authority.session.MutateBatch(ctx, mutations)
+		if err = scalingMutationError(result, err, authority.session); err == nil {
+			t.Fatal("duplicate completion CAS succeeded")
+		}
+	}
+	recovered := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0xf1)
+	stored, err := recovered.ReadScalingIntent(t.Context(), parent.ID)
+	if err != nil || stored.CompletedReplicas != 3 || stored.CompletedInternalReplicas != 2 {
+		t.Fatalf("recovered completion counters=%+v err=%v", stored, err)
+	}
+	stored.CompletedInternalReplicas++
+	stored.CompletedInternalReplicas++
+	if stored.Valid() {
+		t.Fatal("internal completion count exceeded total")
+	}
+}
 
 func scalingTestRunningParent(t *testing.T, authority *ReplicatedCatalogAuthority, target NodeRecord) ScalingIntent {
 	t.Helper()

@@ -583,11 +583,12 @@ func (transport *OrdinaryTransport) AddPeer(node NodeID) error {
 	if !transport.registry.IsPeerEnrolled(node) {
 		return ErrPeerUnauthorized
 	}
+	transport.reclaimUnusedPeers(node)
 	transport.mu.Lock()
 	if existing := transport.byNode[node]; existing != nil {
 		if existing.retiring {
 			transport.mu.Unlock()
-			return ErrPeerConflict
+			return ErrBackpressure
 		}
 		transport.mu.Unlock()
 		return nil
@@ -605,7 +606,7 @@ func (transport *OrdinaryTransport) AddPeer(node NodeID) error {
 	}
 	if !transport.peerCapacityAvailableLocked() {
 		transport.mu.Unlock()
-		return ErrRegistryBound
+		return ErrBackpressure
 	}
 	peer := transport.newPeer(node)
 	transport.peers = append(transport.peers, peer)
@@ -617,8 +618,8 @@ func (transport *OrdinaryTransport) AddPeer(node NodeID) error {
 	return nil
 }
 
-// EnrollPeer atomically publishes a physical enrollment and installs its
-// queue before the enrollment becomes visible to ordinary frame admission.
+// EnrollPeer atomically publishes a physical enrollment. Outbound queues are
+// disposable and allocated by the first authorized send, not enrollment.
 func (transport *OrdinaryTransport) EnrollPeer(
 	intent EnrollmentIntent,
 	verifier EnrollmentVerifier,
@@ -626,8 +627,7 @@ func (transport *OrdinaryTransport) EnrollPeer(
 	return transport.EnrollPeerContext(context.Background(), intent, verifier)
 }
 
-// EnrollPeerContext carries cancellation into a remote catalog verifier while
-// retaining the same queue-before-directory publication fence.
+// EnrollPeerContext carries cancellation into a remote catalog verifier.
 func (transport *OrdinaryTransport) EnrollPeerContext(
 	ctx context.Context,
 	intent EnrollmentIntent,
@@ -636,14 +636,7 @@ func (transport *OrdinaryTransport) EnrollPeerContext(
 	if transport == nil || transport.registry == nil {
 		return ErrInvalidTransport
 	}
-	canonical, err := transport.registry.normalizeEnrollment(intent)
-	if err != nil {
-		return err
-	}
-	intent = canonical
-	return transport.registry.EnrollPeerContextWithCommit(ctx, intent, verifier, func() error {
-		return transport.addPeerPrepared(intent.Peer)
-	})
+	return transport.registry.EnrollPeerContextWithCommit(ctx, intent, verifier, nil)
 }
 
 // EnrollMember is the atomic physical-peer plus existing-group member
@@ -667,8 +660,8 @@ func (transport *OrdinaryTransport) EnrollMemberContext(
 }
 
 // EnrollMemberContextWithCommit enrolls one existing-group member and runs
-// commit after the transport queue is prepared but before the registry
-// publishes its new directory cut. The hook is used by serving processes to
+// commit before the registry publishes its new directory cut. The hook is
+// used by serving processes to
 // persist an authenticated endpoint receipt against the pre-enrollment roster
 // before the enrollment becomes visible to ordinary traffic.
 func (transport *OrdinaryTransport) EnrollMemberContextWithCommit(
@@ -680,55 +673,78 @@ func (transport *OrdinaryTransport) EnrollMemberContextWithCommit(
 	if transport == nil || transport.registry == nil {
 		return ErrInvalidTransport
 	}
-	canonical, err := transport.registry.normalizeEnrollment(intent)
-	if err != nil {
-		return err
-	}
-	intent = canonical
-	return transport.registry.EnrollMemberContextWithCommit(ctx, intent, verifier, func() error {
-		if err := transport.addPeerPrepared(intent.Peer); err != nil {
-			return err
-		}
-		if commit != nil {
-			return commit()
-		}
-		return nil
-	})
+	return transport.registry.EnrollMemberContextWithCommit(ctx, intent, verifier, commit)
 }
 
-// addPeerPrepared is called only from a registry commit callback while the
-// registry's dynamic publication lock is held. The new directory record is
-// intentionally not visible yet; installing the queue first closes the
-// publication window in which frame admission could observe a peer without a
-// matching worker. The expected record is therefore validated locally rather
-// than re-reading the not-yet-published registry.
-func (transport *OrdinaryTransport) addPeerPrepared(expected PhysicalPeer) error {
-	node := expected.NodeID
-	if node == (NodeID{}) || node == transport.registry.LocalNode() ||
-		expected.State != PeerEnrolled || expected.TrustDomain != transport.registry.TrustDomain() {
-		return ErrInvalidTransport
+// reclaimUnusedPeers drops only transport state. The registry's durable
+// physical identity remains available for control traffic and future placement.
+// Select against one serialized cross-group authority cut, then cancel/join
+// workers without either publication or transport locks held.
+func (transport *OrdinaryTransport) reclaimUnusedPeers(keep NodeID) {
+	var retired []*ordinaryPeer
+	transport.registry.dynamicMu.Lock()
+	transport.mu.Lock()
+	for _, peer := range transport.peers {
+		if peer.node != keep && !peer.retiring && !transport.registry.peerReplicates(peer.node) {
+			peer.retiring = true
+			retired = append(retired, peer)
+		}
+	}
+	transport.mu.Unlock()
+	transport.registry.dynamicMu.Unlock()
+	for _, peer := range retired {
+		transport.releaseRetiredPeer(peer)
+	}
+}
+
+// releaseRetiredPeer owns a peer already marked retiring. The map entry stays
+// reserved until its worker and encoders finish, so stale handles cannot publish
+// into a successor queue or escape the shared frame/byte accounting.
+func (transport *OrdinaryTransport) releaseRetiredPeer(peer *ordinaryPeer) {
+	peer.cancel()
+	transport.mu.Lock()
+	connection, started := peer.connection, peer.started
+	transport.mu.Unlock()
+	if connection != nil {
+		_ = connection.Close()
+	}
+	peer.notify()
+	if started {
+		<-peer.done
+	} else {
+		close(peer.done)
 	}
 	transport.mu.Lock()
-	defer transport.mu.Unlock()
-	if existing := transport.byNode[node]; existing != nil {
-		if existing.retiring {
-			return ErrPeerConflict
+	for peer.reservedFrames != 0 {
+		transport.reservations.Wait()
+	}
+	var buffers []*pooledFrameBuffer
+	for peer.count != 0 {
+		frame := peer.queue[peer.head].buffer
+		peer.queue[peer.head] = outboundFrame{}
+		peer.head = (peer.head + 1) % len(peer.queue)
+		peer.count--
+		frameBytes := int64(frame.ownedCapacity())
+		peer.bytes -= frameBytes
+		transport.globalFrames--
+		transport.globalBytes -= frameBytes
+		buffers = append(buffers, frame)
+	}
+	if transport.byNode[peer.node] == peer {
+		delete(transport.byNode, peer.node)
+		for index, candidate := range transport.peers {
+			if candidate == peer {
+				copy(transport.peers[index:], transport.peers[index+1:])
+				transport.peers[len(transport.peers)-1] = nil
+				transport.peers = transport.peers[:len(transport.peers)-1]
+				break
+			}
 		}
-		return nil
 	}
-	if transport.state.Load() == transportClosed || context.Cause(transport.ctx) != nil {
-		return ErrTransportClosed
+	transport.mu.Unlock()
+	for _, buffer := range buffers {
+		transport.frames.put(buffer)
 	}
-	if !transport.peerCapacityAvailableLocked() {
-		return ErrRegistryBound
-	}
-	peer := transport.newPeer(node)
-	transport.peers = append(transport.peers, peer)
-	transport.byNode[node] = peer
-	if transport.state.Load() == transportRunning {
-		transport.startPeerLocked(peer)
-	}
-	return nil
 }
 
 // peerCapacityAvailableLocked accounts for the fixed per-peer ring and
@@ -788,8 +804,6 @@ func (transport *OrdinaryTransport) RetirePeerWithProof(proof PeerRetirementProo
 		return ErrNodeNotFound
 	}
 	var peer *ordinaryPeer
-	var connection PeerConnection
-	var started bool
 	err := transport.registry.RetirePhysicalPeer(proof, func() error {
 		transport.mu.Lock()
 		defer transport.mu.Unlock()
@@ -808,44 +822,14 @@ func (transport *OrdinaryTransport) RetirePeerWithProof(proof PeerRetirementProo
 			return ErrPeerBusy
 		}
 		peer.retiring = true
-		started = peer.started
-		connection = peer.connection
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	// All network operations happen after the registry and transport locks have
-	// been released.  Closing the connection interrupts a blocked write/read.
-	if peer == nil {
-		return nil
+	if peer != nil {
+		transport.releaseRetiredPeer(peer)
 	}
-	peer.cancel()
-	if connection != nil {
-		_ = connection.Close()
-	}
-	peer.notify()
-	if started {
-		<-peer.done
-	} else {
-		// No worker owns a ready transport.  A closed channel keeps the join
-		// invariant true for callers that retire before Run.
-		close(peer.done)
-	}
-	transport.mu.Lock()
-	if transport.byNode[proof.NodeID] == peer {
-		delete(transport.byNode, proof.NodeID)
-		for index, candidate := range transport.peers {
-			if candidate != peer {
-				continue
-			}
-			copy(transport.peers[index:], transport.peers[index+1:])
-			transport.peers[len(transport.peers)-1] = nil
-			transport.peers = transport.peers[:len(transport.peers)-1]
-			break
-		}
-	}
-	transport.mu.Unlock()
 	return nil
 }
 
@@ -923,7 +907,15 @@ func (transport *OrdinaryTransport) reserveOutbound(
 	peer := transport.byNode[plan.destination]
 	if peer == nil {
 		transport.mu.Unlock()
-		return nil, ErrNodeNotFound
+		if err := transport.AddPeer(plan.destination); err != nil {
+			return nil, err
+		}
+		transport.mu.Lock()
+		peer = transport.byNode[plan.destination]
+		if peer == nil {
+			transport.mu.Unlock()
+			return nil, ErrBackpressure
+		}
 	}
 	closed := transport.state.Load() != transportRunning || context.Cause(transport.ctx) != nil
 	if closed || peer.retiring ||
@@ -970,10 +962,11 @@ func (transport *OrdinaryTransport) publishReservation(
 	peer.reservedFrames--
 	peer.reservedBytes -= frameBytes
 	transport.activeSends--
-	if transport.activeSends == 0 {
+	if transport.activeSends == 0 || peer.reservedFrames == 0 {
 		transport.reservations.Broadcast()
 	}
-	if transport.state.Load() != transportRunning || context.Cause(transport.ctx) != nil {
+	closed := transport.state.Load() != transportRunning || context.Cause(transport.ctx) != nil
+	if closed || peer.retiring {
 		if transport.globalFrames <= 0 || transport.globalBytes < frameBytes {
 			transport.mu.Unlock()
 			transport.cancel(ErrInvalidTransport)
@@ -982,7 +975,10 @@ func (transport *OrdinaryTransport) publishReservation(
 		transport.globalFrames--
 		transport.globalBytes -= frameBytes
 		transport.mu.Unlock()
-		return ErrTransportClosed
+		if closed {
+			return ErrTransportClosed
+		}
+		return ErrBackpressure
 	}
 	tail := (peer.head + peer.count) % len(peer.queue)
 	peer.queue[tail] = outboundFrame{buffer: storage}
@@ -1007,7 +1003,7 @@ func (transport *OrdinaryTransport) unwindReservation(peer *ordinaryPeer, ownedS
 	transport.activeSends--
 	transport.globalFrames--
 	transport.globalBytes -= frameBytes
-	if transport.activeSends == 0 {
+	if transport.activeSends == 0 || peer.reservedFrames == 0 {
 		transport.reservations.Broadcast()
 	}
 	transport.mu.Unlock()

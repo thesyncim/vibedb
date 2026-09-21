@@ -986,7 +986,12 @@ func (e *Engine) ensureWaveEntryCapacity(wave Wave) bool {
 }
 
 func (e *Engine) Group(group uint64) (GroupState, bool) {
-	if e == nil || e.log.usable() != nil {
+	if e == nil {
+		return GroupState{}, false
+	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.log.usable() != nil {
 		return GroupState{}, false
 	}
 	g, ok := e.groups[group]
@@ -1002,7 +1007,11 @@ func (e *Engine) Group(group uint64) (GroupState, bool) {
 	for i := range g.sealed {
 		run := g.sealed[i]
 		for index := run.First; index <= run.Last; index++ {
-			location, _, compacted, found := e.Lookup(group, index)
+			location, _, compacted, found, err := e.lookupExactLocked(group, index)
+			if err != nil {
+				_ = e.log.poison(err)
+				return GroupState{}, false
+			}
 			if compacted {
 				continue
 			}
@@ -1021,7 +1030,12 @@ func (e *Engine) Group(group uint64) (GroupState, bool) {
 
 // Summary returns the mutation admission cursor without cloning entry indexes.
 func (e *Engine) Summary(group uint64) (GroupSummary, bool) {
-	if e == nil || e.log.usable() != nil {
+	if e == nil {
+		return GroupSummary{}, false
+	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.log.usable() != nil {
 		return GroupSummary{}, false
 	}
 	g, ok := e.groups[group]
@@ -1033,7 +1047,12 @@ func (e *Engine) Summary(group uint64) (GroupSummary, bool) {
 }
 
 func (e *Engine) Metadata(group uint64) (GroupMetadata, bool) {
-	if e == nil || e.log.usable() != nil {
+	if e == nil {
+		return GroupMetadata{}, false
+	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if e.log.usable() != nil {
 		return GroupMetadata{}, false
 	}
 	g, ok := e.groups[group]
@@ -1047,6 +1066,8 @@ func (e *Engine) Metadata(group uint64) (GroupMetadata, bool) {
 // GroupIDs returns recovered group IDs in canonical order. The allocation is
 // confined to the Open/control path.
 func (e *Engine) GroupIDs() []uint64 {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
 	ids := make([]uint64, 0, len(e.groups))
 	for id := range e.groups {
 		ids = append(ids, id)
@@ -1067,7 +1088,18 @@ func (e *Engine) Lookup(group, index uint64) (location EntryLocation, term uint6
 }
 
 func (e *Engine) LookupExact(group, index uint64) (location EntryLocation, term uint64, compacted, ok bool, err error) {
-	if e == nil || e.log.usable() != nil {
+	if e == nil {
+		return EntryLocation{}, 0, false, false, ErrPoisoned
+	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	return e.lookupExactLocked(group, index)
+}
+
+// lookupExactLocked keeps the mutable entry index and sealed-run publication
+// in one cut while the background sealer replaces resident entries.
+func (e *Engine) lookupExactLocked(group, index uint64) (location EntryLocation, term uint64, compacted, ok bool, err error) {
+	if e.log.usable() != nil {
 		return EntryLocation{}, 0, false, false, ErrPoisoned
 	}
 	g, exists := e.groups[group]
@@ -1095,7 +1127,7 @@ func (e *Engine) LookupExact(group, index uint64) (location EntryLocation, term 
 		if index < run.First || index > run.Last {
 			continue
 		}
-		if err := e.PrepareSegment(run.SegmentID); err != nil {
+		if err := e.prepareSegmentLocked(run.SegmentID); err != nil {
 			return EntryLocation{}, 0, false, false, err
 		}
 		e.readerMu.Lock()

@@ -899,9 +899,12 @@ type ScalingIntent struct {
 	AdmittedMigrationBytes uint64
 	PlannedReplicas        uint32
 	CompletedReplicas      uint32
-	OutstandingMoves       [][32]byte
-	Blockers               []ScalingBlocker
-	Evidence               SafeToStopEvidence
+	// Subset of CompletedReplicas, committed atomically with child completion.
+	// Application completion is the difference; no history rows are required.
+	CompletedInternalReplicas uint32
+	OutstandingMoves          [][32]byte
+	Blockers                  []ScalingBlocker
+	Evidence                  SafeToStopEvidence
 }
 
 type ScalingIntentState uint8
@@ -1060,7 +1063,7 @@ func (intent ScalingIntent) Valid() bool {
 		intent.CatalogGeneration == 0 || intent.Revision == 0 || intent.DirectoryRevision == 0 ||
 		intent.DirectoryRevision != intent.Revision || !intent.State.Valid() ||
 		len(intent.OutstandingMoves) > MaxScalingMovesPerIntent || len(intent.Blockers) > MaxScalingBlockers ||
-		intent.CompletedReplicas > intent.PlannedReplicas {
+		intent.CompletedReplicas > intent.PlannedReplicas || intent.CompletedInternalReplicas > intent.CompletedReplicas {
 		return false
 	}
 	for _, move := range intent.OutstandingMoves {

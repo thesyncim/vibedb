@@ -54,11 +54,6 @@ var buildgateBeforePrimaryRankAffineDisk = GrammarID{
 	0xb8, 0xb1, 0xe5, 0xc8, 0xc0, 0x6e, 0x35, 0x0b,
 }
 
-var buildgateBeforePrimaryRankAffineWire = GrammarID{
-	0x4c, 0x17, 0xf8, 0x6e, 0x78, 0x19, 0x93, 0x02,
-	0x41, 0x95, 0x88, 0x90, 0xe6, 0x68, 0xbc, 0x2d,
-}
-
 func TestGeneratedManifestMatchesCurrentLedgerSemantics(t *testing.T) {
 	semantics := requestledger.SemanticsDigest()
 	if [32]byte(semantics) != generatedRequestLedgerSemantics {
@@ -102,10 +97,7 @@ func TestPortableSidecarsRejectPreviousDiskGrammar(t *testing.T) {
 
 func TestPreRankAffineDiskGrammarIsRejected(t *testing.T) {
 	current := CurrentProfile()
-	if current.WireGrammar != buildgateBeforePrimaryRankAffineWire {
-		t.Fatalf("disk-only rank grammar changed wire identity: got %x want %x",
-			current.WireGrammar, buildgateBeforePrimaryRankAffineWire)
-	}
+
 	if current.DiskGrammar == buildgateBeforePrimaryRankAffineDisk {
 		t.Fatal("current manifest retained the pre-rank-affine disk grammar")
 	}
@@ -188,7 +180,6 @@ func TestBuildBeforeMutationImagesAndPostimagesIsIncompatibleBeforeAdmission(t *
 	}
 }
 
-
 func FuzzCanonicalManifestDerivation(f *testing.F) {
 	raw, err := os.ReadFile(filepath.Join("manifest", "current.txt"))
 	if err != nil {
@@ -203,4 +194,21 @@ func FuzzCanonicalManifestDerivation(f *testing.F) {
 			t.Fatal("accepted manifest derived a zero identity")
 		}
 	})
+}
+
+func TestBeforeAtomicTerminalReleaseGrammarIsRejected(t *testing.T) {
+	current := CurrentProfile()
+	previous := current
+	previous.WireGrammar = GrammarID{0x4c, 0x17, 0xf8, 0x6e, 0x78, 0x19, 0x93, 0x02, 0x41, 0x95, 0x88, 0x90, 0xe6, 0x68, 0xbc, 0x2d}
+	previous.DiskGrammar = GrammarID{0x6e, 0x23, 0xb5, 0xc9, 0x2d, 0xf5, 0x70, 0x81, 0x55, 0x4f, 0x7d, 0x03, 0x01, 0xb3, 0x7a, 0x7b}
+	if _, err := CheckCompatibility(current, previous); !errors.Is(err, ErrWireGrammar) {
+		t.Fatalf("old release protocol accepted: %v", err)
+	}
+	gate, err := NewCurrentDiskGate(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gate.AuthorizeDiskAdoption(DiskIdentity{Grammar: previous.DiskGrammar, Required: previous.Required}); !errors.Is(err, ErrDiskGrammar) {
+		t.Fatalf("old release state accepted: %v", err)
+	}
 }

@@ -2,6 +2,7 @@ package durable
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"slices"
 
@@ -57,6 +58,17 @@ func (c *Collection) RangeRawCurrentBuffer(
 		// Preserve the mature Snapshot materialization path for this rare case;
 		// the common inline overlay lane never reaches it.
 		snapshot, snapshotErr := c.Snapshot()
+		if errors.Is(snapshotErr, ErrCheckpointGroupPressure) {
+			if group := c.checkpointGroup.Load(); group != nil {
+				// A structural scan needs a rooted graph. Only the common
+				// group owner may certify its deferred multi-collection cut,
+				// exactly as for SnapshotCollections.
+				if err := group.Checkpoint(); err != nil {
+					return scratch, errors.Join(snapshotErr, err)
+				}
+				snapshot, snapshotErr = c.Snapshot()
+			}
+		}
 		if snapshotErr != nil {
 			return scratch, snapshotErr
 		}
@@ -233,13 +245,17 @@ func (c *Collection) rangeRawCurrentAt(
 			if ref == (storeio.PageRef{}) {
 				return scratch, nil
 			}
+			// The cursor's reconstructed key can alias the returned splice
+			// buffer. Keep it as a prefix while appending the overflow value.
+			keyBytes := len(key)
+			scratch = append(scratch[:0], key...)
 			scratch, err = c.appendPrimaryOverflowValue(
-				scratch[:0], ref, bounds,
+				scratch, ref, bounds,
 			)
 			if err != nil {
 				return scratch, fmt.Errorf("current rooted overflow: %w", err)
 			}
-			if err = fn(key, scratch); err != nil {
+			if err = fn(scratch[:keyBytes:keyBytes], scratch[keyBytes:]); err != nil {
 				return scratch, err
 			}
 			cursor.AdoptSpliceScratch(scratch)
@@ -442,13 +458,15 @@ func (c *Collection) visitRangeRawCurrentBaseUntil(
 		if ref == (storeio.PageRef{}) {
 			return scratch, nil
 		}
+		keyBytes := len(key)
+		scratch = append(scratch[:0], key...)
 		scratch, err = c.appendPrimaryOverflowValue(
-			scratch[:0], ref, bounds,
+			scratch, ref, bounds,
 		)
 		if err != nil {
 			return scratch, err
 		}
-		if err = fn(key, scratch); err != nil {
+		if err = fn(scratch[:keyBytes:keyBytes], scratch[keyBytes:]); err != nil {
 			return scratch, err
 		}
 	}

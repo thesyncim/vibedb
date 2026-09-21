@@ -188,6 +188,33 @@ func (authority *ReplicatedCatalogAuthority) ReadReplicatedCatalogHead(ctx conte
 	return snapshot, digest, nil
 }
 
+// EnrollmentCatalogCut fences enrollment reads against the two durable
+// publications that can change their meaning. It contains no live process or
+// drain acknowledgement: recovering a replica cannot depend on its own gateway.
+type EnrollmentCatalogCut struct {
+	CatalogGeneration         uint64
+	CatalogHeadDigest         replication.Digest
+	EnrollmentDirectoryDigest replication.Digest
+}
+
+// ReadEnrollmentCatalogCut is a bounded metadata read. Callers recheck this
+// cut after reading child rows and independently fence the physical directory.
+func (authority *ReplicatedCatalogAuthority) ReadEnrollmentCatalogCut(ctx context.Context) (EnrollmentCatalogCut, error) {
+	snapshot, digest, err := authority.ReadReplicatedCatalogHead(ctx)
+	if err != nil {
+		return EnrollmentCatalogCut{}, err
+	}
+	directory, err := authority.readRaw(ctx, enrollmentDirectoryKey, maxEnrollmentDirectoryBytes)
+	if err != nil {
+		return EnrollmentCatalogCut{}, err
+	}
+	if !directory.Found {
+		return EnrollmentCatalogCut{}, ErrEnrollmentIntentMissing
+	}
+	return EnrollmentCatalogCut{CatalogGeneration: snapshot.Generation(), CatalogHeadDigest: digest,
+		EnrollmentDirectoryDigest: scalingDigest(directory.Value)}, nil
+}
+
 // ReplicatedInitialMembershipDigests returns the catalog-certified serving
 // RF3 roster and complete descriptor witnesses for one group. A missing or
 // malformed group returns ok=false; callers must never substitute a made-up

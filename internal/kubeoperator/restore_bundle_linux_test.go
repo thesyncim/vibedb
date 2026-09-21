@@ -103,8 +103,11 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 	freshBinding.MemberID, freshBinding.StoreID = 1, [16]byte{30}
 	freshBinding.Authority.RoutingVersion, freshBinding.Authority.RouteGeneration = 1, 1
 	targetDigest, err := database.ReplicatedRelationManifestForBinding(identity, options.Placement, freshBinding)
-	if err != nil || targetDigest == manifest.RelationManifestDigest {
-		t.Fatalf("fresh target must have its own schema domain: %x source=%x err=%v", targetDigest, manifest.RelationManifestDigest, err)
+	// Restoring the same schema and placement into fresh physical identities
+	// preserves the immutable apply contract. Current binding/publication fences
+	// below establish the new cluster and routing authority independently.
+	if err != nil || targetDigest != manifest.RelationManifestDigest {
+		t.Fatalf("identical restored schema changed apply contract: %x source=%x err=%v", targetDigest, manifest.RelationManifestDigest, err)
 	}
 	logicalDigest, err := sqldriver.ReplicatedRelationManifestDigest(identity)
 	if err != nil {
@@ -208,13 +211,21 @@ func TestRestoreReplicaFactoryBindsExactBundle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Witness.SanitizedImageDigest == manifest.ImageDigest {
-		t.Fatal("restored image retained the source routing hash domain")
+	if first.Witness.SanitizedImageDigest != manifest.ImageDigest {
+		t.Fatal("unchanged rows/schema changed their immutable image digest")
 	}
 	memberRoot := filepath.Join(restoreGroupDirectory(restoredRoot, 0), "replica-1")
 	state, err := OpenRestoredReplicaState(memberRoot)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if state.Identity.Binding.ClusterID != freshBinding.ClusterID ||
+		state.Identity.Binding.ClusterIncarnation != freshBinding.ClusterIncarnation ||
+		state.Identity.Binding.GroupID != freshBinding.GroupID ||
+		state.Identity.Binding.StoreID != freshBinding.StoreID ||
+		state.Identity.Binding.Authority.RoutingVersion != freshBinding.Authority.RoutingVersion ||
+		state.Identity.Binding.Authority.RouteGeneration != freshBinding.Authority.RouteGeneration {
+		t.Fatal("restored schema reused source identity or routing authority")
 	}
 	held, _, err := sqldriver.OpenReplicatedShardStoreWithApplyForSettlement(filepath.Join(memberRoot, "member.vdb"), state.Identity, options)
 	if err != nil {

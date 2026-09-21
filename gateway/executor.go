@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	queryplanner "github.com/thesyncim/vibedb/planner"
@@ -447,7 +448,7 @@ func (e *Executor) queryWithProfileValidation(
 			res.Planning = pl.planning
 			return res, nil
 		}
-		if isStaleErr(err) && attempt < e.maxRetry {
+		if (isStaleErr(err) || errors.Is(err, ErrStaleGeneration) || errors.Is(err, raftservice.ErrServingFence)) && attempt < e.maxRetry {
 			staleGen = snap.Generation()
 			e.metrics.observeRetry()
 			attempt++

@@ -544,8 +544,7 @@ func (reader *canonicalPreparedAckSourceReaderTest) ReadFrontendDrainPreparedAck
 
 func TestFrontendDrainPreparedAckPhysicalReceiverUsesCanonicalSourceService(t *testing.T) {
 	profile, node, source, sourceCut, _ := frontendDrainSourceTestFixture(t)
-	node.Roles |= gateway.NodeRoleCatalog
-	source.Nodes.Nodes[0] = node
+	source.Catalog = catalogRouteSeedSnapshot(t, 1, node.NativeAddress, node)
 	serviceCut, err := runtimeServiceDirectoryCutFromFrontendDrainRuntimeCut(t.Context(), source, profile, 1)
 	if err != nil {
 		t.Fatalf("project canonical source service cut: %v", err)
@@ -555,7 +554,7 @@ func TestFrontendDrainPreparedAckPhysicalReceiverUsesCanonicalSourceService(t *t
 		t.Fatalf("project canonical source cut: %v", err)
 	}
 	if canonicalCut.Digest() == sourceCut.Digest() {
-		t.Fatal("canonical source fixture did not change after catalog-source role binding")
+		t.Fatal("canonical source fixture did not change after catalog placement")
 	}
 	grant := serviceCut.ContinuationGrants[0]
 	request := frontenddrain.PreparedAckRequest{

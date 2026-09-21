@@ -10,8 +10,91 @@ import (
 	"github.com/thesyncim/vibedb/pgwire"
 	queryplanner "github.com/thesyncim/vibedb/planner"
 	"github.com/thesyncim/vibedb/query"
+	"github.com/thesyncim/vibedb/shardservice"
 	driver "github.com/thesyncim/vibedb/sql/driver"
 )
+
+type postgresBoundProbeTransport struct{ *sqlRF3TestTransport }
+
+func (c *postgresBoundProbeTransport) ProbeReplicated(ctx context.Context, route ReplicatedRoute, endpoint ReplicatedEndpoint,
+	capability serviceauthz.Capability,
+) (*shardservice.ReplicatedResponse, error) {
+	response, err := c.DoReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
+		Operation: shardservice.ReplicatedProbe, Capability: capability,
+		Fence: shardservice.ReplicatedFence{Group: route.Group},
+	})
+	if err == nil {
+		_, err = bindReplicatedObservation(route, endpoint, response)
+	}
+	return response, err
+}
+
+func TestPostgreSQLHeldReadRefreshesStaleCatalog(t *testing.T) {
+	for _, cold := range []bool{false, true} {
+		t.Run(map[bool]string{false: "held-leader", true: "cold-discovery"}[cold], func(t *testing.T) {
+			executor, transport := newSQLRF3TestExecutor(t)
+			current := executor.catalog.Current()
+			descriptors := current.ReplicatedShardDescriptors()
+			for i := range descriptors {
+				descriptors[i].Command.RouteGeneration++
+			}
+			fresh, err := NewSnapshotWithReplicatedTableMetadata(cloneConfig(current.config), current.endpoints,
+				current.Generation()+1, nil, nil, descriptors, current.ReplicatedTableProfiles())
+			if err != nil {
+				t.Fatal(err)
+			}
+			available, refreshes := false, 0
+			executor.refresh = func(context.Context, uint64) (*Snapshot, error) {
+				refreshes++
+				if available {
+					return fresh, nil
+				}
+				return current, nil
+			}
+			backend := &PostgreSQLBackend{Executor: executor, Authorize: func(pgwire.SessionIdentity) (serviceauthz.Authority, error) {
+				return serviceauthz.Authority{Node: [16]byte{1}, Generation: 1}, nil
+			}}
+			session, err := backend.NewSession(t.Context(), pgwire.SessionIdentity{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer session.Close()
+			statement, err := session.Prepare(t.Context(), `SELECT id FROM messages WHERE id = 'a'`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer statement.Close()
+			var rows pgwire.BackendRows
+			defer rows.Close()
+			if err := statement.QueryInto(t.Context(), nil, &rows); err != nil {
+				t.Fatal(err)
+			}
+			if err := rows.Close(); err != nil {
+				t.Fatal(err)
+			}
+			for group, route := range transport.routes {
+				route.Command.RouteGeneration++
+				transport.routes[group] = route
+			}
+			if cold {
+				native, err := NewReplicatedExecutor(&postgresBoundProbeTransport{transport}, 3, time.Second)
+				if err != nil {
+					t.Fatal(err)
+				}
+				executor.client = &ReplicatedSQLTransport{Executor: native}
+			}
+			if err := statement.QueryInto(t.Context(), nil, &rows); !errors.Is(err, ErrStaleGeneration) ||
+				!errors.Is(err, driver.ErrTransactionConflict) || rows.Next() || refreshes != 1 {
+				t.Fatalf("stale read must abort with no rows: err=%v refreshes=%d", err, refreshes)
+			}
+			available = true
+			if err := statement.QueryInto(t.Context(), nil, &rows); err != nil || !rows.Next() || rows.Next() ||
+				executor.catalog.Current().Generation() != fresh.Generation() || refreshes != 2 {
+				t.Fatalf("same statement did not recover: err=%v refreshes=%d", err, refreshes)
+			}
+		})
+	}
+}
 
 func TestPostgreSQLRF3ReadOnlyStateLimitsAndCancellation(t *testing.T) {
 	executor, client := newSQLRF3TestExecutor(t)

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"sort"
 
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -270,7 +271,7 @@ func (authority *ReplicatedCatalogAuthority) PublishGroupTransition(ctx context.
 		return receipt, nil
 	}
 	grant, found, err := authority.ReadMembershipGrant(ctx, intent.Key.Group)
-	if err != nil || !found || !transitionMatchesGrant(intent, grant) {
+	if err != nil || !found || !GroupTransitionMatchesGrant(intent, grant) {
 		return GroupPublicationReceipt{}, errors.Join(err, ErrGroupTransition)
 	}
 	publication := &groupTransitionPublication{lease: lease, intent: intent, phase: phase, predecessor: predecessor}
@@ -285,9 +286,32 @@ func (authority *ReplicatedCatalogAuthority) PublishGroupTransition(ctx context.
 	return receipt, nil
 }
 
-func transitionMatchesGrant(intent GroupTransitionIntent, grant membershipgrant.Grant) bool {
-	return grant.Group == intent.Key.Group && grant.CatalogGeneration == intent.SourceHeadGeneration &&
-		grant.SourceMember == intent.SourceMember && grant.TargetMember == intent.TargetMember && grant.TargetNode == intent.Replacement.Node
+// GroupTransitionMatchesGrant compares immutable group provenance. An
+// unrelated catalog publication may precede move admission without changing
+// the grant. This comparison is not authorization: callers must read the
+// current durable grant, whose admission checks its complete source descriptor
+// (including endpoint addresses) and the current distribution owner/receipt.
+func GroupTransitionMatchesGrant(intent GroupTransitionIntent, grant membershipgrant.Grant) bool {
+	if !intent.Valid() || !grant.Valid() || grant.Group != intent.Key.Group ||
+		grant.CatalogGeneration > intent.SourceHeadGeneration ||
+		grant.SourceMember != intent.SourceMember || grant.TargetMember != intent.TargetMember ||
+		grant.TargetNode != intent.Replacement.Node ||
+		grant.InitialReplicaSetVersion != intent.SourceDescriptor.Command.ReplicaSetVersion ||
+		len(intent.SourceDescriptor.Replicas) != ServingReplicaCount ||
+		intent.SourceDescriptor.EnrolledTarget == nil || *intent.SourceDescriptor.EnrolledTarget != intent.Replacement {
+		return false
+	}
+	var voters [ServingReplicaCount]membershipgrant.RosterMember
+	for index, replica := range intent.SourceDescriptor.Replicas {
+		voters[index] = membershipgrant.RosterMember{Member: replica.Member, Node: [16]byte(replica.Node)}
+	}
+	sort.Slice(voters[:], func(left, right int) bool { return voters[left].Member < voters[right].Member })
+	for index, voter := range voters {
+		if voter.Member != grant.InitialVoters[index] {
+			return false
+		}
+	}
+	return membershipgrant.CertifiedRosterDigest(grant.Group, grant.InitialReplicaSetVersion, voters) == grant.InitialRosterDigest
 }
 
 func (authority *ReplicatedCatalogAuthority) groupTransitionMutations(ctx context.Context, publication *groupTransitionPublication, current, next *Snapshot) ([]NativeMutation, error) {

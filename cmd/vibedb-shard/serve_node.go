@@ -181,6 +181,7 @@ func (reader *rf3DynamicCatalogRows) resolve(
 		return nil, err
 	}
 	nodeIdentity := reader.store.NodeIdentity()
+	var unavailable error
 	for _, descriptor := range descriptors {
 		if descriptor.Distribution != string(gateway.ReplicatedCatalogDistribution) ||
 			descriptor.Shard != string(gateway.ReplicatedCatalogShard) {
@@ -199,6 +200,10 @@ func (reader *rf3DynamicCatalogRows) resolve(
 			if cause := context.Cause(ctx); cause != nil {
 				return nil, cause
 			}
+			unavailable = fmt.Errorf("catalog group %x member=%d leader=%d term=%d identity_match=%t: %w", group.GroupID,
+				state.Status.MemberID, state.Status.LeaderID, state.Status.Term,
+				state.Identity.MemberID == descriptor.MemberID && state.Identity.StoreID == descriptor.StoreID,
+				errors.Join(errRF3Serving, probeErr))
 			continue
 		}
 		candidate, readerErr := gateway.NewFrontendDrainRuntimeCatalogRowReaderForCatalogRoute(
@@ -215,7 +220,7 @@ func (reader *rf3DynamicCatalogRows) resolve(
 		reader.mu.Unlock()
 		return candidate, nil
 	}
-	return nil, errRF3Serving
+	return nil, errors.Join(errRF3Serving, unavailable)
 }
 
 func (reader *rf3DynamicCatalogRows) ReadFrontendDrainRuntimeCatalogRoute(

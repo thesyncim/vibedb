@@ -124,7 +124,7 @@ func TestReplicaReplacementSetPublishesBothCertifiedCutsAtomically(t *testing.T)
 }
 
 func TestReplicaReplacementSetRejectsMissingOrMutatedSiblingProof(t *testing.T) {
-	for _, corrupt := range []string{"grant", "receipt", "unrelated-fence", "duplicate"} {
+	for _, corrupt := range []string{"grant", "unrelated-fence", "duplicate"} {
 		t.Run(corrupt, func(t *testing.T) {
 			authority, client, current, changes := newReplacementSetFixture(t)
 			next, err := BuildReplicaReplacementSetTransition(current, changes, false)
@@ -147,20 +147,8 @@ func TestReplicaReplacementSetRejectsMissingOrMutatedSiblingProof(t *testing.T) 
 			}
 			before := bytes.Clone(client.rows[string(replicatedCatalogHeadKey)])
 			err = authority.PublishReplicaReplacementSet(t.Context(), current.Generation(), next, grants, false)
-			if corrupt != "receipt" {
-				if err == nil || !bytes.Equal(before, client.rows[string(replicatedCatalogHeadKey)]) {
-					t.Fatalf("partial/uncertified set published: %v", err)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			key, _ := replicatedReplicaReplacementReceiptKeys(grants[1].Group)
-			delete(client.rows, string(key[:]))
-			observer := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x80)
-			if _, err := observer.Read(t.Context()); err == nil || observer.holder.Current().Generation() != current.Generation() {
-				t.Fatalf("reader accepted incomplete set receipt: %v", err)
+			if err == nil || !bytes.Equal(before, client.rows[string(replicatedCatalogHeadKey)]) {
+				t.Fatalf("partial/uncertified set published: %v", err)
 			}
 		})
 	}

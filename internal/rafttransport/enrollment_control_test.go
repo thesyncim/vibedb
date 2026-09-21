@@ -176,7 +176,7 @@ func TestEnrollmentControlRoundTripAndRestartReplay(t *testing.T) {
 	}
 
 	// Retrying the exact intent after the callback's persistence failure must
-	// reuse the prepared queue, publish once, and return the committed ACK.
+	// publish once and return the committed ACK without retaining a queue.
 	clientConn, serverConn = net.Pipe()
 	client.Conn = clientConn
 	server.Conn = serverConn
@@ -198,8 +198,8 @@ func TestEnrollmentControlRoundTripAndRestartReplay(t *testing.T) {
 	if ack.IntentDigest != intent.Digest || ack.MemberID != 4 || ack.Node != testNode(4) {
 		t.Fatalf("unexpected enrollment ACK: %+v", ack)
 	}
-	if _, err := targetTransport.Stats(testNode(4)); err != nil {
-		t.Fatalf("enrollment ACK did not publish transport queue: %v", err)
+	if _, err := targetTransport.Stats(testNode(4)); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("enrollment ACK allocated an idle transport queue: %v", err)
 	}
 	if role, err := target.Role(group, 4); !errors.Is(err, ErrMemberNotFound) || role != 0 {
 		t.Fatalf("enrollment unexpectedly granted authority: role=%v err=%v", role, err)

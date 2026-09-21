@@ -17,7 +17,7 @@ func observeGatewayReplicaMoveCommand(ctx context.Context, observer gatewayRepli
 	if observer == nil {
 		return raftservice.CommandFence{}, errGatewayReplicaControl
 	}
-	candidates := gatewayReplicaMoveObservationCandidates(cut.Membership)
+	candidates := cut.Membership.AppendControlEndpoints(nil)
 	if len(candidates) < gateway.ServingReplicaCount {
 		return raftservice.CommandFence{}, errGatewayReplicaControl
 	}
@@ -56,24 +56,4 @@ func observeGatewayReplicaMoveCommand(ctx context.Context, observer gatewayRepli
 		return command, nil
 	}
 	return raftservice.CommandFence{}, errors.Join(joined, errGatewayReplicaControl)
-}
-
-// The enrolled replacement can lead after promotion but before the final
-// catalog roster is published. Only that one certified extra endpoint may be
-// observed; arbitrary leader hints never extend this bounded directory.
-func gatewayReplicaMoveObservationCandidates(route gateway.ReplicatedMembershipRoute) []gateway.ReplicatedEndpoint {
-	if len(route.Serving.Replicas) != gateway.ServingReplicaCount {
-		return nil
-	}
-	candidates := make([]gateway.ReplicatedEndpoint, 0, gateway.ServingReplicaCount+1)
-	candidates = append(candidates, route.Serving.Replicas...)
-	if !route.HasEnrolledTarget {
-		return candidates
-	}
-	for _, endpoint := range candidates {
-		if endpoint.Member == route.EnrolledTarget.Member {
-			return candidates
-		}
-	}
-	return append(candidates, route.EnrolledTarget)
 }

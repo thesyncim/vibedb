@@ -2820,7 +2820,7 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		},
 	}
 	got := replicatedApplyProfileDigest(identity, placement)
-	const wantDigest = "e73ccecc7f49f4d42b76efe9cc3be63f5bd3c55fd2307dc36ff4f97bf1ef7c32"
+	const wantDigest = "ca838c6ab9ecf4f0b7115bf7504c973cce9d6b2a666d43d8f4ea39267c9e5fcc"
 	if gotHex := hex.EncodeToString(got[:]); gotHex != wantDigest {
 		t.Fatalf("profile digest = %s, want %s", gotHex, wantDigest)
 	}
@@ -2829,12 +2829,6 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 		func(i *ReplicatedShardStoreIdentity, _ *ReplicatedPlacementProfile) { i.Binding.Distribution += "x" },
 		func(i *ReplicatedShardStoreIdentity, _ *ReplicatedPlacementProfile) { i.Binding.Shard += "x" },
 		func(i *ReplicatedShardStoreIdentity, _ *ReplicatedPlacementProfile) { i.Binding.AllocationGeneration++ },
-		func(i *ReplicatedShardStoreIdentity, _ *ReplicatedPlacementProfile) {
-			i.Binding.Authority.RoutingVersion++
-		},
-		func(i *ReplicatedShardStoreIdentity, _ *ReplicatedPlacementProfile) {
-			i.Binding.Authority.RouteGeneration++
-		},
 		func(i *ReplicatedShardStoreIdentity, _ *ReplicatedPlacementProfile) {
 			i.RelationSchemaGeneration++
 		},
@@ -2856,18 +2850,21 @@ func TestReplicatedApplyProfileDigestGoldenAndBindings(t *testing.T) {
 			t.Fatalf("bound mutation %d did not change digest", index)
 		}
 	}
-	localMutations := []func(*ReplicatedShardStoreIdentity){
+	independentMutations := []func(*ReplicatedShardStoreIdentity){
+		func(i *ReplicatedShardStoreIdentity) { i.Binding.Authority.OwnershipEpoch++ },
+		func(i *ReplicatedShardStoreIdentity) { i.Binding.Authority.RoutingVersion++ },
+		func(i *ReplicatedShardStoreIdentity) { i.Binding.Authority.RouteGeneration++ },
 		func(i *ReplicatedShardStoreIdentity) { i.Binding.MemberID++ },
 		func(i *ReplicatedShardStoreIdentity) { i.Binding.StoreID[0]++ },
 		func(i *ReplicatedShardStoreIdentity) { i.LogID[0]++ },
 		func(i *ReplicatedShardStoreIdentity) { i.UserStorage += "x" },
 		func(i *ReplicatedShardStoreIdentity) { i.Relations[0].Storage += "x" },
 	}
-	for index, mutate := range localMutations {
+	for index, mutate := range independentMutations {
 		changed := identity.Clone()
 		mutate(&changed)
 		if digest := replicatedApplyProfileDigest(changed, placement); digest != got {
-			t.Fatalf("member-local mutation %d changed digest: %x != %x", index, digest, got)
+			t.Fatalf("independent identity/fence mutation %d changed digest: %x != %x", index, digest, got)
 		}
 	}
 }

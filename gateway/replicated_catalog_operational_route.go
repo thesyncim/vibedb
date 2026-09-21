@@ -64,13 +64,25 @@ func (executor *ReplicatedExecutor) catalogOperationalRoute(ctx context.Context,
 	if executor == nil || ctx == nil || !catalogBootstrapRoute(bootstrap) {
 		return ReplicatedRoute{}, ErrReplicatedCatalog
 	}
+	route, err := executor.catalogOperationalRouteOnce(ctx, bootstrap, snapshot)
+	if err == nil || !retryCatalogDiscovery(err) {
+		return route, err
+	}
+	// A fast authenticated leaderless response must not exhaust the proposal
+	// count before an election finishes. Discovery is read-only: give readiness
+	// the configured attempt timeout, bounded further by the caller's deadline.
+	// Create the recovery timer only after a transient failure; normal discovery
+	// retains its single-sweep fast path. Identity and authority failures remain
+	// terminal, and mutating proposals retain their separate attempt bound.
+	recoveryCtx, cancel := context.WithTimeout(ctx, executor.attemptTimeout)
+	defer cancel()
 	for attempt := 0; ; attempt++ {
-		route, err := executor.catalogOperationalRouteOnce(ctx, bootstrap, snapshot)
-		if err == nil || !retryCatalogDiscovery(err) || attempt+1 >= executor.maxAttempts {
-			return route, err
-		}
-		if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
+		if waitErr := waitReplicatedFailoverRetry(recoveryCtx, attempt); waitErr != nil {
 			return ReplicatedRoute{}, errors.Join(err, waitErr)
+		}
+		route, err = executor.catalogOperationalRouteOnce(recoveryCtx, bootstrap, snapshot)
+		if err == nil || !retryCatalogDiscovery(err) {
+			return route, err
 		}
 	}
 }

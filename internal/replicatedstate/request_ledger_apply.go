@@ -1328,7 +1328,7 @@ func planRequestLedgerGC(plan requestLedgerCommandPlan, command requestledger.Co
 		return witnessedRequestLedgerConflict(plan, rows.ack.Revision, requestledger.PhaseAcked, rows.ackRaw), nil
 	}
 	if request.Action != requestledger.GCActionCollect || rows.ack.GCPhase != requestledger.AckGCCollecting ||
-		command.ExpectedRevision != rows.ack.Revision || snapshot.overlay != nil || snapshot.value == nil {
+		command.ExpectedRevision != rows.ack.Revision || snapshot.overlay != nil || snapshot.value == nil && snapshot.live == nil {
 		return witnessedRequestLedgerConflict(plan, rows.ack.Revision, requestledger.PhaseAcked, rows.ackRaw), nil
 	}
 	prefix := requestledger.AppendHeadKey(nil, command.Home, command.KeyDigest)
@@ -1336,7 +1336,7 @@ func planRequestLedgerGC(plan requestLedgerCommandPlan, command requestledger.Co
 	var reclaimed uint64
 	var selected uint16
 	more := false
-	err := snapshot.value.RangePrefixRaw(prefix, func(key, value []byte) error {
+	err := snapshot.rangePrefixRaw(prefix, func(key, value []byte) error {
 		view, openErr := requestledger.OpenStorageKey(key)
 		if openErr != nil || view.Home != command.Home || view.Key != command.KeyDigest {
 			return errors.Join(openErr, ErrStateCorrupt)

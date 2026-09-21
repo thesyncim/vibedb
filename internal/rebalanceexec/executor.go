@@ -259,12 +259,17 @@ func (executor *Executor) executeMembership(
 	if err != nil || !found {
 		return errors.Join(err, ErrGrantUnavailable)
 	}
-	if err = validateGrant(plan, grant); err != nil {
-		return err
+	if err = ValidateMembershipGrant(plan, grant); err != nil {
+		return fmt.Errorf("membership grant does not match move: grant generation=%d source=%d target=%d, move generation=%d source=%d target=%d: %w",
+			grant.CatalogGeneration, grant.SourceMember, grant.TargetMember,
+			plan.CatalogGeneration(), plan.RetiringMember(), plan.TargetMember(), err)
 	}
 	cut, err := executor.resolve(ctx, operation, plan, execution)
-	if err != nil || [16]byte(cut.Target.Node) != grant.TargetNode {
-		return errors.Join(err, ErrExecutionFence)
+	if err != nil {
+		return fmt.Errorf("resolve membership move route: %w", err)
+	}
+	if [16]byte(cut.Target.Node) != grant.TargetNode {
+		return fmt.Errorf("membership target node differs from grant: route=%x grant=%x: %w", cut.Target.Node, grant.TargetNode, ErrExecutionFence)
 	}
 	cut.Membership.Serving.Command.ReplicaSetVersion = execution.PublicationReplicaSet
 	kind := raftservice.MembershipAddLearner
@@ -369,7 +374,7 @@ func (executor *Executor) executeCatalog(
 	if err != nil || !found {
 		return errors.Join(err, ErrGrantUnavailable)
 	}
-	if err = validateGrant(plan, grant); err != nil {
+	if err = ValidateMembershipGrant(plan, grant); err != nil {
 		return err
 	}
 	cut, err := executor.resolve(ctx, operation, plan, execution)
@@ -424,7 +429,7 @@ func (executor *Executor) executeCatalogRefresh(
 	if err != nil || !found {
 		return errors.Join(err, ErrGrantUnavailable)
 	}
-	if err = validateGrant(plan, grant); err != nil {
+	if err = ValidateMembershipGrant(plan, grant); err != nil {
 		return err
 	}
 	cut, err := executor.resolve(ctx, operation, plan, execution)
@@ -544,7 +549,7 @@ func (executor *Executor) executeRetirement(
 		return err
 	}
 	if found {
-		if err = validateGrant(plan, grant); err != nil {
+		if err = ValidateMembershipGrant(plan, grant); err != nil {
 			return err
 		}
 	}
@@ -646,7 +651,10 @@ func (executor *Executor) resolve(
 		!exactRetiringReplica(cut.Retiring, plan.RetiringReplica()) ||
 		cut.SnapshotSource.Member != plan.SnapshotSourceMember() ||
 		cut.Target.Member != plan.TargetMember() {
-		return MoveRoute{}, errors.Join(err, ErrExecutionFence)
+		return MoveRoute{}, fmt.Errorf("move route identity differs: group=%x expected=%x source=%d expected=%d target=%d expected=%d retiring_exact=%t: %w",
+			cut.Membership.Serving.Group.GroupID, plan.Group().GroupID,
+			cut.SnapshotSource.Member, plan.SnapshotSourceMember(), cut.Target.Member, plan.TargetMember(),
+			exactRetiringReplica(cut.Retiring, plan.RetiringReplica()), errors.Join(err, ErrExecutionFence))
 	}
 	return cut, nil
 }
@@ -658,10 +666,19 @@ func exactRetiringReplica(endpoint gateway.ReplicatedEndpoint, identity rebalanc
 		distribution.EndpointID(endpoint.ControlEndpoint) == identity.ControlEndpoint
 }
 
-func validateGrant(plan *rebalance.Plan, grant membershipgrant.Grant) error {
+// ValidateMembershipGrant matches a move against an already-authorized durable
+// grant. Group provenance survives unrelated catalog publications; detached
+// plans without that proof require their exact original head.
+func ValidateMembershipGrant(plan *rebalance.Plan, grant membershipgrant.Grant) error {
 	if plan == nil || !grant.Valid() || grant.Group != plan.Group() ||
-		grant.CatalogGeneration != plan.CatalogGeneration() ||
 		grant.SourceMember != plan.RetiringMember() || grant.TargetMember != plan.TargetMember() {
+		return ErrExecutionFence
+	}
+	if intent, found := plan.TransitionIntent(); found {
+		if !gateway.GroupTransitionMatchesGrant(intent, grant) {
+			return ErrExecutionFence
+		}
+	} else if grant.CatalogGeneration != plan.CatalogGeneration() {
 		return ErrExecutionFence
 	}
 	return nil

@@ -16,6 +16,7 @@ type rf3AdoptedGroupRecovery struct {
 	base          sqldriver.ReplicatedShardStoreIdentity
 	apply         sqldriver.ReplicatedApplyIdentity
 	runtimeDigest [32]byte
+	peers         []rafttransport.PhysicalPeer
 }
 
 func (inventory *rf3AdoptedGroupInventory) recoveryGroups(local rafttransport.NodeID) ([]rf3AdoptedGroupRecovery, error) {
@@ -82,7 +83,7 @@ func (inventory *rf3AdoptedGroupInventory) recoveryGroups(local rafttransport.No
 				return nil, errRF3Serving
 			}
 		}
-		result = append(result, rf3AdoptedGroupRecovery{bundle: bundle, base: target.SQL, apply: target.Apply, runtimeDigest: entry.certificate})
+		result = append(result, rf3AdoptedGroupRecovery{bundle: bundle, base: target.SQL, apply: target.Apply, runtimeDigest: entry.certificate, peers: resources.Peers})
 	}
 	return result, nil
 }

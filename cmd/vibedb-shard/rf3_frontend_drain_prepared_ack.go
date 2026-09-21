@@ -813,14 +813,14 @@ func (reader *rf3FrontendDrainPreparedAckCutReader) readQueryFromConnectionClass
 		return frontenddrain.PreparedAckCut{}, errors.Join(errRF3FrontendDrainPreparedAckReaderWire, err)
 	}
 	if query.Operation == frontenddrain.CutOperationInstallExact && response.Cut.Digest() != query.SourceCutDigest {
-		return frontenddrain.PreparedAckCut{}, errRF3FrontendDrainPreparedAckReaderState
+		return frontenddrain.PreparedAckCut{}, fmt.Errorf("exact source cut digest: %w", errRF3FrontendDrainPreparedAckReaderState)
 	}
 	if physicalSource {
 		if !rf3FrontendDrainPreparedAckPhysicalSourceCutMatchesQuery(response.Cut, query, seed) {
-			return frontenddrain.PreparedAckCut{}, errRF3FrontendDrainPreparedAckReaderState
+			return frontenddrain.PreparedAckCut{}, fmt.Errorf("physical source identity or drain subject: %w", errRF3FrontendDrainPreparedAckReaderState)
 		}
 	} else if !rf3FrontendDrainPreparedAckSourceCutMatchesQuery(response.Cut, query, seed) {
-		return frontenddrain.PreparedAckCut{}, errRF3FrontendDrainPreparedAckReaderState
+		return frontenddrain.PreparedAckCut{}, fmt.Errorf("gateway source identity or drain subject: %w", errRF3FrontendDrainPreparedAckReaderState)
 	}
 	return response.Cut, nil
 }
@@ -885,7 +885,7 @@ func rf3FrontendDrainPreparedAckSourceCutMatchesQuery(
 		if binding.Principal != seed.NodeID {
 			continue
 		}
-		if binding.Roles&serviceauthz.ServiceRoleGateway == 0 ||
+		if foundSource || !binding.Valid() || binding.Roles&serviceauthz.ServiceRoleGateway == 0 ||
 			binding.KeyDigest != [sha256.Size]byte(seed.SPKIPinDigest) ||
 			binding.GatewayIncarnation != seed.Incarnation ||
 			(binding.Lifecycle != serviceauthz.ServiceActive && binding.Lifecycle != serviceauthz.ServiceDraining) {
@@ -896,6 +896,15 @@ func rf3FrontendDrainPreparedAckSourceCutMatchesQuery(
 	if !foundSource {
 		return false
 	}
+	return rf3FrontendDrainPreparedAckSubjectMatchesQuery(cut, query)
+}
+
+// The source publishes the current durable cut. A drain's continuation grant
+// retains its creator identity; that identity is not the controller responsible
+// for publishing lifecycle changes after recovery.
+func rf3FrontendDrainPreparedAckSubjectMatchesQuery(
+	cut frontenddrain.PreparedAckCut, query frontenddrain.PreparedAckCutReadRequest,
+) bool {
 	if query.DrainID == ([32]byte{}) {
 		return query.GrantDigest == ([32]byte{})
 	}
@@ -906,8 +915,7 @@ func rf3FrontendDrainPreparedAckSourceCutMatchesQuery(
 				continue
 			}
 			if foundSubject || !subject.Valid() || subject.GrantDigest != ([32]byte{}) ||
-				subject.GatewayServiceID != seed.NodeID ||
-				(query.RequirePrepared && subject.Lifecycle != 1) {
+				(query.RequirePrepared && subject.Lifecycle != uint8(gateway.FrontendDrainPrepared)) {
 				return false
 			}
 			foundSubject = true
@@ -920,8 +928,7 @@ func rf3FrontendDrainPreparedAckSourceCutMatchesQuery(
 			continue
 		}
 		if !grant.Valid() || (query.RequirePrepared && grant.State != serviceauthz.ContinuationGrantPrepared) ||
-			grant.DrainID != query.DrainID || grant.GatewayServiceID != seed.NodeID ||
-			grant.PeerKeyDigest != [32]byte(seed.SPKIPinDigest) {
+			grant.DrainID != query.DrainID {
 			return false
 		}
 		if foundGrant {
@@ -977,25 +984,7 @@ func rf3FrontendDrainPreparedAckPhysicalSourceCutMatchesQuery(
 	if !rosterMatch {
 		return false
 	}
-	if query.DrainID == ([32]byte{}) {
-		return query.GrantDigest == ([32]byte{})
-	}
-	if query.GrantDigest == ([32]byte{}) {
-		for _, subject := range cut.Subjects {
-			if subject.DrainID == query.DrainID {
-				return subject.Valid() && subject.GrantDigest == ([32]byte{}) &&
-					(!query.RequirePrepared || subject.Lifecycle == uint8(gateway.FrontendDrainPrepared))
-			}
-		}
-		return false
-	}
-	for _, grant := range cut.ServiceDirectory.ContinuationGrants {
-		if grant.GrantDigest == query.GrantDigest {
-			return grant.Valid() && grant.DrainID == query.DrainID &&
-				(!query.RequirePrepared || grant.State == serviceauthz.ContinuationGrantPrepared)
-		}
-	}
-	return false
+	return rf3FrontendDrainPreparedAckSubjectMatchesQuery(cut, query)
 }
 
 func rf3FrontendDrainPreparedAckCutPublishedBy(

@@ -17,7 +17,7 @@ var errRetiredOutboundDestination = errors.New("rafttransport: outbound destinat
 var errRetiredOutboundSource = errors.New("rafttransport: outbound source was removed")
 
 func retiredOutboundSource(view *authorityView, message *pb.Message) bool {
-	if view == nil || message == nil || view.retiredVersion == 0 ||
+	if view == nil || message == nil || !exactCompletedGrantCut(view.roles, view.grant) ||
 		view.grant.SourceMember == 0 || message.GetFrom() != view.grant.SourceMember {
 		return false
 	}
@@ -45,7 +45,7 @@ func retiredOutboundSource(view *authorityView, message *pb.Message) bool {
 // an enrolled learner, unknown destination or unauthorized configuration is
 // not an expected stale message.
 func retiredOutboundDestination(view *authorityView, message *pb.Message) bool {
-	if view == nil || message == nil || view.retiredVersion == 0 ||
+	if view == nil || message == nil || !exactCompletedGrantCut(view.roles, view.grant) ||
 		view.grant.SourceMember == 0 || message.GetTo() != view.grant.SourceMember {
 		return false
 	}

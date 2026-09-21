@@ -187,7 +187,7 @@ func TestGatewaySplitSourceRejectsWrongRoleSchemaAndDescendant(t *testing.T) {
 		"wrong group":        func(s *gatewaySplitSource) { s.Group.GroupID[0]++ },
 		"wrong node":         func(s *gatewaySplitSource) { s.Replicas[0].Node[0]++ },
 		"missing SQL":        func(s *gatewaySplitSource) { s.SQL.Relations = nil },
-		"foreign SQL member": func(s *gatewaySplitSource) { s.SQL.Binding.MemberID++ },
+		"invalid SQL member": func(s *gatewaySplitSource) { s.SQL.Binding.MemberID = 0 },
 		"foreign local indexes": func(s *gatewaySplitSource) {
 			s.LocalIndexes = []store.IndexDefinition{{Name: "foreign", Paths: []string{"/foreign"}}}
 		},

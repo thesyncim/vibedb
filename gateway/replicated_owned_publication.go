@@ -12,7 +12,7 @@ import (
 )
 
 func validOwnedTransitionRecord(record groupTransitionRecord) bool {
-	return record.Grant.Valid() && transitionMatchesGrant(record.Intent, record.Grant) &&
+	return record.Grant.Valid() && GroupTransitionMatchesGrant(record.Intent, record.Grant) &&
 		record.Command.Valid() && DigestCommandFence(record.Command) == record.Receipt.CommittedCommandFenceDigest &&
 		record.Receipt.ValidateSuccessor(record.Intent, record.Previous) == nil &&
 		(record.Previous == nil || record.Previous.ValidateSuccessor(record.Intent, nil) == nil)
@@ -216,14 +216,6 @@ func (authority *ReplicatedCatalogAuthority) publishOwnedGroupTransition(ctx con
 		scalingDirectoryMutation(grantRaw, grantKey[:], grantRaw.Value),
 	}
 	mutations = append(mutations, extra...)
-	// Retain each exact publication so a lagging gateway can certify every
-	// missed head, even after the per-group latest receipt is overwritten.
-	eventID := transitionDocumentID("move-head/", next.Generation())
-	eventRaw, err := encodeTransitionDocument(eventID, record, maxGroupTransitionRecordBytes)
-	if err != nil {
-		return err
-	}
-	mutations = append(mutations, NativeMutation{Kind: replication.MutationPutAbsentOrEqual, Key: fixedControlPlaneKey(eventID), Value: eventRaw})
 
 	if len(mutations) > authority.session.bundle.maxMutations {
 		return ErrReplicatedCatalog
@@ -247,76 +239,4 @@ func (authority *ReplicatedCatalogAuthority) publishOwnedGroupTransition(ctx con
 	}
 	_, err = authority.publishReadCatalogCut(ctx, certified, raw)
 	return err
-}
-
-// prepareOwnedGroupRead replays authenticated, atomically retained head events.
-// Missing history or any unrelated change that cannot be reconstructed is denied.
-func (authority *ReplicatedCatalogAuthority) prepareOwnedGroupRead(ctx context.Context, current, next *Snapshot, nextRaw []byte) (*Snapshot, func() error, bool, error) {
-	if authority == nil || ctx == nil || current == nil || next == nil || next.Generation() <= current.Generation() {
-		return nil, nil, false, nil
-	}
-	certified := current
-	for generation := current.Generation() + 1; ; generation++ {
-		id := transitionDocumentID("move-head/", generation)
-		raw, err := authority.readRaw(ctx, fixedControlPlaneKey(id), maxGroupTransitionRecordBytes)
-		if err != nil {
-			return nil, nil, true, err
-		}
-		if !raw.Found {
-			if generation == current.Generation()+1 {
-				return nil, nil, false, nil
-			}
-			return nil, nil, true, ErrGroupTransition
-		}
-		var record groupTransitionRecord
-		if err = decodeTransitionDocument(raw.Value, id, &record, maxGroupTransitionRecordBytes); err != nil {
-			return nil, nil, true, err
-		}
-		candidate, err := BuildGroupOwnedShardTransition(certified, record.Intent, record.Receipt.Phase, record.Intent.Replacement, record.Command)
-		if err != nil {
-			return nil, nil, true, err
-		}
-		certified, err = certifyOwnedPublication(certified, candidate, record)
-		if err != nil {
-			return nil, nil, true, err
-		}
-		if generation == next.Generation() {
-			break
-		}
-	}
-	canonical, err := appendReplicatedCatalogDocument(nil, certified, maxReplicatedCatalogBytes)
-	if err != nil || sha256.Sum256(canonical) != sha256.Sum256(nextRaw) {
-		return nil, nil, true, errors.Join(err, ErrGroupTransition)
-	}
-	sourceDigest, err := CatalogSnapshotDigest(current)
-	if err != nil {
-		return nil, nil, true, err
-	}
-	return certified, func() error {
-		h := authority.holder
-		h.leaseMu.Lock()
-		defer h.leaseMu.Unlock()
-		h.initLeaseTrackerLocked()
-		installed := h.ptr.Load()
-		if installed == nil {
-			return ErrCatalogGenerationMismatch
-		}
-		digest, err := CatalogSnapshotDigest(installed)
-		if err != nil {
-			return err
-		}
-		if installed.Generation() == next.Generation() {
-			nextDigest, err := CatalogSnapshotDigest(certified)
-			if err != nil || digest != nextDigest {
-				return errors.Join(err, ErrGroupTransition)
-			}
-			return nil
-		}
-		if installed.Generation() != current.Generation() || digest != sourceDigest {
-			return ErrCatalogGenerationMismatch
-		}
-		h.ptr.Store(certified)
-		h.signalLeaseChangeLocked()
-		return nil
-	}, true, nil
 }

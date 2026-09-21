@@ -3,6 +3,7 @@ package snapshottransfer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -332,7 +333,9 @@ func (provider *RetainedSourceExportProvider) PinSourceExport(
 			slices.Contains(publication.ConfState.GetVoters(), request.TargetMember) {
 			_ = cut.Close()
 			returnWorkspace()
-			return SourceExportPlan{}, ErrStaleFence
+			return SourceExportPlan{}, fmt.Errorf("%w: source cut membership requested=%d fence=%d publication=%d source=%d target=%d voters=%v learners=%v", ErrStaleFence,
+				request.ReplicaSetVersion, fence.ReplicaSetVersion, publication.ReplicaSetVersion,
+				request.SourceMember, request.TargetMember, publication.ConfState.GetVoters(), publication.ConfState.GetLearners())
 		}
 		var releaseOnce sync.Once
 		return SourceExportPlan{

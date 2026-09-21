@@ -276,6 +276,17 @@ func TestEnrollPeerRefreshesMonotonicDirectoryRevisionWithoutRotatingGrant(t *te
 		refreshed.EnrollmentDigest != prior.EnrollmentDigest {
 		t.Fatalf("refreshed physical peer=%+v err=%v", refreshed, err)
 	}
+	// Lost ACK / cold receipt replay keeps the newer directory cut intact.
+	revision := registry.PeerDirectoryRevision()
+	if err := registry.EnrollPeer(first, EnrollmentVerifierFunc(allowEnrollment)); err != nil {
+		t.Fatalf("exact prior enrollment proof replay: %v", err)
+	}
+	if current, err := registry.PhysicalPeer(remote); err != nil || current != refreshed || registry.PeerDirectoryRevision() != revision {
+		t.Fatalf("replay changed current physical cut: %+v, %v", current, err)
+	}
+	if err := registry.EnrollPeer(first, EnrollmentVerifierFunc(func(EnrollmentIntent) error { return ErrPeerUnauthorized })); !errors.Is(err, ErrPeerUnauthorized) {
+		t.Fatalf("replay skipped committed proof verification: %v", err)
+	}
 
 	stale := updated
 	stale.Peer.Revision = prior.Revision
@@ -312,7 +323,7 @@ func TestEmptyRegistryRestoresCertifiedLocalIncarnation(t *testing.T) {
 	}
 }
 
-func TestEnrollMemberKeepsOldDigestForStaggeredAuthorizedTraffic(t *testing.T) {
+func TestEnrollmentDoesNotFenceCurrentMemberReplication(t *testing.T) {
 	group := testGroup(202)
 	members := []Member{
 		{Group: group, ReplicaSetVersion: 1, MemberID: 1, Node: testNode(1), Role: MemberVoter},
@@ -348,7 +359,7 @@ func TestEnrollMemberKeepsOldDigestForStaggeredAuthorizedTraffic(t *testing.T) {
 		t.Fatalf("updated sender encoded old-member traffic: %v", err)
 	}
 	header, _, err := parseFrame(frame)
-	if err != nil || header.roster != oldDigest {
+	if err != nil || header.roster != ([32]byte{}) {
 		t.Fatalf("updated sender roster = %x, parse error %v; want legacy %x", header.roster, err, oldDigest)
 	}
 	if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, testNode(1)), frame); err != nil {
@@ -483,7 +494,7 @@ func TestEnrollmentDigestRotatesAcrossCompletedReplacement(t *testing.T) {
 		t.Fatalf("old-member traffic after second enrollment: %v", err)
 	}
 	header, _, err := parseFrame(frame)
-	if err != nil || header.roster != secondDigest {
+	if err != nil || header.roster != ([32]byte{}) {
 		t.Fatalf("second-cycle outbound roster = %x, parse error %v; want adjacent %x", header.roster, err, secondDigest)
 	}
 	// The receiver that stopped after source compaction is still on secondDigest
@@ -559,15 +570,15 @@ func TestEmptyTransportEnrollsAndRetiresBoundedPeer(t *testing.T) {
 	transportTestEventually(t, transport.Running)
 	remote := testNode(2)
 	intent := dynamicPeerIntent(registry, remote, 2, raftmember.GroupKey{}, 0, [sha256.Size]byte{})
-	// Public enrollment accepts the compatibility spelling and default state;
-	// the queue commit must receive the same normalized record as the registry.
+	// Enrollment normalizes physical identity without reserving an outbound
+	// queue before a group authorizes replication.
 	intent.Peer.Node, intent.Peer.NodeID = intent.Peer.NodeID, NodeID{}
 	intent.Peer.State, intent.Peer.TrustDomain = 0, TrustDomain{}
 	if err := transport.EnrollPeer(intent, EnrollmentVerifierFunc(allowEnrollment)); err != nil {
 		t.Fatalf("transport EnrollPeer: %v", err)
 	}
-	if _, err := transport.Stats(remote); err != nil {
-		t.Fatalf("Stats after dynamic queue install: %v", err)
+	if _, err := transport.Stats(remote); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("enrollment allocated an idle queue: %v", err)
 	}
 	if err := transport.RetirePeer(remote); err != nil {
 		t.Fatalf("RetirePeer: %v", err)

@@ -212,6 +212,7 @@ type Runtime struct {
 
 	replicaControlManifest  *gatewayReplicaControlManifest
 	provisionedSplitSources []gatewayProvisionedSplitSource
+	provisioningCatalog     *gateway.Snapshot
 	hotSplitFactory         *gatewayHotSplitFactory
 	controlDirectory        *gateway.ReplicatedControlDirectory
 	serviceDirectory        *serviceauthz.ServiceDirectoryGate

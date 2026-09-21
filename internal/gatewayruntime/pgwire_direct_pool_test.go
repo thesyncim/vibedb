@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -348,6 +349,52 @@ func TestPostgreSQLDirectUnknownRetainsExactCommand(t *testing.T) {
 		t.Fatal(prepared, executed)
 	}
 }
+
+func TestPostgreSQLDirectPreAdmissionRefusalDoesNotPoisonLane(t *testing.T) {
+	for _, priorUnknown := range []bool{false, true} {
+		t.Run(fmt.Sprint(priorUnknown), func(t *testing.T) {
+			s := &directPoolService{}
+			p := testDirectPool(t, s)
+			for i := 1; i < postgresDirectLanes; i++ {
+				<-p.slots
+			}
+			var first durableExecBatchIdentity
+			var firstPlan *gateway.DurableSQLDirectPlan
+			calls := 0
+			s.execute = func(_ context.Context, id durableExecBatchIdentity, q []gateway.Query, plan *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+				calls++
+				if calls == 1 {
+					first, firstPlan = id, plan
+					if priorUnknown {
+						return durableExecBatchExecuteResult{}, errors.New("lost reply")
+					}
+				}
+				if priorUnknown && calls <= 3 && (id != first || plan != firstPlan || q[0].SQL != "UPDATE docs SET n=n+1 WHERE id='a'") {
+					t.Fatal("unresolved recipe changed")
+				}
+				if calls == 1 || priorUnknown && calls == 2 {
+					return durableExecBatchExecuteResult{}, errors.Join(gateway.ErrDurableSQLNotAdmitted,
+						&gateway.ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalUnavailable})
+				}
+				return durableExecBatchExecuteResult{Direct: true, Result: &gateway.Result{RowsAffected: 1}}, nil
+			}
+			_, _, err := p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"})
+			if errors.Is(err, durable.ErrCommitOutcomeUnknown) != priorUnknown {
+				t.Fatalf("first err=%v", err)
+			}
+			_, _, err = p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='b'"})
+			if priorUnknown {
+				if !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+					t.Fatalf("earlier unknown was discarded: %v", err)
+				}
+				_, _, err = p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='b'"})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 func TestPostgreSQLDirectAbortRetriesWithNewIdentity(t *testing.T) {
 	s := &directPoolService{}
 	p := testDirectPool(t, s)
@@ -366,6 +413,29 @@ func TestPostgreSQLDirectAbortRetriesWithNewIdentity(t *testing.T) {
 		if ids[i].IssuerSequence != ids[i-1].IssuerSequence+1 || ids[i].RequestID == ids[i-1].RequestID || ids[i].Reference != ids[0].Reference {
 			t.Fatal(ids)
 		}
+	}
+}
+
+func TestPostgreSQLDirectStalePlanRetriesAfterDefiniteRefusal(t *testing.T) {
+	s := &directPoolService{}
+	p := testDirectPool(t, s)
+	var first durableExecBatchIdentity
+	var firstPlan *gateway.DurableSQLDirectPlan
+	calls := 0
+	s.execute = func(_ context.Context, id durableExecBatchIdentity, q []gateway.Query, plan *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+		calls++
+		if calls == 1 {
+			first, firstPlan = id, plan
+			return durableExecBatchExecuteResult{}, errors.Join(gateway.ErrDurableSQLNotAdmitted, raftservice.ErrServingFence)
+		}
+		if calls != 2 || id.RequestID == first.RequestID || id.IssuerSequence != first.IssuerSequence+1 || plan == firstPlan ||
+			q[0].SQL != "UPDATE docs SET n=n+1 WHERE id='a'" {
+			t.Fatal("definite stale plan did not acquire a fresh recipe for the same statement")
+		}
+		return durableExecBatchExecuteResult{Direct: true, Result: &gateway.Result{RowsAffected: 1}}, nil
+	}
+	if _, _, err := p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"}); err != nil || calls != 2 {
+		t.Fatalf("calls=%d err=%v", calls, err)
 	}
 }
 func TestPostgreSQLDirectSameTableOverlapsAndCloseCancels(t *testing.T) {

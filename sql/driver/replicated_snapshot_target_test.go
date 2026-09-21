@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
+	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -238,6 +240,54 @@ func TestReplicatedSnapshotTargetPrepareColdOpenInstallReopen(t *testing.T) {
 	}
 }
 
+// Copy while the stage owns its collections, before Close can checkpoint them.
+// This is the on-disk crash cut left by a killed learner after receipt and
+// before the seed certificate exists; both lost and persisted cursors resume.
+func TestReplicatedSnapshotTargetCrashWithUncheckpointedRows(t *testing.T) {
+	for _, persisted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cursor=%v", persisted), func(t *testing.T) {
+			stage, target, bootstrap, artifact, cursor := newReplicatedSnapshotStageFixture(t)
+			base, identity, manifest := stage.base, stage.identity, stage.expected
+			root := t.TempDir()
+			path := target.connector.db.path
+			if err := os.CopyFS(root, os.DirFS(filepath.Dir(path))); err != nil {
+				t.Fatal(err)
+			}
+			if err := errors.Join(stage.Close(), target.Close()); err != nil {
+				t.Fatal(err)
+			}
+			path = filepath.Join(root, filepath.Base(path))
+			if opened, err := OpenReplicatedShardStoreWithApply(path, base, identity); opened != nil || !errors.Is(err, durable.ErrCheckpointGroupCorrupt) {
+				t.Fatalf("ordinary opener accepted uncertified rows: %v", err)
+			}
+			target, err := OpenReplicatedSnapshotTarget(path, base, identity)
+			if err != nil {
+				t.Fatalf("resume uncheckpointed snapshot: %v", err)
+			}
+			defer target.Close()
+			if _, err = target.NewSession(t.Context()); !errors.Is(err, ErrReplicatedChildStageBusy) {
+				t.Fatalf("uncertified snapshot allowed SQL: %v", err)
+			}
+			if !persisted {
+				cursor = nil
+			}
+			stage, _, err = target.OpenReplicatedSnapshotStage(base, manifest, cursor, testReplicatedApplyOptions(), replicatedstate.SnapshotArtifactStageOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stage.Close()
+			if _, err = stage.Receive(bytes.NewReader(artifact[stage.Offset():]), func([]byte) error { return nil }); err != nil {
+				t.Fatal(err)
+			}
+			activation, err := stage.Activate(bootstrap)
+			if err != nil {
+				t.Fatalf("authenticate resumed image: %v", err)
+			}
+			defer activation.Apply.Close()
+		})
+	}
+}
+
 func TestReplicatedSnapshotTargetRejectsInitializedStore(t *testing.T) {
 	path, database, binding, _ := prepareReplicatedTestRoot(t, "initialized-not-cold", false)
 	base := requireReplicatedShardStoreBind(t, database, binding, "docs")
@@ -334,5 +384,117 @@ func TestReplicatedSnapshotTargetResumesCertifiedActivationCuts(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestReplicatedSnapshotTargetAfterOwnershipAdvance(t *testing.T) {
+	_, source, base := bindReplicatedApplyTestRoot(t, "snapshot-moved-source")
+	defer source.Close()
+	bootstrap := testReplicatedApplyBootstrap()
+	bootstrap.Metadata.ConfState.Voters = []uint64{1, 2}
+	options := testReplicatedApplyOptions()
+	apply, _, err := source.OpenReplicatedApply(base, bootstrap, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer apply.Close()
+	if _, err = apply.InstallSnapshot(bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	epoch := applyReplicatedApplySessionOpen(t, apply, base, 2)
+	document := []byte(`{"id":"moved-row","value":7}`)
+	key := testReplicatedApplyKey(t, source, document)
+	command := testReplicatedApplyCommand(base, epoch, 2, replication.Mutation{Kind: replication.MutationPut, Key: key, Value: document})
+	if _, err = apply.ApplyNormal(testReplicatedApplyMeta(3), command); err != nil {
+		t.Fatal(err)
+	}
+	binding := replicatedStateBindingAt(base, options.Placement.Range)
+	transition, err := replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
+		From: binding, ExpectedReplicaSetVersion: 1, SourceMember: 1, TargetMember: 2,
+		ToOwnershipEpoch: binding.OwnershipEpoch + 1, ToRoutingVersion: binding.RoutingVersion + 1,
+		ToRouteGeneration: binding.RouteGeneration + 1, ToOwnedRange: binding.OwnedRange,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = apply.ApplyNormal(testReplicatedApplyMeta(4), transition); err != nil {
+		t.Fatal(err)
+	}
+	cut, err := apply.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var artifact bytes.Buffer
+	manifest, err := replicatedstate.WriteSnapshotArtifact(&artifact, cut, replicatedstate.SnapshotArtifactOptions{})
+	if err = errors.Join(err, cut.Close()); err != nil {
+		t.Fatal(err)
+	}
+	targetPath, target, targetBinding, _ := prepareReplicatedTestRoot(t, "snapshot-moved-target", false)
+	defer target.Close()
+	targetBinding.MemberID, targetBinding.StoreID = 9, [16]byte{9}
+	targetBinding.Authority.OwnershipEpoch = manifest.State.Binding.OwnershipEpoch
+	targetBinding.Authority.RoutingVersion = manifest.State.Binding.RoutingVersion
+	targetBinding.Authority.RouteGeneration = manifest.State.Binding.RouteGeneration
+	targetBase := requireReplicatedShardStoreBind(t, target, targetBinding, "docs")
+	stage, targetApplyID, err := target.OpenReplicatedSnapshotStage(targetBase, manifest, nil, options, replicatedstate.SnapshotArtifactStageOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stage.Close()
+	if _, err = stage.Receive(bytes.NewReader(artifact.Bytes()), func([]byte) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	activation, err := stage.Activate(bootstrap)
+	if err != nil {
+		t.Fatalf("activate replacement at current routing fence: %v", err)
+	}
+	defer activation.Apply.Close()
+	if _, err = activation.Apply.InstallSnapshot(activation.SnapshotBase); err != nil {
+		t.Fatal(err)
+	}
+	installed, err := activation.Apply.SnapshotArtifactCut()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := installed.State(); got.Binding != manifest.State.Binding || got.ApplyContractDigest != manifest.State.ApplyContractDigest {
+		t.Fatal("snapshot changed the authenticated current fence or apply contract")
+	}
+	if err = installed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// This replica was created at the second ownership fence. A subsequent
+	// move advances the same allocation while the snapshot's older completion
+	// slots still refer to the original fence. Cold recovery must accept the
+	// exact write-once target binding and retain those completion proofs.
+	binding = manifest.State.Binding
+	transition, err = replicatedstate.AppendOwnershipTransition(nil, replicatedstate.OwnershipTransition{
+		From: binding, ExpectedReplicaSetVersion: manifest.State.ReplicaSetVersion, SourceMember: 1, TargetMember: 2,
+		ToOwnershipEpoch: binding.OwnershipEpoch + 1, ToRoutingVersion: binding.RoutingVersion + 1,
+		ToRouteGeneration: binding.RouteGeneration + 1, ToOwnedRange: binding.OwnedRange,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = activation.Apply.ApplyNormal(testReplicatedApplyMeta(5), transition); err != nil {
+		t.Fatal(err)
+	}
+	if err = errors.Join(activation.Apply.Close(), stage.Close(), target.Close()); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenReplicatedShardStoreWithApply(targetPath, targetBase, targetApplyID)
+	if err != nil {
+		t.Fatalf("cold open moved snapshot target: %v", err)
+	}
+	defer reopened.Close()
+	recovered, _, err := reopened.OpenReplicatedApply(targetBase, bootstrap, options)
+	if err != nil {
+		t.Fatalf("recover moved snapshot target: %v", err)
+	}
+	defer recovered.Close()
+	if recovered.Applied() != 5 {
+		t.Fatalf("recovered applied=%d, want 5", recovered.Applied())
+	}
+	if completion, lookupErr := recovered.LookupCompletion(command); lookupErr != nil || len(completion.Bytes) == 0 {
+		t.Fatalf("historical completion after snapshot, move and restart: %+v %v", completion, lookupErr)
 	}
 }

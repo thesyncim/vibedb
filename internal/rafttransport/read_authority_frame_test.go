@@ -36,8 +36,8 @@ func TestAuthorityFrameRoundTripRequestAndGrant(t *testing.T) {
 			if destination != receiver.LocalNode() {
 				t.Fatalf("destination = %x, want %x", destination, receiver.LocalNode())
 			}
-			if len(frame) != FrameHeaderBytes+raftauthority.CanonicalMessageBytes {
-				t.Fatalf("frame bytes = %d, want %d", len(frame), FrameHeaderBytes+raftauthority.CanonicalMessageBytes)
+			if len(frame) != AuthorityFrameHeaderBytes+raftauthority.CanonicalMessageBytes {
+				t.Fatalf("frame bytes = %d, want %d", len(frame), AuthorityFrameHeaderBytes+raftauthority.CanonicalMessageBytes)
 			}
 			again, againDestination, err := sender.EncodeOutbound(nil, outbound)
 			if err != nil {
@@ -236,7 +236,7 @@ func TestAuthorityFrameRejectsRetiredGenerationAndUnsupportedUnion(t *testing.T)
 		t.Fatalf("unsupported frame kind error = %v, want ErrUnsupportedFrame", err)
 	}
 
-	unsupportedUnion := bytes.Clone(frame[FrameHeaderBytes:])
+	unsupportedUnion := bytes.Clone(frame[AuthorityFrameHeaderBytes:])
 	unsupportedUnion[8] = 0x7f
 	if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, sender.LocalNode()), frameTestReplaceRawPayload(frame, unsupportedUnion)); !errors.Is(err, ErrInvalidFrame) {
 		t.Fatalf("unsupported authority union error = %v, want ErrInvalidFrame", err)

@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -279,7 +280,7 @@ func TestReplicatedExecutorKeepsBoundedRetryAliveThroughLeaderlessElection(t *te
 	}
 	completion, completionErr := replication.OpenCompletion(result.Completion)
 	if completionErr != nil || completion.ResultCode != replicatedstate.ResultApplied ||
-		result.Retries != 2 || client.leaderlessProbes != len(states) ||
+		result.Retries != 1 || client.leaderlessProbes != len(states) ||
 		!slices.Equal(client.addresses, []string{"m1", "m3"}) ||
 		len(client.commands) != 2 || !bytes.Equal(client.commands[0], command) ||
 		!bytes.Equal(client.commands[1], command) {
@@ -912,6 +913,54 @@ func TestReplicatedExecutorPostCutoverRouteDoesNotAdmitEarlierMembershipSteps(t 
 		context.Background(), cutover, uncutSource,
 	); !errors.Is(err, ErrReplicatedRoute) || client.calls != 0 {
 		t.Fatalf("serving source removal err=%v calls=%d", err, client.calls)
+	}
+}
+
+type restartedTransferReplicatedClient struct{ *transferReplicatedClient }
+
+func (client restartedTransferReplicatedClient) ProbeReplicated(ctx context.Context, _ ReplicatedRoute, endpoint ReplicatedEndpoint, _ serviceauthz.Capability) (*shardservice.ReplicatedResponse, error) {
+	return client.DoReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe})
+}
+
+func TestReplicatedExecutorTransfersRestartedRetiringLeaderAfterCatalogCutover(t *testing.T) {
+	for _, lostResponse := range []bool{false, true} {
+		serving, _, states := testReplicatedRouteCommand(t)
+		membership, states := testReplicatedMembershipRoute(serving, states)
+		source, target := serving.Replicas[1], membership.EnrolledTarget
+		serving.Replicas[1] = target
+		for address, state := range states {
+			state.LeaderID, state.Fence.Term = source.Member, 12
+			state.Fence.NodeIncarnation++ // same durable replica, restarted process
+			states[address] = state
+		}
+		cutover := ReplicatedMembershipRoute{Serving: serving, RetiringSource: source}
+		client := &transferReplicatedClient{states: states, failAfterMove: lostResponse}
+		executor, err := NewReplicatedExecutor(restartedTransferReplicatedClient{client}, 3, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := shardservice.ReplicatedMembershipRequest{
+			Kind: raftservice.MembershipTransferLeader, TransitionID: [16]byte{10},
+			MetadataEpoch: 11, CatalogGeneration: 12,
+			ExpectedReplicaSetVersion: serving.Command.ReplicaSetVersion,
+			SourceMember:              source.Member, TargetMember: target.Member,
+		}
+		result, err := executor.ApplyMembership(t.Context(), cutover, request)
+		if err != nil || client.membershipAt != source.Member ||
+			result.TransferWitness.TargetMember != target.Member || result.TransferWitness.Term <= 12 {
+			t.Fatalf("retiring leader was unreachable after catalog publication (lost response=%t): result=%+v sent-to=%d err=%v", lostResponse, result, client.membershipAt, err)
+		}
+		// The next controller process needs no retiring route after removal.
+		delete(states, source.Address)
+		executor, err = NewReplicatedExecutor(restartedTransferReplicatedClient{client}, 3, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cutover.RetiringSource = ReplicatedEndpoint{}
+		request.Kind = raftservice.MembershipRemoveVoter
+		if result, err = executor.ApplyMembership(t.Context(), cutover, request); err != nil || result.State.LeaderID != target.Member {
+			t.Fatalf("removal could not resume through surviving roster: result=%+v err=%v", result, err)
+		}
 	}
 }
 

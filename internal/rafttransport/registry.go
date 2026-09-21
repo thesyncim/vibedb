@@ -349,22 +349,14 @@ type dynamicEnrollment struct {
 }
 
 type authorityView struct {
-	version       uint64
-	roles         map[uint64]MemberRole
-	previous      *authorityView
-	allowPrevious bool
-	// retiredVersion records only the exact authority revoked by source
-	// removal. Its roles are deliberately not retained or accepted.
-	retiredVersion uint64
-	grant          membershipgrant.Grant
-	revokedGrant   membershipgrant.Grant
-	promotion      *raftmember.DurablePromotionProof
-	// replay reads only this group's retained durable log. Its lifetime is the
-	// installed Runtime incarnation; it carries no historical membership roles.
+	version      uint64
+	roles        map[uint64]MemberRole
+	grant        membershipgrant.Grant
+	revokedGrant membershipgrant.Grant
+	promotion    *raftmember.DurablePromotionProof
+	// replay belongs to the same durable Runtime incarnation. It proves old
+	// configuration bytes, never a historical sender role.
 	replay raftmember.CommittedConfigurationReplay
-	// prospective is transient evidence for one received, exactly granted
-	// configuration sequence. It is never stored in an authoritySlot.
-	prospective *prospectiveConfigurationSequence
 }
 
 type authoritySlot struct{ view atomic.Pointer[authorityView] }
@@ -801,11 +793,6 @@ func (registry *StaticRegistry) physicalPeerFrom(
 	return peer, ok
 }
 
-func samePhysicalPeer(left, right PhysicalPeer) bool {
-	return samePhysicalIdentity(left, right) &&
-		left.EnrollmentDigest == right.EnrollmentDigest
-}
-
 func samePhysicalIdentity(left, right PhysicalPeer) bool {
 	return left.NodeID == right.NodeID && left.TrustDomain == right.TrustDomain &&
 		left.Incarnation == right.Incarnation && left.Revision == right.Revision &&
@@ -953,7 +940,12 @@ func (registry *StaticRegistry) enrollPeerWithCommitContext(
 		current = &dynamicEnrollment{directoryRevision: registry.directoryRevision}
 	}
 	if existing, ok := registry.physicalPeerFrom(current, intent.Peer.NodeID); ok {
-		if existing.EnrollmentDigest == intent.Digest && samePhysicalPeer(existing, intent.Peer) {
+		// An exact authenticated enrollment retry may precede later lifecycle
+		// revisions of the same principal. Acknowledge it without changing the
+		// current record; it cannot revive retirement, rotate a key, or downgrade
+		// an endpoint/incarnation. Verification above still runs on every retry.
+		if existing.EnrollmentDigest == intent.Digest &&
+			existing.Revision >= intent.Peer.Revision && samePhysicalBinding(existing, intent.Peer) {
 			if commit != nil {
 				return commit()
 			}
@@ -2026,21 +2018,15 @@ func (registry *StaticRegistry) RevokeTransitionGrant(expected membershipgrant.G
 }
 
 func (registry *StaticRegistry) PublishCommittedAuthority(
-	group raftmember.GroupKey,
-	version uint64,
-	conf *pb.ConfState,
+	group raftmember.GroupKey, version uint64, conf *pb.ConfState,
 ) error {
 	return registry.publishCommittedAuthority(group, version, conf, nil)
 }
 
-// PublishCommittedAuthorityWithReplay binds the applied membership cut to the
-// same Runtime's concurrent, read-only durable log capability. Historical
-// configuration entries may then be replayed only when their complete durable
-// contents match; retained-log compaction naturally bounds that evidence.
+// PublishCommittedAuthorityWithReplay publishes one durable membership cut and
+// its exact retained-log evidence. No previous or prospective role is retained.
 func (registry *StaticRegistry) PublishCommittedAuthorityWithReplay(
-	group raftmember.GroupKey,
-	version uint64,
-	conf *pb.ConfState,
+	group raftmember.GroupKey, version uint64, conf *pb.ConfState,
 	replay raftmember.CommittedConfigurationReplay,
 ) error {
 	if replay == nil {
@@ -2050,9 +2036,7 @@ func (registry *StaticRegistry) PublishCommittedAuthorityWithReplay(
 }
 
 func (registry *StaticRegistry) publishCommittedAuthority(
-	group raftmember.GroupKey,
-	version uint64,
-	conf *pb.ConfState,
+	group raftmember.GroupKey, version uint64, conf *pb.ConfState,
 	replay raftmember.CommittedConfigurationReplay,
 ) error {
 	if registry == nil || version == 0 || conf == nil {
@@ -2066,51 +2050,29 @@ func (registry *StaticRegistry) publishCommittedAuthority(
 	}
 	current := slot.view.Load()
 	if version == current.version {
-		if confMatchesRoles(conf, current.roles) {
-			if replay != nil && !sameConfigurationReplay(current.replay, replay) {
-				next := *current
-				next.replay = replay
-				slot.view.Store(&next)
-			}
-			return nil
+		if !confMatchesRoles(conf, current.roles) {
+			return ErrReplicaSet
 		}
-		return ErrReplicaSet
+		if replay != nil && !sameConfigurationReplay(current.replay, replay) {
+			next := *current
+			next.replay = replay
+			slot.view.Store(&next)
+		}
+		return nil
 	}
 	roles, err := registry.rolesFromConf(group, conf)
 	if err != nil {
 		return err
 	}
-	for {
-		current := slot.view.Load()
-		if version == current.version {
-			if equalRoles(current.roles, roles) {
-				return nil
-			}
-			return ErrReplicaSet
-		}
-		if version < current.version || !validAdjacentRoles(current, roles) {
-			return ErrReplicaSet
-		}
-		_, hadSource := current.roles[current.grant.SourceMember]
-		_, hasSource := roles[current.grant.SourceMember]
-		removed := current.grant.SourceMember != 0 && hadSource && !hasSource
-		var previous *authorityView
-		var retiredVersion uint64
-		if !removed {
-			previous = &authorityView{version: current.version, roles: current.roles, grant: current.grant, replay: current.replay}
-		} else {
-			retiredVersion = current.version
-		}
-		next := &authorityView{version: version, roles: roles, grant: current.grant,
-			revokedGrant: current.revokedGrant,
-			previous:     previous, allowPrevious: !removed, retiredVersion: retiredVersion, replay: current.replay}
-		if replay != nil {
-			next.replay = replay
-		}
-		if slot.view.CompareAndSwap(current, next) {
-			return nil
-		}
+	if version < current.version || !validAdjacentRoles(current, roles) {
+		return ErrReplicaSet
 	}
+	if replay == nil {
+		replay = current.replay
+	}
+	slot.view.Store(&authorityView{version: version, roles: roles, grant: current.grant,
+		revokedGrant: current.revokedGrant, replay: replay})
+	return nil
 }
 
 // Runtime capabilities are stable pointers. Keep their steady-state owner
@@ -2455,11 +2417,6 @@ func (registry *StaticRegistry) peerInUse(node NodeID) bool {
 			if view.grant.SourceMember == key.memberID || view.grant.TargetMember == key.memberID {
 				return true
 			}
-			if view.previous != nil {
-				if _, active := view.previous.roles[key.memberID]; active {
-					return true
-				}
-			}
 		}
 	}
 	current := registry.dynamic.Load()
@@ -2478,11 +2435,34 @@ func (registry *StaticRegistry) peerInUse(node NodeID) bool {
 				if view.grant.SourceMember == key.memberID || view.grant.TargetMember == key.memberID {
 					return true
 				}
-				if view.previous != nil {
-					if _, active := view.previous.roles[key.memberID]; active {
-						return true
-					}
-				}
+			}
+		}
+	}
+	return false
+}
+
+// peerReplicates reports the union of current replication participants across
+// all hosted groups. Historical enrollment and completed transition receipts
+// retain identity, but do not require a live outbound stream. Callers selecting
+// queues for reclamation hold dynamicMu across this check and their selection.
+func (registry *StaticRegistry) peerReplicates(node NodeID) bool {
+	current := registry.dynamic.Load()
+	active := func(key memberKey, record memberRecord) bool {
+		if record.node != node || registry.memberIsRetired(current, key) {
+			return false
+		}
+		view, ok := registry.currentAuthority(key.group)
+		return ok && replicationRole(view, key.memberID) != MemberEnrolled
+	}
+	for key, record := range registry.nodes {
+		if active(key, record) {
+			return true
+		}
+	}
+	if current != nil {
+		for key, record := range current.nodes {
+			if active(key, record) {
+				return true
 			}
 		}
 	}
@@ -2699,7 +2679,6 @@ func (registry *StaticRegistry) RetireMember(
 	}
 	if _, active := view.roles[proof.MemberID]; active ||
 		view.grant.SourceMember == proof.MemberID || view.grant.TargetMember == proof.MemberID ||
-		(view.previous != nil && view.previous.roles[proof.MemberID] != MemberEnrolled) ||
 		(view.promotion != nil && view.promotion.TargetMember == proof.MemberID) {
 		return ErrPeerInUse
 	}
@@ -2988,68 +2967,6 @@ func (registry *StaticRegistry) AcceptsEnrollmentRosterDigest(
 	return err == nil && expected == digest
 }
 
-// outboundRosterDigest chooses the handoff digest for an already-authorized
-// pair while a new physical/member mapping is being rolled through the
-// cluster.  The legacy cut is restricted to member IDs and node identities
-// that were present before enrollment; traffic involving the new target must
-// use the current complete roster and remains blocked until ConfState grants a
-// role to that member.
-func (registry *StaticRegistry) outboundRosterDigest(
-	group raftmember.GroupKey,
-	from, to uint64,
-	current [sha256.Size]byte,
-) [sha256.Size]byte {
-	if registry == nil {
-		return current
-	}
-	view := registry.dynamic.Load()
-	if view == nil {
-		return current
-	}
-	legacy, ok := view.legacyDigests[group]
-	if !ok || legacy == ([sha256.Size]byte{}) {
-		return current
-	}
-	members := view.legacyMembers[group]
-	if members == nil {
-		return current
-	}
-	if _, ok := members[from]; !ok {
-		return current
-	}
-	if _, ok := members[to]; !ok {
-		return current
-	}
-	return legacy
-}
-
-// acceptsRosterDigest accepts the current complete roster or one bounded
-// adjacent handoff cut.  A legacy digest is valid only when both endpoints
-// were present in that exact old member-to-node mapping and the authenticated
-// source/destination still match those identities.  This keeps staggered
-// enrollment from partitioning existing traffic without accepting arbitrary
-// stale endpoint claims.
-func (registry *StaticRegistry) acceptsRosterDigest(
-	group raftmember.GroupKey,
-	digest [sha256.Size]byte,
-	from, to uint64,
-	source, destination NodeID,
-	current [sha256.Size]byte,
-) bool {
-	if digest == current {
-		return true
-	}
-	if registry == nil {
-		return false
-	}
-	view := registry.dynamic.Load()
-	if view == nil || view.legacyDigests[group] != digest {
-		return false
-	}
-	members := view.legacyMembers[group]
-	return members != nil && members[from] == source && members[to] == destination
-}
-
 func (registry *StaticRegistry) currentAuthority(group raftmember.GroupKey) (*authorityView, bool) {
 	if registry == nil {
 		return nil, false
@@ -3060,23 +2977,6 @@ func (registry *StaticRegistry) currentAuthority(group raftmember.GroupKey) (*au
 	}
 	view := slot.view.Load()
 	return view, view != nil
-}
-
-func (registry *StaticRegistry) authorityAt(
-	group raftmember.GroupKey,
-	version uint64,
-) (*authorityView, bool) {
-	current, ok := registry.currentAuthority(group)
-	if !ok {
-		return nil, false
-	}
-	if current.version == version {
-		return current, true
-	}
-	if current.allowPrevious && current.previous != nil && current.previous.version == version {
-		return current.previous, true
-	}
-	return nil, false
 }
 
 func compareMembers(left, right Member) int {

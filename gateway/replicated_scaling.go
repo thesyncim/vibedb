@@ -2211,6 +2211,9 @@ func (authority *ReplicatedCatalogAuthority) enrollmentParentMutations(ctx conte
 				return nil, ErrScalingState
 			}
 			next.CompletedReplicas++
+			if intent.Distribution == ReplicatedCatalogDistribution || intent.Distribution == "request-ledger" {
+				next.CompletedInternalReplicas++
+			}
 			next.OutstandingMoves = slices.DeleteFunc(slices.Clone(next.OutstandingMoves), func(id [32]byte) bool { return id == intent.MoveOperationID })
 			changed = true
 		case EnrollmentCancelled:

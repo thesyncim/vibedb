@@ -134,6 +134,7 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 	if executor == nil || executor.client == nil || ctx == nil || req == nil || !validReplicatedRoute(route) {
 		return nil, ErrReplicatedRoute
 	}
+	route.membershipStable = true
 	// The shell is plan-owned, used synchronously, and scrubbed on release,
 	// so stamping the authority in place (as the route stage already does
 	// for the other per-dispatch fields) saves a ~1KB struct copy per query.
@@ -167,6 +168,9 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 		endpoint, state, err := executor.discoverLeader(ctx, route, preferred, serviceauthz.CapabilityDataRead)
 		if err != nil {
 			joined = errors.Join(joined, err)
+			if terminalReplicatedDiscoveryError(err) {
+				return nil, joined
+			}
 			preferred = 0
 			continue
 		}
@@ -192,7 +196,7 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 			continue
 		}
 		if !validReplicatedResponseState(response) || response.State.Fence.Group != route.Group ||
-			response.State.Fence.AllocationGeneration != route.AllocationGeneration || response.State.Fence.Command != route.Command {
+			response.State.Fence.AllocationGeneration != route.AllocationGeneration || !replicatedObservedCommandMatches(route, response.State.Fence.Command) {
 			return nil, ErrStaleGeneration
 		}
 		switch response.Kind {

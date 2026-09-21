@@ -1589,31 +1589,37 @@ func (owner *Owner) syncMembershipAuthority(group raftmember.GroupKey) error {
 		}
 		if replay != nil {
 			err = replayAuthority.PublishCommittedAuthorityWithReplay(
-				group, publication.ReplicaSetVersion, publication.ConfState, replay,
-			)
+				group, publication.ReplicaSetVersion, publication.ConfState, replay)
 		} else {
 			err = owner.authority.PublishCommittedAuthority(
-				group, publication.ReplicaSetVersion, publication.ConfState,
-			)
+				group, publication.ReplicaSetVersion, publication.ConfState)
 		}
 	} else {
 		err = owner.authority.PublishCommittedAuthority(
-			group, publication.ReplicaSetVersion, publication.ConfState,
-		)
+			group, publication.ReplicaSetVersion, publication.ConfState)
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("publish group %x membership version %d: %w", group.GroupID, publication.ReplicaSetVersion, err)
 	}
 	grant, grantFound, err := owner.authority.CurrentTransitionGrant(group)
 	if err != nil || !grantFound {
 		return err
+	}
+	// A promotion witness only authorizes elections for an applied learner.
+	// Restart may retain both AddLearner and AddNode after the applied cut;
+	// replay the learner first instead of publishing its later witness early.
+	if !containsSorted(publication.ConfState.GetLearners(), grant.TargetMember) {
+		return owner.authority.ClearDurablePromotion(group)
 	}
 	proof, found, err := owner.host.DurablePromotion(group, grant.TargetMember)
 	if err != nil {
 		return err
 	}
 	if found {
-		return owner.authority.PublishDurablePromotion(group, proof)
+		if err := owner.authority.PublishDurablePromotion(group, proof); err != nil {
+			return fmt.Errorf("publish group %x promotion at version %d: %w", group.GroupID, proof.Version, err)
+		}
+		return nil
 	}
 	return owner.authority.ClearDurablePromotion(group)
 }

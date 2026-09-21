@@ -41,6 +41,7 @@ var (
 	ErrReplicatedReadIntentActive = errors.New("gateway: replicated read intersects an active transaction intent")
 	ErrReplicatedUnauthorized     = errors.New("gateway: replicated authorization denied")
 	errReplicatedLeaderUnobserved = errors.New("gateway: no authenticated replica reported itself as leader")
+	errReplicatedNotAdmitted      = errors.New("gateway: replicated command was not admitted by this invocation")
 )
 
 // ReplicatedEndpoint binds one Raft member to its cold network address. Member
@@ -70,18 +71,39 @@ type ReplicatedRoute struct {
 	LineageDigest        replication.Digest
 	ForwardingRuleDigest replication.Digest
 	Replicas             []ReplicatedEndpoint
-	// Enabled only by an explicitly membership-stable command or its gate
-	// read. This is not catalog authority and never changes command bytes.
+	// Reads bind logical catalog ownership, then use the exact authenticated
+	// live membership fence for ReadIndex. Stable commands use the same
+	// discovery rule without changing their retained command bytes.
 	membershipStable bool
 }
 
 // ReplicatedMembershipRoute keeps membership reachability separate from the
-// public data route. Serving always remains the active RF3; EnrolledTarget is
-// the sole replacement endpoint membership control may additionally probe.
+// public data route. Serving always remains the active RF3. The one extra
+// control endpoint is the enrolled target before publication, or the retiring
+// source from the active durable move after publication and before removal.
 type ReplicatedMembershipRoute struct {
 	Serving           ReplicatedRoute
 	EnrolledTarget    ReplicatedEndpoint
 	HasEnrolledTarget bool
+	RetiringSource    ReplicatedEndpoint
+}
+
+// AppendControlEndpoints appends the bounded transition discovery directory.
+// It never changes the serving data route or accepts an endpoint from a leader
+// hint. RetiringSource must come from the exact active durable move intent.
+func (route ReplicatedMembershipRoute) AppendControlEndpoints(dst []ReplicatedEndpoint) []ReplicatedEndpoint {
+	dst = append(dst, route.Serving.Replicas...)
+	if endpoint := route.extraControlEndpoint(); endpoint.Member != 0 {
+		dst = append(dst, endpoint)
+	}
+	return dst
+}
+
+func (route ReplicatedMembershipRoute) extraControlEndpoint() ReplicatedEndpoint {
+	if route.HasEnrolledTarget {
+		return route.EnrolledTarget
+	}
+	return route.RetiringSource
 }
 
 // ReplicatedRoundTripper performs one native request. Implementations must not
@@ -266,6 +288,9 @@ func (executor *ReplicatedExecutor) ReadExecutionPin(
 		)
 		if err != nil {
 			joined = errors.Join(joined, err)
+			if terminalReplicatedDiscoveryError(err) {
+				return ReplicatedExecutionPinReadResult{}, joined
+			}
 			preferred = 0
 			continue
 		}
@@ -405,6 +430,9 @@ func (executor *ReplicatedExecutor) ReadRequestLedger(
 			serviceauthz.CapabilityRequestLedger)
 		if err != nil {
 			joined = errors.Join(joined, err)
+			if terminalReplicatedDiscoveryError(err) {
+				return ReplicatedRequestLedgerReadResult{}, joined
+			}
 			preferred = 0
 			continue
 		}
@@ -530,6 +558,7 @@ func (executor *ReplicatedExecutor) ReadPointBatch(
 		read.MaxResultBytes > replicatedstate.MaxPointReadBatchBytes {
 		return ReplicatedBatchPointResult{}, ErrReplicatedRoute
 	}
+	route.membershipStable = true
 	packed, err := replicatedstate.AppendPointReadBatch(nil, read.Points)
 	if err != nil {
 		return ReplicatedBatchPointResult{}, ErrReplicatedRoute
@@ -542,12 +571,10 @@ func (executor *ReplicatedExecutor) ReadPointBatch(
 		)
 		if discoverErr != nil {
 			joined = errors.Join(joined, discoverErr)
-			preferred = 0
-			if errors.Is(discoverErr, errReplicatedLeaderUnobserved) && attempt+1 < executor.maxAttempts {
-				if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
-					return ReplicatedBatchPointResult{}, errors.Join(ErrReplicatedLeader, joined, waitErr)
-				}
+			if terminalReplicatedDiscoveryError(discoverErr) {
+				return ReplicatedBatchPointResult{}, joined
 			}
+			preferred = 0
 			continue
 		}
 		response, callErr := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
@@ -579,7 +606,7 @@ func (executor *ReplicatedExecutor) ReadPointBatch(
 			preferred = 0
 			continue
 		}
-		if response.State.Fence.Command != route.Command {
+		if !replicatedObservedCommandMatches(route, response.State.Fence.Command) {
 			executor.leaderHints.invalidate(route, endpoint, state)
 			if validReplicatedReadRefusal(response, shardservice.ReplicatedRefusalStaleFence) {
 				return ReplicatedBatchPointResult{}, &ReplicatedRefusalError{Code: response.Refusal}
@@ -711,6 +738,9 @@ func (executor *ReplicatedExecutor) readPointWithEndpointMode(
 		read.MaxValueBytes > replication.MaxMutationValueBytes {
 		return ReplicatedPointResult{}, ErrReplicatedRoute
 	}
+	if capability == serviceauthz.CapabilityDataRead {
+		route.membershipStable = true
+	}
 	preferred := route.Replicas[0].Member
 	var joined error
 	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
@@ -724,12 +754,10 @@ func (executor *ReplicatedExecutor) readPointWithEndpointMode(
 		}
 		if err != nil {
 			joined = errors.Join(joined, err)
-			preferred = 0
-			if errors.Is(err, errReplicatedLeaderUnobserved) && attempt+1 < executor.maxAttempts {
-				if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
-					return ReplicatedPointResult{}, errors.Join(ErrReplicatedLeader, joined, waitErr)
-				}
+			if terminalReplicatedDiscoveryError(err) {
+				return ReplicatedPointResult{}, joined
 			}
+			preferred = 0
 			continue
 		}
 		operation := shardservice.ReplicatedReadFollower
@@ -764,7 +792,7 @@ func (executor *ReplicatedExecutor) readPointWithEndpointMode(
 			preferred = 0
 			continue
 		}
-		if response.State.Fence.Command != route.Command {
+		if !replicatedObservedCommandMatches(route, response.State.Fence.Command) {
 			executor.leaderHints.invalidate(route, endpoint, state)
 			if validReplicatedReadRefusal(
 				response, shardservice.ReplicatedRefusalStaleFence,
@@ -856,24 +884,20 @@ func (executor *ReplicatedExecutor) readEndpoint(
 	// capacity. Every candidate is authenticated by a fresh exact probe.
 	var joined error
 	for _, endpoint := range route.Replicas {
-		response, err := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
-			Operation: shardservice.ReplicatedProbe, Capability: capability,
-			Fence: shardservice.ReplicatedFence{Group: route.Group,
-				AllocationGeneration: route.AllocationGeneration, Command: route.Command},
-		})
+		response, observedEndpoint, err := executor.probeReplicated(ctx, route, endpoint, capability)
 		if err != nil || response == nil || response.Kind != shardservice.ReplicatedHandshake ||
 			!validReplicatedResponseState(response) ||
 			!validReplicatedNonterminalResponse(response) ||
 			response.State.Fence.MemberID != endpoint.Member ||
 			response.State.Fence.Group != route.Group ||
 			response.State.Fence.AllocationGeneration != route.AllocationGeneration ||
-			response.State.Fence.Command != route.Command {
+			!replicatedObservedCommandMatches(route, response.State.Fence.Command) {
 			joined = errors.Join(joined, err, ErrReplicatedRoute)
 			continue
 		}
 		if response.State.Applied >= read.MinimumApplied &&
 			response.State.Fence.MemberID != response.State.LeaderID {
-			return endpoint, response.State, nil
+			return observedEndpoint, response.State, nil
 		}
 	}
 	// A leader is also a valid index-bounded replica.
@@ -973,7 +997,7 @@ func (executor *ReplicatedExecutor) ObserveMembershipTransfer(
 ) (ReplicatedMembershipResult, error) {
 	if executor == nil || executor.client == nil || ctx == nil ||
 		!validReplicatedMembershipRoute(route) || target == 0 || afterTerm == 0 ||
-		!route.HasEnrolledTarget || target != route.EnrolledTarget.Member {
+		!membershipTransferTarget(route, target) {
 		return ReplicatedMembershipResult{}, ErrReplicatedRoute
 	}
 	result, witnessed := executor.observeMembershipTransfer(ctx, route, target, afterTerm)
@@ -1104,6 +1128,10 @@ func membershipRequestMatchesRoute(
 	route ReplicatedMembershipRoute,
 	membership shardservice.ReplicatedMembershipRequest,
 ) bool {
+	if membership.Kind == raftservice.MembershipTransferLeader {
+		return membershipTransferTarget(route, membership.TargetMember) &&
+			(route.HasEnrolledTarget || route.RetiringSource.Member == membership.SourceMember)
+	}
 	if membership.Kind != raftservice.MembershipRemoveVoter {
 		return route.HasEnrolledTarget && membership.TargetMember == route.EnrolledTarget.Member
 	}
@@ -1115,6 +1143,13 @@ func membershipRequestMatchesRoute(
 	}
 	return replicatedRouteContainsMember(route.Serving, membership.TargetMember) &&
 		!replicatedRouteContainsMember(route.Serving, membership.SourceMember)
+}
+
+func membershipTransferTarget(route ReplicatedMembershipRoute, target uint64) bool {
+	if route.HasEnrolledTarget {
+		return target == route.EnrolledTarget.Member
+	}
+	return route.RetiringSource.Member != 0 && replicatedRouteContainsMember(route.Serving, target)
 }
 
 func (executor *ReplicatedExecutor) observeMembershipTransfer(
@@ -1270,6 +1305,43 @@ func (executor *ReplicatedExecutor) propose(
 	capability serviceauthz.Capability,
 	unknownCommandMode replicatedUnknownCommandMode,
 ) (ReplicatedResult, error) {
+	result, err := executor.proposeAttempts(ctx, route, command, hint, priorUnknown, capability, unknownCommandMode)
+	if !replicatedDefiniteUnavailable(err) {
+		return result, err
+	}
+	// A complete typed pre-admission refusal proves this invocation submitted
+	// nothing. Wait for the serving gate to settle without changing the command
+	// or spending the allowance for possibly admitted proposals. The timer is
+	// cold-path only; the caller and configured total attempt budget bound it.
+	recoveryCtx, cancel := context.WithTimeout(ctx, time.Duration(executor.maxAttempts)*executor.attemptTimeout)
+	defer cancel()
+	for retry := 0; ; retry++ {
+		if waitErr := waitReplicatedFailoverRetry(recoveryCtx, retry); waitErr != nil {
+			return ReplicatedResult{}, errors.Join(err, waitErr)
+		}
+		result, err = executor.proposeAttempts(recoveryCtx, route, command, nil, priorUnknown, capability, unknownCommandMode)
+		if !replicatedDefiniteUnavailable(err) {
+			result.Retries += retry + 1
+			return result, err
+		}
+	}
+}
+
+func replicatedDefiniteUnavailable(err error) bool {
+	var refusal *ReplicatedRefusalError
+	return !errors.Is(err, raftservice.ErrOutcomeUnknown) && !terminalReplicatedDiscoveryError(err) && errors.As(err, &refusal) &&
+		refusal.Code == shardservice.ReplicatedRefusalUnavailable
+}
+
+func (executor *ReplicatedExecutor) proposeAttempts(
+	ctx context.Context,
+	route ReplicatedRoute,
+	command []byte,
+	hint *shardservice.ReplicatedMemberState,
+	priorUnknown bool,
+	capability serviceauthz.Capability,
+	unknownCommandMode replicatedUnknownCommandMode,
+) (ReplicatedResult, error) {
 	if executor == nil || executor.client == nil || ctx == nil ||
 		!validReplicatedRoute(route) || len(command) == 0 ||
 		len(command) > replication.MaxCommandBytes {
@@ -1328,7 +1400,7 @@ func (executor *ReplicatedExecutor) propose(
 			if err != nil {
 				if lastUnknown != nil {
 					lastUnknown = errors.Join(lastUnknown, err)
-					if attempt+1 == executor.maxAttempts || context.Cause(ctx) != nil {
+					if attempt+1 == executor.maxAttempts || context.Cause(ctx) != nil || terminalReplicatedDiscoveryError(err) {
 						return ReplicatedResult{}, replicatedUnknownOutcomeError(
 							original, lastUnknown, unknownCommandMode,
 						)
@@ -1341,21 +1413,7 @@ func (executor *ReplicatedExecutor) propose(
 					}
 					continue
 				}
-				// A complete, authenticated sweep can precede the initial
-				// election. Spend the existing retry budget without submitting
-				// or rebuilding the command. Refusals, transport errors and
-				// mismatched fences do not qualify for this startup retry.
-				if errors.Is(err, errReplicatedLeaderUnobserved) {
-					if attempt+1 == executor.maxAttempts {
-						return ReplicatedResult{}, fmt.Errorf("gateway: leader discovery exhausted after %d attempts: %w", attempt+1, err)
-					}
-					preferred = 0
-					if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
-						return ReplicatedResult{}, errors.Join(err, waitErr)
-					}
-					continue
-				}
-				return ReplicatedResult{}, err
+				return ReplicatedResult{}, errors.Join(errReplicatedNotAdmitted, err)
 			}
 		}
 		preferred = state.LeaderID
@@ -1391,6 +1449,7 @@ func (executor *ReplicatedExecutor) propose(
 		// only when no earlier attempt could have been admitted. A later generic
 		// pre-admission refusal cannot resolve an earlier unknown outcome.
 		if validReplicatedUnavailableWithoutState(response) {
+			executor.leaderHints.invalidate(route, endpoint, state)
 			if lastUnknown != nil {
 				continue
 			}
@@ -1553,6 +1612,7 @@ func (executor *ReplicatedExecutor) propose(
 				lastUnknown = errors.Join(lastUnknown, ErrReplicatedRoute)
 				continue
 			}
+			executor.leaderHints.invalidate(route, endpoint, state)
 			if lastUnknown != nil {
 				continue
 			}
@@ -1597,10 +1657,8 @@ func waitReplicatedFailoverRetry(ctx context.Context, attempt int) error {
 	// Failover is exceptional, so spend a small bounded wall-clock budget to
 	// avoid burning every retry while the replacement term is still settling.
 	// The normal proposal path never creates a timer. Twenty milliseconds keeps a
-	// one-race retry responsive. The shipped eight-attempt executor waits at
-	// most 1.26 s, spanning the harness's 950 ms maximum randomized election
-	// timeout with scheduler margin; the absolute sixteen-attempt configuration
-	// remains below 4 s.
+	// one-race retry responsive. Read-only election readiness uses an elapsed
+	// deadline independently of the number of mutating proposal attempts.
 	delay := replicatedFailoverRetryDelay(attempt)
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -1684,6 +1742,39 @@ func (executor *ReplicatedExecutor) discoverLeaderFresh(
 	preferred uint64,
 	capability serviceauthz.Capability,
 ) (ReplicatedEndpoint, shardservice.ReplicatedMemberState, error) {
+	endpoint, state, err := executor.discoverLeaderOnce(ctx, route, preferred, capability)
+	if err == nil || !errors.Is(err, errReplicatedLeaderUnobserved) {
+		return endpoint, state, err
+	}
+	// A complete authenticated sweep can finish before an election or restart
+	// quarantine. Such a sweep submitted nothing and must not consume proposal
+	// attempts. Allocate a timer only on this cold path, bounded by the caller
+	// and the existing configured total attempt budget. Other failures do not
+	// authorize a readiness retry.
+	recoveryCtx, cancel := context.WithTimeout(ctx, time.Duration(executor.maxAttempts)*executor.attemptTimeout)
+	defer cancel()
+	for retry := 0; ; retry++ {
+		if waitErr := waitReplicatedFailoverRetry(recoveryCtx, retry); waitErr != nil {
+			return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{}, errors.Join(err, waitErr)
+		}
+		endpoint, state, err = executor.discoverLeaderOnce(recoveryCtx, route, preferred, capability)
+		if err == nil || !errors.Is(err, errReplicatedLeaderUnobserved) {
+			return endpoint, state, err
+		}
+	}
+}
+
+func terminalReplicatedDiscoveryError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, ErrReplicatedUnauthorized) || errors.Is(err, ErrReplicatedRoute)
+}
+
+func (executor *ReplicatedExecutor) discoverLeaderOnce(
+	ctx context.Context,
+	route ReplicatedRoute,
+	preferred uint64,
+	capability serviceauthz.Capability,
+) (ReplicatedEndpoint, shardservice.ReplicatedMemberState, error) {
 	if executor.parallelDiscovery() {
 		endpoint, state, err := executor.discoverResponsiveLeader(ctx, route, route.Replicas, preferred, capability, false)
 		if err == nil {
@@ -1743,9 +1834,9 @@ func (executor *ReplicatedExecutor) discoverLeaderFresh(
 		errors.Join(ErrReplicatedLeader, joined)
 }
 
-// discoverMembershipLeaderFresh probes only the active serving RF3 and the
-// single enrolled replacement. It deliberately does not consult data-route
-// leader hints: after transfer, the leader may be the non-serving target.
+// discoverMembershipLeaderFresh uses the same bounded transition directory as
+// the move observer. A promoted target or not-yet-removed source may lead while
+// absent from the serving data route.
 func (executor *ReplicatedExecutor) discoverMembershipLeaderFresh(
 	ctx context.Context,
 	route ReplicatedMembershipRoute,
@@ -1755,7 +1846,7 @@ func (executor *ReplicatedExecutor) discoverMembershipLeaderFresh(
 	visited := uint8(0)
 	member := preferred
 	limit := len(route.Serving.Replicas)
-	if route.HasEnrolledTarget {
+	if route.extraControlEndpoint().Member != 0 {
 		limit++
 	}
 	var joined error
@@ -1954,10 +2045,14 @@ func validReplicatedMembershipRoute(route ReplicatedMembershipRoute) bool {
 	if !validReplicatedRoute(route.Serving) || len(route.Serving.Replicas) != ServingReplicaCount {
 		return false
 	}
-	if !route.HasEnrolledTarget {
-		return route.EnrolledTarget == (ReplicatedEndpoint{})
+	if !route.HasEnrolledTarget && route.EnrolledTarget != (ReplicatedEndpoint{}) ||
+		route.HasEnrolledTarget && route.RetiringSource != (ReplicatedEndpoint{}) {
+		return false
 	}
-	target := route.EnrolledTarget
+	target := route.extraControlEndpoint()
+	if target == (ReplicatedEndpoint{}) {
+		return !route.HasEnrolledTarget
+	}
 	if !validReplicatedEndpoint(target) {
 		return false
 	}
@@ -2028,8 +2123,8 @@ func replicatedMembershipEndpoint(
 	if endpoint, ordinal, ok := replicatedEndpoint(route.Serving, member); ok {
 		return endpoint, uint8(ordinal), true
 	}
-	if route.HasEnrolledTarget && route.EnrolledTarget.Member == member {
-		return route.EnrolledTarget, uint8(len(route.Serving.Replicas)), true
+	if extra := route.extraControlEndpoint(); extra.Member != 0 && extra.Member == member {
+		return extra, uint8(len(route.Serving.Replicas)), true
 	}
 	return ReplicatedEndpoint{}, 0, false
 }
@@ -2044,8 +2139,8 @@ func firstUnvisitedReplicatedMembershipEndpoint(
 		}
 	}
 	ordinal := uint8(len(route.Serving.Replicas))
-	if route.HasEnrolledTarget && visited&(uint8(1)<<ordinal) == 0 {
-		return route.EnrolledTarget, ordinal, true
+	if extra := route.extraControlEndpoint(); extra.Member != 0 && visited&(uint8(1)<<ordinal) == 0 {
+		return extra, ordinal, true
 	}
 	return ReplicatedEndpoint{}, 0, false
 }

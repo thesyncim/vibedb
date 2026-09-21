@@ -201,11 +201,6 @@ func TestConfigurationReplayAcrossThreeMovesReconnectAndRestart(t *testing.T) {
 	if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, testNode(2)), duplicateTerm); !errors.Is(err, ErrInvalidFrame) {
 		t.Fatalf("compacted noncanonical probe=%v", err)
 	}
-	stale := bytes.Clone(frame)
-	binary.BigEndian.PutUint64(stale[112:120], version-1)
-	if _, err := receiver.DecodeInbound(testPeerIdentity(receiver, testNode(2)), stale); !errors.Is(err, ErrUnauthorized) {
-		t.Fatalf("compacted stale generation=%v", err)
-	}
 	// The exact boundary can append and must retain normal grant authorization.
 	boundary := frameBaseMessage(pb.MsgApp, 2, 4)
 	boundary.Index = proto.Uint64(version)

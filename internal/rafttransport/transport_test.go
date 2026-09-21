@@ -572,7 +572,7 @@ func TestFrameBufferCapacityClassesBoundRetainedOverhead(t *testing.T) {
 		capacity     int
 		cacheable    bool
 	}{
-		{size: FrameHeaderBytes, retain: DefaultRetainedFrameBytes, capacity: 256, cacheable: true},
+		{size: FrameHeaderBytes, retain: DefaultRetainedFrameBytes, capacity: 128, cacheable: true},
 		{size: 256, retain: DefaultRetainedFrameBytes, capacity: 256, cacheable: true},
 		{size: 257, retain: DefaultRetainedFrameBytes, capacity: 512, cacheable: true},
 		{size: 400, retain: 500, capacity: 500, cacheable: true},
@@ -776,7 +776,7 @@ func TestOrdinaryTransportReconnectUsesInjectedBackoffAndRetainsFrame(t *testing
 	if failure.Node != fixture.remote[0].Node || failure.Phase != peerFailurePhaseDial ||
 		failure.Cause != "closed-pipe" || failure.Group != fixture.group ||
 		failure.From != fixture.local.MemberID || failure.To != fixture.remote[0].MemberID ||
-		failure.Version != 1 || failure.Kind != "ordinary" || failure.MessageType != int32(pb.MsgHeartbeat) ||
+		failure.Version != 0 || failure.Kind != "ordinary" || failure.MessageType != int32(pb.MsgHeartbeat) ||
 		failure.Index != 9 || failure.Term != 5 {
 		t.Fatalf("dial failure snapshot = %+v", failure)
 	}
@@ -835,7 +835,7 @@ func TestOrdinaryTransportHandlesPartialWritesAndRetriesFailedWrite(t *testing.T
 	if failure.Node != fixture.remote[0].Node || failure.Phase != peerFailurePhaseWrite ||
 		failure.Cause != "unexpected-eof" || failure.Group != fixture.group ||
 		failure.From != fixture.local.MemberID || failure.To != fixture.remote[0].MemberID ||
-		failure.Version != 1 || failure.Kind != "ordinary" || failure.MessageType != int32(pb.MsgHeartbeat) ||
+		failure.Version != 0 || failure.Kind != "ordinary" || failure.MessageType != int32(pb.MsgHeartbeat) ||
 		failure.Index != 17 || failure.Term != 5 {
 		t.Fatalf("write failure snapshot = %+v", failure)
 	}

@@ -414,13 +414,30 @@ func TestPlanRebalanceHysteresisIsValidNoWork(t *testing.T) {
 	fixture.nodes[0].Used[autosplit.ResourceLiveBytes] = 500
 	fixture.nodes[3].Used[autosplit.ResourceLiveBytes] = 450
 	fixture.nodes[4].Used[autosplit.ResourceLiveBytes] = 450
+	for _, budget := range []uint64{0, 1} {
+		request := placementRequest(gateway.ScalingRebalance, 0)
+		request.MaxMigrationBytes = budget
+		plan, err := Plan(PlacementInput{Snapshot: fixture.snapshot, Nodes: fixture.nodes, Request: request, Demands: fixture.demands})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if plan.State != PlacementNoWork || len(plan.Moves) != 0 || !placementBlocker(plan, BlockerNoImprovement) {
+			t.Fatalf("balanced rebalance with migration budget %d was not no-work: %+v", budget, plan)
+		}
+	}
+}
+
+func TestPlanRebalanceImprovementStillRequiresMigrationBudget(t *testing.T) {
+	fixture := newPlacementFixture(t, 1)
+	fixture.nodes[0].Used[autosplit.ResourceLiveBytes] = 500
 	request := placementRequest(gateway.ScalingRebalance, 0)
+	request.MaxMigrationBytes = 1
 	plan, err := Plan(PlacementInput{Snapshot: fixture.snapshot, Nodes: fixture.nodes, Request: request, Demands: fixture.demands})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.State != PlacementNoWork || len(plan.Moves) != 0 || !placementBlocker(plan, BlockerNoImprovement) {
-		t.Fatalf("balanced rebalance was not no-work: %+v", plan)
+	if plan.State != PlacementBlocked || plan.HasMoves() || !placementBlocker(plan, BlockerMigrationBudget) {
+		t.Fatalf("improving move exceeded migration budget: %+v", plan)
 	}
 }
 

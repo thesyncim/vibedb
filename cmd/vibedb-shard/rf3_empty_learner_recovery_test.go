@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -17,6 +18,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicaaction"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
 	"github.com/thesyncim/vibejson"
@@ -84,7 +86,7 @@ func TestRF3DynamicLearnerRecoveryBoundsLiveGroupsInsteadOfHistory(t *testing.T)
 		}
 	}
 	factory := &rf3DynamicLearnerFactory{root: root, runtime: &rf3NodeRuntime{reader: new(nodecontrol.IntentReaderSlot)}}
-	if err := factory.Recover(t.Context()); err != nil {
+	if err := factory.Reconcile(t.Context()); err != nil {
 		t.Fatalf("historical reservations prevented startup: %v", err)
 	}
 }
@@ -101,14 +103,12 @@ func (rf3EnrollmentRecoveryReadFunc) ReadEnrollmentIntent(context.Context, [32]b
 
 func TestRF3DynamicLearnerRecoverySkipsOnlyCertifiedMissingHistory(t *testing.T) {
 	for _, test := range []struct {
-		name     string
-		count    int
-		attempts int
-		change   func(*nodecontrol.BootstrapReadReply) error
-		want     error
+		name   string
+		count  int
+		change func(*nodecontrol.BootstrapReadReply) error
+		want   error
 	}{
 		{name: "more retired reservations than live capacity", count: maxRF3ManifestGroups + 1},
-		{name: "reader unavailable", count: 1, attempts: rf3EnrollmentRecoveryAttempts, change: func(*nodecontrol.BootstrapReadReply) error { return nodecontrol.ErrBootstrapReadUnavailable }, want: nodecontrol.ErrBootstrapReadUnavailable},
 		{name: "missing witnesses", count: 1, change: func(reply *nodecontrol.BootstrapReadReply) error {
 			reply.CatalogHeadDigest = replication.Digest{}
 			return nil
@@ -154,14 +154,11 @@ func TestRF3DynamicLearnerRecoverySkipsOnlyCertifiedMissingHistory(t *testing.T)
 			})); err != nil {
 				t.Fatal(err)
 			}
-			factory := &rf3DynamicLearnerFactory{root: root, runtime: &rf3NodeRuntime{reader: slot}}
-			if err := factory.Recover(t.Context()); !errors.Is(err, test.want) {
+			factory := &rf3DynamicLearnerFactory{root: root, runtime: &rf3NodeRuntime{reader: slot, actionJournal: rf3RecoveryTestJournal(t)}}
+			if err := factory.Reconcile(t.Context()); !errors.Is(err, test.want) {
 				t.Fatalf("recovery=%v want=%v", err, test.want)
 			}
 			wantCalls := test.count
-			if test.attempts != 0 {
-				wantCalls *= test.attempts
-			}
 			if calls != wantCalls {
 				t.Fatalf("read calls=%d want=%d", calls, wantCalls)
 			}
@@ -208,8 +205,8 @@ func TestRF3DynamicLearnerRecoveryRetriesTransientBootstrapRead(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	factory := &rf3DynamicLearnerFactory{root: root, runtime: &rf3NodeRuntime{reader: slot}}
-	if err := factory.Recover(t.Context()); err != nil {
+	factory := &rf3DynamicLearnerFactory{root: root, runtime: &rf3NodeRuntime{reader: slot, actionJournal: rf3RecoveryTestJournal(t)}}
+	if err := factory.Reconcile(t.Context()); err != nil {
 		t.Fatalf("transient bootstrap read prevented recovery: %v", err)
 	}
 	if calls != 2 {
@@ -250,6 +247,73 @@ func TestRF3DynamicLearnerRecoveryStopsOnContextCancellation(t *testing.T) {
 	if !errors.Is(err, context.Canceled) || calls != 1 {
 		t.Fatalf("cancellation was retried or changed: err=%v calls=%d", err, calls)
 	}
+}
+
+func TestRF3DynamicLearnerRecoveryWaitsForGatewayReadiness(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ready := time.Now().Add(3 * time.Second)
+		slot := new(nodecontrol.IntentReaderSlot)
+		if err := slot.Set(rf3EnrollmentRecoveryReadFunc(func(context.Context, [32]byte) (nodecontrol.BootstrapReadReply, error) {
+			if time.Now().Before(ready) {
+				return nodecontrol.BootstrapReadReply{}, nodecontrol.ErrBootstrapReadUnavailable
+			}
+			return nodecontrol.BootstrapReadReply{Nonce: [16]byte{1}}, nil
+		})); err != nil {
+			t.Fatal(err)
+		}
+		factory := &rf3DynamicLearnerFactory{runtime: &rf3NodeRuntime{reader: slot}}
+		if reply, err := factory.readEnrollmentRecovery(t.Context(), [32]byte{1}); err != nil || reply.Nonce != ([16]byte{1}) {
+			t.Fatalf("healthy catalog gateway was not allowed to start: nonce=%x err=%v", reply.Nonce, err)
+		}
+	})
+}
+
+func TestRF3DynamicLearnerRecoveryHonorsReadinessDeadlines(t *testing.T) {
+	for _, limit := range []time.Duration{time.Second, rf3EnrollmentRecoveryTimeout} {
+		t.Run(limit.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				slot := new(nodecontrol.IntentReaderSlot)
+				if err := slot.Set(rf3EnrollmentRecoveryReadFunc(func(context.Context, [32]byte) (nodecontrol.BootstrapReadReply, error) {
+					return nodecontrol.BootstrapReadReply{}, nodecontrol.ErrBootstrapReadUnavailable
+				})); err != nil {
+					t.Fatal(err)
+				}
+				parentLimit := limit
+				if parentLimit == rf3EnrollmentRecoveryTimeout {
+					parentLimit *= 2
+				}
+				ctx, cancel := context.WithTimeout(t.Context(), parentLimit)
+				defer cancel()
+				start := time.Now()
+				factory := &rf3DynamicLearnerFactory{runtime: &rf3NodeRuntime{reader: slot}}
+				_, err := factory.readEnrollmentRecovery(ctx, [32]byte{1})
+				if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, nodecontrol.ErrBootstrapReadUnavailable) || time.Since(start) != limit {
+					t.Fatalf("unavailable gateway: elapsed=%s err=%v", time.Since(start), err)
+				}
+			})
+		})
+	}
+}
+
+func TestRF3DynamicLearnerRecoveryRetriesAttemptTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		slot := new(nodecontrol.IntentReaderSlot)
+		if err := slot.Set(rf3EnrollmentRecoveryReadFunc(func(ctx context.Context, _ [32]byte) (nodecontrol.BootstrapReadReply, error) {
+			calls++
+			if calls == 1 {
+				<-ctx.Done()
+				return nodecontrol.BootstrapReadReply{}, ctx.Err()
+			}
+			return nodecontrol.BootstrapReadReply{Nonce: [16]byte{1}}, nil
+		})); err != nil {
+			t.Fatal(err)
+		}
+		factory := &rf3DynamicLearnerFactory{runtime: &rf3NodeRuntime{reader: slot}}
+		if _, err := factory.readEnrollmentRecovery(t.Context(), [32]byte{1}); err != nil || calls != 2 {
+			t.Fatalf("attempt deadline ended readiness budget: calls=%d err=%v", calls, err)
+		}
+	})
 }
 
 func TestRF3DynamicLearnerRecoversRegistrationBeforeRuntimeReceipt(t *testing.T) {
@@ -461,4 +525,102 @@ func rf3RecoveryServingCut(t *testing.T, intent gateway.GroupEnrollmentIntent) n
 		t.Fatal("invalid current placement fixture")
 	}
 	return cut
+}
+
+func TestRF3InstalledRecoveryValidatesLocalRegistrationBeforeCatalog(t *testing.T) {
+	fixture := newRF3NodeRecoveryFixtureWithLearner(t, true)
+	owner, err := newRF3NodeOwner(fixture.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = owner.Close() })
+	intent := rf3RecoveryEnrollmentIntent()
+	intent.Group = groupFromBinding(fixture.bases[0].Binding)
+	intent.Target.Node, intent.Target.StoreID = rafttransport.NodeID(fixture.node.NodeID), fixture.bases[0].Binding.StoreID
+	proof := rf3ReservationProof(intent)
+	intent.Proof = &proof
+	descriptor := snapshottransfer.Descriptor{Group: intent.Group, SourceMember: 1, TargetMember: 4,
+		TargetStore: intent.Target.StoreID, TargetIncarnation: 1, SchemaGeneration: 1,
+		ReplicaSetVersion: 1, SnapshotIndex: 1, SnapshotTerm: 1, Lineage: [32]byte{1},
+		ArtifactHash: [32]byte{2}, ArtifactBytes: 4096, ChunkBytes: 4096}
+	root := t.TempDir()
+	reservation := rf3EnrollmentReservationPath(root, intent.IntentID)
+	if err = os.MkdirAll(reservation, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err = persistRF3EnrollmentDescriptor(reservation, intent, descriptor); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := replicaaction.OpenFileJournal(t.TempDir(), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	reader := new(nodecontrol.IntentReaderSlot)
+	reads := 0
+	if err = reader.Set(rf3EnrollmentRecoveryReadFunc(func(context.Context, [32]byte) (nodecontrol.BootstrapReadReply, error) {
+		reads++
+		return nodecontrol.BootstrapReadReply{}, nodecontrol.ErrBootstrapReadUnavailable
+	})); err != nil {
+		t.Fatal(err)
+	}
+	factory := &rf3DynamicLearnerFactory{root: root, owner: owner,
+		runtime: &rf3NodeRuntime{reader: reader, actionJournal: journal}}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	// This exact retained registration must validate its local installation
+	// before requesting a catalog quorum. A missing SQL reservation is a hard
+	// local failure; catalog unavailability must neither hide it nor bypass it.
+	if err = factory.RecoverInstalled(ctx); !errors.Is(err, nodecontrol.ErrNotPrepared) || reads != 0 {
+		t.Fatalf("installed recovery depended on catalog or skipped local validation: reads=%d err=%v", reads, err)
+	}
+}
+
+func TestRF3EnrollmentDescriptorRetainsImmutableRecoveryInput(t *testing.T) {
+	intent := rf3RecoveryEnrollmentIntent()
+	descriptor := snapshottransfer.Descriptor{Group: intent.Group, SourceMember: 1, TargetMember: 4,
+		TargetStore: intent.Target.StoreID, TargetIncarnation: 1, SchemaGeneration: 1,
+		ReplicaSetVersion: 1, SnapshotIndex: 1, SnapshotTerm: 1, Lineage: [32]byte{1},
+		ArtifactHash: [32]byte{2}, ArtifactBytes: 4096, ChunkBytes: 4096}
+	root := t.TempDir()
+	if err := persistRF3EnrollmentDescriptor(root, intent, descriptor); err != nil {
+		t.Fatal(err)
+	}
+	intent.Revision++
+	if err := persistRF3EnrollmentDescriptor(root, intent, descriptor); err != nil {
+		t.Fatalf("lifecycle revision changed immutable receipt: %v", err)
+	}
+	path := filepath.Join(root, rf3EnrollmentDescriptorFile)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt rf3EnrollmentDescriptorReceipt
+	if err = vibejson.Unmarshal(raw, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if !receipt.Intent.Valid() || receipt.Intent.Digest() != intent.Digest() || receipt.Intent.State != gateway.EnrollmentPrepared || receipt.Intent.Revision != 1 {
+		t.Fatal("receipt did not retain canonical immutable installation input")
+	}
+	receipt.Intent.Target.StoreID[0]++
+	raw, err = vibejson.Marshal(&receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = readRF3EnrollmentDescriptor(root, intent); !errors.Is(err, nodecontrol.ErrJournalCorrupt) {
+		t.Fatalf("changed local installation identity was accepted: %v", err)
+	}
+}
+
+func rf3RecoveryTestJournal(t *testing.T) *replicaaction.FileJournal {
+	t.Helper()
+	journal, err := replicaaction.OpenFileJournal(t.TempDir(), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = journal.Close() })
+	return journal
 }

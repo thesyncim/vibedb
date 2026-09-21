@@ -35,20 +35,20 @@ func (l sessionFenceLookup) get(state State, routing, generation uint64) (sessio
 		}
 		return f, nil
 	}
-	if l.snapshot.value == nil && l.snapshot.overlay == nil {
+	if l.snapshot.value == nil && l.snapshot.live == nil && l.snapshot.overlay == nil {
 		return sessionFence{}, ErrSessionCorrupt
 	}
 	return sessionFenceAt(l.snapshot, state, routing, generation)
 }
 
 func bindingMatchesFenceOrigin(initial Binding, state State) bool {
-	if state.FenceOriginDigest == ([32]byte{}) {
-		return bindingAdvancesFrom(initial, state.Binding)
-	}
-	if initial == state.Binding {
+	// A snapshot target's write-once binding can start after the origin of
+	// imported completion slots. Ordinary intact-shard moves still follow the
+	// exact allocation identity and lockstep fence progression from that binding.
+	if bindingAdvancesFrom(initial, state.Binding) {
 		return true
 	}
-	if sessionFenceOrigin(initial) != state.FenceOriginDigest {
+	if state.FenceOriginDigest == ([32]byte{}) || sessionFenceOrigin(initial) != state.FenceOriginDigest {
 		return false
 	}
 	// Identity/schema equality remains exact; only coordinates previously

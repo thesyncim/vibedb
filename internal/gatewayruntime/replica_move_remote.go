@@ -132,6 +132,7 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 	var request rebalance.MoveRequest
 	var sourceGeneration uint64
 	var transitionKey gateway.GroupTransitionKey
+	var transition gateway.GroupTransitionIntent
 	if initial != nil {
 		if initial.OperationID() != operation {
 			return rebalance.ReplicatedMoveCut{}, errGatewayReplicaControl
@@ -139,6 +140,7 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 		request, sourceGeneration = initial.Request(), initial.CatalogGeneration()
 		if intent, ok := initial.TransitionIntent(); ok {
 			transitionKey = intent.Key
+			transition = intent
 		}
 	} else {
 		identity, err := rebalance.InspectReplicaMoveIntent(record.Intent)
@@ -147,13 +149,26 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 		}
 		request, sourceGeneration = identity.Request, identity.SourceGeneration
 		transitionKey = identity.TransitionKey
+		transition = identity.Transition
 	}
 	catalog, err := observer.authority.Read(ctx)
 	if err != nil || catalog == nil || catalog.Generation() < sourceGeneration ||
 		(!transitionKey.Valid() && catalog.Generation() > sourceGeneration+2) {
 		return rebalance.ReplicatedMoveCut{}, errors.Join(err, errGatewayReplicaControl)
 	}
-	route, err := resolveGatewayReplicaMoveRoute(catalog, request)
+	var receipt gateway.GroupPublicationReceipt
+	var receiptFound bool
+	if transitionKey.Valid() {
+		reader, ok := observer.authority.(gateway.GroupTransitionReceiptReader)
+		if !ok {
+			return rebalance.ReplicatedMoveCut{}, gateway.ErrGroupTransition
+		}
+		receipt, receiptFound, err = reader.ReadGroupPublicationReceipt(ctx, transitionKey)
+		if err != nil {
+			return rebalance.ReplicatedMoveCut{}, err
+		}
+	}
+	route, err := resolveGatewayReplicaMoveRoute(catalog, request, transition, receipt.Phase)
 	if err != nil {
 		return rebalance.ReplicatedMoveCut{}, err
 	}
@@ -171,7 +186,7 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 	var leader replicacontrol.Observation
 	var leaderFound bool
 	var observeErrors error
-	candidates := gatewayReplicaMoveObservationCandidates(route.Membership)
+	candidates := route.Membership.AppendControlEndpoints(nil)
 	for _, endpoint := range candidates {
 		candidate, observeErr := observer.remote.Observe(ctx, endpoint.Node, observeRequest)
 		if observeErr == nil && candidate.Publication.ReplicaSetVersion >= minimumReplicaSet &&
@@ -183,9 +198,9 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 		if observeErr != nil {
 			observeErrors = errors.Join(observeErrors, fmt.Errorf("observe move member %d: %w", endpoint.Member, observeErr))
 		} else {
-			observeErrors = errors.Join(observeErrors, fmt.Errorf("observe move member %d: member=%d leader=%d term=%d replica-set=%d minimum=%d: %w",
-				endpoint.Member, candidate.Status.MemberID, candidate.Status.LeaderID, candidate.Status.Term,
-				candidate.Publication.ReplicaSetVersion, minimumReplicaSet, errGatewayReplicaControl))
+			observeErrors = errors.Join(observeErrors, fmt.Errorf("observe move member %d: group=%x member=%d leader=%d term=%d replica-set=%d minimum=%d voters=%v learners=%v: %w",
+				endpoint.Member, request.Group.GroupID, candidate.Status.MemberID, candidate.Status.LeaderID, candidate.Status.Term,
+				candidate.Publication.ReplicaSetVersion, minimumReplicaSet, candidate.Publication.ConfState.GetVoters(), candidate.Publication.ConfState.GetLearners(), errGatewayReplicaControl))
 		}
 	}
 	if !leaderFound {
@@ -200,17 +215,7 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 		TargetStatus: target.Status, TargetState: target.State,
 		TargetProgress: leader.Progress, ProgressFound: leader.ProgressFound,
 	}}
-	if transitionKey.Valid() {
-		reader, ok := observer.authority.(gateway.GroupTransitionReceiptReader)
-		if !ok {
-			return rebalance.ReplicatedMoveCut{}, gateway.ErrGroupTransition
-		}
-		receipt, found, err := reader.ReadGroupPublicationReceipt(ctx, transitionKey)
-		if err != nil {
-			return rebalance.ReplicatedMoveCut{}, err
-		}
-		cut.TransitionReceipt, cut.TransitionReceiptFound = receipt, found
-	}
+	cut.TransitionReceipt, cut.TransitionReceiptFound = receipt, receiptFound
 	if target.SnapshotBase != nil {
 		cut.SnapshotBase = target.SnapshotBase
 	} else {
@@ -267,7 +272,10 @@ func gatewayReplicaObservationStep(operation rebalance.OperationID, generation u
 // move intent. It therefore remains restart-safe after G+1 removes the source
 // from the serving RF3 directory.
 type gatewayReplicaMoveRouteResolver struct {
-	catalog  gatewayReplicaCatalogReader
+	catalog interface {
+		gatewayReplicaCatalogReader
+		gateway.GroupTransitionReceiptReader
+	}
 	observer gatewayReplicaObservationClient
 }
 
@@ -286,7 +294,12 @@ func (resolver gatewayReplicaMoveRouteResolver) ResolveReplicaMove(
 		return rebalanceexec.MoveRoute{}, errors.Join(err, errGatewayReplicaControl)
 	}
 	request := plan.Request()
-	cut, err := resolveGatewayReplicaMoveRoute(catalog, request)
+	transition, _ := plan.TransitionIntent()
+	receipt, _, err := resolver.catalog.ReadGroupPublicationReceipt(ctx, transition.Key)
+	if err != nil {
+		return rebalanceexec.MoveRoute{}, err
+	}
+	cut, err := resolveGatewayReplicaMoveRoute(catalog, request, transition, receipt.Phase)
 	if err != nil {
 		return rebalanceexec.MoveRoute{}, err
 	}
@@ -304,7 +317,8 @@ func (resolver gatewayReplicaMoveRouteResolver) ResolveReplicaMove(
 }
 
 func resolveGatewayReplicaMoveRoute(
-	catalog *gateway.Snapshot, request rebalance.MoveRequest,
+	catalog *gateway.Snapshot, request rebalance.MoveRequest, transition gateway.GroupTransitionIntent,
+	phase gateway.TransitionPhase,
 ) (rebalanceexec.MoveRoute, error) {
 	var workspace [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
 	membership, found := catalog.ResolveReplicatedMembershipRoute(
@@ -337,6 +351,34 @@ func resolveGatewayReplicaMoveRoute(
 		cut.Retiring = gateway.ReplicatedEndpoint{Member: identity.Member, Node: identity.Node,
 			StoreID: identity.StoreID, NodeIncarnation: identity.NodeIncarnation,
 			ControlEndpoint: string(identity.ControlEndpoint), ControlAddress: address}
+		// The serving catalog changes before Raft removes the source. A restart
+		// may elect that still-current voter; recover its native endpoint from
+		// the same durable transition that already certifies its control identity.
+		if !transition.Valid() || transition.Key.Group != request.Group ||
+			transition.SourceMember != request.RetiringMember || transition.TargetMember != request.TargetMember {
+			return rebalanceexec.MoveRoute{}, errGatewayReplicaControl
+		}
+		for _, source := range transition.SourceDescriptor.Replicas {
+			if source.Member != identity.Member {
+				continue
+			}
+			if source.Node != identity.Node || source.StoreID != identity.StoreID ||
+				source.NodeIncarnation != identity.NodeIncarnation || source.ControlEndpoint != identity.ControlEndpoint {
+				return rebalanceexec.MoveRoute{}, errGatewayReplicaControl
+			}
+			address, addressErr := catalog.Address(source.NativeEndpoint)
+			if addressErr != nil {
+				return rebalanceexec.MoveRoute{}, errors.Join(addressErr, errGatewayReplicaControl)
+			}
+			cut.Retiring.NativeEndpoint, cut.Retiring.Address = string(source.NativeEndpoint), address
+			break
+		}
+		if cut.Retiring.NativeEndpoint == "" || membership.HasEnrolledTarget {
+			return rebalanceexec.MoveRoute{}, errGatewayReplicaControl
+		}
+		if phase < gateway.TransitionPhasePostRemove {
+			cut.Membership.RetiringSource = cut.Retiring
+		}
 	}
 	if cut.Target.Member != request.TargetMember || cut.SnapshotSource.Member != request.SnapshotSourceMember ||
 		cut.Retiring.Member != request.RetiringMember {
@@ -1166,7 +1208,7 @@ func (remote gatewayReplicaRemoteActions) AwaitReplicaMove(
 		Group: plan.Group(), TargetMember: plan.TargetMember()}
 	switch execution.Action.Kind {
 	case rebalance.ActionAwaitLeader:
-		for _, endpoint := range gatewayReplicaMoveObservationCandidates(cut.Membership) {
+		for _, endpoint := range cut.Membership.AppendControlEndpoints(nil) {
 			request.TargetMember = endpoint.Member
 			observation, observeErr := remote.observer.Observe(ctx, endpoint.Node, request)
 			if observeErr == nil && observation.Status.LeaderID != 0 &&
@@ -1198,7 +1240,7 @@ func (remote gatewayReplicaRemoteActions) AwaitReplicaMove(
 				return err
 			}
 		}
-		leader := gatewayReplicaMoveObservationCandidates(cut.Membership)
+		leader := cut.Membership.AppendControlEndpoints(nil)
 		for _, endpoint := range leader {
 			observation, observeErr := remote.observer.Observe(ctx, endpoint.Node, request)
 			if observeErr == nil && observation.Status.MemberID == observation.Status.LeaderID &&
@@ -1228,9 +1270,7 @@ func (remote gatewayReplicaRemoteActions) installCatchUpGrant(
 		return errGatewayReplicaControl
 	}
 	grant, found, err := remote.grants.ReadMembershipGrant(ctx, plan.Group())
-	if err != nil || !found || !grant.Valid() || grant.Group != plan.Group() ||
-		grant.CatalogGeneration != plan.CatalogGeneration() ||
-		grant.SourceMember != plan.RetiringMember() || grant.TargetMember != plan.TargetMember() ||
+	if err != nil || !found || rebalanceexec.ValidateMembershipGrant(plan, grant) != nil ||
 		cut.Target.Member != grant.TargetMember || [16]byte(cut.Target.Node) != grant.TargetNode {
 		return errors.Join(err, errGatewayReplicaControl)
 	}
@@ -1256,7 +1296,7 @@ func (remote gatewayReplicaRemoteActions) ProposeReplicaMoveOwnership(
 	if err != nil {
 		return err
 	}
-	candidates := gatewayReplicaMoveObservationCandidates(route)
+	candidates := route.AppendControlEndpoints(nil)
 	var leader gateway.ReplicatedEndpoint
 	for _, candidate := range candidates {
 		if state.Fence.MemberID == candidate.Member && state.LeaderID == candidate.Member &&

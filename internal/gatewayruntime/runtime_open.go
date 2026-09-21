@@ -44,6 +44,21 @@ func (runtime *Runtime) bindReplicaControlManifestToLiveDirectory(
 	return bindGatewayReplicaControlManifestToDirectory(manifest, catalog, cut.Nodes)
 }
 
+func (runtime *Runtime) newHotSplitFactory(manifest gatewayReplicaControlManifest) (*gatewayHotSplitFactory, error) {
+	if runtime.provisioningCatalog == nil {
+		initial, err := gateway.LoadSnapshot(runtime.config.CatalogPath)
+		if err != nil {
+			return nil, err
+		}
+		runtime.provisioningCatalog = initial
+	}
+	// Initial sources prove their original schema/storage provisioning. Moves
+	// can replace every original replica without invalidating that proof.
+	// Plans and serving routes are still fenced by the current catalog; online
+	// table sources carry their own immutable provisioning fragment.
+	return newGatewayHotSplitFactory(manifest, runtime.provisioningCatalog, runtime.provisionedSplitSources...)
+}
+
 func (runtime *Runtime) open() error {
 	config := runtime.config
 	var (
@@ -219,9 +234,11 @@ func (runtime *Runtime) open() error {
 		startupManifest = &boundManifest
 		// Validate every paired fragment/source, including aggregate root and
 		// capacity constraints, before any catalog CAS can publish one table.
-		if _, preflightErr := newGatewayHotSplitFactory(*startupManifest, runtime.holder.Current(), runtime.provisionedSplitSources...); preflightErr != nil {
+		factory, preflightErr := runtime.newHotSplitFactory(*startupManifest)
+		if preflightErr != nil {
 			return fmt.Errorf("validate table provision bundles: %w", preflightErr)
 		}
+		runtime.hotSplitFactory = factory
 	}
 	for index, registration := range registrations {
 		registerErr := error(nil)

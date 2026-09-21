@@ -66,7 +66,7 @@ const (
 	MaxRouteGateCompletionEnvelopeBytes = replication.MaxEmptyResultCompletionEnvelopeBytes + routegate.OutcomeBytes
 
 	// MaxStateEnvelopeBytes bounds the fixed publication record. Its compact
-	// 376-byte header (416 bytes when transaction accounting is present), two
+	// 408-byte header (448 bytes when transaction accounting is present), two
 	// 255-byte identities, checksum, and a deterministic protobuf
 	// with at most 64 ten-byte member IDs fit below 1.6 KiB; 2 KiB retains a
 	// format margin without inflating every hidden collection. Session metadata

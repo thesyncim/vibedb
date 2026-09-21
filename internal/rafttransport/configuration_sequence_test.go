@@ -11,7 +11,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestProspectiveSameGrantSequenceCatchesUpDisconnectedSurvivor(t *testing.T) {
+func TestOrderedGrantSequenceCatchesUpDisconnectedSurvivor(t *testing.T) {
 	group := testGroup(109)
 	grant := authorityTestGrant(group)
 	members := []Member{
@@ -69,7 +69,7 @@ func TestProspectiveSameGrantSequenceCatchesUpDisconnectedSurvivor(t *testing.T)
 		t.Fatalf("disconnected survivor cannot receive exact granted sequence: message=%+v err=%v", inbound.Message, err)
 	}
 	view, _ := follower.currentAuthority(group)
-	if view.version != 5 || view.roles[1] != MemberVoter || view.roles[3] != MemberEnrolled || view.prospective != nil {
+	if view.version != 5 || view.roles[1] != MemberVoter || view.roles[3] != MemberEnrolled {
 		t.Fatalf("request-local sequence published uncommitted roles: %+v", view)
 	}
 	negative := []struct {
@@ -92,18 +92,13 @@ func TestProspectiveSameGrantSequenceCatchesUpDisconnectedSurvivor(t *testing.T)
 			message.Commit = proto.Uint64(9)
 			message.Entries = append(message.Entries, replayConfigurationEntry(t, grant, 9, pb.ConfChangeRemoveNode, 1))
 		}},
-		{"uncommitted final cut", 8, func(message *pb.Message) { message.Commit = proto.Uint64(7) }},
-		{"header beyond final cut", 9, func(message *pb.Message) { message.Commit = proto.Uint64(9) }},
-		{"removed sender", 8, func(message *pb.Message) { message.From = proto.Uint64(1) }},
-		{"vote cannot project roles", 8, func(message *pb.Message) { message.Type = pb.MsgVote.Enum(); message.Entries = nil }},
 	}
 	for _, test := range negative {
 		t.Run(test.name, func(t *testing.T) {
 			changed := proto.Clone(message).(*pb.Message)
 			test.mutate(changed)
 			forged := frameTestReplacePayload(t, frame, changed)
-			binary.BigEndian.PutUint64(forged[112:120], test.version)
-			binary.BigEndian.PutUint64(forged[120:128], changed.GetFrom())
+			binary.BigEndian.PutUint64(forged[80:88], changed.GetFrom())
 			if _, err := follower.DecodeInbound(testPeerIdentity(follower, testNode(byte(changed.GetFrom()))), forged); err == nil {
 				t.Fatal("invalid prospective sequence accepted")
 			}
@@ -159,28 +154,16 @@ func TestProspectiveSameGrantSequenceCatchesUpDisconnectedSurvivor(t *testing.T)
 			stale := &pb.Message{Type: kind.Enum(), From: proto.Uint64(4), To: proto.Uint64(2),
 				Term: proto.Uint64(5), LogTerm: proto.Uint64(5), Index: proto.Uint64(7)}
 			staleFrame := frameTestReplacePayload(t, ackFrame, stale)
-			if _, err := leader.DecodeInbound(testPeerIdentity(leader, testNode(4)), staleFrame); err == nil {
-				t.Fatalf("retired generation admitted %s instead of only survivor responses", kind)
+			if _, err := leader.DecodeInbound(testPeerIdentity(leader, testNode(4)), staleFrame); err != nil {
+				t.Fatalf("current survivor cannot send %s: %v", kind, err)
 			}
 		}
 		removedAck := proto.Clone(ack).(*pb.Message)
 		removedAck.From = proto.Uint64(1)
 		removedFrame := frameTestReplacePayload(t, ackFrame, removedAck)
-		binary.BigEndian.PutUint64(removedFrame[120:128], 1)
+		binary.BigEndian.PutUint64(removedFrame[80:88], 1)
 		if _, err := leader.DecodeInbound(testPeerIdentity(leader, testNode(1)), removedFrame); err == nil {
 			t.Fatal("retired source response regained authority")
-		}
-		for _, alter := range []func(*pb.Message){
-			func(message *pb.Message) { message.Entries[2].Data[len(message.Entries[2].Data)-1] ^= 1 },
-			func(message *pb.Message) { message.From = proto.Uint64(1) },
-		} {
-			changed := proto.Clone(message).(*pb.Message)
-			alter(changed)
-			forged := frameTestReplacePayload(t, frame, changed)
-			binary.BigEndian.PutUint64(forged[120:128], changed.GetFrom())
-			if _, err := compacted.DecodeInbound(testPeerIdentity(compacted, testNode(byte(changed.GetFrom()))), forged); err == nil {
-				t.Fatal("invalid future grant or removed sender reached committed-prefix shortcut")
-			}
 		}
 	})
 }

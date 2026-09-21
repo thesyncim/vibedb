@@ -252,7 +252,19 @@ type Stats struct {
 }
 
 func NewServer(profile *rafttransport.PeerTLS, class rafttransport.TrafficClass, authorizer *NodeAuthorizer) (*Server, error) {
-	if profile == nil || profile.LocalIdentity().Node == (rafttransport.NodeID{}) || authorizer == nil {
+	return newServer(profile, class, authorizer, nil)
+}
+
+// NewPeerAuthorizedServer admits against a live authenticated directory instead
+// of retaining a second node allowlist. The callback must be bounded and must
+// validate the verified certificate identity/key; handlers still authorize the
+// requested operation. TLS identity and ALPN checks precede this callback.
+func NewPeerAuthorizedServer(profile *rafttransport.PeerTLS, class rafttransport.TrafficClass, authorize func(rafttransport.PeerConnection) bool) (*Server, error) {
+	return newServer(profile, class, nil, authorize)
+}
+
+func newServer(profile *rafttransport.PeerTLS, class rafttransport.TrafficClass, authorizer *NodeAuthorizer, authorize func(rafttransport.PeerConnection) bool) (*Server, error) {
+	if profile == nil || profile.LocalIdentity().Node == (rafttransport.NodeID{}) || authorizer == nil && authorize == nil {
 		return nil, ErrInvalidProfile
 	}
 	// Constructing the config proves class is a supported, isolated ALPN before
@@ -260,7 +272,7 @@ func NewServer(profile *rafttransport.PeerTLS, class rafttransport.TrafficClass,
 	if _, err := profile.ServerConfig(class); err != nil {
 		return nil, errors.Join(ErrInvalidProfile, err)
 	}
-	return &Server{tls: profile, class: class, authorizer: authorizer, generation: 1,
+	return &Server{tls: profile, class: class, authorizer: authorizer, peerAuthorizer: authorize, generation: 1,
 		active: make(map[*trackedConnection]struct{})}, nil
 }
 
@@ -288,7 +300,8 @@ func (server *Server) BindPeerAuthorizer(authorize func(rafttransport.PeerConnec
 }
 
 func (server *Server) admit(connection rafttransport.PeerConnection, authorizer *NodeAuthorizer, generation uint64) (*trackedConnection, error) {
-	if connection == nil || connection.TrafficClass() != server.class || !authorizer.allows(connection.PeerIdentity()) {
+	if connection == nil || connection.TrafficClass() != server.class ||
+		authorizer != nil && !authorizer.allows(connection.PeerIdentity()) {
 		return nil, ErrUnauthorized
 	}
 	server.mu.Lock()
@@ -298,7 +311,7 @@ func (server *Server) admit(connection rafttransport.PeerConnection, authorizer 
 	}
 	peerAuthorizer := server.peerAuthorizer
 	server.mu.Unlock()
-	if peerAuthorizer != nil && !peerAuthorizer(connection) {
+	if authorizer == nil && peerAuthorizer == nil || peerAuthorizer != nil && !peerAuthorizer(connection) {
 		return nil, ErrUnauthorized
 	}
 	tracked := &trackedConnection{PeerConnection: connection, generation: generation}

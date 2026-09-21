@@ -432,7 +432,7 @@ func ReplicatedRequestFrameBytes(request *ReplicatedRequest) (int, error) {
 			return 0, err
 		}
 	case ReplicatedMembership:
-		if err := add(4 + len(request.Command) + 65); err != nil {
+		if err := add(4 + len(request.Command) + 57); err != nil {
 			return 0, err
 		}
 	case ReplicatedReadLeader, ReplicatedReadFollower:

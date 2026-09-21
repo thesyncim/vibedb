@@ -1326,6 +1326,17 @@ func TestReplicatedScalingFrontendProofBlocksAndThenAllowsRetirement(t *testing.
 	if err := authority.PutFrontendDrainRecord(ctx, record, 0); err != nil {
 		t.Fatalf("gateway prepared drain child: %v", err)
 	}
+	ackCut, err := authority.ReadFrontendDrainRuntimeCut(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acked := record
+	acked.ReceiverDirectoryRevision, acked.ReceiverDirectoryDigest = ackCut.Nodes.Revision, ackCut.Nodes.Digest
+	acked.ReceiverCatalogGeneration, acked.ReceiverCatalogHeadDigest = ackCut.Nodes.CatalogGeneration, ackCut.CatalogHeadDigest
+	acked.Revision++
+	if err := authority.PutFrontendDrainRecord(ctx, acked, record.Revision); err != nil {
+		t.Fatal(err)
+	}
 	draining := active
 	if err := authority.EnforceFrontendDrain(ctx, drainID, active.NodeID, active.Incarnation, active.Revision); err != nil {
 		t.Fatalf("gateway prepared drain enforcement: %v", err)

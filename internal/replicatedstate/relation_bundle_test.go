@@ -454,12 +454,16 @@ func exactIndexKeys(
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := collection.Snapshot()
+	cut, err := durable.SnapshotCollections([]durable.NamedCollection{{Name: "index", Collection: collection}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	snapshot, ok := cut.Collection("index")
+	if !ok || snapshot == nil {
+		t.Fatal("missing retained index snapshot")
+	}
 	defer func() {
-		if err := snapshot.Close(); err != nil {
+		if err := cut.Close(); err != nil {
 			t.Fatal(err)
 		}
 	}()

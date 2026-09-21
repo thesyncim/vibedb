@@ -109,6 +109,60 @@ func TestReplicatedCatalogPreparedReadPublicationRejectsSupersededCut(t *testing
 	}
 }
 
+func TestReplicatedCatalogCommittedReadRejectsRollbackAndIdentityFork(t *testing.T) {
+	for _, fault := range []string{"head-rollback", "membership-rollback", "policy-rollback", "route-rollback", "same-fence-roster", "group", "range", "schema"} {
+		t.Run(fault, func(t *testing.T) {
+			authority, client, current := newCatalogAuthorityFixtureWithDescriptor(t, func(d *ReplicatedShardDescriptor) {
+				d.Command.ReplicaSetVersion = 4
+			})
+			installed := authority.holder.Current()
+			descriptors := current.ReplicatedShardDescriptors()
+			d := &descriptors[0]
+			generation := current.Generation() + 1
+			switch fault {
+			case "head-rollback":
+				generation = current.Generation() - 1
+			case "membership-rollback":
+				d.Command.ReplicaSetVersion--
+			case "policy-rollback":
+				d.Command.ActivePolicyGeneration--
+			case "route-rollback":
+				d.Command.RoutingVersion--
+			case "same-fence-roster":
+				d.Replicas[0].StoreID[0]++
+			case "group":
+				d.Group.GroupID[0]++
+			case "range":
+				d.RangeIdentity[0]++
+			case "schema":
+				d.Command.RelationManifestDigest[0]++
+			}
+			next, err := NewSnapshotWithReplicatedMetadata(current.config, current.endpoints, generation, nil, nil, descriptors)
+			if err != nil {
+				t.Fatal(err)
+			}
+			head, err := appendReplicatedCatalogDocument(nil, next, maxReplicatedCatalogBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			witness, err := appendReplicatedCatalogHeadWitness(nil, next.Generation(), head)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Even a self-consistent persisted head/witness pair cannot roll
+			// back or fork identities already observed by a serving reader.
+			client.rows[string(replicatedCatalogHeadKey)] = head
+			client.rows[string(replicatedCatalogHeadWitnessKey)] = witness
+			if _, err := authority.Read(t.Context()); err == nil {
+				t.Fatal("committed read accepted rollback or identity fork")
+			}
+			if authority.holder.Current() != installed {
+				t.Fatal("rejected cut changed serving catalog")
+			}
+		})
+	}
+}
+
 func TestReplicatedCatalogAttestedReadPreservesExactCutDuringPublication(t *testing.T) {
 	authority, _, current := newCatalogAuthorityFixture(t)
 	genesis := testCatalogAuthoritySnapshot(t, 1)

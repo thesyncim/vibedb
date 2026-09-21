@@ -8,11 +8,71 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
+
+type catalogElectionClient struct {
+	states  map[string]shardservice.ReplicatedMemberState
+	readyAt time.Time
+}
+
+func (client *catalogElectionClient) DoReplicated(ctx context.Context, endpoint ReplicatedEndpoint,
+	_ *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	state := client.states[endpoint.Address]
+	if time.Now().Before(client.readyAt) {
+		state.LeaderID = 0
+	}
+	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake, HasState: true, State: state}, nil
+}
+
+func TestCatalogDiscoveryWaitsForElectionWithinTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		route, _, states := testReplicatedRouteCommand(t)
+		route.Distribution, route.Shard = ReplicatedCatalogDistribution, ReplicatedCatalogShard
+		start := time.Now()
+		client := &catalogElectionClient{states: states, readyAt: start.Add(3 * time.Second)}
+		executor, err := NewReplicatedExecutor(client, 8, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		observed, err := executor.catalogOperationalRoute(t.Context(), route, nil)
+		if err != nil || observed.Command != route.Command || time.Since(start) < 3*time.Second {
+			t.Fatalf("election within configured readiness budget: elapsed=%s command_matches=%t err=%v", time.Since(start), observed.Command == route.Command, err)
+		}
+	})
+}
+
+func TestCatalogDiscoveryReadinessRespectsBothDeadlines(t *testing.T) {
+	for _, callerBudget := range []time.Duration{time.Second, 10 * time.Second} {
+		t.Run(callerBudget.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				route, _, states := testReplicatedRouteCommand(t)
+				route.Distribution, route.Shard = ReplicatedCatalogDistribution, ReplicatedCatalogShard
+				start := time.Now()
+				client := &catalogElectionClient{states: states, readyAt: start.Add(time.Minute)}
+				executor, err := NewReplicatedExecutor(client, 8, 2*time.Second)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithTimeout(t.Context(), callerBudget)
+				defer cancel()
+				_, err = executor.catalogOperationalRoute(ctx, route, nil)
+				if !errors.Is(err, ErrReplicatedLeader) || !errors.Is(err, context.DeadlineExceeded) ||
+					time.Since(start) != min(callerBudget, 2*time.Second) {
+					t.Fatalf("readiness deadline: elapsed=%s err=%v", time.Since(start), err)
+				}
+			})
+		})
+	}
+}
 
 type catalogDisconnectedSweepClient struct {
 	states   map[string]shardservice.ReplicatedMemberState
@@ -88,12 +148,13 @@ func TestCatalogDiscoveryRetriesDisconnectedSweep(t *testing.T) {
 				client.probes[index].Store(0)
 			}
 			client.always = true
-			if _, err = executor.catalogOperationalRoute(t.Context(), route, nil); !errors.Is(err, io.EOF) || !errors.Is(err, ErrReplicatedLeader) {
+			if _, err = executor.catalogOperationalRoute(t.Context(), route, nil); !errors.Is(err, io.EOF) ||
+				!errors.Is(err, ErrReplicatedLeader) || !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("disconnected catalog lost its transport cause: %v", err)
 			}
 			for index := range client.probes {
-				if probes := client.probes[index].Load(); probes != 2 {
-					t.Fatalf("member %d probes=%d, want bounded two sweeps", index+1, probes)
+				if probes := client.probes[index].Load(); probes < 2 {
+					t.Fatalf("member %d probes=%d, want fresh sweeps until the readiness deadline", index+1, probes)
 				}
 			}
 		})

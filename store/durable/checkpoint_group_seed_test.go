@@ -654,3 +654,23 @@ func TestCheckpointGroupSeedCrashCuts(t *testing.T) {
 		})
 	}
 }
+
+func TestSnapshotCheckpointMissingCertificateRejectsConditionalJournal(t *testing.T) {
+	dir, members, _ := newCheckpointGroupTestResources(t, "system", "user")
+	header := mintEmptyTxnMarker(t, dir)
+	prepareMaybePublish(t, members[0].Collection, header.MarkerID, header.Epoch, 1, "staged", `{"value":1}`, false)
+	image := copyCheckpointGroupDirectory(t, dir)
+	before := checkpointGroupDirectoryBytes(t, image)
+	requests, files := checkpointGroupTestOpenRequests(t, image)
+	defer func() {
+		for _, file := range files {
+			_ = file.Close()
+		}
+	}()
+	_, _, _, err := OpenCollectionsWithSnapshotCheckpointGroup(image, TxnLogOptions{}, requests,
+		[]string{"system", "user"}, "system", CheckpointGroupOptions{})
+	if !errors.Is(err, ErrCheckpointGroupCorrupt) {
+		t.Fatalf("snapshot opener accepted conditional journal: %v", err)
+	}
+	requireCheckpointGroupDirectoryBytes(t, image, before)
+}

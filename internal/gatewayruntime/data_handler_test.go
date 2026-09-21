@@ -82,6 +82,7 @@ func TestNativeDataResponseForErrorIsClosedAndTyped(t *testing.T) {
 		{gateway.ErrReplicatedReadBehind, nativeDataResponseReadBehind, true},
 		{raftmodel.ErrAdmissionBound, nativeDataResponseOverloaded, true},
 		{raftservice.ErrServingFence, nativeDataResponseStaleCatalog, true},
+		{gateway.ErrStaleGeneration, nativeDataResponseStaleCatalog, true},
 		{errors.Join(raftservice.ErrServingFence, gateway.ErrReplicatedUnauthorized), nativeDataResponseStaleCatalog, true},
 		{errors.Join(raftservice.ErrServingFence, gateway.ErrReplicatedDataRead), nativeDataResponseStaleCatalog, true},
 		{context.DeadlineExceeded, nativeDataResponseUnavailable, true},

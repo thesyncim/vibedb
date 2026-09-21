@@ -202,11 +202,14 @@ func (runtime *Runtime) openReplicaControl() error {
 			observer: controls.HealthObservations, read: readDeadline, write: writeDeadline,
 		}
 	}
-	splitFactory, err := newGatewayHotSplitFactory(manifest, runtime.holder.Current(), runtime.provisionedSplitSources...)
-	if err != nil {
-		return fmt.Errorf("open hot split factory: %w", err)
+	splitFactory := runtime.hotSplitFactory
+	if splitFactory == nil {
+		splitFactory, err = runtime.newHotSplitFactory(manifest)
+		if err != nil {
+			return fmt.Errorf("open hot split factory: %w", err)
+		}
+		runtime.hotSplitFactory = splitFactory
 	}
-	runtime.hotSplitFactory = splitFactory
 	moveController, err := newGatewayReplicaMoveController(runtime.authority, runtime.replicated, controls)
 	if err != nil {
 		return fmt.Errorf("open replica move controller: %w", err)

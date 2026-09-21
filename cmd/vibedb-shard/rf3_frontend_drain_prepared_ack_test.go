@@ -36,7 +36,83 @@ func (connection *rf3PreparedAckReaderTestConnection) TrafficClass() rafttranspo
 }
 
 func TestRF3FrontendDrainPreparedAckReaderReadsCanonicalSourceOverGatewayControl(t *testing.T) {
-	request, seed, cut := rf3PreparedAckReaderTestRequest(t)
+	for _, name := range []string{"creator", "current-controller", "current-controller-empty-drain"} {
+		t.Run(name, func(t *testing.T) {
+			request, seed, cut := rf3PreparedAckReaderTestRequest(t)
+			if name == "current-controller-empty-drain" {
+				grant := cut.ServiceDirectory.ContinuationGrants[0]
+				cut.Subjects = []frontenddrain.PreparedAckSubject{{
+					DrainID: grant.DrainID, PhysicalNode: grant.PhysicalNode, PhysicalIncarnation: grant.PhysicalIncarnation,
+					GatewayServiceID: grant.GatewayServiceID, GatewayIncarnation: seed.Incarnation,
+					GatewaySessionID: grant.GatewaySessionID, GatewaySessionRevision: grant.GatewaySessionRevision,
+					NodeRevision: 1, Lifecycle: 1, DrainFenceDigest: [32]byte{33},
+				}}
+				cut.ServiceDirectory.ContinuationGrants = nil
+				request.GrantDigest = [32]byte{}
+			}
+			if name != "creator" {
+				// The current controller publishes an exact durable cut. The
+				// continuation credential still belongs to its original gateway.
+				publisher := cut.ServiceDirectory.Bindings[1]
+				publisher.Principal = rafttransport.NodeID{31}
+				publisher.KeyDigest = [32]byte{32}
+				cut.ServiceDirectory.Bindings = append(cut.ServiceDirectory.Bindings, publisher)
+				request.SourcePrincipal, request.SourcePrincipalKeyDigest = publisher.Principal, publisher.KeyDigest
+				request.SourceCut = cut
+				seed.NodeID, seed.SPKIPinDigest = publisher.Principal, publisher.KeyDigest
+			}
+			testRF3PreparedAckGatewaySourceRead(t, request, seed, cut)
+		})
+	}
+}
+
+func TestRF3FrontendDrainPreparedAckSourceRequiresCurrentPublisherAndExactSubject(t *testing.T) {
+	for _, name := range []string{"principal", "key", "incarnation", "retired", "drain", "grant", "prepared"} {
+		t.Run(name, func(t *testing.T) {
+			request, seed, cut := rf3PreparedAckReaderTestRequest(t)
+			query := frontenddrain.PreparedAckCutReadRequest{
+				Operation: frontenddrain.CutOperationInstallExact, Nonce: request.Nonce,
+				DrainID: request.DrainID, GrantDigest: request.GrantDigest,
+				ReceiverNode: request.ReceiverNode, ReceiverIncarnation: request.ReceiverIncarnation,
+				ReceiverServiceKeyDigest: request.ReceiverServiceKeyDigest, ReceiverNodeRevision: request.ReceiverNodeRevision,
+				SourceFloor: cut.ReadFloor(), SourceCutDigest: cut.Digest(),
+			}
+			switch name {
+			case "principal":
+				seed.NodeID[0]++
+			case "key":
+				seed.SPKIPinDigest[0]++
+			case "incarnation":
+				seed.Incarnation++
+			case "retired":
+				cut.ServiceDirectory.Bindings[1].Lifecycle = serviceauthz.ServiceDecommissioned
+			case "drain":
+				query.DrainID[0]++
+			case "grant":
+				query.GrantDigest[0]++
+			case "prepared":
+				query.RequirePrepared = true
+				grant := cut.ServiceDirectory.ContinuationGrants[0]
+				grant.State = serviceauthz.ContinuationGrantEnforcing
+				var err error
+				grant, err = serviceauthz.NewCommittedFrontendContinuationGrant(grant)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cut.ServiceDirectory.ContinuationGrants[0] = grant
+				query.GrantDigest = grant.GrantDigest
+			}
+			if rf3FrontendDrainPreparedAckSourceCutMatchesQuery(cut, query, seed) {
+				t.Fatal("accepted mismatched current publisher or drain subject")
+			}
+		})
+	}
+}
+
+func testRF3PreparedAckGatewaySourceRead(t *testing.T, request frontenddrain.PreparedAckRequest,
+	seed nodecontrol.BootstrapGatewaySeed, cut frontenddrain.PreparedAckCut,
+) {
+	t.Helper()
 	trust := cut.ServiceDirectory.TrustDomain
 	reader := &rf3FrontendDrainPreparedAckCutReader{
 		trust: trust, localNode: request.ReceiverNode, localIncarnation: request.ReceiverIncarnation,
@@ -372,7 +448,7 @@ func TestRF3FrontendDrainPreparedAckReaderInstallsAuthenticatedCutWithoutSeeds(t
 	managed := &rf3FrontendDrainPreparedAckCutReader{
 		trust: cut.ServiceDirectory.TrustDomain, localNode: request.ReceiverNode,
 		localIncarnation: request.ReceiverIncarnation, localServiceKey: request.ReceiverServiceKeyDigest,
-		readDeadline: func() time.Time { return time.Now().Add(time.Second) },
+		readDeadline:  func() time.Time { return time.Now().Add(time.Second) },
 		writeDeadline: func() time.Time { return time.Now().Add(time.Second) },
 		seeds: map[rafttransport.NodeID]nodecontrol.BootstrapGatewaySeed{
 			rafttransport.NodeID{9}: seed,

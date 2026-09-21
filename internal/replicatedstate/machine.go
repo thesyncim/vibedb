@@ -373,7 +373,9 @@ func OpenBundle(
 	if state.BootstrapDigest != bootstrapDigest || state.SessionCount != sessionCount ||
 		state.SessionSlotCount != slotCount || state.AuthorityBindingCount != authorityCount ||
 		state.SessionCount > options.MaxSessions {
-		return nil, fmt.Errorf("%w: persisted publication disagrees with construction", ErrStateCorrupt)
+		return nil, fmt.Errorf("%w: persisted publication bootstrap_match=%v sessions=%d/%d slots=%d/%d authorities=%d/%d max_sessions=%d",
+			ErrStateCorrupt, state.BootstrapDigest == bootstrapDigest, state.SessionCount, sessionCount,
+			state.SessionSlotCount, slotCount, state.AuthorityBindingCount, authorityCount, options.MaxSessions)
 	}
 	if sourceRecovery {
 		if err := m.validateOpenedSchemaSource(state, prepared); err != nil {
@@ -385,7 +387,9 @@ func OpenBundle(
 		state.RelationPlacementDigest != relationPlacementStateDigest(
 			state.Binding.SchemaGeneration, m.manifestDigest, m.relations,
 		)) {
-		return nil, fmt.Errorf("%w: persisted publication disagrees with construction", ErrStateCorrupt)
+		return nil, fmt.Errorf("%w: persisted publication binding_match=%v apply_contract_match=%v placement_match=%v",
+			ErrStateCorrupt, bindingMatchesFenceOrigin(binding, state), state.ApplyContractDigest == prepared.applyContract,
+			state.RelationPlacementDigest == relationPlacementStateDigest(state.Binding.SchemaGeneration, m.manifestDigest, m.relations))
 	}
 	if state.LastKind == RecordSchema && !sourceRecovery {
 		if err := validateOpenedSchemaTransition(

@@ -978,7 +978,7 @@ func TestPublishReplicaReplacementAtomicallySettlesCatalogGrantAndPage(t *testin
 	}
 }
 
-func TestReplicaReplacementReceiptLetsConcurrentStaleGatewaysRefresh(t *testing.T) {
+func TestReplicaReplacementCommittedHeadLetsConcurrentStaleGatewaysRefresh(t *testing.T) {
 	authority, _, current := newCatalogAuthorityFixture(t)
 	first := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x81)
 	second := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x82)
@@ -1062,11 +1062,8 @@ func TestReplicaReplacementReceiptLetsConcurrentStaleGatewaysRefresh(t *testing.
 			t.Fatalf("gateway %d post-remove refresh=%v", index, refreshErr)
 		}
 	}
-	if _, err = skipper.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogConflict) {
-		t.Fatalf("gateway skipped two certified cuts: %v", err)
-	}
-	if skipper.holder.Current().Generation() != current.Generation() {
-		t.Fatal("skipped refresh advanced stale holder")
+	if observed, err := skipper.Read(context.Background()); err != nil || observed.Generation() != post.Generation() {
+		t.Fatalf("gateway cannot catch up across two committed cuts: %v", err)
 	}
 }
 
@@ -1128,111 +1125,57 @@ func TestReplicaReplacementPostRemoveRejectsFenceDriftAndStaleObservation(t *tes
 	}
 }
 
-func TestReplicaReplacementRefreshFailsClosedWithoutCanonicalReceipt(t *testing.T) {
-	for _, testCase := range []struct {
-		name   string
-		mutate func(map[string][]byte, replicatedMembershipRecordKey)
-	}{
-		{name: "missing", mutate: func(rows map[string][]byte, key replicatedMembershipRecordKey) {
-			delete(rows, string(key[:]))
-		}},
-		{name: "corrupt", mutate: func(rows map[string][]byte, key replicatedMembershipRecordKey) {
-			raw := append([]byte(nil), rows[string(key[:])]...)
-			raw[len(raw)-2] ^= 1
-			rows[string(key[:])] = raw
-		}},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			authority, client, current := newCatalogAuthorityFixture(t)
-			peer := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x83)
-			_, _, descriptor := testReplicatedCatalogInput(t)
-			grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
-			if err := authority.PublishMembershipGrant(context.Background(), grant); err != nil {
-				t.Fatal(err)
-			}
-			next, err := BuildReplicaReplacementTransition(
-				current, manifest, current.Generation()+1, grant, target, command,
-			)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err = authority.PublishReplicaReplacement(
-				context.Background(), current.Generation(), next, grant,
-			); err != nil {
-				t.Fatal(err)
-			}
-			recordKey, _ := replicatedReplicaReplacementReceiptKeys(grant.Group)
-			testCase.mutate(client.rows, recordKey)
-			if _, err = peer.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogConflict) {
-				t.Fatalf("refresh without exact receipt=%v", err)
-			}
-			if peer.holder.Current().Generation() != current.Generation() {
-				t.Fatal("failed receipt validation advanced stale holder")
-			}
-		})
-	}
-}
-
-func TestReplicaReplacementPostRemoveRefreshRequiresCanonicalReceipt(t *testing.T) {
-	for _, testCase := range []struct {
-		name   string
-		mutate func(map[string][]byte, replicatedMembershipRecordKey)
-	}{
-		{name: "missing", mutate: func(rows map[string][]byte, key replicatedMembershipRecordKey) {
-			delete(rows, string(key[:]))
-		}},
-		{name: "corrupt", mutate: func(rows map[string][]byte, key replicatedMembershipRecordKey) {
-			raw := append([]byte(nil), rows[string(key[:])]...)
-			raw[len(raw)-2] ^= 1
-			rows[string(key[:])] = raw
-		}},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			authority, client, current := newCatalogAuthorityFixture(t)
-			peer := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x85)
-			_, _, descriptor := testReplicatedCatalogInput(t)
-			grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
-			if err := authority.PublishMembershipGrant(context.Background(), grant); err != nil {
-				t.Fatal(err)
-			}
-			next, err := BuildReplicaReplacementTransition(
-				current, manifest, current.Generation()+1, grant, target, command,
-			)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err = authority.PublishReplicaReplacement(
-				context.Background(), current.Generation(), next, grant,
-			); err != nil {
-				t.Fatal(err)
-			}
-			if _, err = peer.Read(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			version, ok := replicaSetVersionForGroup(next, grant.Group)
-			if !ok {
-				t.Fatal("replacement fence is missing")
-			}
-			post, err := BuildReplicaReplacementPostRemoveTransition(
-				next, next.Generation()+1, grant, version+1,
-			)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err = authority.PublishReplicaReplacementPostRemove(
-				context.Background(), next.Generation(), post, grant, version+1,
-			); err != nil {
-				t.Fatal(err)
-			}
-			receiptKey, _ := replicatedReplicaReplacementReceiptKeys(grant.Group)
-			testCase.mutate(client.rows, receiptKey)
-			if _, err = peer.Read(context.Background()); !errors.Is(err, ErrReplicatedCatalogConflict) {
-				t.Fatalf("post-remove refresh without exact receipt=%v", err)
-			}
-			if peer.holder.Current().Generation() != next.Generation() {
-				t.Fatal("failed post-remove receipt validation advanced stale holder")
-			}
-		})
+func TestReplicaReplacementRefreshRequiresExactCommittedCut(t *testing.T) {
+	for _, stage := range []string{"pre-remove", "post-remove"} {
+		for _, corruption := range []string{"missing-witness", "corrupt-witness", "stale-witness", "missing-genesis", "corrupt-genesis"} {
+			t.Run(stage+"/"+corruption, func(t *testing.T) {
+				authority, client, current := newCatalogAuthorityFixture(t)
+				peer := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x83)
+				_, _, descriptor := testReplicatedCatalogInput(t)
+				grant, manifest, target, command := testCertifiedReplicaReplacement(t, current, descriptor)
+				if err := authority.PublishMembershipGrant(t.Context(), grant); err != nil {
+					t.Fatal(err)
+				}
+				oldWitness := bytes.Clone(client.rows[string(replicatedCatalogHeadWitnessKey)])
+				next, err := BuildReplicaReplacementTransition(current, manifest, current.Generation()+1, grant, target, command)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = authority.PublishReplicaReplacement(t.Context(), current.Generation(), next, grant); err != nil {
+					t.Fatal(err)
+				}
+				if stage == "post-remove" {
+					version, _ := replicaSetVersionForGroup(next, grant.Group)
+					post, err := BuildReplicaReplacementPostRemoveTransition(next, next.Generation()+1, grant, version+1)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err = authority.PublishReplicaReplacementPostRemove(t.Context(), next.Generation(), post, grant, version+1); err != nil {
+						t.Fatal(err)
+					}
+				}
+				key := string(replicatedCatalogHeadWitnessKey)
+				if strings.HasSuffix(corruption, "genesis") {
+					key = string(replicatedCatalogGenesisKey)
+				}
+				switch {
+				case strings.HasPrefix(corruption, "missing"):
+					delete(client.rows, key)
+				case corruption == "stale-witness":
+					client.rows[key] = oldWitness
+				default:
+					raw := bytes.Clone(client.rows[key])
+					raw[len(raw)-2] ^= 1
+					client.rows[key] = raw
+				}
+				if _, err = peer.Read(t.Context()); !errors.Is(err, ErrReplicatedCatalogConflict) {
+					t.Fatalf("refresh accepted corrupt committed cut: %v", err)
+				}
+				if peer.holder.Current().Generation() != current.Generation() {
+					t.Fatal("failed proof validation changed holder")
+				}
+			})
+		}
 	}
 }
 

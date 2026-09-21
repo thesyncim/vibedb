@@ -22,10 +22,13 @@ import (
 
 const (
 	seamlessScaleEvidenceSchema  = "vibedb.seamless-scale-in-out"
-	seamlessScaleEvidenceVersion = 1
+	seamlessScaleEvidenceVersion = 2
 	seamlessScalePhaseBaseline   = "baseline"
 	seamlessScalePhaseDuring     = "during"
 	seamlessScalePhaseAfter      = "after"
+	seamlessScalePhaseSteady     = "during_steady"
+	seamlessScalePhaseRecovery   = "during_recovery"
+	seamlessScaleFaultRecoveryNS = 10 * uint64(1_000_000_000)
 )
 
 // seamlessScalePerformanceBounds are relative to the measured baseline.  A
@@ -159,7 +162,7 @@ type seamlessScalePhaseEvidence struct {
 
 func (phase seamlessScalePhaseEvidence) valid() bool {
 	return phase.Phase == seamlessScalePhaseBaseline || phase.Phase == seamlessScalePhaseDuring ||
-		phase.Phase == seamlessScalePhaseAfter
+		phase.Phase == seamlessScalePhaseAfter || phase.Phase == seamlessScalePhaseSteady || phase.Phase == seamlessScalePhaseRecovery
 }
 
 // seamlessScaleBudgetEvidence is populated from the node-wide migration
@@ -205,6 +208,11 @@ type seamlessScaleEvidence struct {
 	Baseline                      seamlessScalePhaseEvidence
 	During                        seamlessScalePhaseEvidence
 	After                         seamlessScalePhaseEvidence
+	SteadyDuring                  seamlessScalePhaseEvidence
+	RecoveryDuring                seamlessScalePhaseEvidence
+	SteadyWindows                 uint64
+	RecoveryWindows               uint64
+	FaultInjections               uint64
 	Budget                        seamlessScaleBudgetEvidence
 }
 
@@ -240,28 +248,49 @@ func (evidence seamlessScaleEvidence) valid(bounds seamlessScalePerformanceBound
 			return fmt.Errorf("invalid %s workload evidence", phase.Phase)
 		}
 	}
+	// Every during sample belongs to exactly one explicitly classified window.
+	// These two summaries may span disjoint windows: DurationNS is their actual
+	// active duration, never the wall-clock gap occupied by the other class.
+	if evidence.FaultInjections != 4 || evidence.SteadyWindows < 3 || evidence.RecoveryWindows == 0 ||
+		evidence.RecoveryWindows > 2*evidence.FaultInjections ||
+		evidence.SteadyWindows+evidence.RecoveryWindows != evidence.DuringWindows ||
+		evidence.SteadyDuring.Scheduled+evidence.RecoveryDuring.Scheduled != evidence.During.Scheduled ||
+		evidence.SteadyDuring.Successes+evidence.RecoveryDuring.Successes != evidence.During.Successes ||
+		evidence.SteadyDuring.AcknowledgedWrites+evidence.RecoveryDuring.AcknowledgedWrites != evidence.During.AcknowledgedWrites ||
+		evidence.SteadyDuring.VerifiedReads+evidence.RecoveryDuring.VerifiedReads != evidence.During.VerifiedReads {
+		return errors.New("fault/steady workload partition is incomplete")
+	}
+	for _, phase := range []seamlessScalePhaseEvidence{evidence.SteadyDuring, evidence.RecoveryDuring} {
+		if !phase.valid() || phase.DurationNS == 0 || phase.EndNS <= phase.StartNS || phase.DurationNS > phase.EndNS-phase.StartNS ||
+			phase.Scheduled == 0 || phase.Started != phase.Scheduled || phase.Completed != phase.Started || phase.Successes != phase.Completed ||
+			phase.Errors != 0 || phase.Timeouts != 0 || phase.Missed != 0 || phase.P50NS == 0 || phase.P95NS < phase.P50NS || phase.P99NS < phase.P95NS ||
+			phase.ThroughputMilli != phase.Successes*1_000_000_000_000/phase.DurationNS || phase.CompletionGapNS == 0 {
+			return fmt.Errorf("invalid %s timing partition", phase.Phase)
+		}
+	}
 	if evidence.Budget.ThrottledCalls == 0 || evidence.Budget.ThrottledBytes == 0 ||
 		evidence.Budget.MaxActive == 0 || evidence.Budget.PeakActive == 0 ||
 		evidence.Budget.PeakActive > evidence.Budget.MaxActive {
 		return errors.New("migration budget did not provide positive throttling evidence")
 	}
-	if evidence.Baseline.MaxPauseNS > bounds.MaxPauseNS || evidence.During.MaxPauseNS > bounds.MaxPauseNS ||
+	if evidence.Baseline.MaxPauseNS > bounds.MaxPauseNS || evidence.SteadyDuring.MaxPauseNS > bounds.MaxPauseNS ||
+		evidence.RecoveryDuring.MaxPauseNS > seamlessScaleFaultRecoveryNS || evidence.RecoveryDuring.P99NS > seamlessScaleFaultRecoveryNS ||
 		evidence.After.MaxPauseNS > bounds.MaxPauseNS {
 		return errors.New("foreground pause exceeded configured maximum")
 	}
-	if !withinContinuityBound(evidence.During.CompletionGapNS, evidence.Baseline.CompletionGapNS, evidence.Baseline.OfferedRateMilli) ||
+	if !withinContinuityBound(evidence.SteadyDuring.CompletionGapNS, evidence.Baseline.CompletionGapNS, evidence.Baseline.OfferedRateMilli) ||
 		!withinContinuityBound(evidence.After.CompletionGapNS, evidence.Baseline.CompletionGapNS, evidence.Baseline.OfferedRateMilli) {
 		return errors.New("completion gap exceeded configured continuity bound")
 	}
-	if !withinRelativeBound(evidence.During.P50NS, evidence.Baseline.P50NS, bounds.DuringP50PPM, bounds.LatencyFloor) ||
-		!withinRelativeBound(evidence.During.P95NS, evidence.Baseline.P95NS, bounds.DuringP95PPM, bounds.LatencyFloor) ||
-		!withinRelativeBound(evidence.During.P99NS, evidence.Baseline.P99NS, bounds.DuringP99PPM, bounds.LatencyFloor) ||
+	if !withinRelativeBound(evidence.SteadyDuring.P50NS, evidence.Baseline.P50NS, bounds.DuringP50PPM, bounds.LatencyFloor) ||
+		!withinRelativeBound(evidence.SteadyDuring.P95NS, evidence.Baseline.P95NS, bounds.DuringP95PPM, bounds.LatencyFloor) ||
+		!withinRelativeBound(evidence.SteadyDuring.P99NS, evidence.Baseline.P99NS, bounds.DuringP99PPM, bounds.LatencyFloor) ||
 		!withinRelativeBound(evidence.After.P50NS, evidence.Baseline.P50NS, bounds.AfterP50PPM, bounds.LatencyFloor) ||
 		!withinRelativeBound(evidence.After.P95NS, evidence.Baseline.P95NS, bounds.AfterP95PPM, bounds.LatencyFloor) ||
 		!withinRelativeBound(evidence.After.P99NS, evidence.Baseline.P99NS, bounds.AfterP99PPM, bounds.LatencyFloor) {
 		return errors.New("latency exceeded configured relative bound")
 	}
-	if !throughputAtLeast(evidence.During.ThroughputMilli, evidence.Baseline.ThroughputMilli, bounds.DuringTPSPPM) ||
+	if !throughputAtLeast(evidence.SteadyDuring.ThroughputMilli, evidence.Baseline.ThroughputMilli, bounds.DuringTPSPPM) ||
 		!throughputAtLeast(evidence.After.ThroughputMilli, evidence.Baseline.ThroughputMilli, bounds.AfterTPSPPM) {
 		return errors.New("throughput fell below configured relative bound")
 	}
@@ -349,6 +378,7 @@ func appendSeamlessScaleEvidence(raw []byte, evidence seamlessScaleEvidence) []b
 	raw = fmt.Appendf(raw, "topology\tbaseline_windows\t%d\n", evidence.BaselineWindows)
 	raw = fmt.Appendf(raw, "topology\tduring_windows\t%d\n", evidence.DuringWindows)
 	raw = fmt.Appendf(raw, "topology\tafter_windows\t%d\n", evidence.AfterWindows)
+	raw = fmt.Appendf(raw, "topology\tsteady_windows\t%d\ntopology\trecovery_windows\t%d\ntopology\tfault_injections\t%d\n", evidence.SteadyWindows, evidence.RecoveryWindows, evidence.FaultInjections)
 	raw = fmt.Appendf(raw, "topology\tretiring_references_after\t%d\n", evidence.RetiringReferencesAfter)
 	raw = fmt.Appendf(raw, "topology\tgroup_inventory_before_digest\t%s\n", evidence.GroupInventoryBeforeDigest)
 	raw = fmt.Appendf(raw, "topology\tgroup_inventory_after_digest\t%s\n", evidence.GroupInventoryAfterDigest)
@@ -371,7 +401,7 @@ func appendSeamlessScaleEvidence(raw []byte, evidence seamlessScaleEvidence) []b
 	} {
 		raw = fmt.Appendf(raw, "marker\t%s\t%d\n", marker.name, boolBit(marker.value))
 	}
-	for _, phase := range []seamlessScalePhaseEvidence{evidence.Baseline, evidence.During, evidence.After} {
+	for _, phase := range []seamlessScalePhaseEvidence{evidence.Baseline, evidence.During, evidence.After, evidence.SteadyDuring, evidence.RecoveryDuring} {
 		for _, metric := range []struct {
 			name  string
 			value uint64
@@ -437,7 +467,7 @@ func parseSeamlessScaleEvidence(raw []byte) (seamlessScaleEvidence, error) {
 			switch fields[1] {
 			case "physical_before", "physical_peak", "physical_after", "application_groups_moved", "internal_groups_moved",
 				"cycles", "baseline_windows", "during_windows", "after_windows", "retiring_references_after",
-				"group_inventory_before_digest", "group_inventory_after_digest":
+				"group_inventory_before_digest", "group_inventory_after_digest", "steady_windows", "recovery_windows", "fault_injections":
 				known = true
 			}
 			if known && seenTopology[fields[1]] {
@@ -487,6 +517,15 @@ func parseSeamlessScaleEvidence(raw []byte) (seamlessScaleEvidence, error) {
 				seenTopology[fields[1]] = true
 			case "after_windows":
 				evidence.AfterWindows = value
+				seenTopology[fields[1]] = true
+			case "steady_windows":
+				evidence.SteadyWindows = value
+				seenTopology[fields[1]] = true
+			case "recovery_windows":
+				evidence.RecoveryWindows = value
+				seenTopology[fields[1]] = true
+			case "fault_injections":
+				evidence.FaultInjections = value
 				seenTopology[fields[1]] = true
 			case "retiring_references_after":
 				evidence.RetiringReferencesAfter = value
@@ -678,7 +717,7 @@ func parseSeamlessScaleEvidence(raw []byte) (seamlessScaleEvidence, error) {
 	if !seenSchema || !seenResult || !seenPhase {
 		return seamlessScaleEvidence{}, errors.New("seamless scale evidence is missing required markers")
 	}
-	for _, name := range []string{seamlessScalePhaseBaseline, seamlessScalePhaseDuring, seamlessScalePhaseAfter} {
+	for _, name := range []string{seamlessScalePhaseBaseline, seamlessScalePhaseDuring, seamlessScalePhaseAfter, seamlessScalePhaseSteady, seamlessScalePhaseRecovery} {
 		if len(seenWorkload[name]) != 24 {
 			return seamlessScaleEvidence{}, fmt.Errorf("workload %s is incomplete", name)
 		}
@@ -687,7 +726,7 @@ func parseSeamlessScaleEvidence(raw []byte) (seamlessScaleEvidence, error) {
 }
 
 func validSeamlessScalePhaseName(name string) bool {
-	return name == seamlessScalePhaseBaseline || name == seamlessScalePhaseDuring || name == seamlessScalePhaseAfter
+	return name == seamlessScalePhaseBaseline || name == seamlessScalePhaseDuring || name == seamlessScalePhaseAfter || name == seamlessScalePhaseSteady || name == seamlessScalePhaseRecovery
 }
 
 func newSeamlessScalePhase(evidence *seamlessScaleEvidence, name string) *seamlessScalePhaseEvidence {
@@ -696,6 +735,10 @@ func newSeamlessScalePhase(evidence *seamlessScaleEvidence, name string) *seamle
 		return &evidence.Baseline
 	case seamlessScalePhaseDuring:
 		return &evidence.During
+	case seamlessScalePhaseSteady:
+		return &evidence.SteadyDuring
+	case seamlessScalePhaseRecovery:
+		return &evidence.RecoveryDuring
 	default:
 		return &evidence.After
 	}
@@ -776,9 +819,31 @@ func TestSeamlessScaleEvidenceRequiresPositivePacingAndConservation(t *testing.T
 		Baseline:                  validPhase(seamlessScalePhaseBaseline), During: validPhase(seamlessScalePhaseDuring), After: validPhase(seamlessScalePhaseAfter),
 		Budget: seamlessScaleBudgetEvidence{ThrottledCalls: 4, ThrottledBytes: 8 << 20, PeakActive: 2, MaxActive: 2},
 	}
+	installSeamlessScaleTestTimingPartition(&evidence)
 	if err := evidence.valid(bounds); err != nil {
 		t.Fatal(err)
 	}
+	clean := evidence
+	for _, mutation := range []func(*seamlessScaleEvidence){
+		func(e *seamlessScaleEvidence) { e.SteadyDuring.P99NS = 1_000_000_000 },
+		func(e *seamlessScaleEvidence) { e.SteadyDuring.ThroughputMilli /= 2 },
+		func(e *seamlessScaleEvidence) { e.RecoveryDuring.MaxPauseNS = seamlessScaleFaultRecoveryNS + 1 },
+		func(e *seamlessScaleEvidence) { e.RecoveryDuring.Errors++ },
+		func(e *seamlessScaleEvidence) { e.RecoveryDuring.Scheduled-- },
+		func(e *seamlessScaleEvidence) { e.FaultInjections++ },
+	} {
+		candidate := clean
+		mutation(&candidate)
+		if err := candidate.valid(bounds); err == nil {
+			t.Fatal("invalid fault/steady evidence accepted")
+		}
+	}
+	evidence.RecoveryDuring.MaxPauseNS = 3_500_000_000
+	evidence.RecoveryDuring.P99NS = 4_000_000_000
+	if err := evidence.valid(bounds); err != nil {
+		t.Fatalf("bounded injected fault recovery rejected: %v", err)
+	}
+	evidence = clean
 	evidence.Budget.ThrottledCalls = 0
 	if err := evidence.valid(bounds); err == nil {
 		t.Fatal("evidence without positive throttling accepted")
@@ -809,6 +874,7 @@ func TestSeamlessScaleEvidenceRoundTripsCanonicalRows(t *testing.T) {
 		After:                      strictSeamlessScaleRoundTripPhase(seamlessScalePhaseAfter),
 		Budget:                     seamlessScaleBudgetEvidence{ThrottledCalls: 1, ThrottledBytes: 1, PeakActive: 1, MaxActive: 1},
 	}
+	installSeamlessScaleTestTimingPartition(&evidence)
 	raw := appendSeamlessScaleEvidence(nil, evidence)
 	parsed, err := parseSeamlessScaleEvidence(raw)
 	if err != nil {
@@ -839,4 +905,29 @@ func strictSeamlessScaleRoundTripPhase(name string) seamlessScalePhaseEvidence {
 		CompletionGapNS: 4, QueueLagP99NS: 4, OfferedRateMilli: 1, ThroughputMilli: 1,
 		AcknowledgementDigest: "1111111111111111111111111111111111111111111111111111111111111111",
 		VerificationDigest:    "1111111111111111111111111111111111111111111111111111111111111111"}
+}
+
+// Build four real-duration fixture windows: three steady and one recovery.
+func installSeamlessScaleTestTimingPartition(evidence *seamlessScaleEvidence) {
+	base := evidence.During
+	scale := func(phase string, factor uint64) seamlessScalePhaseEvidence {
+		result := base
+		result.Phase = phase
+		result.DurationNS *= factor
+		result.EndNS = result.StartNS + result.DurationNS
+		result.Scheduled *= factor
+		result.Started *= factor
+		result.Completed *= factor
+		result.Requests *= factor
+		result.Successes *= factor
+		result.AcknowledgedWrites *= factor
+		result.VerifiedReads *= factor
+		return result
+	}
+	evidence.During = scale(seamlessScalePhaseDuring, 4)
+	evidence.SteadyDuring = scale(seamlessScalePhaseSteady, 3)
+	evidence.RecoveryDuring = scale(seamlessScalePhaseRecovery, 1)
+	evidence.RecoveryDuring.StartNS = evidence.SteadyDuring.EndNS
+	evidence.RecoveryDuring.EndNS = evidence.RecoveryDuring.StartNS + evidence.RecoveryDuring.DurationNS
+	evidence.DuringWindows, evidence.SteadyWindows, evidence.RecoveryWindows, evidence.FaultInjections = 4, 3, 1, 4
 }

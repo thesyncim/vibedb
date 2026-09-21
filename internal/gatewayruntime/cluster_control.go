@@ -38,6 +38,7 @@ type ScalingOperatorBackend struct {
 	writer             gateway.DirectoryWriter
 	catalog            scalingCatalogReader
 	distributedMetrics *gateway.DistributedMetrics
+	moveFailure        func([32]byte) string
 }
 
 func NewScalingOperatorBackend(controller *ScalingController) (*ScalingOperatorBackend, error) {
@@ -47,6 +48,9 @@ func NewScalingOperatorBackend(controller *ScalingController) (*ScalingOperatorB
 	backend, err := newScalingOperatorBackend(controller.directory, controller.writer, controller.catalog)
 	if err != nil {
 		return nil, err
+	}
+	if controller.moves != nil {
+		backend.moveFailure = controller.moves.LastFailure
 	}
 	return backend, nil
 }
@@ -213,12 +217,18 @@ func (backend *ScalingOperatorBackend) nodesResponse(ctx context.Context, respon
 		response.Error = boundedClusterControlError(err)
 		return response
 	}
+	progress, err := backend.progress(ctx, gateway.ScalingIntent{})
+	if err != nil {
+		response.Error = boundedClusterControlError(err)
+		return response
+	}
 	slices.SortFunc(nodes, func(left, right gateway.NodeRecord) int {
 		return bytesCompareNodeRecords(left, right)
 	})
 	response.OK = true
 	response.CatalogGeneration = generation
 	response.DirectoryRevision = revision
+	response.GroupInventoryDigest = progress.inventoryDigest
 	response.Nodes = make([]clustercontrol.NodeStatus, 0, len(nodes))
 	acknowledged := backend.terminalDrainAcknowledgements(ctx)
 	for _, node := range nodes {
@@ -288,6 +298,11 @@ func (backend *ScalingOperatorBackend) observeOnce(ctx context.Context, response
 		return response
 	}
 	response.Phase = progress.phase
+	if progress.moveFailure != "" {
+		response.Blockers = append(response.Blockers, clustercontrol.Blocker{
+			Code: "move_execution", Detail: progress.moveFailure,
+		})
+	}
 	response.ApplicationGroupsMoved = progress.applicationGroupsMoved
 	response.InternalGroupsMoved = progress.internalGroupsMoved
 	response.GroupInventoryDigest = progress.inventoryDigest
@@ -375,10 +390,12 @@ type clusterControlProgress struct {
 	internalGroupsMoved    uint32
 	retiringReferences     uint32
 	inventoryDigest        string
+	moveFailure            string
 }
 
 // progress derives operator-visible movement facts from the current catalog
-// route inventory and the durable enrollment rows. It intentionally does not
+// route inventory and atomically committed parent counters. Active enrollment
+// rows describe only the current phase. It intentionally does not
 // use planner output, in-memory queues, or node counts as a completion signal.
 func (backend *ScalingOperatorBackend) progress(ctx context.Context, parent gateway.ScalingIntent) (clusterControlProgress, error) {
 	if backend == nil || backend.catalog == nil {
@@ -388,13 +405,16 @@ func (backend *ScalingOperatorBackend) progress(ctx context.Context, parent gate
 	if err != nil || snapshot == nil {
 		return clusterControlProgress{}, errors.Join(err, errClusterControlUnavailable)
 	}
-	result := clusterControlProgress{phase: scalingStateName(parent.State)}
-	application := make(map[raftmember.GroupKey]struct{})
-	internal := make(map[raftmember.GroupKey]struct{})
+	if parent.CompletedInternalReplicas > parent.CompletedReplicas {
+		return clusterControlProgress{}, gateway.ErrInvalidScalingMetadata
+	}
+	result := clusterControlProgress{phase: scalingStateName(parent.State),
+		applicationGroupsMoved: parent.CompletedReplicas - parent.CompletedInternalReplicas,
+		internalGroupsMoved:    parent.CompletedInternalReplicas}
 	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
 	seen := make(map[raftmember.GroupKey]struct{}, snapshot.ReplicatedRouteCount())
 	hash := sha256.New()
-	hash.Write([]byte("vibedb/cluster-control/group-inventory/v1\x00"))
+	hash.Write([]byte("vibedb/cluster-control/group-inventory/v2\x00"))
 	for index := 0; index < snapshot.ReplicatedRouteCount(); index++ {
 		route, ok := snapshot.ReplicatedRouteAt(index, replicas[:0])
 		if !ok {
@@ -404,61 +424,41 @@ func (backend *ScalingOperatorBackend) progress(ctx context.Context, parent gate
 			continue
 		}
 		seen[route.Group] = struct{}{}
-		rows, listErr := backend.directory.ListEnrollmentIntents(ctx, route.Group)
-		if listErr != nil {
-			return clusterControlProgress{}, listErr
-		}
-		slices.SortFunc(rows, func(left, right gateway.GroupEnrollmentIntent) int {
-			for index := range left.IntentID {
-				if left.IntentID[index] < right.IntentID[index] {
-					return -1
-				}
-				if left.IntentID[index] > right.IntentID[index] {
-					return 1
-				}
-			}
-			return 0
-		})
+		// Inventory describes the current committed physical placement, not
+		// retained operation history. It is unchanged by history collection.
 		entry := struct {
 			Group                raftmember.GroupKey
 			Distribution         distribution.DistributionName
 			Shard                distribution.ShardID
 			AllocationGeneration uint64
-			IntentIDs            []string
-			States               []gateway.EnrollmentState
-			MoveIDs              []string
-		}{Group: route.Group, Distribution: route.Distribution, Shard: route.Shard,
-			AllocationGeneration: route.AllocationGeneration}
-		for _, row := range rows {
-			if row.State == gateway.EnrollmentCancelled || scalingEnrollmentID(parent.ID, row) != row.IntentID {
-				continue
+			Replicas             []gateway.ReplicatedEndpoint
+		}{route.Group, route.Distribution, route.Shard, route.AllocationGeneration, route.Replicas}
+		if parent.ID != ([32]byte{}) && parent.State < gateway.ScalingComplete {
+			rows, listErr := backend.directory.ListEnrollmentIntents(ctx, route.Group)
+			if listErr != nil {
+				return clusterControlProgress{}, listErr
 			}
-			entry.IntentIDs = append(entry.IntentIDs, hex.EncodeToString(row.IntentID[:]))
-			entry.States = append(entry.States, row.State)
-			if row.MoveOperationID != ([32]byte{}) {
-				entry.MoveIDs = append(entry.MoveIDs, hex.EncodeToString(row.MoveOperationID[:]))
-			}
-			if row.State >= gateway.EnrollmentComplete {
-				if route.Distribution == gateway.ReplicatedCatalogDistribution || route.Distribution == distribution.DistributionName("request-ledger") {
-					internal[route.Group] = struct{}{}
-				} else {
-					application[route.Group] = struct{}{}
+			for _, row := range rows {
+				if row.State >= gateway.EnrollmentComplete || row.State == gateway.EnrollmentCancelled ||
+					scalingEnrollmentID(parent.ID, row) != row.IntentID {
+					continue
+				}
+				if row.State > enrollmentStateForPhase(result.phase) {
+					result.phase = enrollmentPhaseName(row.State)
+				}
+				if result.moveFailure == "" && row.MoveOperationID != ([32]byte{}) && backend.moveFailure != nil {
+					if detail := backend.moveFailure(row.MoveOperationID); detail != "" {
+						result.moveFailure = boundedClusterControlError(errors.New(detail))
+					}
 				}
 			}
-			if row.State > enrollmentStateForPhase(result.phase) && parent.State < gateway.ScalingComplete {
-				result.phase = enrollmentPhaseName(row.State)
-			}
 		}
-		slices.Sort(entry.IntentIDs)
-		slices.Sort(entry.MoveIDs)
 		encoded, marshalErr := vibejson.Marshal(&entry)
 		if marshalErr != nil {
 			return clusterControlProgress{}, marshalErr
 		}
 		hash.Write(encoded)
 	}
-	result.applicationGroupsMoved = uint32(len(application))
-	result.internalGroupsMoved = uint32(len(internal))
 	digest := hash.Sum(nil)
 	result.inventoryDigest = hex.EncodeToString(digest)
 	if parent.State == gateway.ScalingComplete {

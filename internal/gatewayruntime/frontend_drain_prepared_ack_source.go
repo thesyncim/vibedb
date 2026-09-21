@@ -245,7 +245,6 @@ func serveFrontendDrainPreparedAckCutReadConnectionWithOptions(
 	if !options.requireCurrentGateway &&
 		(options.sourceNode == (rafttransport.NodeID{}) || options.sourceIncarnation == 0 ||
 			options.sourceServiceKeyDigest == ([32]byte{}) ||
-			!sourceContainsCanonicalCatalogSource(source, options.sourceNode, options.sourceIncarnation, options.sourceServiceKeyDigest) ||
 			!sourceRosterContains(source, options.sourceNode, options.sourceIncarnation, options.sourceServiceKeyDigest)) {
 		return errFrontendDrainPreparedAckSourceAuth
 	}
@@ -360,14 +359,29 @@ func frontendDrainPreparedAckCutFloorStrictlyAdvanced(
 }
 
 func frontendDrainPreparedAckSourceRoster(source gateway.FrontendDrainRuntimeCut) []frontenddrain.PreparedAckSource {
-	if !source.Nodes.Valid() {
+	if !source.Nodes.Valid() || source.Catalog == nil {
 		return nil
 	}
-	result := make([]frontenddrain.PreparedAckSource, 0, len(source.Nodes.CurrentNodes()))
+	var replicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	route, ok := source.Catalog.ResolveReplicatedMembershipRoute(gateway.ReplicatedCatalogDistribution, gateway.ReplicatedCatalogShard, replicas[:0])
+	if !ok {
+		return nil
+	}
+	// Catalog placement, including the enrolled successor, is the only source
+	// roster. Static node roles do not follow a catalog move. Learning the
+	// successor before promotion keeps cold recovery reachable after removal.
+	result := make([]frontenddrain.PreparedAckSource, 0, gateway.ServingReplicaCount+1)
 	for _, node := range source.Nodes.CurrentNodes() {
-		if node.Roles&(gateway.NodeRoleStorage|gateway.NodeRoleCatalog) !=
-			(gateway.NodeRoleStorage|gateway.NodeRoleCatalog) ||
+		if node.Roles&gateway.NodeRoleStorage == 0 ||
 			(node.Lifecycle != gateway.NodeActive && node.Lifecycle != gateway.NodeDraining) {
+			continue
+		}
+		placed := route.HasEnrolledTarget && route.EnrolledTarget.Node == node.NodeID &&
+			route.EnrolledTarget.NodeIncarnation == node.Incarnation && route.EnrolledTarget.ControlAddress == node.ControlAddress
+		for _, replica := range route.Serving.Replicas {
+			placed = placed || replica.Node == node.NodeID && replica.NodeIncarnation == node.Incarnation && replica.ControlAddress == node.ControlAddress
+		}
+		if !placed {
 			continue
 		}
 		result = append(result, frontenddrain.PreparedAckSource{
@@ -391,26 +405,6 @@ func sourceContainsExactNode(source gateway.FrontendDrainRuntimeCut, want gatewa
 		}
 	}
 	return false
-}
-
-func sourceContainsCanonicalCatalogSource(
-	source gateway.FrontendDrainRuntimeCut, nodeID rafttransport.NodeID,
-	incarnation uint64, key [32]byte,
-) bool {
-	found := false
-	for _, node := range source.Nodes.Nodes {
-		if node.NodeID != nodeID || node.Incarnation != incarnation {
-			continue
-		}
-		if found || !node.Valid() || node.ServiceKeyDigest != replication.Digest(key) ||
-			node.Roles&(gateway.NodeRoleStorage|gateway.NodeRoleCatalog) !=
-				(gateway.NodeRoleStorage|gateway.NodeRoleCatalog) ||
-			(node.Lifecycle != gateway.NodeActive && node.Lifecycle != gateway.NodeDraining) {
-			return false
-		}
-		found = true
-	}
-	return found
 }
 
 func sourceRosterContains(

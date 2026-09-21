@@ -78,6 +78,9 @@ func TestInitialReplicatedRelationManifestPureContract(t *testing.T) {
 		local := binding
 		local.MemberID = member
 		local.StoreID[0] += byte(member)
+		local.Authority.OwnershipEpoch += member
+		local.Authority.RoutingVersion += member
+		local.Authority.RouteGeneration += member
 		got, gotLimits, err := InitialReplicatedRelationManifest(local, placement, schema)
 		if err != nil || got != digest || gotLimits != limits {
 			t.Fatalf("replica %d: %x %v", member, got, err)
@@ -111,12 +114,6 @@ func TestInitialReplicatedRelationManifestPureContract(t *testing.T) {
 	}{
 		{"schema_generation", false, func(b *ReplicatedShardStoreBinding, _ *ReplicatedPlacementProfile, _ *InitialReplicatedRelationSchema) {
 			b.Authority.SchemaGeneration++
-		}},
-		{"routing", false, func(b *ReplicatedShardStoreBinding, _ *ReplicatedPlacementProfile, _ *InitialReplicatedRelationSchema) {
-			b.Authority.RoutingVersion++
-		}},
-		{"route_generation", false, func(b *ReplicatedShardStoreBinding, _ *ReplicatedPlacementProfile, _ *InitialReplicatedRelationSchema) {
-			b.Authority.RouteGeneration++
 		}},
 		{"allocation", false, func(b *ReplicatedShardStoreBinding, _ *ReplicatedPlacementProfile, _ *InitialReplicatedRelationSchema) {
 			b.AllocationGeneration++

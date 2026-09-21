@@ -741,17 +741,37 @@ func rf3CatalogGenesisExistingCutFixture(
 		t.Fatalf("invalid existing lifecycle fixture local=%+v draining=%+v", local, draining)
 	}
 	config := distribution.ClusterConfig{
-		Distributions: []distribution.DistributionSpec{{Name: "catalog", Arity: 1, MapperVersion: distribution.NativeMapperVersion}},
+		Distributions: []distribution.DistributionSpec{{Name: gateway.ReplicatedCatalogDistribution, Arity: 1, MapperVersion: distribution.NativeMapperVersion}},
 		Manifests: func() []*distribution.Manifest {
-			manifest, err := distribution.NewManifest("catalog", 1, []distribution.Shard{{ID: "catalog", AllocationGeneration: 1,
-				Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}, Leaders: []distribution.EndpointID{"catalog-endpoint"}, Epoch: 1}})
+			manifest, err := distribution.NewManifest(gateway.ReplicatedCatalogDistribution, 1, []distribution.Shard{{ID: gateway.ReplicatedCatalogShard, AllocationGeneration: 1,
+				Range: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}, Leaders: []distribution.EndpointID{"data-local", "data-drain", "data-third"}, Epoch: 1}})
 			if err != nil {
 				t.Fatal(err)
 			}
 			return []*distribution.Manifest{manifest}
 		}(),
 	}
-	snapshot, err := gateway.NewSnapshot(config, map[distribution.EndpointID]string{"catalog-endpoint": "127.0.0.1:8301"}, 2)
+	endpoints := map[distribution.EndpointID]string{
+		local.DataEndpoint: local.DataAddress, local.NativeEndpoint: local.NativeAddress, local.ControlEndpoint: local.ControlAddress,
+		draining.DataEndpoint: draining.DataAddress, draining.NativeEndpoint: draining.NativeAddress, draining.ControlEndpoint: draining.ControlAddress,
+		"data-third": "127.0.0.1:8301", "native-third": "127.0.0.1:8302", "control-third": "127.0.0.1:8303",
+	}
+	snapshot, err := gateway.NewSnapshotWithReplicatedMetadata(config, endpoints, 2, nil, nil, []gateway.ReplicatedShardDescriptor{{
+		Distribution: gateway.ReplicatedCatalogDistribution, Shard: gateway.ReplicatedCatalogShard,
+		Group: rf3CommandGroup(), AllocationGeneration: 1,
+		Command: raftservice.CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1, ProtectionEpoch: 1,
+			OwnershipEpoch: 1, SchemaGeneration: 1, RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1},
+		RangeIdentity: [32]byte{2}, LineageDigest: [32]byte{3}, ForwardingRuleDigest: [32]byte{4},
+		RequestLedgerRanges: []gateway.DurableRequestLedgerRangeDescriptor{{Identity: [32]byte{5}}},
+		Replicas: []gateway.ReplicatedReplicaDescriptor{
+			{Member: 1, Node: local.NodeID, NodeIncarnation: local.Incarnation, StoreID: [16]byte{1},
+				Endpoint: local.DataEndpoint, NativeEndpoint: local.NativeEndpoint, ControlEndpoint: local.ControlEndpoint},
+			{Member: 2, Node: draining.NodeID, NodeIncarnation: draining.Incarnation, StoreID: [16]byte{2},
+				Endpoint: draining.DataEndpoint, NativeEndpoint: draining.NativeEndpoint, ControlEndpoint: draining.ControlEndpoint},
+			{Member: 3, Node: [16]byte{3}, NodeIncarnation: 1, StoreID: [16]byte{3},
+				Endpoint: "data-third", NativeEndpoint: "native-third", ControlEndpoint: "control-third"},
+		},
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}

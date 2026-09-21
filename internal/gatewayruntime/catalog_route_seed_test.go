@@ -346,7 +346,7 @@ func catalogRouteSeedRoute(t testing.TB, snapshot *gateway.Snapshot) gateway.Rep
 }
 
 func catalogRouteSeedSnapshot(
-	t testing.TB, generation uint64, firstNativeAddress string,
+	t testing.TB, generation uint64, firstNativeAddress string, physical ...gateway.NodeRecord,
 ) *gateway.Snapshot {
 	t.Helper()
 	leaders := []distribution.EndpointID{"one", "two", "three"}
@@ -377,6 +377,14 @@ func catalogRouteSeedSnapshot(
 			NativeEndpoint:  distribution.EndpointID(string(name) + "-native"),
 			ControlEndpoint: distribution.EndpointID(string(name) + "-control"),
 		}
+	}
+	if len(physical) != 0 {
+		if len(physical) != 1 {
+			t.Fatal("expected one physical catalog source")
+		}
+		node := physical[0]
+		replicas[0].Node, replicas[0].NodeIncarnation = node.NodeID, node.Incarnation
+		endpoints["one"], endpoints["one-native"], endpoints["one-control"] = node.DataAddress, node.NativeAddress, node.ControlAddress
 	}
 	group := raftmember.GroupKey{
 		ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},

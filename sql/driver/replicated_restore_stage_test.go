@@ -79,8 +79,8 @@ func TestReplicatedRestoreStageDiscardsAuthorityAndResumesBundle(t *testing.T) {
 	freshBinding.Authority.RoutingVersion++
 	freshBinding.Authority.RouteGeneration++
 	freshMachine, freshErr := target.ReplicatedRelationManifestForBinding(targetIdentity, testReplicatedApplyOptions().Placement, freshBinding)
-	if freshErr != nil || freshMachine == sourceMachine {
-		t.Fatalf("fresh routing domain unchanged err=%v", freshErr)
+	if freshErr != nil || freshMachine != sourceMachine {
+		t.Fatalf("routing publication changed immutable schema contract err=%v", freshErr)
 	}
 	wrongSource := sourceManifest.Clone()
 	wrongSource.RelationManifestDigest[0] ^= 1

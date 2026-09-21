@@ -18,6 +18,7 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -41,6 +42,7 @@ type postgresDirectPending struct {
 	identity durableExecBatchIdentity
 	queries  []gateway.Query
 	plan     *gateway.DurableSQLDirectPlan
+	unknown  bool
 }
 type postgresDirectSlot struct {
 	index       int
@@ -306,6 +308,11 @@ func (p *postgresDirectPool) resolve(ctx context.Context, slot *postgresDirectSl
 		err = errInvalidDurableRequestAdapter
 	}
 	if err != nil {
+		if !pending.unknown && errors.Is(err, gateway.ErrDurableSQLNotAdmitted) {
+			slot.pending = nil
+			return nil, err
+		}
+		pending.unknown = true
 		return nil, postgresDirectUnknown(pending.identity.RequestID, err)
 	}
 	slot.pending = nil
@@ -319,7 +326,7 @@ func (p *postgresDirectPool) prepare(ctx context.Context, id durableExecBatchIde
 	for attempt := 0; ; attempt++ {
 		plan, err := p.prepared.PrepareDirectBatch(ctx, p.record.Authority, id, queries)
 		if err == nil || attempt == 7 || ctx.Err() != nil ||
-			errors.Is(err, gateway.ErrReplicatedMembershipTransition) ||
+			errors.Is(err, gateway.ErrReplicatedUnauthorized) || errors.Is(err, gateway.ErrReplicatedRoute) ||
 			errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 			!(errors.Is(err, raftmodel.ErrAdmissionBound) || errors.Is(err, gateway.ErrReplicatedLeader) || errors.Is(err, gateway.ErrReplicatedReadBehind)) {
 			return plan, err
@@ -388,7 +395,8 @@ func (p *postgresDirectPool) Write(ctx context.Context, q gateway.Query) (*gatew
 		}
 		slot.pending = &postgresDirectPending{identity: id, queries: queries, plan: plan}
 		result, err := p.resolve(ctx, slot)
-		if !errors.Is(err, gateway.ErrDurableSQLAborted) {
+		if !errors.Is(err, gateway.ErrDurableSQLAborted) &&
+			!(slot.pending == nil && errors.Is(err, gateway.ErrDurableSQLNotAdmitted) && errors.Is(err, raftservice.ErrServingFence)) {
 			return result, true, err
 		}
 	}

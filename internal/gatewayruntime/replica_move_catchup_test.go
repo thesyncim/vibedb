@@ -82,7 +82,7 @@ func TestGatewayReplicaCatchUpRestoresLearnerGrantBeforeConfigurationReplay(t *t
 		t.Fatal(err)
 	}
 	var members []rafttransport.Member
-	for _, endpoint := range gatewayReplicaMoveObservationCandidates(membership) {
+	for _, endpoint := range membership.AppendControlEndpoints(nil) {
 		role := rafttransport.MemberVoter
 		if endpoint.Member == 4 {
 			role = rafttransport.MemberLearner

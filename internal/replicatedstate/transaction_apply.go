@@ -1451,7 +1451,7 @@ func loadTransactionRelationPayloads(
 	wantMutations uint64,
 	wantRelations uint16,
 ) ([]TransactionRelationPayloadView, error) {
-	if snapshot.value == nil || snapshot.overlay != nil || wantMutations == 0 ||
+	if snapshot.value == nil && snapshot.live == nil || snapshot.overlay != nil || wantMutations == 0 ||
 		wantMutations > replication.MaxMutations || wantRelations == 0 ||
 		wantRelations > replication.MaxRelationsPerBundle {
 		return nil, ErrTransactionStateCorrupt
@@ -1461,7 +1461,7 @@ func loadTransactionRelationPayloads(
 	copy(prefix[1:], id[:])
 	rows := make([]TransactionRelationPayloadView, 0, wantRelations)
 	seen := uint64(0)
-	err := snapshot.value.RangePrefixRaw(prefix[:], func(key, value []byte) error {
+	err := snapshot.rangePrefixRaw(prefix[:], func(key, value []byte) error {
 		owned := bytes.Clone(value)
 		view, err := OpenTransactionRelationPayload(owned)
 		if err != nil || view.ID != id {
@@ -1480,7 +1480,8 @@ func loadTransactionRelationPayloads(
 		return nil
 	})
 	if err != nil || seen != wantMutations || len(rows) != int(wantRelations) {
-		return nil, errors.Join(err, ErrTransactionStateCorrupt)
+		return nil, errors.Join(err, fmt.Errorf("%w: payload scan read %d/%d mutations across %d/%d relations",
+			ErrTransactionStateCorrupt, seen, wantMutations, len(rows), wantRelations))
 	}
 	return rows, nil
 }

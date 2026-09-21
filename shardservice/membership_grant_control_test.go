@@ -233,7 +233,7 @@ func membershipGrantConfChangeMessage(
 		t.Fatal(err)
 	}
 	return &pb.Message{Type: pb.MsgApp.Enum(), From: &from, To: &to,
-		Term: proto.Uint64(1), LogTerm: proto.Uint64(1), Index: proto.Uint64(8), Commit: proto.Uint64(8),
+		Term: proto.Uint64(1), LogTerm: proto.Uint64(1), Index: proto.Uint64(grant.InitialReplicaSetVersion), Commit: proto.Uint64(grant.InitialReplicaSetVersion),
 		Entries: []*pb.Entry{{Type: pb.EntryConfChange.Enum(), Term: proto.Uint64(1),
-			Index: proto.Uint64(9), Data: data}}}
+			Index: proto.Uint64(grant.InitialReplicaSetVersion + 1), Data: data}}}
 }

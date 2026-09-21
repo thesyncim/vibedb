@@ -184,9 +184,15 @@ func TestControllerDiscoversOnlyMovesAndResumesFromJournal(t *testing.T) {
 	}
 	observer.cut.LeaderStatus.Commit = 6
 	observer.cut.LeaderStatus.Applied = 6
+	fixture.bootstrapErr = ErrExecutionFence
+	if _, err := controller.RunPass(context.Background()); !errors.Is(err, ErrExecutionFence) ||
+		controller.LastFailure([32]byte(plan.OperationID())) == "" || controller.LastFailure([32]byte{0xff}) != "" {
+		t.Fatalf("missing or misattributed active move diagnostic: %v", err)
+	}
+	fixture.bootstrapErr = nil
 	pass, err := controller.RunPass(context.Background())
 	if err != nil || pass.Discovered != 2 || pass.Moves != 1 || pass.Advanced != 1 ||
-		pass.Completed != 0 || len(fixture.snapshotRequests) != 1 {
+		pass.Completed != 0 || len(fixture.snapshotRequests) != 2 || controller.LastFailure([32]byte(plan.OperationID())) != "" {
 		t.Fatalf("pass=%+v snapshots=%d err=%v", pass, len(fixture.snapshotRequests), err)
 	}
 }

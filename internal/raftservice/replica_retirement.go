@@ -81,7 +81,7 @@ func (owner *Owner) validateProvenReplicaRetirement(request ownerRequest, member
 	case member.identity.StoreID != fence.StoreID:
 		return retirementFenceFailure("source store differs from fence")
 	case member.identity.NodeIncarnation != fence.NodeIncarnation:
-		return retirementFenceFailure("source node incarnation differs from fence")
+		return retirementFenceFailure("source group=%x node incarnation=%d differs from fence=%d", fence.Group.GroupID, member.identity.NodeIncarnation, fence.NodeIncarnation)
 	case member.command.SchemaGeneration == fence.Command.SchemaGeneration && member.command.RelationManifestDigest != fence.Command.RelationManifestDigest:
 		return retirementFenceFailure("source relation manifest differs from fence at schema %d", fence.Command.SchemaGeneration)
 	case !fence.Command.Valid():

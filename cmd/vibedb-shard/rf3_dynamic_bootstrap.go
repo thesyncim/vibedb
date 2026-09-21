@@ -135,6 +135,11 @@ func (registry *rf3DynamicBootstrapRegistry) Remove(
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	prior, found := registry.reservations[intent.Group]
+	// Installed cold recovery has no transfer receiver. A completed removal
+	// likewise leaves neither entry; retiring the runtime needs no new receiver.
+	if !found && registry.services[intent.Group] == nil {
+		return nil
+	}
 	if !found || prior.intent.Digest() != intent.Digest() || prior.proof != proof {
 		return nodecontrol.ErrConflict
 	}

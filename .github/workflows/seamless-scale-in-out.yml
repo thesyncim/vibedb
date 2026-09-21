@@ -114,7 +114,7 @@ jobs:
           qualification="${evidence}/qualification.tsv"
           test -s "${qualification}"
           test "$(stat -c %s "${qualification}")" -le 65536
-          grep -Fqx $'schema\tvibedb.seamless-scale-in-out\t1' "${qualification}"
+          grep -Fqx $'schema\tvibedb.seamless-scale-in-out\t2' "${qualification}"
           grep -Fqx $'result\tpass' "${qualification}"
           grep -Fqx $'phase\tterminal_post_stop_verified' "${qualification}"
           for marker in empty_target_at_enrollment controller_restarted target_restarted duplicate_operation_stable post_restart_operation_recovered safe_to_stop node_stopped acknowledged_data_intact no_skipped_success survivor_session_stable retiring_session_blocked retiring_session_released; do

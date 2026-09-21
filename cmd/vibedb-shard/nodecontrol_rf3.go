@@ -74,22 +74,25 @@ type rf3EnrollmentReceiverReceipt struct {
 // restart never has to reconstruct an artifact identity from a peer address
 // or a local snapshot cursor.
 type rf3EnrollmentDescriptorReceipt struct {
-	Kind              string               `json:"kind"`
-	IntentID          [32]byte             `json:"intent_id"`
-	IntentDigest      replication.Digest   `json:"intent_digest"`
-	Group             raftmember.GroupKey  `json:"group"`
-	TargetMember      uint64               `json:"target_member"`
-	TargetNode        rafttransport.NodeID `json:"target_node"`
-	TargetIncarnation uint64               `json:"target_incarnation"`
-	TargetStoreID     [16]byte             `json:"target_store_id"`
-	Descriptor        []byte               `json:"descriptor"`
-	DescriptorDigest  replication.Digest   `json:"descriptor_digest"`
+	// Intent retains the authenticated installation input for offline Raft
+	// recovery. A catalog quorum must not be required to reopen that quorum.
+	Intent            gateway.GroupEnrollmentIntent `json:"intent"`
+	Kind              string                        `json:"kind"`
+	IntentID          [32]byte                      `json:"intent_id"`
+	IntentDigest      replication.Digest            `json:"intent_digest"`
+	Group             raftmember.GroupKey           `json:"group"`
+	TargetMember      uint64                        `json:"target_member"`
+	TargetNode        rafttransport.NodeID          `json:"target_node"`
+	TargetIncarnation uint64                        `json:"target_incarnation"`
+	TargetStoreID     [16]byte                      `json:"target_store_id"`
+	Descriptor        []byte                        `json:"descriptor"`
+	DescriptorDigest  replication.Digest            `json:"descriptor_digest"`
 }
 
 // rf3EnrollmentRuntimeReceipt is written only after the shared peer has
 // accepted the adopted runtime.  It is evidence for restart repair; it is
-// never consumed as membership authority and therefore cannot make a group
-// serve without a fresh committed intent/receipt and transport registration.
+// never consumed as membership authority. Recovery uses durable Raft membership
+// and retirement records; ordinary serving still requires current catalog fences.
 type rf3EnrollmentRuntimeReceipt struct {
 	Kind              string                     `json:"kind"`
 	IntentID          [32]byte                   `json:"intent_id"`
@@ -404,8 +407,15 @@ func persistRF3EnrollmentDescriptor(
 	if err != nil {
 		return err
 	}
+	// The receipt is an immutable installation input, not a second catalog
+	// state machine. Later retries may carry a newer lifecycle revision.
+	retained := intent
+	retained.State, retained.Revision = gateway.EnrollmentPrepared, 1
+	retained.PreparationClaim, retained.MoveOperationID = [32]byte{}, [32]byte{}
+	retained.Receipt = nil
 	receipt := rf3EnrollmentDescriptorReceipt{
-		Kind: rf3EnrollmentPayloadKind, IntentID: intent.IntentID, IntentDigest: intent.Digest(),
+		Intent: retained,
+		Kind:   rf3EnrollmentPayloadKind, IntentID: intent.IntentID, IntentDigest: intent.Digest(),
 		Group: intent.Group, TargetMember: intent.Target.Member, TargetNode: intent.Target.Node,
 		TargetIncarnation: intent.Target.NodeIncarnation, TargetStoreID: intent.Target.StoreID,
 		Descriptor: rawDescriptor, DescriptorDigest: descriptorDigest,
@@ -445,6 +455,7 @@ func readRF3EnrollmentDescriptor(
 	}
 	canonical, marshalErr := vibejson.Marshal(&receipt)
 	if marshalErr != nil || !bytes.Equal(canonical, raw) || receipt.Kind != rf3EnrollmentPayloadKind ||
+		!receipt.Intent.Valid() || receipt.Intent.Digest() != intent.Digest() ||
 		receipt.IntentID != intent.IntentID || receipt.IntentDigest != intent.Digest() ||
 		receipt.Group != intent.Group || receipt.TargetMember != intent.Target.Member ||
 		receipt.TargetNode != intent.Target.Node || receipt.TargetIncarnation != intent.Target.NodeIncarnation ||

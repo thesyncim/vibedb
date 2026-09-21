@@ -342,9 +342,59 @@ func rf3RecoveredEnrollmentRoster(
 	if target := manifest.EnrolledTarget; target != nil {
 		known[target.MemberID] = rf3ManifestMember{MemberID: target.MemberID, NodeID: target.NodeID, PeerAddress: target.PeerAddress}
 	}
+	required := make(map[uint64]struct{}, 4)
+	for _, id := range conf.GetVoters() {
+		required[id] = struct{}{}
+	}
+	for _, id := range conf.GetLearners() {
+		required[id] = struct{}{}
+	}
+	required[localMember] = struct{}{}
+	if target := manifest.EnrolledTarget; target != nil {
+		required[target.MemberID] = struct{}{}
+	}
+	var currentGrant membershipgrant.Grant
+	if manifest.Route.MembershipGrantPath != "" {
+		grant, found, err := readRF3MembershipGrant(manifest.Route.MembershipGrantPath)
+		if err != nil {
+			return result, err
+		}
+		if found {
+			if grant.Group != group {
+				return result, errRF3EnrollmentPeerReceipt
+			}
+			for _, id := range grant.InitialVoters {
+				required[id] = struct{}{}
+			}
+			required[grant.TargetMember] = struct{}{}
+			currentGrant = grant
+		}
+	}
+	// The operator's current manifest is an identity anchor. Resolve only
+	// missing identities and their dependencies; retired history cannot make
+	// an explicitly reprovisioned, complete roster depend on an older one.
+	needed := make(map[uint64]bool)
+	for id := range required {
+		if _, found := known[id]; !found {
+			needed[id] = true
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, receipt := range receipts {
+			if receipt.Group != group || !needed[receipt.MemberID] {
+				continue
+			}
+			for _, id := range receipt.Grant.InitialVoters {
+				if _, found := known[id]; !found && !needed[id] {
+					needed[id], changed = true, true
+				}
+			}
+		}
+	}
 	chain := make([]rf3EnrollmentPeerReceipt, 0)
 	for _, receipt := range receipts {
-		if receipt.Group == group {
+		if receipt.Group == group && needed[receipt.MemberID] {
 			chain = append(chain, receipt)
 		}
 	}
@@ -386,33 +436,9 @@ func rf3RecoveredEnrollmentRoster(
 		}
 		known[member.MemberID], witnesses[member.MemberID] = member, receipt
 	}
-	required := make(map[uint64]struct{}, 4)
-	for _, id := range conf.GetVoters() {
-		required[id] = struct{}{}
-	}
-	for _, id := range conf.GetLearners() {
-		required[id] = struct{}{}
-	}
-	required[localMember] = struct{}{}
-	if target := manifest.EnrolledTarget; target != nil {
-		required[target.MemberID] = struct{}{}
-	}
-	if manifest.Route.MembershipGrantPath != "" {
-		grant, found, err := readRF3MembershipGrant(manifest.Route.MembershipGrantPath)
-		if err != nil {
-			return result, err
-		}
-		if found {
-			if grant.Group != group {
-				return result, errRF3EnrollmentPeerReceipt
-			}
-			for _, id := range grant.InitialVoters {
-				required[id] = struct{}{}
-			}
-			required[grant.TargetMember] = struct{}{}
-			if receipt, exists := witnesses[grant.TargetMember]; exists && receipt.Grant != grant {
-				return result, errRF3EnrollmentPeerReceipt
-			}
+	if currentGrant != (membershipgrant.Grant{}) {
+		if receipt, exists := witnesses[currentGrant.TargetMember]; exists && receipt.Grant != currentGrant {
+			return result, errRF3EnrollmentPeerReceipt
 		}
 	}
 	ids := make([]uint64, 0, len(required))

@@ -2,6 +2,7 @@ package gatewayruntime
 
 import (
 	"bytes"
+	"fmt"
 	"slices"
 	"strings"
 
@@ -186,7 +187,7 @@ func gatewayHotSplitSources(manifest gatewayReplicaControlManifest, catalog *gat
 	for _, source := range sources {
 		logical, err := sqldriver.ReplicatedRelationManifestDigest(source.SQL)
 		if err != nil {
-			return nil, hotshard.ErrInvalidPressureCut
+			return nil, fmt.Errorf("%w: source %x SQL schema: %v", hotshard.ErrInvalidPressureCut, source.Group.GroupID, err)
 		}
 		source.LogicalSchemaDigest = replication.Digest(logical)
 		descriptor, found := byGroup[source.Group]
@@ -196,20 +197,14 @@ func gatewayHotSplitSources(manifest gatewayReplicaControlManifest, catalog *gat
 			len(placement.Columns) != 1 || placement.Columns[0] != source.Template.ShardKey ||
 			!gatewaySplitSourceMatches(source, descriptor, profile) || !validGatewaySplitTemplate(source.Template) ||
 			len(descriptor.Replicas) != gateway.ServingReplicaCount {
-			return nil, hotshard.ErrInvalidPressureCut
+			return nil, fmt.Errorf("%w: source %x catalog %d group/schema placement", hotshard.ErrInvalidPressureCut, source.Group.GroupID, catalog.Generation())
 		}
 		if !gatewaySplitSourceSQLIdentityMatches(source) || !gatewaySplitSourceProfilesMatch(source, byDistribution[descriptor.Distribution]) || source.SQL.Binding.Distribution != string(descriptor.Distribution) ||
 			source.SQL.Binding.Shard != string(descriptor.Shard) || source.SQL.Binding.AllocationGeneration != uint64(descriptor.AllocationGeneration) ||
 			source.SQL.UserPrimaryKey != profile.PrimaryKey || source.SQL.UserLimits.MaxKeyBytes != int(profile.MaxKeyBytes) ||
 			source.SQL.UserLimits.MaxDocumentBytes != int(profile.MaxDocumentBytes) ||
 			source.SQL.UserLimits.MaxBatchDocuments != source.Template.MaxBatchDocuments || source.SQL.UserLimits.MaxBatchBytes != source.Template.MaxBatchBytes {
-			return nil, hotshard.ErrInvalidPressureCut
-		}
-		matchedReplica := false
-		for _, replica := range descriptor.Replicas {
-			if replica.Member == source.SQL.Binding.MemberID && replica.StoreID == source.SQL.Binding.StoreID {
-				matchedReplica = true
-			}
+			return nil, fmt.Errorf("%w: source %x SQL identity/profile", hotshard.ErrInvalidPressureCut, source.Group.GroupID)
 		}
 		manifest, manifestFound := catalog.Manifest(descriptor.Distribution)
 		var sourceRange distribution.KeyRange
@@ -223,12 +218,12 @@ func gatewayHotSplitSources(manifest gatewayReplicaControlManifest, catalog *gat
 				}
 			}
 		}
-		if !matchedReplica || !matchedRange || !gatewaySplitSourceRetainedRangeMatches(source, descriptor, sourceRange) {
-			return nil, hotshard.ErrInvalidPressureCut
+		if !matchedRange || !gatewaySplitSourceRetainedRangeMatches(source, descriptor, sourceRange) {
+			return nil, fmt.Errorf("%w: source %x catalog %d retained range", hotshard.ErrInvalidPressureCut, source.Group.GroupID, catalog.Generation())
 		}
 		digest, err := sqldriver.ReplicatedSchemaManifest(source.SQL, source.Placement, source.LocalIndexes)
 		if err != nil || digest != source.RelationManifestDigest {
-			return nil, hotshard.ErrInvalidPressureCut
+			return nil, fmt.Errorf("%w: source %x immutable schema digest: %v", hotshard.ErrInvalidPressureCut, source.Group.GroupID, err)
 		}
 		source.SQL = source.SQL.Clone()
 		source.LocalIndexes = cloneGatewaySplitIndexes(source.LocalIndexes)
@@ -245,15 +240,10 @@ func gatewayHotSplitSources(manifest gatewayReplicaControlManifest, catalog *gat
 			if !enrolled || !validGatewaySplitRoot(replica.Root) || !validGatewayReplicaAddress(endpoint.Snapshot) {
 				return nil, hotshard.ErrInvalidPressureCut
 			}
-			foundNode := false
-			for _, member := range descriptor.Replicas {
-				if member.Node == replica.Node {
-					foundNode = true
-				}
-			}
-			if !foundNode {
-				return nil, hotshard.ErrInvalidPressureCut
-			}
+			// This catalog proves the immutable source schema, not current
+			// placement. An operator may enroll child roots after a replica
+			// move. buildChildTarget selects only the current catalog's exact
+			// members; historical or unrelated enrolled roots grant no role.
 			key := gatewaySplitReplica{Node: replica.Node, Root: replica.Root}
 			if _, duplicate := roots[key]; duplicate {
 				return nil, hotshard.ErrInvalidPressureCut
@@ -277,6 +267,12 @@ func gatewaySplitSourceRetainedRangeMatches(source gatewaySplitSource, descripto
 		!initial.End.Max && (current.End.Max || bytes.Compare(initial.End.Point[:], current.End.Point[:]) < 0) {
 		return false
 	}
+	// The portable SQL schema may come from any valid physical replica of
+	// this exact group. Its member and routing fields do not authorize a
+	// child: the current catalog supplies every new child binding.
+	if current == initial {
+		return true
+	}
 	old, applied := source.SQL.Binding.Authority, descriptor.Command
 	if applied.OwnershipEpoch < old.OwnershipEpoch || applied.RoutingVersion < old.RoutingVersion || applied.RouteGeneration < old.RouteGeneration ||
 		applied.ActivePolicyGeneration < old.ActivePolicyGeneration || applied.ProtectionEpoch < old.ProtectionEpoch {
@@ -285,7 +281,7 @@ func gatewaySplitSourceRetainedRangeMatches(source gatewaySplitSource, descripto
 	// A narrower live range is accepted only behind a later catalog-certified
 	// ownership cut of this exact group. Its immutable validation range remains
 	// untouched, so restart recomputes the same source machine schema.
-	return current == initial || applied.OwnershipEpoch > old.OwnershipEpoch && applied.RoutingVersion > old.RoutingVersion && applied.RouteGeneration > old.RouteGeneration
+	return applied.OwnershipEpoch > old.OwnershipEpoch && applied.RoutingVersion > old.RoutingVersion && applied.RouteGeneration > old.RouteGeneration
 }
 
 func cloneGatewaySplitIndexes(indexes []store.IndexDefinition) []store.IndexDefinition {

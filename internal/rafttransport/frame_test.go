@@ -100,7 +100,7 @@ func TestFrameGoldenHeartbeat(t *testing.T) {
 	if destination != receiver.LocalNode() {
 		t.Fatalf("destination = %x, want %x", destination, receiver.LocalNode())
 	}
-	const golden = "5644524600010100070100000000000000000000000000000702000000000000000000000000000000000000000000070703000000000000000000000000000007040000000000000000000000000000810cf18386ac3345a53a17fb9c5756197adb0a55b2fd4f8e138c1c828dd175430000000000000001000000000000000c000000000000000b000000130808100b180c20052804300740076203637478"
+	const golden = "5644524600020100070100000000000000000000000000000702000000000000000000000000000000000000000000070703000000000000000000000000000007040000000000000000000000000000000000000000000c000000000000000b000000130808100b180c20052804300740076203637478"
 	if got := hex.EncodeToString(frame); got != golden {
 		t.Fatalf("golden frame changed:\n got %s\nwant %s", got, golden)
 	}
@@ -344,7 +344,7 @@ func TestStaticFrameRejectsConfigurationEntry(t *testing.T) {
 	}
 }
 
-func TestDecodeInboundRejectsChangedStaticRoster(t *testing.T) {
+func TestDecodeInboundUsesCurrentMemberIdentity(t *testing.T) {
 	group := testGroup(19)
 	sender, receiver, from, to := frameTestRegistries(t, 3, group)
 	frame := frameTestEncode(t, sender, group, frameTestMessage(pb.MsgHeartbeat, from, to))
@@ -359,12 +359,12 @@ func TestDecodeInboundRejectsChangedStaticRoster(t *testing.T) {
 		wantUnauthorized bool
 	}{
 		{name: "role", mutate: func(members []Member) { members[1].Role = MemberLearner }},
-		{name: "node", mutate: func(members []Member) { members[1].Node = testNode(4) }, wantUnauthorized: true},
+		{name: "node", mutate: func(members []Member) { members[2].Node = testNode(4) }, wantUnauthorized: true},
 		{name: "replica-set version", mutate: func(members []Member) {
 			for i := range members {
 				members[i].ReplicaSetVersion++
 			}
-		}, wantUnauthorized: true},
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -511,7 +511,7 @@ func TestDecodeInboundRejectsForgedPeerGroupAndMember(t *testing.T) {
 			want: ErrInvalidFrame,
 		},
 		{
-			name:          "roster digest",
+			name:          "source member",
 			authenticated: sender.LocalNode(),
 			mutate:        func(frame []byte) { frame[frameTestRosterOffset] ^= 0x80 },
 			want:          ErrUnauthorized,
@@ -588,7 +588,7 @@ func TestDecodeInboundRejectsEveryTruncationAndHeaderDamage(t *testing.T) {
 	}{
 		{name: "magic", mutate: func(frame []byte) { frame[0] ^= 0xff }, want: ErrUnsupportedFrame},
 		{name: "format", mutate: func(frame []byte) { binary.BigEndian.PutUint16(frame[4:6], frameCodecFormat+1) }, want: ErrUnsupportedFrame},
-		{name: "kind", mutate: func(frame []byte) { frame[6]++ }, want: ErrUnsupportedFrame},
+		{name: "kind", mutate: func(frame []byte) { frame[6] = 0xff }, want: ErrUnsupportedFrame},
 		{name: "flags", mutate: func(frame []byte) { frame[7] = 1 }, want: ErrUnsupportedFrame},
 		{name: "zero cluster", mutate: func(frame []byte) { clear(frame[frameTestGroupOffset : frameTestGroupOffset+16]) }, want: ErrInvalidFrame},
 		{name: "zero cluster incarnation", mutate: func(frame []byte) { clear(frame[frameTestGroupOffset+16 : frameTestGroupOffset+32]) }, want: ErrInvalidFrame},
@@ -779,7 +779,11 @@ func frameTestReplacePayload(t testing.TB, frame []byte, message *pb.Message) []
 }
 
 func frameTestReplaceRawPayload(frame, payload []byte) []byte {
-	replaced := append(bytes.Clone(frame[:FrameHeaderBytes]), payload...)
+	headerBytes := FrameHeaderBytes
+	if frame[6] == frameKindAuthority {
+		headerBytes = AuthorityFrameHeaderBytes
+	}
+	replaced := append(bytes.Clone(frame[:headerBytes]), payload...)
 	binary.BigEndian.PutUint32(replaced[frameTestLengthOffset:FrameHeaderBytes], uint32(len(payload)))
 	return replaced
 }

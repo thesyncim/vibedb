@@ -475,22 +475,6 @@ func Plan(input PlacementInput) (PlacementPlan, error) {
 				continue
 			}
 		}
-		if input.Request.MaxMigrationBytes != 0 &&
-			(candidate.migrationBytes > input.Request.MaxMigrationBytes ||
-				state.plannedMigration > input.Request.MaxMigrationBytes-candidate.migrationBytes) {
-			addCandidateBlocker(&plan, *candidate, PlacementBlocker{
-				Code: BlockerMigrationBudget, Detail: "migration budget is exhausted for this wave",
-			})
-			plan.RemainingReplicas++
-			continue
-		}
-		if state.totalMigration > math.MaxUint64-candidate.migrationBytes {
-			addCandidateBlocker(&plan, *candidate, PlacementBlocker{
-				Code: BlockerOverflow, Detail: "migration total would overflow the bounded cut",
-			})
-			plan.RemainingReplicas++
-			continue
-		}
 		selected, blocker := chooseTarget(
 			candidate, targets, nodes, freshScaleOutTargets, &state, input.Request, policy,
 		)
@@ -502,6 +486,25 @@ func Plan(input PlacementInput) (PlacementPlan, error) {
 		if selected < 0 {
 			addCandidateBlocker(&plan, *candidate, PlacementBlocker{
 				Code: BlockerNoSafeTarget, Detail: "all eligible targets violate a hard placement constraint",
+			})
+			plan.RemainingReplicas++
+			continue
+		}
+		// Admission limits apply to actual moves. A balanced replica needs no
+		// transfer, even when its image exceeds this operation's byte budget.
+		if input.Request.MaxMigrationBytes != 0 &&
+			(candidate.migrationBytes > input.Request.MaxMigrationBytes ||
+				state.plannedMigration > input.Request.MaxMigrationBytes-candidate.migrationBytes) {
+			addCandidateBlocker(&plan, *candidate, PlacementBlocker{
+				Code: BlockerMigrationBudget, Detail: fmt.Sprintf("migration requires %d bytes; wave limit=%d reserved=%d",
+					candidate.migrationBytes, input.Request.MaxMigrationBytes, state.plannedMigration),
+			})
+			plan.RemainingReplicas++
+			continue
+		}
+		if state.totalMigration > math.MaxUint64-candidate.migrationBytes {
+			addCandidateBlocker(&plan, *candidate, PlacementBlocker{
+				Code: BlockerOverflow, Detail: "migration total would overflow the bounded cut",
 			})
 			plan.RemainingReplicas++
 			continue
@@ -1093,11 +1096,6 @@ func chooseTarget(
 				firstBlocker = PlacementBlocker{Code: reason, Detail: "target projected usage violates a hard capacity or migration bound", Node: node.NodeID, Revision: node.Revision, TargetNode: node.NodeID}
 			}
 			continue
-		}
-		if request.MaxMigrationBytes != 0 {
-			// The total cut is checked at reservation time; this branch only
-			// keeps a concrete reason available if every target otherwise fits.
-			// The actual remaining budget is attached by reserveMove.
 		}
 		objective := max(sourceAfter, targetPressure)
 		before := max(sourceCurrent, pressureWithReservation(*node, target, state))

@@ -98,7 +98,7 @@ func (executor *Executor) executeCatalogSet(ctx context.Context, operation rebal
 		if err != nil || !found {
 			return true, errors.Join(err, ErrGrantUnavailable)
 		}
-		if err = validateGrant(sibling, grant); err != nil {
+		if err = ValidateMembershipGrant(sibling, grant); err != nil {
 			return true, err
 		}
 		route, err := executor.resolve(ctx, id, sibling, execution)

@@ -107,16 +107,15 @@ type EnrollmentControlAuthorizer func(
 // caller's claimed capacity are authority.
 type EnrollmentControlServiceOptions struct {
 	Registry *StaticRegistry
-	// Transport is the preferred commit owner. When present, the handler
-	// publishes the queue before the registry directory cut, preserving the
-	// same atomic fence as OrdinaryTransport.EnrollMemberContext. Registry is
-	// still retained for detached ACK construction and must be the transport's
-	// registry when both are supplied.
+	// Transport shares the registry used by ordinary frame admission. Enrollment
+	// commits identity and its dependent receipts atomically; queues are created
+	// lazily by authorized sends. Registry is retained for detached ACKs and
+	// must be the transport's registry when both are supplied.
 	Transport *OrdinaryTransport
 	Verifier  EnrollmentVerifier
 	Authorize EnrollmentControlAuthorizer
 	// OnEnrolled updates dependent physical-identity admission such as the
-	// snapshot TLS listener after the transport queue is prepared and before
+	// snapshot TLS listener before
 	// the registry publishes its new directory cut or the service sends ACK.
 	OnEnrolled    func(EnrollmentIntent) error
 	ReadDeadline  DeadlineFunc
@@ -291,7 +290,7 @@ func NewEnrollmentControlClient(
 }
 
 // EnrollMember sends one exact committed intent to target. The target's
-// handler performs the local verifier read and queue-before-directory commit.
+// handler verifies the committed intent before atomically publishing identity.
 //
 // DirectoryRevision fences every enrollment a registry ever commits behind
 // one monotonic counter shared across all its groups and peers, not just the

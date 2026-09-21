@@ -13,8 +13,13 @@ retries the same operation IDs. A process skip is a qualification failure in
 CI.
 
 The foreground workload uses a bounded calibration with the same mixed
-open-loop SQL/native workload, selects one sustainable offered rate, and keeps
-that rate fixed for baseline, migration, and after windows. Latency is measured
+open-loop SQL/native workload. It measures all five baseline windows at 1200
+requests/second, falling back to 1000 only if the higher rate misses arrivals.
+The selected candidate’s complete measurement becomes the baseline, and that
+rate stays fixed for migration and after windows. Operation errors fail
+calibration; they cannot select a lower rate. Each of the sixteen
+workers keeps its own SQL and authenticated native connection; the original
+survivor connections are retained and checked after the wave. Latency is measured
 from scheduled arrival to validated response, including queueing and retries.
 Samples are assigned to a phase by scheduled arrival, so migration requests
 cannot move into a quiet post-migration window. Surviving gateways and SQL
@@ -30,7 +35,7 @@ The test writes one bounded TSV file per run. The first rows identify the
 schema and terminal phase:
 
 ```text
-schema	vibedb.seamless-scale-in-out	1
+schema	vibedb.seamless-scale-in-out	2
 result	pass
 phase	terminal_post_stop_verified
 ```
@@ -105,3 +110,24 @@ The required Linux gate is defined in
 `VIBEDB_SEAMLESS_SCALE_E2E=1`, rejects skipped or incomplete JSON test output,
 and checks every strict marker and terminal evidence row before uploading the
 TSV.
+
+Forced process failures use an explicit recovery budget. A measured local voter
+restart interrupted completions for 3.5 seconds, exceeding the previous shared
+100 ms pause gate and two-second arrival queue. The fixture now reserves ten
+seconds of timestamp queue capacity and records each of the three target
+restarts and the one controller restart before stopping the process. Only
+complete measurement windows intersecting the ten seconds after an injected
+fault enter `during_recovery`; all other migration windows enter `during_steady`.
+The two partitions account for every request in the full `during` aggregate.
+The recovery pause and p99 ceilings are ten seconds. The original steady and
+post-migration latency multipliers, 99% throughput floor, 100 ms pause ceiling,
+and continuity comparison remain unchanged. No phase permits errors, missed
+arrivals, lost acknowledgements, or incorrect results.
+
+Schema 2 includes both partitions, their window counts, and the four fault
+injections. Partition `duration_ns` is the measured active span of its contiguous
+window runs; `start_ns` and `end_ns` retain the actual first and last timestamps.
+Retry counts and time remain included. Native reads retry only explicit
+retryable responses; SQL retries only definite transaction aborts (or read-only
+availability failures), with a ten-second elapsed deadline and 20–320 ms
+backoff. Unknown SQL writes and transport failures are never resubmitted.

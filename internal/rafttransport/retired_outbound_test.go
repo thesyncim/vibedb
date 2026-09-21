@@ -89,7 +89,7 @@ func TestTransportDiscardsOnlyCommittedRemovedSource(t *testing.T) {
 	}
 	view, _ := registry.currentAuthority(group)
 	withoutRemoval := *view
-	withoutRemoval.retiredVersion = 0
+	withoutRemoval.grant.SourceMember = 0
 	if retiredOutboundSource(&withoutRemoval, pending.Message) {
 		t.Fatal("discarded a source without committed removal")
 	}
@@ -134,8 +134,8 @@ func TestTransportDiscardsOnlyCommittedRemovedDestination(t *testing.T) {
 	// buffer ownership, and rejected packets must remain errors.
 	transport.state.Store(transportRunning)
 	defer transport.Close()
-	if err := transport.Send(outbound(pb.MsgHeartbeat, 2, 3)); !errors.Is(err, ErrUnauthorized) {
-		t.Fatalf("uncommitted destination=%v", err)
+	if _, _, err := registry.EncodeOutbound(nil, outbound(pb.MsgHeartbeat, 2, 3)); err != nil {
+		t.Fatalf("exact active target replication=%v", err)
 	}
 	for _, next := range []struct {
 		version uint64
@@ -154,7 +154,7 @@ func TestTransportDiscardsOnlyCommittedRemovedDestination(t *testing.T) {
 		before := []byte("unchanged")
 		frame, destination, err := registry.EncodeOutbound(before, packet)
 		if !errors.Is(err, ErrUnauthorized) || !errors.Is(err, errRetiredOutboundDestination) ||
-			errors.Is(err, ErrRetiredAuthority) || !bytes.Equal(frame, before) || destination != (NodeID{}) {
+			!bytes.Equal(frame, before) || destination != (NodeID{}) {
 			t.Fatalf("%s frame=%q destination=%v error=%v", kind, frame, destination, err)
 		}
 		if err := transport.Send(packet); err != nil {
@@ -188,8 +188,8 @@ func TestTransportDiscardsOnlyCommittedRemovedDestination(t *testing.T) {
 	if retiredOutboundDestination(&copy, pending.Message) {
 		t.Fatal("learner originated leader traffic")
 	}
-	if !retiredOutboundDestination(&copy, outbound(pb.MsgAppResp, 2, 1).Message) {
-		t.Fatal("valid learner response not discarded")
+	if retiredOutboundDestination(&copy, outbound(pb.MsgAppResp, 2, 1).Message) {
+		t.Fatal("nonterminal roster was treated as a completed removal")
 	}
 	delete(copy.roles, 2)
 	if retiredOutboundDestination(&copy, outbound(pb.MsgAppResp, 2, 1).Message) {

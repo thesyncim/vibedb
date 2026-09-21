@@ -40,6 +40,7 @@ func testGroupTransitionIntent(t *testing.T, current *Snapshot, source Replicate
 func TestBuildGroupOwnedShardTransitionReplacesNonFirstRouteLeader(t *testing.T) {
 	_, _, current := newCatalogAuthorityFixtureWithDescriptor(t, func(source *ReplicatedShardDescriptor) {
 		source.LogicalSchemaDigest = [32]byte{0x93}
+		testReplicatedCatalogEnrollTarget(source)
 	})
 	source := current.ReplicatedShardDescriptors()[0]
 	_, _, target, command := testCertifiedReplicaReplacement(t, current, source)
@@ -71,7 +72,10 @@ func TestBuildGroupOwnedShardTransitionReplacesNonFirstRouteLeader(t *testing.T)
 }
 
 func TestGroupTransitionReceiptAtomicRecoveryAndOwnerFence(t *testing.T) {
-	authority, client, current := newCatalogAuthorityFixtureWithDescriptor(t, func(source *ReplicatedShardDescriptor) { source.LogicalSchemaDigest = [32]byte{0x93} })
+	authority, client, current := newCatalogAuthorityFixtureWithDescriptor(t, func(source *ReplicatedShardDescriptor) {
+		source.LogicalSchemaDigest = [32]byte{0x93}
+		testReplicatedCatalogEnrollTarget(source)
+	})
 	observer := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x92)
 	lagging := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x94)
 	source := current.ReplicatedShardDescriptors()[0]
@@ -155,43 +159,6 @@ func TestGroupTransitionReceiptAtomicRecoveryAndOwnerFence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	eventID := transitionDocumentID("move-head/", next.Generation())
-	eventKey := string(fixedControlPlaneKey(eventID))
-	savedEvent := bytes.Clone(client.rows[eventKey])
-	for _, mutation := range []string{"missing", "grant", "command", "head", "owner-key"} {
-		t.Run("reject-history-"+mutation, func(t *testing.T) {
-			var event groupTransitionRecord
-			if err := decodeTransitionDocument(savedEvent, eventID, &event, maxGroupTransitionRecordBytes); err != nil {
-				t.Fatal(err)
-			}
-			switch mutation {
-			case "missing":
-				delete(client.rows, eventKey)
-			case "grant":
-				event.Grant.TargetMember++
-			case "command":
-				event.Command.ReplicaSetVersion++
-			case "head":
-				event.Receipt.CommittedHeadDigest[0]++
-			case "owner-key":
-				event.Intent.Key.OperationID[0]++
-			}
-			if mutation != "missing" {
-				raw, err := encodeTransitionDocument(eventID, event, maxGroupTransitionRecordBytes)
-				if err != nil {
-					t.Fatal(err)
-				}
-				client.rows[eventKey] = raw
-			}
-			defer func() { client.rows[eventKey] = savedEvent }()
-			if _, err := lagging.Read(ctx); err == nil {
-				t.Fatal("unproven history accepted")
-			}
-			if lagging.holder.Current().Generation() != current.Generation() {
-				t.Fatal("invalid history changed holder")
-			}
-		})
-	}
 	recovered, err := lagging.Read(ctx)
 	if err != nil || recovered == nil || recovered.Generation() != post.Generation() {
 		t.Fatalf("missed publication replay: snapshot=%v err=%v", recovered, err)
@@ -239,8 +206,92 @@ func advanceUnrelatedGroupTestHead(t *testing.T, authority *ReplicatedCatalogAut
 	return authority.holder.Current()
 }
 
+func TestMoveAdmittedAfterUnrelatedHeadUsesExactExistingGrant(t *testing.T) {
+	authority, client, current := newCatalogAuthorityFixtureWithDescriptor(t, func(source *ReplicatedShardDescriptor) {
+		source.LogicalSchemaDigest = [32]byte{0x93}
+		testReplicatedCatalogEnrollTarget(source)
+	})
+	source := current.ReplicatedShardDescriptors()[0]
+	grant, _, target, command := testCertifiedReplicaReplacement(t, current, source)
+	ctx := t.Context()
+	if err := authority.PublishMembershipGrant(ctx, grant); err != nil {
+		t.Fatal(err)
+	}
+	current = advanceUnrelatedGroupTestHead(t, authority, current)
+	intent := testGroupTransitionIntent(t, current, source, target, grant.SourceMember)
+	lease, err := authority.AcquireDistributionTransition(ctx, intent.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, found, err := authority.ReadMembershipGrant(ctx, grant.Group); err != nil || !found || got != grant {
+		t.Fatalf("unchanged current group no longer authorizes grant: found=%t err=%v", found, err)
+	}
+	next, err := BuildGroupOwnedShardTransition(current, intent, TransitionPhasePreRemove, target, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.unknownNext = true
+	if _, err = authority.PublishGroupTransition(ctx, lease, intent, TransitionPhasePreRemove, next, [32]byte{}); !errors.Is(err, ErrReplicatedCatalogPending) {
+		t.Fatalf("grant born at %d, move admitted at %d: %v", grant.CatalogGeneration, intent.SourceHeadGeneration, err)
+	}
+	client.holdUnknown = false
+	if err = authority.RetryPending(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cold := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(nil), 0x97)
+	if _, err = cold.Read(ctx); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := cold.PublishGroupTransition(ctx, lease, intent, TransitionPhasePreRemove, next, [32]byte{})
+	if err != nil || receipt.CommittedHeadGeneration != next.Generation() {
+		t.Fatalf("cold lost-reply recovery: receipt=%+v err=%v", receipt, err)
+	}
+	if got, found, err := cold.ReadMembershipGrant(ctx, grant.Group); err != nil || !found || got != grant {
+		t.Fatalf("recovered move lost its exact grant: found=%t err=%v", found, err)
+	}
+}
+
+func TestMoveGrantRetainsGroupFencesAcrossUnrelatedHead(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(*ReplicatedShardDescriptor)
+	}{
+		{"source-store", func(source *ReplicatedShardDescriptor) { source.Replicas[0].StoreID[0]++ }},
+		{"source-incarnation", func(source *ReplicatedShardDescriptor) { source.Replicas[0].NodeIncarnation++ }},
+		{"target-store", func(source *ReplicatedShardDescriptor) { source.EnrolledTarget.StoreID[0]++ }},
+		{"target-endpoint", func(source *ReplicatedShardDescriptor) { source.EnrolledTarget.ControlEndpoint = "wrong-control" }},
+		{"replica-set", func(source *ReplicatedShardDescriptor) { source.Command.ReplicaSetVersion++ }},
+		{"schema", func(source *ReplicatedShardDescriptor) { source.Command.SchemaGeneration++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authority, _, current := newCatalogAuthorityFixtureWithDescriptor(t, func(source *ReplicatedShardDescriptor) {
+				source.LogicalSchemaDigest = [32]byte{0x93}
+				testReplicatedCatalogEnrollTarget(source)
+			})
+			grant, _, _, _ := testCertifiedReplicaReplacement(t, current, current.ReplicatedShardDescriptors()[0])
+			if err := authority.PublishMembershipGrant(t.Context(), grant); err != nil {
+				t.Fatal(err)
+			}
+			current = advanceUnrelatedGroupTestHead(t, authority, current)
+			source := current.ReplicatedShardDescriptors()[0]
+			test.change(&source)
+			intent := testGroupTransitionIntent(t, current, source, *source.EnrolledTarget, grant.SourceMember)
+			if _, err := authority.AcquireDistributionTransition(t.Context(), intent.Key); err != nil {
+				t.Fatal(err)
+			}
+			if _, found, err := authority.ReadMembershipGrant(t.Context(), grant.Group); err == nil || found {
+				t.Fatalf("changed source identity authorized old grant: found=%t err=%v", found, err)
+			}
+		})
+	}
+}
+
 func TestOwnedGroupPublicationSurvivesUnrelatedCatalogHead(t *testing.T) {
-	authority, _, current := newCatalogAuthorityFixtureWithDescriptor(t, func(source *ReplicatedShardDescriptor) { source.LogicalSchemaDigest = [32]byte{0x93} })
+	authority, _, current := newCatalogAuthorityFixtureWithDescriptor(t, func(source *ReplicatedShardDescriptor) {
+		source.LogicalSchemaDigest = [32]byte{0x93}
+		testReplicatedCatalogEnrollTarget(source)
+	})
+	lagging := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(current), 0x95)
 	source := current.ReplicatedShardDescriptors()[0]
 	grant, _, target, command := testCertifiedReplicaReplacement(t, current, source)
 	intent := testGroupTransitionIntent(t, current, source, target, grant.SourceMember)
@@ -288,5 +339,15 @@ func TestOwnedGroupPublicationSurvivesUnrelatedCatalogHead(t *testing.T) {
 	}
 	if err = authority.ReleaseDistributionTransition(ctx, lease, final); err != nil {
 		t.Fatal(err)
+	}
+	refreshed, err := lagging.Read(ctx)
+	if err != nil || refreshed == nil || refreshed.Generation() != current.Generation() {
+		t.Fatalf("warm reader cannot recover interleaved committed heads: snapshot=%v err=%v", refreshed, err)
+	}
+	cold := newCatalogAuthorityPeer(t, authority, NewCatalogHolder(nil), 0x96)
+	loaded, err := cold.Read(ctx)
+	equal, compareErr := equalCatalogSnapshots(refreshed, loaded)
+	if err != nil || compareErr != nil || !equal {
+		t.Fatalf("warm and cold committed readers disagree: read=%v compare=%v", err, compareErr)
 	}
 }

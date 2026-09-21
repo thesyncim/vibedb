@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"errors"
 
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
 )
 
@@ -56,7 +58,6 @@ func (executor *DurableSQLRequestExecutor) PrepareDirect(ctx context.Context, ke
 	var targets []ReplicatedTransactionTarget
 	var handled bool
 	refreshedMiss := false
-	refreshState := newDurableSQLCatalogRefreshState(executor.data)
 	for {
 		if contextErr := context.Cause(opctx); contextErr != nil {
 			return nil, contextErr
@@ -75,24 +76,13 @@ func (executor *DurableSQLRequestExecutor) PrepareDirect(ctx context.Context, ke
 				opctx, lease.snapshot, queries, profile, executor.data,
 			)
 		}
-		if isReplicatedMembershipTransitionPlanningError(err) {
-			transitionErr := err
-			staleGeneration := lease.generation
-			// This plan is still private and has no ledger record. Release the
-			// stale planning lease before waiting for checked catalog progress.
-			lease.release()
-			if refreshErr := refreshState.refreshMembership(opctx, executor.planner, staleGeneration); refreshErr != nil {
-				return nil, errors.Join(transitionErr, refreshErr)
-			}
-			continue
-		}
-		if !errors.Is(err, ErrTableNotPlaced) || refreshedMiss {
+		if !(errors.Is(err, ErrTableNotPlaced) || errors.Is(err, raftservice.ErrServingFence)) || refreshedMiss {
 			break
 		}
 		refreshedMiss = true
 		staleGeneration := lease.generation
 		lease.release()
-		if refreshErr := refreshState.refreshMissing(opctx, executor.planner, staleGeneration); refreshErr != nil {
+		if refreshErr := executor.planner.refreshAfterCatalogMiss(opctx, staleGeneration); refreshErr != nil {
 			return nil, preserveCatalogMiss(err, refreshErr)
 		}
 	}
@@ -168,6 +158,28 @@ func (executor *DurableSQLRequestExecutor) ExecutePreparedDirect(ctx context.Con
 	}
 	if errors.Is(err, ErrReplicatedTransactionConflict) {
 		err = ErrDurableSQLAborted
+	}
+	if errors.Is(err, errReplicatedNotAdmitted) {
+		err = errors.Join(ErrDurableSQLNotAdmitted, err)
+	}
+	var refusal *ReplicatedRefusalError
+	if !errors.Is(err, raftservice.ErrOutcomeUnknown) && errors.As(err, &refusal) {
+		switch refusal.Code {
+		case shardservice.ReplicatedRefusalUnavailable, shardservice.ReplicatedRefusalStaleFence,
+			shardservice.ReplicatedRefusalUnauthorized, shardservice.ReplicatedRefusalAdmissionBound,
+			shardservice.ReplicatedRefusalProposalRefused:
+			// This invocation has a validated pre-admission refusal. An earlier
+			// invocation of the same durable recipe may still be unresolved.
+			err = errors.Join(ErrDurableSQLNotAdmitted, err)
+		}
+	}
+	if errors.Is(err, ErrDurableSQLNotAdmitted) && errors.Is(err, raftservice.ErrServingFence) && executor.planner != nil {
+		// Only a certified catalog refresh can authorize a newly planned write.
+		// This retained recipe remains unchanged, including on recovery after an
+		// earlier invocation with an unknown outcome.
+		if refreshErr := executor.planner.refreshAfterCatalogMiss(opctx, plan.CatalogGeneration); refreshErr != nil {
+			err = errors.Join(err, refreshErr)
+		}
 	}
 	return direct.DurableSQLRequestResult, err
 }

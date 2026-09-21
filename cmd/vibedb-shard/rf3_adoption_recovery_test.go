@@ -59,7 +59,7 @@ func TestRF3AdoptionRecoveryBeforeFirstSnapshotDescriptor(t *testing.T) {
 			t.Fatal(err)
 		}
 		factory := &rf3DynamicLearnerFactory{root: root, runtime: &rf3NodeRuntime{reader: reader, receivers: receivers, actionJournal: journal}}
-		if err := factory.Recover(t.Context()); err != nil {
+		if err := factory.Reconcile(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 		got, found := receivers.reservations[intent.Group]

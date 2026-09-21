@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rebalance"
@@ -29,6 +30,19 @@ type Controller struct {
 	executor          rebalance.ReplicatedMoveActionExecutor
 	abandonment       *AbandonmentScheduler
 	abandonmentCursor AbandonmentSchedulerCursor
+	// Diagnostic only: replaced after each complete directory pass and never
+	// consulted by the reconciler or any authorization/completion decision.
+	failures atomic.Pointer[map[[32]byte]string]
+}
+
+func (controller *Controller) LastFailure(operation [32]byte) string {
+	if controller == nil {
+		return ""
+	}
+	if failures := controller.failures.Load(); failures != nil {
+		return (*failures)[operation]
+	}
+	return ""
 }
 
 func (controller *Controller) InstallAbandonmentScheduler(scheduler *AbandonmentScheduler) bool {
@@ -219,6 +233,14 @@ func (controller *Controller) RunPass(ctx context.Context) (ControllerPass, erro
 		return ControllerPass{}, err
 	}
 	pass := ControllerPass{Discovered: uint32(len(ids))}
+	var reported map[[32]byte]string
+	defer func() {
+		if len(reported) == 0 {
+			controller.failures.Store(nil)
+		} else {
+			controller.failures.Store(&reported)
+		}
+	}()
 	var failures error
 	if controller.abandonment != nil {
 		abandoned, abandonErr := controller.abandonment.RunPass(ctx, controller.abandonmentCursor)
@@ -253,6 +275,14 @@ func (controller *Controller) RunPass(ctx context.Context) (ControllerPass, erro
 		action, stepErr := controller.Resume(ctx, rebalance.OperationID(record.ID))
 		if stepErr != nil {
 			failures = errors.Join(failures, stepErr)
+			if reported == nil {
+				reported = make(map[[32]byte]string)
+			}
+			detail := stepErr.Error()
+			if len(detail) > 2048 {
+				detail = detail[:2048]
+			}
+			reported[record.ID] = detail
 			continue
 		}
 		pass.Advanced++

@@ -307,8 +307,7 @@ func TestFrontendDrainPreparedAckCutReadPhysicalShardSource(t *testing.T) {
 	// The source process is a catalog-owning storage node with no gateway
 	// frontend. Its identity is therefore proved by the physical node record,
 	// while the requester's identity remains the exact receiver binding.
-	node.Roles |= gateway.NodeRoleCatalog
-	source.Nodes.Nodes[0] = node
+	source.Catalog = catalogRouteSeedSnapshot(t, 1, node.NativeAddress, node)
 	serviceCut, err := runtimeServiceDirectoryCutFromFrontendDrainRuntimeCut(
 		t.Context(), source, profile, 1)
 	if err != nil {
@@ -376,6 +375,33 @@ func TestFrontendDrainPreparedAckCutReadPhysicalShardSource(t *testing.T) {
 	}
 	if err := wrongSource.Serve(t.Context(), rejected); !errors.Is(err, errFrontendDrainPreparedAckSourceAuth) {
 		t.Fatalf("wrong physical source accepted: %v", err)
+	}
+	for _, mutate := range []func(){
+		func() {
+			// A former catalog role cannot authorize a node outside current
+			// placement, even with the same authenticated physical identity.
+			source.Catalog = catalogRouteSeedSnapshot(t, 1, node.NativeAddress)
+			source.Nodes.Nodes[0].Roles |= gateway.NodeRoleCatalog
+		},
+		func() {
+			source.Catalog = catalogRouteSeedSnapshot(t, 1, node.NativeAddress, node)
+			source.Nodes.Nodes[0] = node
+			source.Nodes.Nodes[0].ControlAddress = "127.0.0.1:8199"
+		},
+		func() {
+			prior := node
+			prior.Incarnation++
+			source.Catalog = catalogRouteSeedSnapshot(t, 1, node.NativeAddress, prior)
+			source.Nodes.Nodes[0] = node
+		},
+	} {
+		mutate()
+		connection := &frontendDrainSourceTestConnection{input: bytes.NewReader(request.Marshal()),
+			peer: rafttransport.PeerIdentity{TrustDomain: trust, Node: node.NodeID},
+			key:  [32]byte{10}, class: rafttransport.TrafficShardControl}
+		if err := service.Serve(t.Context(), connection); !errors.Is(err, errFrontendDrainPreparedAckSourceAuth) || connection.output.Len() != 0 {
+			t.Fatalf("unplaced or mismatched source authorized a cut: %v", err)
+		}
 	}
 }
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -285,7 +286,7 @@ func (cut rf3DynamicDonorCut) SnapshotArtifactCut() (*replicatedstate.ReadSnapsh
 	cut.state.mu.Lock()
 	defer cut.state.mu.Unlock()
 	if cut.state.apply == nil || cut.state.quiesced {
-		return nil, snapshottransfer.ErrStaleFence
+		return nil, fmt.Errorf("%w: local snapshot donor apply=%t quiesced=%t", snapshottransfer.ErrStaleFence, cut.state.apply != nil, cut.state.quiesced)
 	}
 	return cut.state.apply.SnapshotArtifactCut()
 }
@@ -297,7 +298,7 @@ func (cut rf3DynamicDonorCut) SnapshotAuthorizationFence() (replicatedstate.Snap
 	cut.state.mu.Lock()
 	defer cut.state.mu.Unlock()
 	if cut.state.apply == nil || cut.state.quiesced {
-		return replicatedstate.SnapshotFence{}, snapshottransfer.ErrStaleFence
+		return replicatedstate.SnapshotFence{}, fmt.Errorf("%w: local snapshot donor apply=%t quiesced=%t", snapshottransfer.ErrStaleFence, cut.state.apply != nil, cut.state.quiesced)
 	}
 	return cut.state.apply.SnapshotAuthorizationFence()
 }

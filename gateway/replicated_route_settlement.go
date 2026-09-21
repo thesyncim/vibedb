@@ -44,12 +44,10 @@ func (executor *ReplicatedExecutor) ReadRouteReleaseReceipt(
 		)
 		if discoverErr != nil {
 			joined = errors.Join(joined, discoverErr)
-			preferred = 0
-			if errors.Is(discoverErr, errReplicatedLeaderUnobserved) && attempt+1 < executor.maxAttempts {
-				if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
-					return ReplicatedResult{}, errors.Join(ErrReplicatedLeader, joined, waitErr)
-				}
+			if terminalReplicatedDiscoveryError(discoverErr) {
+				return ReplicatedResult{}, joined
 			}
+			preferred = 0
 			continue
 		}
 		preferred = state.LeaderID

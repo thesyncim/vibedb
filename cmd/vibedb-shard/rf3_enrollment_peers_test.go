@@ -63,6 +63,23 @@ func TestRF3EnrollmentPeerReceiptRestoresExactDynamicEndpoint(t *testing.T) {
 		t.Fatalf("restored roster=%+v, want exact peer=%+v", restored, peer)
 	}
 
+	refreshed := base
+	refreshed.Members[0] = rf3ManifestMember{MemberID: uint64(peer.NodeID[0]), NodeID: peer.NodeID, PeerAddress: peer.Endpoint}
+	slices.SortFunc(refreshed.Members[:], func(a, b rf3ManifestMember) int {
+		if a.MemberID < b.MemberID {
+			return -1
+		}
+		if a.MemberID > b.MemberID {
+			return 1
+		}
+		return 0
+	})
+	refreshed.Route.MembershipGrantPath = ""
+	completed := raftmodel.Publication{ReplicaSetVersion: 12, ConfState: &raftpb.ConfState{Voters: []uint64{2, 3, 4}}}
+	if _, err := rf3RecoveredEnrollmentRoster(refreshed, group, 2, completed, reopened.snapshot()); err != nil {
+		t.Fatalf("current operator roster rejected historical receipt: %v", err)
+	}
+
 	tampered := reopened.snapshot()
 	tampered[0].PeerAddress = "foreign.example:17400"
 	if _, err := rf3RecoveredEnrollmentRoster(base, group, 1, publication, tampered); !errors.Is(err, errRF3EnrollmentPeerReceipt) {

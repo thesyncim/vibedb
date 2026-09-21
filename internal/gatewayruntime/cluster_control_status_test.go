@@ -127,7 +127,7 @@ func TestClusterControlNodesUsesCommittedTerminalCutWhenFrontendIsOffline(t *tes
 	backend := &ScalingOperatorBackend{directory: directory, catalog: terminalStatusCatalog{}}
 
 	response := backend.nodesResponse(context.Background(), clustercontrol.Response{})
-	if !response.OK || len(response.Nodes) != 1 || !response.Nodes[0].SafeToStop {
+	if !response.OK || len(response.Nodes) != 1 || !response.Nodes[0].SafeToStop || len(response.GroupInventoryDigest) != 64 {
 		t.Fatalf("nodes response did not use committed terminal cut: response=%+v", response)
 	}
 

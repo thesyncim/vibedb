@@ -397,7 +397,7 @@ type BootstrapReadAuthority interface {
 	ReadNode(context.Context, rafttransport.NodeID, uint64) (gateway.NodeRecord, error)
 	ReadNodeDirectoryCut(context.Context) (gateway.NodeDirectoryCut, error)
 	ReadEnrollmentIntent(context.Context, [32]byte) (gateway.GroupEnrollmentIntent, error)
-	ScanNodeReferences(context.Context, rafttransport.NodeID, uint64) (gateway.NodeReferenceEvidence, error)
+	ReadEnrollmentCatalogCut(context.Context) (gateway.EnrollmentCatalogCut, error)
 }
 
 type bootstrapRecoveryAuthority interface {
@@ -574,26 +574,23 @@ func (service *BootstrapReadService) readStable(
 			}
 		}
 	}
-	evidence, err := service.authority.ScanNodeReferences(ctx, request.PhysicalNode, request.Incarnation)
+	evidence, err := service.authority.ReadEnrollmentCatalogCut(ctx)
 	if err != nil {
-		return BootstrapReadReply{}, fmt.Errorf("bootstrap reference scan: %w", errors.Join(ErrBootstrapReadStale, err))
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap enrollment catalog cut: %w", errors.Join(ErrBootstrapReadStale, err))
 	}
-	if evidence.NodeID != request.PhysicalNode || evidence.Incarnation != request.Incarnation ||
-		evidence.DirectoryRevision != initial.Revision ||
-		request.Operation == OpReadOwnEnrollmentRecovery && (evidence.CatalogGeneration != catalogGeneration || evidence.CatalogHeadDigest != catalogDigest) {
-		return BootstrapReadReply{}, fmt.Errorf("bootstrap reference scan binding: %w", ErrBootstrapReadStale)
+	if request.Operation == OpReadOwnEnrollmentRecovery && (evidence.CatalogGeneration != catalogGeneration || evidence.CatalogHeadDigest != catalogDigest) {
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap enrollment catalog binding: %w", ErrBootstrapReadStale)
 	}
 	after, err := service.authority.ReadNodeDirectoryCut(ctx)
-	if err != nil || !after.Valid() || before.Revision != after.Revision || before.Digest != after.Digest ||
-		evidence.DirectoryCutRevision != after.Revision || evidence.DirectoryCutDigest != after.Digest {
+	if err != nil || !after.Valid() || before.Revision != after.Revision || before.Digest != after.Digest {
 		return BootstrapReadReply{}, fmt.Errorf("bootstrap directory cut changed during scan: %w", ErrBootstrapReadStale)
 	}
 	final, err := service.authority.ReadNode(ctx, request.PhysicalNode, request.Incarnation)
 	if err != nil || final != initial || final.Lifecycle == gateway.NodeDecommissioned {
 		return BootstrapReadReply{}, fmt.Errorf("bootstrap physical node changed during scan: %w", ErrBootstrapReadStale)
 	}
-	// The reference scan and the directory cut fence cover the global
-	// enrollment directory, but the requested row is a separate bounded read.
+	// The catalog and directory cut fence cover the global enrollment
+	// directory, but the requested row is a separate bounded read.
 	// Read it again immediately before publishing the reply.  A controller may
 	// cancel, prepare, or complete the row while the scan is in flight; a reply
 	// that combines the first row with the later witness would otherwise be a
@@ -611,23 +608,23 @@ func (service *BootstrapReadService) readStable(
 		finalIntent.Target.NodeIncarnation != request.Incarnation {
 		return BootstrapReadReply{}, fmt.Errorf("bootstrap enrollment changed during scan: %w", ErrBootstrapReadStale)
 	}
-	finalCut, err := service.authority.ReadNodeDirectoryCut(ctx)
-	if err != nil || !finalCut.Valid() || finalCut.Revision != after.Revision || finalCut.Digest != after.Digest {
-		return BootstrapReadReply{}, fmt.Errorf("bootstrap final directory cut changed: %w", ErrBootstrapReadStale)
-	}
 	// Catalog publication and enrollment-directory updates do not necessarily
-	// advance the physical-node directory cut. Repeating the bounded reference
-	// scan closes that second race and ensures the catalog/enrollment witnesses
+	// advance the physical-node directory cut. Repeating the metadata read
+	// closes that second race and ensures the catalog/enrollment witnesses
 	// in the reply describe the same observed cut as the row re-read.
-	verification, err := service.authority.ScanNodeReferences(ctx, request.PhysicalNode, request.Incarnation)
+	verification, err := service.authority.ReadEnrollmentCatalogCut(ctx)
 	if err != nil || verification != evidence {
-		return BootstrapReadReply{}, fmt.Errorf("bootstrap reference scan changed: %w", ErrBootstrapReadStale)
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap enrollment catalog cut changed: %w", errors.Join(ErrBootstrapReadStale, err))
 	}
 	if currentRoute != nil {
 		grant, found, err := service.authority.(bootstrapRecoveryAuthority).ReadMembershipGrant(ctx, intent.Group)
 		if err != nil || found != (currentGrant != nil) || found && grant != *currentGrant {
 			return BootstrapReadReply{}, fmt.Errorf("bootstrap membership grant changed: %w", errors.Join(ErrBootstrapReadStale, err))
 		}
+	}
+	finalCut, err := service.authority.ReadNodeDirectoryCut(ctx)
+	if err != nil || !finalCut.Valid() || finalCut.Revision != after.Revision || finalCut.Digest != after.Digest {
+		return BootstrapReadReply{}, fmt.Errorf("bootstrap final directory cut changed: %w", errors.Join(ErrBootstrapReadStale, err))
 	}
 	reply := BootstrapReadReply{
 		Nonce: request.Nonce, Operation: request.Operation, PhysicalNode: request.PhysicalNode,

@@ -88,8 +88,11 @@ func TestRF3EnrollCertifiedRosterPeersPublishesDirectory(t *testing.T) {
 	if err := rf3EnrollCertifiedRosterPeersFiltered(
 		context.Background(), registry, registry, spec, secondCertificate, domain,
 		func(rafttransport.NodeID) bool { return true },
-	); !errors.Is(err, rafttransport.ErrPeerConflict) {
-		t.Fatalf("stale source directory revision replay error = %v, want ErrPeerConflict", err)
+	); err != nil {
+		t.Fatalf("historical receipt cannot replay the unchanged physical identity: %v", err)
+	}
+	if current, err := registry.PhysicalPeer(remote); err != nil || current != updatedPeer {
+		t.Fatalf("historical receipt replaced current physical proof: %+v, %v", current, err)
 	}
 	changedSpec := spec
 	changedSpec.InitialVoters[0].ServiceKeyDigest = replication.Digest{42}
@@ -120,5 +123,57 @@ func TestRF3EnrollCertifiedRosterPeersPublishesDirectory(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("dynamic group install after enrollment: %v", err)
+	}
+}
+
+func TestRF3RetainedPeerRecoveryPreservesCurrentPhysicalProof(t *testing.T) {
+	domain := rafttransport.TrustDomain{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}}
+	peer := rafttransport.PhysicalPeer{
+		NodeID: rafttransport.NodeID{2}, Node: rafttransport.NodeID{2}, TrustDomain: domain,
+		Incarnation: 3, Revision: 4, ServiceKeyDigest: [32]byte{5}, EnrollmentDigest: [32]byte{6},
+		Endpoint: "127.0.0.1:21001", Address: "127.0.0.1:21001", State: rafttransport.PeerEnrolled,
+	}
+	for _, test := range []struct {
+		name   string
+		change func(*rafttransport.PhysicalPeer)
+		replay bool
+	}{
+		{name: "same physical identity from another group"},
+		{name: "changed key", change: func(p *rafttransport.PhysicalPeer) { p.ServiceKeyDigest[0]++ }},
+		{name: "changed incarnation", change: func(p *rafttransport.PhysicalPeer) { p.Incarnation++ }},
+		{name: "historical revision", change: func(p *rafttransport.PhysicalPeer) { p.Revision-- }, replay: true},
+		{name: "changed endpoint", change: func(p *rafttransport.PhysicalPeer) { p.Endpoint = "127.0.0.1:21002"; p.Address = p.Endpoint }},
+		{name: "retired peer", change: func(p *rafttransport.PhysicalPeer) { p.State = rafttransport.PeerRetired }},
+		{name: "wrong domain", change: func(p *rafttransport.PhysicalPeer) { p.TrustDomain.ClusterIncarnation[0]++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry, err := rafttransport.NewEmptyRegistry(rafttransport.NodeID{1}, domain,
+				rafttransport.Limits{MaxGroups: 1, MaxMembers: 4, MaxPeers: 4})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = rf3EnrollRetainedPeers(t.Context(), registry, registry, []rafttransport.PhysicalPeer{peer}); err != nil {
+				t.Fatalf("initial recovery: %v", err)
+			}
+			revision := registry.PeerDirectoryRevision()
+			retained := peer
+			retained.EnrollmentDigest = [32]byte{7}
+			if test.change != nil {
+				test.change(&retained)
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				err = rf3EnrollRetainedPeers(t.Context(), registry, registry, []rafttransport.PhysicalPeer{retained})
+				if (test.change == nil || test.replay) && err != nil {
+					t.Fatalf("recover identical peer from another certified group: %v", err)
+				}
+				if test.change != nil && !test.replay && err == nil {
+					t.Fatal("changed physical identity accepted")
+				}
+				current, lookupErr := registry.PhysicalPeer(peer.NodeID)
+				if lookupErr != nil || current != peer || registry.PeerDirectoryRevision() != revision {
+					t.Fatalf("recovery changed current directory proof: peer=%+v error=%v", current, lookupErr)
+				}
+			}
+		})
 	}
 }

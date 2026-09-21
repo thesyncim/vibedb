@@ -35,6 +35,8 @@ type membershipProgressHost struct {
 	ownerHost
 	publicationCalls map[raftmember.GroupKey]int
 	promotionFound   bool
+	promotionCalls   int
+	conf             *pb.ConfState
 	publicationErr   error
 	progress         []multiraft.Progress
 	cancel           context.CancelFunc
@@ -42,9 +44,14 @@ type membershipProgressHost struct {
 
 func (h *membershipProgressHost) Publication(g raftmember.GroupKey) (raftmodel.Publication, error) {
 	h.publicationCalls[g]++
-	return raftmodel.Publication{ReplicaSetVersion: 1, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}}}, h.publicationErr
+	conf := h.conf
+	if conf == nil {
+		conf = &pb.ConfState{Voters: []uint64{1, 2, 3}}
+	}
+	return raftmodel.Publication{ReplicaSetVersion: 1, ConfState: conf}, h.publicationErr
 }
 func (h *membershipProgressHost) DurablePromotion(raftmember.GroupKey, uint64) (raftmember.DurablePromotionProof, bool, error) {
+	h.promotionCalls++
 	return raftmember.DurablePromotionProof{}, h.promotionFound, nil
 }
 func (h *membershipProgressHost) RunOne() (multiraft.Progress, bool, error) {
@@ -97,6 +104,7 @@ func TestOwnerGroupAuthorityRefreshRetainsPromotionAndErrors(t *testing.T) {
 	authority.grant = membershipgrant.Grant{Group: group, TargetMember: 4}
 	authority.found = true
 	host.promotionFound = true
+	host.conf = &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}
 	if err := owner.syncMembershipAuthority(group); err != nil {
 		t.Fatal(err)
 	}
@@ -110,5 +118,28 @@ func TestOwnerGroupAuthorityRefreshRetainsPromotionAndErrors(t *testing.T) {
 	host.publicationErr = errors.New("unavailable publication")
 	if err := owner.syncMembershipAuthority(group); !errors.Is(err, host.publicationErr) {
 		t.Fatalf("publication error lost: %v", err)
+	}
+}
+
+func TestOwnerDefersDurablePromotionUntilLearnerApply(t *testing.T) {
+	group := peerServerTestGroup()
+	authority := &progressAuthority{membershipTestAuthority: membershipTestAuthority{grant: membershipgrant.Grant{Group: group, TargetMember: 4}, found: true}, publications: make(map[raftmember.GroupKey]int)}
+	host := &membershipProgressHost{publicationCalls: make(map[raftmember.GroupKey]int), promotionFound: true}
+	owner := &Owner{host: host, authority: authority}
+	for _, conf := range []*pb.ConfState{{Voters: []uint64{1, 2, 3}}, {Voters: []uint64{1, 2, 3, 4}}} {
+		host.conf = conf
+		if err := owner.syncMembershipAuthority(group); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if host.promotionCalls != 0 || len(authority.promoted) != 0 || len(authority.cleared) != 2 {
+		t.Fatal("published premature or obsolete election witness")
+	}
+	host.conf = &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}
+	if err := owner.syncMembershipAuthority(group); err != nil {
+		t.Fatal(err)
+	}
+	if host.promotionCalls != 1 || len(authority.promoted) != 1 {
+		t.Fatal("applied learner did not recover its durable promotion")
 	}
 }

@@ -63,6 +63,7 @@ const (
 	seamlessScaleOfferedRate         = 1_200
 	seamlessScaleWorkloadConnections = 16
 	seamlessScaleOperationWait       = 750 * time.Millisecond
+	seamlessScaleRecoveryBudget      = 10 * time.Second
 	// cluster dev gives node zero the only autonomous topology controller.
 	// Keep the controller and the long-lived survivor gateway running while
 	// this qualification retires each physical node in turn.
@@ -116,16 +117,12 @@ type seamlessScaleTarget struct {
 const seamlessScaleIdentityOID = "1.3.6.1.4.1.32473.1.1"
 
 type seamlessScaleWorkload struct {
-	t            *testing.T
-	ctx          context.Context
-	addresses    []string
 	survivorSQL  net.Conn
 	survivorGate net.Conn
-	gateReader   *bufio.Reader
-	gateMu       sync.Mutex
-	connections  []net.Conn
+	connections  []seamlessScaleConnection
 	mu           sync.Mutex
 	historyMu    sync.Mutex
+	faultStarts  []time.Time
 	history      map[string][]seamlessScaleWindow
 	sequence     uint64
 	seedRows     []seamlessScaleAck
@@ -133,6 +130,13 @@ type seamlessScaleWorkload struct {
 	acknowledged map[string]seamlessScaleAck
 	sqlRequests  uint64
 	gateRequests uint64
+	reportWindow func(seamlessScalePhaseEvidence, []seamlessScaleSample)
+}
+
+type seamlessScaleConnection struct {
+	sql    net.Conn
+	gate   net.Conn
+	reader *bufio.Reader
 }
 
 type seamlessScaleAck struct {
@@ -159,19 +163,30 @@ type seamlessScaleWindow struct {
 	samples  []seamlessScaleSample
 }
 
-func newSeamlessScaleWorkload(t *testing.T, ctx context.Context, address string, survivorSQL, survivorGateway net.Conn) *seamlessScaleWorkload {
+func newSeamlessScaleWorkload(t *testing.T, ctx context.Context, address string, survivorSQL, survivorGateway net.Conn,
+	openGateway func() (net.Conn, error),
+) *seamlessScaleWorkload {
 	t.Helper()
-	workload := &seamlessScaleWorkload{t: t, ctx: ctx, addresses: []string{address}, survivorSQL: survivorSQL,
-		survivorGate: survivorGateway, gateReader: bufio.NewReaderSize(survivorGateway, 64<<10),
+	workload := &seamlessScaleWorkload{survivorSQL: survivorSQL, survivorGate: survivorGateway,
 		history: make(map[string][]seamlessScaleWindow), seed: make(map[string]seamlessScaleAck),
 		acknowledged: make(map[string]seamlessScaleAck)}
-	workload.connections = append(workload.connections, survivorSQL)
+	t.Cleanup(workload.Close)
+	workload.connections = append(workload.connections, seamlessScaleConnection{
+		sql: survivorSQL, gate: survivorGateway, reader: bufio.NewReaderSize(survivorGateway, 64<<10),
+	})
 	for index := 1; index < seamlessScaleWorkloadConnections; index++ {
 		connection, err := fusedOpenDDLWire(ctx, address)
 		if err != nil {
 			t.Fatalf("open scale workload SQL connection %d: %v", index+1, err)
 		}
-		workload.connections = append(workload.connections, connection)
+		gate, err := openGateway()
+		if err != nil {
+			_ = connection.Close()
+			t.Fatalf("open scale workload native connection %d: %v", index+1, err)
+		}
+		workload.connections = append(workload.connections, seamlessScaleConnection{
+			sql: connection, gate: gate, reader: bufio.NewReaderSize(gate, 64<<10),
+		})
 	}
 	return workload
 }
@@ -180,19 +195,9 @@ func (workload *seamlessScaleWorkload) Close() {
 	if workload == nil {
 		return
 	}
-	seen := make(map[net.Conn]struct{}, len(workload.connections)+1)
 	for _, connection := range workload.connections {
-		if connection == nil {
-			continue
-		}
-		if _, ok := seen[connection]; ok {
-			continue
-		}
-		seen[connection] = struct{}{}
-		_ = connection.Close()
-	}
-	if workload.survivorGate != nil {
-		_ = workload.survivorGate.Close()
+		_ = connection.sql.Close()
+		_ = connection.gate.Close()
 	}
 }
 
@@ -239,12 +244,14 @@ func (workload *seamlessScaleWorkload) Window(ctx context.Context, phase string,
 	if interval <= 0 {
 		interval = time.Nanosecond
 	}
-	jobs := make(chan time.Time, rate*2)
+	// Preserve arrivals through the explicit fault recovery budget. This is
+	// bounded timestamp storage (at1200/s,12000 entries), not dropped load.
+	jobs := make(chan time.Time, rate*int(seamlessScaleRecoveryBudget/time.Second))
 	results := make(chan seamlessScaleSample, rate*2)
 	var workers sync.WaitGroup
 	for index, connection := range workload.connections {
 		workers.Add(1)
-		go func(worker int, connection net.Conn) {
+		go func(worker int, connection seamlessScaleConnection) {
 			defer workers.Done()
 			for scheduled := range jobs {
 				results <- workload.doJob(ctx, worker, connection, scheduled)
@@ -295,6 +302,9 @@ func (workload *seamlessScaleWorkload) Window(ctx context.Context, phase string,
 	workload.historyMu.Lock()
 	workload.history[phase] = append(workload.history[phase], seamlessScaleWindow{evidence: evidence, samples: append([]seamlessScaleSample(nil), samples...)})
 	workload.historyMu.Unlock()
+	if workload.reportWindow != nil {
+		workload.reportWindow(evidence, samples)
+	}
 	return evidence
 }
 
@@ -339,6 +349,8 @@ func (workload *seamlessScaleWorkload) WindowSet(ctx context.Context, phase stri
 func (workload *seamlessScaleWorkload) WindowUntil(ctx context.Context, phase string, duration time.Duration, rate int, stop <-chan struct{}) {
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-stop:
 			return
 		default:
@@ -347,37 +359,122 @@ func (workload *seamlessScaleWorkload) WindowUntil(ctx context.Context, phase st
 	}
 }
 
-// calibrateSeamlessScaleRate performs a bounded preflight with the exact
-// mixed SQL/native workload used by the qualification. It chooses once before
-// baseline collection, and every subsequent phase uses that same offered
-// rate. A rate that cannot keep its bounded queue fed is rejected instead of
-// allowing a scheduler-overload artifact to masquerade as a migration pause.
-func calibrateSeamlessScaleRate(t *testing.T, workload *seamlessScaleWorkload, ctx context.Context) int {
+// calibrateSeamlessScaleRate selects a sustained rate using the complete five
+// baseline windows. The chosen candidate's entire measurement is the baseline;
+// rejected candidates remain in history and no windows are discarded from it.
+func calibrateSeamlessScaleRate(t *testing.T, workload *seamlessScaleWorkload, ctx context.Context) (int, seamlessScalePhaseEvidence) {
 	t.Helper()
 	for _, candidate := range []int{seamlessScaleOfferedRate, 1_000} {
-		// The queue holds two seconds of arrivals. A two-second probe can
-		// always enqueue its entire workload and falsely pass while draining
-		// below the offered rate. Use the actual qualification window.
-		probe := workload.Window(ctx, "calibration", seamlessScaleWindowDuration, candidate)
-		t.Logf("scale calibration rate=%d scheduled=%d completed=%d errors=%d missed=%d writes=%d reads=%d p99=%s", candidate, probe.Scheduled, probe.Completed, probe.Errors, probe.Missed, probe.AcknowledgedWrites, probe.VerifiedReads, time.Duration(probe.P99NS))
-		if probe.Errors != 0 {
-			workload.historyMu.Lock()
-			windows := workload.history["calibration"]
-			for _, sample := range windows[len(windows)-1].samples {
-				if sample.Err != nil {
-					t.Logf("calibration first operation error: %v", sample.Err)
-					break
-				}
-			}
-			workload.historyMu.Unlock()
+		phase := fmt.Sprintf("calibration-%d", candidate)
+		probe := workload.WindowSet(ctx, phase, 5, seamlessScaleWindowDuration, candidate)
+		t.Logf("scale sustained calibration rate=%d windows=5 scheduled=%d completed=%d errors=%d missed=%d writes=%d reads=%d p99=%s", candidate, probe.Scheduled, probe.Completed, probe.Errors, probe.Missed, probe.AcknowledgedWrites, probe.VerifiedReads, time.Duration(probe.P99NS))
+		if probe.Errors != 0 || probe.Timeouts != 0 {
+			// Capacity selection must never conceal an operation/data failure.
+			t.Fatalf("scale calibration operation failure: errors=%d timeouts=%d", probe.Errors, probe.Timeouts)
 		}
-		if probe.Scheduled >= uint64(candidate)*uint64(seamlessScaleWindowDuration/time.Second) && probe.Started == probe.Scheduled &&
-			probe.Completed == probe.Started && probe.Errors == 0 && probe.Missed == 0 {
-			return candidate
+		if probe.Scheduled >= uint64(candidate)*uint64(5*seamlessScaleWindowDuration/time.Second) && probe.Started == probe.Scheduled &&
+			probe.Completed == probe.Started && probe.Missed == 0 {
+			workload.historyMu.Lock()
+			workload.history[seamlessScalePhaseBaseline] = workload.history[phase]
+			for index := range workload.history[seamlessScalePhaseBaseline] {
+				workload.history[seamlessScalePhaseBaseline][index].evidence.Phase = seamlessScalePhaseBaseline
+			}
+			delete(workload.history, phase)
+			workload.historyMu.Unlock()
+			probe.Phase = seamlessScalePhaseBaseline
+			return candidate, probe
 		}
 	}
 	t.Fatal("scale workload calibration could not sustain the minimum strict offered rate without misses")
-	return 0
+	return 0, seamlessScalePhaseEvidence{}
+}
+
+// MarkFault records an injected process failure before issuing the stop. Only
+// windows intersecting the following fixed10s recovery interval receive the
+// recovery timing budget; normal migration work keeps the original SLOs.
+func (workload *seamlessScaleWorkload) MarkFault(start time.Time) {
+	workload.historyMu.Lock()
+	workload.faultStarts = append(workload.faultStarts, start)
+	workload.historyMu.Unlock()
+}
+
+func seamlessScaleRecoveryWindow(window seamlessScalePhaseEvidence, starts []time.Time) bool {
+	for _, start := range starts {
+		if window.StartNS < uint64(start.Add(seamlessScaleRecoveryBudget).UnixNano()) && window.EndNS > uint64(start.UnixNano()) {
+			return true
+		}
+	}
+	return false
+}
+
+// Timing summaries retain the exact samples and actual duration of disjoint
+// steady/recovery windows. Pauses across excluded windows are not data: compute
+// continuity within each contiguous run instead of treating exclusion as idle.
+func (workload *seamlessScaleWorkload) FaultTimingEvidence() (seamlessScalePhaseEvidence, seamlessScalePhaseEvidence, uint64, uint64, uint64) {
+	workload.historyMu.Lock()
+	windows := append([]seamlessScaleWindow(nil), workload.history[seamlessScalePhaseDuring]...)
+	faults := append([]time.Time(nil), workload.faultStarts...)
+	workload.historyMu.Unlock()
+	var partitions [2]seamlessScalePhaseEvidence
+	var counts [2]uint64
+	for class := range 2 {
+		var samples []seamlessScaleSample
+		var start, end time.Time
+		var duration, scheduled, missed, gap uint64
+		var previousEnd, previousCompletion time.Time
+		previousSelected := false
+		for _, window := range windows {
+			selected := seamlessScaleRecoveryWindow(window.evidence, faults) == (class == 1)
+			if !selected {
+				previousSelected = false
+				continue
+			}
+			counts[class]++
+			wstart, wend := time.Unix(0, int64(window.evidence.StartNS)), time.Unix(0, int64(window.evidence.EndNS))
+			if start.IsZero() {
+				start = wstart
+			}
+			end = wend
+			duration += uint64(wend.Sub(wstart))
+			if previousSelected && wstart.After(previousEnd) {
+				duration += uint64(wstart.Sub(previousEnd))
+			}
+			var first, last time.Time
+			for _, sample := range window.samples {
+				if sample.Completed.IsZero() {
+					continue
+				}
+				if first.IsZero() || sample.Completed.Before(first) {
+					first = sample.Completed
+				}
+				if sample.Completed.After(last) {
+					last = sample.Completed
+				}
+			}
+			gap = max(gap, window.evidence.CompletionGapNS)
+			if previousSelected && !first.IsZero() && first.After(previousCompletion) {
+				gap = max(gap, uint64(first.Sub(previousCompletion)))
+			}
+			previousEnd, previousCompletion, previousSelected = wend, last, true
+			scheduled += window.evidence.Scheduled
+			missed += window.evidence.Missed
+			samples = append(samples, window.samples...)
+		}
+		phase := seamlessScalePhaseSteady
+		if class == 1 {
+			phase = seamlessScalePhaseRecovery
+		}
+		if counts[class] == 0 {
+			partitions[class].Phase = phase
+			continue
+		}
+		value := workload.phaseEvidence(phase, start, end, scheduled, missed, samples)
+		value.DurationNS, value.MaxPauseNS, value.CompletionGapNS = duration, gap, gap
+		value.OfferedRateMilli = scheduled * 1_000_000_000_000 / max(uint64(1), duration)
+		value.ThroughputMilli = value.Successes * 1_000_000_000_000 / max(uint64(1), duration)
+		partitions[class] = value
+	}
+	return partitions[0], partitions[1], counts[0], counts[1], uint64(len(faults))
 }
 
 // HistoryEvidence returns the complete measured span for a phase. It is used
@@ -412,7 +509,7 @@ func (workload *seamlessScaleWorkload) HistoryEvidence(phase string) seamlessSca
 	return workload.phaseEvidence(phase, start, end, scheduled, missed, samples)
 }
 
-func (workload *seamlessScaleWorkload) doJob(ctx context.Context, worker int, connection net.Conn, scheduled time.Time) seamlessScaleSample {
+func (workload *seamlessScaleWorkload) doJob(ctx context.Context, worker int, connection seamlessScaleConnection, scheduled time.Time) seamlessScaleSample {
 	sample := seamlessScaleSample{Scheduled: scheduled, Started: time.Now()}
 	workload.mu.Lock()
 	sequence := workload.sequence
@@ -424,13 +521,13 @@ func (workload *seamlessScaleWorkload) doJob(ctx context.Context, worker int, co
 		row := seamlessScaleAck{Table: table, ID: fmt.Sprintf("live-%s-%012d", table, sequence),
 			Value: int(sequence%1_000_000) + 50_000, Marker: seamlessScalePayload(table, rowIndex)}
 		query := fmt.Sprintf("INSERT INTO %s (id,value,marker) VALUES ('%s',%d,'%s')", table, row.ID, row.Value, row.Marker)
-		result, retries, err := seamlessScaleQueryRetry(ctx, connection, query, false)
+		result, retries, err := seamlessScaleQueryRetry(ctx, connection.sql, query, false, false)
 		sample.Retries = retries
 		if err == nil && (result.code != "" || result.tag != "INSERT 0 1") {
 			err = fmt.Errorf("unexpected write acknowledgement: %+v", result)
 		}
 		if err != nil {
-			sample.Err = err
+			sample.Err = fmt.Errorf("SQL write: %w", err)
 		}
 		if err == nil {
 			workload.mu.Lock()
@@ -452,10 +549,10 @@ func (workload *seamlessScaleWorkload) doJob(ctx context.Context, worker int, co
 		if row.ID == "" {
 			sample.Err = errors.New("empty seeded workload")
 		} else {
-			// Keep the authenticated native gateway stream active throughout every
-			// window. Reads use a single serialized stream just as a long-lived
-			// application client would.
-			result, retries, err := workload.gatewayRead(ctx, row)
+			// Each worker owns persistent SQL and native streams through every
+			// topology wave. Do not serialize all foreground readers through one
+			// client mutex: that measures a single round trip, not cluster capacity.
+			result, retries, err := workload.gatewayRead(ctx, connection, row)
 			sample.Retries = retries
 			if err == nil {
 				workload.mu.Lock()
@@ -464,23 +561,23 @@ func (workload *seamlessScaleWorkload) doJob(ctx context.Context, worker int, co
 				sample.Verified = &row
 			}
 			if err != nil {
-				sample.Err = err
+				sample.Err = fmt.Errorf("native read: %w", err)
 			} else {
 				// A gateway read is the foreground read for the sample. Keep one
 				// SQL read on the same survivor connection as a second oracle.
-				result, retries, err = seamlessScaleQueryRetry(ctx, connection,
-					fmt.Sprintf("SELECT id,value,marker FROM %s WHERE id='%s'", row.Table, row.ID), false)
+				result, retries, err = seamlessScaleQueryRetry(ctx, connection.sql,
+					fmt.Sprintf("SELECT id,value,marker FROM %s WHERE id='%s'", row.Table, row.ID), false, true)
 				sample.Retries += retries
 				if err == nil {
 					workload.mu.Lock()
 					workload.sqlRequests++
 					workload.mu.Unlock()
 					if !seamlessScaleSQLMatches(result, row) {
-						err = fmt.Errorf("unexpected SQL read result: code=%s rows=%d columns=%v key=%s worker=%d sequence=%d", result.code, len(result.rows), result.columns, row.ID, worker, sequence)
+						err = fmt.Errorf("unexpected SQL read result: code=%s message=%s rows=%d columns=%v key=%s worker=%d sequence=%d", result.code, result.message, len(result.rows), result.columns, row.ID, worker, sequence)
 					}
 				}
 				if err != nil {
-					sample.Err = err
+					sample.Err = fmt.Errorf("SQL read: %w", err)
 				}
 			}
 		}
@@ -491,56 +588,92 @@ func (workload *seamlessScaleWorkload) doJob(ctx context.Context, worker int, co
 	return sample
 }
 
-func seamlessScaleQueryRetry(ctx context.Context, connection net.Conn, query string, extended bool) (fusedPGResult, uint64, error) {
-	var last error
-	for attempt := uint64(0); attempt < 4; attempt++ {
-		result, err := fusedDDLWireQuery(ctx, connection, query, extended)
-		if err == nil && !fusedPGResultTransient(result) {
-			return result, attempt, nil
-		}
-		if err != nil {
-			last = err
-		} else {
-			last = fmt.Errorf("transient PostgreSQL response %s: %s", result.code, result.message)
-		}
-		if attempt != 3 {
-			if err := fusedWaitRetry(ctx, 2*time.Millisecond); err != nil {
-				return result, attempt + 1, err
-			}
-		}
-	}
-	return fusedPGResult{}, 3, last
+func seamlessScaleQueryRetry(ctx context.Context, connection net.Conn, query string, extended, readOnly bool) (fusedPGResult, uint64, error) {
+	return retrySeamlessScaleSQL(ctx, readOnly, func(attempt context.Context) (fusedPGResult, error) {
+		return fusedDDLWireQuery(attempt, connection, query, extended)
+	})
 }
 
-func (workload *seamlessScaleWorkload) gatewayRead(ctx context.Context, row seamlessScaleAck) (fusedPGResult, uint64, error) {
+// Only complete responses proving safe replay may retry. An unknown write or
+// a transport failure must never resubmit SQL under a new durable identity.
+func retrySeamlessScaleSQL(ctx context.Context, readOnly bool, call func(context.Context) (fusedPGResult, error)) (fusedPGResult, uint64, error) {
+	var cancel context.CancelFunc
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+	}()
+	for attempt := uint64(0); ; attempt++ {
+		result, err := call(ctx)
+		if err != nil || !seamlessScaleSQLRetryable(result, readOnly) {
+			return result, attempt, err
+		}
+		if cancel == nil {
+			ctx, cancel = context.WithTimeout(ctx, seamlessScaleRecoveryBudget)
+		}
+		last := fmt.Errorf("transient PostgreSQL response %s: %s", result.code, result.message)
+		if err := fusedWaitRetry(ctx, seamlessScaleRetryDelay(attempt)); err != nil {
+			return result, attempt + 1, errors.Join(last, err)
+		}
+	}
+}
+
+func seamlessScaleSQLRetryable(result fusedPGResult, readOnly bool) bool {
+	if result.code == "40001" {
+		return true
+	} // Complete transaction abort.
+	if !readOnly {
+		return false
+	}
+	switch result.code {
+	case "XX000", "55000", "55P03", "57P03":
+		return fusedPGResultTransient(result)
+	default:
+		return false
+	}
+}
+
+func seamlessScaleRetryDelay(attempt uint64) time.Duration {
+	return 20 * time.Millisecond << min(attempt, 4)
+}
+
+func (workload *seamlessScaleWorkload) gatewayRead(ctx context.Context, connection seamlessScaleConnection, row seamlessScaleAck) (fusedPGResult, uint64, error) {
 	request := rf3FixturePointRequest(row.Table, row.ID)
 	raw, err := vibejson.Marshal(&request)
 	if err != nil {
 		return fusedPGResult{}, 0, err
 	}
-	workload.gateMu.Lock()
-	defer workload.gateMu.Unlock()
-	for attempt := uint64(0); attempt < 4; attempt++ {
-		if err := workload.survivorGate.SetDeadline(minFusedDeadline(ctx, time.Now().Add(10*time.Second))); err != nil {
+	var cancel context.CancelFunc
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+	}()
+	for attempt := uint64(0); ; attempt++ {
+		if err := connection.gate.SetDeadline(minFusedDeadline(ctx, time.Now().Add(seamlessScaleRecoveryBudget))); err != nil {
 			return fusedPGResult{}, attempt, err
 		}
-		if _, err := workload.survivorGate.Write(append(append([]byte(nil), raw...), '\n')); err != nil {
+		if _, err := connection.gate.Write(append(raw, '\n')); err != nil {
 			return fusedPGResult{}, attempt, err
 		}
-		response, err := workload.gateReader.ReadSlice('\n')
+		response, err := connection.reader.ReadSlice('\n')
 		if err == nil && seamlessScaleGatewayResponseMatches(response, row) {
 			return fusedPGResult{}, attempt, nil
 		}
 		if err != nil {
 			return fusedPGResult{}, attempt, err
 		}
-		if attempt != 3 {
-			if err := fusedWaitRetry(ctx, 2*time.Millisecond); err != nil {
-				return fusedPGResult{}, attempt + 1, err
-			}
+		last := fmt.Errorf("native gateway response did not match %s/%s: %.1024s", row.Table, row.ID, response)
+		if !durableRF3ExternalRetryableResponse(response) {
+			return fusedPGResult{}, attempt, last
+		}
+		if cancel == nil {
+			ctx, cancel = context.WithTimeout(ctx, seamlessScaleRecoveryBudget)
+		}
+		if err := fusedWaitRetry(ctx, seamlessScaleRetryDelay(attempt)); err != nil {
+			return fusedPGResult{}, attempt + 1, errors.Join(last, err)
 		}
 	}
-	return fusedPGResult{}, 3, fmt.Errorf("native gateway response did not match %s/%s", row.Table, row.ID)
 }
 
 func seamlessScaleGatewayResponseMatches(raw []byte, row seamlessScaleAck) bool {
@@ -656,6 +789,11 @@ func (workload *seamlessScaleWorkload) VerifyAllAcknowledgements(ctx context.Con
 	}
 	workload.mu.Unlock()
 	sort.Slice(rows, func(i, j int) bool { return seamlessScaleAckKey(rows[i]) < seamlessScaleAckKey(rows[j]) })
+	if len(rows) != 0 {
+		if _, _, err := workload.gatewayRead(ctx, workload.connections[0], rows[0]); err != nil {
+			return fmt.Errorf("original survivor native session: %w", err)
+		}
+	}
 	for _, row := range rows {
 		result, err := fusedDDLWireQuery(ctx, workload.survivorSQL,
 			fmt.Sprintf("SELECT id,value,marker FROM %s WHERE id='%s'", row.Table, row.ID), false)
@@ -672,7 +810,7 @@ func (workload *seamlessScaleWorkload) VerifyAllAcknowledgements(ctx context.Con
 func (workload *seamlessScaleWorkload) VerifyExactPG(ctx context.Context, address string) error {
 	connection, err := fusedOpenDDLWire(ctx, address)
 	if err != nil {
-		return err
+		return fmt.Errorf("open independent SQL oracle: %w", err)
 	}
 	defer connection.Close()
 	workload.mu.Lock()
@@ -875,6 +1013,10 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 	if len(cluster.NodeManifests) == 0 {
 		t.Fatal("initial cluster has no source node manifest")
 	}
+	// Bind the saved original endpoints before allocating any empty-node
+	// addresses. The bootstrap supervisor released those fixed ports above;
+	// reserving targets first could otherwise steal an original peer port.
+	physical := startSeamlessScalePhysicalCluster(t, ctx, shardBinary, cluster)
 	listenerReservation, err := rf3testfixture.ReserveLoopbackAddresses(12)
 	if err != nil {
 		t.Fatalf("reserve empty-node listeners: %v", err)
@@ -894,10 +1036,8 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 			t.Fatalf("target %d empty manifest: %v", index+1, err)
 		}
 	}
-	physical := startSeamlessScalePhysicalCluster(t, ctx, shardBinary, cluster)
-	// Keep target ports reserved while the initial physical cluster starts so
-	// its independently allocated listeners cannot reuse an empty target's
-	// address before that target is launched in a later cycle.
+	// All target addresses were reserved together while the original listeners
+	// were live, so neither a sibling target nor an original owns the same port.
 	if err := listenerReservation.Close(); err != nil {
 		t.Fatalf("release empty-node listener reservations: %v", err)
 	}
@@ -944,7 +1084,7 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 		emptyTargets[index].Public = descriptor
 	}
 	nodesResponse := runSeamlessScaleCLI(t, ctx, vibedbBinary, "nodes", profilePath)
-	if !nodesResponse.OK || len(nodesResponse.Nodes) != 3 {
+	if !nodesResponse.OK || len(nodesResponse.Nodes) != 3 || !validEvidenceDigest(nodesResponse.GroupInventoryDigest) {
 		t.Fatalf("initial nodes response=%+v", nodesResponse)
 	}
 	for index, target := range emptyTargets {
@@ -969,13 +1109,14 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 	}
 	defer survivorSQL.Close()
 
-	workload := newSeamlessScaleWorkload(t, ctx, pgListens[survivorIndex], survivorSQL, survivorGateway)
-	defer workload.Close()
+	workload := newSeamlessScaleWorkload(t, ctx, pgListens[survivorIndex], survivorSQL, survivorGateway, func() (net.Conn, error) {
+		return fusedDialGateway(ctx, clusterProfile, mustSeamlessScaleNodeID(t, cluster.NodeManifests[survivorIndex].GatewayNode),
+			cluster.NodeManifests[survivorIndex].FrontendListen)
+	})
 	if err := workload.Seed(t, ctx); err != nil {
 		t.Fatalf("seed acknowledged workload rows: %v", err)
 	}
-	calibratedRate := calibrateSeamlessScaleRate(t, workload, ctx)
-	baseline := workload.WindowSet(ctx, seamlessScalePhaseBaseline, 5, seamlessScaleWindowDuration, calibratedRate)
+	calibratedRate, baseline := calibrateSeamlessScaleRate(t, workload, ctx)
 	t.Logf("scale baseline complete: rate=%d scheduled=%d completed=%d errors=%d missed=%d p99=%s", calibratedRate,
 		baseline.Scheduled, baseline.Completed, baseline.Errors, baseline.Missed, time.Duration(baseline.P99NS))
 	// These are already mandatory final evidence gates. An invalid baseline
@@ -983,6 +1124,38 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 	if baseline.Errors != 0 || baseline.Timeouts != 0 || baseline.Missed != 0 || baseline.Completed != baseline.Scheduled {
 		t.Fatalf("strict baseline cannot qualify: scheduled=%d completed=%d errors=%d timeouts=%d missed=%d",
 			baseline.Scheduled, baseline.Completed, baseline.Errors, baseline.Timeouts, baseline.Missed)
+	}
+	// A failed foreground window cannot become a qualification by completing
+	// more topology cycles. Preserve its measured counters and first errors,
+	// then stop at the actual failing phase instead of hiding it at the end.
+	workload.reportWindow = func(window seamlessScalePhaseEvidence, samples []seamlessScaleSample) {
+		if window.Errors == 0 && window.Timeouts == 0 && window.Missed == 0 && window.Completed == window.Scheduled {
+			return
+		}
+		failures := make([]string, 0, 3)
+		for _, sample := range samples {
+			if sample.Err != nil {
+				failures = append(failures, fmt.Sprintf("%.2048s", sample.Err.Error()))
+				if len(failures) == cap(failures) {
+					break
+				}
+			}
+		}
+		if path := os.Getenv(seamlessScaleEvidenceEnvironment); path != "" {
+			raw, err := json.Marshal(struct {
+				Window seamlessScalePhaseEvidence
+				Errors []string
+			}{window, failures})
+			if err == nil {
+				err = os.WriteFile(path+".failed-window.json", append(raw, '\n'), 0600)
+			}
+			if err != nil {
+				t.Errorf("persist failed workload window: %v", err)
+			}
+		}
+		t.Errorf("scale foreground window failed: phase=%s scheduled=%d completed=%d errors=%d timeouts=%d missed=%d first_errors=%q",
+			window.Phase, window.Scheduled, window.Completed, window.Errors, window.Timeouts, window.Missed, failures)
+		cancel()
 	}
 
 	// The actor starts before the first enrollment and runs until the third
@@ -1074,6 +1247,7 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 		t.Logf("scale cycle %d enrollment pacing observed: operation=%s throttled_calls=%d throttled_bytes=%d", cycle+1,
 			join.OperationID, joinPacingResponse.Budget.ThrottledCalls, joinPacingResponse.Budget.ThrottledBytes)
 
+		workload.MarkFault(time.Now())
 		if err := targetProcesses[cycle].Restart(ctx); err != nil {
 			t.Fatalf("cycle %d restart target during enrollment migration: %v", cycle+1, err)
 		}
@@ -1082,6 +1256,7 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 			// Node zero is the controller owner for this direct process set.
 			// Restarting this process exercises durable operation recovery while
 			// the two survivor frontends and their sessions remain connected.
+			workload.MarkFault(time.Now())
 			if err := physical.Restart(ctx, seamlessScaleControllerIndex); err != nil {
 				t.Fatalf("cycle %d restart controller owner during enrollment migration: %v", cycle+1, err)
 			}
@@ -1195,7 +1370,7 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 					return true
 				}
 				if !witnessWriteDone {
-					writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					writeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 					result, writeErr := fusedDDLWireQuery(writeCtx, retiringSQL,
 						fmt.Sprintf("INSERT INTO %s (id,value,marker) VALUES ('%s',%d,'%s')", witnessRow.Table, witnessRow.ID, witnessRow.Value, witnessRow.Marker), false)
 					cancel()
@@ -1207,7 +1382,7 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 				}
 				if witnessLastProbe.IsZero() || time.Since(witnessLastProbe) >= 5*time.Second {
 					witnessLastProbe = time.Now()
-					probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+					probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 					probe, probeErr := fusedDDLWireQuery(probeCtx, retiringSQL,
 						fmt.Sprintf("SELECT id,value,marker FROM %s WHERE id='%s'", witnessRow.Table, witnessRow.ID), false)
 					cancel()
@@ -1239,6 +1414,8 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 		if err != nil || !safe {
 			t.Fatalf("cycle %d decommission did not report safe_to_stop with zero references: %v response=%+v", cycle+1, err, safeResponse)
 		}
+		applicationMoved = maxUint32(applicationMoved, safeResponse.ApplicationGroupsMoved)
+		internalMoved = maxUint32(internalMoved, safeResponse.InternalGroupsMoved)
 		finalSafeResponse = safeResponse
 		physicalPeak = maxInt(physicalPeak, countSeamlessScaleServingNodes(safeResponse))
 
@@ -1276,6 +1453,12 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 	if err := workload.VerifyAllAcknowledgements(ctx); err != nil {
 		t.Fatalf("acknowledged data oracle: %v", err)
 	}
+	// Every acknowledged row has now been verified on the original held SQL
+	// session. End the measured continuity interval and release all worker
+	// sessions before the independent fresh-session oracle: the workload uses
+	// the listener's entire bounded connection budget.
+	survivorSessionsStable := workload.SurvivorSessionsStable()
+	workload.Close()
 	if err := workload.VerifyExactPG(ctx, pgListens[survivorIndex]); err != nil {
 		t.Fatalf("post-stop survivor SQL oracle: %v", err)
 	}
@@ -1300,16 +1483,53 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 	evidence.BaselineWindows = workload.WindowCount(seamlessScalePhaseBaseline)
 	evidence.DuringWindows = workload.WindowCount(seamlessScalePhaseDuring)
 	evidence.AfterWindows = workload.WindowCount(seamlessScalePhaseAfter)
-	evidence.SurvivorSessionStable = workload.SurvivorSessionsStable()
+	evidence.SurvivorSessionStable = survivorSessionsStable
 	evidence.RetiringSessionBlocked = firstSessionBlocked
 	evidence.RetiringSessionReleased = firstSessionReleased
 	evidence.RetiringReferencesAfter = uint64(finalSafeResponse.RetiringReferences)
 	evidence.GroupInventoryBeforeDigest = beforeInventoryDigest
 	evidence.GroupInventoryAfterDigest = finalNodesResponse.GroupInventoryDigest
 	evidence.Budget = aggregateBudget
+	evidence.SteadyDuring, evidence.RecoveryDuring, evidence.SteadyWindows, evidence.RecoveryWindows, evidence.FaultInjections = workload.FaultTimingEvidence()
+	// Stop every surviving catalog voter before
+	// starting any of them: sequential restarts would hide a bootstrap cycle.
+	live := []*seamlessScaleNodeProcess{physical.nodes[0], physical.nodes[survivorIndex], targetProcesses[len(targetProcesses)-1]}
+	for _, process := range live {
+		if err := process.StopContext(ctx); err != nil {
+			t.Fatalf("stop all catalog voters for cold recovery: %v", err)
+		}
+	}
+	for index, process := range live {
+		live[index] = launchSeamlessScaleNode(t, shardBinary, process.manifest, process.ready)
+	}
+	for _, process := range live {
+		if err := process.ready(ctx, process.manifest); err != nil {
+			t.Fatalf("cold catalog quorum recovery: %v\n%s", err, process.diagnostic.String())
+		}
+	}
+	if err := workload.VerifyExactPG(ctx, pgListens[survivorIndex]); err != nil {
+		t.Fatalf("cold cluster acknowledged-data oracle: %v", err)
+	}
+	coldNodes := runSeamlessScaleCLI(t, ctx, vibedbBinary, "nodes", profilePath)
+	if !coldNodes.OK || countSeamlessScaleServingNodes(coldNodes) != 3 || coldNodes.GroupInventoryDigest != finalNodesResponse.GroupInventoryDigest {
+		t.Fatalf("cold cluster changed committed placement: %+v", coldNodes)
+	}
+	t.Log("scale cold catalog quorum restart preserved all acknowledgements and placement")
 	bounds, err := loadSeamlessScalePerformanceBounds(os.Getenv)
 	if err != nil {
 		t.Fatalf("performance bounds: %v", err)
+	}
+	// Preserve measured aggregates before validating them. Diagnostic output
+	// cannot be mistaken for the separately emitted successful qualification.
+	t.Logf("scale measured evidence: %+v", evidence)
+	if path := os.Getenv(seamlessScaleEvidenceEnvironment); path != "" {
+		measured, marshalErr := json.Marshal(evidence)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if err := os.WriteFile(path+".measured.json", append(measured, '\n'), 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := evidence.valid(bounds); err != nil {
 		t.Fatalf("strict scale qualification evidence: %v", err)

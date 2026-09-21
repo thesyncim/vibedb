@@ -2368,11 +2368,12 @@ func replicatedApplyProfileDigest(
 	_, _ = h.Write(limits[:])
 	writeReplicatedApplyHashFrame(h, []byte(identity.Binding.Distribution))
 	writeReplicatedApplyHashFrame(h, []byte(identity.Binding.Shard))
-	var generations [24]byte
-	binary.LittleEndian.PutUint64(generations[0:8], identity.Binding.AllocationGeneration)
-	binary.LittleEndian.PutUint64(generations[8:16], identity.Binding.Authority.RoutingVersion)
-	binary.LittleEndian.PutUint64(generations[16:24], identity.Binding.Authority.RouteGeneration)
-	_, _ = h.Write(generations[:])
+	// Routing and ownership are authenticated by the current command/state
+	// fence. They do not change row validation and must not change the schema
+	// contract when a replacement replica is prepared after an ownership move.
+	var allocation [8]byte
+	binary.LittleEndian.PutUint64(allocation[:], identity.Binding.AllocationGeneration)
+	_, _ = h.Write(allocation[:])
 	var placementVersions [10]byte
 	binary.LittleEndian.PutUint16(placementVersions[0:2], placement.Format)
 	binary.LittleEndian.PutUint32(placementVersions[2:6], uint32(placement.TupleVersion))

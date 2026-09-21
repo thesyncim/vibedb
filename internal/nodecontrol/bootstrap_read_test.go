@@ -206,11 +206,11 @@ type bootstrapReadTestAuthority struct {
 	intent       gateway.GroupEnrollmentIntent
 	node         gateway.NodeRecord
 	cut          gateway.NodeDirectoryCut
-	evidence     gateway.NodeReferenceEvidence
+	evidence     gateway.EnrollmentCatalogCut
 	intentReads  int
 	onIntentRead func(int, *bootstrapReadTestAuthority)
-	scanReads    int
-	onScan       func(int, *bootstrapReadTestAuthority)
+	cutReads     int
+	onCatalogCut func(int, *bootstrapReadTestAuthority)
 	intentErr    error
 }
 
@@ -248,13 +248,10 @@ func (authority *bootstrapReadTestAuthority) ReadEnrollmentIntent(_ context.Cont
 	return copyOf, nil
 }
 
-func (authority *bootstrapReadTestAuthority) ScanNodeReferences(_ context.Context, node rafttransport.NodeID, incarnation uint64) (gateway.NodeReferenceEvidence, error) {
-	if node != authority.node.NodeID || incarnation != authority.node.Incarnation {
-		return gateway.NodeReferenceEvidence{}, gateway.ErrScalingNodeMissing
-	}
-	authority.scanReads++
-	if authority.onScan != nil {
-		authority.onScan(authority.scanReads, authority)
+func (authority *bootstrapReadTestAuthority) ReadEnrollmentCatalogCut(context.Context) (gateway.EnrollmentCatalogCut, error) {
+	authority.cutReads++
+	if authority.onCatalogCut != nil {
+		authority.onCatalogCut(authority.cutReads, authority)
 	}
 	return authority.evidence, nil
 }
@@ -391,7 +388,7 @@ func TestBootstrapRecoveryReadRejectsCatalogChangeAndUnavailableAuthority(t *tes
 	request := BootstrapReadRequest{Nonce: [16]byte{1}, Operation: OpReadOwnEnrollmentRecovery, PhysicalNode: node.NodeID, Incarnation: node.Incarnation, IntentID: intent.IntentID}
 	snapshot := bootstrapRecoveryTestSnapshot(t, intent, true)
 	node, cut := bootstrapRecoveryTestDirectory(t, snapshot, node)
-	for _, name := range []string{"unsupported", "unavailable", "first scan changed", "second scan changed", "missing physical peer", "group absent", "membership grant changed"} {
+	for _, name := range []string{"unsupported", "unavailable", "first catalog cut changed", "second catalog cut changed", "missing physical peer", "group absent", "membership grant changed"} {
 		t.Run(name, func(t *testing.T) {
 			base := &bootstrapReadTestAuthority{intent: intent, node: node, cut: cut, evidence: bootstrapReadTestEvidence(node)}
 			authority := &bootstrapRecoveryTestAuthority{bootstrapReadTestAuthority: base, snapshot: snapshot, digest: base.evidence.CatalogHeadDigest}
@@ -401,10 +398,10 @@ func TestBootstrapRecoveryReadRejectsCatalogChangeAndUnavailableAuthority(t *tes
 				service.authority = base
 			case "unavailable":
 				authority.err = errors.New("authority unavailable")
-			case "first scan changed":
+			case "first catalog cut changed":
 				base.evidence.CatalogHeadDigest[0]++
-			case "second scan changed":
-				base.onScan = func(count int, state *bootstrapReadTestAuthority) {
+			case "second catalog cut changed":
+				base.onCatalogCut = func(count int, state *bootstrapReadTestAuthority) {
 					if count == 2 {
 						state.evidence.CatalogHeadDigest[0]++
 					}
@@ -446,10 +443,9 @@ func bootstrapReadTestCut(node gateway.NodeRecord) gateway.NodeDirectoryCut {
 	return gateway.NodeDirectoryCut{Revision: 7, Digest: replication.Digest{0x07}, CatalogGeneration: 12, Nodes: []gateway.NodeRecord{node}}
 }
 
-func bootstrapReadTestEvidence(node gateway.NodeRecord) gateway.NodeReferenceEvidence {
-	return gateway.NodeReferenceEvidence{NodeID: node.NodeID, Incarnation: node.Incarnation, CatalogGeneration: 12,
-		DirectoryRevision: node.Revision, DirectoryCutRevision: 7, DirectoryCutDigest: replication.Digest{0x07},
-		CatalogHeadDigest: replication.Digest{0x08}, EnrollmentDirectoryDigest: replication.Digest{0x09}, Digest: replication.Digest{0x0a}}
+func bootstrapReadTestEvidence(node gateway.NodeRecord) gateway.EnrollmentCatalogCut {
+	return gateway.EnrollmentCatalogCut{CatalogGeneration: node.CatalogGeneration,
+		CatalogHeadDigest: replication.Digest{0x08}, EnrollmentDirectoryDigest: replication.Digest{0x09}}
 }
 
 func bootstrapReadTestReply(intent gateway.GroupEnrollmentIntent, node gateway.NodeRecord) BootstrapReadReply {
@@ -565,7 +561,7 @@ func TestBootstrapRecoveryMissingIntentRequiresStableAuthoritativeAbsence(t *tes
 					}
 				}
 			case "enrollment changed", "catalog changed":
-				base.onScan = func(count int, state *bootstrapReadTestAuthority) {
+				base.onCatalogCut = func(count int, state *bootstrapReadTestAuthority) {
 					if count == 2 {
 						if name == "enrollment changed" {
 							state.evidence.EnrollmentDirectoryDigest[0]++
