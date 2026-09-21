@@ -164,10 +164,12 @@ func (c *Collection) createIndexContext(
 	if err := ctx.Err(); err != nil {
 		return store.IndexInfo{}, err
 	}
-	// Refuse before claiming the build slot or touching arenas: the exact
-	// pipeline below would otherwise compile the tin definition as exact.
+	// Tin declarations take the declare-only path below: postings build
+	// lazily per generation on first query use, so publication only persists
+	// the declaration. Routing here (before the build slot) keeps the exact
+	// pipeline from ever compiling a tin definition as exact.
 	if definition.Kind == store.IndexTin {
-		return store.IndexInfo{}, ErrTinIndexUnsupported
+		return c.createTinIndexContext(ctx, definition)
 	}
 	if !c.onlineIndexBuild.CompareAndSwap(false, true) {
 		return store.IndexInfo{}, ErrIndexBuildInProgress
@@ -397,6 +399,124 @@ func (c *Collection) createIndexContext(
 		c.recycleUnpublishedOnlineEpochLocked(prepared.epoch)
 		c.writer.Unlock()
 	}
+}
+
+// createTinIndexContext declares a full-text index and atomically publishes
+// its catalog declaration. Postings build lazily per generation on first
+// query use (buildTinSnapshot scans the executing generation once), so
+// unlike the exact path there is no document scan, no repartition, and no
+// physical index: publication is always the alias-only lane. The build slot
+// still serializes concurrent DDL, and generation publication still fences
+// readers, so a concurrent query never observes a half-declared index.
+func (c *Collection) createTinIndexContext(
+	ctx context.Context,
+	definition store.IndexDefinition,
+) (store.IndexInfo, error) {
+	if c == nil {
+		return store.IndexInfo{}, ErrClosed
+	}
+	if err := c.rejectCheckpointGroupOwner(); err != nil {
+		return store.IndexInfo{}, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return store.IndexInfo{}, err
+	}
+	// Fail fast on shape before claiming the build slot or touching arenas:
+	// exactly one path, no uniqueness, compilable pointer.
+	if _, err := store.CompileTinDefinition(definition); err != nil {
+		return store.IndexInfo{}, err
+	}
+	if !c.onlineIndexBuild.CompareAndSwap(false, true) {
+		return store.IndexInfo{}, ErrIndexBuildInProgress
+	}
+	defer c.onlineIndexBuild.Store(false)
+
+	c.writer.Lock()
+	if c.closed {
+		c.writer.Unlock()
+		return store.IndexInfo{}, ErrClosed
+	}
+	if c.options.OpaqueValues {
+		c.writer.Unlock()
+		return store.IndexInfo{}, fmt.Errorf(
+			"%w: opaque values do not support JSON indexes",
+			ErrPrimaryCutoverUnsupported,
+		)
+	}
+	if _, exists := c.options.indexNameIDs[definition.Name]; exists {
+		c.writer.Unlock()
+		return store.IndexInfo{}, store.ErrIndexExists
+	}
+	for _, existing := range c.options.tinIndexes {
+		if existing.Name == definition.Name {
+			c.writer.Unlock()
+			return store.IndexInfo{}, store.ErrIndexExists
+		}
+	}
+	// Re-normalization rebuilds the canonical catalog from Indexes alone,
+	// so the new declaration rides with the existing tin definitions; the
+	// normalizer splits the tin family back out and rejects any name the
+	// early checks above could not see.
+	candidateOptions := c.options.Options
+	candidateOptions.Indexes = append(
+		slices.Clone(c.options.Indexes), store.IndexDefinition{
+			Name: definition.Name, Paths: slices.Clone(definition.Paths),
+			Kind: store.IndexTin,
+		},
+	)
+	candidateOptions.Indexes = append(
+		candidateOptions.Indexes, slices.Clone(c.options.tinIndexes)...,
+	)
+	candidate, err := candidateOptions.normalized()
+	if err != nil {
+		c.writer.Unlock()
+		return store.IndexInfo{}, err
+	}
+	// The published catalog is one catalog-only transaction: it fits below
+	// the exact-build ceiling by construction, but the arena guards still
+	// apply — a collection that cannot admit its own catalog cannot grow one.
+	if candidate.singleDocumentTransactionPages > c.options.maxTransactionPages {
+		c.writer.Unlock()
+		return store.IndexInfo{}, fmt.Errorf(
+			"%w: existing transaction arena cannot admit this index",
+			ErrPrimaryCutoverUnsupported,
+		)
+	}
+	candidate.maxTransactionPages = c.options.maxTransactionPages
+	candidate.singleDocumentFreeFoldLimit =
+		c.options.singleDocumentFreeFoldLimit
+	candidate.freeFoldLimit = c.options.freeFoldLimit
+	c.writer.Unlock()
+	if err := ctx.Err(); err != nil {
+		return store.IndexInfo{}, err
+	}
+	// Alias-only publication names no exact target: the exact set is
+	// unchanged, so there may be no exact index at all. Target zero is a
+	// placeholder the publication ignores on the alias lane.
+	c.writer.Lock()
+	err = c.publishOnlineIndexLocked(candidate, nil, 0)
+	c.writer.Unlock()
+	if err != nil {
+		return store.IndexInfo{}, err
+	}
+	return tinDeclaredIndexInfo(definition), nil
+}
+
+// tinDeclaredIndexInfo reports a newly declared tin index in catalog form.
+// The declaration is usable immediately: the first query over a generation
+// builds that generation's postings, exactly like the heap sidecar.
+func tinDeclaredIndexInfo(definition store.IndexDefinition) store.IndexInfo {
+	info := store.IndexInfo{
+		Name: definition.Name, Kind: store.IndexTin, State: store.IndexReady,
+		ColumnCount: 1,
+	}
+	if len(definition.Paths) == 1 {
+		info.Columns[0] = definition.Paths[0]
+	}
+	return info
 }
 
 // repartitionPrimaryForExactIndexLocked converts scan-oriented unindexed
@@ -1129,6 +1249,20 @@ func (c *Collection) publishOnlineIndexLocked(
 			goto catalogAddsName
 		}
 	}
+	// A tin declaration adds no exact alias; a new tin name is still a
+	// catalog addition.
+	for _, tin := range candidate.tinIndexes {
+		known := false
+		for _, existing := range c.options.tinIndexes {
+			if existing.Name == tin.Name {
+				known = true
+				break
+			}
+		}
+		if !known {
+			goto catalogAddsName
+		}
+	}
 	return store.ErrIndexExists
 
 catalogAddsName:
@@ -1181,8 +1315,11 @@ catalogAddsName:
 	} else {
 		// Alias-only publication can reuse the current physical residents and
 		// liveness; canonical physical IDs are unchanged when no new path vector
-		// is introduced.
-		if int(targetID) >= len(candidate.indexes) {
+		// is introduced. A tin declaration names no exact target and the exact
+		// set may be empty, so the target bound only applies when exact
+		// indexes exist.
+		if len(candidate.indexes) != 0 &&
+			int(targetID) >= len(candidate.indexes) {
 			return storeio.ErrInvalidWrite
 		}
 	}
@@ -1219,6 +1356,13 @@ catalogAddsName:
 	nextState.root.PageCatalogDigest = candidate.pageCatalog.Digest()
 	nextState.root.IndexCount = uint32(len(candidate.indexes))
 	nextState.root.IndexCatalogHash = candidate.indexCatalogHash
+	if len(candidate.tinIndexes) != 0 {
+		// The published catalog binds declared tin indexes. The root flag
+		// must agree with the catalog or reopen rejects the generation as
+		// corrupt; the bit is monotonic because declarations are never
+		// removed.
+		nextState.root.Options |= storeio.StateOptionTinIndexes
+	}
 
 	if prepared != nil {
 		if c.primaryEpoch == nil && c.primaryEpochRetired == nil {

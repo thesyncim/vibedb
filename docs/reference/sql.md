@@ -100,9 +100,10 @@ non-null tuples. Index sort direction, expressions, predicates, collations,
 and INCLUDE are unsupported, as are USING methods other than `tin`.
 
 `USING tin` builds a full-text index over exactly one text path, for use
-with the `==>` predicate. Only in-memory collections catalog tin indexes;
-durable collections refuse the definition instead of mistaking it for an
-exact index.
+with the `==>` predicate. Both in-memory and durable collections catalog
+tin indexes; on a durable collection the declaration publishes in a
+catalog-only generation and each generation's postings build lazily on
+first query use.
 
 DROP TABLE/INDEX and TRUNCATE reject multiple objects, CASCADE/RESTRICT, and
 identity options. A table with dependent views cannot be dropped until its

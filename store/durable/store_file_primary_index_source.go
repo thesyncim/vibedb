@@ -12,10 +12,10 @@ import (
 // exact — candidate and exact probes coincide.
 
 // AppendIndexes appends the immutable index catalog visible to the snapshot:
-// the exact aliases, then the declared tin definitions. Tin has no postings
-// yet, so it advertises IndexBuilding: the planner keys indexability off
-// State and keeps its exact-scan fallback, while readers still observe the
-// published declaration exactly.
+// the exact aliases, then the declared tin definitions. Tin postings build
+// lazily per generation on first query use, so a declaration is usable
+// immediately and advertises IndexReady, exactly like the heap sidecar;
+// readers still observe the published declaration exactly.
 func (s *Snapshot) AppendIndexes(dst []store.IndexInfo) []store.IndexInfo {
 	if s == nil || s.collection == nil || s.state == nil {
 		return dst
@@ -24,7 +24,7 @@ func (s *Snapshot) AppendIndexes(dst []store.IndexInfo) []store.IndexInfo {
 		if definition.Kind == store.IndexTin {
 			info := store.IndexInfo{
 				Name: definition.Name, Kind: store.IndexTin,
-				State:       store.IndexBuilding,
+				State:       store.IndexReady,
 				ColumnCount: 1,
 			}
 			if len(definition.Paths) == 1 {

@@ -1532,6 +1532,10 @@ var replicatedLocalIndexUniquenessDomain = []byte(
 	"vibedb/sql/replicated-local-index-uniqueness/v1\x00",
 )
 
+var replicatedLocalIndexMethodDomain = []byte(
+	"vibedb/sql/replicated-local-index-method/v1\x00",
+)
+
 func validateReplicatedRelationManifest(identity ReplicatedShardStoreIdentity) error {
 	count := int(identity.RelationCount)
 	if count < 1 || count > replication.MaxRelationsPerBundle ||
@@ -1694,13 +1698,26 @@ func replicatedLocalIndexDigest(indexes []indexMeta) [sha256.Size]byte {
 	binary.LittleEndian.PutUint64(count[:], uint64(len(canonical)))
 	_, _ = h.Write(count[:])
 	hasUnique := false
+	hasMethod := false
 	for i := range canonical {
 		writeReplicatedRelationFrame(h, []byte(canonical[i].Name))
 		hasUnique = hasUnique || canonical[i].Unique
+		hasMethod = hasMethod || canonical[i].Method != ""
 		binary.LittleEndian.PutUint64(count[:], uint64(len(canonical[i].Paths)))
 		_, _ = h.Write(count[:])
 		for _, path := range canonical[i].Paths {
 			writeReplicatedRelationFrame(h, []byte(path))
+		}
+	}
+	if hasMethod {
+		// Keep every method-less manifest byte-stable. The domain-separated
+		// suffix extends only manifests that declare an access method; the
+		// base stream already binds the canonical index count and order. A
+		// tin-vs-exact difference over the same name and paths must digest
+		// differently, or replication would treat them as the same image.
+		_, _ = h.Write(replicatedLocalIndexMethodDomain)
+		for i := range canonical {
+			writeReplicatedRelationFrame(h, []byte(canonical[i].Method))
 		}
 	}
 	if hasUnique {

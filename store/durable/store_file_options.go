@@ -31,12 +31,10 @@ var (
 	// grow to MaxPageSize); variable base page sizes are no longer supported, so
 	// Create refuses a non-4096 PageSize and Open refuses a store that recorded one.
 	ErrUnsupportedPageSize = errors.New("vibedb: collection page size must be 4096")
-	// ErrTinIndexUnsupported reports an online USING tin build on a
-	// durable collection. The durable page catalog persists the declaration
-	// but carries no tin postings yet, so building one would compile it as
-	// an exact index over the path — silent corruption. Tin declarations
-	// enter the catalog at creation only, until the postings slice lands.
-	ErrTinIndexUnsupported = errors.New("vibedb: durable collections do not support USING tin indexes yet")
+	// Tin index declarations (USING tin) enter the durable page catalog
+	// through the declare-only online path: createTinIndexContext publishes
+	// the declaration in a catalog-only generation, and postings build
+	// lazily per generation on first query use.
 	// ErrPrimaryLeafSplitRequired reports that an insert landed on a leaf with
 	// no room for it. It is an internal retry signal: the mutation path catches
 	// it, commits an atomic leaf split as its own structural transaction, and
@@ -938,10 +936,11 @@ type normalizedFileStoreOptions struct {
 	pageCatalog                            *storeio.CanonicalPageCatalog
 	indexes                                []*store.ExactIndex
 	// tinIndexes carries the declared full-text definitions in canonical
-	// catalog order. Tin has no postings yet: nothing in the write,
-	// enforcement, or exact-probe paths consults this list. Snapshots
-	// advertise it so readers observe the published catalog exactly, and
-	// the online index path preserves it across re-normalization.
+	// catalog order. Tin postings build lazily per generation on first
+	// query use: nothing in the write, enforcement, or exact-probe paths
+	// consults this list. Snapshots advertise it so readers observe the
+	// published catalog exactly, and the online index path preserves it
+	// across re-normalization.
 	tinIndexes   []store.IndexDefinition
 	skipIndexes  []vibejson.CompiledPointer
 	indexNameIDs map[string]uint32

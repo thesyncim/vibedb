@@ -8,18 +8,18 @@ import (
 	"github.com/thesyncim/vibedb/store"
 )
 
-// An online USING tin build on a durable collection is refused: the durable
-// page catalog persists the declaration but carries no tin postings yet, so
-// building one would compile it as an exact index over the path — silent
-// corruption. Tin declarations enter the catalog only at creation, until the
-// postings slice lands.
-func TestDurableRefusesTinIndexDefinitions(t *testing.T) {
-	options := testDatabaseOptions()
-	db, err := OpenDatabase(t.TempDir(), DatabaseOptions{Options: options})
+// An online USING tin declaration on a durable collection publishes the
+// declaration in a catalog-only generation: postings build lazily per
+// generation on first query use, so unlike exact indexes there is no scan.
+// The declaration is usable immediately and survives reopen.
+func TestDurableDeclaresTinIndexOnline(t *testing.T) {
+	dir := t.TempDir()
+	databaseOptions := DatabaseOptions{Options: testDatabaseOptions()}
+	db, err := OpenDatabase(dir, databaseOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	options := testDatabaseOptions()
 	docs, err := db.CreateCollection("docs", options)
 	if err != nil {
 		t.Fatal(err)
@@ -28,28 +28,106 @@ func TestDurableRefusesTinIndexDefinitions(t *testing.T) {
 	def := store.IndexDefinition{
 		Name: "body_tin", Paths: []string{"/body"}, Kind: store.IndexTin,
 	}
-	if _, err := docs.CreateIndex(def); !errors.Is(err, ErrTinIndexUnsupported) {
-		t.Fatalf("CreateIndex(tin) = %v, want %v", err, ErrTinIndexUnsupported)
+	info, err := docs.CreateIndexContext(t.Context(), def)
+	if err != nil {
+		t.Fatalf("CreateIndexContext(tin) = %v", err)
 	}
-	if _, err := docs.CreateIndexContext(t.Context(), def); !errors.Is(err, ErrTinIndexUnsupported) {
-		t.Fatalf("CreateIndexContext(tin) = %v, want %v", err, ErrTinIndexUnsupported)
+	if info.Name != "body_tin" || info.Kind != store.IndexTin ||
+		info.State != store.IndexReady || info.ColumnCount != 1 ||
+		info.Columns[0] != "/body" {
+		t.Fatalf("CreateIndexContext(tin) info = %+v", info)
 	}
-	// The definition must not have leaked into the catalog as exact.
+	// A duplicate declaration and one shadowing an exact alias both fail
+	// without disturbing the published declaration.
+	exactDef := store.IndexDefinition{Name: "id_exact", Paths: []string{"/id"}}
+	if _, err := docs.CreateIndex(exactDef); err != nil {
+		t.Fatalf("CreateIndex(exact) = %v", err)
+	}
+	if _, err := docs.CreateIndex(def); !errors.Is(err, store.ErrIndexExists) {
+		t.Fatalf("duplicate CreateIndex(tin) = %v, want %v", err, store.ErrIndexExists)
+	}
+	shadow := store.IndexDefinition{
+		Name: "id_exact", Paths: []string{"/body"}, Kind: store.IndexTin,
+	}
+	if _, err := docs.CreateIndex(shadow); !errors.Is(err, store.ErrIndexExists) {
+		t.Fatalf("shadowing CreateIndex(tin) = %v, want %v", err, store.ErrIndexExists)
+	}
+	// Malformed shapes fail before publication: empty names, non-single
+	// paths, uniqueness, and bad pointers.
+	for name, bad := range map[string]store.IndexDefinition{
+		"empty name":  {Name: "", Paths: []string{"/body"}, Kind: store.IndexTin},
+		"two paths":   {Name: "t", Paths: []string{"/a", "/b"}, Kind: store.IndexTin},
+		"unique":      {Name: "t", Paths: []string{"/body"}, Kind: store.IndexTin, Unique: true},
+		"bad pointer": {Name: "t", Paths: []string{"body"}, Kind: store.IndexTin},
+	} {
+		if _, err := docs.CreateIndex(bad); !errors.Is(err, store.ErrIndexDefinition) {
+			t.Fatalf("%s CreateIndex(tin) = %v, want %v", name, err, store.ErrIndexDefinition)
+		}
+	}
+	// The declaration answers immediately: the first query builds the
+	// generation's postings.
 	snap, err := docs.Snapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer snap.Close()
-	for _, info := range snap.AppendIndexes(nil) {
-		if info.Name == "body_tin" {
-			t.Fatalf("tin definition cataloged as %+v", info)
+	hits, err := docs.TinSearch(snap, "/body", "luxury", 10)
+	snap.Close()
+	if err != nil {
+		t.Fatalf("TinSearch after declare = %v", err)
+	}
+	if len(hits) != 1 || hits[0].Key != "one" {
+		t.Fatalf("TinSearch after declare = %+v, want [one]", hits)
+	}
+	// The declaration survives reopen with its exact neighbor intact.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenDatabase(dir, databaseOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	redocs, ok := reopened.Collection("docs")
+	if !ok {
+		t.Fatal("reopened database lost collection docs")
+	}
+	rsnap, err := redocs.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rsnap.Close()
+	var exact, tin *store.IndexInfo
+	for _, info := range rsnap.AppendIndexes(nil) {
+		switch info.Name {
+		case "id_exact":
+			ii := info
+			exact = &ii
+		case "body_tin":
+			ii := info
+			tin = &ii
 		}
+	}
+	if exact == nil || exact.Kind != store.IndexExact ||
+		exact.State != store.IndexReady {
+		t.Fatalf("reopened exact advertisement = %+v", exact)
+	}
+	if tin == nil || tin.Kind != store.IndexTin ||
+		tin.State != store.IndexReady || tin.ColumnCount != 1 ||
+		tin.Columns[0] != "/body" {
+		t.Fatalf("reopened tin advertisement = %+v", tin)
+	}
+	rhits, err := redocs.TinSearch(rsnap, "/body", "luxury", 10)
+	if err != nil {
+		t.Fatalf("TinSearch after reopen = %v", err)
+	}
+	if len(rhits) != 1 || rhits[0].Key != "one" {
+		t.Fatalf("TinSearch after reopen = %+v, want [one]", rhits)
 	}
 }
 
 // Tin declarations at creation persist in the versioned catalog section and
-// reopen identically. They advertise as IndexBuilding — no postings exist —
-// so planners keep their fallback while readers observe the declaration.
+// reopen identically. Postings build lazily per generation, so declarations
+// advertise IndexReady while readers observe the declaration exactly.
 func TestDurablePersistsTinIndexDefinitions(t *testing.T) {
 	dir := t.TempDir()
 	databaseOptions := DatabaseOptions{Options: testDatabaseOptions()}
@@ -117,7 +195,7 @@ func assertTinAdvertised(t *testing.T, docs *Collection, reopened bool) {
 	if tin == nil {
 		t.Fatalf("reopened=%v: tin declaration missing from catalog", reopened)
 	}
-	if tin.Kind != store.IndexTin || tin.State != store.IndexBuilding ||
+	if tin.Kind != store.IndexTin || tin.State != store.IndexReady ||
 		tin.ColumnCount != 1 || tin.Columns[0] != "/body" {
 		t.Fatalf("reopened=%v tin advertisement = %+v", reopened, tin)
 	}

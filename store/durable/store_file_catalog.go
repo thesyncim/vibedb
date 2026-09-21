@@ -299,8 +299,8 @@ func normalizeOpenedFileStoreOptions(
 		}
 		// Tin declarations round-trip with their Kind so the re-derived
 		// canonical catalog below reproduces the persisted tin section
-		// byte-for-byte. Declared postings still do not exist; snapshots
-		// advertise these as IndexBuilding until the postings slice lands.
+		// byte-for-byte. Postings build lazily per generation on first
+		// query use, so snapshots advertise these as IndexReady.
 		for i, tin := range definition.TinIndexes {
 			options.Indexes[len(definition.Indexes)+i] = store.IndexDefinition{
 				Name: tin.Name, Paths: []string{tin.Path},

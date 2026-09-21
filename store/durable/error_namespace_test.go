@@ -26,7 +26,6 @@ func TestPublicErrorsUseVibeDBNamespace(t *testing.T) {
 		"ErrPrimaryLeafSplitRequired":    ErrPrimaryLeafSplitRequired,
 		"ErrPrimaryMacroSplitRequired":   ErrPrimaryMacroSplitRequired,
 		"ErrStoreDirectIOUnsupported":    ErrStoreDirectIOUnsupported,
-		"ErrTinIndexUnsupported":         ErrTinIndexUnsupported,
 		"ErrUnsupportedPageSize":         ErrUnsupportedPageSize,
 		"ErrUnsupportedDatabaseLayout":   ErrUnsupportedDatabaseLayout,
 		"ErrWriterLocked":                ErrWriterLocked,
