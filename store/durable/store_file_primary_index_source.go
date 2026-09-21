@@ -11,12 +11,28 @@ import (
 // masks are rechecked against the live posting map on read, so they are already
 // exact — candidate and exact probes coincide.
 
-// AppendIndexes appends the immutable exact-index catalog visible to the snapshot.
+// AppendIndexes appends the immutable index catalog visible to the snapshot:
+// the exact aliases, then the declared tin definitions. Tin has no postings
+// yet, so it advertises IndexBuilding: the planner keys indexability off
+// State and keeps its exact-scan fallback, while readers still observe the
+// published declaration exactly.
 func (s *Snapshot) AppendIndexes(dst []store.IndexInfo) []store.IndexInfo {
 	if s == nil || s.collection == nil || s.state == nil {
 		return dst
 	}
 	for _, definition := range s.indexDefinitions {
+		if definition.Kind == store.IndexTin {
+			info := store.IndexInfo{
+				Name: definition.Name, Kind: store.IndexTin,
+				State:       store.IndexBuilding,
+				ColumnCount: 1,
+			}
+			if len(definition.Paths) == 1 {
+				info.Columns[0] = definition.Paths[0]
+			}
+			dst = append(dst, info)
+			continue
+		}
 		info := store.IndexInfo{
 			Name: definition.Name, Kind: store.IndexExact, State: store.IndexReady,
 			Unique: definition.Unique,

@@ -213,6 +213,12 @@ func (c *Collection) createIndexContext(
 			Unique: definition.Unique,
 		},
 	)
+	// Re-normalization rebuilds the canonical catalog from Indexes alone,
+	// so declared tin definitions ride along here or the published catalog
+	// would silently drop them.
+	candidateOptions.Indexes = append(
+		candidateOptions.Indexes, slices.Clone(c.options.tinIndexes)...,
+	)
 	candidate, err := candidateOptions.normalized()
 	if err != nil {
 		c.writer.Unlock()
@@ -1266,6 +1272,7 @@ catalogAddsName:
 	// struct would needlessly race lock-free readers of frozen admission limits
 	// such as MaxDocumentBytes; those fields are intentionally untouched.
 	c.options.Options.Indexes = candidate.Options.Indexes
+	c.options.tinIndexes = candidate.tinIndexes
 	c.options.maxTransactionBytes = candidate.maxTransactionBytes
 	c.options.maxTransactionPhysicalBytes =
 		candidate.maxTransactionPhysicalBytes

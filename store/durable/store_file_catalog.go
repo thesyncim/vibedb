@@ -41,6 +41,7 @@ func planFilePageCatalog(
 	size := catalog.CanonicalSize()
 	definition := catalog.Definition()
 	semanticEmpty := len(definition.Indexes) == 0 &&
+		len(definition.TinIndexes) == 0 &&
 		len(definition.SkipPaths) == 0 &&
 		definition.Schema == nil
 	if size == 0 {
@@ -192,7 +193,7 @@ func normalizeOpenedFileStoreOptions(
 		)
 	}
 	definition := catalog.Definition()
-	hasIndexes := len(definition.Indexes) != 0
+	hasIndexes := len(definition.Indexes) != 0 || len(definition.TinIndexes) != 0
 	hasSkipIndexes := len(definition.SkipPaths) != 0
 	hasSchema := definition.Schema != nil
 	hasOpaqueValues := root.Options&storeio.StateOptionOpaqueValues != 0
@@ -271,12 +272,23 @@ func normalizeOpenedFileStoreOptions(
 	options.Collection.IndexOptions.MaxDepth = int(root.IndexMaxDepth)
 	if options.Indexes == nil {
 		options.Indexes = make(
-			[]store.IndexDefinition, len(definition.Indexes),
+			[]store.IndexDefinition,
+			len(definition.Indexes)+len(definition.TinIndexes),
 		)
 		for i, index := range definition.Indexes {
 			options.Indexes[i] = store.IndexDefinition{
 				Name: index.Name, Paths: slices.Clone(index.Paths),
 				Unique: index.Unique,
+			}
+		}
+		// Tin declarations round-trip with their Kind so the re-derived
+		// canonical catalog below reproduces the persisted tin section
+		// byte-for-byte. Declared postings still do not exist; snapshots
+		// advertise these as IndexBuilding until the postings slice lands.
+		for i, tin := range definition.TinIndexes {
+			options.Indexes[len(definition.Indexes)+i] = store.IndexDefinition{
+				Name: tin.Name, Paths: []string{tin.Path},
+				Kind: store.IndexTin,
 			}
 		}
 	}
