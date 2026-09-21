@@ -287,8 +287,11 @@ func TestLegacySQLJoinLayoutAndWarmAllocationGates(t *testing.T) {
 		// (perf/commit-garbage): joinBinding.file.docs is a batch Segment,
 		// so the binding shrinks with it. Layout of query-owned fields is
 		// unchanged — lits offset below still pins that.
-		if got := unsafe.Sizeof(joinBinding{}); got != 3520 {
-			t.Fatalf("joinBinding size = %d, want unchanged 3520", got)
+		// 3520 before ==> bindings: the binding's inner scan Workspace
+		// carries one parsed-query slice and its evaluator one parsed-query
+		// alias plus one scratch slice (24 + 48 bytes incl. alignment).
+		if got := unsafe.Sizeof(joinBinding{}); got != 3600 {
+			t.Fatalf("joinBinding size = %d, want unchanged 3600", got)
 		}
 		if got := unsafe.Offsetof(joinBinding{}.lits); got != 8 {
 			t.Fatalf("joinBinding.lits offset = %d, want unchanged 8", got)

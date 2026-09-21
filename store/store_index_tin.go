@@ -203,3 +203,36 @@ func tinSlotText(chunk *Chunk, slot int, pointer vibejson.CompiledPointer) (stri
 	}
 	return text, true
 }
+
+// TinIndexForPath returns the tin index built over snapshot s for the first
+// definition covering path, building it on first use by scanning s's own
+// chunks. Definitions over one path hold identical content, so the first
+// catalog hit answers for every name over that path. A snapshot taken from a
+// collection (or database) carries its collection; a zero Snapshot or one
+// whose collection defines no tin index over path reports ErrIndexNotFound.
+func (s Snapshot) TinIndexForPath(path string) (*tin.Index, error) {
+	if s.coll == nil {
+		return nil, ErrIndexNotFound
+	}
+	return s.coll.TinIndexForPath(s, path)
+}
+
+// TinIndexForPath resolves the definition covering path to its catalog name
+// and returns the index TinIndex builds for s. The definition scan holds the
+// collection lock only for the map lookup; the build itself locks inside
+// TinIndex.
+func (c *Collection) TinIndexForPath(s Snapshot, path string) (*tin.Index, error) {
+	c.mu.Lock()
+	name := ""
+	for candidate, tdef := range c.tinDefs {
+		if tdef.path == path {
+			name = candidate
+			break
+		}
+	}
+	c.mu.Unlock()
+	if name == "" {
+		return nil, ErrIndexNotFound
+	}
+	return c.TinIndex(s, name)
+}

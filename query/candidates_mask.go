@@ -54,8 +54,16 @@ import (
 // at compile time, so each concrete entry point states its own and the compiler
 // checks the claim.
 type sourceCaps struct {
-	live   store.LiveMaskSource
-	ranges store.RangeIndexSource
+	// live is the heap snapshot's own live-row universe, held concrete
+	// rather than as a LiveMaskSource interface: boxing the Snapshot value
+	// into the interface costs a heap allocation on every warmed execution,
+	// and only heap snapshots ever provide the capability (durable
+	// deliberately declines it — materializing that universe needs real
+	// page I/O). hasLive distinguishes a provided universe from the zero
+	// caps a durable source passes.
+	live    store.Snapshot
+	hasLive bool
+	ranges  store.RangeIndexSource
 }
 
 func snapshotCandidateMasks[S store.IndexSource](p *plan, snapshot S, caps sourceCaps, w *Workspace, requireExact bool) ([]store.Mask, bool, error) {
@@ -208,7 +216,7 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 		// Durable deliberately offers no live universe because obtaining one
 		// would require a full document-page scan, so it declines here before
 		// paying for any positive probes.
-		if caps.live == nil {
+		if !caps.hasLive {
 			return nil, false, false, nil
 		}
 		positive := *p
@@ -264,7 +272,7 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 		// backend that can never complete a NOT should decline it at zero cost,
 		// not after paying for a child probe it can't use.
 		live := caps.live
-		if live == nil {
+		if !caps.hasLive {
 			return nil, false, false, nil
 		}
 		// Complementing a candidate superset is unsafe: a hash collision in the

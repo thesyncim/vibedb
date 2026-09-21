@@ -137,6 +137,9 @@ func (p *plan) runFileSmall(e *Exec, snapshot *durable.Snapshot, span *FileRange
 // durable ranges keeps the complete predicate authoritative; its Segment
 // fallback covers complex paths and uncommon JSON roots.
 func (p *plan) runValidatedRawInto(e *Exec, raw []byte) error {
+	if err := rejectTinMatch(p, "a validated raw source"); err != nil {
+		return err
+	}
 	if e.file.small == nil {
 		e.file.small = &fileSmallScan{}
 		e.file.small.row = e.file.small.appendRow

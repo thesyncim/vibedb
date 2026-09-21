@@ -1028,6 +1028,8 @@ func (s *Statement) leafForm(e *sqlast.Expr, args []any) (leafForm, error) {
 		return leafForm{pred: Contains(spec, e.Value.Text), total: true}, nil
 	case sqlast.ExprLike:
 		return s.likeForm(e, args)
+	case sqlast.ExprMatch:
+		return s.matchForm(e, args)
 	default:
 		return leafForm{}, fmt.Errorf("query: unsupported predicate in SQL lowering")
 	}
@@ -1087,6 +1089,44 @@ func (s *Statement) likeForm(e *sqlast.Expr, args []any) (leafForm, error) {
 		pred = ILike(s.spec(e.Path), pattern)
 	}
 	return leafForm{pred: pred, guard: isString(s.spec(e.Path))}, nil
+}
+
+// matchForm lowers Path ==> 'tinql'. It mirrors likeForm: a parameterized
+// statement lowers once with an empty-string stand-in so shape errors surface
+// early, and the real binding is validated below. The TINQL text itself is
+// not parsed here — expansions resolve against the executing snapshot's tin
+// index dictionary, so bindMatches parses it once per execution. The
+// isString guard keeps non-text rows out exactly like LIKE.
+func (s *Statement) matchForm(e *sqlast.Expr, args []any) (leafForm, error) {
+	if s.prepareMode && e.Value.Kind == sqlast.OperandParam {
+		return leafForm{
+			pred:  Match(s.spec(e.Path), ""),
+			guard: isString(s.spec(e.Path)),
+		}, nil
+	}
+	value, known, err := s.operand(e.Value, args)
+	if err != nil {
+		return leafForm{}, err
+	}
+	if !known {
+		return leafForm{noTrue: true, noFalse: true}, nil
+	}
+	var tinql string
+	switch v := value.(type) {
+	case *string:
+		tinql = *v
+	case string:
+		tinql = v
+	default:
+		return leafForm{}, fmt.Errorf(
+			"%w: ==> query must be a string, got %T",
+			ErrParameterType, value,
+		)
+	}
+	return leafForm{
+		pred:  Match(s.spec(e.Path), tinql),
+		guard: isString(s.spec(e.Path)),
+	}, nil
 }
 
 func (s *Statement) subqueryCompareForm(e *sqlast.Expr) (leafForm, error) {

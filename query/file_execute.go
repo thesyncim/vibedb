@@ -628,6 +628,11 @@ func (p *plan) runFileInto(
 	if err := e.Workspace.checkCanceled(); err != nil {
 		return err
 	}
+	// Durable execution has no tin catalog to parse against yet; the heap
+	// snapshot sources bind ==> before reaching any file path.
+	if err := rejectTinMatch(p, "a durable snapshot"); err != nil {
+		return err
+	}
 	n, err := normalizeFileOptions(e.Options)
 	if err != nil {
 		return err
@@ -776,6 +781,9 @@ func (p *plan) runFileOverlayInto(e *Exec, snapshot *durable.Snapshot, overlay F
 	e.Result.fileData = e.Result.fileData[:0]
 	e.Stats = ExecStats{}
 	if err := e.Workspace.checkCanceled(); err != nil {
+		return err
+	}
+	if err := rejectTinMatch(p, "a durable snapshot"); err != nil {
 		return err
 	}
 	n, err := normalizeFileOptions(e.Options)

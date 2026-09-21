@@ -683,6 +683,9 @@ func (p *plan) runEmptyFileDatabaseInto(
 	if err := e.Workspace.checkCanceled(); err != nil {
 		return err
 	}
+	if err := rejectTinMatch(p, "a durable snapshot"); err != nil {
+		return err
+	}
 	n, err := normalizeFileOptions(e.Options)
 	if err != nil {
 		return err

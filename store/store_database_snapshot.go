@@ -102,7 +102,7 @@ func (d *Database) Snapshot() DatabaseSnapshot {
 	for _, collection := range collections {
 		entries = append(entries, databaseSnapshotEntry{
 			name:     collection.name,
-			snapshot: Snapshot{state: collection.state.Load()},
+			snapshot: Snapshot{state: collection.state.Load(), coll: collection},
 		})
 	}
 	return DatabaseSnapshot{entries: entries}

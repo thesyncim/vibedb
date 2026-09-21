@@ -992,6 +992,10 @@ func (p *plan) bindMarks(
 		clear(b.keyKinds)
 		b.ensureSeed()
 		b.scan.cancel = w.cancel
+		// Slots are statement-global, so the mark's inner scan aliases the
+		// outer binding: bindMatches already parsed its ==> nodes against
+		// this same inner snapshot.
+		b.scan.eval.bindMatches(w.matchQueries)
 		if err := b.collectHeap(inner, work); err != nil {
 			return err
 		}

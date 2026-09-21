@@ -6,6 +6,7 @@ import (
 	"math/bits"
 	"slices"
 
+	"github.com/thesyncim/vibedb/internal/tin"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
@@ -130,6 +131,12 @@ type Workspace struct {
 	// marks is the immutable-after-bind grouped state for correlated predicate
 	// subqueries. Each evaluator aliases it read-only during the outer scan.
 	marks []markBinding
+	// matchQueries is one parsed TINQL query per ==> slot, in the order
+	// assignMatchSlots numbered. It lives here rather than in the plan
+	// because expansions resolve against the executing snapshot's index
+	// dictionary: a compiled Query is shared by every concurrent execution
+	// while the parse belongs to exactly one of them.
+	matchQueries []tin.Query
 	// correlations is the execution-local scalar tuple supplied by a containing
 	// APPLY. Compiled plans carry only slot ordinals; values are copied here at
 	// the synchronous child boundary and cleared before the Workspace is reused.
@@ -233,12 +240,14 @@ func (w *Workspace) clearBorrowedViews() {
 	w.ctx.rows = 0
 	w.eval.bindTo(nil)
 	w.eval.bindMarks(nil)
+	w.eval.bindMatches(nil)
 	w.resetCorrelationBindings()
 	w.eval.setWork(nil)
 	if w.pool != nil {
 		for i := range w.pool.workers {
 			w.pool.workers[i].eval.bindTo(nil)
 			w.pool.workers[i].eval.bindMarks(nil)
+			w.pool.workers[i].eval.bindMatches(nil)
 			w.pool.workers[i].eval.bindCorrelations(nil)
 			w.pool.workers[i].eval.setWork(nil)
 			w.pool.workers[i].release()
@@ -318,11 +327,17 @@ type evalScratch struct {
 	// text is the decoded-string arena a nested evaluation classifies through.
 	// Only a join probe uses it; a top-level scan classifies into the phase
 	// arenas the extraction owns.
-	text              []byte
-	binds             []joinBinding
-	probes            []joinProbe
-	marks             []markBinding
-	correlations      []scalar
+	text         []byte
+	binds        []joinBinding
+	probes       []joinProbe
+	marks        []markBinding
+	correlations []scalar
+	// matchQueries aliases the executing Workspace's parsed TINQL queries,
+	// shared read-only across evaluators; matchScratch is this evaluator's
+	// own transient per-slot scratch. bindMatches installs both together so
+	// a worker can never see queries without scratch for them.
+	matchQueries      []tin.Query
+	matchScratch      []tin.TextScratch
 	markLeftEntries   []vibejson.IndexEntry
 	markRightEntries  []vibejson.IndexEntry
 	markLeftReserved  int64
@@ -523,6 +538,11 @@ func (p *plan) runInto(dst *Result, s *store.Segment, w *Workspace, workers int)
 	if err := w.checkCanceled(); err != nil {
 		return err
 	}
+	// A bare segment carries no index catalog, so ==> has nothing to parse
+	// against here; the snapshot sources bind before reaching this path.
+	if err := rejectTinMatch(p, "a bare segment"); err != nil {
+		return err
+	}
 	if p.hasLimit && p.limit == 0 && !p.requiresSQLDomainScan() {
 		return prepareResult(dst, p, 0)
 	}
@@ -679,6 +699,9 @@ func (p *plan) runSnapshotInto(e *Exec, snapshot store.Snapshot, catalog store.D
 		}
 		e.Stats = ExecStats{}
 		return prepareResult(&e.Result, p, 0)
+	}
+	if err := p.bindMatches(&e.Workspace, snapshot, catalog); err != nil {
+		return err
 	}
 	if err := p.bindJoins(
 		&e.Workspace, snapshot, catalog,
