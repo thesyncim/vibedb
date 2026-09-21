@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/raftserve"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -458,7 +460,26 @@ func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauth
 		errors.Is(err, gateway.ErrDurableSQLNotAdmitted) && w.record.Query == nil && w.poison == nil {
 		return w.writeFresh(ctx, authority, q, gateway.DurableSQLCoordinated)
 	}
+	// A membership publication refuses the prepared fence before Raft admits
+	// the command. The sequence was not consumed. Replan against the refreshed
+	// catalog instead of returning that refusal to the caller.
+	for attempt := 0; attempt < 8 && preAdmissionWriteRetry(err) && w.record.Query == nil && w.poison == nil && ctx.Err() == nil; attempt++ {
+		timer := time.NewTimer(time.Duration(attempt+1) * 20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		result, err = w.writeFresh(ctx, authority, q, mode)
+	}
 	return result, err
+}
+
+func preAdmissionWriteRetry(err error) bool {
+	return err != nil && errors.Is(err, gateway.ErrDurableSQLNotAdmitted) &&
+		!errors.Is(err, durable.ErrCommitOutcomeUnknown) &&
+		(errors.Is(err, raftserve.ErrProposalRefused) || errors.Is(err, raftservice.ErrServingFence))
 }
 
 func (w *postgresDurableWriter) writeFresh(ctx context.Context, authority serviceauthz.Authority, q gateway.Query, mode gateway.DurableSQLExecutionMode) (*gateway.Result, error) {

@@ -334,6 +334,12 @@ func (lane *ExecutionLane) SnapshotAuthorizationFence(key raftmember.GroupKey) (
 	}
 	return lane.set.SnapshotAuthorizationFence(key)
 }
+func (lane *ExecutionLane) PublishedLogicalEpochs(key raftmember.GroupKey) (uint64, uint64, uint64, uint64, uint64, uint64, bool) {
+	if err := lane.accepts(key); err != nil {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	return lane.set.PublishedLogicalEpochs(key)
+}
 func (lane *ExecutionLane) SnapshotBaseCertificate(key raftmember.GroupKey) (replicatedstate.SnapshotBaseCertificate, error) {
 	if err := lane.accepts(key); err != nil {
 		return replicatedstate.SnapshotBaseCertificate{}, err
@@ -934,6 +940,21 @@ func (set *ExecutionLanes) SnapshotAuthorizationFence(
 		lane.counters.rejected++
 	}
 	return result, err
+}
+
+func (set *ExecutionLanes) PublishedLogicalEpochs(
+	key raftmember.GroupKey,
+) (policy, protection, ownership, schema, routing, generation uint64, ok bool) {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	if set.state.Load() != executionLanesOpen || lane.host == nil {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	return lane.host.PublishedLogicalEpochs(key)
 }
 
 func (set *ExecutionLanes) SnapshotBaseCertificate(

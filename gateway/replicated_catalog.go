@@ -388,13 +388,31 @@ func (snapshot *Snapshot) ResolveReplicatedRoute(
 	}
 	dst = append(dst[:0], snapshot.replicatedReplicas[int(entry.replicaBase):int(entry.replicaBase)+int(entry.replicaCount)]...)
 	dst = dst[:len(dst):len(dst)]
-	return ReplicatedRoute{
+	route := ReplicatedRoute{
 		Distribution: distributionName, Shard: shardID,
 		Group: entry.group, AllocationGeneration: uint64(entry.allocation),
 		Command: entry.command, LogicalSchemaDigest: entry.logicalSchema, RangeIdentity: entry.rangeIdentity,
 		LineageDigest: entry.lineageDigest, ForwardingRuleDigest: entry.forwardingDigest,
 		Replicas: dst,
-	}, true
+	}
+	route = snapshot.withEnrolledDiscovery(route, entry)
+	return route, true
+}
+
+// withEnrolledDiscovery keeps a promoted replacement reachable for leader
+// discovery without adding it to the serving replica set. Ordinary reads and
+// writes still cannot select it.
+func (snapshot *Snapshot) withEnrolledDiscovery(route ReplicatedRoute, entry replicatedCatalogShard) ReplicatedRoute {
+	if snapshot == nil || !entry.hasEnrolledTarget {
+		return route
+	}
+	index := int(entry.replicaBase) + int(entry.replicaCount)
+	if index >= len(snapshot.replicatedReplicas) {
+		return route
+	}
+	route.discoveryReplica = snapshot.replicatedReplicas[index]
+	route.hasDiscoveryReplica = true
+	return route
 }
 
 // ReplicatedRouteCount reports the complete catalog RF3 inventory, including

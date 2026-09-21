@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+
+	"github.com/thesyncim/vibedb/internal/raftservice"
 )
 
 // Readers install the complete committed catalog, whether cold or already
@@ -109,14 +111,32 @@ func validateCommittedCatalogAdvance(current, next *Snapshot) error {
 		if candidate.allocation != old.allocation {
 			continue
 		}
+		if replicatedCommandFenceRegresses(old.command, candidate.command) {
+			return &CatalogError{Reason: "committed replica identity regressed or forked"}
+		}
 		if candidate.group != old.group || candidate.rangeIdentity != old.rangeIdentity ||
-			candidate.lineageDigest != old.lineageDigest || candidate.forwardingDigest != old.forwardingDigest ||
-			!sameReplicatedSplitOrigin(candidate.splitOrigin, old.splitOrigin) ||
-			replicatedCommandFenceRegresses(old.command, candidate.command) ||
+			!sameReplicatedSplitOrigin(candidate.splitOrigin, old.splitOrigin) {
+			return &CatalogError{Reason: "committed replica identity regressed or forked"}
+		}
+		// A later membership, ownership, or route publication may replace the
+		// roster and forwarding identity. Only an unchanged fence can fork
+		// those fields, or the schema at the same generation.
+		if committedCommandFenceAdvanced(old.command, candidate.command) {
+			continue
+		}
+		if candidate.lineageDigest != old.lineageDigest || candidate.forwardingDigest != old.forwardingDigest ||
 			candidate.command.SchemaGeneration == old.command.SchemaGeneration && candidate.logicalSchema != old.logicalSchema ||
-			candidate.command.ReplicaSetVersion == old.command.ReplicaSetVersion && !sameReplicatedCatalogRoster(current, old, next, candidate) {
+			!sameReplicatedCatalogRoster(current, old, next, candidate) {
 			return &CatalogError{Reason: "committed replica identity regressed or forked"}
 		}
 	}
 	return nil
+}
+
+func committedCommandFenceAdvanced(old, next raftservice.CommandFence) bool {
+	return next.ReplicaSetVersion > old.ReplicaSetVersion ||
+		next.OwnershipEpoch > old.OwnershipEpoch ||
+		next.RoutingVersion > old.RoutingVersion ||
+		next.RouteGeneration > old.RouteGeneration ||
+		next.SchemaGeneration > old.SchemaGeneration
 }

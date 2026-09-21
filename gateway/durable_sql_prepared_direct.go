@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 
+	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
@@ -173,7 +174,8 @@ func (executor *DurableSQLRequestExecutor) ExecutePreparedDirect(ctx context.Con
 			err = errors.Join(ErrDurableSQLNotAdmitted, err)
 		}
 	}
-	if errors.Is(err, ErrDurableSQLNotAdmitted) && errors.Is(err, raftservice.ErrServingFence) && executor.planner != nil {
+	if errors.Is(err, ErrDurableSQLNotAdmitted) && executor.planner != nil &&
+		(errors.Is(err, raftservice.ErrServingFence) || errors.Is(err, raftserve.ErrProposalRefused)) {
 		// Only a certified catalog refresh can authorize a newly planned write.
 		// This retained recipe remains unchanged, including on recovery after an
 		// earlier invocation with an unknown outcome.

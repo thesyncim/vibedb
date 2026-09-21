@@ -207,6 +207,10 @@ type commitMetricsRuntime interface {
 	CommitMetrics() raftmodel.CommitMetrics
 }
 
+type logicalEpochRuntime interface {
+	PublishedLogicalEpochs() (policy, protection, ownership, schema, routing, generation uint64, ok bool)
+}
+
 type memberRuntime interface {
 	Identity() raftmember.RuntimeIdentity
 	Failure() error
@@ -1398,6 +1402,23 @@ func (host *Host) SnapshotAuthorizationFence(
 		return replicatedstate.SnapshotFence{}, err
 	}
 	return group.runtime.SnapshotAuthorizationFence()
+}
+
+// PublishedLogicalEpochs returns the applied command epochs for one group.
+// A runtime that does not publish them reports ok false so admission keeps
+// its existing fence check.
+func (host *Host) PublishedLogicalEpochs(
+	key raftmember.GroupKey,
+) (policy, protection, ownership, schema, routing, generation uint64, ok bool) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	source, implemented := group.runtime.(logicalEpochRuntime)
+	if !implemented {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	return source.PublishedLogicalEpochs()
 }
 
 // SnapshotBaseCertificate returns the exact immutable certificate retained by

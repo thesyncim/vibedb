@@ -260,8 +260,8 @@ func ExecuteReplicatedMoveStep(
 	// "evidence regressed" and permanently strand this action; the cursor
 	// mismatch it produces still falls through to the ordinary re-plan path
 	// below, which re-freezes the witness against the current live value.
-	refreshFenceAdvanced := action.Kind == ActionRefreshCatalogFence &&
-		ActionKind(record.Cursor[0]) == ActionRefreshCatalogFence &&
+	refreshFenceAdvanced := (action.Kind == ActionRefreshCatalogFence || action.Kind == ActionPublishCatalog) &&
+		ActionKind(record.Cursor[0]) == action.Kind &&
 		cut.Publication.ReplicaSetVersion > record.Cursor[4]
 	// ActionAwaitCatchUp and ActionAwaitSnapshotInstall are passive progress
 	// polls, not membership commands: neither proposes a raft config change,

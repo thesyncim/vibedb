@@ -75,6 +75,11 @@ type ReplicatedRoute struct {
 	// live membership fence for ReadIndex. Stable commands use the same
 	// discovery rule without changing their retained command bytes.
 	membershipStable bool
+	// discoveryReplica is the enrolled replacement. Leader discovery may probe
+	// it while it leads, before catalog publication moves it into Replicas.
+	// Reads and serving selection never use it.
+	discoveryReplica    ReplicatedEndpoint
+	hasDiscoveryReplica bool
 }
 
 // ReplicatedMembershipRoute keeps membership reachability separate from the
@@ -1775,8 +1780,10 @@ func (executor *ReplicatedExecutor) discoverLeaderOnce(
 	preferred uint64,
 	capability serviceauthz.Capability,
 ) (ReplicatedEndpoint, shardservice.ReplicatedMemberState, error) {
+	var scratch [ServingReplicaCount + 1]ReplicatedEndpoint
+	candidates := routeDiscoveryCandidates(route, scratch[:0])
 	if executor.parallelDiscovery() {
-		endpoint, state, err := executor.discoverResponsiveLeader(ctx, route, route.Replicas, preferred, capability, false)
+		endpoint, state, err := executor.discoverResponsiveLeader(ctx, route, candidates, preferred, capability, false)
 		if err == nil {
 			executor.leaderHints.publish(route, endpoint, state)
 		}
@@ -1785,10 +1792,10 @@ func (executor *ReplicatedExecutor) discoverLeaderOnce(
 	visited := uint64(0)
 	member := preferred
 	var joined error
-	for probes := 0; probes < len(route.Replicas); probes++ {
-		endpoint, ordinal, ok := replicatedEndpoint(route, member)
+	for probes := 0; probes < len(candidates); probes++ {
+		endpoint, ordinal, ok := replicatedCandidate(candidates, member)
 		if !ok || visited&(uint64(1)<<ordinal) != 0 {
-			endpoint, ordinal, ok = firstUnvisitedReplicatedEndpoint(route, visited)
+			endpoint, ordinal, ok = firstUnvisitedCandidate(candidates, visited)
 			if !ok {
 				break
 			}
@@ -1832,6 +1839,32 @@ func (executor *ReplicatedExecutor) discoverLeaderOnce(
 	}
 	return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{},
 		errors.Join(ErrReplicatedLeader, joined)
+}
+
+func routeDiscoveryCandidates(route ReplicatedRoute, dst []ReplicatedEndpoint) []ReplicatedEndpoint {
+	dst = append(dst, route.Replicas...)
+	if route.hasDiscoveryReplica && !replicatedRouteContainsMember(route, route.discoveryReplica.Member) {
+		dst = append(dst, route.discoveryReplica)
+	}
+	return dst
+}
+
+func replicatedCandidate(candidates []ReplicatedEndpoint, member uint64) (ReplicatedEndpoint, int, bool) {
+	for index, endpoint := range candidates {
+		if endpoint.Member == member {
+			return endpoint, index, true
+		}
+	}
+	return ReplicatedEndpoint{}, 0, false
+}
+
+func firstUnvisitedCandidate(candidates []ReplicatedEndpoint, visited uint64) (ReplicatedEndpoint, int, bool) {
+	for index, endpoint := range candidates {
+		if visited&(uint64(1)<<index) == 0 {
+			return endpoint, index, true
+		}
+	}
+	return ReplicatedEndpoint{}, 0, false
 }
 
 // discoverMembershipLeaderFresh uses the same bounded transition directory as

@@ -16,6 +16,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
 
@@ -716,33 +717,88 @@ func inFlightMatchesSnapshot(intent gateway.GroupEnrollmentIntent, snapshot *gat
 	route, ok := snapshot.ResolveReplicatedMembershipRoute(intent.Distribution, intent.Shard, replicas[:0])
 	if !ok || route.Serving.Group != intent.Group ||
 		route.Serving.AllocationGeneration != uint64(intent.AllocationGeneration) ||
-		route.Serving.Command != intent.ExpectedCommand || int(intent.ReplicaOrdinal) >= len(route.Serving.Replicas) {
+		int(intent.ReplicaOrdinal) >= len(route.Serving.Replicas) ||
+		!enrollmentFenceCompatible(intent, route.Serving.Command) {
 		return false
 	}
 	source := route.Serving.Replicas[intent.ReplicaOrdinal]
-	if source.Member != intent.Source.Member || source.Node != intent.Source.Node ||
-		source.NodeIncarnation != intent.Source.NodeIncarnation || source.StoreID != intent.Source.StoreID ||
-		source.Endpoint != string(intent.Source.Endpoint) || source.NativeEndpoint != string(intent.Source.NativeEndpoint) ||
-		source.ControlEndpoint != string(intent.Source.ControlEndpoint) {
-		return false
-	}
-	for _, replica := range route.Serving.Replicas {
-		if replica.Member == intent.Target.Member || replica.Node == intent.Target.Node || replica.StoreID == intent.Target.StoreID {
+	if enrollmentEndpointMatches(source, intent.Source) {
+		for _, replica := range route.Serving.Replicas {
+			if replica.Member == intent.Target.Member || replica.Node == intent.Target.Node || replica.StoreID == intent.Target.StoreID {
+				return false
+			}
+		}
+		if intent.State == gateway.EnrollmentEnrolled || intent.State == gateway.EnrollmentMoving {
+			// Enrollment itself advances the global head. Its certified descriptor
+			// remains usable through unrelated publications. Once the move changes
+			// this group, keep its target unavailable until terminal reconciliation
+			// rather than charge the old source demand to a changed serving roster.
+			return gateway.EnrollmentReceiptMatchesSnapshot(intent, snapshot)
+		}
+		if route.HasEnrolledTarget {
 			return false
 		}
+		roster, descriptor, digestOK := gateway.ReplicatedInitialMembershipDigests(snapshot, intent.Group)
+		return digestOK && roster == intent.ExpectedRosterDigest && descriptor == intent.ExpectedDescriptorDigest
 	}
-	if intent.State == gateway.EnrollmentEnrolled || intent.State == gateway.EnrollmentMoving {
-		// Enrollment itself advances the global head. Its certified descriptor
-		// remains usable through unrelated publications. Once the move changes
-		// this group, keep its target unavailable until terminal reconciliation
-		// rather than charge the old source demand to a changed serving roster.
-		return gateway.EnrollmentReceiptMatchesSnapshot(intent, snapshot)
+	// ReplicaSetVersion is the Raft configuration index, so it leaves the
+	// value captured at reservation as soon as the first configuration
+	// commits. A published removal then advances ownership, routing, and
+	// route generation by one and serves the target in the source ordinal.
+	return intent.State == gateway.EnrollmentMoving && !route.HasEnrolledTarget &&
+		enrollmentEndpointMatches(source, intent.Target) &&
+		!routeContainsIdentity(route, intent.Source) &&
+		postRemoveCommand(intent.ExpectedCommand, route.Serving.Command)
+}
+
+func enrollmentEndpointMatches(replica gateway.ReplicatedEndpoint, identity gateway.ReplicaIdentity) bool {
+	return replica.Member == identity.Member && replica.Node == identity.Node &&
+		replica.NodeIncarnation == identity.NodeIncarnation && replica.StoreID == identity.StoreID &&
+		replica.Endpoint == string(identity.Endpoint) && replica.NativeEndpoint == string(identity.NativeEndpoint) &&
+		replica.ControlEndpoint == string(identity.ControlEndpoint)
+}
+
+func routeContainsIdentity(route gateway.ReplicatedMembershipRoute, identity gateway.ReplicaIdentity) bool {
+	for _, replica := range route.Serving.Replicas {
+		if replica.Member == identity.Member || replica.Node == identity.Node || replica.StoreID == identity.StoreID {
+			return true
+		}
 	}
-	if route.HasEnrolledTarget {
+	return false
+}
+
+func enrollmentFenceCompatible(intent gateway.GroupEnrollmentIntent, command raftservice.CommandFence) bool {
+	expected := intent.ExpectedCommand
+	if command == expected {
+		return true
+	}
+	if intent.State != gateway.EnrollmentEnrolled && intent.State != gateway.EnrollmentMoving {
 		return false
 	}
-	roster, descriptor, ok := gateway.ReplicatedInitialMembershipDigests(snapshot, intent.Group)
-	return ok && roster == intent.ExpectedRosterDigest && descriptor == intent.ExpectedDescriptorDigest
+	if command.ActivePolicyGeneration != expected.ActivePolicyGeneration ||
+		command.ProtectionEpoch != expected.ProtectionEpoch ||
+		command.SchemaGeneration != expected.SchemaGeneration ||
+		command.RelationManifestDigest != expected.RelationManifestDigest ||
+		command.ReplicaSetVersion < expected.ReplicaSetVersion {
+		return false
+	}
+	epochsHeld := command.OwnershipEpoch == expected.OwnershipEpoch &&
+		command.RoutingVersion == expected.RoutingVersion &&
+		command.RouteGeneration == expected.RouteGeneration
+	return epochsHeld || postRemoveCommand(expected, command)
+}
+
+func postRemoveCommand(expected, command raftservice.CommandFence) bool {
+	return command.ReplicaSetVersion > expected.ReplicaSetVersion &&
+		command.ActivePolicyGeneration == expected.ActivePolicyGeneration &&
+		command.ProtectionEpoch == expected.ProtectionEpoch &&
+		command.SchemaGeneration == expected.SchemaGeneration &&
+		command.RelationManifestDigest == expected.RelationManifestDigest &&
+		expected.OwnershipEpoch != ^uint64(0) && expected.RoutingVersion != ^uint64(0) &&
+		expected.RouteGeneration != ^uint64(0) &&
+		command.OwnershipEpoch == expected.OwnershipEpoch+1 &&
+		command.RoutingVersion == expected.RoutingVersion+1 &&
+		command.RouteGeneration == expected.RouteGeneration+1
 }
 
 // staleEnrollmentDetail keeps the planner's durable identity and the current

@@ -355,7 +355,8 @@ func (p *Plan) postRemoveCatalogFence(snapshot *gateway.Snapshot, replicaSetVers
 	)
 	if !ok || route.Group != p.request.Group ||
 		route.AllocationGeneration != p.baseState.Binding.AllocationGeneration ||
-		route.Command.ReplicaSetVersion != replicaSetVersion ||
+		route.Command.ReplicaSetVersion <= p.baseState.ReplicaSetVersion ||
+		route.Command.ReplicaSetVersion > replicaSetVersion ||
 		route.Command.ActivePolicyGeneration != p.baseState.Binding.ActivePolicyGeneration ||
 		route.Command.ProtectionEpoch != p.baseState.Binding.ProtectionEpoch ||
 		route.Command.OwnershipEpoch != p.baseState.Binding.OwnershipEpoch+1 ||

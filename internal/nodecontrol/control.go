@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -522,10 +523,16 @@ func (service *Service) executePrepare(ctx context.Context, request Request, int
 		if intent.State != gateway.EnrollmentReserved {
 			return Record{}, ErrNotPrepared
 		}
-		proof, err = service.preparer.Prepare(ctx, intent, request.Payload)
+		// The caller uses a short RPC deadline. Keep the reservation running
+		// after that deadline so the next exact retry observes it instead of
+		// starting over. Process exit still bounds the detached work.
+		workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+		defer cancel()
+		proof, err = service.preparer.Prepare(workCtx, intent, request.Payload)
 		if err != nil {
 			return Record{}, err
 		}
+		ctx = workCtx
 	}
 	if !proofMatchesIntent(proof, intent) {
 		return Record{}, ErrInvalidProof
@@ -613,9 +620,12 @@ func (service *Service) executeAdopt(ctx context.Context, request Request, inten
 	if adopted, observeErr := service.adopter.ObserveAdopted(ctx, intent, record.Proof); observeErr != nil {
 		return Record{}, observeErr
 	} else if !adopted {
-		if err = service.adopter.Adopt(ctx, intent, record.Proof); err != nil {
+		workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+		defer cancel()
+		if err = service.adopter.Adopt(workCtx, intent, record.Proof); err != nil {
 			return Record{}, err
 		}
+		ctx = workCtx
 	}
 	terminal := record
 	terminal.Revision++

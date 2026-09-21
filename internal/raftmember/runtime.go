@@ -1273,6 +1273,15 @@ func (runtime *Runtime) SnapshotAuthorizationFence() (replicatedstate.SnapshotFe
 	return runtime.apply.SnapshotAuthorizationFence()
 }
 
+// PublishedLogicalEpochs returns the applied command epochs. It does not
+// acquire a collection snapshot and does not wait for result settlement.
+func (runtime *Runtime) PublishedLogicalEpochs() (policy, protection, ownership, schema, routing, generation uint64, ok bool) {
+	if runtime == nil || runtime.apply == nil {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	return runtime.apply.PublishedLogicalEpochs()
+}
+
 // SnapshotBaseCertificate returns the exact immutable snapshot-base
 // certificate sealed into the current WAL generation. It never synthesizes a
 // certificate from live state: callers use the returned digest together with

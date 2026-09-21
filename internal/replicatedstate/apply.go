@@ -2931,6 +2931,7 @@ func (m *Machine) persistTransitionRows(
 		m.shard = []byte(next.Binding.Shard)
 	}
 	m.binding = next.Binding
+	m.publishLogicalEpochs(next.Binding)
 	m.initialized = true
 	m.publication = publicationFromState(next)
 	if len(captureRecord) != 0 {

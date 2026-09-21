@@ -693,6 +693,75 @@ func placementAdvanceCatalog(t *testing.T, fixture *placementFixture, generation
 	}
 }
 
+func TestPlanMovingEnrollmentSurvivesPublishedReplicaSetIndex(t *testing.T) {
+	fixture := newPlacementFixture(t, 2)
+	intent := placementInFlightIntent(t, fixture, fixture.nodes[3])
+	intent.State = gateway.EnrollmentMoving
+	intent.MoveOperationID = [32]byte{0xf2}
+	intent.Proof = placementPreparedProof(intent)
+	_, descriptorDigest, ok := gateway.ReplicatedInitialMembershipDigests(fixture.snapshot, intent.Group)
+	if !ok {
+		t.Fatal("enrolled group has no descriptor digest")
+	}
+	intent.Receipt = &gateway.CertifiedEnrollmentReceipt{
+		IntentID: intent.IntentID, IntentDigest: intent.Digest(),
+		BaseCatalogGeneration: intent.CatalogGeneration, BaseCatalogHeadDigest: intent.ExpectedCatalogHeadDigest,
+		BaseDescriptorDigest:             intent.ExpectedDescriptorDigest,
+		PublicationPredecessorGeneration: intent.CatalogGeneration,
+		PublicationPredecessorHeadDigest: intent.ExpectedCatalogHeadDigest,
+		EnrolledCatalogGeneration:        intent.CatalogGeneration + 1, EnrolledCatalogHeadDigest: replication.Digest{0xc2},
+		EnrolledDescriptorDigest: descriptorDigest, Target: intent.Target,
+		InitialReplicaSetVersion: intent.ExpectedCommand.ReplicaSetVersion,
+		GrantDigest:              replication.Digest{0xf1}, TransitionID: gateway.EnrollmentTransitionDigest(intent),
+	}
+	target := fixture.nodes[3]
+	fixture.descriptors[0].EnrolledTarget = nil
+	fixture.descriptors[0].Replicas[0] = gateway.ReplicatedReplicaDescriptor{
+		Member: intent.Target.Member, Node: intent.Target.Node, StoreID: intent.Target.StoreID,
+		NodeIncarnation: intent.Target.NodeIncarnation, Endpoint: intent.Target.Endpoint,
+		NativeEndpoint: intent.Target.NativeEndpoint, ControlEndpoint: intent.Target.ControlEndpoint,
+	}
+	fixture.descriptors[0].Command.ReplicaSetVersion = 18035
+	fixture.descriptors[0].Command.OwnershipEpoch++
+	fixture.descriptors[0].Command.RoutingVersion++
+	fixture.descriptors[0].Command.RouteGeneration++
+	fixture.endpoints[intent.Target.Endpoint] = target.DataAddress
+	fixture.endpoints[intent.Target.NativeEndpoint] = target.NativeAddress
+	fixture.endpoints[intent.Target.ControlEndpoint] = target.ControlAddress
+	manifest, err := fixture.config.Manifests[0].ReplaceShardLeader(
+		0, fixture.config.Manifests[0].Version()+1, 0, intent.Target.Endpoint,
+		distribution.OwnershipEpoch(fixture.descriptors[0].Command.OwnershipEpoch),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.config.Manifests[0] = manifest
+	placementAdvanceCatalog(t, &fixture, placementGeneration+8)
+	if !inFlightMatchesSnapshot(intent, fixture.snapshot) {
+		t.Fatal("published move was rejected after the replica-set index advanced")
+	}
+	request := placementRequest(gateway.ScalingDecommission, 0)
+	request.Drain = gateway.NodeReference{NodeID: intent.Source.Node, Incarnation: intent.Source.NodeIncarnation}
+	for index := range fixture.nodes {
+		if fixture.nodes[index].NodeID == intent.Source.Node {
+			fixture.nodes[index].Lifecycle = gateway.NodeDraining
+		}
+	}
+	plan, err := Plan(PlacementInput{Snapshot: fixture.snapshot, Nodes: fixture.nodes,
+		Request: request, Demands: fixture.demands, InFlight: []gateway.GroupEnrollmentIntent{intent}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if placementBlocker(plan, BlockerStaleGeneration) {
+		t.Fatalf("published move blocked decommission: %+v", plan.Blockers)
+	}
+	forked := intent
+	forked.ExpectedCommand.OwnershipEpoch++
+	if inFlightMatchesSnapshot(forked, fixture.snapshot) {
+		t.Fatal("published move accepted an ownership fork")
+	}
+}
+
 func TestPlanInFlightGroupFenceSurvivesUnrelatedCatalogHeads(t *testing.T) {
 	for _, state := range []gateway.EnrollmentState{
 		gateway.EnrollmentReserved, gateway.EnrollmentPrepared, gateway.EnrollmentEnrolled, gateway.EnrollmentMoving,

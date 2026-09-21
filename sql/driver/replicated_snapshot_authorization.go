@@ -46,3 +46,17 @@ func (a *ReplicatedApply) PublishedWithSnapshotAuthorizationFence() (
 	}
 	return a.machine.Published(), fence, nil
 }
+
+// PublishedLogicalEpochs returns the applied command epochs without taking a
+// state snapshot. A closed apply reports ok false.
+func (a *ReplicatedApply) PublishedLogicalEpochs() (policy, protection, ownership, schema, routing, generation uint64, ok bool) {
+	if a == nil || a.database == nil {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	return a.machine.PublishedLogicalEpochs()
+}

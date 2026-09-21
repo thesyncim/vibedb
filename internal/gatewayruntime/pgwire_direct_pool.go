@@ -18,6 +18,7 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -376,7 +377,7 @@ func (p *postgresDirectPool) Write(ctx context.Context, q gateway.Query) (*gatew
 		}
 	}
 	queries := []gateway.Query{owned}
-	for attempt := 0; attempt < 8; attempt++ {
+	for attempt := 0; attempt < 12; attempt++ {
 		if err = ctx.Err(); err != nil {
 			return nil, true, err
 		}
@@ -395,12 +396,27 @@ func (p *postgresDirectPool) Write(ctx context.Context, q gateway.Query) (*gatew
 		}
 		slot.pending = &postgresDirectPending{identity: id, queries: queries, plan: plan}
 		result, err := p.resolve(ctx, slot)
-		if !errors.Is(err, gateway.ErrDurableSQLAborted) &&
-			!(slot.pending == nil && errors.Is(err, gateway.ErrDurableSQLNotAdmitted) && errors.Is(err, raftservice.ErrServingFence)) {
+		if !postgresDirectPreAdmissionRetry(err) || slot.pending != nil {
 			return result, true, err
+		}
+		if attempt+1 == 12 {
+			break
+		}
+		timer := time.NewTimer(time.Duration(min(attempt+1, 8)) * 25 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, true, errors.Join(err, ctx.Err())
+		case <-timer.C:
 		}
 	}
 	return nil, true, gateway.ErrDurableSQLAborted
+}
+
+func postgresDirectPreAdmissionRetry(err error) bool {
+	return err != nil && errors.Is(err, gateway.ErrDurableSQLNotAdmitted) &&
+		!errors.Is(err, durable.ErrCommitOutcomeUnknown) &&
+		(errors.Is(err, raftservice.ErrServingFence) || errors.Is(err, raftserve.ErrProposalRefused))
 }
 
 // A context-aware, writer-preferring table gate lets direct requests overlap

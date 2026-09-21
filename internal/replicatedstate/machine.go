@@ -94,6 +94,17 @@ type Machine struct {
 	// been validated during source recovery.
 	legacySchemaSourceCommand [sha256.Size]byte
 	poison                    atomic.Pointer[machinePoison]
+
+	// logicalEpochSeq is a seqlock for the applied command epochs. It lets the
+	// serving owner reject a data proposal whose catalog fence is behind the
+	// applied binding without copying a state snapshot on the write path.
+	logicalEpochSeq        atomic.Uint64
+	logicalPolicy          atomic.Uint64
+	logicalProtection      atomic.Uint64
+	logicalOwnership       atomic.Uint64
+	logicalSchema          atomic.Uint64
+	logicalRouting         atomic.Uint64
+	logicalRouteGeneration atomic.Uint64
 }
 
 // machinePoison is published independently of mu so a reader can fail closed
@@ -425,6 +436,7 @@ func OpenBundle(
 		m.relations[i].placementApplied = state.Applied
 	}
 	m.binding = state.Binding
+	m.publishLogicalEpochs(state.Binding)
 	m.distribution = []byte(state.Binding.Distribution)
 	m.shard = []byte(state.Binding.Shard)
 	m.initialized = true

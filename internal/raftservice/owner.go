@@ -12,6 +12,7 @@ import (
 	"runtime/trace"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
@@ -77,6 +78,10 @@ var (
 	ErrExecutionPinUnauthorized = errors.New(
 		"raftservice: execution-pin read is not authorized",
 	)
+	// errProposalQuiesce asks the ownership caller to wait off the owner lane
+	// while admitted data proposals finish. New data proposals are refused
+	// until the serving fence publishes the applied ownership epochs.
+	errProposalQuiesce = errors.New("raftservice: data proposals are draining before ownership")
 )
 
 // Limits bounds every object retained outside Host and rafttransport. Host and
@@ -181,36 +186,37 @@ type transferDelivery struct {
 }
 
 type ownerRequest struct {
-	kind                 requestKind
-	group                raftmember.GroupKey
-	data                 []byte
-	fence                ServingFence
-	inbound              rafttransport.Inbound
-	reply                chan ownerReply
-	bytes                int64
-	async                bool
-	delivery             *proposalDelivery
-	transferDelivery     *transferDelivery
-	authorize            ProposalAuthorization
-	authorityToken       raftauthority.AuthorityToken
-	authorityGeneration  *ownerGeneration
-	authorityPermit      *servingFencePermit
-	membership           MembershipRequest
-	read                 readRequest
-	targetMember         uint64
-	operation            [32]byte
-	step                 [32]byte
-	sourceMember         uint64
-	retirementProof      *ReplicaRetirementProof
-	retirementAuthorized bool
-	install              ExecutionGroup
-	pointReadSlot        *pointReadViewSlot
-	publish              func()
-	registryChange       func(func(func()) error) error
-	database             *sqldriver.Database
-	apply                *sqldriver.ReplicatedApply
-	schemaSQL            sqldriver.ReplicatedShardStoreIdentity
-	schemaApply          sqldriver.ReplicatedApplyIdentity
+	kind                  requestKind
+	group                 raftmember.GroupKey
+	data                  []byte
+	fence                 ServingFence
+	inbound               rafttransport.Inbound
+	reply                 chan ownerReply
+	bytes                 int64
+	async                 bool
+	delivery              *proposalDelivery
+	transferDelivery      *transferDelivery
+	authorize             ProposalAuthorization
+	authorityToken        raftauthority.AuthorityToken
+	authorityGeneration   *ownerGeneration
+	authorityPermit       *servingFencePermit
+	membership            MembershipRequest
+	read                  readRequest
+	targetMember          uint64
+	operation             [32]byte
+	step                  [32]byte
+	sourceMember          uint64
+	retirementProof       *ReplicaRetirementProof
+	retirementAuthorized  bool
+	ownershipDrainExpired bool
+	install               ExecutionGroup
+	pointReadSlot         *pointReadViewSlot
+	publish               func()
+	registryChange        func(func(func()) error) error
+	database              *sqldriver.Database
+	apply                 *sqldriver.ReplicatedApply
+	schemaSQL             sqldriver.ReplicatedShardStoreIdentity
+	schemaApply           sqldriver.ReplicatedApplyIdentity
 }
 
 type ownerReply struct {
@@ -868,6 +874,7 @@ type ownerMember struct {
 	read              ReadSource
 	recovery          TransactionRecoverySource
 	retiring          bool
+	proposalQuiesced  bool
 	generation        *ownerGeneration
 	permit            *servingFencePermit
 	pointReadSlot     *pointReadViewSlot
@@ -1638,6 +1645,31 @@ func (owner *Owner) handle(request ownerRequest) error {
 			reply.err = err
 			break
 		}
+		if replication.IsDataAuthority(command.AuthorityClass) &&
+			!owner.dataEpochsMatchApplied(request.group, command) {
+			// The applied binding has already moved. Refuse before enqueue so
+			// a catalog that still names the previous ownership cannot become
+			// an admitted unknown. The refusal is cleared once this proposal
+			// carries the applied epochs.
+			if member.proposalQuiesced {
+				member.proposalQuiesced = false
+				owner.storeOwnerMember(request.group, member)
+			}
+			reply.err = ErrServingFence
+			break
+		}
+		if member.proposalQuiesced && replication.IsDataAuthority(command.AuthorityClass) {
+			// Once the applied epochs have moved, a command that matches them
+			// is the post-publish write and must be admitted. Until then, user
+			// data stays out of the registry while topology still runs.
+			if owner.memberEpochsLagApplied(request.group, member.command) {
+				member.proposalQuiesced = false
+				owner.storeOwnerMember(request.group, member)
+			} else {
+				reply.err = raftserve.ErrProposalRefused
+				break
+			}
+		}
 		if !commandMatchesFence(command, request.fence) && !CatalogCommandReplayMatchesFence(command, request.fence) {
 			reply.err = ErrServingFence
 			break
@@ -1811,7 +1843,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 			}
 		}
 	case requestOwnershipTransition:
-		reply.err = owner.applyOwnershipTransition(request.fence, request.data)
+		reply.err = owner.applyOwnershipTransition(request.fence, request.data, request.ownershipDrainExpired)
 	case requestSplitSourceLeadership:
 		err := owner.beginLeaderTransfer(request)
 		if errors.Is(err, errOwnerTransferDeferred) {
@@ -2322,8 +2354,14 @@ func (owner *Owner) syncCommandFenceFromState(
 	nextCommand.SchemaGeneration = binding.SchemaGeneration
 	nextCommand.RoutingVersion = binding.RoutingVersion
 	nextCommand.RouteGeneration = binding.RouteGeneration
+	logicalMoved := nextCommand.OwnershipEpoch != member.command.OwnershipEpoch ||
+		nextCommand.RoutingVersion != member.command.RoutingVersion ||
+		nextCommand.RouteGeneration != member.command.RouteGeneration
 	if nextCommand != member.command {
 		owner.revokeServingFencePermit(group)
+	}
+	if member.proposalQuiesced && logicalMoved {
+		member.proposalQuiesced = false
 	}
 	member.command = nextCommand
 	owner.storeOwnerMember(group, member)
@@ -2362,8 +2400,14 @@ func (owner *Owner) syncCommandFenceFromSnapshot(
 	nextCommand.SchemaGeneration = binding.SchemaGeneration
 	nextCommand.RoutingVersion = binding.RoutingVersion
 	nextCommand.RouteGeneration = binding.RouteGeneration
+	logicalMoved := nextCommand.OwnershipEpoch != member.command.OwnershipEpoch ||
+		nextCommand.RoutingVersion != member.command.RoutingVersion ||
+		nextCommand.RouteGeneration != member.command.RouteGeneration
 	if nextCommand != member.command {
 		owner.revokeServingFencePermit(group)
+	}
+	if member.proposalQuiesced && logicalMoved {
+		member.proposalQuiesced = false
 	}
 	member.command = nextCommand
 	owner.storeOwnerMember(group, member)
@@ -2501,7 +2545,7 @@ func servingFenceMatchesIdentity(
 		fence.NodeIncarnation == identity.NodeIncarnation && fence.Term != 0
 }
 
-func (owner *Owner) applyOwnershipTransition(fence ServingFence, command []byte) error {
+func (owner *Owner) applyOwnershipTransition(fence ServingFence, command []byte, drainExpired bool) error {
 	member, found := owner.members[fence.Group]
 	if !found || !servingFenceMatchesIdentity(fence, member) {
 		return ErrServingFence
@@ -2523,14 +2567,26 @@ func (owner *Owner) applyOwnershipTransition(fence ServingFence, command []byte)
 		return &NotLeaderError{Status: status}
 	}
 	digest := sha256.Sum256(command)
+	member.proposalQuiesced = true
+	owner.storeOwnerMember(fence.Group, member)
 	if pending := member.ownershipProposal; pending != nil &&
 		pending.term == status.Term && pending.command == fence.Command {
 		if pending.digest != digest {
+			member.proposalQuiesced = false
+			owner.storeOwnerMember(fence.Group, member)
 			return ErrServingFence
 		}
 		return nil
 	}
+	// New user data is already refused. Wait briefly so admitted data can finish,
+	// then propose even if a topology command is still registered. Leaving the
+	// refusal latched until that count hits zero wedges catalog publication.
+	if !drainExpired && owner.registry != nil && owner.registry.GroupHasPendingProposals(fence.Group) {
+		return errProposalQuiesce
+	}
 	if err := owner.host.ProposeControl(fence.Group, command); err != nil {
+		member.proposalQuiesced = false
+		owner.storeOwnerMember(fence.Group, member)
 		return err
 	}
 	member.ownershipProposal = &ownershipProposal{command: fence.Command, term: status.Term, digest: digest}
@@ -2700,6 +2756,44 @@ func retirementStateMatches(
 	}
 	voters := state.ConfState.GetVoters()
 	return !containsSorted(voters, sourceMember) && containsSorted(voters, targetMember)
+}
+
+type publishedLogicalEpochs interface {
+	PublishedLogicalEpochs(raftmember.GroupKey) (policy, protection, ownership, schema, routing, generation uint64, ok bool)
+}
+
+func (owner *Owner) dataEpochsMatchApplied(group raftmember.GroupKey, command replication.CommandView) bool {
+	source, ok := owner.host.(publishedLogicalEpochs)
+	if !ok {
+		return true
+	}
+	policy, protection, ownership, schema, routing, generation, published := source.PublishedLogicalEpochs(group)
+	if !published {
+		return true
+	}
+	return command.ActivePolicyGeneration == policy &&
+		command.ProtectionEpoch == protection &&
+		command.OwnershipEpoch == ownership &&
+		command.SchemaGeneration == schema &&
+		command.RoutingVersion == routing &&
+		command.RouteGeneration == generation
+}
+
+func (owner *Owner) memberEpochsLagApplied(group raftmember.GroupKey, command CommandFence) bool {
+	source, ok := owner.host.(publishedLogicalEpochs)
+	if !ok {
+		return false
+	}
+	policy, protection, ownership, schema, routing, generation, published := source.PublishedLogicalEpochs(group)
+	if !published {
+		return false
+	}
+	return command.ActivePolicyGeneration != policy ||
+		command.ProtectionEpoch != protection ||
+		command.OwnershipEpoch != ownership ||
+		command.SchemaGeneration != schema ||
+		command.RoutingVersion != routing ||
+		command.RouteGeneration != generation
 }
 
 func commandMatchesFence(command replication.CommandView, fence ServingFence) bool {
@@ -4144,11 +4238,25 @@ func (owner *Owner) ProposeOwnershipTransition(
 	}
 	owned := make([]byte, len(command))
 	copy(owned, command)
-	reply := make(chan ownerReply, 1)
-	_, err := owner.enqueue(ctx, ownerRequest{
-		kind: requestOwnershipTransition, group: fence.Group, fence: fence,
-		data: owned, reply: reply, bytes: int64(len(owned)),
-	})
+	var err error
+	for attempt := 0; attempt < 64; attempt++ {
+		reply := make(chan ownerReply, 1)
+		_, err = owner.enqueue(ctx, ownerRequest{
+			kind: requestOwnershipTransition, group: fence.Group, fence: fence,
+			data: owned, reply: reply, bytes: int64(len(owned)),
+			ownershipDrainExpired: attempt >= 16,
+		})
+		if !errors.Is(err, errProposalQuiesce) {
+			break
+		}
+		timer := time.NewTimer(2 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return context.Cause(ctx)
+		case <-timer.C:
+		}
+	}
 	if err != nil && context.Cause(ctx) != nil {
 		return errors.Join(ErrOutcomeUnknown, err)
 	}
