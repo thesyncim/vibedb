@@ -1126,6 +1126,9 @@ func (p *plan) bindFileMarks(
 		clear(b.keyKinds)
 		b.ensureSeed()
 		b.scan.cancel = w.cancel
+		// Statement-global ==> slots: the mark's inner scan aliases the
+		// binding bindFileMatches parsed against this same inner snapshot.
+		b.scan.eval.bindMatches(w.matchQueries)
 		if inner != nil {
 			if err := b.collectFile(inner, work); err != nil {
 				return err

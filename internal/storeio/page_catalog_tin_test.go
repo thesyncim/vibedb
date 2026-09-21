@@ -107,7 +107,7 @@ func TestPageCatalogTinDefinitionRejects(t *testing.T) {
 				out := make([]PageCatalogTinIndex, PageCatalogMaxTinIndexes+1)
 				for i := range out {
 					out[i] = PageCatalogTinIndex{
-						Name: string(rune('a' + i%26)) + string(rune('0'+i/26)),
+						Name: string(rune('a'+i%26)) + string(rune('0'+i/26)),
 						Path: "/body",
 					}
 				}

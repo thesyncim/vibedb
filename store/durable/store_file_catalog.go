@@ -163,6 +163,7 @@ func (p filePageCatalogPlan) ref(ordinal uint16) storeio.PageRef {
 func fileStoreCollectionOptionFlags(
 	options store.Options,
 	hasSkipIndexes bool,
+	hasTinIndexes bool,
 	hasOpaqueValues bool,
 ) uint32 {
 	var flags uint32
@@ -172,10 +173,23 @@ func fileStoreCollectionOptionFlags(
 	if hasSkipIndexes {
 		flags |= storeio.StateOptionSkipIndexes
 	}
+	if hasTinIndexes {
+		flags |= storeio.StateOptionTinIndexes
+	}
 	if hasOpaqueValues {
 		flags |= storeio.StateOptionOpaqueValues
 	}
 	return flags
+}
+
+// hasTinIndexDefinitions reports whether any definition declares full text.
+func hasTinIndexDefinitions(definitions []store.IndexDefinition) bool {
+	for _, definition := range definitions {
+		if definition.Kind == store.IndexTin {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeOpenedFileStoreOptions reconstructs every frozen collection option
@@ -194,6 +208,7 @@ func normalizeOpenedFileStoreOptions(
 	}
 	definition := catalog.Definition()
 	hasIndexes := len(definition.Indexes) != 0 || len(definition.TinIndexes) != 0
+	hasTinIndexes := len(definition.TinIndexes) != 0
 	hasSkipIndexes := len(definition.SkipPaths) != 0
 	hasSchema := definition.Schema != nil
 	hasOpaqueValues := root.Options&storeio.StateOptionOpaqueValues != 0
@@ -205,6 +220,7 @@ func normalizeOpenedFileStoreOptions(
 	if root.IndexCount != uint32(catalog.PhysicalIndexCount()) ||
 		(root.Options&storeio.StateOptionSchema != 0) != hasSchema ||
 		(root.Options&storeio.StateOptionSkipIndexes != 0) != hasSkipIndexes ||
+		(root.Options&storeio.StateOptionTinIndexes != 0) != hasTinIndexes ||
 		opaqueCatalogConflict ||
 		(root.PageCatalogBytes != 0) !=
 			(hasIndexes || hasSkipIndexes || hasSchema) {
@@ -250,10 +266,10 @@ func normalizeOpenedFileStoreOptions(
 	}
 	persistedFlags := root.Options &
 		(storeio.StateOptionSchema | storeio.StateOptionSkipIndexes |
-			storeio.StateOptionOpaqueValues)
+			storeio.StateOptionTinIndexes | storeio.StateOptionOpaqueValues)
 	assertedFlags := fileStoreCollectionOptionFlags(
 		supplied.Collection, len(supplied.SkipIndexes) != 0,
-		supplied.OpaqueValues,
+		hasTinIndexDefinitions(supplied.Indexes), supplied.OpaqueValues,
 	)
 	if assertedFlags&^persistedFlags != 0 {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
@@ -340,7 +356,7 @@ func normalizeOpenedFileStoreOptions(
 		persistedFlags !=
 			fileStoreCollectionOptionFlags(
 				normalized.Collection, len(normalized.SkipIndexes) != 0,
-				normalized.OpaqueValues,
+				len(normalized.tinIndexes) != 0, normalized.OpaqueValues,
 			) {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
 			"%w: state summaries disagree with canonical catalog",

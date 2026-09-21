@@ -112,9 +112,16 @@ type Collection struct {
 	// are catalog-local and cannot provide that order when the same handles are
 	// exposed through different catalogs.
 	snapshotOrder atomic.Uint64
-	closed        bool
-	closeDone     bool
-	closePhase    collectionClosePhase
+	// tinMu serializes generation-pinned full-text builds; tinBuilds caches
+	// them bounded by generation. A build materializes its keys and postings,
+	// so an executing snapshot's Close never invalidates a live reader, and
+	// eviction never touches a generation a caller could still resolve
+	// through its own build reference.
+	tinMu      sync.Mutex
+	tinBuilds  map[uint64]*tinSnapshotBuild
+	closed     bool
+	closeDone  bool
+	closePhase collectionClosePhase
 	// closeErr is the terminal result of a completed Close, or a sticky
 	// persistence error already discovered while retryable cleanup (active
 	// readers or writer unlock) still prevents completion. writer protects it.

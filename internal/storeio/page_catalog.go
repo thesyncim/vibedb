@@ -29,7 +29,7 @@ const (
 	// PageCatalogMaxUniqueStrings is the exact sum of every independently
 	// addressable maximum: 4096 exact aliases, 64*4 physical paths, 8 skip
 	// paths, 4096 schema fields, and 64 tin names plus 64 tin paths.
-	PageCatalogMaxUniqueStrings = 8584
+	PageCatalogMaxUniqueStrings  = 8584
 	PageCatalogMaxStringBytes    = 1<<16 - 1
 	PageCatalogMaxCanonicalBytes = 32 << 20
 	PageCatalogDigestSize        = 16

@@ -362,6 +362,11 @@ func (p *plan) bindFileJoins(
 		}
 		j := &p.joins[i]
 		b := &w.joins[j.slot]
+		// The inner plan's ==> slots are statement-global: the inner scan
+		// aliases the binding bindFileMatches parsed against this same
+		// inner snapshot. Bind before collecting, or membership rows
+		// evaluate unbound slots as non-matches.
+		b.scan.eval.bindMatches(w.matchQueries)
 		if err := j.bindFile(
 			b, catalog, limit, int(outer.Len()), ratio, workBudget, w.cancel, stats,
 		); err != nil {
@@ -486,6 +491,12 @@ func (p *plan) runFileJoinedBatched(
 		}
 		e.Stats = stats
 		return prepareResult(&e.Result, p, 0)
+	}
+	// ==> binds before the joined side is collected: inner membership scans
+	// evaluate their plans during collection, so their queries must already
+	// be parsed against their own snapshots' generations.
+	if err := p.bindFileMatches(&e.Workspace, snapshot, catalog); err != nil {
+		return err
 	}
 	// The durable driving scan has its own bounded batch/merge frontier. The
 	// joined side is bound before that scan exists, so arm the configured

@@ -942,9 +942,9 @@ type normalizedFileStoreOptions struct {
 	// enforcement, or exact-probe paths consults this list. Snapshots
 	// advertise it so readers observe the published catalog exactly, and
 	// the online index path preserves it across re-normalization.
-	tinIndexes                             []store.IndexDefinition
-	skipIndexes                            []vibejson.CompiledPointer
-	indexNameIDs                           map[string]uint32
+	tinIndexes   []store.IndexDefinition
+	skipIndexes  []vibejson.CompiledPointer
+	indexNameIDs map[string]uint32
 	// uniqueIndexIDs is the normalized OR of alias-local Unique policy onto
 	// physical path-vector identities. Keeping it beside the compiled catalog
 	// makes the overwhelmingly common non-unique Put path a constant-time nil

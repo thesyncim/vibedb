@@ -75,12 +75,19 @@ const (
 	// structural-index semantics; the bit is durable so Open cannot silently
 	// reinterpret arbitrary bytes as JSON.
 	StateOptionOpaqueValues
+	// StateOptionTinIndexes means the durable catalog also binds declared
+	// full-text definitions. Tin carries no postings yet; the bit keeps a
+	// tin-only catalog present so roots, digests, and hashes stay
+	// consistent between a writer that declares tin and a reader reopening
+	// it.
+	StateOptionTinIndexes
 )
 
 const stateRootKnownOptions = StateOptionSchema |
 	StateOptionSkipIndexes |
 	StateOptionCanonicalMaterialization |
-	StateOptionOpaqueValues
+	StateOptionOpaqueValues |
+	StateOptionTinIndexes
 
 // ErrStateRootCorrupt reports a common page that passed basic framing but does
 // not encode a valid Store state root.
@@ -362,7 +369,7 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 		)
 	}
 	hasCatalog := root.IndexCount != 0 ||
-		root.Options&(StateOptionSchema|StateOptionSkipIndexes) != 0
+		root.Options&(StateOptionSchema|StateOptionSkipIndexes|StateOptionTinIndexes) != 0
 	hasExactCatalog := root.PageCatalogBytes != 0
 	if root.Options&StateOptionOpaqueValues != 0 &&
 		(hasCatalog || root.ExactIndexRoot != (PageRef{}) ||
