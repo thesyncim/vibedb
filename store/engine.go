@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/storekey"
+	"github.com/thesyncim/vibedb/internal/tin"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
 )
@@ -145,6 +146,10 @@ type Collection struct {
 	indexes      map[string]*storeIndexBuild
 	indexVisit   uint32
 	exactAliases uint32
+	// tinDefs records full-text index definitions by name; tinCache pins
+	// built tin indexes per snapshot State (see store_index_tin.go).
+	tinDefs  map[string]tinDefinition
+	tinCache map[*State]map[string]*tin.Index
 }
 
 // WithBulkSnapshot runs fn with c's current State (materializing an

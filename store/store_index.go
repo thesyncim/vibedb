@@ -6,6 +6,8 @@ import (
 	"math/bits"
 	"slices"
 	"strings"
+
+	"github.com/thesyncim/vibedb/internal/tin"
 )
 
 // IndexKind names an online secondary-index family.
@@ -122,6 +124,17 @@ func (c *Collection) nextExactIndexVisitLocked() uint32 {
 // later write dual-maintains the definition before publication. Until Ready,
 // probes use an exact scan fallback.
 func (c *Collection) CreateIndex(def IndexDefinition) (IndexInfo, error) {
+	if def.Kind == IndexTin {
+		if def.Unique {
+			return IndexInfo{}, fmt.Errorf(
+				"%w: in-memory collections do not enforce unique indexes",
+				ErrIndexDefinition,
+			)
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.createTinIndexLocked(def)
+	}
 	if def.Unique {
 		return IndexInfo{}, fmt.Errorf(
 			"%w: in-memory collections do not enforce unique indexes",
@@ -142,6 +155,9 @@ func (c *Collection) CreateIndex(def IndexDefinition) (IndexInfo, error) {
 		c.indexes = make(map[string]*storeIndexBuild)
 	}
 	if _, exists := c.indexes[def.Name]; exists {
+		return IndexInfo{}, ErrIndexExists
+	}
+	if _, exists := c.tinDefs[def.Name]; exists {
 		return IndexInfo{}, ErrIndexExists
 	}
 	name := strings.Clone(def.Name)
@@ -183,6 +199,26 @@ func (c *Collection) CreateIndex(def IndexDefinition) (IndexInfo, error) {
 func (c *Collection) BackfillIndex(name string, maxChunks int) (IndexInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if tdef, ok := c.tinDefs[name]; ok {
+		// Warm the sidecar for the current state; queries build lazily
+		// anyway, so backfill is an eager cache fill, never a requirement.
+		if state := c.state.Load(); state != nil {
+			ix, err := buildTinIndex(state, tdef)
+			if err != nil {
+				return IndexInfo{}, err
+			}
+			if c.tinCache == nil {
+				c.tinCache = make(map[*State]map[string]*tin.Index)
+			}
+			entry := c.tinCache[state]
+			if entry == nil {
+				entry = make(map[string]*tin.Index)
+				c.tinCache[state] = entry
+			}
+			entry[name] = ix
+		}
+		return tinIndexInfo(tdef), nil
+	}
 	b := c.indexes[name]
 	if b == nil {
 		return IndexInfo{}, ErrIndexNotFound
@@ -259,6 +295,19 @@ func (c *Collection) BackfillIndex(name string, maxChunks int) (IndexInfo, error
 func (c *Collection) DropIndex(name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if _, ok := c.tinDefs[name]; ok {
+		c.dropTinIndexLocked(name)
+		state := c.state.Load()
+		if state == nil {
+			return nil
+		}
+		next := *state
+		next.Generation++
+		next.Indexes = c.indexInfosLocked()
+		next.secondary = c.indexSnapshotsLocked()
+		c.state.Store(&next)
+		return nil
+	}
 	if c.indexes == nil || c.indexes[name] == nil {
 		return ErrIndexNotFound
 	}
@@ -413,12 +462,15 @@ func (c *Collection) indexSnapshotsLocked() []storeIndexSnapshot {
 }
 
 func (c *Collection) indexInfosLocked() []IndexInfo {
-	if len(c.indexes) == 0 {
+	if len(c.indexes) == 0 && len(c.tinDefs) == 0 {
 		return nil
 	}
-	out := make([]IndexInfo, 0, len(c.indexes))
+	out := make([]IndexInfo, 0, len(c.indexes)+len(c.tinDefs))
 	for name, b := range c.indexes {
 		out = append(out, storeLogicalIndexInfo(name, b))
+	}
+	for _, tdef := range c.tinDefs {
+		out = append(out, tinIndexInfo(tdef))
 	}
 	slices.SortFunc(out, func(a, b IndexInfo) int {
 		if a.Name < b.Name {
