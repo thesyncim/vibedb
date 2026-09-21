@@ -97,7 +97,12 @@ the new catalog generation. It cannot add or change a primary key.
 An index contains one to four exact scalar paths. Missing/null tuples are not
 indexed; container values are invalid. A unique index rejects duplicate
 non-null tuples. Index sort direction, expressions, predicates, collations,
-INCLUDE, and USING methods are unsupported.
+and INCLUDE are unsupported, as are USING methods other than `tin`.
+
+`USING tin` builds a full-text index over exactly one text path, for use
+with the `==>` predicate. Only in-memory collections catalog tin indexes;
+durable collections refuse the definition instead of mistaking it for an
+exact index.
 
 DROP TABLE/INDEX and TRUNCATE reject multiple objects, CASCADE/RESTRICT, and
 identity options. A table with dependent views cannot be dropped until its
@@ -290,9 +295,25 @@ WHERE active = TRUE AND tier IN ('pro', 'team') AND score BETWEEN 10 AND 20
 ```
 
 Implemented predicates are comparisons, IS `[NOT]` NULL, IS `[NOT]` MISSING,
-IN/NOT IN lists or subqueries, BETWEEN, `@>`, LIKE/ILIKE, EXISTS, IS [NOT]
+IN/NOT IN lists or subqueries, BETWEEN, `@>`, LIKE/ILIKE, full-text `==>`,
+EXISTS, IS [NOT]
 TRUE/FALSE, AND/OR/NOT,
 and bounded scalar subqueries.
+
+```sql
+CREATE INDEX docs_body_tin ON docs(body) USING tin;
+SELECT id FROM docs WHERE body ==> 'luxury AND goods' ORDER BY id;
+```
+
+`path ==> 'tinql'` tests the string at path against a TINQL full-text
+query: terms, wildcards, fuzzy match, phrases, boolean operators, and
+proximity. The path needs a tin index (exactly one text path, created with
+`USING tin`); without one the statement reports which path is missing it.
+Non-string, null, and absent values never match, and under `NOT` only string
+rows can fail the match, exactly like `LIKE`. The query parses against the
+executing snapshot's index, so a prepared statement sees each snapshot's own
+terms. Full-text match currently executes over in-memory collection
+snapshots; other sources reject it.
 
 `IS NULL` is true for explicit JSON null and an absent path. `IS MISSING` is
 true only for absence. Projection and wire encoding render both as SQL NULL.

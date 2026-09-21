@@ -31,6 +31,12 @@ var (
 	// grow to MaxPageSize); variable base page sizes are no longer supported, so
 	// Create refuses a non-4096 PageSize and Open refuses a store that recorded one.
 	ErrUnsupportedPageSize = errors.New("vibedb: collection page size must be 4096")
+	// ErrTinIndexUnsupported reports a USING tin definition on a durable
+	// collection. The durable page catalog has no tin family yet, so
+	// accepting one would compile and build it as an exact index over the
+	// path — silent corruption. Tin definitions are cataloged by in-memory
+	// collections only, until the durable mirror lands.
+	ErrTinIndexUnsupported = errors.New("vibedb: durable collections do not support USING tin indexes yet")
 	// ErrPrimaryLeafSplitRequired reports that an insert landed on a leaf with
 	// no room for it. It is an internal retry signal: the mutation path catches
 	// it, commits an atomic leaf split as its own structural transaction, and

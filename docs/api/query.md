@@ -73,7 +73,7 @@ for the whole document. The builder exposes:
 | --- | --- |
 | Projection | `Path` |
 | Aggregate | `Count`, `Sum`, `Avg`, `Min`, `Max` |
-| Predicate | `Cmp`, `In`, `Like`, `ILike`, `Contains`, `Exists`, `IsNull` |
+| Predicate | `Cmp`, `In`, `Like`, `ILike`, `Contains`, `Exists`, `IsNull`, `Match` |
 | Boolean composition | `And`, `Or`, `Not` |
 | Clauses | `Where`, `GroupBy`, `OrderBy`, `Limit`, `Join` |
 
@@ -190,6 +190,10 @@ are two-valued, while SQL statements use three-valued logic.
   missing, while `IS MISSING` matches only absence.
 - Comparisons operate within JSON types. A null/missing value never satisfies
   a comparison.
+- `Match(path, tinql)` tests the string at path against a TINQL full-text
+  query. Non-string, null, and absent values do not match. Execution
+  requires a tin index over the path and parses the query against that
+  snapshot's index, so expansions stay pinned to the scanned state.
 - Numbers compare by exact decimal value, including integers beyond the exact
   `float64` range.
 - ORDER BY and GROUP BY use the defined total order null, bool, number, string,

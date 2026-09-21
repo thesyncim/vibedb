@@ -236,3 +236,47 @@ func (c *Collection) TinIndexForPath(s Snapshot, path string) (*tin.Index, error
 	}
 	return c.TinIndex(s, name)
 }
+
+// TinHit is one ranked full-text hit: the document key and its BM25 score.
+// Hits arrive in index order: descending score, ties by document identity.
+type TinHit struct {
+	Key   string
+	Score float64
+}
+
+// TinSearch is the Go API for full-text search over one path: it resolves
+// the tin index covering path in s, parses tinql against that snapshot's
+// index, and returns up to topK hits by BM25 score. DocIDs pack the stable
+// slot addresses TinDocID documents, so keys resolve through the same state
+// the index was built from and a hit can never name a document another
+// snapshot's write moved. A missing index reports ErrIndexNotFound and an
+// invalid query reports its TINQL parse error; topK <= 0 returns no hits.
+func (c *Collection) TinSearch(s Snapshot, path, tinql string, topK int) ([]TinHit, error) {
+	if topK <= 0 {
+		return nil, nil
+	}
+	ix, err := s.TinIndexForPath(path)
+	if err != nil {
+		return nil, err
+	}
+	q, err := ix.ParseTINQL(tinql)
+	if err != nil {
+		return nil, err
+	}
+	state := s.state
+	if state == nil {
+		return nil, ErrIndexNotFound
+	}
+	scored := ix.Score(q, topK, nil)
+	hits := make([]TinHit, 0, len(scored))
+	for _, hit := range scored {
+		chunk := state.Chunks.Get(uint32(hit.Doc >> 32))
+		slot := int(hit.Doc & 0xffffffff)
+		if chunk == nil || slot < 0 || slot >= MaxChunkDocuments ||
+			chunk.Live&(uint64(1)<<uint(slot)) == 0 {
+			continue
+		}
+		hits = append(hits, TinHit{Key: chunk.Key(slot), Score: hit.Score})
+	}
+	return hits, nil
+}

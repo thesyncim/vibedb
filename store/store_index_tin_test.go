@@ -144,3 +144,65 @@ func TestTinIndexExpansions(t *testing.T) {
 		}
 	}
 }
+
+func TestTinSearchGoAPI(t *testing.T) {
+	c := &Collection{}
+	putDoc(t, c, "a", `{"title":"fuji apple pie"}`)
+	putDoc(t, c, "b", `{"title":"apple fuji tart"}`)
+	putDoc(t, c, "c", `{"title":"lazy dog"}`)
+	if _, err := c.CreateIndex(IndexDefinition{
+		Name: "title_tin", Paths: []string{"/title"}, Kind: IndexTin,
+	}); err != nil {
+		t.Fatalf("CreateIndex: %v", err)
+	}
+	snap, err := c.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits, err := c.TinSearch(snap, "/title", "apple", 10)
+	if err != nil {
+		t.Fatalf("TinSearch: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("hits = %+v, want 2", hits)
+	}
+	keys := map[string]float64{hits[0].Key: hits[0].Score, hits[1].Key: hits[1].Score}
+	if _, ok := keys["a"]; !ok {
+		t.Fatalf("hits = %+v, want key a", hits)
+	}
+	if _, ok := keys["b"]; !ok {
+		t.Fatalf("hits = %+v, want key b", hits)
+	}
+	for _, h := range hits {
+		if h.Score <= 0 {
+			t.Fatalf("hit %+v has non-positive score", h)
+		}
+	}
+	if hits[0].Score < hits[1].Score {
+		t.Fatalf("hits not score-ordered: %+v", hits)
+	}
+	if one, err := c.TinSearch(snap, "/title", "apple", 1); err != nil || len(one) != 1 {
+		t.Fatalf("topK=1 = (%+v, %v), want 1 hit", one, err)
+	}
+	if none, err := c.TinSearch(snap, "/title", "apple", 0); err != nil || none != nil {
+		t.Fatalf("topK=0 = (%+v, %v), want nil", none, err)
+	}
+	if _, err := c.TinSearch(snap, "/missing", "apple", 10); err != ErrIndexNotFound {
+		t.Fatalf("unindexed path = %v, want %v", err, ErrIndexNotFound)
+	}
+	if _, err := c.TinSearch(snap, "/title", `"unclosed`, 10); err == nil {
+		t.Fatal("invalid TINQL = nil, want parse error")
+	}
+	// Snapshot-pinned builds: the old snapshot never sees the new doc.
+	putDoc(t, c, "d", `{"title":"apple turnover"}`)
+	fresh, err := c.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale, err := c.TinSearch(snap, "/title", "apple", 10); err != nil || len(stale) != 2 {
+		t.Fatalf("stale snapshot = (%+v, %v), want 2 hits", stale, err)
+	}
+	if grew, err := c.TinSearch(fresh, "/title", "apple", 10); err != nil || len(grew) != 3 {
+		t.Fatalf("fresh snapshot = (%+v, %v), want 3 hits", grew, err)
+	}
+}

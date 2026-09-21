@@ -164,6 +164,11 @@ func (c *Collection) createIndexContext(
 	if err := ctx.Err(); err != nil {
 		return store.IndexInfo{}, err
 	}
+	// Refuse before claiming the build slot or touching arenas: the exact
+	// pipeline below would otherwise compile the tin definition as exact.
+	if definition.Kind == store.IndexTin {
+		return store.IndexInfo{}, ErrTinIndexUnsupported
+	}
 	if !c.onlineIndexBuild.CompareAndSwap(false, true) {
 		return store.IndexInfo{}, ErrIndexBuildInProgress
 	}
