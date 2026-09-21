@@ -2,7 +2,9 @@
 
 package tin
 
-// NEON byte ops are baseline arm64, so the wide fold needs no runtime gate.
+// NEON byte and float ops are baseline arm64, so the wide kernels need no
+// runtime gate.
 func init() {
 	foldASCIIImpl = foldASCIIWide
+	bm25Impl = bm25Wide
 }

@@ -11,4 +11,5 @@ func init() {
 		return
 	}
 	foldASCIIImpl = foldASCIIWide
+	bm25Impl = bm25Wide
 }

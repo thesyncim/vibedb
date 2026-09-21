@@ -2,6 +2,7 @@ package tin
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"strings"
 	"testing"
@@ -171,11 +172,11 @@ func TestBooleanAndPhrase(t *testing.T) {
 	if got := matchIDs(t, ix, andnot); fmt.Sprint(got) != "[]" && len(got) != 0 {
 		t.Fatalf("brown AND NOT quick = %v, want empty", got)
 	}
-	phrase := Query{Op: OpPhrase, Terms: []uint64{quick, brown, fox}}
+	phrase := Query{Op: OpPhrase, Phrase: []PhrasePos{{Alts: []uint64{quick}}, {Alts: []uint64{brown}}, {Alts: []uint64{fox}}}}
 	if got := matchIDs(t, ix, phrase); fmt.Sprint(got) != "[1 2]" {
 		t.Fatalf("phrase quick brown fox = %v", got)
 	}
-	slop := Query{Op: OpPhrase, Terms: []uint64{brown, quick}, Slop: 1}
+	slop := Query{Op: OpPhrase, Phrase: []PhrasePos{{Alts: []uint64{brown}}, {Alts: []uint64{quick}}}, Slop: 1}
 	if got := matchIDs(t, ix, slop); fmt.Sprint(got) != "[3]" {
 		t.Fatalf("phrase brown quick~1 = %v", got)
 	}
@@ -204,14 +205,16 @@ func TestBM25OrdersByFrequency(t *testing.T) {
 	if got := ix.Score(Query{Op: OpTerm, Term: apple}, 1, nil); len(got) != 1 || got[0].Doc != 2 {
 		t.Fatalf("topK=1 = %v", got)
 	}
-	// Boost scales.
+	// Boost scales (relative agreement: the kernel's rounding need not
+	// preserve an exact factor of 3 in the last ulp).
 	plain := ix.Score(Query{Op: OpTerm, Term: apple}, 0, nil)
 	boosted := ix.Score(Query{Op: OpTerm, Term: apple, Boost: 3}, 0, nil)
 	if len(plain) != len(boosted) {
 		t.Fatalf("boost changed matches: %v vs %v", plain, boosted)
 	}
 	for i := range plain {
-		if boosted[i].Score != 3*plain[i].Score {
+		rel := math.Abs(boosted[i].Score-3*plain[i].Score) / math.Abs(3*plain[i].Score)
+		if rel > 1e-12 {
 			t.Fatalf("boost not applied: %v vs %v", plain[i], boosted[i])
 		}
 	}

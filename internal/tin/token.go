@@ -20,8 +20,16 @@ func mix(h uint64, b byte) uint64 {
 // folding on the fly. It allocates nothing: substrings share text's backing
 // and runes decode into stack values.
 func scanString(text string, emit func(hash uint64, pos uint32)) {
+	scanStringRec(text, nil, func(h uint64, p uint32, _ []byte) { emit(h, p) })
+}
+
+// scanStringRec is scanString with optional spelling capture: when spell is
+// non-nil, each emit also carries the token's folded bytes, valid only for
+// the call's duration (they alias *spell, which the caller reuses).
+func scanStringRec(text string, spell *[]byte, emit func(hash uint64, pos uint32, spelling []byte)) {
 	var s scanner
 	s.emit = emit
+	s.spell = spell
 	for i := 0; i < len(text); {
 		c := text[i]
 		if c < utf8.RuneSelf {
@@ -43,8 +51,14 @@ func scanString(text string, emit func(hash uint64, pos uint32)) {
 // (see foldASCII). Multibyte sequences pass the fold through, so the rune
 // path decodes them identically to scanString.
 func scanFolded(buf []byte, emit func(hash uint64, pos uint32)) {
+	scanFoldedRec(buf, nil, func(h uint64, p uint32, _ []byte) { emit(h, p) })
+}
+
+// scanFoldedRec is scanFolded with optional spelling capture.
+func scanFoldedRec(buf []byte, spell *[]byte, emit func(hash uint64, pos uint32, spelling []byte)) {
 	var s scanner
 	s.emit = emit
+	s.spell = spell
 	for i := 0; i < len(buf); {
 		c := buf[i]
 		if c < utf8.RuneSelf {
@@ -77,17 +91,25 @@ func FoldTerm(term string) (hash uint64, n int) {
 
 // scanner holds one scan's running state.
 type scanner struct {
-	emit   func(hash uint64, pos uint32)
+	emit   func(hash uint64, pos uint32, spelling []byte)
+	spell  *[]byte
+	mark   int
 	h      uint64
 	pos    uint32
 	inWord bool
 }
 
-// take feeds one folded ASCII byte into the open token, starting one first.
+// take feeds one folded byte into the open token, starting one first.
 func (s *scanner) take(b byte) {
 	if !s.inWord {
 		s.h = fnvOffset
 		s.inWord = true
+		if s.spell != nil {
+			s.mark = len(*s.spell)
+		}
+	}
+	if s.spell != nil {
+		*s.spell = append(*s.spell, b)
 	}
 	s.h = mix(s.h, b)
 }
@@ -97,7 +119,11 @@ func (s *scanner) flush() {
 	if !s.inWord {
 		return
 	}
-	s.emit(s.h, s.pos)
+	var spelling []byte
+	if s.spell != nil {
+		spelling = (*s.spell)[s.mark:]
+	}
+	s.emit(s.h, s.pos, spelling)
 	s.pos++
 	s.inWord = false
 	s.h = fnvOffset

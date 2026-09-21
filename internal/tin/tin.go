@@ -42,16 +42,39 @@ const (
 type Index struct {
 	mu sync.Mutex
 
-	docs    map[DocID]*docMeta
-	post    map[uint64]*postings
-	nDocs   int
-	tokens  uint64
-	sorted  bool
-	foldBuf []byte
+	docs     map[DocID]docMeta
+	post     map[uint64]*postings
+	nDocs    int
+	tokens   uint64
+	sorted   bool
+	foldBuf  []byte
+	spellBuf []byte
+
+	// dict maps term hashes to their first-seen folded spelling. spellIdx
+	// orders the same vocabulary by spelling for wildcard, fuzzy, range,
+	// and regex expansion. Spellings are never pruned on Remove: a removed
+	// term keeps its spelling but its posting list is gone, so expansions
+	// over it simply match nothing.
+	dict     map[uint64]string
+	spellIdx []spellEntry
+	// maxSpell bounds fuzzy DP scratch; it only grows with the vocabulary.
+	maxSpell int
 
 	// scratchS stages one Score call's hits; scoring only appends, so
 	// sharing it across the query tree is safe.
 	scratchS []Scored
+	// scoreTF/scoreDL/scoreOut stage term frequencies, document lengths, and
+	// kernel outputs for BM25; gathered scalar, computed wide, drained
+	// immediately, so sequential scoring calls safely share them.
+	scoreTF  []float64
+	scoreDL  []float64
+	scoreOut []float64
+}
+
+// spellEntry is one vocabulary row ordered by spelling.
+type spellEntry struct {
+	spell string
+	hash  uint64
 }
 
 // docMeta tracks per-document statistics for BM25 and the term list needed
@@ -74,8 +97,9 @@ type postings struct {
 // NewIndex returns an empty Index.
 func NewIndex() *Index {
 	return &Index{
-		docs: make(map[DocID]*docMeta),
+		docs: make(map[DocID]docMeta),
 		post: make(map[uint64]*postings),
+		dict: make(map[uint64]string),
 	}
 }
 
@@ -104,9 +128,12 @@ func (ix *Index) Add(id DocID, text string) {
 
 	var length uint32
 	var terms []uint64
-	emit := func(hash uint64, pos uint32) {
+	ix.spellBuf = ix.spellBuf[:0]
+	spell := &ix.spellBuf
+	emit := func(hash uint64, pos uint32, spelling []byte) {
 		length++
 		terms = ix.appendLocked(id, hash, pos, terms)
+		ix.learnLocked(hash, spelling)
 	}
 	if len(text) >= simdFoldThreshold && len(text) <= maxFoldDoc {
 		if cap(ix.foldBuf) < len(text) {
@@ -114,11 +141,11 @@ func (ix *Index) Add(id DocID, text string) {
 		}
 		buf := ix.foldBuf[:len(text)]
 		foldASCII(buf, text)
-		scanFolded(buf, emit)
+		scanFoldedRec(buf, spell, emit)
 	} else {
-		scanString(text, emit)
+		scanStringRec(text, spell, emit)
 	}
-	ix.docs[id] = &docMeta{length: length, terms: terms}
+	ix.docs[id] = docMeta{length: length, terms: terms}
 	ix.nDocs++
 	ix.tokens += uint64(length)
 	ix.sorted = false
@@ -159,7 +186,7 @@ func (ix *Index) Remove(id DocID) bool {
 	return true
 }
 
-func (ix *Index) removeLocked(id DocID, old *docMeta) {
+func (ix *Index) removeLocked(id DocID, old docMeta) {
 	for _, hash := range old.terms {
 		p := ix.post[hash]
 		if p == nil {

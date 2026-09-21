@@ -6,40 +6,112 @@ import (
 	"slices"
 )
 
-// Query evaluation: terms, phrases with slop, boolean operators, match-all,
-// and BM25 top-K. Queries are plain values over term hashes — the TINQL
-// parser (a later slice) compiles surface syntax down to this AST, and the
-// SQL ==> operator will lower to it too.
+// Query evaluation over span sets. Every TINQL expression denotes a set of
+// spans (position ranges); boolean and span-relation operators combine them,
+// and Match projects the final set to documents while Score weights it with
+// BM25. Queries are plain values over term hashes — ParseTINQL compiles
+// surface syntax down to this AST, and the SQL ==> operator will lower to it
+// too.
+//
+// Layout note for distribution and persistence: evaluation only reads sorted
+// posting lists, the term dictionary, and document lengths — all plain
+// slices and maps with deterministic order — so an index shard encodes,
+// ships, and merges without pointer fixups (a later slice adds Encode/Merge).
 
 // Op tags a Query node.
 type Op uint8
 
 const (
-	// OpTerm matches documents containing Term.
+	// OpTerm matches documents containing Term; each occurrence is a span.
 	OpTerm Op = iota
-	// OpPhrase matches documents where Terms occur in order with at most
-	// Slop extra words between consecutive terms (Slop 0 is adjacency).
+	// OpPhrase matches the ordered Phrase slots; see PhrasePos. Slop allows
+	// up to Slop extra words between consecutive slots.
 	OpPhrase
-	// OpAnd matches documents matching every kid.
+	// OpAnd keeps documents matching every kid; spans union per document.
 	OpAnd
-	// OpOr matches documents matching any kid.
+	// OpOr keeps documents matching any kid; spans concatenate.
 	OpOr
-	// OpAndNot matches documents matching Kids[0] and no later kid.
+	// OpAndNot keeps documents matching Kids[0] and no later kid.
 	OpAndNot
-	// OpAll matches every document (TIN's standalone `*`).
+	// OpAll matches every document with its whole extent as one span (TIN's
+	// standalone `*`).
 	OpAll
+	// OpThen is ordered proximity: pairs of Kids[0]/Kids[1] spans with
+	// 0..Dist extra words between, emitted as covering spans.
+	OpThen
+	// OpNear is OpThen in either order.
+	OpNear
+	// OpWithin keeps Kids[0] spans of width at most Dist words.
+	OpWithin
+	// OpEncloses keeps Kids[0] spans containing a Kids[1] span (or
+	// containing none, when Neg holds).
+	OpEncloses
+	// OpEnclosedBy keeps Kids[0] spans inside a Kids[1] span (or inside
+	// none, when Neg holds).
+	OpEnclosedBy
+	// OpOverlapping keeps Kids[0] spans sharing a position with a Kids[1]
+	// span (or sharing none, when Neg holds).
+	OpOverlapping
+	// OpBefore keeps Kids[0] spans starting before a Kids[1] span's start.
+	OpBefore
+	// OpAfter keeps Kids[0] spans starting after a Kids[1] span's start.
+	OpAfter
+	// OpFilter keeps Kids[0] spans fully inside Filter's window.
+	OpFilter
+	// OpAtLeast keeps documents matching at least Threshold kids, with the
+	// contributing spans concatenated.
+	OpAtLeast
 )
 
-// Query is one evaluator node. Only the fields its Op reads are meaningful:
-// Term for OpTerm; Terms and Slop for OpPhrase; Kids for the boolean ops;
-// Boost scales the node's BM25 contribution (1 when unset... see Score).
+// PhrasePos is one phrase slot: one of Alts must occur there, or (when Any)
+// any single word. An empty Alts without Any never matches.
+type PhrasePos struct {
+	Alts []uint64
+	Any  bool
+}
+
+// FilterKind tags a positional window; positions are 0-based.
+type FilterKind uint8
+
+const (
+	// FilterFirstWords keeps spans in the first N tokens.
+	FilterFirstWords FilterKind = iota
+	// FilterFirstPct keeps spans in the first N percent of the document.
+	FilterFirstPct
+	// FilterLastWords keeps spans in the last N tokens.
+	FilterLastWords
+	// FilterLastPct keeps spans in the last N percent of the document.
+	FilterLastPct
+	// FilterMiddlePct keeps spans in the middle N percent of the document.
+	FilterMiddlePct
+	// FilterWords keeps spans in the inclusive range [Lo, Hi].
+	FilterWords
+)
+
+// FilterSpec is one IN-filter window.
+type FilterSpec struct {
+	Kind FilterKind
+	N    int
+	Lo   int
+	Hi   int
+}
+
+// Query is one evaluator node. Only the fields its Op reads are meaningful.
 type Query struct {
-	Op    Op
-	Term  uint64
-	Terms []uint64
-	Slop  int
-	Kids  []Query
-	Boost float32
+	Op     Op
+	Term   uint64
+	Phrase []PhrasePos
+	Slop   int
+	Kids   []Query
+	Boost  float32
+	// Dist bounds OpThen/OpNear gaps and OpWithin widths, in words.
+	Dist int
+	// Neg selects the NOT form of the span relations.
+	Neg bool
+	// Filter windows OpFilter.
+	Filter FilterSpec
+	// Threshold counts OpAtLeast kids (percentages resolved at parse).
+	Threshold int
 }
 
 // boostOf normalizes the unset/zero boost to 1.
@@ -50,34 +122,35 @@ func (q Query) boostOf() float64 {
 	return float64(q.Boost)
 }
 
+// spanHit is one [start, end) span in doc; end is exclusive so a single
+// occurrence at p is {p, p+1} and a whole document of L words is {0, L}.
+type spanHit struct {
+	doc        DocID
+	start, end uint32
+}
+
 // Match appends every document matching q, ascending, and returns out.
-// Single-level queries (terms, phrases, match-all) append straight into out
-// without scratch; each boolean level reuses its accumulator in place, so
-// combination costs one allocation per level, never per document.
+// Term, match-all, and boolean queries run on document fast paths; phrases,
+// proximity, relations, filters, and thresholds evaluate span sets and
+// project. Per-level combination allocates bounded by the query shape, never
+// by the data size.
 func (ix *Index) Match(q Query, out []DocID) []DocID {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	ix.ensureSorted()
-	return ix.matchInto(q, out)
-}
-
-func (ix *Index) matchInto(q Query, out []DocID) []DocID {
 	switch q.Op {
 	case OpAll:
 		base := len(out)
 		for id := range ix.docs {
 			out = append(out, id)
 		}
-		head := out[base:]
-		sortDocIDs(head)
+		sortDocIDs(out[base:])
 		return out
 	case OpTerm:
 		if p := ix.post[q.Term]; p != nil {
 			out = append(out, p.ids...)
 		}
 		return out
-	case OpPhrase:
-		return ix.matchPhrase(q.Terms, q.Slop, out)
 	case OpAnd:
 		if len(q.Kids) == 0 {
 			return out
@@ -88,17 +161,14 @@ func (ix *Index) matchInto(q Query, out []DocID) []DocID {
 			// In-place: the write head never outruns the read head.
 			acc = intersectInto(acc, other, acc[:0])
 		}
-		out = append(out, acc...)
-		return out
+		return append(out, acc...)
 	case OpOr:
 		var res []DocID
 		for _, k := range q.Kids {
 			res = ix.matchInto(k, res)
 		}
 		sortDocIDs(res)
-		res = dedupeInto(res)
-		out = append(out, res...)
-		return out
+		return append(out, dedupeInto(res)...)
 	case OpAndNot:
 		if len(q.Kids) == 0 {
 			return out
@@ -109,50 +179,549 @@ func (ix *Index) matchInto(q Query, out []DocID) []DocID {
 			// In-place: survivors only move down.
 			acc = differenceInto(acc, other, acc[:0])
 		}
-		out = append(out, acc...)
-		return out
+		return append(out, acc...)
 	default:
-		return out
+		spans := ix.evalInto(q, nil)
+		return append(out, projectDocs(spans)...)
 	}
 }
 
-// matchPhrase matches an ordered term sequence with slop tolerance: between
-// consecutive terms it allows 1..1+Slop position steps.
-func (ix *Index) matchPhrase(terms []uint64, slop int, out []DocID) []DocID {
-	if len(terms) == 0 {
-		return out
-	}
-	first := ix.post[terms[0]]
-	if first == nil {
-		return out
-	}
-	lists := make([]*postings, 0, len(terms))
-	lists = append(lists, first)
-	for _, h := range terms[1:] {
-		p := ix.post[h]
-		if p == nil {
+// matchInto is the document fast path shared by the boolean combinators.
+func (ix *Index) matchInto(q Query, out []DocID) []DocID {
+	switch q.Op {
+	case OpAnd:
+		if len(q.Kids) == 0 {
 			return out
 		}
-		lists = append(lists, p)
+		acc := ix.matchInto(q.Kids[0], nil)
+		for _, k := range q.Kids[1:] {
+			other := ix.matchInto(k, nil)
+			acc = intersectInto(acc, other, acc[:0])
+		}
+		return append(out, acc...)
+	case OpOr:
+		var res []DocID
+		for _, k := range q.Kids {
+			res = ix.matchInto(k, res)
+		}
+		sortDocIDs(res)
+		return append(out, dedupeInto(res)...)
+	case OpAndNot:
+		if len(q.Kids) == 0 {
+			return out
+		}
+		acc := ix.matchInto(q.Kids[0], nil)
+		for _, k := range q.Kids[1:] {
+			other := ix.matchInto(k, nil)
+			acc = differenceInto(acc, other, acc[:0])
+		}
+		return append(out, acc...)
+	default:
+		spans := ix.evalInto(q, nil)
+		return append(out, projectDocs(spans)...)
 	}
-	rows := make([]int, len(lists))
-	for i := range first.ids {
-		if phraseAt(lists, rows, i, slop) {
-			out = append(out, first.ids[i])
+}
+
+// projectDocs extracts ascending distinct documents from (doc, start)
+// ordered spans.
+func projectDocs(spans []spanHit) []DocID {
+	var out []DocID
+	for _, s := range spans {
+		if n := len(out); n == 0 || out[n-1] != s.doc {
+			out = append(out, s.doc)
 		}
 	}
 	return out
 }
 
-// phraseAt reports whether the terms co-occur in order at posting row i of
-// the first term, within slop tolerance. Other terms' rows are found by
-// binary search on the same document; rows is caller scratch (one slot per
-// term) so the per-candidate check allocates nothing.
-func phraseAt(lists []*postings, rows []int, row int, slop int) bool {
-	doc := lists[0].ids[row]
-	rows[0] = row
-	for t := 1; t < len(lists); t++ {
-		p := lists[t]
+// evalInto appends q's span hits sorted by (doc, start). Intermediate levels
+// allocate bounded by the query shape; leaves append into out directly.
+func (ix *Index) evalInto(q Query, out []spanHit) []spanHit {
+	switch q.Op {
+	case OpTerm:
+		if p := ix.post[q.Term]; p != nil {
+			for i, id := range p.ids {
+				for _, pos := range positionsOf(p, i) {
+					out = append(out, spanHit{doc: id, start: pos, end: pos + 1})
+				}
+			}
+		}
+		return out
+	case OpAll:
+		for id, meta := range ix.docs {
+			out = append(out, spanHit{doc: id, start: 0, end: meta.length})
+		}
+		sortSpanHits(out)
+		return out
+	case OpPhrase:
+		return ix.phraseSpans(q.Phrase, q.Slop, out)
+	case OpAnd:
+		if len(q.Kids) == 0 {
+			return out
+		}
+		acc := ix.evalInto(q.Kids[0], nil)
+		for _, k := range q.Kids[1:] {
+			other := ix.evalInto(k, nil)
+			acc = joinDocs(acc, other)
+		}
+		return append(out, acc...)
+	case OpOr:
+		var res []spanHit
+		for _, k := range q.Kids {
+			res = ix.evalInto(k, res)
+		}
+		sortSpanHits(res)
+		return append(out, res...)
+	case OpAndNot:
+		if len(q.Kids) == 0 {
+			return out
+		}
+		acc := ix.evalInto(q.Kids[0], nil)
+		for _, k := range q.Kids[1:] {
+			other := ix.evalInto(k, nil)
+			acc = subtractDocs(acc, projectDocSet(other))
+		}
+		return append(out, acc...)
+	case OpThen:
+		if len(q.Kids) != 2 {
+			return out
+		}
+		return ix.proximitySpans(q.Kids[0], q.Kids[1], q.Dist, false, out)
+	case OpNear:
+		if len(q.Kids) != 2 {
+			return out
+		}
+		out = ix.proximitySpans(q.Kids[0], q.Kids[1], q.Dist, false, out)
+		out = ix.proximitySpans(q.Kids[1], q.Kids[0], q.Dist, false, out)
+		sortSpanHits(out)
+		return out
+	case OpWithin:
+		if len(q.Kids) != 1 {
+			return out
+		}
+		for _, s := range ix.evalInto(q.Kids[0], nil) {
+			if int(s.end-s.start) <= q.Dist {
+				out = append(out, s)
+			}
+		}
+		return out
+	case OpEncloses, OpEnclosedBy, OpOverlapping, OpBefore, OpAfter:
+		if len(q.Kids) != 2 {
+			return out
+		}
+		return relateSpans(q.Op, q.Neg, ix.evalInto(q.Kids[0], nil), ix.evalInto(q.Kids[1], nil), out)
+	case OpFilter:
+		if len(q.Kids) != 1 {
+			return out
+		}
+		for _, s := range ix.evalInto(q.Kids[0], nil) {
+			if window, ok := ix.filterWindow(q.Filter, s.doc); ok && s.start >= window[0] && s.end <= window[1] {
+				out = append(out, s)
+			}
+		}
+		return out
+	case OpAtLeast:
+		return ix.atLeastSpans(q, out)
+	default:
+		return out
+	}
+}
+
+// joinDocs keeps spans of a whose document also occurs in b, concatenating
+// both sides' spans per document (the union a boolean AND denotes over span
+// sets). Inputs must be (doc, start) ordered; output is too.
+func joinDocs(a, b []spanHit) []spanHit {
+	out := a[:0]
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i].doc < b[j].doc:
+			i = skipDoc(a, i)
+		case a[i].doc > b[j].doc:
+			j = skipDoc(b, j)
+		default:
+			d := a[i].doc
+			for i < len(a) && a[i].doc == d {
+				out = append(out, a[i])
+				i++
+			}
+			for j < len(b) && b[j].doc == d {
+				out = append(out, b[j])
+				j++
+			}
+		}
+	}
+	// Restore start order inside documents concatenated from both sides.
+	tidyDocSpans(out)
+	return out
+}
+
+// skipDoc advances past one document's run.
+func skipDoc(s []spanHit, i int) int {
+	d := s[i].doc
+	for i < len(s) && s[i].doc == d {
+		i++
+	}
+	return i
+}
+
+// tidyDocSpans sorts each document's run by start (runs arrive ordered from
+// each side but interleaved across sides).
+func tidyDocSpans(s []spanHit) {
+	start := 0
+	for start < len(s) {
+		end := skipDoc(s, start)
+		slices.SortFunc(s[start:end], cmpSpanStart)
+		start = end
+	}
+}
+
+func cmpSpanStart(a, b spanHit) int {
+	if a.start != b.start {
+		return cmp.Compare(a.start, b.start)
+	}
+	return cmp.Compare(a.end, b.end)
+}
+
+func sortSpanHits(s []spanHit) {
+	slices.SortFunc(s, func(a, b spanHit) int {
+		if a.doc != b.doc {
+			return cmp.Compare(a.doc, b.doc)
+		}
+		return cmpSpanStart(a, b)
+	})
+}
+
+// subtractDocs drops whole documents listed in banned (ascending).
+func subtractDocs(spans []spanHit, banned []DocID) []spanHit {
+	out := spans[:0]
+	j := 0
+	for _, s := range spans {
+		for j < len(banned) && banned[j] < s.doc {
+			j++
+		}
+		if j < len(banned) && banned[j] == s.doc {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// projectDocSet extracts ascending distinct documents.
+func projectDocSet(spans []spanHit) []DocID {
+	var out []DocID
+	for _, s := range spans {
+		if n := len(out); n == 0 || out[n-1] != s.doc {
+			out = append(out, s.doc)
+		}
+	}
+	return out
+}
+
+// proximitySpans pairs a-spans with the earliest b-span starting at most
+// Dist words after the a-span ends (gap = b.start - a.end, so adjacency is
+// gap 0). Emitted spans cover [a.start, b.end). When sym is set the pairing
+// also accepts overlap (b.start >= a.start); callers implement NEAR by
+// evaluating both directions instead.
+func (ix *Index) proximitySpans(aq, bq Query, dist int, sym bool, out []spanHit) []spanHit {
+	a := ix.evalInto(aq, nil)
+	b := ix.evalInto(bq, nil)
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i].doc < b[j].doc:
+			i = skipDoc(a, i)
+		case a[i].doc > b[j].doc:
+			j = skipDoc(b, j)
+		default:
+			d := a[i].doc
+			ai, aj := i, j
+			for ai < len(a) && a[ai].doc == d {
+				lo := aj
+				for lo < len(b) && b[lo].doc == d && int64(b[lo].start) < int64(a[ai].end) {
+					if sym && b[lo].start >= a[ai].start {
+						break
+					}
+					lo++
+				}
+				if lo < len(b) && b[lo].doc == d && int64(b[lo].start)-int64(a[ai].end) <= int64(dist) {
+					out = append(out, spanHit{doc: d, start: a[ai].start, end: b[lo].end})
+				}
+				ai++
+			}
+			i = skipDoc(a, i)
+			j = skipDoc(b, j)
+		}
+	}
+	return out
+}
+
+// relateSpans filters left spans by their relation to right spans of the
+// same document. BEFORE/AFTER compare starts existentially: an a-span is
+// kept when some b-span starts later/earlier.
+func relateSpans(op Op, neg bool, left, right []spanHit, out []spanHit) []spanHit {
+	i, j := 0, 0
+	for i < len(left) && j < len(right) {
+		switch {
+		case left[i].doc < right[j].doc:
+			if neg {
+				out = append(out, left[i])
+			}
+			i++
+		case left[i].doc > right[j].doc:
+			j = skipDoc(right, j)
+		default:
+			d := left[i].doc
+			jj := j
+			for j < len(right) && right[j].doc == d {
+				j++
+			}
+			b := right[jj:j]
+			for i < len(left) && left[i].doc == d {
+				if relateOne(op, left[i], b) != neg {
+					out = append(out, left[i])
+				}
+				i++
+			}
+		}
+	}
+	if neg {
+		for ; i < len(left); i++ {
+			out = append(out, left[i])
+		}
+	}
+	return out
+}
+
+// relateOne tests one left span against its document's right spans.
+func relateOne(op Op, a spanHit, b []spanHit) bool {
+	switch op {
+	case OpEncloses:
+		for _, s := range b {
+			if s.start >= a.start && s.end <= a.end {
+				return true
+			}
+		}
+		return false
+	case OpEnclosedBy:
+		for _, s := range b {
+			if a.start >= s.start && a.end <= s.end {
+				return true
+			}
+		}
+		return false
+	case OpOverlapping:
+		for _, s := range b {
+			if a.start < s.end && s.start < a.end {
+				return true
+			}
+		}
+		return false
+	case OpBefore:
+		for _, s := range b {
+			if a.start < s.start {
+				return true
+			}
+		}
+		return false
+	case OpAfter:
+		for _, s := range b {
+			if a.start > s.start {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// filterWindow resolves a FilterSpec to the inclusive-exclusive [lo, hi)
+// token window for doc. ok is false for an unknown document.
+func (ix *Index) filterWindow(f FilterSpec, doc DocID) (window [2]uint32, ok bool) {
+	meta, ok := ix.docs[doc]
+	if !ok {
+		return window, false
+	}
+	l := int(meta.length)
+	switch f.Kind {
+	case FilterFirstWords:
+		return [2]uint32{0, uint32(min(f.N, l))}, true
+	case FilterFirstPct:
+		return [2]uint32{0, uint32(pctOf(l, f.N))}, true
+	case FilterLastWords:
+		return [2]uint32{uint32(max(l-f.N, 0)), uint32(l)}, true
+	case FilterLastPct:
+		k := pctOf(l, f.N)
+		return [2]uint32{uint32(max(l-k, 0)), uint32(l)}, true
+	case FilterMiddlePct:
+		k := pctOf(l, f.N)
+		s := (l - k) / 2
+		return [2]uint32{uint32(s), uint32(s + k)}, true
+	case FilterWords:
+		lo := min(max(f.Lo, 0), l)
+		hi := min(max(f.Hi+1, 0), l)
+		if hi < lo {
+			hi = lo
+		}
+		return [2]uint32{uint32(lo), uint32(hi)}, true
+	default:
+		return window, false
+	}
+}
+
+// pctOf rounds a percentage of l up: a 25% window of a 3-word document still
+// covers its first word.
+func pctOf(l, pct int) int {
+	if pct <= 0 || l <= 0 {
+		return 0
+	}
+	return (l*pct + 99) / 100
+}
+
+// atLeastDocs returns ascending documents occurring in at least threshold
+// of the per-kid ascending doc lists. Counting sorted runs replaces a hash
+// map: one slice allocation, no buckets, no pointer chasing.
+func atLeastDocs(lists [][]DocID, threshold int) []DocID {
+	var all []DocID
+	for _, l := range lists {
+		all = append(all, l...)
+	}
+	sortDocIDs(all)
+	// Compact qualifying run heads in place; the write head trails the read
+	// head, so this is safe.
+	w, i := 0, 0
+	for i < len(all) {
+		j := i + 1
+		for j < len(all) && all[j] == all[i] {
+			j++
+		}
+		if j-i >= threshold {
+			all[w] = all[i]
+			w++
+		}
+		i = j
+	}
+	return all[:w]
+}
+
+// atLeastSpans keeps documents matching at least Threshold kids,
+// concatenating the contributing spans.
+func (ix *Index) atLeastSpans(q Query, out []spanHit) []spanHit {
+	kids := make([][]spanHit, 0, len(q.Kids))
+	lists := make([][]DocID, 0, len(q.Kids))
+	for _, k := range q.Kids {
+		spans := ix.evalInto(k, nil)
+		kids = append(kids, spans)
+		lists = append(lists, projectDocSet(spans))
+	}
+	qual := atLeastDocs(lists, q.Threshold)
+	for _, spans := range kids {
+		i, j := 0, 0
+		for i < len(spans) && j < len(qual) {
+			switch {
+			case spans[i].doc < qual[j]:
+				i = skipDoc(spans, i)
+			case spans[i].doc > qual[j]:
+				j++
+			default:
+				out = append(out, spans[i])
+				i++
+			}
+		}
+	}
+	sortSpanHits(out)
+	return out
+}
+
+// phraseSpans matches an ordered slot chain with slop tolerance. Any slots
+// advance exactly one word and must land inside the document; after them a
+// constrained slot may sit 1..1+slop steps beyond, so explicit `_` gaps and
+// slop compose instead of conflicting.
+func (ix *Index) phraseSpans(ph []PhrasePos, slop int, out []spanHit) []spanHit {
+	if len(ph) == 0 {
+		return out
+	}
+	anchor := -1
+	for i, slot := range ph {
+		if !slot.Any && len(slot.Alts) > 0 {
+			anchor = i
+			break
+		}
+	}
+	if anchor == -1 {
+		// All-Any: every window of len(ph) words in every document.
+		for id, meta := range ix.docs {
+			for s := uint32(0); s+uint32(len(ph)) <= meta.length && meta.length > 0; s++ {
+				out = append(out, spanHit{doc: id, start: s, end: s + uint32(len(ph))})
+			}
+		}
+		sortSpanHits(out)
+		return out
+	}
+	// Candidate documents hold the anchor slot: union its alternatives.
+	altKids := make([]Query, 0, len(ph[anchor].Alts))
+	for _, h := range ph[anchor].Alts {
+		altKids = append(altKids, Query{Op: OpTerm, Term: h})
+	}
+	cands := ix.matchInto(Query{Op: OpOr, Kids: altKids}, nil)
+	slots := make([]uint32, len(ph))
+	for _, doc := range cands {
+		meta, ok := ix.docs[doc]
+		if !ok {
+			continue
+		}
+		lists := make([][]uint32, len(ph))
+		complete := true
+		for t, slot := range ph {
+			if slot.Any {
+				continue
+			}
+			lists[t] = ix.slotPositions(slot.Alts, doc)
+			if len(lists[t]) == 0 {
+				complete = false
+				break
+			}
+		}
+		if !complete {
+			continue
+		}
+		for _, a := range lists[anchor] {
+			if s0, s1, ok := chainFrom(ph, lists, meta.length, anchor, a, slop, slots); ok {
+				out = append(out, spanHit{doc: doc, start: s0, end: s1 + 1})
+			}
+		}
+	}
+	return out
+}
+
+// slotPositions returns the ascending union of alts' positions in doc, or
+// nil when none occur there.
+func (ix *Index) slotPositions(alts []uint64, doc DocID) []uint32 {
+	if len(alts) == 1 {
+		if p := ix.post[alts[0]]; p != nil {
+			lo, hi := 0, len(p.ids)
+			for lo < hi {
+				m := lo + (hi-lo)/2
+				if p.ids[m] < doc {
+					lo = m + 1
+				} else {
+					hi = m
+				}
+			}
+			if lo < len(p.ids) && p.ids[lo] == doc {
+				return positionsOf(p, lo)
+			}
+		}
+		return nil
+	}
+	var union []uint32
+	for _, h := range alts {
+		p := ix.post[h]
+		if p == nil {
+			continue
+		}
 		lo, hi := 0, len(p.ids)
 		for lo < hi {
 			m := lo + (hi-lo)/2
@@ -162,47 +731,60 @@ func phraseAt(lists []*postings, rows []int, row int, slop int) bool {
 				hi = m
 			}
 		}
-		if lo >= len(p.ids) || p.ids[lo] != doc {
-			return false
+		if lo < len(p.ids) && p.ids[lo] == doc {
+			union = append(union, positionsOf(p, lo)...)
 		}
-		rows[t] = lo
 	}
-	return spansMatch(lists, rows, slop)
+	slices.Sort(union)
+	return union
 }
 
-// spansMatch checks the positional chain greedily from each start position
-// of term 0: every later term must offer a position within 1..1+slop steps
-// after the previous term's position. Position lists ascend, so the first
-// slot in range is the earliest reachable one, and greedy choice is complete:
-// any later slot only shrinks the window left for the remaining terms.
-func spansMatch(lists []*postings, rows []int, slop int) bool {
-	first := positionsOf(lists[0], rows[0])
-	for _, start := range first {
-		cur := start
-		ok := true
-		for t := 1; t < len(lists); t++ {
-			next, found := nextInRange(positionsOf(lists[t], rows[t]), cur, slop)
-			if !found {
-				ok = false
-				break
+// chainFrom verifies the slot chain around one anchor occurrence. Forward
+// slots take the earliest reachable position and backward slots the latest
+// reachable one; both greeds are complete because position lists ascend, so
+// the extremal reachable choice always leaves maximal room for the rest.
+// slots is caller scratch with one entry per slot.
+func chainFrom(ph []PhrasePos, lists [][]uint32, docLen uint32, anchor int, anchorPos uint32, slop int, slots []uint32) (uint32, uint32, bool) {
+	slots[anchor] = anchorPos
+	cur := anchorPos
+	for t := anchor + 1; t < len(ph); t++ {
+		if ph[t].Any {
+			cur++
+			if cur >= docLen {
+				return 0, 0, false
 			}
-			cur = next
+			slots[t] = cur
+			continue
 		}
-		if ok {
-			return true
+		next, ok := earliestAfter(lists[t], cur, slop)
+		if !ok {
+			return 0, 0, false
 		}
+		cur = next
+		slots[t] = cur
 	}
-	return false
+	cur = anchorPos
+	for t := anchor - 1; t >= 0; t-- {
+		if ph[t].Any {
+			if cur == 0 {
+				return 0, 0, false
+			}
+			cur--
+			slots[t] = cur
+			continue
+		}
+		prev, ok := latestBefore(lists[t], cur, slop)
+		if !ok {
+			return 0, 0, false
+		}
+		cur = prev
+		slots[t] = cur
+	}
+	return slots[0], slots[len(ph)-1], true
 }
 
-// positionsOf returns the position slice for one posting row.
-func positionsOf(p *postings, row int) []uint32 {
-	return p.pos[p.off[row]:p.off[row+1]]
-}
-
-// nextInRange returns the earliest slot strictly after cur and at most
-// 1+slop steps beyond it.
-func nextInRange(slots []uint32, cur uint32, slop int) (uint32, bool) {
+// earliestAfter returns the first slot position in (cur, cur+1+slop].
+func earliestAfter(slots []uint32, cur uint32, slop int) (uint32, bool) {
 	lo, hi := 0, len(slots)
 	for lo < hi {
 		m := lo + (hi-lo)/2
@@ -212,10 +794,38 @@ func nextInRange(slots []uint32, cur uint32, slop int) (uint32, bool) {
 			hi = m
 		}
 	}
-	if lo < len(slots) && slots[lo] <= cur+1+uint32(slop) {
+	if lo < len(slots) && int64(slots[lo])-int64(cur) <= int64(slop)+1 {
 		return slots[lo], true
 	}
 	return 0, false
+}
+
+// latestBefore returns the last slot position in [cur-1-slop, cur-1].
+func latestBefore(slots []uint32, cur uint32, slop int) (uint32, bool) {
+	if cur == 0 {
+		return 0, false
+	}
+	lo, hi := 0, len(slots)
+	for lo < hi {
+		m := lo + (hi-lo)/2
+		if slots[m] < cur {
+			lo = m + 1
+		} else {
+			hi = m
+		}
+	}
+	if lo == 0 {
+		return 0, false
+	}
+	if s := slots[lo-1]; int64(cur)-int64(s) <= int64(slop)+1 {
+		return s, true
+	}
+	return 0, false
+}
+
+// positionsOf returns the position slice for one posting row.
+func positionsOf(p *postings, row int) []uint32 {
+	return p.pos[p.off[row]:p.off[row+1]]
 }
 
 // Score appends BM25-scored hits for q, descending by score (ties by DocID),
@@ -237,18 +847,38 @@ func (ix *Index) Score(q Query, topK int, out []Scored) []Scored {
 	return out
 }
 
-// scoreInto accumulates q's BM25 over its matching documents.
-func (ix *Index) scoreInto(q Query, docs map[DocID]*docMeta, acc *[]Scored) {
+// scoreInto accumulates q's BM25 over its matching documents. Terms and
+// phrases score from posting frequencies; proximity, relations, filters, and
+// thresholds score their resulting span counts as occurrence frequencies;
+// booleans sum their children. Every level scales by its boost.
+func (ix *Index) scoreInto(q Query, docs map[DocID]docMeta, acc *[]Scored) {
 	switch q.Op {
 	case OpTerm:
 		ix.scoreTerm(q.Term, q.boostOf(), docs, acc)
 	case OpPhrase:
-		ix.scorePhrase(q.Terms, q.Slop, q.boostOf(), docs, acc)
-	case OpAnd, OpOr:
+		ix.scorePhrase(q.Phrase, q.Slop, q.boostOf(), docs, acc)
+	case OpAnd:
+		if len(q.Kids) == 0 {
+			return
+		}
 		for _, k := range q.Kids {
 			ix.scoreInto(k, docs, acc)
 		}
 		mergeScores(acc)
+		// Summation ranges over the union; AND ranks only the intersection.
+		keep := ix.matchInto(q.Kids[0], nil)
+		for _, k := range q.Kids[1:] {
+			other := ix.matchInto(k, nil)
+			keep = intersectInto(keep, other, keep[:0])
+		}
+		filterScored(acc, keep)
+		scaleScores(acc, q.boostOf())
+	case OpOr:
+		for _, k := range q.Kids {
+			ix.scoreInto(k, docs, acc)
+		}
+		mergeScores(acc)
+		scaleScores(acc, q.boostOf())
 	case OpAndNot:
 		if len(q.Kids) == 0 {
 			return
@@ -276,101 +906,125 @@ func (ix *Index) scoreInto(q Query, docs map[DocID]*docMeta, acc *[]Scored) {
 			}
 		}
 		*acc = append(*acc, pos[i:]...)
+		scaleScores(acc, q.boostOf())
 	case OpAll:
 		for id := range docs {
 			*acc = append(*acc, Scored{Doc: id, Score: q.boostOf()})
 		}
+	case OpAtLeast:
+		for _, k := range q.Kids {
+			ix.scoreInto(k, docs, acc)
+		}
+		// Keep only documents matching enough kids, then merge.
+		lists := make([][]DocID, 0, len(q.Kids))
+		for _, k := range q.Kids {
+			lists = append(lists, ix.matchInto(k, nil))
+		}
+		keep := atLeastDocs(lists, q.Threshold)
+		sortScoredByDoc(*acc)
+		w, j := 0, 0
+		for _, s := range *acc {
+			for j < len(keep) && keep[j] < s.Doc {
+				j++
+			}
+			if j < len(keep) && keep[j] == s.Doc {
+				(*acc)[w] = s
+				w++
+			}
+		}
+		*acc = (*acc)[:w]
+		mergeScores(acc)
+		scaleScores(acc, q.boostOf())
+	default:
+		ix.scoreSpans(ix.evalInto(q, nil), q.boostOf(), docs, acc)
 	}
 }
 
-// scoreTerm adds one term's BM25 contribution over its posting list.
-func (ix *Index) scoreTerm(term uint64, boost float64, docs map[DocID]*docMeta, acc *[]Scored) {
+// filterScored keeps accumulated hits whose document is in keep. acc must
+// be document-ordered (as mergeScores leaves it) and keep ascending.
+func filterScored(acc *[]Scored, keep []DocID) {
+	s := *acc
+	w, j := 0, 0
+	for _, h := range s {
+		for j < len(keep) && keep[j] < h.Doc {
+			j++
+		}
+		if j < len(keep) && keep[j] == h.Doc {
+			s[w] = h
+			w++
+		}
+	}
+	*acc = s[:w]
+}
+
+// scaleScores multiplies accumulated hits by a group boost.
+func scaleScores(acc *[]Scored, boost float64) {
+	if boost == 1 {
+		return
+	}
+	for i := range *acc {
+		(*acc)[i].Score *= boost
+	}
+}
+
+// scoreTerm adds one term's BM25 contribution over its posting list. It
+// gathers frequencies and lengths into reused scratch, then runs the (wide
+// or scalar) kernel over the flat arrays.
+func (ix *Index) scoreTerm(term uint64, boost float64, docs map[DocID]docMeta, acc *[]Scored) {
 	p := ix.post[term]
 	if p == nil || ix.nDocs == 0 {
 		return
 	}
 	idf := idf(ix.nDocs, len(p.ids))
 	avg := float64(ix.tokens) / float64(ix.nDocs)
+	tf, dl, sc := ix.scoreTF[:0], ix.scoreDL[:0], ix.scoreOut[:0]
 	for i, id := range p.ids {
-		dl := float64(docs[id].length)
-		f := float64(p.freq[i])
-		den := f + bm25K1*(1-bm25B+bm25B*dl/avg)
-		*acc = append(*acc, Scored{Doc: id, Score: boost * idf * f * (bm25K1 + 1) / den})
+		tf = append(tf, float64(p.freq[i]))
+		dl = append(dl, float64(docs[id].length))
 	}
+	sc = bm25Scores(idf, avg, boost, tf, dl, sc)
+	for i, id := range p.ids {
+		*acc = append(*acc, Scored{Doc: id, Score: sc[i]})
+	}
+	ix.scoreTF, ix.scoreDL, ix.scoreOut = tf[:0], dl[:0], sc[:0]
 }
 
 // scorePhrase scores phrase occurrences like a term whose frequency is the
 // occurrence count.
-func (ix *Index) scorePhrase(terms []uint64, slop int, boost float64, docs map[DocID]*docMeta, acc *[]Scored) {
-	if len(terms) == 0 || ix.nDocs == 0 {
+func (ix *Index) scorePhrase(ph []PhrasePos, slop int, boost float64, docs map[DocID]docMeta, acc *[]Scored) {
+	if len(ph) == 0 || ix.nDocs == 0 {
 		return
 	}
-	matched := ix.matchPhrase(terms, slop, nil)
-	if len(matched) == 0 {
-		return
-	}
-	idf := idf(ix.nDocs, len(matched))
-	avg := float64(ix.tokens) / float64(ix.nDocs)
-	for _, id := range matched {
-		f := float64(countPhrase(terms, slop, id, ix.post))
-		dl := float64(docs[id].length)
-		den := f + bm25K1*(1-bm25B+bm25B*dl/avg)
-		*acc = append(*acc, Scored{Doc: id, Score: boost * idf * f * (bm25K1 + 1) / den})
-	}
+	spans := ix.phraseSpans(ph, slop, nil)
+	ix.scoreSpans(spans, boost, docs, acc)
 }
 
-// countPhrase counts ordered occurrences of terms in doc.
-func countPhrase(terms []uint64, slop int, doc DocID, post map[uint64]*postings) int {
-	lists := make([]*postings, 0, len(terms))
-	rows := make([]int, 0, len(terms))
-	for _, h := range terms {
-		p := post[h]
-		if p == nil {
-			return 0
-		}
-		lo, hi := 0, len(p.ids)
-		for lo < hi {
-			m := lo + (hi-lo)/2
-			if p.ids[m] < doc {
-				lo = m + 1
-			} else {
-				hi = m
-			}
-		}
-		if lo >= len(p.ids) || p.ids[lo] != doc {
-			return 0
-		}
-		lists = append(lists, p)
-		rows = append(rows, lo)
+// scoreSpans scores span hits with BM25 over occurrence counts: tf is the
+// document's span count, df the number of spanned documents.
+func (ix *Index) scoreSpans(spans []spanHit, boost float64, docs map[DocID]docMeta, acc *[]Scored) {
+	if len(spans) == 0 || ix.nDocs == 0 {
+		return
 	}
-	n := 0
-	prev := lists[0].pos[lists[0].off[rows[0]]:lists[0].off[rows[0]+1]]
-	for _, start := range prev {
-		cur := start
-		ok := true
-		for t := 1; t < len(lists); t++ {
-			slots := lists[t].pos[lists[t].off[rows[t]]:lists[t].off[rows[t]+1]]
-			found := false
-			for _, s := range slots {
-				if s > cur && s <= cur+1+uint32(slop) {
-					cur = s
-					found = true
-					break
-				}
-				if s > cur+1+uint32(slop) {
-					break
-				}
-			}
-			if !found {
-				ok = false
-				break
-			}
+	matched := projectDocSet(spans)
+	idf := idf(ix.nDocs, len(matched))
+	avg := float64(ix.tokens) / float64(ix.nDocs)
+	tf, dl, sc := ix.scoreTF[:0], ix.scoreDL[:0], ix.scoreOut[:0]
+	i := 0
+	for i < len(spans) {
+		d := spans[i].doc
+		j := i
+		for j < len(spans) && spans[j].doc == d {
+			j++
 		}
-		if ok {
-			n++
-		}
+		tf = append(tf, float64(j-i))
+		dl = append(dl, float64(docs[d].length))
+		i = j
 	}
-	return n
+	sc = bm25Scores(idf, avg, boost, tf, dl, sc)
+	for k, d := range matched {
+		*acc = append(*acc, Scored{Doc: d, Score: sc[k]})
+	}
+	ix.scoreTF, ix.scoreDL, ix.scoreOut = tf[:0], dl[:0], sc[:0]
 }
 
 // idf is BM25's smoothed inverse document frequency.
