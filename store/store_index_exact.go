@@ -32,6 +32,9 @@ type IndexDefinition struct {
 	// Durable collections validate existing rows before publication, persist
 	// this bit, and enforce it on later point, batch, bulk, and replay writes.
 	Unique bool
+	// Kind selects the index family: zero (IndexExact) or IndexTin. Tin
+	// requires exactly one path and refuses Unique.
+	Kind IndexKind
 }
 
 var (

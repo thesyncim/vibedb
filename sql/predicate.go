@@ -559,10 +559,17 @@ func (p *Parser) parseLeafTail(
 	case p.atKeyword(kwSimilar):
 		return nil, p.errHere("SIMILAR TO is not supported: the engine has no pattern operator")
 	case negated:
-		return nil, p.errHere("expected IN, BETWEEN, or LIKE after NOT")
+		// NOT ==> parses below beside @>; anything else after NOT is
+		// refused with the keyword list.
+		if p.tok.kind != tokMatch {
+			return nil, p.errHere("expected IN, BETWEEN, LIKE, or ==> after NOT")
+		}
 	}
 	if p.tok.kind == tokContains {
 		return p.parseContainsTail(agg, path, pos)
+	}
+	if p.tok.kind == tokMatch {
+		return p.parseMatchTail(agg, path, pos, negated)
 	}
 	op, ok := comparisonOp(p.tok.kind)
 	if !ok {
@@ -729,6 +736,33 @@ func (p *Parser) parseLikeTail(
 	e := p.exprs.one()
 	*e = Expr{
 		Kind: ExprLike, Negated: negated, Insensitive: insensitive,
+		Column: -1, Path: path, Value: value, Pos: pos,
+	}
+	return e, nil
+}
+
+// parseMatchTail parses Path [NOT] ==> TINQL. The right side is a string
+// literal or placeholder holding a TINQL query; the lowerer resolves it
+// against the collection's tin index for the path, exactly like LIKE resolves
+// its pattern, so prepare-time shape checks and placeholder binding behave
+// the same way.
+func (p *Parser) parseMatchTail(
+	agg AggKind, path *PathExpr, pos int, negated bool,
+) (*Expr, error) {
+	if agg != AggNone {
+		return nil, p.errHere("==> does not apply to an aggregate result")
+	}
+	p.advance() // ==>
+	value, err := p.parseOperand()
+	if err != nil {
+		return nil, err
+	}
+	if value.Kind != OperandString && value.Kind != OperandParam {
+		return nil, p.errAt(value.Pos, "==> query must be a string literal or a placeholder")
+	}
+	e := p.exprs.one()
+	*e = Expr{
+		Kind: ExprMatch, Negated: negated,
 		Column: -1, Path: path, Value: value, Pos: pos,
 	}
 	return e, nil

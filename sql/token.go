@@ -31,6 +31,7 @@ const (
 	tokGt
 	tokGe
 	tokContains // @>
+	tokMatch    // ==>, full-text match against a TINQL query
 	tokPlus
 	tokMinus
 	tokSlash

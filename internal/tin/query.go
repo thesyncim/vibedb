@@ -286,13 +286,13 @@ func (ix *Index) evalInto(q Query, out []spanHit) []spanHit {
 		if len(q.Kids) != 2 {
 			return out
 		}
-		return ix.proximitySpans(q.Kids[0], q.Kids[1], q.Dist, false, out)
+		return ix.proximitySpans(q.Kids[0], q.Kids[1], q.Dist, out)
 	case OpNear:
 		if len(q.Kids) != 2 {
 			return out
 		}
-		out = ix.proximitySpans(q.Kids[0], q.Kids[1], q.Dist, false, out)
-		out = ix.proximitySpans(q.Kids[1], q.Kids[0], q.Dist, false, out)
+		out = ix.proximitySpans(q.Kids[0], q.Kids[1], q.Dist, out)
+		out = ix.proximitySpans(q.Kids[1], q.Kids[0], q.Dist, out)
 		sortSpanHits(out)
 		return out
 	case OpWithin:
@@ -419,12 +419,31 @@ func projectDocSet(spans []spanHit) []DocID {
 	return out
 }
 
-// proximitySpans pairs a-spans with the earliest b-span starting at most
-// Dist words after the a-span ends (gap = b.start - a.end, so adjacency is
-// gap 0). Emitted spans cover [a.start, b.end). When sym is set the pairing
-// also accepts overlap (b.start >= a.start); callers implement NEAR by
-// evaluating both directions instead.
-func (ix *Index) proximitySpans(aq, bq Query, dist int, sym bool, out []spanHit) []spanHit {
+// pairSpans pairs a-spans with the earliest b-span starting at most dist
+// words after the a-span ends (gap = b.start - a.end, so adjacency is gap
+// 0), emitting covering spans. Both lists address one document and ascend by
+// start. Each a-span searches from the list head (binary search): ends need
+// not ascend with starts, so a shared cursor would miss pairs.
+func pairSpans(aSpans, bSpans []spanHit, dist int, out []spanHit) []spanHit {
+	for _, a := range aSpans {
+		lo, hi := 0, len(bSpans)
+		for lo < hi {
+			m := lo + (hi-lo)/2
+			if int64(bSpans[m].start) < int64(a.end) {
+				lo = m + 1
+			} else {
+				hi = m
+			}
+		}
+		if lo < len(bSpans) && int64(bSpans[lo].start)-int64(a.end) <= int64(dist) {
+			out = append(out, spanHit{doc: a.doc, start: a.start, end: bSpans[lo].end})
+		}
+	}
+	return out
+}
+
+// proximitySpans pairs per-document span groups with pairSpans.
+func (ix *Index) proximitySpans(aq, bq Query, dist int, out []spanHit) []spanHit {
 	a := ix.evalInto(aq, nil)
 	b := ix.evalInto(bq, nil)
 	i, j := 0, 0
@@ -436,22 +455,16 @@ func (ix *Index) proximitySpans(aq, bq Query, dist int, sym bool, out []spanHit)
 			j = skipDoc(b, j)
 		default:
 			d := a[i].doc
-			ai, aj := i, j
+			ai := i
 			for ai < len(a) && a[ai].doc == d {
-				lo := aj
-				for lo < len(b) && b[lo].doc == d && int64(b[lo].start) < int64(a[ai].end) {
-					if sym && b[lo].start >= a[ai].start {
-						break
-					}
-					lo++
-				}
-				if lo < len(b) && b[lo].doc == d && int64(b[lo].start)-int64(a[ai].end) <= int64(dist) {
-					out = append(out, spanHit{doc: d, start: a[ai].start, end: b[lo].end})
-				}
 				ai++
 			}
-			i = skipDoc(a, i)
-			j = skipDoc(b, j)
+			jj := j
+			for j < len(b) && b[j].doc == d {
+				j++
+			}
+			out = pairSpans(a[i:ai], b[jj:j], dist, out)
+			i = ai
 		}
 	}
 	return out
@@ -544,30 +557,37 @@ func (ix *Index) filterWindow(f FilterSpec, doc DocID) (window [2]uint32, ok boo
 	if !ok {
 		return window, false
 	}
-	l := int(meta.length)
+	return filterWindowLen(f, meta.length), true
+}
+
+// filterWindowLen resolves a FilterSpec against a known document length in
+// words. It is the sharable core of filterWindow for cursors (like transient
+// matching) that know lengths without the document table.
+func filterWindowLen(f FilterSpec, length uint32) [2]uint32 {
+	l := int(length)
 	switch f.Kind {
 	case FilterFirstWords:
-		return [2]uint32{0, uint32(min(f.N, l))}, true
+		return [2]uint32{0, uint32(min(f.N, l))}
 	case FilterFirstPct:
-		return [2]uint32{0, uint32(pctOf(l, f.N))}, true
+		return [2]uint32{0, uint32(pctOf(l, f.N))}
 	case FilterLastWords:
-		return [2]uint32{uint32(max(l-f.N, 0)), uint32(l)}, true
+		return [2]uint32{uint32(max(l-f.N, 0)), uint32(l)}
 	case FilterLastPct:
 		k := pctOf(l, f.N)
-		return [2]uint32{uint32(max(l-k, 0)), uint32(l)}, true
+		return [2]uint32{uint32(max(l-k, 0)), uint32(l)}
 	case FilterMiddlePct:
 		k := pctOf(l, f.N)
 		s := (l - k) / 2
-		return [2]uint32{uint32(s), uint32(s + k)}, true
+		return [2]uint32{uint32(s), uint32(s + k)}
 	case FilterWords:
 		lo := min(max(f.Lo, 0), l)
 		hi := min(max(f.Hi+1, 0), l)
 		if hi < lo {
 			hi = lo
 		}
-		return [2]uint32{uint32(lo), uint32(hi)}, true
+		return [2]uint32{uint32(lo), uint32(hi)}
 	default:
-		return window, false
+		return [2]uint32{}
 	}
 }
 

@@ -517,7 +517,15 @@ func (p *Parser) parseCreateIndex(unique bool) error {
 	case p.atKeyword(kwWhere):
 		return p.errHere("a partial index (INDEX ... WHERE) is not supported: this engine's indexes cover every document of the collection")
 	case p.atKeyword(kwUsing):
-		return p.errHere("INDEX ... USING is not supported: the engine has one index structure, an exact scalar posting index, and no method to choose between")
+		p.advance() // USING
+		method, err := p.parseIndexMethod()
+		if err != nil {
+			return err
+		}
+		p.idx.Method = method
+		if method == "tin" && len(p.idx.Paths) != 1 {
+			return p.errHere("USING tin indexes one text path; compound full-text indexes are not supported")
+		}
 	}
 	if err := p.expectEnd(); err != nil {
 		return err
@@ -533,6 +541,20 @@ func (p *Parser) parseCreateIndex(unique bool) error {
 		}
 	}
 	return nil
+}
+
+// parseIndexMethod reads the access method after USING. Only tin exists
+// beside the default exact index; anything else keeps the precise refusal
+// so a new method arrives deliberately rather than by typo.
+func (p *Parser) parseIndexMethod() (string, error) {
+	name, err := p.parseAliasName("an index method after USING")
+	if err != nil {
+		return "", err
+	}
+	if equalFoldASCII(name, "tin") {
+		return "tin", nil
+	}
+	return "", p.errHere("INDEX ... USING names an unknown method: only tin is supported besides the default exact index")
 }
 
 // parseIndexPath reads one indexed path, refusing the per-key modifiers SQL

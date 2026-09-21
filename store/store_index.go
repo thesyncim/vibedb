@@ -17,6 +17,10 @@ const (
 	// order-sensitive typed fingerprint to persistent stable-slot bitmaps;
 	// hashes only prune and every returned row is verified exactly.
 	IndexExact IndexKind = iota + 1
+	// IndexTin is a full-text index over one text path, maintained as a
+	// positional inverted index with TINQL evaluation and BM25 scoring (see
+	// internal/tin). Exactly one path is indexed; UNIQUE is refused.
+	IndexTin
 )
 
 // IndexState is an online index's publication state.
