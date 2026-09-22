@@ -112,6 +112,12 @@ type Query struct {
 	Filter FilterSpec
 	// Threshold counts OpAtLeast kids (percentages resolved at parse).
 	Threshold int
+	// Expanded reports dictionary expansion shaped the query: a
+	// wildcard, fuzzy, MATCHES, or range operator generated alternatives
+	// from the parsed index's vocabulary, so the same pattern may lower
+	// differently on another index. Segmented top-K serves only
+	// unexpanded queries from one parse.
+	Expanded bool
 }
 
 // boostOf normalizes the unset/zero boost to 1.

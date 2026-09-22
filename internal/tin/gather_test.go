@@ -7,6 +7,8 @@ import (
 // gatherShardCorpus splits docs across n shards with disjoint DocIDs:
 // every doc carries "common", every 5th adds "zipf", and one shard in
 // four holds an exact-tie group ("tied tie tie") so ties span shards.
+// Shard 0 holds a near-neighbor ("zipp") so fuzzy expansions stay
+// multi-term and leave the pinned fast path.
 func gatherShardCorpus(n, per int) []Shard {
 	shards := make([]Shard, n)
 	for s := range shards {
@@ -19,6 +21,9 @@ func gatherShardCorpus(n, per int) []Shard {
 			}
 			if i%5 == 0 {
 				body += " zipf"
+			}
+			if s == 0 && i == 1 {
+				body += " zipp"
 			}
 			if s%2 == 0 && i%7 == 0 {
 				body = "tied tie tie"
@@ -152,5 +157,128 @@ func TestMergeScoredUnit(t *testing.T) {
 	}
 	if len(mergeScored(nil, 10, nil)) != 0 {
 		t.Fatal("no runs must merge empty")
+	}
+}
+
+// gatherSingleCorpus rebuilds gatherShardCorpus's documents (same DocIDs,
+// same texts) in one index: the single-index oracle for segmented search.
+func gatherSingleCorpus(n, per int) *Index {
+	ix := NewIndex()
+	for s := 0; s < n; s++ {
+		for i := 0; i < per; i++ {
+			id := DocID(uint64(s*per+i) + 1)
+			body := "common"
+			for k := 0; k < (i*13)%24; k++ {
+				body += " filler"
+			}
+			if i%5 == 0 {
+				body += " zipf"
+			}
+			if s == 0 && i == 1 {
+				body += " zipp"
+			}
+			if s%2 == 0 && i%7 == 0 {
+				body = "tied tie tie"
+			}
+			ix.Add(id, body)
+		}
+	}
+	return ix
+}
+
+// TestScoreSegmentedExact proves the pinned segmented top-K is the single
+// index's top-K bit for bit: terms, ANDs, boosts, missing terms, terms
+// absent from whole shards, duplicate kids, cross-shard ties, and empty
+// and nil shards. Shapes outside the pinned fast path decline.
+func TestScoreSegmentedExact(t *testing.T) {
+	shards := gatherShardCorpus(4, 2000)
+	shards = append(shards, Shard{Ix: NewIndex()}, Shard{})
+	single := gatherSingleCorpus(4, 2000)
+	exact := []string{
+		"common", "zipf", "tied", "missing",
+		"zipf AND common", "tied AND common", "common AND missing",
+		"common^2", "zipf^0.5 AND common",
+	}
+	for _, pattern := range exact {
+		q := gatherQuery(t, shards, pattern)
+		for _, topK := range []int{1, 10, 100} {
+			got, ok := ScoreSegmented(shards, q, topK, nil)
+			if !ok {
+				t.Fatalf("%s topK=%d declined, want exact", pattern, topK)
+			}
+			want := single.Score(q, topK, nil)
+			if len(got) != len(want) {
+				t.Fatalf("%s topK=%d: %d hits, want %d", pattern, topK, len(got), len(want))
+			}
+			for i := range got {
+				if got[i] != want[i] {
+					t.Fatalf("%s topK=%d hit %d = %+v, want %+v", pattern, topK, i, got[i], want[i])
+				}
+			}
+		}
+	}
+	// `zipf AND zipf` declines too: its intersection is the list itself,
+	// which trips the unselective fast gate in the single index as well.
+	decline := []string{`"tied tie"`, `zipf OR common`, `zipf~1`, `zip*`, `zipf THEN/0 common`, `*`, `zipf AND zipf`}
+	for _, pattern := range decline {
+		q := gatherQuery(t, shards, pattern)
+		if _, ok := ScoreSegmented(shards, q, 10, nil); ok {
+			t.Fatalf("%s segmented without pinned support, want decline", pattern)
+		}
+	}
+}
+
+// TestScoreSegmentedMasksExact proves MatchGathered unions every shape
+// exactly, including the ones ScoreSegmented declines: masks never score.
+func TestScoreSegmentedMasksExact(t *testing.T) {
+	shards := gatherShardCorpus(4, 2000)
+	shards = append(shards, Shard{Ix: NewIndex()}, Shard{})
+	single := gatherSingleCorpus(4, 2000)
+	for _, pattern := range []string{
+		"common", "zipf AND common", `"tied tie"`, `zipf OR common`,
+		`zipf~1`, `zip*`, `zipf THEN/0 common`, `common^2`,
+	} {
+		q := gatherQuery(t, shards, pattern)
+		got := MatchGathered(shards, q, nil)
+		want := single.Match(q, nil)
+		if len(got) != len(want) {
+			t.Fatalf("%s: %d docs, want %d", pattern, len(got), len(want))
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("%s doc %d = %d, want %d", pattern, i, got[i], want[i])
+			}
+		}
+	}
+}
+
+// TestRefreshSegmentedStatsExact proves segmented statistics are the
+// single index's bit for bit: totals, term frequencies, and span-node
+// document frequencies across terms, booleans, phrases, proximity,
+// filters, and boosts.
+func TestRefreshSegmentedStatsExact(t *testing.T) {
+	shards := gatherShardCorpus(4, 2000)
+	single := gatherSingleCorpus(4, 2000)
+	for _, pattern := range []string{
+		"common", "zipf AND common", `"tied tie"`, `zipf OR common`,
+		`common NEAR/3 zipf`, `tied THEN/0 tie`, `zipf~1`, `zip*`,
+		`common IN FIRST 100 WORDS`, `common^2`,
+		`AT LEAST 2 OF [common zipf tied]`, `missing`,
+	} {
+		q := gatherQuery(t, shards, pattern)
+		got := RefreshSegmentedStats(shards, q, nil)
+		want := single.RefreshScoreStats(q, nil)
+		if got.nDocs != want.nDocs || got.avg != want.avg {
+			t.Fatalf("%s: totals (%d, %v), want (%d, %v)",
+				pattern, got.nDocs, got.avg, want.nDocs, want.avg)
+		}
+		if len(got.idfs) != len(want.idfs) {
+			t.Fatalf("%s: %d idfs, want %d", pattern, len(got.idfs), len(want.idfs))
+		}
+		for i := range got.idfs {
+			if got.idfs[i] != want.idfs[i] {
+				t.Fatalf("%s idf %d = %v, want %v", pattern, i, got.idfs[i], want.idfs[i])
+			}
+		}
 	}
 }

@@ -52,6 +52,7 @@ func (ix *Index) ParseTINQL(input string) (Query, error) {
 	if !p.eof() {
 		return Query{}, p.errorf("unexpected trailing input")
 	}
+	q.Expanded = p.expanded
 	return q, nil
 }
 
@@ -82,6 +83,11 @@ type tinParser struct {
 	// ':' is rejected there (it needs an explicit operator after
 	// another expression); explicit positions allow it.
 	implicitOperand bool
+	// expanded records dictionary expansion: a wildcard, fuzzy,
+	// MATCHES, or range operator shaped the query from the index's
+	// vocabulary. Segmented search serves only unexpanded queries from
+	// one parse, since each shard would expand the pattern differently.
+	expanded bool
 }
 
 // rejectSpanStar errors when a span, relation, or positional operator
@@ -1006,6 +1012,7 @@ func patternWordRune(s string) (bool, int) {
 // whole-pattern alternatives as before.
 func (p *tinParser) finishWildcard(unescaped string) (Query, error) {
 	if pieces := splitPattern(unescaped); len(pieces) > 1 {
+		p.expanded = true
 		slots := make([]PhrasePos, len(pieces))
 		for i, pc := range pieces {
 			var alts []uint64
@@ -1041,6 +1048,7 @@ func (p *tinParser) finishWildcard(unescaped string) (Query, error) {
 
 // wholeWildcard expands one boundary-free pattern to alternatives.
 func (p *tinParser) wholeWildcard(unescaped string) (Query, error) {
+	p.expanded = true
 	hashes, err := p.ix.expandWildcard(foldPattern(unescaped))
 	if err != nil {
 		return Query{}, err
@@ -1097,6 +1105,7 @@ func (p *tinParser) scanFuzzyHashes(term uint64) ([]uint64, error) {
 	if err != nil {
 		return nil, err
 	}
+	p.expanded = true
 	// The dictionary spelling of the exact term anchors the neighborhood.
 	spell, ok := p.ix.dict[term]
 	if !ok {
@@ -1168,6 +1177,7 @@ func (p *tinParser) parseRangeBound() (*string, error) {
 // rangeQuery builds an inclusive term-dictionary range; a reversed range
 // matches nothing.
 func (p *tinParser) rangeQuery(lo, hi *string) (Query, error) {
+	p.expanded = true
 	if lo != nil && hi != nil && *lo > *hi {
 		return Query{Op: OpOr}, nil
 	}
@@ -1246,6 +1256,7 @@ done:
 	if p.pos == start {
 		return Query{}, p.errorf("expected a pattern after MATCHES")
 	}
+	p.expanded = true
 	re, err := regexp.Compile("^(?:" + string(sb) + ")$")
 	if err != nil {
 		return Query{}, p.errorf("bad pattern: %v", err)

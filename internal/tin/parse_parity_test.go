@@ -369,3 +369,40 @@ func TestParityLockedReference(t *testing.T) {
 		}
 	}
 }
+
+// PlanetScale parity plumbing: queries shaped by dictionary expansion
+// report Expanded, so segmented search serves only unexpanded queries
+// from one parse — each shard would expand the pattern differently.
+func TestParityExpandedFlag(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "brewery beer")
+	plain := []string{
+		`beer`, `beer AND brewery`, `"beer brewery"`, `wi-fi`,
+		`beer IN FIRST 10 WORDS`, `AT LEAST 1 OF [beer brewery]`,
+		`CONTAINS beer`,
+	}
+	for _, input := range plain {
+		q, err := ix.ParseTINQL(input)
+		if err != nil {
+			t.Fatalf("%s: %v", input, err)
+		}
+		if q.Expanded {
+			t.Fatalf("%s reported Expanded, want unexpanded", input)
+		}
+	}
+	expanded := []string{
+		`brew*`, `b?er`, `beer~1`, `e-mail*`, `e-mail~1`,
+		`MATCHES br.*y`, `CONTAINS brew*`, `CONTAINS beer~1`,
+		`aal TO abz`, `* TO beer`,
+		`AT LEAST 1 OF [brew* brewery]`,
+	}
+	for _, input := range expanded {
+		q, err := ix.ParseTINQL(input)
+		if err != nil {
+			t.Fatalf("%s: %v", input, err)
+		}
+		if !q.Expanded {
+			t.Fatalf("%s reported unexpanded, want Expanded", input)
+		}
+	}
+}

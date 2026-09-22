@@ -75,6 +75,69 @@ func (ix *Index) RefreshScoreStats(q Query, st *ScoreStats) *ScoreStats {
 	return st
 }
 
+// RefreshSegmentedStats recomputes st for q over shards exactly as
+// RefreshScoreStats would over their union: document and token totals
+// sum, term frequencies sum postings counts, and span nodes merge their
+// per-shard matches. The preorder — and therefore every idf — matches
+// scoreSingleInto's consumption order exactly, so per-row SCORE() values
+// stay bit-identical to the single index. Buffers persist across
+// refreshes, so warm executions allocate nothing beyond the merge's
+// shard-bounded heap.
+func RefreshSegmentedStats(shards []Shard, q Query, st *ScoreStats) *ScoreStats {
+	if st == nil {
+		st = &ScoreStats{}
+	}
+	nDocs := 0
+	var tokens uint64
+	for i := range shards {
+		ix := shards[i].Ix
+		if ix == nil {
+			continue
+		}
+		ix.mu.Lock()
+		nDocs += ix.nDocs
+		tokens += ix.tokens
+		ix.mu.Unlock()
+	}
+	st.nDocs = nDocs
+	if nDocs == 0 {
+		st.avg = 0
+	} else {
+		st.avg = float64(tokens) / float64(nDocs)
+	}
+	st.idfs = st.idfs[:0]
+	var walk func(q Query)
+	walk = func(q Query) {
+		switch q.Op {
+		case OpTerm:
+			n := 0
+			for i := range shards {
+				ix := shards[i].Ix
+				if ix == nil {
+					continue
+				}
+				ix.mu.Lock()
+				if p := ix.post[q.Term]; p != nil {
+					n += p.docCount()
+				}
+				ix.mu.Unlock()
+			}
+			st.idfs = append(st.idfs, idf(nDocs, n))
+		case OpPhrase,
+			OpThen, OpNear, OpWithin,
+			OpEncloses, OpEnclosedBy, OpOverlapping, OpBefore, OpAfter,
+			OpFilter:
+			st.buf = MatchGathered(shards, q, st.buf[:0])
+			st.idfs = append(st.idfs, idf(nDocs, len(st.buf)))
+		}
+		for _, k := range q.Kids {
+			walk(k)
+		}
+	}
+	walk(q)
+	return st
+}
+
 // ScoreSingle reports text's BM25 score for q under the pinned statistics,
 // with the same value ix.Score attributes to the document. A row that does
 // not match scores 0 (like an unscored document, which simply has no

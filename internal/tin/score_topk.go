@@ -42,8 +42,22 @@ func (ix *Index) scoreSingleTopK(term uint64, boost float64, topK int, out []Sco
 	if topK <= 0 || topK >= n {
 		return out, false
 	}
-	idfV := idf(ix.nDocs, n)
-	avg := float64(ix.tokens) / float64(ix.nDocs)
+	return ix.scoreSingleTopKCore(p, ix.nDocs, float64(ix.tokens)/float64(ix.nDocs), n,
+		boost, topK, out)
+}
+
+// scoreSingleTopKCore scores one term's list into a sorted top-K run with
+// caller-supplied corpus statistics, so indexes sharing one stats view
+// rank identically. A missing list contributes nothing; unlike the
+// routed wrapper it never declines, since a shard's shortfall still
+// merges exactly. Callers guarantee topK > 0: the heap root read below
+// needs a nonempty heap once full.
+func (ix *Index) scoreSingleTopKCore(p *postings, nDocs int, avg float64, df int,
+	boost float64, topK int, out []Scored) ([]Scored, bool) {
+	if p == nil || nDocs == 0 {
+		return out, true
+	}
+	idfV := idf(nDocs, df)
 	h := ix.topHeap[:0]
 	if p.sealed == nil {
 		h = ix.scoreOpenTopK(p, idfV, avg, boost, topK, h)

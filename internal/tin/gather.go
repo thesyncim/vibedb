@@ -47,6 +47,129 @@ func ScoreGathered(shards []Shard, q Query, topK int, out []Scored) []Scored {
 	return mergeScored(runs, topK, out)
 }
 
+// SegGlobals is one corpus-wide statistics view every segment ranks
+// under: total documents, average length, and each scoring term's global
+// document frequency. Segments searched under one view produce the same
+// scores the single index over their union would, so the merge is exact
+// where ScoreGathered's per-segment idfs are only Lucene-approximate.
+type SegGlobals struct {
+	nDocs int
+	avg   float64
+	df    map[uint64]int
+}
+
+// gatherSegGlobals sums corpus statistics over shards: documents, tokens,
+// and per-term document frequencies from postings counts, never matches,
+// so gathering costs O(shards × terms).
+func gatherSegGlobals(shards []Shard, terms []uint64) SegGlobals {
+	var g SegGlobals
+	var tokens uint64
+	g.df = make(map[uint64]int, len(terms))
+	for i := range shards {
+		ix := shards[i].Ix
+		if ix == nil {
+			continue
+		}
+		ix.mu.Lock()
+		g.nDocs += ix.nDocs
+		tokens += ix.tokens
+		for _, t := range terms {
+			if p := ix.post[t]; p != nil {
+				g.df[t] += p.docCount()
+			}
+		}
+		ix.mu.Unlock()
+	}
+	if g.nDocs > 0 {
+		g.avg = float64(tokens) / float64(g.nDocs)
+	}
+	return g
+}
+
+// ScorePinned scores like Score's top-K fast path but under gs, reporting
+// false when q leaves the pinned shapes (anything but a term or an
+// all-term AND with topK > 0). Shard shortfalls still report true —
+// missing lists and empty intersections contribute nothing — so only
+// shape and fast-gate declines veto the merge.
+func (ix *Index) ScorePinned(q Query, topK int, out []Scored, gs *SegGlobals) ([]Scored, bool) {
+	if gs == nil || topK <= 0 {
+		return out, false
+	}
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	ix.ensureSorted()
+	switch q.Op {
+	case OpTerm:
+		// gs covers q's own terms, so a missing key means the term is
+		// absent everywhere: df 0, and the nil list below contributes
+		// nothing.
+		return ix.scoreSingleTopKCore(ix.post[q.Term], gs.nDocs, gs.avg,
+			gs.df[q.Term], q.boostOf(), topK, out)
+	case OpAnd:
+		kids := q.Kids
+		if len(kids) == 0 || !allTerms(kids) {
+			return out, false
+		}
+		return ix.scoreAndTopKCore(kids, q.boostOf(), topK, out, gs.nDocs,
+			gs.avg, func(term uint64) int { return gs.df[term] })
+	}
+	return out, false
+}
+
+// ScoreSegmented scores q on every shard in parallel under one shared
+// statistics view and merges the exact global top-K. It reports false
+// when q leaves the pinned shapes or any shard declines its fast gate;
+// the caller serves those shapes another way (single index, ordinary
+// scan). Nil shards contribute nothing. Buffer rules match ScoreGathered.
+func ScoreSegmented(shards []Shard, q Query, topK int, out []Scored) ([]Scored, bool) {
+	if topK <= 0 {
+		return out, false
+	}
+	var terms []uint64
+	switch q.Op {
+	case OpTerm:
+		terms = []uint64{q.Term}
+	case OpAnd:
+		if len(q.Kids) == 0 || !allTerms(q.Kids) {
+			return out, false
+		}
+		terms = make([]uint64, len(q.Kids))
+		for i, k := range q.Kids {
+			terms[i] = k.Term
+		}
+	default:
+		return out, false
+	}
+	gs := gatherSegGlobals(shards, terms)
+	if gs.nDocs == 0 {
+		return out, true
+	}
+	runs := make([][]Scored, len(shards))
+	oks := make([]bool, len(shards))
+	var wg sync.WaitGroup
+	for i := range shards {
+		if shards[i].Ix == nil {
+			oks[i] = true
+			continue
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			s, ok := shards[i].Ix.ScorePinned(q, topK, shards[i].Out[:0], &gs)
+			shards[i].Out = s
+			runs[i] = s
+			oks[i] = ok
+		}(i)
+	}
+	wg.Wait()
+	for _, ok := range oks {
+		if !ok {
+			return out, false
+		}
+	}
+	return mergeScored(runs, topK, out), true
+}
+
 // MatchGathered matches q on every shard in parallel and merges the union
 // of matching DocIDs, deduplicated, into out. Each per-shard run arrives
 // DocID-sorted, so the union merge is linear. A nil shard index
@@ -75,6 +198,30 @@ func gatherScores(shards []Shard, q Query, topK int) [][]Scored {
 	}
 	wg.Wait()
 	return runs
+}
+
+// MatchGatheredQueries matches one query per shard in parallel and merges
+// the deduplicated union. It serves patterns whose dictionary expansion
+// differs per shard: each shard matches the pattern parsed against its
+// own vocabulary, so the union covers every shard's expansions exactly.
+// queries parallels shards; a nil index's query is ignored. Buffer rules
+// match MatchGathered.
+func MatchGatheredQueries(shards []Shard, queries []Query, out []DocID) []DocID {
+	runs := make([][]DocID, len(shards))
+	var wg sync.WaitGroup
+	for i := range shards {
+		if shards[i].Ix == nil || i >= len(queries) {
+			continue
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			shards[i].DocOut = shards[i].Ix.Match(queries[i], shards[i].DocOut[:0])
+			runs[i] = shards[i].DocOut
+		}(i)
+	}
+	wg.Wait()
+	return mergeDocIDs(runs, out)
 }
 
 // gatherMatches runs one Match per shard, each on its own goroutine.
