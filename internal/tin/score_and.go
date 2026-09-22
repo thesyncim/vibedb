@@ -44,6 +44,24 @@ func (ix *Index) scoreAndTopK(q Query, topK int, out []Scored) ([]Scored, bool) 
 	if topK <= 0 || len(kids) == 0 || !allTerms(kids) {
 		return out, false
 	}
+	return ix.scoreAndTopKCore(kids, q.boostOf(), topK, out, ix.nDocs,
+		float64(ix.tokens)/float64(max(ix.nDocs, 1)), func(term uint64) int {
+			if p := ix.post[term]; p != nil {
+				return p.docCount()
+			}
+			return 0
+		})
+}
+
+// scoreAndTopKCore is scoreAndTopK with caller-supplied corpus statistics:
+// nDocs and avg anchor the shared view every shard ranks under, while df
+// resolves each kid's global document frequency. List handling — the
+// missing-kid empty, shortest-first reorder, selectivity gates — stays
+// local: it gates the shard's own work. A shard missing a kid, or holding
+// no documents, contributes nothing and still reports true, so the merge
+// stays exact.
+func (ix *Index) scoreAndTopKCore(kids []Query, boost float64, topK int, out []Scored,
+	nDocs int, avg float64, df func(term uint64) int) ([]Scored, bool) {
 	// Pre-gate on bare document frequencies, before paying a match.
 	lists := ix.termLists[:0]
 	total := 0
@@ -59,9 +77,13 @@ func (ix *Index) scoreAndTopK(q Query, topK int, out []Scored) ([]Scored, bool) 
 		total += p.docCount()
 	}
 	ix.termLists = lists
+	// Shortest-first by the shared df view, not local counts: every
+	// shard then accumulates kid scores in the single index's own kid
+	// order, keeping the merged sums bit-identical. Locally df is the
+	// list count, so the routed path orders exactly as before.
 	short := 0
 	for i := range lists {
-		if lists[i].docCount() < lists[short].docCount() {
+		if df(kids[i].Term) < df(kids[short].Term) {
 			short = i
 		}
 	}
@@ -78,10 +100,9 @@ func (ix *Index) scoreAndTopK(q Query, topK int, out []Scored) ([]Scored, bool) 
 	if int64(len(keep))*int64(len(lists)) > int64(total) {
 		return out, false
 	}
-	if len(keep) == 0 || ix.nDocs == 0 {
+	if len(keep) == 0 || nDocs == 0 {
 		return out, true
 	}
-	avg := float64(ix.tokens) / float64(ix.nDocs)
 	dl := ix.andDL[:0]
 	for _, d := range keep {
 		dl = append(dl, float64(ix.docLength(d)))
@@ -92,10 +113,8 @@ func (ix *Index) scoreAndTopK(q Query, topK int, out []Scored) ([]Scored, bool) 
 	}
 	for ki, k := range kids {
 		p := lists[ki]
-		n := p.docCount()
-		ix.andKidScores(p, n, idf(ix.nDocs, n), avg, k.boostOf(), poss[ki], dl, sums)
+		ix.andKidScores(p, idf(nDocs, df(k.Term)), avg, k.boostOf(), poss[ki], dl, sums)
 	}
-	boost := q.boostOf()
 	h := ix.topHeap[:0]
 	for i, d := range keep {
 		h = heapPush(h, topK, Scored{Doc: d, Score: sums[i] * boost})
@@ -217,27 +236,20 @@ func (ix *Index) andFreqAt(p *postings, pos int) uint32 {
 // into sums, reading frequencies by position. Positions below the list's
 // odd tail stage for the kernel; a matched tail runs scalar, exactly
 // like the kernel's own tail.
-func (ix *Index) andKidScores(p *postings, n int, idfV, avg, kidBoost float64, poss []int, dl, sums []float64) {
+func (ix *Index) andKidScores(p *postings, idfV, avg, kidBoost float64, poss []int, dl, sums []float64) {
 	ptf := ix.andPTF[:0]
 	pdl := ix.andPDL[:0]
 	pidx := ix.andPIdx[:0]
-	paired := n &^ 1
 	for i, pos := range poss {
-		f := ix.andFreqAt(p, pos)
-		if pos < paired {
-			ptf = append(ptf, float64(f))
-			pdl = append(pdl, dl[i])
-			pidx = append(pidx, i)
-			continue
-		}
-		sums[i] += bm25One(idfV, avg, kidBoost, float64(f), dl[i])
+		ptf = append(ptf, float64(ix.andFreqAt(p, pos)))
+		pdl = append(pdl, dl[i])
+		pidx = append(pidx, i)
 	}
-	if len(ptf)%2 == 1 {
-		// Lanes compute independently: padding with any value rounds
-		// every real element exactly as a paired lane.
-		ptf = append(ptf, ptf[len(ptf)-1])
-		pdl = append(pdl, pdl[len(pdl)-1])
-	}
+	// Every keep document rides the kernel lanes (odd counts pad
+	// inside bm25Scores): lane assignment never depends on list
+	// length, so sharded and single indexes score each document
+	// identically. Routing tails through the scalar spelling instead
+	// measured 1-ulp flips that broke rank identity.
 	if len(ptf) > 0 {
 		sc := bm25Scores(idfV, avg, kidBoost, ptf, pdl, ix.scoreOut[:0])
 		for j, i := range pidx {

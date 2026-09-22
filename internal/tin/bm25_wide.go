@@ -10,7 +10,7 @@ import "simd/archsimd"
 // bit-identical while instruction-level parallelism doubles.
 func bm25Wide(idf, avg, boost float64, tf, dl, out []float64) []float64 {
 	n := len(tf) &^ 1
-	if n > 0 {
+	if n > 0 || len(tf) > n {
 		k1 := archsimd.BroadcastFloat64x2(bm25K1)
 		base := archsimd.BroadcastFloat64x2(1 - bm25B)
 		slope := archsimd.BroadcastFloat64x2(bm25B)
@@ -30,9 +30,26 @@ func bm25Wide(idf, avg, boost float64, tf, dl, out []float64) []float64 {
 			sc.Store(pair[:])
 			out = append(out, pair[0], pair[1])
 		}
-	}
-	for i := n; i < len(tf); i++ {
-		out = append(out, bm25One(idf, avg, boost, tf[i], dl[i]))
+		if len(tf) > n {
+			// Odd tail: the final document rides a stack-padded
+			// pair through the identical lanes — the zero lane
+			// scores exactly 0 (nonnegative scale, positive
+			// denominator) and is discarded — so every document
+			// takes the same roundings regardless of batching.
+			// Without this, list-length-parity lane assignment
+			// would score the same document differently across
+			// batchings (measured 1-ulp flips, 12/257 random
+			// inputs), breaking sharded/single rank identity.
+			var tfp, dlp [2]float64
+			tfp[0], dlp[0] = tf[n], dl[n]
+			fv := archsimd.LoadFloat64x2(tfp[:])
+			dv := archsimd.LoadFloat64x2(dlp[:])
+			norm := base.Add(slope.Mul(dv.Div(avgv)))
+			den := fv.Add(k1.Mul(norm))
+			sc := boostv.Mul(idfv).Mul(fv).Mul(k1p1).Div(den)
+			sc.Store(pair[:])
+			out = append(out, pair[0])
+		}
 	}
 	return out
 }

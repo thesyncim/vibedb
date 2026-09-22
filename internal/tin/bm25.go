@@ -3,10 +3,13 @@ package tin
 // BM25 arithmetic dispatch: bm25Scores evaluates the Okapi formula over
 // parallel tf/dl slices. The vector kernel (bm25_wide.go) handles pairs with
 // Float64x2; everywhere else bm25Scalar runs. Both spell the same formula,
-// but bit-identity between them is unachievable: the compiler fuses an FMA
-// into the scalar denominator on some targets while the vector kernel keeps
-// separate roundings. The differential test therefore demands 1e-12 relative
-// agreement, which never flips a ranking — ties break by DocID.
+// but bit-identity between the spellings is unachievable: the vector lanes
+// round differently from scalar on some inputs (measured 1-ulp flips, so a
+// "never flips a ranking" claim would be false). The kernel therefore pads
+// odd tails through its own lanes instead of the scalar tail, making every
+// document's score independent of batching: sharded and single indexes
+// agree bit for bit. The cross-spelling differential demands 1e-12 relative
+// agreement; bm25One stays the uniform scalar for single-document paths.
 
 // bm25Impl is the scoring kernel in force, selected by per-arch enable
 // files exactly like the fold kernel.

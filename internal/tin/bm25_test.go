@@ -40,3 +40,24 @@ func BenchmarkBM25Kernel(b *testing.B) {
 		}
 	})
 }
+
+// TestBM25BatchingIndependent proves every document scores identically
+// whether it lands in a vector pair or the padded odd tail: the kernel's
+// output for a document depends only on its own inputs, never on
+// batching. Sharded and single indexes chunk lists differently, so this
+// is the foundation of their rank identity.
+func TestBM25BatchingIndependent(t *testing.T) {
+	var tf, dl []float64
+	for i := 0; i < 65; i++ {
+		tf = append(tf, float64(1+(i*37)%64))
+		dl = append(dl, float64(1+(i*101)%300))
+	}
+	const idf, avg, boost = 2.5, 150.0, 1.0
+	full := bm25Scores(idf, avg, boost, tf, dl, nil)
+	for i := range tf {
+		one := bm25Scores(idf, avg, boost, tf[i:i+1], dl[i:i+1], nil)
+		if one[0] != full[i] {
+			t.Fatalf("doc %d: batched %v, solo %v", i, full[i], one[0])
+		}
+	}
+}
