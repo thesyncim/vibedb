@@ -213,3 +213,40 @@ func BenchmarkTransientMatchTerm(b *testing.B)   { benchmarkTransient(b, `apple 
 func BenchmarkTransientMatchPhrase(b *testing.B) { benchmarkTransient(b, `"apple banana"`, false) }
 func BenchmarkTransientScoreTerm(b *testing.B)   { benchmarkTransient(b, `apple AND banana`, true) }
 func BenchmarkTransientScorePhrase(b *testing.B) { benchmarkTransient(b, `"apple banana"`, true) }
+
+// benchmarkMatchStop runs MatchSingle over a long document with the term
+// at the given position, pinning early-exit behavior: a leading hit
+// scans a prefix, a missing term scans everything.
+func benchmarkMatchStop(b *testing.B, doc, input string, want bool) {
+	b.Helper()
+	ix := NewIndex()
+	ix.Add(1, doc)
+	q, err := ix.ParseTINQL(input)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var scratch TextScratch
+	if got := MatchSingle(doc, q, &scratch); got != want {
+		b.Fatalf("match = %v, want %v", got, want)
+	}
+	b.SetBytes(int64(len(doc)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = MatchSingle(doc, q, &scratch)
+	}
+}
+
+var matchStopBase = transientBenchDoc + " " + transientBenchDoc + " " +
+	transientBenchDoc + " " + transientBenchDoc + " trailing words here"
+
+func BenchmarkMatchStopEarly(b *testing.B) {
+	benchmarkMatchStop(b, "needle "+matchStopBase, `needle`, true)
+}
+func BenchmarkMatchStopLate(b *testing.B) {
+	benchmarkMatchStop(b, matchStopBase+" needle", `needle`, true)
+}
+func BenchmarkMatchStopAbsent(b *testing.B) {
+	benchmarkMatchStop(b, matchStopBase, `absentterm`, false)
+}
+func BenchmarkMatchStopAll(b *testing.B) { benchmarkMatchStop(b, matchStopBase, `*`, true) }

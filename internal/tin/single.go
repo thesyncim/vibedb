@@ -2,6 +2,7 @@ package tin
 
 import (
 	"slices"
+	"unicode/utf8"
 )
 
 // Transient single-document matching. MatchSingle answers whether one text
@@ -132,15 +133,298 @@ func matchUnsorted(pairs []tokPos, q Query) bool {
 // MatchSingle reports whether text matches q. q must be parsed (expansions
 // resolved); expansion operators never appear because ParseTINQL desugars
 // them, and a zero OpOr (empty expansion) matches nothing.
+// stopCap bounds the stop set: queries with more distinct terms fall back
+// to the full scan, which stays exact. Sixteen covers every realistic
+// recheck while keeping the tracking on the stack, so the hot path grows
+// no struct and allocates nothing.
+const stopCap = 16
+
+// decideUnsorted evaluates boolean structure over the distinct terms
+// found so far, without assuming the scan finished: done reports the
+// verdict is final (a later token cannot change it), verdict its value.
+// At end of text the verdict equals matchUnsorted exactly — duplicates
+// never affect membership, and every arm mirrors evalInto's emptiness,
+// including the zero-match AtLeast edge.
+func decideUnsorted(q Query, found []tokPos, eof bool) (done, verdict bool) {
+	has := func(term uint64) bool {
+		for _, tp := range found {
+			if tp.hash == term {
+				return true
+			}
+		}
+		return false
+	}
+	switch q.Op {
+	case OpTerm:
+		if has(q.Term) {
+			return true, true
+		}
+		if eof {
+			return true, false
+		}
+		return false, false
+	case OpAll:
+		return true, true
+	case OpAnd:
+		if len(q.Kids) == 0 {
+			return true, false
+		}
+		allTrue := true
+		for i := range q.Kids {
+			d, v := decideUnsorted(q.Kids[i], found, eof)
+			if d && !v {
+				return true, false
+			}
+			if !d || !v {
+				allTrue = false
+			}
+		}
+		if allTrue {
+			return true, true
+		}
+		if eof {
+			return true, false
+		}
+		return false, false
+	case OpOr:
+		if len(q.Kids) == 0 {
+			return true, false
+		}
+		allFalse := true
+		for i := range q.Kids {
+			d, v := decideUnsorted(q.Kids[i], found, eof)
+			if d && v {
+				return true, true
+			}
+			if !d || v {
+				allFalse = false
+			}
+		}
+		if allFalse || eof {
+			return true, false
+		}
+		return false, false
+	case OpAndNot:
+		if len(q.Kids) == 0 {
+			return true, false
+		}
+		d0, v0 := decideUnsorted(q.Kids[0], found, eof)
+		if d0 && !v0 {
+			return true, false
+		}
+		allBannedFalse := true
+		for _, k := range q.Kids[1:] {
+			d, v := decideUnsorted(k, found, eof)
+			if d && v {
+				return true, false
+			}
+			if !d || v {
+				allBannedFalse = false
+			}
+		}
+		if d0 && v0 && allBannedFalse {
+			return true, true
+		}
+		if eof {
+			return true, false
+		}
+		return false, false
+	case OpAtLeast:
+		matched := 0
+		for i := range q.Kids {
+			if d, v := decideUnsorted(q.Kids[i], found, eof); d && v {
+				matched++
+			}
+		}
+		if matched > 0 && matched >= q.Threshold {
+			return true, true
+		}
+		if eof {
+			return true, false
+		}
+		return false, false
+	default:
+		return false, false
+	}
+}
+
+// collectTerms gathers the query's distinct term hashes for the stop
+// set; structural operators contribute none. It reports false when the
+// set would overflow the caller's bounded buffer, in which case the
+// caller scans fully.
+func collectTerms(q *Query, out []uint64) ([]uint64, bool) {
+	if q.Op == OpTerm {
+		for _, h := range out {
+			if h == q.Term {
+				return out, true
+			}
+		}
+		if len(out) == cap(out) {
+			return nil, false
+		}
+		return append(out, q.Term), true
+	}
+	for i := range q.Kids {
+		var ok bool
+		if out, ok = collectTerms(&q.Kids[i], out); !ok {
+			return nil, false
+		}
+	}
+	return out, true
+}
+
+// scanPairsUntil tokenizes like scanPairs but returns once the distinct
+// terms found decide the verdict. Each outer iteration completes at most
+// one token (a separator or rune flushes at most once; word runs never
+// flush), so one top-of-loop hook observes every completion: membership
+// probe unrolled for the dominant single-term shape, dedupe, and the
+// decide walk on growth only — no calls on the hot path, which is what
+// keeps full scans near the untracked cost. Flush stays lean and
+// inlineable. Overshoot is bounded by one trailing word; its pairs are
+// ordinary scratch. Everything is values over caller-stack buffers, so
+// the scan allocates nothing by construction.
+func scanPairsUntil(text string, out []tokPos, q Query, needed []uint64, found []tokPos) ([]tokPos, []tokPos, bool, bool) {
+	s := pairScanner{out: out, h: fnvOffset}
+	i, n, base := 0, len(text), len(out)
+	for i < n {
+		if len(s.out) > base {
+			base = len(s.out)
+			h := s.out[base-1].hash
+			member := len(needed) == 1 && needed[0] == h
+			if !member {
+				for _, t := range needed {
+					if t == h {
+						member = true
+						break
+					}
+				}
+			}
+			if member {
+				dup := false
+				for _, tp := range found {
+					if tp.hash == h {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					found = append(found, tokPos{hash: h})
+					if d, v := decideUnsorted(q, found, false); d {
+						return s.out, found, true, v
+					}
+				}
+			}
+		}
+		c := text[i]
+		if c >= utf8.RuneSelf {
+			r, size := utf8.DecodeRuneInString(text[i:])
+			s.feed(r, size)
+			i += size
+			continue
+		}
+		if b := scanTab[c]; b == 0 {
+			s.flush()
+			i++
+			continue
+		}
+		if !s.inWord {
+			s.h = fnvOffset
+			s.inWord = true
+		}
+		h := s.h
+		for i < n {
+			c := text[i]
+			if c >= utf8.RuneSelf {
+				break
+			}
+			b := scanTab[c]
+			if b == 0 {
+				break
+			}
+			h = mix(h, b)
+			i++
+		}
+		s.h = h
+	}
+	s.flush()
+	if len(s.out) > base {
+		h := s.out[len(s.out)-1].hash
+		member := len(needed) == 1 && needed[0] == h
+		if !member {
+			for _, t := range needed {
+				if t == h {
+					member = true
+					break
+				}
+			}
+		}
+		if member {
+			dup := false
+			for _, tp := range found {
+				if tp.hash == h {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				found = append(found, tokPos{hash: h})
+				if d, v := decideUnsorted(q, found, false); d {
+					return s.out, found, true, v
+				}
+			}
+		}
+	}
+	return s.out, found, false, false
+}
+
+// matchStopScan answers term-boolean structure while scanning, stopping
+// once the distinct terms found decide the verdict: recheck candidates
+// are index-positive, so their terms are present and the exit fires on
+// nearly every row. Stale or over-accepted rows fall through to the full
+// scan, which matchUnsorted answers exactly. Tracking rides bounded
+// caller-stack buffers (found never outgrows needed, both capped), so
+// oversized stop sets and degenerate term-free structure fall back to
+// the exact full scan.
+func matchStopScan(text string, q Query, scratch *TextScratch) bool {
+	var neededBuf [stopCap]uint64
+	needed, ok := collectTerms(&q, neededBuf[:0])
+	if !ok || len(needed) == 0 {
+		pairs := scanPairs(text, scratch.pairs[:0])
+		scratch.pairs = pairs
+		return matchUnsorted(pairs, q)
+	}
+	var foundBuf [stopCap]tokPos
+	out, found, stopped, verdict := scanPairsUntil(text, scratch.pairs[:0], q, needed, foundBuf[:0])
+	scratch.pairs = out
+	if stopped {
+		return verdict
+	}
+	return matchUnsorted(found, q)
+}
+
 func MatchSingle(text string, q Query, scratch *TextScratch) bool {
 	// scanPairs, not scanString: the emit closure escapes to the heap on
 	// every call, while the slice-threading scanner allocates only on
 	// growth, so warm scratch makes this call free.
-	pairs := scanPairs(text, scratch.pairs[:0])
 	if !needsPositions(q) {
+		// Early exit pays exactly when the verdict can precede end of
+		// text: single terms, alternatives, and thresholds decide on
+		// presence, while conjunctions need the last term and banned
+		// terms need the whole text — tracking would tax every token
+		// for an exit that rarely fires, so those scan fully.
+		switch q.Op {
+		case OpTerm, OpOr, OpAtLeast, OpAll:
+			if q.Op == OpAll {
+				scratch.pairs = scratch.pairs[:0]
+				return true
+			}
+			return matchStopScan(text, q, scratch)
+		}
+		pairs := scanPairs(text, scratch.pairs[:0])
 		scratch.pairs = pairs
 		return matchUnsorted(pairs, q)
 	}
+	pairs := scanPairs(text, scratch.pairs[:0])
 	sortTokPos(pairs)
 	scratch.pairs = pairs
 	length := uint32(0)
