@@ -53,6 +53,37 @@ func (s *Snapshot) TinIndexForPath(path string) (*tin.Index, error) {
 	return s.collection.TinIndexForPath(s, path)
 }
 
+// TinIndex returns the tin index built over the snapshot's generation for
+// the named declaration, building it on first use by scanning the
+// generation's own documents. The index is shared by every concurrent
+// reader of the generation and must not be mutated. A snapshot whose
+// pinned catalog declares no tin index under name reports
+// store.ErrIndexNotFound.
+func (c *Collection) TinIndex(snap *Snapshot, name string) (*tin.Index, error) {
+	if c == nil || snap == nil || snap.state == nil {
+		return nil, fmt.Errorf("%w: snapshot has no state", store.ErrIndexNotFound)
+	}
+	declared := false
+	for _, definition := range snap.indexDefinitions {
+		if definition.Kind == store.IndexTin && definition.Name == name {
+			declared = true
+			break
+		}
+	}
+	if !declared {
+		return nil, store.ErrIndexNotFound
+	}
+	build, err := c.tinBuild(snap)
+	if err != nil {
+		return nil, err
+	}
+	ix, ok := build.indexes[name]
+	if !ok {
+		return nil, store.ErrIndexNotFound
+	}
+	return ix, nil
+}
+
 // TinIndexForPath returns the tin index built over the snapshot's generation
 // for the first definition covering path. The index is shared by every
 // concurrent reader of the generation and must not be mutated. A snapshot

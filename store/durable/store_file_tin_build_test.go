@@ -116,3 +116,32 @@ func TestDurableTinSearchErrors(t *testing.T) {
 		t.Fatal("invalid TINQL = nil")
 	}
 }
+
+// The by-name accessor resolves the same generation-pinned build the path
+// accessor returns, and reports ErrIndexNotFound for anything the pinned
+// catalog does not declare — mirroring the heap Collection contract.
+func TestDurableTinIndexByName(t *testing.T) {
+	_, docs := openTinDatabase(t)
+	snap, err := docs.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	byName, err := docs.TinIndex(snap, "body_tin")
+	if err != nil {
+		t.Fatalf("TinIndex(body_tin): %v", err)
+	}
+	byPath, err := docs.TinIndexForPath(snap, "/body")
+	if err != nil {
+		t.Fatalf("TinIndexForPath(/body): %v", err)
+	}
+	if byName != byPath {
+		t.Fatal("by-name and by-path accessors built different indexes")
+	}
+	if _, err := docs.TinIndex(snap, "missing"); !errors.Is(err, store.ErrIndexNotFound) {
+		t.Fatalf("TinIndex(missing) = %v, want %v", err, store.ErrIndexNotFound)
+	}
+	if _, err := docs.TinIndex(snap, "id_exact"); !errors.Is(err, store.ErrIndexNotFound) {
+		t.Fatalf("TinIndex(exact name) = %v, want %v", err, store.ErrIndexNotFound)
+	}
+}
