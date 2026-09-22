@@ -107,23 +107,60 @@ type scanner struct {
 // data struct, so warm callers allocate only when out must grow.
 // TestScanPairsAgreesWithScanString locks the two together, including the
 // rune fold path.
+// scanTab fuses the ASCII fold and word class into one lookup: 0 means
+// separator, anything else is the folded byte to hash. It builds in
+// init from foldByte/wordClass so the two can never disagree; a var
+// initializer would run before wordClass's own init and read it empty.
+// Multibyte sequences never consult the table (their bytes are not
+// independently foldable).
+var scanTab [256]byte
+
+func init() {
+	for c := 0; c < 256; c++ {
+		if b := foldByte(byte(c)); wordClass[b] {
+			scanTab[c] = b
+		}
+	}
+}
+
 func scanPairs(text string, out []tokPos) []tokPos {
 	s := pairScanner{out: out, h: fnvOffset}
-	for i := 0; i < len(text); {
+	i, n := 0, len(text)
+	for i < n {
 		c := text[i]
-		if c < utf8.RuneSelf {
-			b := foldByte(c)
-			if wordClass[b] {
-				s.take(b)
-			} else {
-				s.flush()
-			}
+		if c >= utf8.RuneSelf {
+			r, size := utf8.DecodeRuneInString(text[i:])
+			s.feed(r, size)
+			i += size
+			continue
+		}
+		if b := scanTab[c]; b == 0 {
+			s.flush()
 			i++
 			continue
 		}
-		r, size := utf8.DecodeRuneInString(text[i:])
-		s.feed(r, size)
-		i += size
+		// ASCII word run: the per-byte in-word branch hoists out, and
+		// the run may still continue through a multibyte letter, so
+		// the token stays open in s (flushed by the next separator,
+		// a breaking rune, or the trailing flush) exactly as before.
+		if !s.inWord {
+			s.h = fnvOffset
+			s.inWord = true
+		}
+		h := s.h
+		for i < n {
+			c := text[i]
+			if c >= utf8.RuneSelf {
+				break
+			}
+			b := scanTab[c]
+			if b == 0 {
+				break
+			}
+			h = mix(h, b)
+			i++
+		}
+		s.h = h
 	}
 	s.flush()
 	return s.out
