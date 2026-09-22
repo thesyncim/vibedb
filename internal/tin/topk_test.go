@@ -6,18 +6,21 @@ import (
 	"testing"
 )
 
-// TestDocLengthDense pins the dense length array: 0-based and 1-based
+// TestDocLengthDense pins the dense length runs: 0-based and 1-based
 // sequential adds stay dense with exact lengths, replace overwrites in
-// place, remove zeroes the slot, and the first sparse jump (or out-of-order
-// arrival) drops the array with the map staying source of truth. Score
-// agreement elsewhere proves the values.
+// place, remove zeroes the slot, and packed (chunk, slot) ids stay dense
+// per chunk instead of dying at the first chunk boundary. Sparse jumps and
+// out-of-order arrivals stay map-served without poisoning their chunk's
+// later contiguous runs, and no sparse id may grow a giant array. Score
+// agreement elsewhere proves the values; every value assertion below is
+// unchanged from the flat-array era.
 func TestDocLengthDense(t *testing.T) {
 	zero := NewIndex()
 	for i := 0; i < 300; i++ {
 		zero.Add(DocID(i), "common filler")
 	}
-	if zero.docLens == nil || len(zero.docLens) != 300 {
-		t.Fatalf("0-based adds: dense array len %d, want 300", len(zero.docLens))
+	if c := zero.docLens[0]; c == nil || len(c.arr) != 300 {
+		t.Fatalf("0-based adds: dense array len %d, want 300", len(c.arr))
 	}
 	for i := 0; i < 300; i++ {
 		if got := zero.docLength(DocID(i)); got != 2 {
@@ -28,13 +31,13 @@ func TestDocLengthDense(t *testing.T) {
 	for i := 1; i <= 300; i++ {
 		one.Add(DocID(i), "common filler extra")
 	}
-	if one.docLens == nil || len(one.docLens) != 300 {
-		t.Fatalf("1-based adds: dense array len %d, want 300", len(one.docLens))
+	if c := one.docLens[0]; c == nil || len(c.arr) != 300 {
+		t.Fatalf("1-based adds: dense array len %d, want 300", len(c.arr))
 	}
 	if got := one.docLength(42); got != 3 {
 		t.Fatalf("doc 42 length = %d, want 3", got)
 	}
-	// Replace overwrites; remove zeroes; both keep the array dense.
+	// Replace overwrites; remove zeroes; both keep the run dense.
 	one.Add(42, "changed")
 	if got := one.docLength(42); got != 1 {
 		t.Fatalf("replaced doc 42 length = %d, want 1", got)
@@ -45,27 +48,58 @@ func TestDocLengthDense(t *testing.T) {
 	if got := one.docLength(43); got != 0 {
 		t.Fatalf("removed doc 43 length = %d, want 0", got)
 	}
-	if one.docLens == nil {
-		t.Fatal("replace/remove dropped a dense array")
+	if one.docLens[0] == nil {
+		t.Fatal("replace/remove dropped a dense run")
 	}
-	// Sparse jump and out-of-order arrival fall back to the map.
+	// Packed ids stay dense per chunk across chunk boundaries; removals
+	// zero their slots in place and keep the run.
+	packed := NewIndex()
+	for chunk := uint32(0); chunk < 3; chunk++ {
+		for slot := 0; slot < 64; slot++ {
+			packed.Add(DocID(uint64(chunk)<<32|uint64(slot)), "common filler")
+		}
+		for slot := 1; slot < 64; slot += 2 {
+			packed.Remove(DocID(uint64(chunk)<<32 | uint64(slot)))
+		}
+	}
+	for chunk := uint32(0); chunk < 3; chunk++ {
+		if c := packed.docLens[chunk]; c == nil || len(c.arr) != 64 {
+			t.Fatalf("chunk %d: dense run len %d, want 64", chunk, len(c.arr))
+		}
+		for slot := 0; slot < 64; slot++ {
+			want := uint32(2)
+			if slot%2 == 1 {
+				want = 0
+			}
+			if got := packed.docLength(DocID(uint64(chunk)<<32 | uint64(slot))); got != want {
+				t.Fatalf("chunk %d slot %d length = %d, want %d", chunk, slot, got, want)
+			}
+		}
+	}
+	// Sparse jump and out-of-order arrival stay map-served with exact
+	// values and bounded arrays: no sparse id grows a giant run.
 	sparse := NewIndex()
 	sparse.Add(1, "a")
 	sparse.Add(DocID(1)<<40, "b")
-	if sparse.docLens != nil {
-		t.Fatal("wide gap kept a dense array")
+	for _, c := range sparse.docLens {
+		if len(c.arr) > 2 {
+			t.Fatalf("wide gap grew a dense run of len %d", len(c.arr))
+		}
 	}
 	if got := sparse.docLength(1); got != 1 {
 		t.Fatalf("sparse doc 1 length = %d, want 1", got)
 	}
+	if got := sparse.docLength(DocID(1) << 40); got != 1 {
+		t.Fatalf("sparse far doc length = %d, want 1", got)
+	}
 	ooo := NewIndex()
 	ooo.Add(5, "a b")
 	ooo.Add(3, "c")
-	if ooo.docLens != nil {
-		t.Fatal("out-of-order arrival kept a dense array")
-	}
 	if got := ooo.docLength(3); got != 1 {
 		t.Fatalf("ooo doc 3 length = %d, want 1", got)
+	}
+	if got := ooo.docLength(5); got != 2 {
+		t.Fatalf("ooo doc 5 length = %d, want 2", got)
 	}
 }
 

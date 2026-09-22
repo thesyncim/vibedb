@@ -105,48 +105,86 @@ type Index struct {
 	// second same-block lookup fills the block cache (see sealedFindRow).
 	missSrc *sealedPostings
 	missBlk int
-	// docBase/docLens index document lengths densely while ids arrive
-	// dense (append for the next id, overwrite on replace); the first
-	// sparse jump drops the array and the docs map stays source of
-	// truth. Lengths are only read for live posting-derived documents,
-	// so a zeroed removal slot is never observed.
-	docBase uint64
-	docLens []uint32
+	// docLens indexes document lengths by DocID high bits (the store's
+	// chunk address, or zero for raw sequential ids), each with its own
+	// base-anchored dense array. Packed (chunk, slot) ids land in tiny
+	// per-chunk arrays instead of killing one flat array at the first
+	// chunk boundary; sequential ids share a single growing array exactly
+	// like before. Sparse jumps stay map-served without poisoning later
+	// contiguous runs. Lengths are only read for live posting-derived
+	// documents, so a zeroed removal slot is never observed. The docs
+	// map stays the source of truth for everything the arrays do not
+	// cover.
+	docLens map[uint32]*docLenChunk
+	// lenCache memoizes the last chunk's array: hot scoring walks
+	// doc-sorted postings, so consecutive lookups almost always hit the
+	// same chunk and skip the map entirely. The cache names a backing
+	// array, and every mutation writes through that same backing (appends
+	// only ever extend it), so a cached probe can never observe a torn
+	// value — at worst a grown array serves one slow map fallback.
+	lenCacheOK   bool
+	lenCacheKey  uint32
+	lenCacheArr  []uint32
+	lenCacheBase uint64
 	// minDocLen is the shortest length ever noted. Removals can only
 	// leave it stale-low, which keeps block score upper bounds valid
 	// (conservative); clearing every document re-establishes it.
 	minDocLen uint32
 }
 
-// noteDocLength tracks id's length in the dense array. Call with the
-// document not yet inserted so an empty map plus a nil array means the
-// first document ever (which establishes the base).
+// docLenChunk is one dense length run: slots base..base+len(arr)-1.
+type docLenChunk struct {
+	base uint64
+	arr  []uint32
+}
+
+// noteDocLength tracks id's length in its chunk's dense array. Call with
+// the document not yet inserted so an empty docs map still establishes
+// the global minimum. A slot extending its chunk's run appends; a slot
+// landing inside overwrites (replace); anything else stays map-served,
+// so one sparse id never poisons its chunk's later contiguous runs.
 func (ix *Index) noteDocLength(id DocID, length uint32) {
 	if len(ix.docs) == 0 || length < ix.minDocLen {
 		ix.minDocLen = length
 	}
-	if ix.docLens == nil {
-		if len(ix.docs) != 0 {
-			return
+	key := uint32(uint64(id) >> 32)
+	slot := uint64(id) & 0xffffffff
+	c := ix.docLens[key]
+	if c == nil {
+		if ix.docLens == nil {
+			ix.docLens = make(map[uint32]*docLenChunk)
 		}
-		ix.docBase = uint64(id)
-		ix.docLens = make([]uint32, 0, 64)
+		c = &docLenChunk{base: slot}
+		ix.docLens[key] = c
 	}
-	if d := uint64(id) - ix.docBase; d < uint64(len(ix.docLens)) {
-		ix.docLens[d] = length
-	} else if d == uint64(len(ix.docLens)) {
-		ix.docLens = append(ix.docLens, length)
-	} else {
-		ix.docLens = nil
+	if d := slot - c.base; d < uint64(len(c.arr)) {
+		c.arr[d] = length
+	} else if d == uint64(len(c.arr)) {
+		c.arr = append(c.arr, length)
+		if ix.lenCacheOK && ix.lenCacheKey == key {
+			ix.lenCacheArr = c.arr
+		}
 	}
 }
 
-// docLength returns id's length without hashing: array probe while dense,
-// map fallback once sparse.
+// docLength returns id's length: one cached array probe while scoring
+// walks a chunk run, one map probe at each chunk crossing, and the docs
+// map for ids no dense run covers.
 func (ix *Index) docLength(id DocID) uint32 {
-	if ix.docLens != nil {
-		if d := uint64(id) - ix.docBase; d < uint64(len(ix.docLens)) {
-			return ix.docLens[d]
+	key := uint32(uint64(id) >> 32)
+	slot := uint64(id) & 0xffffffff
+	if ix.lenCacheOK && ix.lenCacheKey == key {
+		if d := slot - ix.lenCacheBase; d < uint64(len(ix.lenCacheArr)) {
+			return ix.lenCacheArr[d]
+		}
+	}
+	if c := ix.docLens[key]; c != nil {
+		ix.lenCacheOK = true
+		ix.lenCacheKey = key
+		ix.lenCacheArr = c.arr
+		ix.lenCacheBase = c.base
+		if d := slot - c.base; d < uint64(len(c.arr)) {
+			return c.arr[d]
 		}
 	}
 	return ix.docs[id].length
@@ -172,9 +210,9 @@ type docMeta struct {
 // same rows bit-packed and delta-coded (see postings_sealed.go) with the
 // open arrays released; readers branch on sealed, mutators unseal first.
 type postings struct {
-	ids []DocID
-	off []uint32
-	pos []uint32
+	ids    []DocID
+	off    []uint32
+	pos    []uint32
 	sealed *sealedPostings
 }
 
@@ -311,9 +349,9 @@ func (ix *Index) removeLocked(id DocID, old docMeta) {
 		}
 	}
 	delete(ix.docs, id)
-	if ix.docLens != nil {
-		if d := uint64(id) - ix.docBase; d < uint64(len(ix.docLens)) {
-			ix.docLens[d] = 0
+	if c := ix.docLens[uint32(uint64(id)>>32)]; c != nil {
+		if d := uint64(id)&0xffffffff - c.base; d < uint64(len(c.arr)) {
+			c.arr[d] = 0
 		}
 	}
 	ix.nDocs--
