@@ -88,6 +88,13 @@ type tinParser struct {
 	// vocabulary. Segmented search serves only unexpanded queries from
 	// one parse, since each shard would expand the pattern differently.
 	expanded bool
+	// base shifts reported error bytes to the absolute input offset
+	// when re-parsing an embedded segment (phrase [...] content).
+	base int
+	// commaInWord keeps commas inside words for phrase [...] re-parses,
+	// where commas are literal term characters rather than alternative
+	// separators.
+	commaInWord bool
 }
 
 // rejectSpanStar errors when a span, relation, or positional operator
@@ -102,7 +109,7 @@ func (p *tinParser) rejectSpanStar(kids ...Query) error {
 }
 
 func (p *tinParser) errorf(format string, args ...interface{}) error {
-	return fmt.Errorf("tinql at byte %d: %s", p.pos, fmt.Sprintf(format, args...))
+	return fmt.Errorf("tinql at byte %d: %s", p.pos+p.base, fmt.Sprintf(format, args...))
 }
 
 func (p *tinParser) eof() bool { return p.pos >= len(p.s) }
@@ -140,9 +147,10 @@ func (p *tinParser) scanWord() (string, error) {
 		return "", p.errorf("expected a term")
 	}
 	c := p.s[p.pos]
-	if c == ';' || c == ',' {
+	if c == ';' || (c == ',' && !p.commaInWord) {
 		// A word never starts with a bare separator: digit-flanked
-		// commas join inside the loop below.
+		// commas join inside the loop below, and phrase [...]
+		// re-parses keep every comma inside the word.
 		return "", p.errorf("unexpected %q", string(c))
 	}
 	if isDelim(c) {
@@ -150,7 +158,7 @@ func (p *tinParser) scanWord() (string, error) {
 	}
 	start := p.pos
 	for p.pos < len(p.s) && !isDelim(p.s[p.pos]) {
-		if p.s[p.pos] == ',' &&
+		if p.s[p.pos] == ',' && !p.commaInWord &&
 			!(p.pos > start && isDigit(p.s[p.pos-1]) && p.pos+1 < len(p.s) && isDigit(p.s[p.pos+1])) {
 			// A comma between two digits is a numeric separator
 			// (`47,000`); anywhere else it ends the word (an
@@ -177,13 +185,13 @@ func (p *tinParser) peekWord() (string, bool) {
 		return "", false
 	}
 	c := p.s[p.pos]
-	if isDelim(c) || c == ';' || c == ',' {
+	if isDelim(c) || c == ';' || (c == ',' && !p.commaInWord) {
 		p.pos = save
 		return "", false
 	}
 	start := p.pos
 	for p.pos < len(p.s) && !isDelim(p.s[p.pos]) {
-		if p.s[p.pos] == ',' &&
+		if p.s[p.pos] == ',' && !p.commaInWord &&
 			!(p.pos > start && isDigit(p.s[p.pos-1]) && p.pos+1 < len(p.s) && isDigit(p.s[p.pos+1])) {
 			break
 		}
@@ -1425,13 +1433,17 @@ func (p *tinParser) parseBracketed() ([]Query, error) {
 // and a trailing ~N tolerance.
 func (p *tinParser) parsePhrase() (Query, error) {
 	p.pos++ // "
+	rawBase := p.pos
 	var inner []byte
+	// innerRaw maps each inner byte (plus the end) back to its raw
+	// offset from rawBase, so [...] re-parses report absolute input
+	// bytes even when escapes collapse two raw bytes into one.
+	var innerRaw []int
 	closed := false
 	for p.pos < len(p.s) {
 		c := p.s[p.pos]
 		if c == '"' {
 			closed = true
-			p.pos++
 			break
 		}
 		if c == '\\' {
@@ -1441,20 +1453,25 @@ func (p *tinParser) parsePhrase() (Query, error) {
 			// `\" \\ \_ \[ \]` resolve to the bare character (with `\ `
 			// a literal space); any other `\X` passes X through, so
 			// `"a\xb"` reads as the word "axb".
+			innerRaw = append(innerRaw, p.pos-rawBase)
 			inner = append(inner, p.s[p.pos+1])
 			p.pos += 2
 			continue
 		}
+		innerRaw = append(innerRaw, p.pos-rawBase)
 		inner = append(inner, c)
 		p.pos++
 	}
 	if !closed {
 		return Query{}, p.errorf("unclosed phrase")
 	}
+	raw := p.s[rawBase:p.pos]
+	p.pos++ // "
+	innerRaw = append(innerRaw, len(raw))
 	if len(inner) == 0 {
 		return Query{}, p.errorf("empty \"\" is invalid")
 	}
-	slots, err := p.phraseSlots(string(inner))
+	slots, err := p.phraseSlots(string(inner), raw, rawBase, innerRaw)
 	if err != nil {
 		return Query{}, err
 	}
@@ -1481,22 +1498,98 @@ func (p *tinParser) parsePhrase() (Query, error) {
 	return Query{Op: OpPhrase, Phrase: slots, Slop: slop}, nil
 }
 
-// isBracketOperator reports whether word is reserved as an operator when
-// bare: inside phrase [...] it would re-parse as (part of) a full
-// expression rather than a term. Context-dependent words (FIRST, BY, OF,
-// ...) stay terms here.
-func isBracketOperator(word string) bool {
-	switch word {
-	case "AND", "OR", "NOT", "THEN", "NEAR",
-		"ENCLOSES", "ENCLOSED", "OVERLAPPING", "BEFORE", "AFTER",
-		"WITHIN", "TO", "IN", "AT", "ALL", "CONTAINS", "MATCHES":
-		return true
+// parsePhraseBracketAlts re-parses phrase [...] content as full TINQL
+// alternatives and returns each choice with its raw text. Whitespace
+// separates choices (never implicit AND), commas stay literal term
+// characters, and base pins errors to absolute input bytes.
+func (p *tinParser) parsePhraseBracketAlts(raw string, base int) (alts []Query, altRaw []string, err error) {
+	sub := &tinParser{ix: p.ix, s: raw, base: base, noImplicit: true, commaInWord: true}
+	for {
+		sub.skipWS()
+		if sub.eof() {
+			break
+		}
+		start := sub.pos
+		var alt Query
+		alt, err = sub.parseOr()
+		if err != nil {
+			return nil, nil, err
+		}
+		if sub.pos == start {
+			return nil, nil, sub.errorf("empty alternative in phrase [...]")
+		}
+		alts = append(alts, alt)
+		altRaw = append(altRaw, raw[start:sub.pos])
+		sub.skipWS()
 	}
-	return false
+	// Dictionary expansions inside brackets resolve against this
+	// index's vocabulary just like top-level ones, so they gate
+	// segmented search the same way.
+	p.expanded = p.expanded || sub.expanded
+	return alts, altRaw, nil
 }
 
-// phraseSlots splits phrase inner text into positions.
-func (p *tinParser) phraseSlots(inner string) ([]PhrasePos, error) {
+// lowerPhraseAlt lowers one re-parsed phrase [...] alternative to its
+// positional token hashes: one entry per phrase position. Terms,
+// implicit phrases, and ORs of those lower exactly; anything needing
+// span, document, or positional evaluation (AND, proximity, filters,
+// match-all) does not, and neither do non-default boosts. A dictionary
+// expansion with no hits lowers to zero positions: the alternative
+// matches nothing.
+func lowerPhraseAlt(q Query) ([][]uint64, bool) {
+	if q.Boost != 0 && q.Boost != 1 {
+		return nil, false
+	}
+	switch q.Op {
+	case OpTerm:
+		return [][]uint64{{q.Term}}, true
+	case OpPhrase:
+		if q.Slop != 0 {
+			return nil, false
+		}
+		slots := make([][]uint64, len(q.Phrase))
+		for i, slot := range q.Phrase {
+			if slot.Any {
+				return nil, false
+			}
+			slots[i] = slot.Alts
+		}
+		return slots, true
+	case OpOr:
+		var out [][]uint64
+		for _, kid := range q.Kids {
+			slots, ok := lowerPhraseAlt(kid)
+			if !ok {
+				return nil, false
+			}
+			if len(slots) == 0 {
+				continue
+			}
+			if out == nil {
+				out = make([][]uint64, len(slots))
+				for i, s := range slots {
+					out[i] = append([]uint64(nil), s...)
+				}
+				continue
+			}
+			if len(slots) != len(out) {
+				return nil, false
+			}
+			for i := range out {
+				out[i] = append(out[i], slots[i]...)
+			}
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+// phraseSlots splits phrase inner text into positions. Bracket sections
+// re-parse as full expressions (see parsePhraseBracketAlts); raw with
+// rawBase and innerRaw map the collapsed inner bytes back to absolute
+// input offsets for exact error positions.
+func (p *tinParser) phraseSlots(inner, raw string, rawBase int, innerRaw []int) ([]PhrasePos, error) {
 	var slots []PhrasePos
 	i := 0
 	skip := func() {
@@ -1514,62 +1607,84 @@ func (p *tinParser) phraseSlots(inner string) ([]PhrasePos, error) {
 			slots = append(slots, PhrasePos{Any: true})
 			i++
 		case '[':
-			i++
-			var altTokens [][]uint64
-			for {
-				skip()
-				if i >= len(inner) {
-					return nil, p.errorf("unclosed [ in phrase")
-				}
-				if inner[i] == ']' {
-					i++
+			j := -1
+			for k := i + 1; k < len(inner); k++ {
+				if inner[k] == ']' {
+					j = k
 					break
 				}
-				j := i
-				for j < len(inner) && inner[j] != ' ' && inner[j] != '\t' && inner[j] != ']' {
-					j++
-				}
-				word := inner[i:j]
-				i = j
-				// A quote inside brackets is always an escaped
-				// literal (an unescaped one ends the phrase), and
-				// the reference rejects it there.
-				if strings.Contains(word, "\"") {
-					return nil, p.errorf("quote is not allowed inside phrase [...]")
-				}
-				// Operator words would re-parse as full
-				// expressions, which need span slots the phrase
-				// evaluator does not have; refuse them instead of
-				// misreading them as terms.
-				if _, _, attached, oor := splitAttachedProx(word); oor || attached || isBracketOperator(word) {
-					return nil, p.errorf("phrase [...] alternatives support terms, not %q", word)
-				}
-				hashes := foldTokens(word)
-				if len(hashes) == 0 {
-					return nil, p.errorf("alternative %q analyzes to no tokens", word)
-				}
-				altTokens = append(altTokens, hashes)
 			}
-			if len(altTokens) == 0 {
+			if j == -1 {
+				return nil, p.errorf("unclosed [ in phrase")
+			}
+			seg := inner[i+1 : j]
+			// A quote inside brackets is always an escaped
+			// literal (an unescaped one ends the phrase), and
+			// the reference rejects it there.
+			if strings.Contains(seg, "\"") {
+				return nil, p.errorf("quote is not allowed inside phrase [...]")
+			}
+			rawSeg := raw[innerRaw[i+1]:innerRaw[j]]
+			alts, altRaw, err := p.parsePhraseBracketAlts(rawSeg, rawBase+innerRaw[i+1])
+			if err != nil {
+				return nil, err
+			}
+			if len(alts) == 0 {
 				return nil, p.errorf("empty [] in phrase")
+			}
+			// Alternatives that re-parse to span, document, or
+			// positional operators have no positional lowering;
+			// refuse them instead of misreading them as terms.
+			// Expansions with no dictionary hits match nothing
+			// and contribute no hashes to the union.
+			type loweredAlt struct {
+				slots [][]uint64
+				raw   string
+			}
+			var lists []loweredAlt
+			for k, alt := range alts {
+				ls, ok := lowerPhraseAlt(alt)
+				if !ok {
+					return nil, p.errorf("phrase [...] alternatives support terms, not %q", altRaw[k])
+				}
+				if len(ls) == 0 {
+					continue
+				}
+				lists = append(lists, loweredAlt{slots: ls, raw: altRaw[k]})
+			}
+			if len(lists) == 0 {
+				return nil, p.errorf("phrase [...] alternatives match nothing")
 			}
 			// A written token the tokenizer splits occupies
 			// consecutive positions at its slot; every
 			// alternative must span the same width for the
 			// phrase to stay aligned.
-			width := len(altTokens[0])
-			for _, at := range altTokens[1:] {
-				if len(at) != width {
+			width := len(lists[0].slots)
+			for _, l := range lists[1:] {
+				if len(l.slots) != width {
 					return nil, p.errorf("phrase [...] alternatives must align in token count")
 				}
 			}
-			for k := 0; k < width; k++ {
-				alts := make([]uint64, len(altTokens))
-				for a, at := range altTokens {
-					alts[a] = at[k]
+			// Splicing several multi-position alternatives with
+			// per-position choices over-approximates (cross terms
+			// pair up); a lone alternative passes through exactly.
+			if len(lists) > 1 && width > 1 {
+				for _, l := range lists {
+					for _, s := range l.slots {
+						if len(s) > 1 {
+							return nil, p.errorf("phrase [...] alternative %q spans positions with alternatives", l.raw)
+						}
+					}
 				}
-				slots = append(slots, PhrasePos{Alts: alts})
 			}
+			for k := 0; k < width; k++ {
+				var union []uint64
+				for _, l := range lists {
+					union = append(union, l.slots[k]...)
+				}
+				slots = append(slots, PhrasePos{Alts: union})
+			}
+			i = j + 1
 		default:
 			j := i
 			for j < len(inner) && inner[j] != ' ' && inner[j] != '\t' {

@@ -406,3 +406,72 @@ func TestParityExpandedFlag(t *testing.T) {
 		}
 	}
 }
+
+// PlanetScale parity batch 7: phrase [...] alternatives re-parse as full
+// TINQL expressions, and term-valued shapes lower to positional slots.
+// Wildcards expand against the dictionary, ORs splice per position, and
+// span, boosted, or unaligned shapes stay parse errors.
+func TestParityPhraseBracketExpressions(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "brew x")
+	ix.Add(2, "brewer x")
+	ix.Add(3, "fresh x")
+	ix.Add(4, "bread x")
+	ix.Add(5, "a x")
+	ix.Add(6, "b x")
+	ix.Add(7, "e-mail now")
+	ix.Add(8, "e-mails now")
+	ix.Add(9, "c x")
+	ix.Add(10, "x-y z")
+	ix.Add(11, "x-yl z")
+	parityMatchWant(t, ix, `"[brew* fresh] x"`, []DocID{1, 2, 3})
+	parityMatchWant(t, ix, `"[a OR b] x"`, []DocID{5, 6})
+	parityMatchWant(t, ix, `"[e-mail*] now"`, []DocID{7, 8})
+	parityMatchWant(t, ix, `"[a^1 b] x"`, []DocID{5, 6})
+	parityMatchWant(t, ix, `"[(a) b] x"`, []DocID{5, 6})
+	parityMatchWant(t, ix, `"[a, b] x"`, []DocID{5, 6})
+	parityMatchWant(t, ix, `"[zzz* b] x"`, []DocID{6})
+	for _, input := range []string{
+		`"[a AND b] x"`, `"[a NEAR 3 b] x"`, `"[a^2 b] x"`,
+		`"[e-mail* x-y*] z"`, `"[(a b)] x"`, `"[NOT a] x"`,
+		`"[zzz*] x"`, `"[a b"`, `"[]"`, `"[A NEAR/3 B] x"`,
+	} {
+		parityMustFail(t, ix, input)
+	}
+	// Juxtaposition inside groups behaves exactly like the top-level
+	// bracket list: both reject it, since brackets never admit
+	// implicit AND.
+	parityMustFail(t, ix, `[(a b)]`)
+	// Sub-parse syntax errors report absolute input bytes, through
+	// escapes: the `~` in `"xy [a b~] z"` sits at byte 8 and the
+	// missing edit distance at byte 9; the unclosed group in
+	// `"[(a b]"` fails at byte 5.
+	for _, tc := range []struct{ input, want string }{
+		{`"xy [a b~] z"`, `tinql at byte 9: expected edit distance`},
+		{`"[(a b]"`, `tinql at byte 5: expected )`},
+	} {
+		_, err := ix.ParseTINQL(tc.input)
+		if err == nil || err.Error() != tc.want {
+			t.Fatalf("%s: error = %v, want %q", tc.input, err, tc.want)
+		}
+	}
+	// Bracket expansions resolve against the index vocabulary, so they
+	// report Expanded exactly like their top-level forms, while plain
+	// term splices stay unexpanded.
+	for _, input := range []string{`"[brew* fresh] x"`, `"[e-mail*] now"`} {
+		q, err := ix.ParseTINQL(input)
+		if err != nil {
+			t.Fatalf("%s: %v", input, err)
+		}
+		if !q.Expanded {
+			t.Fatalf("%s reported unexpanded, want Expanded", input)
+		}
+	}
+	q, err := ix.ParseTINQL(`"[a OR b] x"`)
+	if err != nil {
+		t.Fatalf(`"[a OR b] x": %v`, err)
+	}
+	if q.Expanded {
+		t.Fatalf(`"[a OR b] x" reported Expanded, want unexpanded`)
+	}
+}
