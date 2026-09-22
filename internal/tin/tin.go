@@ -81,6 +81,13 @@ type Index struct {
 	andPTF  []float64
 	andPDL  []float64
 	andPIdx []int
+	// andKids stages the shortest-first kid order; andOther stages a
+	// merge-gated sibling decode; andPos/andPoss stage per-list
+	// position lanes for the keep set.
+	andKids  []Query
+	andOther []DocID
+	andPos   []int
+	andPoss  [][]int
 	// decIDs stages sealed document ids for scoring gathers; decPos stages
 	// one sealed row's positions for span expansion. Both are sequential
 	// staging under the index lock, never retained across calls.
