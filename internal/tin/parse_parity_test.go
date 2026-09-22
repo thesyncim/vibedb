@@ -90,6 +90,59 @@ func TestParitySpanStarRejected(t *testing.T) {
 
 // TestParityColonTerm pins the leading-colon rule: a term starting with
 // : needs an explicit operator after another expression.
+// TestParityComma pins comma handling: separator inside [...], numeric
+// comma between digits, and rejection elsewhere. Matching follows the
+// index's own tokenization on both sides.
+func TestParityComma(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "beer")
+	ix.Add(2, "ale")
+	ix.Add(3, "lager")
+	ix.Add(4, "I owe 47,000 dollars")
+	ix.Add(5, "I owe 48,000 dollars")
+	parityMatchWant(t, ix, `[beer, ale, lager]`, []DocID{1, 2, 3})
+	parityMatchWant(t, ix, `[beer,ale]`, []DocID{1, 2})
+	parityMatchWant(t, ix, `[beer ale, lager]`, []DocID{1, 2, 3})
+	parityMatchWant(t, ix, `[47,000 48,000]`, []DocID{4, 5})
+	parityMatchWant(t, ix, `1,000 TO 2,000`, nil)
+	for _, in := range []string{`[beer,]`, `a,b`, `;`, `beer;`} {
+		parityMustFail(t, ix, in)
+	}
+	if _, err := ix.ParseTINQL(`47,000`); err != nil {
+		t.Fatalf("47,000: unexpected error %v", err)
+	}
+}
+
+// TestParityBackslash pins backslash handling: a backslash before a
+// non-special stays literal in bare terms, while \" \\ _ [ ] and \X
+// resolve inside phrases.
+func TestParityBackslash(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, `foo\bar docs here`)
+	ix.Add(2, `hello world`)
+	if _, err := ix.ParseTINQL(`foo\bar`); err != nil {
+		t.Fatalf(`foo\bar: unexpected error %v`, err)
+	}
+	if _, err := ix.ParseTINQL(`C:\Users\docs`); err != nil {
+		t.Fatalf(`C:\Users\docs: unexpected error %v`, err)
+	}
+	if _, err := ix.ParseTINQL(`abc\`); err != nil {
+		t.Fatalf(`abc\: unexpected error %v`, err)
+	}
+	parityMatchWant(t, ix, `"hello world"`, []DocID{2})
+	parityMatchWant(t, ix, `"a\xb"`, nil)
+}
+
+// TestParityByTerm pins BY as an ordinary term outside ENCLOSED BY.
+func TestParityByTerm(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "x by y")
+	ix.Add(2, "x y")
+	parityMatchWant(t, ix, `x BY y`, []DocID{1})
+	parityMatchWant(t, ix, `x by y`, []DocID{1})
+	parityMatchWant(t, ix, `100%`, nil)
+}
+
 func TestParityColonTerm(t *testing.T) {
 	ix := NewIndex()
 	parityMustFail(t, ix, `beer :tag`)

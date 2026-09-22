@@ -204,8 +204,10 @@ func TestTINQLErrors(t *testing.T) {
 		`apple~`, `apple~x`, `apple^`, `apple^10001`, `wi-fi~2`,
 		`apple NOT peel`, `NOT apple`, `THEN/2 apple`, `apple THEN apple`,
 		`apple THEN/ apple`, `apple IN NOWHERE 5`, `apple IN WORDS 1`,
-		`AT MOST 2 OF [a b]`, `ALL [a b]`, `MATCHES`, `[a, b]`, `a,b`,
+		`AT MOST 2 OF [a b]`, `ALL [a b]`, `MATCHES`, `a,b`,
 		`apple ENCLOSED apple`, `A TO * TO B`, `"a * b"`,
+		// `[a, b]` was here: commas separate alternatives per the TINQL
+		// reference now (TestParityComma), while bare `a,b` still errors.
 	} {
 		if q, err := ix.ParseTINQL(input); err == nil {
 			t.Fatalf("ParseTINQL(%q) = %+v, want error", input, q)

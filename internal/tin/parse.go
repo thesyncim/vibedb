@@ -53,11 +53,14 @@ func (ix *Index) ParseTINQL(input string) (Query, error) {
 }
 
 // hasSyntax reports whether input holds any TINQL syntax character; without
-// one, a token-free input matches nothing instead of erroring.
+// one, a token-free input matches nothing instead of erroring. `;` and `,`
+// count as syntax: neither ever stands alone validly, so a bare `;` (or
+// stray `,`) reaches the real parser and errors instead of leniently
+// matching nothing.
 func hasSyntax(s string) bool {
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
-		case '"', '(', ')', '[', ']', '~', '^', '*', '?':
+		case '"', '(', ')', '[', ']', '~', '^', '*', '?', ';', ',':
 			return true
 		}
 	}
@@ -108,14 +111,18 @@ func (p *tinParser) skipWS() {
 
 // isDelim reports TINQL word boundaries: whitespace, structural characters,
 // and the postfix/prefix operators. Slash stays a word character (`and/or`
-// is one term); comma and semicolon are refused outright.
+// is one term), as do `%` and digit-flanked commas (`100%`, `47,000`);
+// a bare semicolon is refused outright.
 func isDelim(c byte) bool {
 	switch c {
-	case ' ', '\t', '\n', '\r', '\v', '\f', '"', '(', ')', '[', ']', '~', '^', '%', ',', ';':
+	case ' ', '\t', '\n', '\r', '\v', '\f', '"', '(', ')', '[', ']', '~', '^', ';':
 		return true
 	}
 	return false
 }
+
+// isDigit reports ASCII digits for the numeric-comma rule.
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 
 // scanWord consumes one raw word (escapes intact) or reports an error for
 // stray delimiters.
@@ -124,7 +131,9 @@ func (p *tinParser) scanWord() (string, error) {
 		return "", p.errorf("expected a term")
 	}
 	c := p.s[p.pos]
-	if c == ',' || c == ';' {
+	if c == ';' || c == ',' {
+		// A word never starts with a bare separator: digit-flanked
+		// commas join inside the loop below.
 		return "", p.errorf("unexpected %q", string(c))
 	}
 	if isDelim(c) {
@@ -132,10 +141,17 @@ func (p *tinParser) scanWord() (string, error) {
 	}
 	start := p.pos
 	for p.pos < len(p.s) && !isDelim(p.s[p.pos]) {
+		if p.s[p.pos] == ',' &&
+			!(p.pos > start && isDigit(p.s[p.pos-1]) && p.pos+1 < len(p.s) && isDigit(p.s[p.pos+1])) {
+			// A comma between two digits is a numeric separator
+			// (`47,000`); anywhere else it ends the word (an
+			// alternatives separator inside [...], an error outside).
+			break
+		}
 		if p.s[p.pos] == '\\' {
 			p.pos++
 			if p.pos >= len(p.s) {
-				return "", p.errorf("dangling escape")
+				break // trailing backslash stays literal
 			}
 		}
 		p.pos++
@@ -152,12 +168,16 @@ func (p *tinParser) peekWord() (string, bool) {
 		return "", false
 	}
 	c := p.s[p.pos]
-	if isDelim(c) && c != ',' && c != ';' {
+	if isDelim(c) || c == ';' || c == ',' {
 		p.pos = save
 		return "", false
 	}
 	start := p.pos
 	for p.pos < len(p.s) && !isDelim(p.s[p.pos]) {
+		if p.s[p.pos] == ',' &&
+			!(p.pos > start && isDigit(p.s[p.pos-1]) && p.pos+1 < len(p.s) && isDigit(p.s[p.pos+1])) {
+			break
+		}
 		if p.s[p.pos] == '\\' {
 			p.pos++
 			if p.pos >= len(p.s) {
@@ -180,8 +200,10 @@ func isKeyword(w, kw string) bool {
 	return w == kw
 }
 
-// unescapeWord resolves `\` escapes; only syntax characters and space may
-// follow a backslash. It also reports bare (active) `*`/`?` markers.
+// unescapeWord resolves `\` escapes and reports bare (active) `*`/`?`
+// markers. A backslash escapes `*`, `?`, and itself; before anything
+// else it stays literal (`foo\bar`, `C:\path`). A trailing backslash
+// stays literal too.
 func unescapeWord(raw string) (unescaped string, sawWild bool, err error) {
 	var sb []byte
 	for i := 0; i < len(raw); {
@@ -196,16 +218,17 @@ func unescapeWord(raw string) (unescaped string, sawWild bool, err error) {
 		}
 		i++
 		if i >= len(raw) {
-			return "", false, fmt.Errorf("dangling escape")
+			sb = append(sb, '\\')
+			break
 		}
 		e := raw[i]
-		switch e {
-		case '*', '?', '\\', '"', '~', '^', '%', '[', ']', '(', ')', '_', ' ', '/':
+		if e == '*' || e == '?' || e == '\\' {
 			sb = append(sb, e)
 			i++
-		default:
-			return "", false, fmt.Errorf("bad escape %q", "\\"+string(e))
+			continue
 		}
+		sb = append(sb, '\\', e)
+		i++
 	}
 	return string(sb), sawWild, nil
 }
@@ -331,7 +354,7 @@ func (p *tinParser) noImplicitAhead() bool {
 		return true
 	}
 	switch p.s[p.pos] {
-	case ')', ']', '~', '^', '%', ',', ';':
+	case ')', ']', '~', '^', ';':
 		return true
 	}
 	w, ok := p.peekWord()
@@ -343,7 +366,7 @@ func (p *tinParser) noImplicitAhead() bool {
 		isKeyword(w, "THEN") || isKeyword(w, "NEAR") || isKeyword(w, "WITHIN") ||
 		isKeyword(w, "IN") || isKeyword(w, "TO") || isKeyword(w, "ENCLOSES") ||
 		isKeyword(w, "ENCLOSED") || isKeyword(w, "OVERLAPPING") || isKeyword(w, "BEFORE") ||
-		isKeyword(w, "AFTER") || isKeyword(w, "BY") || isKeyword(w, "OF") ||
+		isKeyword(w, "AFTER") || isKeyword(w, "OF") ||
 		isKeyword(w, "LEAST") || isKeyword(w, "FIRST") || isKeyword(w, "LAST") ||
 		isKeyword(w, "MIDDLE") || isKeyword(w, "WORDS"):
 		return true
@@ -776,7 +799,7 @@ func (p *tinParser) parsePrimary() (Query, error) {
 		isKeyword(w, "THEN") || isKeyword(w, "NEAR") || isKeyword(w, "WITHIN") ||
 		isKeyword(w, "IN") || isKeyword(w, "TO") || isKeyword(w, "ENCLOSES") ||
 		isKeyword(w, "ENCLOSED") || isKeyword(w, "OVERLAPPING") || isKeyword(w, "BEFORE") ||
-		isKeyword(w, "AFTER") || isKeyword(w, "BY") || isKeyword(w, "OF") ||
+		isKeyword(w, "AFTER") || isKeyword(w, "OF") ||
 		isKeyword(w, "LEAST") || isKeyword(w, "FIRST") || isKeyword(w, "LAST") ||
 		isKeyword(w, "MIDDLE") || isKeyword(w, "WORDS"):
 		return Query{}, p.errorf("unexpected keyword %q here", w)
@@ -818,6 +841,28 @@ func (p *tinParser) parseBareTerm(w string) (Query, error) {
 	if err != nil {
 		return Query{}, err
 	}
+	// A following TO makes this word a range bound, addressed as a
+	// dictionary spelling without tokenizing (so `1,000` stays one
+	// bound); a wildcard word is refused as a bound here.
+	save := p.pos
+	p.skipWS()
+	if w2, ok := p.peekWord(); ok && isKeyword(w2, "TO") {
+		if sawWild {
+			return Query{}, p.errorf("range bounds must be exact terms")
+		}
+		if _, n := spellOf(unescaped); n == 0 {
+			return Query{}, p.errorf("range bound %q is erased by the analyzer", w)
+		}
+		p.skipWS()
+		p.scanWord() // TO
+		hi, err := p.parseRangeBound()
+		if err != nil {
+			return Query{}, err
+		}
+		lo := foldPattern(unescaped)
+		return p.rangeQuery(&lo, hi)
+	}
+	p.pos = save
 	if sawWild {
 		folded := foldPattern(unescaped)
 		hashes, err := p.ix.expandWildcard(folded)
@@ -838,20 +883,6 @@ func (p *tinParser) parseBareTerm(w string) (Query, error) {
 		if !p.eof() && p.s[p.pos] == '~' {
 			return p.parseFuzzy(term)
 		}
-		save := p.pos
-		p.skipWS()
-		if w2, ok := p.peekWord(); ok && isKeyword(w2, "TO") {
-			p.skipWS()
-			p.scanWord() // TO
-			hi, err := p.parseRangeBound()
-			if err != nil {
-				return Query{}, err
-			}
-			spell, _ := spellOf(unescaped)
-			lo := string(spell)
-			return p.rangeQuery(&lo, hi)
-		}
-		p.pos = save
 		return Query{Op: OpTerm, Term: term}, nil
 	default:
 		// A hyphenated (or otherwise multi-token) word searches as an
@@ -918,11 +949,13 @@ func (p *tinParser) parseRangeBound() (*string, error) {
 	if sawWild {
 		return nil, p.errorf("range bounds must be exact terms")
 	}
-	spell, n := spellOf(unescaped)
-	if n != 1 {
-		return nil, p.errorf("range bound %q must be one term", w)
+	// Bounds address dictionary spellings without tokenizing (so
+	// `1,000` stays one bound); a bound the analyzer erases entirely
+	// is rejected rather than treated as open.
+	if _, n := spellOf(unescaped); n == 0 {
+		return nil, p.errorf("range bound %q is erased by the analyzer", w)
 	}
-	s := string(spell)
+	s := foldPattern(unescaped)
 	return &s, nil
 }
 
@@ -1097,6 +1130,18 @@ func (p *tinParser) parseBracketed() ([]Query, error) {
 			return nil, err
 		}
 		alts = append(alts, alt)
+		// Commas separate alternatives (`[beer, ale]`); a comma between
+		// two digits never reaches here (numeric terms join in
+		// scanWord). A trailing comma leaves an empty alternative,
+		// which is invalid.
+		p.skipWS()
+		if !p.eof() && p.s[p.pos] == ',' {
+			p.pos++
+			p.skipWS()
+			if !p.eof() && p.s[p.pos] == ']' {
+				return nil, p.errorf("empty alternative in [...]")
+			}
+		}
 	}
 	if len(alts) == 0 {
 		return nil, p.errorf("empty [] is invalid")
@@ -1121,14 +1166,11 @@ func (p *tinParser) parsePhrase() (Query, error) {
 			if p.pos+1 >= len(p.s) {
 				return Query{}, p.errorf("dangling escape in phrase")
 			}
-			e := p.s[p.pos+1]
-			switch e {
-			case '"', '\\', '_', '[', ']':
-				inner = append(inner, e)
-				p.pos += 2
-			default:
-				return Query{}, p.errorf("bad phrase escape %q", "\\"+string(e))
-			}
+			// `\" \\ \_ \[ \]` resolve to the bare character (with `\ `
+			// a literal space); any other `\X` passes X through, so
+			// `"a\xb"` reads as the word "axb".
+			inner = append(inner, p.s[p.pos+1])
+			p.pos += 2
 			continue
 		}
 		inner = append(inner, c)
