@@ -1,6 +1,7 @@
 package query
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"slices"
@@ -489,6 +490,108 @@ func TestSQLScoreFileAgreesWithTinSearch(t *testing.T) {
 			if !scoreClose(score, hit.Score) {
 				t.Fatalf("%q key %q: SCORE() %v != TinSearch %v", tinql, hit.Key, score, hit.Score)
 			}
+		}
+	}
+}
+
+// scoreBenchRows runs SELECT id, SCORE() over the big score corpus and
+// returns rows in SELECT order, under both serial and parallel workers.
+func scoreBenchRows(t testing.TB, db *store.Database, src string) [][2]any {
+	t.Helper()
+	catalog := db.Snapshot()
+	statement, err := PrepareStatement(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	var out [][2]any
+	for _, workers := range []int{0, 4} {
+		exec := Exec{Options: ExecOptions{Workers: workers}}
+		cursor, err := statement.RunInto(&exec, FromDatabase(catalog, "docs"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = out[:0]
+		for cursor.Next() {
+			id, ok := cursor.Cell(0).Text()
+			if !ok {
+				t.Fatalf("id cell = %s, want string", cursor.Cell(0).JSON())
+			}
+			score, ok := cursor.Cell(1).Float64()
+			if !ok {
+				t.Fatalf("score cell = %s, want number", cursor.Cell(1).JSON())
+			}
+			out = append(out, [2]any{id, score})
+		}
+		exec.Release()
+	}
+	return out
+}
+
+// TestSQLScoreLimitMatchesSortPrefix proves the ORDER BY ... LIMIT top-K
+// selection returns exactly the full sort's prefix: ids and scores
+// bit-identical across directions, offsets, multi-key orders, and ties.
+func TestSQLScoreLimitMatchesSortPrefix(t *testing.T) {
+	db := scoreBenchDatabase(t)
+	full := scoreBenchRows(t, db,
+		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'common' ORDER BY SCORE() DESC`)
+	if len(full) < 100 {
+		t.Fatalf("%d rows, want a sort-heavy set", len(full))
+	}
+	compare := func(base, src string, from, to int) {
+		t.Helper()
+		want := scoreBenchRows(t, db, base)
+		got := scoreBenchRows(t, db, src)
+		if len(got) != to-from {
+			t.Fatalf("%s: %d rows, want %d", src, len(got), to-from)
+		}
+		for i, row := range got {
+			if row != want[from+i] {
+				t.Fatalf("%s row %d: top-K %v != sort prefix %v", src, i, row, want[from+i])
+			}
+		}
+	}
+	desc := `SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'common' ORDER BY SCORE() DESC`
+	asc := `SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'common' ORDER BY SCORE() ASC`
+	multi := `SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'common' ORDER BY SCORE() DESC, o.id ASC`
+	compare(desc, desc+` LIMIT 10`, 0, 10)
+	compare(asc, asc+` LIMIT 10`, 0, 10)
+	compare(desc, desc+` LIMIT 10 OFFSET 5`, 5, 15)
+	compare(multi, multi+` LIMIT 10`, 0, 10)
+	compare(desc, desc+` LIMIT 20000`, 0, len(full))
+}
+
+// TestSQLScoreLimitTieStability proves LIMIT keeps scan order across
+// exact ties: identical bodies score identically, so the first LIMIT
+// rows are the first scanned.
+func TestSQLScoreLimitTieStability(t *testing.T) {
+	db := &store.Database{}
+	coll, err := db.CreateCollection("docs", store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 200 {
+		body := `{"id":"d` + fmt.Sprintf("%04d", i) + `","body":"identical body text for every document here"}`
+		if _, err := coll.Put(fmt.Sprintf("d%04d", i), []byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := coll.CreateIndex(store.IndexDefinition{
+		Name: "body_tin", Paths: []string{"/body"}, Kind: store.IndexTin,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coll.BackfillIndex("body_tin", 0); err != nil {
+		t.Fatal(err)
+	}
+	got := scoreBenchRows(t, db,
+		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'identical' ORDER BY SCORE() DESC LIMIT 10`)
+	if len(got) != 10 {
+		t.Fatalf("%d rows, want 10", len(got))
+	}
+	for i, row := range got {
+		if want := fmt.Sprintf("d%04d", i); row[0].(string) != want {
+			t.Fatalf("row %d: id %q, want scan order %q", i, row[0].(string), want)
 		}
 	}
 }

@@ -141,9 +141,18 @@ type statementScalarOrdered struct {
 	having        *havingProgram
 	rows          []statementScalarOrderRow
 	scratch       []statementScalarOrderRow
+	heap          []scalarOrderEntry
 	values        []scalar
 	arena         []byte
 	cells         []Cell
+}
+
+// scalarOrderEntry pairs a sort row with its pre-sort sequence so a
+// bounded heap reproduces the stable sort's order exactly: keys first,
+// original position on ties.
+type scalarOrderEntry struct {
+	row statementScalarOrderRow
+	seq int
 }
 
 // statementScalar is the cold prepared sidecar. It owns both the postorder
@@ -1785,17 +1794,38 @@ func (r *statementScalar) executeOrdered(
 		return Cursor{}, err
 	}
 	if len(ordered.order) != 0 {
-		sortScratchBytes := saturatedProduct(
-			int64(len(ordered.rows)), int64(unsafe.Sizeof(statementScalarOrderRow{})),
-		)
-		if err := frame.intermediate.reserve("scalar ORDER BY sort workspace", sortScratchBytes); err != nil {
-			return Cursor{}, err
+		// OFFSET+LIMIT bounds the survivors the output reads, so a
+		// bounded selection replaces the full sort whenever it covers
+		// fewer rows. Stability carries over exactly (sequence
+		// tiebreak), and downstream slices rows[first:last] unchanged.
+		k := 0
+		if s.hasLimit {
+			if k = s.offset + s.limit; k < 0 || k >= len(ordered.rows) {
+				k = 0
+			}
 		}
-		if err := ordered.sort(options.Cancel); err != nil {
+		if k > 0 {
+			heapBytes := saturatedProduct(int64(k), int64(unsafe.Sizeof(scalarOrderEntry{})))
+			if err := frame.intermediate.reserve("scalar ORDER BY top-K heap", heapBytes); err != nil {
+				return Cursor{}, err
+			}
+			orderCharge = saturatedBytes(orderCharge, heapBytes)
+			if err := ordered.topK(options.Cancel, k); err != nil {
+				return Cursor{}, err
+			}
+		} else {
+			sortScratchBytes := saturatedProduct(
+				int64(len(ordered.rows)), int64(unsafe.Sizeof(statementScalarOrderRow{})),
+			)
+			if err := frame.intermediate.reserve("scalar ORDER BY sort workspace", sortScratchBytes); err != nil {
+				return Cursor{}, err
+			}
+			if err := ordered.sort(options.Cancel); err != nil {
+				frame.intermediate.release(sortScratchBytes)
+				return Cursor{}, err
+			}
 			frame.intermediate.release(sortScratchBytes)
-			return Cursor{}, err
 		}
-		frame.intermediate.release(sortScratchBytes)
 	}
 	if err := cancellationCheckpoint(options.Cancel, len(ordered.rows)+1); err != nil {
 		return Cursor{}, err
@@ -2045,6 +2075,78 @@ func (o *statementScalarOrdered) sort(cancel *CancelFlag) error {
 		}
 	}
 	return nil
+}
+
+// orderLess is the stable sort's total order: keys first, original
+// position on ties (positions are unique, so the order is total).
+func (o *statementScalarOrdered) orderLess(a, b scalarOrderEntry) bool {
+	if c := o.compare(a.row, b.row); c != 0 {
+		return c < 0
+	}
+	return a.seq < b.seq
+}
+
+// topK leaves the k best rows ordered in o.rows[:k]: a worst-first heap
+// over (keys, sequence) selects them at O(n log k) comparisons, then
+// heapsort orders the winners. The result equals the stable sort's
+// length-k prefix exactly. Requires 0 < k < len(o.rows); the heap
+// staging persists for reuse like the sort scratch.
+func (o *statementScalarOrdered) topK(cancel *CancelFlag, k int) error {
+	h := o.heap[:0]
+	for i, row := range o.rows {
+		if err := cancellationCheckpoint(cancel, i); err != nil {
+			return err
+		}
+		e := scalarOrderEntry{row: row, seq: i}
+		if len(h) < k {
+			h = append(h, e)
+			up := len(h) - 1
+			for up > 0 {
+				parent := (up - 1) / 2
+				if !o.orderLess(h[parent], h[up]) {
+					break
+				}
+				h[up], h[parent] = h[parent], h[up]
+				up = parent
+			}
+			continue
+		}
+		if o.orderLess(e, h[0]) {
+			h[0] = e
+			o.siftDown(h, 0)
+		}
+	}
+	o.heap = h
+	for end := len(h) - 1; end > 0; end-- {
+		if err := cancellationCheckpoint(cancel, end); err != nil {
+			return err
+		}
+		h[0], h[end] = h[end], h[0]
+		o.siftDown(h[:end], 0)
+	}
+	for i, e := range h {
+		o.rows[i] = e.row
+	}
+	return nil
+}
+
+// siftDown restores the worst-first heap below down.
+func (o *statementScalarOrdered) siftDown(h []scalarOrderEntry, down int) {
+	for {
+		left := 2*down + 1
+		if left >= len(h) {
+			break
+		}
+		worst := left
+		if right := left + 1; right < len(h) && o.orderLess(h[left], h[right]) {
+			worst = right
+		}
+		if !o.orderLess(h[down], h[worst]) {
+			break
+		}
+		h[down], h[worst] = h[worst], h[down]
+		down = worst
+	}
 }
 
 func scalarOwnedBytes(value scalar) int64 {

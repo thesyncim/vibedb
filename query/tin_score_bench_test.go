@@ -12,7 +12,7 @@ import (
 // (varying TF and length, so SCORE() spreads) and a skewed term for the
 // selective lane. Both benches below pin the full SQL path: ==> match,
 // per-row SCORE(), ORDER BY plus LIMIT.
-func scoreBenchDatabase(b *testing.B) *store.Database {
+func scoreBenchDatabase(b testing.TB) *store.Database {
 	b.Helper()
 	db := &store.Database{}
 	coll, err := db.CreateCollection("docs", store.Options{})
@@ -30,7 +30,8 @@ func scoreBenchDatabase(b *testing.B) *store.Database {
 		if i%5 == 0 {
 			body += " zipf"
 		}
-		if _, err := coll.Put(fmt.Sprintf("d%04d", i), []byte(`{"body":`+strconv.Quote(body)+`}`)); err != nil {
+		doc := `{"id":"d` + fmt.Sprintf("%04d", i) + `","body":` + strconv.Quote(body) + `}`
+		if _, err := coll.Put(fmt.Sprintf("d%04d", i), []byte(doc)); err != nil {
 			b.Fatal(err)
 		}
 	}
