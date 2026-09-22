@@ -176,6 +176,13 @@ func (ix *Index) scoreOpenTopK(p *postings, idfV, avg, boost float64, topK int, 
 	dl := ix.scoreDL[:0]
 	sc := ix.scoreOut[:0]
 	var ids [sealedBlockRows]DocID
+	// Hoisted length-cache probe: scoring walks DocID order, so rows of
+	// a chunk share one dense length array; the slow path is docLength
+	// itself, which keeps the shared cache fields evolving identically.
+	var larr []uint32
+	var lbase uint64
+	var lkey uint32
+	lok := false
 	n := len(p.ids)
 	for base := 0; base < n; base += sealedBlockRows {
 		end := base + sealedBlockRows
@@ -185,25 +192,41 @@ func (ix *Index) scoreOpenTopK(p *postings, idfV, avg, boost float64, topK int, 
 		rows := end - base
 		maxF := uint32(0)
 		tf = tf[:0]
+		dl = dl[:0]
 		for i := 0; i < rows; i++ {
+			id := p.ids[base+i]
 			f := p.off[base+i+1] - p.off[base+i]
 			tf = append(tf, float64(f))
 			if f > maxF {
 				maxF = f
 			}
-			ids[i] = p.ids[base+i]
+			ids[i] = id
+			key := uint32(uint64(id) >> 32)
+			slot := uint64(id) & 0xffffffff
+			if lok && key == lkey {
+				if d := slot - lbase; d < uint64(len(larr)) {
+					dl = append(dl, float64(larr[d]))
+					continue
+				}
+			}
+			dl = append(dl, float64(ix.docLength(id)))
+			lok = ix.lenCacheOK
+			lkey = ix.lenCacheKey
+			larr = ix.lenCacheArr
+			lbase = ix.lenCacheBase
 		}
 		if skip && len(h) == topK &&
 			blockSkippable(idfV, avg, boost, float64(maxF), ix.minDocLen, h[0].Score) {
 			continue
 		}
-		dl = dl[:0]
-		for i := 0; i < rows; i++ {
-			dl = append(dl, float64(ix.docLength(ids[i])))
-		}
 		sc = bm25Scores(idfV, avg, boost, tf, dl, sc[:0])
 		for i := 0; i < rows; i++ {
-			h = heapPush(h, topK, Scored{Doc: ids[i], Score: sc[i]})
+			// heapPush re-checks this first; skipping the call for
+			// rejected rows keeps the hot loop call-free.
+			c := Scored{Doc: ids[i], Score: sc[i]}
+			if len(h) < topK || worseScored(h[0], c) {
+				h = heapPush(h, topK, c)
+			}
 		}
 	}
 	ix.scoreTF, ix.scoreDL, ix.scoreOut = tf[:0], dl[:0], sc[:0]

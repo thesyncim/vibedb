@@ -49,7 +49,18 @@ func (ix *Index) RefreshScoreStats(q Query, st *ScoreStats) *ScoreStats {
 	var walk func(q Query)
 	walk = func(q Query) {
 		switch q.Op {
-		case OpTerm, OpPhrase,
+		case OpTerm:
+			// A term's document frequency is its postings count:
+			// the same length a full Match would append, without
+			// walking the list.
+			ix.mu.Lock()
+			n := 0
+			if p := ix.post[q.Term]; p != nil {
+				n = p.docCount()
+			}
+			ix.mu.Unlock()
+			st.idfs = append(st.idfs, idf(nDocs, n))
+		case OpPhrase,
 			OpThen, OpNear, OpWithin,
 			OpEncloses, OpEnclosedBy, OpOverlapping, OpBefore, OpAfter,
 			OpFilter:
