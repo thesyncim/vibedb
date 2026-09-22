@@ -137,6 +137,16 @@ type Workspace struct {
 	// dictionary: a compiled Query is shared by every concurrent execution
 	// while the parse belongs to exactly one of them.
 	matchQueries []tin.Query
+	// matchIndexes parallels matchQueries: the generation-pinned tin index
+	// each ==> slot parsed against, for index-pruned candidate masks. It
+	// lives here rather than in the plan because the build belongs to the
+	// executing snapshot's generation; nil entries decline to the full
+	// scan. Like matchQueries it is rebound every execution and cleared
+	// when the plan carries no ==> node, so a reused Workspace never
+	// retains a build past its snapshot.
+	matchIndexes []*tin.Index
+	// matchDocIDs is scratch for tin Match enumeration during ==> pruning.
+	matchDocIDs []tin.DocID
 	// correlations is the execution-local scalar tuple supplied by a containing
 	// APPLY. Compiled plans carry only slot ordinals; values are copied here at
 	// the synchronous child boundary and cleared before the Workspace is reused.

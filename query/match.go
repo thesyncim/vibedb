@@ -96,18 +96,23 @@ func assignMatchSlots(p *plan) int {
 func (p *plan) bindMatches(w *Workspace, snapshot store.Snapshot, catalog store.DatabaseSnapshot) error {
 	if p.matchCount == 0 {
 		w.matchQueries = w.matchQueries[:0]
+		w.matchIndexes = w.matchIndexes[:0]
 		w.eval.bindMatches(nil)
 		return nil
 	}
 	for len(w.matchQueries) < p.matchCount {
 		w.matchQueries = append(w.matchQueries, tin.Query{})
 	}
+	for len(w.matchIndexes) < p.matchCount {
+		w.matchIndexes = append(w.matchIndexes, nil)
+	}
 	// Reslice to the exact count so workers aliasing w.matchQueries see the
 	// same binding the calling evaluator gets; retained capacity past the
 	// count stays warm for the next execution.
 	w.matchQueries = w.matchQueries[:p.matchCount]
+	w.matchIndexes = w.matchIndexes[:p.matchCount]
 	queries := w.matchQueries
-	if err := bindPlanMatches(p, snapshot, catalog, queries); err != nil {
+	if err := bindPlanMatches(p, snapshot, catalog, queries, w.matchIndexes); err != nil {
 		return err
 	}
 	w.eval.bindMatches(queries)
@@ -115,9 +120,11 @@ func (p *plan) bindMatches(w *Workspace, snapshot store.Snapshot, catalog store.
 }
 
 // bindPlanMatches binds one plan level against its own collection snapshot,
-// recursing into join and mark inner plans with theirs.
-func bindPlanMatches(p *plan, snapshot store.Snapshot, catalog store.DatabaseSnapshot, queries []tin.Query) error {
-	if err := bindPredMatches(p.where, p, snapshot, queries); err != nil {
+// recursing into join and mark inner plans with theirs. indexes parallels
+// queries: the generation-pinned build each slot parsed against, retained
+// for index-pruned candidate masks.
+func bindPlanMatches(p *plan, snapshot store.Snapshot, catalog store.DatabaseSnapshot, queries []tin.Query, indexes []*tin.Index) error {
+	if err := bindPredMatches(p.where, p, snapshot, queries, indexes); err != nil {
 		return err
 	}
 	for i := range p.joins {
@@ -128,7 +135,7 @@ func bindPlanMatches(p *plan, snapshot store.Snapshot, catalog store.DatabaseSna
 				p.joins[i].collection,
 			)
 		}
-		if err := bindPlanMatches(p.joins[i].inner, inner, catalog, queries); err != nil {
+		if err := bindPlanMatches(p.joins[i].inner, inner, catalog, queries, indexes); err != nil {
 			return err
 		}
 	}
@@ -140,7 +147,7 @@ func bindPlanMatches(p *plan, snapshot store.Snapshot, catalog store.DatabaseSna
 				p.marks[i].collection,
 			)
 		}
-		if err := bindPlanMatches(p.marks[i].inner, inner, catalog, queries); err != nil {
+		if err := bindPlanMatches(p.marks[i].inner, inner, catalog, queries, indexes); err != nil {
 			return err
 		}
 	}
@@ -151,12 +158,13 @@ func bindPlanMatches(p *plan, snapshot store.Snapshot, catalog store.DatabaseSna
 // against the owning plan's collection, then one ParseTINQL against that
 // snapshot's index. A missing tin index and an invalid query are both
 // statement errors naming the path.
-func bindPredMatches(pd *compiledPredicate, owner *plan, snapshot store.Snapshot, queries []tin.Query) error {
+func bindPredMatches(pd *compiledPredicate, owner *plan, snapshot store.Snapshot, queries []tin.Query, indexes []*tin.Index) error {
 	if pd == nil {
 		return nil
 	}
 	if pd.kind == predMatch {
-		if pd.col < 0 || pd.col >= len(owner.valuePaths) || pd.slot < 0 || pd.slot >= len(queries) {
+		if pd.col < 0 || pd.col >= len(owner.valuePaths) || pd.slot < 0 || pd.slot >= len(queries) ||
+			pd.slot >= len(indexes) {
 			return fmt.Errorf("query: ==> node names an uncompiled path or slot")
 		}
 		path := owner.valuePaths[pd.col].indexPath()
@@ -172,9 +180,10 @@ func bindPredMatches(pd *compiledPredicate, owner *plan, snapshot store.Snapshot
 			return fmt.Errorf("query: ==> over %s: invalid TINQL query: %v", path, err)
 		}
 		queries[pd.slot] = q
+		indexes[pd.slot] = ix
 	}
 	for _, kid := range pd.kids {
-		if err := bindPredMatches(kid, owner, snapshot, queries); err != nil {
+		if err := bindPredMatches(kid, owner, snapshot, queries, indexes); err != nil {
 			return err
 		}
 	}

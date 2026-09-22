@@ -290,8 +290,11 @@ func TestLegacySQLJoinLayoutAndWarmAllocationGates(t *testing.T) {
 		// 3520 before ==> bindings: the binding's inner scan Workspace
 		// carries one parsed-query slice and its evaluator one parsed-query
 		// alias plus one scratch slice (24 + 48 bytes incl. alignment).
-		if got := unsafe.Sizeof(joinBinding{}); got != 3600 {
-			t.Fatalf("joinBinding size = %d, want unchanged 3600", got)
+		// 3600 before ==> pruning: the Workspace gains the parallel
+		// build-pointer slice plus the DocID enumeration scratch (48
+		// bytes), both nil until an ==> node binds.
+		if got := unsafe.Sizeof(joinBinding{}); got != 3648 {
+			t.Fatalf("joinBinding size = %d, want unchanged 3648", got)
 		}
 		if got := unsafe.Offsetof(joinBinding{}.lits); got != 8 {
 			t.Fatalf("joinBinding.lits offset = %d, want unchanged 8", got)

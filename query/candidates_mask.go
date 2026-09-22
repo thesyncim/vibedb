@@ -1,6 +1,7 @@
 package query
 
 import (
+	"github.com/thesyncim/vibedb/internal/tin"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibejson"
 )
@@ -248,6 +249,8 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 			return nil, false, false, nil
 		}
 		return candidatesFor(p.containPlan, snapshot, caps, paths, indexes, w, requireExact)
+	case predMatch:
+		return matchCandidateMasks(p, w)
 	case predAnd:
 		return andCandidatesFor(p, snapshot, caps, paths, indexes, w, requireExact)
 	case predOr:
@@ -475,6 +478,83 @@ func singleColumnIndex(path string, indexes []store.IndexInfo) (store.IndexInfo,
 	return store.IndexInfo{}, false
 }
 
+// singleColumnTinIndex reports the Ready full-text declaration covering one
+// path, the only catalog shape ==> pruning accepts. Building indexes stay
+// out: their postings do not exist yet.
+func singleColumnTinIndex(path string, indexes []store.IndexInfo) bool {
+	for _, index := range indexes {
+		if index.Kind == store.IndexTin && index.State == store.IndexReady &&
+			index.ColumnCount == 1 && index.Columns[0] == path {
+			return true
+		}
+	}
+	return false
+}
+
+// matchCandidateMasks prunes ==> with the slot's generation-pinned tin
+// postings. Match enumerates every document the bound query accepts as DocIDs
+// packing (chunk, slot); folding them into ascending chunk masks feeds the
+// compact scan directly. TestMatchSingleAgreesWithIndex proves the Match set
+// is exactly the per-row verdict set, and the filter phase still rechecks
+// every candidate with evalMatch, so the probe reports exact=false and only
+// ever narrows the scan. A missing or out-of-range slot (an execution that
+// never bound, such as a join inner scan's private workspace) declines to
+// the full scan rather than erroring: an index is an optimization, and the
+// rechecked scan remains exact.
+func matchCandidateMasks(
+	p *compiledPredicate, w *Workspace,
+) ([]store.Mask, bool, bool, error) {
+	if p.slot < 0 || p.slot >= len(w.matchQueries) || p.slot >= len(w.matchIndexes) {
+		return nil, false, false, nil
+	}
+	ix := w.matchIndexes[p.slot]
+	if ix == nil {
+		return nil, false, false, nil
+	}
+	ids := ix.Match(w.matchQueries[p.slot], w.matchDocIDs[:0])
+	w.matchDocIDs = ids
+	if len(ids) == 0 {
+		return nil, true, false, nil
+	}
+	out := w.nextStoreMasks()
+	out = appendMatchMasks(out, ids)
+	if out == nil {
+		// A slot width beyond the 64-bit mask universe cannot be pruned
+		// exactly: decline rather than drop a document.
+		return nil, false, false, nil
+	}
+	w.keepStoreMasks(out)
+	return out, true, false, nil
+}
+
+// appendMatchMasks folds ascending match DocIDs into ascending chunk masks.
+// It returns nil if any slot escapes the mask universe; the caller must
+// decline rather than emit a partial set.
+func appendMatchMasks(out []store.Mask, ids []tin.DocID) []store.Mask {
+	var cur uint32
+	var bits uint64
+	started := false
+	flush := func() {
+		if started {
+			out = append(out, store.Mask{Chunk: cur, Bits: bits})
+		}
+	}
+	for _, id := range ids {
+		chunk := uint32(id >> 32)
+		slot := uint(id & 0xffffffff)
+		if slot >= 64 {
+			return nil
+		}
+		if !started || chunk != cur {
+			flush()
+			cur, bits, started = chunk, 0, true
+		}
+		bits |= uint64(1) << slot
+	}
+	flush()
+	return out
+}
+
 // membership returns the alternatives and needles a membership leaf tests
 // against, resolving a late-bound one through its slot in the executing
 // Workspace. bindable is false for a binding that chose the lookup strategy:
@@ -617,6 +697,12 @@ func (p *compiledPredicate) canBoundWithRanges(
 		return p.containPlan != nil && p.containPlan.canBoundWithRanges(
 			paths, indexes, w, ranges,
 		)
+	case predMatch:
+		// OR-side pruning needs every disjunct bounded; a Ready tin
+		// declaration over the path bounds this leaf. The bound query
+		// itself is only consulted at probe time, post-bind, so this
+		// stays accurate on the EXPLAIN path too.
+		return singleColumnTinIndex(p.indexPath(paths), indexes)
 	case predAnd:
 		if _, _, ok := p.bestCompoundIndex(paths, indexes, w); ok {
 			return true
