@@ -2,6 +2,7 @@ package tin
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -458,7 +459,8 @@ func (p *tinParser) parseFilterSpec() (FilterSpec, error) {
 		if err != nil {
 			return FilterSpec{}, err
 		}
-		p.skipWS()
+		// The reference places % immediately after the number; WORDS
+		// keeps the usual whitespace skip.
 		if p.pos < len(p.s) && p.s[p.pos] == '%' {
 			p.pos++
 			if first {
@@ -466,6 +468,7 @@ func (p *tinParser) parseFilterSpec() (FilterSpec, error) {
 			}
 			return FilterSpec{Kind: FilterLastPct, N: n}, nil
 		}
+		p.skipWS()
 		w2, err := p.scanWord()
 		if err != nil || !isKeyword(w2, "WORDS") {
 			return FilterSpec{}, p.errorf("expected %% or WORDS after IN FIRST/LAST count")
@@ -479,7 +482,6 @@ func (p *tinParser) parseFilterSpec() (FilterSpec, error) {
 		if err != nil {
 			return FilterSpec{}, err
 		}
-		p.skipWS()
 		if p.pos >= len(p.s) || p.s[p.pos] != '%' {
 			return FilterSpec{}, p.errorf("expected %% after IN MIDDLE percent")
 		}
@@ -602,25 +604,26 @@ func (p *tinParser) peekSecond(kw string) bool {
 // splitAttachedProx splits THEN/N and NEAR/N written without spaces (`/`
 // stays a word character so `and/or` remains one term). Only an exact
 // keyword prefix with an all-digit gap qualifies.
-func splitAttachedProx(w string) (ordered bool, n int, ok bool) {
+func splitAttachedProx(w string) (ordered bool, n int, ok bool, outOfRange bool) {
 	var rest string
 	if len(w) > 5 && w[:5] == "THEN/" {
 		ordered, rest = true, w[5:]
 	} else if len(w) > 5 && w[:5] == "NEAR/" {
 		rest = w[5:]
 	} else {
-		return false, 0, false
+		return false, 0, false, false
 	}
 	for i := 0; i < len(rest); i++ {
 		if rest[i] < '0' || rest[i] > '9' {
-			return false, 0, false
+			return false, 0, false, false
 		}
 	}
-	v, err := strconv.Atoi(rest)
+	// rest is non-empty all digits: it parses unless it exceeds 32 bits.
+	v, err := strconv.ParseUint(rest, 10, 32)
 	if err != nil {
-		return false, 0, false
+		return false, 0, false, true
 	}
-	return ordered, v, true
+	return ordered, int(v), true, false
 }
 
 // parseProx parses THEN/N and NEAR/N (left associative), attached or spaced.
@@ -650,7 +653,10 @@ func (p *tinParser) parseProx() (Query, error) {
 				return Query{}, err
 			}
 		case ok:
-			o, v, good := splitAttachedProx(w)
+			o, v, good, oor := splitAttachedProx(w)
+			if oor {
+				return Query{}, p.errorf("bad gap: does not fit in 32 bits")
+			}
 			if !good {
 				p.pos = save
 				return left, nil
@@ -721,24 +727,42 @@ func (p *tinParser) parseBoost() (Query, error) {
 	return node, nil
 }
 
-// scanBoost parses a boost factor in [0.0, 10000.0].
+// scanBoost parses a boost factor in [0.0, 10000.0], accepting decimals
+// and scientific notation (`^1.5`, `^1e3`).
 func (p *tinParser) scanBoost() (float64, error) {
 	p.skipWS()
 	start := p.pos
 	for p.pos < len(p.s) && (p.s[p.pos] == '.' || (p.s[p.pos] >= '0' && p.s[p.pos] <= '9')) {
 		p.pos++
 	}
+	// An exponent binds only when it is complete (`^1e3` is 1000, while
+	// `^1e` leaves a trailing term as before).
+	if p.pos < len(p.s) && (p.s[p.pos] == 'e' || p.s[p.pos] == 'E') {
+		j := p.pos + 1
+		if j < len(p.s) && (p.s[j] == '+' || p.s[j] == '-') {
+			j++
+		}
+		k := j
+		for k < len(p.s) && p.s[k] >= '0' && p.s[k] <= '9' {
+			k++
+		}
+		if k > j {
+			p.pos = k
+		}
+	}
 	v, err := strconv.ParseFloat(p.s[start:p.pos], 64)
 	if err != nil || p.pos == start {
 		return 0, p.errorf("expected a boost factor after ^")
 	}
-	if v < 0 || v > 10000 {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 10000 {
 		return 0, p.errorf("boost %v out of range [0.0, 10000.0]", v)
 	}
 	return v, nil
 }
 
-// scanDigits parses a non-negative integer.
+// scanDigits parses a non-negative integer. Every numeric argument fits in
+// an unsigned 32-bit integer per the reference (NumberOutOfRange); larger
+// values are parse errors on all platforms.
 func (p *tinParser) scanDigits(what string) (int, error) {
 	p.skipWS()
 	start := p.pos
@@ -748,11 +772,11 @@ func (p *tinParser) scanDigits(what string) (int, error) {
 	if p.pos == start {
 		return 0, p.errorf("expected %s", what)
 	}
-	v, err := strconv.Atoi(p.s[start:p.pos])
+	v, err := strconv.ParseUint(p.s[start:p.pos], 10, 32)
 	if err != nil {
-		return 0, p.errorf("bad %s", what)
+		return 0, p.errorf("bad %s: does not fit in 32 bits", what)
 	}
-	return v, nil
+	return int(v), nil
 }
 
 // parsePrimary parses terms, phrases, brackets, groups, MATCHES, CONTAINS,
@@ -833,7 +857,9 @@ func (p *tinParser) parseBareTerm(w string) (Query, error) {
 	if p.implicitOperand && strings.HasPrefix(w, ":") {
 		return Query{}, p.errorf("a term starting with ':' needs an explicit operator after another expression")
 	}
-	if _, _, attached := splitAttachedProx(w); attached {
+	if _, _, attached, oor := splitAttachedProx(w); oor {
+		return Query{}, p.errorf("bad gap: does not fit in 32 bits")
+	} else if attached {
 		return Query{}, p.errorf("proximity operator needs a left operand")
 	}
 	if strings.HasPrefix(w, "THEN/") || strings.HasPrefix(w, "NEAR/") {
@@ -1280,7 +1306,7 @@ func (p *tinParser) parseAtLeast() (Query, error) {
 	if err != nil {
 		return Query{}, err
 	}
-	p.skipWS()
+	// The reference places % immediately after the number.
 	pct := false
 	if !p.eof() && p.s[p.pos] == '%' {
 		pct = true
@@ -1425,7 +1451,32 @@ func (p *tinParser) parsePhrase() (Query, error) {
 		}
 		slop = n
 	}
+	// Leading and trailing gaps have no neighboring word to anchor to and
+	// are ignored; a phrase of only gaps matches nothing.
+	for len(slots) > 0 && slots[0].Any {
+		slots = slots[1:]
+	}
+	for len(slots) > 0 && slots[len(slots)-1].Any {
+		slots = slots[:len(slots)-1]
+	}
+	if len(slots) == 0 {
+		return Query{Op: OpOr}, nil
+	}
 	return Query{Op: OpPhrase, Phrase: slots, Slop: slop}, nil
+}
+
+// isBracketOperator reports whether word is reserved as an operator when
+// bare: inside phrase [...] it would re-parse as (part of) a full
+// expression rather than a term. Context-dependent words (FIRST, BY, OF,
+// ...) stay terms here.
+func isBracketOperator(word string) bool {
+	switch word {
+	case "AND", "OR", "NOT", "THEN", "NEAR",
+		"ENCLOSES", "ENCLOSED", "OVERLAPPING", "BEFORE", "AFTER",
+		"WITHIN", "TO", "IN", "AT", "ALL", "CONTAINS", "MATCHES":
+		return true
+	}
+	return false
 }
 
 // phraseSlots splits phrase inner text into positions.
@@ -1448,7 +1499,7 @@ func (p *tinParser) phraseSlots(inner string) ([]PhrasePos, error) {
 			i++
 		case '[':
 			i++
-			var alts []uint64
+			var altTokens [][]uint64
 			for {
 				skip()
 				if i >= len(inner) {
@@ -1464,16 +1515,45 @@ func (p *tinParser) phraseSlots(inner string) ([]PhrasePos, error) {
 				}
 				word := inner[i:j]
 				i = j
-				hashes := foldTokens(word)
-				if len(hashes) != 1 {
-					return nil, p.errorf("phrase alternatives must be single terms")
+				// A quote inside brackets is always an escaped
+				// literal (an unescaped one ends the phrase), and
+				// the reference rejects it there.
+				if strings.Contains(word, "\"") {
+					return nil, p.errorf("quote is not allowed inside phrase [...]")
 				}
-				alts = append(alts, hashes[0])
+				// Operator words would re-parse as full
+				// expressions, which need span slots the phrase
+				// evaluator does not have; refuse them instead of
+				// misreading them as terms.
+				if _, _, attached, oor := splitAttachedProx(word); oor || attached || isBracketOperator(word) {
+					return nil, p.errorf("phrase [...] alternatives support terms, not %q", word)
+				}
+				hashes := foldTokens(word)
+				if len(hashes) == 0 {
+					return nil, p.errorf("alternative %q analyzes to no tokens", word)
+				}
+				altTokens = append(altTokens, hashes)
 			}
-			if len(alts) == 0 {
+			if len(altTokens) == 0 {
 				return nil, p.errorf("empty [] in phrase")
 			}
-			slots = append(slots, PhrasePos{Alts: alts})
+			// A written token the tokenizer splits occupies
+			// consecutive positions at its slot; every
+			// alternative must span the same width for the
+			// phrase to stay aligned.
+			width := len(altTokens[0])
+			for _, at := range altTokens[1:] {
+				if len(at) != width {
+					return nil, p.errorf("phrase [...] alternatives must align in token count")
+				}
+			}
+			for k := 0; k < width; k++ {
+				alts := make([]uint64, len(altTokens))
+				for a, at := range altTokens {
+					alts[a] = at[k]
+				}
+				slots = append(slots, PhrasePos{Alts: alts})
+			}
 		default:
 			j := i
 			for j < len(inner) && inner[j] != ' ' && inner[j] != '\t' {
@@ -1481,9 +1561,9 @@ func (p *tinParser) phraseSlots(inner string) ([]PhrasePos, error) {
 			}
 			word := inner[i:j]
 			i = j
-			if strings.ContainsAny(word, "*?~^") {
-				return nil, p.errorf("wildcards need expression level, not phrases")
-			}
+			// Inside a phrase `*?~^` are literal text: keywords,
+			// wildcards, and modifiers keep no special meaning
+			// here, so the tokenizer simply folds them away.
 			hashes := foldTokens(word)
 			for _, h := range hashes {
 				slots = append(slots, PhrasePos{Alts: []uint64{h}})

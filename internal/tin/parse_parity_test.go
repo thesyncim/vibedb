@@ -231,3 +231,141 @@ func TestParityContainsShapes(t *testing.T) {
 		t.Fatalf("CONTAINS ... parsed without a term, want error")
 	}
 }
+
+// PlanetScale parity: every numeric argument fits in an unsigned 32-bit
+// integer; larger values are parse errors on all platforms.
+func TestParityU32Bounds(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "beer wine")
+	for _, input := range []string{
+		`beer THEN/4294967296 wine`,
+		`beer NEAR/4294967296 wine`,
+		`beer~4294967296`,
+		`beer~1:4294967296`,
+		`beer IN FIRST 4294967296 WORDS`,
+		`beer IN LAST 4294967296 WORDS`,
+		`beer IN MIDDLE 4294967296%`,
+		`beer IN WORDS 1 TO 4294967296`,
+		`(beer NEAR/1 wine) WITHIN 4294967296`,
+		`"beer wine"~4294967296`,
+		`AT LEAST 4294967296 OF [beer wine]`,
+		`AT LEAST 18446744073709551615 OF [beer wine]`,
+	} {
+		if _, err := ix.ParseTINQL(input); err == nil {
+			t.Fatalf("%s parsed past the 32-bit bound, want error", input)
+		}
+	}
+	// The bound itself still parses.
+	for _, input := range []string{
+		`beer THEN/4294967295 wine`,
+		`beer IN FIRST 4294967295 WORDS`,
+		`AT LEAST 4294967295 OF [beer wine]`,
+	} {
+		if _, err := ix.ParseTINQL(input); err != nil {
+			t.Fatalf("%s: unexpected error %v", input, err)
+		}
+	}
+}
+
+// PlanetScale parity: % sits immediately after the number. The percentage
+// rounds up: 50% of 5 items means at least 3 must match.
+func TestParityPercentPlacement(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "a")
+	ix.Add(2, "a b")
+	ix.Add(3, "a b c")
+	ix.Add(4, "a b c d")
+	ix.Add(5, "a b c d e")
+	parityMatchWant(t, ix, `AT LEAST 50% OF [a b c d]`, []DocID{2, 3, 4, 5})
+	parityMatchWant(t, ix, `AT LEAST 50% OF [a b c d e]`, []DocID{3, 4, 5})
+	for _, input := range []string{
+		`AT LEAST 50 % OF [a b]`,
+		`a IN FIRST 25 %`,
+		`a IN LAST 25 %`,
+		`a IN MIDDLE 50 %`,
+	} {
+		if _, err := ix.ParseTINQL(input); err == nil {
+			t.Fatalf("%s parsed with a spaced %%, want error", input)
+		}
+	}
+}
+
+// PlanetScale parity: boost factors accept scientific notation within
+// [0, 10000]; anything outside is a parse error.
+func TestParityBoostScientific(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "beer")
+	q, err := ix.ParseTINQL(`beer^1e3`)
+	if err != nil {
+		t.Fatalf("beer^1e3: %v", err)
+	}
+	if q.Boost != 1000 {
+		t.Fatalf("beer^1e3 boost = %v, want 1000", q.Boost)
+	}
+	for _, input := range []string{`beer^1e5`, `beer^1e999`, `beer^10000.1`} {
+		if _, err := ix.ParseTINQL(input); err == nil {
+			t.Fatalf("%s parsed past the boost bound, want error", input)
+		}
+	}
+}
+
+// PlanetScale parity: inside a phrase `*?~^` are literal text; leading and
+// trailing gaps anchor to nothing and are ignored; an all-gap phrase
+// matches nothing; a quote inside [...] is a parse error.
+func TestParityPhraseLiterals(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "a b")
+	ix.Add(2, "axb")
+	ix.Add(3, "wolf")
+	ix.Add(4, "big bad wolf")
+	parityMatchWant(t, ix, `"a * b"`, []DocID{1})
+	parityMatchWant(t, ix, `"a^b"`, []DocID{1})
+	parityMatchWant(t, ix, `"a~b"`, []DocID{1})
+	parityMatchWant(t, ix, `"_ wolf"`, []DocID{3, 4})
+	parityMatchWant(t, ix, `"big bad _"`, []DocID{4})
+	parityMatchWant(t, ix, `"_"`, nil)
+	parityMatchWant(t, ix, `"_"~2`, nil)
+	parityMatchWant(t, ix, `"she said \"hi\""`, nil)
+	for _, input := range []string{`"[\"a\" b]"`, `"[A AND B] x"`, `"[A NEAR/3 B] x"`} {
+		if _, err := ix.ParseTINQL(input); err == nil {
+			t.Fatalf("%s parsed, want error", input)
+		}
+	}
+}
+
+// PlanetScale parity: a written token the tokenizer splits occupies
+// consecutive positions at its phrase slot; commas inside phrase brackets
+// are literal term characters.
+func TestParityPhraseMultiTokenAlts(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "e-mail now")
+	ix.Add(2, "e-maul now")
+	ix.Add(3, "e-xyz now")
+	ix.Add(4, "47 000 48 000 number")
+	parityMatchWant(t, ix, `"[e-mail e-maul] now"`, []DocID{1, 2})
+	parityMatchWant(t, ix, `"[47,000 48,000]"`, []DocID{4})
+	if _, err := ix.ParseTINQL(`"[wi-fi wimax] x"`); err == nil {
+		t.Fatalf(`"[wi-fi wimax] x" parsed with mixed-width alternatives, want error`)
+	}
+}
+
+// Locked reference behaviors: digit-commas never split the alternative
+// list, MATCHES keeps its pattern case exactly, and the reserved words
+// stay reserved.
+func TestParityLockedReference(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "47 000 x")
+	ix.Add(2, "48 000 x")
+	ix.Add(3, "beer")
+	parityMatchWant(t, ix, `47,000`, []DocID{1})
+	parityMatchWant(t, ix, `[47,000 48,000]`, []DocID{1, 2})
+	parityMatchWant(t, ix, `MATCHES beer.*`, []DocID{3})
+	parityMatchWant(t, ix, `MATCHES Beer.*`, nil)
+	for _, input := range []string{
+		`AT`, `ALL`, `ENCLOSED`, `beer IN bar`, `beer IN MIDDLE 5 WORDS`,
+	} {
+		if _, err := ix.ParseTINQL(input); err == nil {
+			t.Fatalf("%s parsed, want error", input)
+		}
+	}
+}

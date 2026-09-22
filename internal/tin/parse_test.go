@@ -207,7 +207,9 @@ func TestTINQLErrors(t *testing.T) {
 		`apple NOT peel`, `NOT apple`, `THEN/2 apple`, `apple THEN apple`,
 		`apple THEN/ apple`, `apple IN NOWHERE 5`, `apple IN WORDS 1`,
 		`AT MOST 2 OF [a b]`, `ALL [a b]`, `MATCHES`, `a,b`,
-		`apple ENCLOSED apple`, `A TO * TO B`, `"a * b"`,
+		`apple ENCLOSED apple`, `A TO * TO B`,
+		// `"a * b"` was here: inside a phrase `*` is literal text, so it
+		// reads as the phrase "a b" (TestParityPhraseLiterals).
 		// `[a, b]` was here: commas separate alternatives per the TINQL
 		// reference now (TestParityComma), while bare `a,b` still errors.
 	} {
