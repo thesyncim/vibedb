@@ -228,6 +228,52 @@ func TestScoreSegmentedExact(t *testing.T) {
 	}
 }
 
+// TestScoreSegmentedFullExact proves ScoreSegmentedFull merges the exact
+// full ranking — every (Doc, Score) bit-identical to the single index —
+// over open and sealed shards, empty and nil shards, and missing terms.
+// Only lone terms serve: conjunctions sum in task-dependent orders that
+// agree to 1 ulp, which can reorder near-ties, so they decline.
+func TestScoreSegmentedFullExact(t *testing.T) {
+	for _, sealed := range []bool{false, true} {
+		shards := gatherShardCorpus(4, 2000)
+		shards = append(shards, Shard{Ix: NewIndex()}, Shard{})
+		if sealed {
+			for i := range shards {
+				if shards[i].Ix != nil {
+					shards[i].Ix.Seal()
+				}
+			}
+		}
+		single := gatherSingleCorpus(4, 2000)
+		for _, pattern := range []string{
+			"common", "zipf", "tied", "missing", "common^2", "zipf^0.5",
+		} {
+			q := gatherQuery(t, shards, pattern)
+			got, ok := ScoreSegmentedFull(shards, q, nil)
+			if !ok {
+				t.Fatalf("sealed=%v %s declined, want exact", sealed, pattern)
+			}
+			want := single.Score(q, 0, nil)
+			if len(got) != len(want) {
+				t.Fatalf("sealed=%v %s: %d hits, want %d", sealed, pattern, len(got), len(want))
+			}
+			for i := range got {
+				if got[i] != want[i] {
+					t.Fatalf("sealed=%v %s hit %d = %+v, want %+v", sealed, pattern, i, got[i], want[i])
+				}
+			}
+		}
+		for _, pattern := range []string{
+			`zipf AND common`, `"tied tie"`, `zipf OR common`, `*`,
+		} {
+			q := gatherQuery(t, shards, pattern)
+			if _, ok := ScoreSegmentedFull(shards, q, nil); ok {
+				t.Fatalf("sealed=%v %s segmented without full support, want decline", sealed, pattern)
+			}
+		}
+	}
+}
+
 // TestScoreSegmentedMasksExact proves MatchGathered unions every shape
 // exactly, including the ones ScoreSegmented declines: masks never score.
 func TestScoreSegmentedMasksExact(t *testing.T) {

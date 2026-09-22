@@ -152,14 +152,28 @@ func applyTinTopK(w *Workspace, spec tinTopKSpec) bool {
 		// ranking by score alone, stably, so equal scores retain the
 		// ranking's DocID order — the scan order the full sort breaks ties
 		// with. Scoring the full match set still skips every per-row
-		// retokenization, which is where the time used to go. Only the
-		// single index serves this shape; segmented snapshots decline to
-		// the ordinary scan.
-		if ix == nil {
-			return false
+		// retokenization, which is where the time used to go. Segmented
+		// snapshots serve lone terms, whose shared-view full ranking
+		// merges bit-identically (see tin.ScoreSegmentedFull); anything
+		// else declines to the single index, and to the ordinary scan
+		// when it is unbuilt.
+		segServed := false
+		if haveSeg && q.Op == tin.OpTerm {
+			if hits, ok := tin.ScoreSegmentedFull(w.matchShards[spec.slot], q, w.matchScored[:0]); ok {
+				w.matchScored = hits
+				segServed = true
+			}
 		}
-		hits := ix.Score(q, 0, w.matchScored[:0])
-		w.matchScored = hits
+		var hits []tin.Scored
+		if segServed {
+			hits = w.matchScored
+		} else {
+			if ix == nil {
+				return false
+			}
+			hits = ix.Score(q, 0, w.matchScored[:0])
+			w.matchScored = hits
+		}
 		sort.SliceStable(hits, func(i, j int) bool { return hits[i].Score < hits[j].Score })
 		// Keep the offset+limit prefix, exactly like the plan-level bound:
 		// the cursor still skips the offset itself downstream.

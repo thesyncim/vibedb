@@ -322,6 +322,11 @@ func TestTinSegmentedSQLIdentity(t *testing.T) {
 		if qi == 0 && !segEngaged {
 			t.Fatalf("%s: segmented run skipped the top-K restriction", src)
 		}
+		// The ascending lone term serves from the segmented full
+		// ranking instead of declining to the ordinary scan.
+		if qi == 2 && !segEngaged {
+			t.Fatalf("%s: segmented ascending run skipped the top-K restriction", src)
+		}
 		if len(segRows) != len(singleRows) {
 			t.Fatalf("%s: %d rows segmented, %d single", src, len(segRows), len(singleRows))
 		}

@@ -116,6 +116,72 @@ func (ix *Index) ScorePinned(q Query, topK int, out []Scored, gs *SegGlobals) ([
 	return out, false
 }
 
+// ScorePinnedFull scores q's whole matching set under gs, reporting
+// false outside OpTerm: a lone term sums once per document, so the
+// shared-view scores match the single index bit for bit and the merge
+// order equals its ranking. AND sums in shard/task-dependent orders
+// that agree only to 1 ulp (see score_and.go), which can reorder
+// near-ties, so conjunctions stay on the top-K path whose single-index
+// twin uses the same core. A missing list contributes nothing.
+func (ix *Index) ScorePinnedFull(q Query, out []Scored, gs *SegGlobals) ([]Scored, bool) {
+	if gs == nil || q.Op != OpTerm {
+		return out, false
+	}
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	ix.ensureSorted()
+	p := ix.post[q.Term]
+	if p == nil || gs.nDocs == 0 {
+		return out, true
+	}
+	n := p.docCount()
+	if n == 0 {
+		return out, true
+	}
+	// topK covers the shard's whole list, so the heap never fills and
+	// no sealed block is ever skipped: the run is the full ranking.
+	return ix.scoreSingleTopKCore(p, gs.nDocs, gs.avg, gs.df[q.Term], q.boostOf(), n, out)
+}
+
+// ScoreSegmentedFull scores q on every shard in parallel under one shared
+// statistics view and merges the exact full ranking. See ScorePinnedFull
+// for the OpTerm-only contract; anything else reports false and the
+// caller serves it another way. Nil shards contribute nothing. Buffer
+// rules match ScoreGathered.
+func ScoreSegmentedFull(shards []Shard, q Query, out []Scored) ([]Scored, bool) {
+	if q.Op != OpTerm {
+		return out, false
+	}
+	gs := gatherSegGlobals(shards, []uint64{q.Term})
+	if gs.nDocs == 0 {
+		return out, true
+	}
+	runs := make([][]Scored, len(shards))
+	oks := make([]bool, len(shards))
+	var wg sync.WaitGroup
+	for i := range shards {
+		if shards[i].Ix == nil {
+			oks[i] = true
+			continue
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			s, ok := shards[i].Ix.ScorePinnedFull(q, shards[i].Out[:0], &gs)
+			shards[i].Out = s
+			runs[i] = s
+			oks[i] = ok
+		}(i)
+	}
+	wg.Wait()
+	for _, ok := range oks {
+		if !ok {
+			return out, false
+		}
+	}
+	return mergeScored(runs, 0, out), true
+}
+
 // ScoreSegmented scores q on every shard in parallel under one shared
 // statistics view and merges the exact global top-K. It reports false
 // when q leaves the pinned shapes or any shard declines its fast gate;
