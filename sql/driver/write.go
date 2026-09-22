@@ -528,6 +528,32 @@ func indexDefinitionMethod(definition query.IndexDefinition) string {
 	return ""
 }
 
+// compileReplicatedLocalIndex validates one local index definition for a
+// replicated schema image, preserving its access method: exact definitions
+// compile as exact, USING tin definitions compile as tin. Every replicated
+// path must route through here; compiling by family keeps a tin declaration
+// from failing closed as "not an exact index" or, worse, materializing as
+// exact on a replica while the primary answers full text.
+func compileReplicatedLocalIndex(definition store.IndexDefinition) (indexMeta, error) {
+	if definition.Kind == store.IndexTin {
+		if _, err := store.CompileTinDefinition(definition); err != nil {
+			return indexMeta{}, err
+		}
+		return indexMeta{
+			Name:   definition.Name,
+			Paths:  append([]string(nil), definition.Paths...),
+			Method: indexMethodTin,
+		}, nil
+	}
+	compiled, err := store.CompileExactIndex(definition)
+	if err != nil {
+		return indexMeta{}, err
+	}
+	return indexMeta{
+		Name: definition.Name, Paths: compiled.Specs[:compiled.N],
+	}, nil
+}
+
 // createIndexContext keeps the catalog mutex only around validation and the
 // final metadata publication. A materialized table delegates the expensive
 // scan to durable.Collection.CreateIndexContext, whose optimistic leaf

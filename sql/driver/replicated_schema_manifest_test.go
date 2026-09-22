@@ -204,3 +204,50 @@ func TestReplicatedSchemaManifestRejectsLocalUniqueIndex(t *testing.T) {
 			err, ErrReplicatedShardStoreProfile)
 	}
 }
+
+// Tin declarations ride the replicated schema image with their method:
+// the compiler preserves the family, the digest separates tin from exact
+// over identical names and paths, and the initial manifest builds with tin.
+func TestReplicatedSchemaManifestCarriesTinMethod(t *testing.T) {
+	tin := store.IndexDefinition{Name: "body_tin", Paths: []string{"/body"}, Kind: store.IndexTin}
+	meta, err := compileReplicatedLocalIndex(tin)
+	if err != nil {
+		t.Fatalf("compile tin: %v", err)
+	}
+	if meta.Method != indexMethodTin || len(meta.Paths) != 1 || meta.Paths[0] != "/body" {
+		t.Fatalf("tin meta = %+v, want method tin over /body", meta)
+	}
+	exact, err := compileReplicatedLocalIndex(store.IndexDefinition{Name: "body_tin", Paths: []string{"/body"}})
+	if err != nil {
+		t.Fatalf("compile exact: %v", err)
+	}
+	if exact.Method != "" {
+		t.Fatalf("exact meta carries method %q", exact.Method)
+	}
+	if replicatedLocalIndexDigest([]indexMeta{meta}) == replicatedLocalIndexDigest([]indexMeta{exact}) {
+		t.Fatal("tin and exact digests collide over identical names and paths")
+	}
+	if _, err := compileReplicatedLocalIndex(store.IndexDefinition{
+		Name: "bad_tin", Paths: []string{"/a", "/b"}, Kind: store.IndexTin,
+	}); err == nil {
+		t.Fatal("two-path tin compiled")
+	}
+	source, _, _ := childSchemaIdentity(t, false, false)
+	placement := testReplicatedApplyOptions().Placement
+	schema := InitialReplicatedRelationSchema{
+		Table: source.UserTable, PrimaryKey: source.UserPrimaryKey,
+		Limits: source.UserLimits, LocalIndexes: []store.IndexDefinition{tin},
+	}
+	tinDigest, _, err := InitialReplicatedRelationManifest(source.Binding, placement, schema)
+	if err != nil {
+		t.Fatalf("initial manifest with tin: %v", err)
+	}
+	schema.LocalIndexes = []store.IndexDefinition{{Name: "body_tin", Paths: []string{"/body"}}}
+	exactDigest, _, err := InitialReplicatedRelationManifest(source.Binding, placement, schema)
+	if err != nil {
+		t.Fatalf("initial manifest with exact: %v", err)
+	}
+	if tinDigest == exactDigest {
+		t.Fatal("initial manifest conflates tin and exact images")
+	}
+}

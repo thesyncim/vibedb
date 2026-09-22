@@ -120,12 +120,16 @@ func validateReplicatedChildSchemaDefinition(table, primaryKey, createTable stri
 			for i, path := range index.Paths {
 				paths[i] = string(path.AppendPointer(nil))
 			}
-			compiled, err := store.CompileExactIndex(store.IndexDefinition{Name: index.Name, Paths: paths})
+			definition := store.IndexDefinition{Name: index.Name, Paths: paths}
+			if index.Method == indexMethodTin {
+				definition.Kind = store.IndexTin
+			}
+			meta, err := compileReplicatedLocalIndex(definition)
 			if err != nil {
 				return fail()
 			}
 			names[index.Name] = struct{}{}
-			indexes = append(indexes, indexMeta{Name: index.Name, Paths: compiled.Specs[:compiled.N]})
+			indexes = append(indexes, meta)
 		default:
 			return fail()
 		}
