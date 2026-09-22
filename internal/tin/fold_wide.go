@@ -21,14 +21,14 @@ var (
 // which is exactly the passthrough the rune path requires. The tail stays
 // scalar.
 func foldASCIIWide(dst []byte, src string) {
-	// Walk a raw pointer: slice indexing would bounds-check every vector.
-	ptr := unsafe.StringData(src)
+	// Each window derives from the base pointer: slice indexing would
+	// bounds-check every vector, while carrying the pointer forward trips
+	// checkptr under -race. The window borrows the string body without
+	// copying or allocating and never escapes the load.
+	base := unsafe.Pointer(unsafe.StringData(src))
 	i := 0
 	for ; i+16 <= len(src); i += 16 {
-		// The window borrows the string body without copying or allocating
-		// and never escapes the load.
-		v := archsimd.LoadUint8x16(unsafe.Slice(ptr, 16))
-		ptr = (*byte)(unsafe.Add(unsafe.Pointer(ptr), 16))
+		v := archsimd.LoadUint8x16(unsafe.Slice((*byte)(unsafe.Add(base, uintptr(i))), 16))
 		upper := v.GreaterEqual(foldWideA).And(v.LessEqual(foldWideZ))
 		folded := v.Add(foldWideDelta.Masked(upper))
 		folded.Store(dst[i : i+16])

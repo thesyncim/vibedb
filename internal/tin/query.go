@@ -866,10 +866,8 @@ func (ix *Index) slotPositions(alts []uint64, doc DocID, stage []uint32) ([]uint
 				}
 				return nil, stage
 			}
-			if row, ok := ix.sealedFindRow(p.sealed, doc); ok {
-				base := len(stage)
-				stage = ix.sealedPositionsInto(p.sealed, row, stage)
-				return stage[base:], stage
+			if tail, stage2, ok := ix.sealedRowPositions(p.sealed, doc, stage); ok {
+				return tail, stage2
 			}
 		}
 		return nil, stage
@@ -895,8 +893,8 @@ func (ix *Index) slotPositions(alts []uint64, doc DocID, stage []uint32) ([]uint
 			}
 			continue
 		}
-		if row, ok := ix.sealedFindRow(p.sealed, doc); ok {
-			stage = ix.sealedPositionsInto(p.sealed, row, stage)
+		if _, stage2, ok := ix.sealedRowPositions(p.sealed, doc, stage); ok {
+			stage = stage2
 		}
 	}
 	tail := stage[base:]

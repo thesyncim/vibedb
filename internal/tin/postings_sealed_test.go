@@ -366,6 +366,48 @@ func benchmarkMatchSkewed(b *testing.B, ix *Index) {
 func BenchmarkMatchSkewedOpen(b *testing.B)   { benchmarkMatchSkewed(b, skewedBenchIndex(false)) }
 func BenchmarkMatchSkewedSealed(b *testing.B) { benchmarkMatchSkewed(b, skewedBenchIndex(true)) }
 
+// BenchmarkBuild20k times adding 20000 documents: the reference Seal
+// divides by.
+func BenchmarkBuild20k(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		ix := NewIndex()
+		for j := 0; j < 20000; j++ {
+			text := "common filler words here"
+			if j%7 == 0 {
+				text += " selective selective selective"
+			}
+			if j%29 == 0 {
+				text += " " + strings.Repeat("repeat ", 40)
+			}
+			ix.Add(DocID(j+1), text)
+		}
+		_ = ix
+	}
+}
+
+// BenchmarkSeal20k times sealing a 20000-document index (build untimed):
+// the one-time cost every durable generation build pays after its scan.
+func BenchmarkSeal20k(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		ix := NewIndex()
+		for j := 0; j < 20000; j++ {
+			text := "common filler words here"
+			if j%7 == 0 {
+				text += " selective selective selective"
+			}
+			if j%29 == 0 {
+				text += " " + strings.Repeat("repeat ", 40)
+			}
+			ix.Add(DocID(j+1), text)
+		}
+		b.StartTimer()
+		ix.Seal()
+	}
+}
+
 func benchmarkMatchPhrase(b *testing.B, ix *Index) {
 	q, err := ix.ParseTINQL(`"filler words"`)
 	if err != nil {

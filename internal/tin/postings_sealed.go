@@ -422,22 +422,28 @@ func linearBlockRow(s *sealedPostings, b int, doc DocID) (int, bool) {
 	return 0, false
 }
 
-// sealedPositionsInto appends row's positions to out: the frequency comes
-// from the cached block and the delta bit offset accumulates over cached
-// prefix counts, so no count-stream walk fires — only the row's own gaps
-// decode.
-func (ix *Index) sealedPositionsInto(s *sealedPostings, row int, out []uint32) []uint32 {
-	b := row / sealedBlockRows
-	wrow := row % sealedBlockRows
+// sealedRowAt appends cached block (b, wrow)'s positions to out: the
+// frequency comes from cached counts and the delta bit offset accumulates
+// from the checkpoint over cached prefix counts, so only the row's own
+// gaps decode.
+func (ix *Index) sealedRowAt(s *sealedPostings, b, wrow int, out []uint32) []uint32 {
 	bl := &s.blk[b]
 	_, cnts := ix.sealedBlock(s, b)
 	c := cnts[wrow]
-	base := s.bases[row]
-	posBit := uint32(0)
-	for i := 0; i < wrow; i++ {
+	base := s.bases[b*sealedBlockRows+wrow]
+	anchor := wrow / sealedCkptEvery * sealedCkptEvery
+	posBit := bl.posCkpt[anchor/sealedCkptEvery]
+	for i := anchor; i < wrow; i++ {
 		posBit += (cnts[i] - 1) * uint32(bl.posW)
 	}
 	out = append(out, base)
+	return s.decodeGaps(bl, posBit, base, c, out)
+}
+
+// decodeGaps appends (c-1) delta-decoded positions after base. A block of
+// single-occurrence documents packs no gaps at all; seeking an empty
+// stream would read out of bounds, hence the guard.
+func (s *sealedPostings) decodeGaps(bl *sealedBlock, posBit, base, c uint32, out []uint32) []uint32 {
 	if c > 1 {
 		posR := packReaderSeek(s.pos, bl.posOff, posBit)
 		cur := base
@@ -447,6 +453,51 @@ func (ix *Index) sealedPositionsInto(s *sealedPostings, row int, out []uint32) [
 		}
 	}
 	return out
+}
+
+// sealedRowPositions appends doc's positions to stage and returns the new
+// tail plus the extended stage, or false when doc is absent: one
+// block-index search, one cache probe, one binary search, one checkpointed
+// delta decode. It fuses sealedFindRow plus sealedRowAt so phrase lookups
+// pay the index and cache exactly once. Callers must use the extended
+// stage from here on: the tail aliases it.
+func (ix *Index) sealedRowPositions(s *sealedPostings, doc DocID, stage []uint32) ([]uint32, []uint32, bool) {
+	lo, hi := 0, len(s.first)
+	for lo < hi {
+		m := lo + (hi-lo)/2
+		if s.first[m] <= uint64(doc) {
+			lo = m + 1
+		} else {
+			hi = m
+		}
+	}
+	if lo == 0 {
+		return nil, stage, false
+	}
+	b := lo - 1
+	for i := range ix.blk {
+		if ix.blk[i].src == s && ix.blk[i].num == b {
+			row, ok := binaryBlockRow(b, ix.blk[i].ids, doc)
+			if !ok {
+				return nil, stage, false
+			}
+			base := len(stage)
+			out := ix.sealedRowAt(s, b, row%sealedBlockRows, stage)
+			return out[base:], out, true
+		}
+	}
+	// Miss: decode the block unconditionally. Unlike bare membership
+	// probes, a positions lookup always wants the block's counts next,
+	// so the fill always pays; alternating terms would defeat a
+	// miss-twice heuristic here.
+	ids, _ := ix.sealedBlock(s, b)
+	row, ok := binaryBlockRow(b, ids, doc)
+	if !ok {
+		return nil, stage, false
+	}
+	base := len(stage)
+	out := ix.sealedRowAt(s, b, row%sealedBlockRows, stage)
+	return out[base:], out, true
 }
 
 // sealedTermSpans expands a sealed term posting list to span hits, one
