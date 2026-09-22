@@ -86,6 +86,44 @@ type Index struct {
 	// second same-block lookup fills the block cache (see sealedFindRow).
 	missSrc *sealedPostings
 	missBlk int
+	// docBase/docLens index document lengths densely while ids arrive
+	// dense (append for the next id, overwrite on replace); the first
+	// sparse jump drops the array and the docs map stays source of
+	// truth. Lengths are only read for live posting-derived documents,
+	// so a zeroed removal slot is never observed.
+	docBase uint64
+	docLens []uint32
+}
+
+// noteDocLength tracks id's length in the dense array. Call with the
+// document not yet inserted so an empty map plus a nil array means the
+// first document ever (which establishes the base).
+func (ix *Index) noteDocLength(id DocID, length uint32) {
+	if ix.docLens == nil {
+		if len(ix.docs) != 0 {
+			return
+		}
+		ix.docBase = uint64(id)
+		ix.docLens = make([]uint32, 0, 64)
+	}
+	if d := uint64(id) - ix.docBase; d < uint64(len(ix.docLens)) {
+		ix.docLens[d] = length
+	} else if d == uint64(len(ix.docLens)) {
+		ix.docLens = append(ix.docLens, length)
+	} else {
+		ix.docLens = nil
+	}
+}
+
+// docLength returns id's length without hashing: array probe while dense,
+// map fallback once sparse.
+func (ix *Index) docLength(id DocID) uint32 {
+	if ix.docLens != nil {
+		if d := uint64(id) - ix.docBase; d < uint64(len(ix.docLens)) {
+			return ix.docLens[d]
+		}
+	}
+	return ix.docs[id].length
 }
 
 // spellEntry is one vocabulary row ordered by spelling.
@@ -165,6 +203,7 @@ func (ix *Index) Add(id DocID, text string) {
 	} else {
 		scanStringRec(text, spell, emit)
 	}
+	ix.noteDocLength(id, length)
 	ix.docs[id] = docMeta{length: length, terms: terms}
 	ix.nDocs++
 	ix.tokens += uint64(length)
@@ -246,6 +285,11 @@ func (ix *Index) removeLocked(id DocID, old docMeta) {
 		}
 	}
 	delete(ix.docs, id)
+	if ix.docLens != nil {
+		if d := uint64(id) - ix.docBase; d < uint64(len(ix.docLens)) {
+			ix.docLens[d] = 0
+		}
+	}
 	ix.nDocs--
 	ix.tokens -= uint64(old.length)
 }

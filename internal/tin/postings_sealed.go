@@ -542,7 +542,6 @@ func (ix *Index) sealedTermSpans(s *sealedPostings, out []spanHit, posBuf []uint
 // drain: later sealed calls reuse it.
 func (ix *Index) sealedScoreGather(
 	s *sealedPostings,
-	docs map[DocID]docMeta,
 	tf, dl []float64,
 ) ([]DocID, []float64, []float64) {
 	ids := ix.decIDs[:0]
@@ -558,7 +557,7 @@ func (ix *Index) sealedScoreGather(
 			c := cntR.next(bl.cntW)
 			ids = append(ids, id)
 			tf = append(tf, float64(c))
-			dl = append(dl, float64(docs[id].length))
+			dl = append(dl, float64(ix.docLength(id)))
 		}
 	}
 	ix.decIDs = ids

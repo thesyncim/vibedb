@@ -999,12 +999,9 @@ func (ix *Index) Score(q Query, topK int, out []Scored) []Scored {
 	defer ix.mu.Unlock()
 	ix.ensureSorted()
 	ix.scratchS = ix.scratchS[:0]
-	ix.scoreInto(q, ix.docs, &ix.scratchS)
+	ix.scoreInto(q, &ix.scratchS)
 	s := ix.scratchS
-	sortScored(s)
-	if topK > 0 && len(s) > topK {
-		s = s[:topK]
-	}
+	s = topKScored(s, topK)
 	out = append(out, s...)
 	ix.scratchS = ix.scratchS[:0]
 	return out
@@ -1014,18 +1011,18 @@ func (ix *Index) Score(q Query, topK int, out []Scored) []Scored {
 // phrases score from posting frequencies; proximity, relations, filters, and
 // thresholds score their resulting span counts as occurrence frequencies;
 // booleans sum their children. Every level scales by its boost.
-func (ix *Index) scoreInto(q Query, docs map[DocID]docMeta, acc *[]Scored) {
+func (ix *Index) scoreInto(q Query, acc *[]Scored) {
 	switch q.Op {
 	case OpTerm:
-		ix.scoreTerm(q.Term, q.boostOf(), docs, acc)
+		ix.scoreTerm(q.Term, q.boostOf(), acc)
 	case OpPhrase:
-		ix.scorePhrase(q.Phrase, q.Slop, q.boostOf(), docs, acc)
+		ix.scorePhrase(q.Phrase, q.Slop, q.boostOf(), acc)
 	case OpAnd:
 		if len(q.Kids) == 0 {
 			return
 		}
 		for _, k := range q.Kids {
-			ix.scoreInto(k, docs, acc)
+			ix.scoreInto(k, acc)
 		}
 		mergeScores(acc)
 		// Summation ranges over the union; AND ranks only the intersection.
@@ -1043,7 +1040,7 @@ func (ix *Index) scoreInto(q Query, docs map[DocID]docMeta, acc *[]Scored) {
 		scaleScores(acc, q.boostOf())
 	case OpOr:
 		for _, k := range q.Kids {
-			ix.scoreInto(k, docs, acc)
+			ix.scoreInto(k, acc)
 		}
 		mergeScores(acc)
 		scaleScores(acc, q.boostOf())
@@ -1052,7 +1049,7 @@ func (ix *Index) scoreInto(q Query, docs map[DocID]docMeta, acc *[]Scored) {
 			return
 		}
 		var pos []Scored
-		ix.scoreInto(q.Kids[0], docs, &pos)
+		ix.scoreInto(q.Kids[0], &pos)
 		var banned []DocID
 		for _, k := range q.Kids[1:] {
 			banned = ix.matchInto(k, banned)
@@ -1076,12 +1073,12 @@ func (ix *Index) scoreInto(q Query, docs map[DocID]docMeta, acc *[]Scored) {
 		*acc = append(*acc, pos[i:]...)
 		scaleScores(acc, q.boostOf())
 	case OpAll:
-		for id := range docs {
+		for id := range ix.docs {
 			*acc = append(*acc, Scored{Doc: id, Score: q.boostOf()})
 		}
 	case OpAtLeast:
 		for _, k := range q.Kids {
-			ix.scoreInto(k, docs, acc)
+			ix.scoreInto(k, acc)
 		}
 		// Keep only documents matching enough kids, then merge.
 		lists := make([][]DocID, 0, len(q.Kids))
@@ -1104,7 +1101,7 @@ func (ix *Index) scoreInto(q Query, docs map[DocID]docMeta, acc *[]Scored) {
 		mergeScores(acc)
 		scaleScores(acc, q.boostOf())
 	default:
-		ix.scoreSpans(ix.evalInto(q, nil), q.boostOf(), docs, acc)
+		ix.scoreSpans(ix.evalInto(q, nil), q.boostOf(), acc)
 	}
 }
 
@@ -1138,7 +1135,7 @@ func scaleScores(acc *[]Scored, boost float64) {
 // scoreTerm adds one term's BM25 contribution over its posting list. It
 // gathers frequencies and lengths into reused scratch, then runs the (wide
 // or scalar) kernel over the flat arrays.
-func (ix *Index) scoreTerm(term uint64, boost float64, docs map[DocID]docMeta, acc *[]Scored) {
+func (ix *Index) scoreTerm(term uint64, boost float64, acc *[]Scored) {
 	p := ix.post[term]
 	if p == nil || ix.nDocs == 0 {
 		return
@@ -1151,10 +1148,10 @@ func (ix *Index) scoreTerm(term uint64, boost float64, docs map[DocID]docMeta, a
 		ids = p.ids
 		for i, id := range p.ids {
 			tf = append(tf, float64(p.off[i+1]-p.off[i]))
-			dl = append(dl, float64(docs[id].length))
+			dl = append(dl, float64(ix.docLength(id)))
 		}
 	} else {
-		ids, tf, dl = ix.sealedScoreGather(p.sealed, docs, tf, dl)
+		ids, tf, dl = ix.sealedScoreGather(p.sealed, tf, dl)
 	}
 	sc = bm25Scores(idf, avg, boost, tf, dl, sc)
 	for i, id := range ids {
@@ -1165,17 +1162,17 @@ func (ix *Index) scoreTerm(term uint64, boost float64, docs map[DocID]docMeta, a
 
 // scorePhrase scores phrase occurrences like a term whose frequency is the
 // occurrence count.
-func (ix *Index) scorePhrase(ph []PhrasePos, slop int, boost float64, docs map[DocID]docMeta, acc *[]Scored) {
+func (ix *Index) scorePhrase(ph []PhrasePos, slop int, boost float64, acc *[]Scored) {
 	if len(ph) == 0 || ix.nDocs == 0 {
 		return
 	}
 	spans := ix.phraseSpans(ph, slop, nil)
-	ix.scoreSpans(spans, boost, docs, acc)
+	ix.scoreSpans(spans, boost, acc)
 }
 
 // scoreSpans scores span hits with BM25 over occurrence counts: tf is the
 // document's span count, df the number of spanned documents.
-func (ix *Index) scoreSpans(spans []spanHit, boost float64, docs map[DocID]docMeta, acc *[]Scored) {
+func (ix *Index) scoreSpans(spans []spanHit, boost float64, acc *[]Scored) {
 	if len(spans) == 0 || ix.nDocs == 0 {
 		return
 	}
@@ -1191,7 +1188,7 @@ func (ix *Index) scoreSpans(spans []spanHit, boost float64, docs map[DocID]docMe
 			j++
 		}
 		tf = append(tf, float64(j-i))
-		dl = append(dl, float64(docs[d].length))
+		dl = append(dl, float64(ix.docLength(d)))
 		i = j
 	}
 	sc = bm25Scores(idf, avg, boost, tf, dl, sc)
@@ -1232,6 +1229,60 @@ func mergeScores(acc *[]Scored) {
 // nothing and stays off the hot path's budget.
 func sortScored(s []Scored) {
 	slices.SortFunc(s, cmpScoredDesc)
+}
+
+// topKScored returns s's best topK hits in rank order: quickselect
+// partition by the same total order sortScored uses, then sort the prefix.
+// Bit-identical to sorting all and truncating (the comparator breaks every
+// tie by DocID, so the top-K set and its order are unique), at O(n)
+// average instead of O(n log n). topK <= 0 keeps every hit, sorted.
+func topKScored(s []Scored, topK int) []Scored {
+	if topK <= 0 || topK >= len(s) {
+		sortScored(s)
+		return s
+	}
+	quickselectScored(s, topK)
+	prefix := s[:topK]
+	sortScored(prefix)
+	return prefix
+}
+
+// quickselectScored rearranges s so its first k elements are its k best
+// (unordered). Deterministic middle pivot, three-way partition, in place.
+// The equal band matters: under this comparator equal entries are
+// identical (Doc, Score) pairs, hence interchangeable, and a zero-boost
+// query scores everything equal — two-way schemes degrade to quadratic
+// there while this one returns in one pass.
+func quickselectScored(s []Scored, k int) {
+	lo, hi := 0, len(s)
+	for hi-lo > 1 {
+		p := s[lo+(hi-lo)/2]
+		lt, i, gt := lo, lo, hi-1
+		for i <= gt {
+			switch c := cmpScoredDesc(s[i], p); {
+			case c < 0:
+				s[lt], s[i] = s[i], s[lt]
+				lt++
+				i++
+			case c > 0:
+				s[i], s[gt] = s[gt], s[i]
+				gt--
+			default:
+				i++
+			}
+		}
+		// [lo,lt) outranks everything else in range; [lt,gt] ties the
+		// pivot (identical pairs); (gt,hi) ranks below.
+		switch {
+		case k <= lt-lo:
+			hi = lt
+		case k <= gt-lo+1:
+			return
+		default:
+			k -= gt - lo + 1
+			lo = gt + 1
+		}
+	}
 }
 
 func cmpScoredDesc(a, b Scored) int {

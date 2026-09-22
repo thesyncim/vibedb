@@ -314,6 +314,26 @@ func benchmarkScoreTerm(b *testing.B, ix *Index, term string) {
 func BenchmarkScoreTermOpen(b *testing.B)   { benchmarkScoreTerm(b, sealedBenchIndex(false), "common") }
 func BenchmarkScoreTermSealed(b *testing.B) { benchmarkScoreTerm(b, sealedBenchIndex(true), "common") }
 
+func benchmarkScoreTopK(b *testing.B, ix *Index, term string, topK int) {
+	q := Query{Op: OpTerm, Term: mustHash(b, term)}
+	out := ix.Score(q, topK, nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out = ix.Score(q, topK, out[:0])
+	}
+	_ = out
+}
+
+func BenchmarkScoreTop10Open(b *testing.B)   { benchmarkScoreTopK(b, sealedBenchIndex(false), "common", 10) }
+func BenchmarkScoreTop10Sealed(b *testing.B) { benchmarkScoreTopK(b, sealedBenchIndex(true), "common", 10) }
+func BenchmarkScoreTop10_20kOpen(b *testing.B) {
+	benchmarkScoreTopK(b, skewedBenchIndex(false), "common", 10)
+}
+func BenchmarkScoreTop10_20kSealed(b *testing.B) {
+	benchmarkScoreTopK(b, skewedBenchIndex(true), "common", 10)
+}
+
 func benchmarkMatchAnd(b *testing.B, ix *Index) {
 	q, err := ix.ParseTINQL("common AND selective")
 	if err != nil {
