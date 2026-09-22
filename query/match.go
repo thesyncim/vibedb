@@ -2,10 +2,45 @@ package query
 
 import (
 	"fmt"
+	"runtime"
 
 	"github.com/thesyncim/vibedb/internal/tin"
 	"github.com/thesyncim/vibedb/store"
 )
+
+// tinSegmentGateDocs is the snapshot size at which the heap ==> path fans
+// out to segment indexes: below it the single index wins outright (fan-out
+// overhead exceeds the search). Crossover-tuned: at 32k docs segmented
+// top-K already wins 2.5x at tin level (205us to 83us, -cpu=8), 3.5x at
+// 64k, 4.7x at 128k; at 8k the 1.4x is not worth the build duplication.
+// The 8k-doc pinned benches stay single. A variable so tests can force
+// the segmented path on small corpora.
+var tinSegmentGateDocs = 32768
+
+// tinSegmentShards sizes the fan-out: one segment per worker up to eight.
+// A single worker never segments.
+func tinSegmentShards() int {
+	if n := runtime.GOMAXPROCS(0); n < 8 {
+		return n
+	}
+	return 8
+}
+
+// bindTinSegments resolves the segmented build for path when the snapshot
+// repays fan-out: enough documents and more than one segment. It reports
+// false for small snapshots, single-worker runtimes, and missing
+// definitions, leaving the single-index path to serve (and to report the
+// missing-index statement error there).
+func bindTinSegments(snapshot store.Snapshot, path string) ([]*tin.Index, bool) {
+	if snapshot.Len() < tinSegmentGateDocs || tinSegmentShards() < 2 {
+		return nil, false
+	}
+	segs, err := snapshot.TinSegmentsForPath(path, tinSegmentShards())
+	if err != nil || len(segs) < 2 {
+		return nil, false
+	}
+	return segs, true
+}
 
 // Full-text (==>) execution binding.
 //
@@ -97,6 +132,8 @@ func (p *plan) bindMatches(w *Workspace, snapshot store.Snapshot, catalog store.
 	if p.matchCount == 0 {
 		w.matchQueries = w.matchQueries[:0]
 		w.matchIndexes = w.matchIndexes[:0]
+		w.matchShards = w.matchShards[:0]
+		w.matchPatterns = w.matchPatterns[:0]
 		w.matchTinBuilds = w.matchTinBuilds[:0]
 		w.matchTinRouter = nil
 		w.eval.bindMatches(nil)
@@ -108,18 +145,26 @@ func (p *plan) bindMatches(w *Workspace, snapshot store.Snapshot, catalog store.
 	for len(w.matchIndexes) < p.matchCount {
 		w.matchIndexes = append(w.matchIndexes, nil)
 	}
+	for len(w.matchShards) < p.matchCount {
+		w.matchShards = append(w.matchShards, nil)
+	}
+	for len(w.matchPatterns) < p.matchCount {
+		w.matchPatterns = append(w.matchPatterns, "")
+	}
 	// Reslice to the exact count so workers aliasing w.matchQueries see the
 	// same binding the calling evaluator gets; retained capacity past the
 	// count stays warm for the next execution.
 	w.matchQueries = w.matchQueries[:p.matchCount]
 	w.matchIndexes = w.matchIndexes[:p.matchCount]
+	w.matchShards = w.matchShards[:p.matchCount]
+	w.matchPatterns = w.matchPatterns[:p.matchCount]
 	// A Workspace reused across backends must not retain the other one's
 	// builds: a stale durable build would mask a heap scan with foreign
 	// addresses.
 	w.matchTinBuilds = w.matchTinBuilds[:0]
 	w.matchTinRouter = nil
 	queries := w.matchQueries
-	if err := bindPlanMatches(p, snapshot, catalog, queries, w.matchIndexes); err != nil {
+	if err := bindPlanMatches(p, snapshot, catalog, queries, w.matchIndexes, w.matchShards, w.matchPatterns); err != nil {
 		return err
 	}
 	w.eval.bindMatches(queries)
@@ -130,8 +175,8 @@ func (p *plan) bindMatches(w *Workspace, snapshot store.Snapshot, catalog store.
 // recursing into join and mark inner plans with theirs. indexes parallels
 // queries: the generation-pinned build each slot parsed against, retained
 // for index-pruned candidate masks.
-func bindPlanMatches(p *plan, snapshot store.Snapshot, catalog store.DatabaseSnapshot, queries []tin.Query, indexes []*tin.Index) error {
-	if err := bindPredMatches(p.where, p, snapshot, queries, indexes); err != nil {
+func bindPlanMatches(p *plan, snapshot store.Snapshot, catalog store.DatabaseSnapshot, queries []tin.Query, indexes []*tin.Index, shards [][]tin.Shard, patterns []string) error {
+	if err := bindPredMatches(p.where, p, snapshot, queries, indexes, shards, patterns); err != nil {
 		return err
 	}
 	for i := range p.joins {
@@ -142,7 +187,7 @@ func bindPlanMatches(p *plan, snapshot store.Snapshot, catalog store.DatabaseSna
 				p.joins[i].collection,
 			)
 		}
-		if err := bindPlanMatches(p.joins[i].inner, inner, catalog, queries, indexes); err != nil {
+		if err := bindPlanMatches(p.joins[i].inner, inner, catalog, queries, indexes, shards, patterns); err != nil {
 			return err
 		}
 	}
@@ -154,7 +199,7 @@ func bindPlanMatches(p *plan, snapshot store.Snapshot, catalog store.DatabaseSna
 				p.marks[i].collection,
 			)
 		}
-		if err := bindPlanMatches(p.marks[i].inner, inner, catalog, queries, indexes); err != nil {
+		if err := bindPlanMatches(p.marks[i].inner, inner, catalog, queries, indexes, shards, patterns); err != nil {
 			return err
 		}
 	}
@@ -165,32 +210,57 @@ func bindPlanMatches(p *plan, snapshot store.Snapshot, catalog store.DatabaseSna
 // against the owning plan's collection, then one ParseTINQL against that
 // snapshot's index. A missing tin index and an invalid query are both
 // statement errors naming the path.
-func bindPredMatches(pd *compiledPredicate, owner *plan, snapshot store.Snapshot, queries []tin.Query, indexes []*tin.Index) error {
+func bindPredMatches(pd *compiledPredicate, owner *plan, snapshot store.Snapshot, queries []tin.Query, indexes []*tin.Index, shards [][]tin.Shard, patterns []string) error {
 	if pd == nil {
 		return nil
 	}
 	if pd.kind == predMatch {
 		if pd.col < 0 || pd.col >= len(owner.valuePaths) || pd.slot < 0 || pd.slot >= len(queries) ||
-			pd.slot >= len(indexes) {
+			pd.slot >= len(indexes) || pd.slot >= len(shards) || pd.slot >= len(patterns) {
 			return fmt.Errorf("query: ==> node names an uncompiled path or slot")
 		}
 		path := owner.valuePaths[pd.col].indexPath()
-		ix, err := snapshot.TinIndexForPath(path)
-		if err != nil {
-			return fmt.Errorf(
-				"query: ==> over %s requires a tin index over that path (CREATE INDEX ... USING tin)",
-				path,
-			)
+		patterns[pd.slot] = pd.pattern
+		if segs, ok := bindTinSegments(snapshot, path); ok {
+			// Segmented heap path: the single index stays unbuilt.
+			// Shard buffers persist across executions; only the
+			// index pointers rebind to this snapshot's segments.
+			sh := shards[pd.slot]
+			if len(sh) != len(segs) {
+				sh = make([]tin.Shard, len(segs))
+			}
+			for i := range segs {
+				sh[i].Ix = segs[i]
+			}
+			shards[pd.slot] = sh
+			// The shared parse runs against the first segment.
+			// Masks re-parse per shard when it reports Expanded,
+			// and top-K serves only unexpanded shapes from it.
+			q, err := segs[0].ParseTINQL(pd.pattern)
+			if err != nil {
+				return fmt.Errorf("query: ==> over %s: invalid TINQL query: %v", path, err)
+			}
+			queries[pd.slot] = q
+			indexes[pd.slot] = nil
+		} else {
+			shards[pd.slot] = nil
+			ix, err := snapshot.TinIndexForPath(path)
+			if err != nil {
+				return fmt.Errorf(
+					"query: ==> over %s requires a tin index over that path (CREATE INDEX ... USING tin)",
+					path,
+				)
+			}
+			q, err := ix.ParseTINQL(pd.pattern)
+			if err != nil {
+				return fmt.Errorf("query: ==> over %s: invalid TINQL query: %v", path, err)
+			}
+			queries[pd.slot] = q
+			indexes[pd.slot] = ix
 		}
-		q, err := ix.ParseTINQL(pd.pattern)
-		if err != nil {
-			return fmt.Errorf("query: ==> over %s: invalid TINQL query: %v", path, err)
-		}
-		queries[pd.slot] = q
-		indexes[pd.slot] = ix
 	}
 	for _, kid := range pd.kids {
-		if err := bindPredMatches(kid, owner, snapshot, queries, indexes); err != nil {
+		if err := bindPredMatches(kid, owner, snapshot, queries, indexes, shards, patterns); err != nil {
 			return err
 		}
 	}

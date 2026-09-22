@@ -507,6 +507,47 @@ func matchCandidateMasks(
 	if p.slot < 0 || p.slot >= len(w.matchQueries) {
 		return nil, false, false, nil
 	}
+	// Segmented heap path: gathered matches union exactly, with global
+	// document identities the mask folding below already speaks. A shared
+	// parse serves only unexpanded queries; expanding patterns re-parse
+	// per shard so every shard's expansions contribute.
+	if p.slot < len(w.matchShards) && len(w.matchShards[p.slot]) > 0 {
+		shards := w.matchShards[p.slot]
+		q := w.matchQueries[p.slot]
+		var ids []tin.DocID
+		if q.Expanded && p.slot < len(w.matchPatterns) {
+			// Expansion needs syntax, so a shared Expanded parse
+			// always has a pattern to re-parse per shard.
+			pattern := w.matchPatterns[p.slot]
+			queries := make([]tin.Query, len(shards))
+			for i := range shards {
+				if shards[i].Ix == nil {
+					continue
+				}
+				qi, err := shards[i].Ix.ParseTINQL(pattern)
+				if err != nil {
+					return nil, false, false, nil
+				}
+				queries[i] = qi
+			}
+			ids = tin.MatchGatheredQueries(shards, queries, w.matchDocIDs[:0])
+		} else {
+			ids = tin.MatchGathered(shards, q, w.matchDocIDs[:0])
+		}
+		w.matchDocIDs = ids
+		if len(ids) == 0 {
+			return nil, true, false, nil
+		}
+		out := w.nextStoreMasks()
+		out = appendMatchMasks(out, ids)
+		if out == nil {
+			// A slot width beyond the 64-bit mask universe cannot be pruned
+			// exactly: decline rather than drop a document.
+			return nil, false, false, nil
+		}
+		w.keepStoreMasks(out)
+		return out, true, false, nil
+	}
 	if p.slot < len(w.matchIndexes) && w.matchIndexes[p.slot] != nil {
 		ix := w.matchIndexes[p.slot]
 		ids := ix.Match(w.matchQueries[p.slot], w.matchDocIDs[:0])

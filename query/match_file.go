@@ -154,12 +154,18 @@ func (p *plan) bindFileMatches(
 		w.matchTinBuilds = w.matchTinBuilds[:0]
 		w.matchTinRouter = nil
 		w.matchIndexes = w.matchIndexes[:0]
+		w.matchShards = w.matchShards[:0]
+		w.matchPatterns = w.matchPatterns[:0]
 		w.eval.bindMatches(nil)
 		return nil
 	}
 	if snapshot == nil {
 		return fmt.Errorf("query: ==> full-text match needs a durable snapshot")
 	}
+	// The file backend never serves segments: heap shard bindings must
+	// not survive the backend switch.
+	w.matchShards = w.matchShards[:0]
+	w.matchPatterns = w.matchPatterns[:0]
 	for len(w.matchQueries) < p.matchCount {
 		w.matchQueries = append(w.matchQueries, tin.Query{})
 	}
@@ -199,6 +205,8 @@ func (p *plan) bindFileOverlayMatches(
 		w.matchTinBuilds = w.matchTinBuilds[:0]
 		w.matchTinRouter = nil
 		w.matchIndexes = w.matchIndexes[:0]
+		w.matchShards = w.matchShards[:0]
+		w.matchPatterns = w.matchPatterns[:0]
 		w.eval.bindMatches(nil)
 		return nil
 	}
@@ -210,6 +218,9 @@ func (p *plan) bindFileOverlayMatches(
 			"query: ==> full-text match is not supported over a staged-write overlay with pending writes; flush it first",
 		)
 	}
+	// Overlays never serve segments either; see bindFileMatches.
+	w.matchShards = w.matchShards[:0]
+	w.matchPatterns = w.matchPatterns[:0]
 	for i := range p.joins {
 		if planHasMatch(p.joins[i].inner) {
 			return fmt.Errorf(

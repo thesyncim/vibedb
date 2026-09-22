@@ -150,6 +150,9 @@ type Collection struct {
 	// built tin indexes per snapshot State (see store_index_tin.go).
 	tinDefs  map[string]tinDefinition
 	tinCache map[*State]map[string]*tin.Index
+	// tinSegCache pins segmented tin builds per State, keyed by index
+	// name and segment count.
+	tinSegCache map[*State]map[tinSegKey][]*tin.Index
 }
 
 // WithBulkSnapshot runs fn with c's current State (materializing an

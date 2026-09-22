@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"runtime"
 	"strconv"
 	"testing"
 
@@ -234,5 +235,100 @@ func TestTinTopKSelectivePaths(t *testing.T) {
 	}
 	if len(plain) != 10 {
 		t.Fatalf("non-score order: %d rows, want 10", len(plain))
+	}
+}
+
+// tinSegmentedRun executes src and returns id/score rows, whether the
+// top-K restriction engaged, and whether the ==> slot bound segment
+// indexes (rather than the single index).
+func tinSegmentedRun(t *testing.T, db *store.Database, src string) (rows [][2]any, engaged, segmented bool) {
+	t.Helper()
+	catalog := db.Snapshot()
+	statement, err := PrepareStatement(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	exec := Exec{}
+	cursor, err := statement.RunInto(&exec, FromDatabase(catalog, "docs"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for cursor.Next() {
+		id, ok := cursor.Cell(0).Text()
+		if !ok {
+			t.Fatalf("id cell = %s, want string", cursor.Cell(0).JSON())
+		}
+		score, ok := cursor.Cell(1).Float64()
+		if !ok {
+			t.Fatalf("score cell = %s, want number", cursor.Cell(1).JSON())
+		}
+		rows = append(rows, [2]any{id, score})
+	}
+	engaged = exec.Workspace.tinTopKUsed
+	for _, sh := range exec.Workspace.matchShards {
+		for _, s := range sh {
+			if s.Ix != nil {
+				segmented = true
+			}
+		}
+	}
+	exec.Release()
+	return rows, engaged, segmented
+}
+
+// TestTinSegmentedSQLIdentity proves the segmented heap path returns
+// exactly the single index's rows — ids and SCORE() values bit-identical —
+// across top-K directions, masks, expansions (which decline to the
+// ordinary scan), offsets, and empty windows. Each query runs twice, once
+// with the segment gate forced open and once with it closed; the forced
+// run must actually bind segments, and the closed run must not.
+func TestTinSegmentedSQLIdentity(t *testing.T) {
+	// Exercise the true parallel fan-out even under the repo's -cpu=1
+	// gates: identity must hold regardless of worker count.
+	oldProcs := runtime.GOMAXPROCS(8)
+	defer runtime.GOMAXPROCS(oldProcs)
+	db := tinTopKTieDatabase(t)
+	queries := []string{
+		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'alpha' ORDER BY SCORE() DESC LIMIT 10`,
+		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'alpha AND beta' ORDER BY SCORE() DESC LIMIT 10`,
+		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'alpha' ORDER BY SCORE() ASC LIMIT 10`,
+		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'alph*' ORDER BY SCORE() DESC LIMIT 10`,
+		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> '"alpha beta"' ORDER BY SCORE() DESC LIMIT 10`,
+		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'alpha' LIMIT 10`,
+		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'alpha' ORDER BY SCORE() DESC LIMIT 5 OFFSET 3`,
+		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'alpha' ORDER BY SCORE() DESC LIMIT 0`,
+		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'missing' ORDER BY SCORE() DESC LIMIT 10`,
+	}
+	oldGate := tinSegmentGateDocs
+	defer func() { tinSegmentGateDocs = oldGate }()
+	for qi, src := range queries {
+		tinSegmentGateDocs = 1
+		segRows, segEngaged, segmented := tinSegmentedRun(t, db, src)
+		if !segmented {
+			t.Fatalf("%s: forced run bound no segments", src)
+		}
+		// The descending term shape always engages, proving the
+		// segmented branch served rather than merely declining
+		// everything. Other shapes may decline asymmetrically: the
+		// per-shard selectivity pre-gates veto the whole merge on
+		// small skewed shards while the single index engages, and
+		// rows still match because both sides stay correct.
+		tinSegmentGateDocs = 1 << 30
+		singleRows, _, singleSeg := tinSegmentedRun(t, db, src)
+		if singleSeg {
+			t.Fatalf("%s: closed run bound segments", src)
+		}
+		if qi == 0 && !segEngaged {
+			t.Fatalf("%s: segmented run skipped the top-K restriction", src)
+		}
+		if len(segRows) != len(singleRows) {
+			t.Fatalf("%s: %d rows segmented, %d single", src, len(segRows), len(singleRows))
+		}
+		for i := range segRows {
+			if segRows[i] != singleRows[i] {
+				t.Fatalf("%s row %d = %v segmented, %v single", src, i, segRows[i], singleRows[i])
+			}
+		}
 	}
 }

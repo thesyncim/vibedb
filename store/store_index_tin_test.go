@@ -1,7 +1,10 @@
 package store
 
 import (
+	"fmt"
 	"testing"
+
+	"github.com/thesyncim/vibedb/internal/tin"
 )
 
 func putDoc(t *testing.T, c *Collection, key, doc string) {
@@ -238,5 +241,123 @@ func TestTinIndexForPathResolvesSmallestName(t *testing.T) {
 		if got != want {
 			t.Fatal("TinIndexForPath resolved outside the smallest catalog name")
 		}
+	}
+}
+
+// TestTinSegmentsUnion proves sidecar segments union exactly: the same
+// corpus searched through four segment indexes matches the single index
+// hit for hit and score for score, across deletes, non-string bodies,
+// ties, and every match shape. It also pins the per-State cache (second
+// call shares the builds) and the clamp of oversized segment counts.
+func TestTinSegmentsUnion(t *testing.T) {
+	c := &Collection{}
+	for i := range 200 {
+		key := fmt.Sprintf("k%04d", i)
+		// alpha everywhere; beta in every 5th (selective, like the
+		// SQL bench's zipf); gamma ties pair the residues.
+		var body string
+		switch i % 5 {
+		case 0:
+			body = `"alpha beta"`
+		case 1, 2:
+			body = `"alpha gamma"`
+		default:
+			body = `"alpha"`
+		}
+		if i%9 == 0 {
+			body = `42`
+		}
+		putDoc(t, c, key, `{"title":`+body+`}`)
+	}
+	for i := 0; i < 200; i += 11 {
+		if _, err := c.Delete(fmt.Sprintf("k%04d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.CreateIndex(IndexDefinition{Name: "title_tin", Paths: []string{"/title"}, Kind: IndexTin}); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := c.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	segs, err := c.TinSegmentsForPath(snap, "/title", 4)
+	if err != nil {
+		t.Fatalf("TinSegmentsForPath: %v", err)
+	}
+	if len(segs) != 4 {
+		t.Fatalf("segments = %d, want 4 (200 docs over 64-doc chunks)", len(segs))
+	}
+	for i, s := range segs {
+		if s == nil {
+			t.Fatalf("segment %d is nil", i)
+		}
+	}
+	single, err := c.TinIndexForPath(snap, "/title")
+	if err != nil {
+		t.Fatalf("TinIndexForPath: %v", err)
+	}
+	shards := make([]tin.Shard, len(segs))
+	for i := range segs {
+		shards[i].Ix = segs[i]
+	}
+	mustParse := func(pattern string) tin.Query {
+		t.Helper()
+		q, err := single.ParseTINQL(pattern)
+		if err != nil {
+			t.Fatalf("parse %s: %v", pattern, err)
+		}
+		return q
+	}
+	for _, pattern := range []string{
+		"alpha", "beta AND alpha", "gamma OR beta", `"alpha beta"`,
+		"alpha NEAR/1 beta", "alph*", "alpha~1", "MATCHES al.*a",
+		"aab TO aac", "missing",
+	} {
+		q := mustParse(pattern)
+		got := tin.MatchGathered(shards, q, nil)
+		want := single.Match(q, nil)
+		if len(got) != len(want) {
+			t.Fatalf("%s: %d docs, want %d", pattern, len(got), len(want))
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("%s doc %d = %d, want %d", pattern, i, got[i], want[i])
+			}
+		}
+	}
+	for _, pattern := range []string{"alpha", "beta AND alpha", "alpha^2", "missing"} {
+		q := mustParse(pattern)
+		for _, topK := range []int{1, 5, 25} {
+			got, ok := tin.ScoreSegmented(shards, q, topK, nil)
+			if !ok {
+				t.Fatalf("%s topK=%d declined", pattern, topK)
+			}
+			want := single.Score(q, topK, nil)
+			if len(got) != len(want) {
+				t.Fatalf("%s topK=%d: %d hits, want %d", pattern, topK, len(got), len(want))
+			}
+			for i := range got {
+				if got[i] != want[i] {
+					t.Fatalf("%s topK=%d hit %d = %+v, want %+v", pattern, topK, i, got[i], want[i])
+				}
+			}
+		}
+	}
+	again, err := c.TinSegmentsForPath(snap, "/title", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range segs {
+		if again[i] != segs[i] {
+			t.Fatalf("segment %d not shared across calls", i)
+		}
+	}
+	clamped, err := c.TinSegmentsForPath(snap, "/title", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clamped) != len(segs) {
+		t.Fatalf("clamped segments = %d, want %d", len(clamped), len(segs))
 	}
 }

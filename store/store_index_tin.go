@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/bits"
 	"strings"
+	"sync"
 
 	"github.com/thesyncim/vibedb/internal/tin"
 	"github.com/thesyncim/vibejson"
@@ -164,6 +165,134 @@ func (c *Collection) TinIndex(s Snapshot, name string) (*tin.Index, error) {
 // maxTinCacheStates bounds state-pinned tin builds retained by a collection.
 const maxTinCacheStates = 4
 
+// tinSegKey names one cached segmented build: the index name plus the
+// segment count it was partitioned into.
+type tinSegKey struct {
+	name string
+	n    int
+}
+
+// TinSegments returns n segment indexes partitioning snapshot s's rows
+// for the named tin index, building them in parallel on first use and
+// caching per State like TinIndex. Segments share the global (chunk,
+// slot) document identities over disjoint contiguous chunk sets, so
+// gathered search unions exactly and per-segment top-K merges under one
+// shared statistics view. n clamps into [1, chunk count]; the builds are
+// never mutated, matching the single index's sharing contract.
+func (c *Collection) TinSegments(s Snapshot, name string, n int) ([]*tin.Index, error) {
+	if n <= 0 {
+		return nil, fmt.Errorf("%w: segment count %d", ErrIndexDefinition, n)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tdef, ok := c.tinDefs[name]
+	if !ok {
+		return nil, ErrIndexNotFound
+	}
+	state := s.state
+	if state == nil {
+		return nil, fmt.Errorf("%w: snapshot has no state", ErrIndexNotFound)
+	}
+	if byState, ok := c.tinSegCache[state]; ok {
+		if segs, ok := byState[tinSegKey{name, n}]; ok {
+			return segs, nil
+		}
+	} else {
+		c.evictTinSegCacheLocked()
+	}
+	var ids []uint32
+	state.Chunks.Each(func(id uint32, _ *Chunk) bool {
+		ids = append(ids, id)
+		return true
+	})
+	if n > len(ids) {
+		n = len(ids)
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	segs := make([]*tin.Index, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range segs {
+		lo := len(ids) * i / n
+		hi := len(ids) * (i + 1) / n
+		wg.Add(1)
+		go func(i int, chunkIDs []uint32) {
+			defer wg.Done()
+			ix := tin.NewIndex()
+			for _, id := range chunkIDs {
+				if err := addChunkToIndex(ix, id, state.Chunks.Get(id), tdef.pointer); err != nil {
+					errs[i] = err
+					return
+				}
+			}
+			segs[i] = ix
+		}(i, ids[lo:hi])
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	if c.tinSegCache == nil {
+		c.tinSegCache = make(map[*State]map[tinSegKey][]*tin.Index)
+	}
+	byState := c.tinSegCache[state]
+	if byState == nil {
+		byState = make(map[tinSegKey][]*tin.Index)
+		c.tinSegCache[state] = byState
+	}
+	byState[tinSegKey{name, n}] = segs
+	return segs, nil
+}
+
+// evictTinSegCacheLocked bounds retained segmented builds like the single
+// builds: executing snapshots hold their own references, so eviction never
+// invalidates a live reader.
+func (c *Collection) evictTinSegCacheLocked() {
+	if len(c.tinSegCache) < maxTinCacheStates {
+		return
+	}
+	for st := range c.tinSegCache {
+		if st != c.state.Load() {
+			delete(c.tinSegCache, st)
+			break
+		}
+	}
+	if len(c.tinSegCache) >= maxTinCacheStates {
+		c.tinSegCache = make(map[*State]map[tinSegKey][]*tin.Index)
+	}
+}
+
+// TinSegmentsForPath resolves the definition covering path and returns the
+// n-way segmented build TinSegments makes for s.
+func (c *Collection) TinSegmentsForPath(s Snapshot, path string, n int) ([]*tin.Index, error) {
+	c.mu.Lock()
+	name := ""
+	for candidate, tdef := range c.tinDefs {
+		if tdef.path == path && (name == "" || candidate < name) {
+			name = candidate
+		}
+	}
+	c.mu.Unlock()
+	if name == "" {
+		return nil, ErrIndexNotFound
+	}
+	return c.TinSegments(s, name, n)
+}
+
+// TinSegmentsForPath returns the segmented build over snapshot s for the
+// first definition covering path. A snapshot without a collection, or a
+// collection with no tin index over path, reports ErrIndexNotFound.
+func (s Snapshot) TinSegmentsForPath(path string, n int) ([]*tin.Index, error) {
+	if s.coll == nil {
+		return nil, ErrIndexNotFound
+	}
+	return s.coll.TinSegmentsForPath(s, path, n)
+}
+
 // buildTinIndex scans every live slot of state, indexing string values found
 // at the definition's path. Non-string values are skipped: tin indexes text.
 func buildTinIndex(state *State, tdef tinDefinition) (*tin.Index, error) {
@@ -173,17 +302,28 @@ func buildTinIndex(state *State, tdef tinDefinition) (*tin.Index, error) {
 		if err != nil {
 			return false
 		}
-		for live := chunk.Live; live != 0; live &= live - 1 {
-			slot := bits.TrailingZeros64(live)
-			text, ok := tinSlotText(chunk, slot, tdef.pointer)
-			if !ok {
-				continue
-			}
-			ix.Add(TinDocID(id, slot), text)
+		if e := addChunkToIndex(ix, id, chunk, tdef.pointer); e != nil {
+			err = e
+			return false
 		}
 		return true
 	})
 	return ix, err
+}
+
+// addChunkToIndex indexes one chunk's live text slots into ix with global
+// (chunk, slot) document identities, so segment builds over disjoint
+// chunk sets stay mutually disjoint and union exactly.
+func addChunkToIndex(ix *tin.Index, id uint32, chunk *Chunk, pointer vibejson.CompiledPointer) error {
+	for live := chunk.Live; live != 0; live &= live - 1 {
+		slot := bits.TrailingZeros64(live)
+		text, ok := tinSlotText(chunk, slot, pointer)
+		if !ok {
+			continue
+		}
+		ix.Add(TinDocID(id, slot), text)
+	}
+	return nil
 }
 
 // tinSlotText extracts the decoded string at pointer for one live slot.

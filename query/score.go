@@ -259,6 +259,10 @@ func (r *statementScalar) bindScore(w *Workspace) error {
 	// ==> is false.
 	if r.scoreSlot < len(w.matchIndexes) && w.matchIndexes[r.scoreSlot] != nil {
 		w.matchIndexes[r.scoreSlot].RefreshScoreStats(w.matchQueries[r.scoreSlot], stats)
+	} else if r.scoreSlot < len(w.matchShards) && len(w.matchShards[r.scoreSlot]) > 0 {
+		// Segmented heap path: statistics merge exactly like the single
+		// index's, so per-row SCORE() stays bit-identical.
+		tin.RefreshSegmentedStats(w.matchShards[r.scoreSlot], w.matchQueries[r.scoreSlot], stats)
 	} else if r.scoreSlot < len(w.matchTinBuilds) && w.matchTinBuilds[r.scoreSlot] != nil &&
 		w.matchTinBuilds[r.scoreSlot].Index() != nil {
 		w.matchTinBuilds[r.scoreSlot].Index().RefreshScoreStats(w.matchQueries[r.scoreSlot], stats)

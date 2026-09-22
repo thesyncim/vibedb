@@ -307,8 +307,12 @@ func TestLegacySQLJoinLayoutAndWarmAllocationGates(t *testing.T) {
 		// 3760 before verdict/sort skipping: the Workspace gains the
 		// restricting plan pointer (8 bytes), matched by the sort-skip
 		// reader so foreign plans never skip.
-		if got := unsafe.Sizeof(joinBinding{}); got != 3768 {
-			t.Fatalf("joinBinding size = %d, want unchanged 3768", got)
+		// 3768 before segmented ==> search: the Workspace gains the
+		// per-slot segment shard slice plus the raw pattern slice
+		// (24 + 24 bytes), both nil until an ==> node binds a
+		// fan-out-sized heap snapshot.
+		if got := unsafe.Sizeof(joinBinding{}); got != 3816 {
+			t.Fatalf("joinBinding size = %d, want unchanged 3816", got)
 		}
 		if got := unsafe.Offsetof(joinBinding{}.lits); got != 8 {
 			t.Fatalf("joinBinding.lits offset = %d, want unchanged 8", got)

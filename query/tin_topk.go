@@ -100,12 +100,14 @@ func applyTinTopK(w *Workspace, spec tinTopKSpec) bool {
 	} else if spec.slot < len(w.matchTinBuilds) && w.matchTinBuilds[spec.slot] != nil &&
 		w.matchTinBuilds[spec.slot].Index() != nil {
 		ix = w.matchTinBuilds[spec.slot].Index()
-	} else {
-		return false
 	}
 	var survivors []tin.Scored
+	haveSeg := !q.Expanded && spec.slot < len(w.matchShards) && len(w.matchShards[spec.slot]) > 0
 	if spec.desc {
 		if spec.limit == 0 {
+			if ix == nil && !haveSeg {
+				return false
+			}
 			w.storeRows = w.storeRows[:0]
 			w.tinTopKUsed = true
 			return true
@@ -116,19 +118,46 @@ func applyTinTopK(w *Workspace, spec tinTopKSpec) bool {
 			// ranking covers every rank, sliced below.
 			need = 0
 		}
-		hits := ix.Score(q, need, w.matchScored[:0])
-		w.matchScored = hits
-		if need > 0 && len(hits) > need {
-			hits = hits[:need]
+		// Segmented heap path first: one shared statistics view makes
+		// the gathered top-K exactly the single index's, with global
+		// document identities the row mapping below already speaks.
+		// Expanding queries lower per shard, so only unexpanded
+		// shapes serve from the shared parse; anything else declines
+		// to the single index.
+		segServed := false
+		if haveSeg {
+			if hits, ok := tin.ScoreSegmented(w.matchShards[spec.slot], q, need, w.matchScored[:0]); ok {
+				w.matchScored = hits
+				if need > 0 && len(hits) > need {
+					hits = hits[:need]
+				}
+				survivors = hits
+				segServed = true
+			}
 		}
-		survivors = hits
+		if !segServed {
+			if ix == nil {
+				return false
+			}
+			hits := ix.Score(q, need, w.matchScored[:0])
+			w.matchScored = hits
+			if need > 0 && len(hits) > need {
+				hits = hits[:need]
+			}
+			survivors = hits
+		}
 	} else {
 		// Ascending keeps scan order inside ties, which is the reverse of
 		// nothing the descending ranking offers directly: re-sort the full
 		// ranking by score alone, stably, so equal scores retain the
 		// ranking's DocID order — the scan order the full sort breaks ties
 		// with. Scoring the full match set still skips every per-row
-		// retokenization, which is where the time used to go.
+		// retokenization, which is where the time used to go. Only the
+		// single index serves this shape; segmented snapshots decline to
+		// the ordinary scan.
+		if ix == nil {
+			return false
+		}
 		hits := ix.Score(q, 0, w.matchScored[:0])
 		w.matchScored = hits
 		sort.SliceStable(hits, func(i, j int) bool { return hits[i].Score < hits[j].Score })

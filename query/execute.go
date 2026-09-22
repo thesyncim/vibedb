@@ -147,6 +147,17 @@ type Workspace struct {
 	// when the plan carries no ==> node, so a reused Workspace never
 	// retains a build past its snapshot.
 	matchIndexes []*tin.Index
+	// matchShards parallels matchQueries on the segmented heap path: one
+	// tin.Shard per segment index of the executing snapshot, searched in
+	// parallel and merged exactly (ScoreSegmented for unexpanded term/AND
+	// top-K, MatchGathered for masks). Empty entries decline to the
+	// single index or the full scan. Result buffers persist across
+	// executions for warm reuse; only the index pointers rebind.
+	matchShards [][]tin.Shard
+	// matchPatterns parallels matchQueries: the raw TINQL pattern each
+	// slot parsed, for per-shard expansion when the shared parse reports
+	// Expanded. Set alongside every binding; empty when unbound.
+	matchPatterns []string
 	// matchTinBuilds parallels matchQueries on the durable path: the
 	// generation-pinned build each ==> slot parsed against, carrying the
 	// ordinal-to-stable-slot map for pruned candidate masks. Nil entries
