@@ -23,22 +23,31 @@ type tokPos struct {
 
 // TextScratch stages transient matching. Reuse one across rows; it retains
 // no references between calls.
+//
+// The zero-alloc contract: on warm scratch (buffers sized to the documents
+// being matched) MatchSingle allocates nothing for ANY operator. Token
+// pairs thread by value (scanPairs), positions and phrase unions reuse
+// merge/pool, final spans reuse spans, and every intermediate span list the
+// boolean combinators build lives in the arena bump buffer, which one call
+// resets and reuses throughout. Growth allocates only while sizing up.
 type TextScratch struct {
 	pairs []tokPos
 	merge []uint32
 	pool  []uint32
 	spans []spanHit
 	slots []uint32
+	lists [][]uint32
+	arena []spanHit
 }
 
 // MatchSingle reports whether text matches q. q must be parsed (expansions
 // resolved); expansion operators never appear because ParseTINQL desugars
 // them, and a zero OpOr (empty expansion) matches nothing.
 func MatchSingle(text string, q Query, scratch *TextScratch) bool {
-	pairs := scratch.pairs[:0]
-	scanString(text, func(h uint64, p uint32) {
-		pairs = append(pairs, tokPos{hash: h, pos: p})
-	})
+	// scanPairs, not scanString: the emit closure escapes to the heap on
+	// every call, while the slice-threading scanner allocates only on
+	// growth, so warm scratch makes this call free.
+	pairs := scanPairs(text, scratch.pairs[:0])
 	slices.SortFunc(pairs, func(a, b tokPos) int {
 		if a.hash != b.hash {
 			if a.hash < b.hash {
@@ -62,10 +71,29 @@ func MatchSingle(text string, q Query, scratch *TextScratch) bool {
 		}
 	}
 	view := docView{pairs: pairs, length: length, scratch: scratch}
+	scratch.arena = scratch.arena[:0]
 	spans := scratch.spans[:0]
 	spans = view.evalInto(q, spans)
 	scratch.spans = spans[:0]
 	return len(spans) > 0
+}
+
+// evalTemp evaluates kid into a fresh tail of the scratch arena, so sibling
+// combinators can hold several tails alive at once. Tails that outgrow the
+// tip fork to a new array; evalTemp copies a forked tail back into the arena
+// (reclaiming the dead inner region first) instead of adopting the fork, so
+// the arena keeps one array whose capacity converges on the live set and
+// warm callers never fork. A tail that fits only widens the anchor.
+func (v docView) evalTemp(q Query) []spanHit {
+	s := v.scratch
+	start := len(s.arena)
+	tmp := v.evalInto(q, s.arena[start:start])
+	if len(tmp) > cap(s.arena)-start {
+		s.arena = append(s.arena[:start], tmp...)
+		return s.arena[start:]
+	}
+	s.arena = s.arena[:start+len(tmp)]
+	return s.arena[start:]
 }
 
 // docView is one document's sorted token runs plus shared scratch.
@@ -161,17 +189,20 @@ func (v docView) evalInto(q Query, out []spanHit) []spanHit {
 		if len(q.Kids) == 0 {
 			return out
 		}
-		acc := v.evalInto(q.Kids[0], nil)
+		acc := v.evalTemp(q.Kids[0])
 		if len(acc) == 0 {
 			return out
 		}
 		for _, k := range q.Kids[1:] {
-			other := v.evalInto(k, nil)
+			other := v.evalTemp(k)
 			if len(other) == 0 {
 				return out
 			}
 			acc = append(acc, other...)
 		}
+		// Re-anchor past the merge: whoever extends the live set owns the
+		// anchor, so the arena converges instead of re-forking every call.
+		v.scratch.arena = acc
 		return append(out, acc...)
 	case OpOr:
 		for _, k := range q.Kids {
@@ -182,12 +213,12 @@ func (v docView) evalInto(q Query, out []spanHit) []spanHit {
 		if len(q.Kids) == 0 {
 			return out
 		}
-		acc := v.evalInto(q.Kids[0], nil)
+		acc := v.evalTemp(q.Kids[0])
 		if len(acc) == 0 {
 			return out
 		}
 		for _, k := range q.Kids[1:] {
-			if len(v.evalInto(k, nil)) > 0 {
+			if len(v.evalTemp(k)) > 0 {
 				return out
 			}
 		}
@@ -196,18 +227,19 @@ func (v docView) evalInto(q Query, out []spanHit) []spanHit {
 		if len(q.Kids) != 2 {
 			return out
 		}
-		return pairSpans(v.evalInto(q.Kids[0], nil), v.evalInto(q.Kids[1], nil), q.Dist, out)
+		return pairSpans(v.evalTemp(q.Kids[0]), v.evalTemp(q.Kids[1]), q.Dist, out)
 	case OpNear:
 		if len(q.Kids) != 2 {
 			return out
 		}
-		out = pairSpans(v.evalInto(q.Kids[0], nil), v.evalInto(q.Kids[1], nil), q.Dist, out)
-		return pairSpans(v.evalInto(q.Kids[1], nil), v.evalInto(q.Kids[0], nil), q.Dist, out)
+		left, right := v.evalTemp(q.Kids[0]), v.evalTemp(q.Kids[1])
+		out = pairSpans(left, right, q.Dist, out)
+		return pairSpans(right, left, q.Dist, out)
 	case OpWithin:
 		if len(q.Kids) != 1 {
 			return out
 		}
-		for _, s := range v.evalInto(q.Kids[0], nil) {
+		for _, s := range v.evalTemp(q.Kids[0]) {
 			if int(s.end-s.start) <= q.Dist {
 				out = append(out, s)
 			}
@@ -217,13 +249,13 @@ func (v docView) evalInto(q Query, out []spanHit) []spanHit {
 		if len(q.Kids) != 2 {
 			return out
 		}
-		return relateSingle(q.Op, q.Neg, v.evalInto(q.Kids[0], nil), v.evalInto(q.Kids[1], nil), out)
+		return relateSingle(q.Op, q.Neg, v.evalTemp(q.Kids[0]), v.evalTemp(q.Kids[1]), out)
 	case OpFilter:
 		if len(q.Kids) != 1 {
 			return out
 		}
 		window := filterWindowLen(q.Filter, v.length)
-		for _, s := range v.evalInto(q.Kids[0], nil) {
+		for _, s := range v.evalTemp(q.Kids[0]) {
 			if s.start >= window[0] && s.end <= window[1] {
 				out = append(out, s)
 			}
@@ -231,14 +263,15 @@ func (v docView) evalInto(q Query, out []spanHit) []spanHit {
 		return out
 	case OpAtLeast:
 		matched := 0
-		var acc []spanHit
+		acc := v.scratch.arena[len(v.scratch.arena):len(v.scratch.arena)]
 		for _, k := range q.Kids {
-			kid := v.evalInto(k, nil)
+			kid := v.evalTemp(k)
 			if len(kid) > 0 {
 				matched++
 				acc = append(acc, kid...)
 			}
 		}
+		v.scratch.arena = acc
 		if matched >= q.Threshold {
 			return append(out, acc...)
 		}
@@ -267,7 +300,13 @@ func (v docView) phraseSpans(ph []PhrasePos, slop int, out []spanHit) []spanHit 
 		return out
 	}
 	v.scratch.pool = v.scratch.pool[:0]
-	lists := make([][]uint32, len(ph))
+	lists := v.scratch.lists
+	if cap(lists) < len(ph) {
+		lists = make([][]uint32, len(ph))
+	} else {
+		lists = lists[:len(ph)]
+	}
+	v.scratch.lists = lists
 	for t, slot := range ph {
 		if slot.Any {
 			continue

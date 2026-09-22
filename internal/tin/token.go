@@ -99,6 +99,98 @@ type scanner struct {
 	inWord bool
 }
 
+// scanPairs appends text's (hash, 0-based position) pairs to out, folding on
+// the fly exactly like scanString but with no emit callback. A func argument
+// stored in the scanner escapes to the heap — one closure plus its captured
+// slice per call — while this threads the slice by value through a plain
+// data struct, so warm callers allocate only when out must grow.
+// TestScanPairsAgreesWithScanString locks the two together, including the
+// rune fold path.
+func scanPairs(text string, out []tokPos) []tokPos {
+	s := pairScanner{out: out, h: fnvOffset}
+	for i := 0; i < len(text); {
+		c := text[i]
+		if c < utf8.RuneSelf {
+			b := foldByte(c)
+			if wordClass[b] {
+				s.take(b)
+			} else {
+				s.flush()
+			}
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(text[i:])
+		s.feed(r, size)
+		i += size
+	}
+	s.flush()
+	return s.out
+}
+
+// pairScanner is scanString's state machine with the emit callback replaced
+// by an appended slice. It holds data only, so callers keep it on the stack.
+type pairScanner struct {
+	out    []tokPos
+	h      uint64
+	pos    uint32
+	inWord bool
+}
+
+// take feeds one folded byte into the open token, starting one first.
+func (s *pairScanner) take(b byte) {
+	if !s.inWord {
+		s.h = fnvOffset
+		s.inWord = true
+	}
+	s.h = mix(s.h, b)
+}
+
+// flush closes the open token, if any.
+func (s *pairScanner) flush() {
+	if !s.inWord {
+		return
+	}
+	s.out = append(s.out, tokPos{hash: s.h, pos: s.pos})
+	s.pos++
+	s.inWord = false
+	s.h = fnvOffset
+}
+
+// feed folds one decoded rune into the running hash. Bytes the fold cannot
+// represent start or continue a token by Unicode letter/digit property;
+// anything else separates. Mirrors scanner.feed exactly.
+func (s *pairScanner) feed(r rune, size int) {
+	if r < utf8.RuneSelf {
+		if b := foldByte(byte(r)); wordClass[b] {
+			s.take(b)
+		} else {
+			s.flush()
+		}
+		return
+	}
+	if r < 256 {
+		if f := latinFold[byte(r)]; f != 0 {
+			s.take(f)
+			return
+		}
+	}
+	if r == utf8.RuneError && size <= 1 {
+		s.flush()
+		return
+	}
+	l := unicode.ToLower(r)
+	if !unicode.IsLetter(l) && !unicode.IsDigit(l) {
+		s.flush()
+		return
+	}
+	var enc [utf8.UTFMax]byte
+	n := utf8.EncodeRune(enc[:], l)
+	for _, b := range enc[:n] {
+		s.take(b)
+	}
+}
+
 // take feeds one folded byte into the open token, starting one first.
 func (s *scanner) take(b byte) {
 	if !s.inWord {

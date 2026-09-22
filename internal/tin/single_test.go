@@ -57,25 +57,51 @@ func TestMatchSingleAgreesWithIndex(t *testing.T) {
 	}
 }
 
-// TestMatchSingleAllocs bounds transient matching garbage: warmed scratch
-// must hold steady state at a small constant (phrase slot lists), never
-// scaling with the text.
+// TestMatchSingleAllocs is the zero-alloc contract: warmed scratch makes
+// MatchSingle free for every operator, never scaling with the text. Parse
+// costs are out of scope (ParseTINQL runs once per execution, not per row).
 func TestMatchSingleAllocs(t *testing.T) {
-	q := Query{Op: OpPhrase, Phrase: []PhrasePos{
-		{Alts: []uint64{mustHash(t, "quick")}},
-		{Alts: []uint64{mustHash(t, "brown")}},
-		{Alts: []uint64{mustHash(t, "fox")}},
-	}}
-	text := "the quick brown fox jumps over the lazy dog near the river bank"
-	var scratch TextScratch
-	if !MatchSingle(text, q, &scratch) {
-		t.Fatal("expected match")
+	ix := NewIndex()
+	docs := []string{
+		"fuji apple juicy red pie",
+		"lazy dog sleeps all day near the river bank",
+		"security critical threat level alpha beta gamma",
+		"title alpha beta gamma disclaimer",
+		"the quick brown fox jumps over the lazy dog",
 	}
-	const maxAllocs = 4
-	if n := testing.AllocsPerRun(50, func() {
-		MatchSingle(text, q, &scratch)
-	}); n > maxAllocs {
-		t.Fatalf("MatchSingle allocated %v per run, want <= %d", n, maxAllocs)
+	for id, text := range docs {
+		ix.Add(DocID(id+1), text)
+	}
+	inputs := []string{
+		`apple`, `fuji`, `apple AND fuji`, `apple OR dog`, `apple AND NOT pie`,
+		`"fuji apple"`, `"fuji apple"~2`, `"big _ wolf"`, `"apple [pie banana]"`,
+		`[apple dog peach]`, `AT LEAST 2 OF [apple dog peach pie]`, `ALL OF [apple fuji]`,
+		`apple THEN/0 fuji`, `peach NEAR/3 rain`, `fuji NEAR/1 apple`,
+		`(security NEAR/5 threat) ENCLOSES critical`,
+		`critical ENCLOSED BY (security NEAR/5 threat)`,
+		`title NOT OVERLAPPING disclaimer`, `alpha BEFORE gamma`, `gamma AFTER alpha`,
+		`apple IN FIRST 2 WORDS`, `day IN LAST 2 WORDS`, `*`, `* NOT ENCLOSES apple`,
+		`appl*`, `p?ach`, `apple~1`, `aardvark TO cat`, `MATCHES fuji`,
+		`CONTAINS banana`, `wi-fi`, `jalapeno`, `apple^2`, `"apple banana"^1.5`,
+		`(apple OR dog) WITHIN 4`, `apple IN WORDS 0 TO 2`,
+	}
+	for _, input := range inputs {
+		q, err := ix.ParseTINQL(input)
+		if err != nil {
+			t.Fatalf("ParseTINQL(%q): %v", input, err)
+		}
+		var scratch TextScratch
+		for _, text := range docs {
+			MatchSingle(text, q, &scratch)
+		}
+		for _, text := range docs {
+			text := text
+			if n := testing.AllocsPerRun(20, func() {
+				MatchSingle(text, q, &scratch)
+			}); n != 0 {
+				t.Fatalf("%q doc %q: MatchSingle allocated %v per run, want 0", input, text, n)
+			}
+		}
 	}
 }
 

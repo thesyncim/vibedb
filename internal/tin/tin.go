@@ -85,13 +85,13 @@ type docMeta struct {
 }
 
 // postings is one term's posting list. ids is sorted exactly when the
-// index's sorted flag holds; freq parallels ids; pos holds per-document
-// positions with offsets in off (off has len(ids)+1).
+// index's sorted flag holds; pos holds per-document positions with offsets
+// in off (off has len(ids)+1), so the term frequency of entry i is always
+// off[i+1]-off[i] with no separate frequency array.
 type postings struct {
-	ids  []DocID
-	freq []uint32
-	off  []uint32
-	pos  []uint32
+	ids []DocID
+	off []uint32
+	pos []uint32
 }
 
 // NewIndex returns an empty Index.
@@ -162,13 +162,11 @@ func (ix *Index) appendLocked(id DocID, hash uint64, pos uint32, terms []uint64)
 		ix.post[hash] = p
 	}
 	if n := len(p.ids); n > 0 && p.ids[n-1] == id {
-		p.freq[n-1]++
 		p.pos = append(p.pos, pos)
 		p.off[n] = uint32(len(p.pos))
 		return terms
 	}
 	p.ids = append(p.ids, id)
-	p.freq = append(p.freq, 1)
 	p.pos = append(p.pos, pos)
 	p.off = append(p.off, uint32(len(p.pos)))
 	return append(terms, hash)
@@ -212,7 +210,6 @@ func (ix *Index) removeLocked(id DocID, old docMeta) {
 			p.off[i] -= width
 		}
 		p.ids = append(p.ids[:lo], p.ids[lo+1:]...)
-		p.freq = append(p.freq[:lo], p.freq[lo+1:]...)
 		p.off = append(p.off[:lo], p.off[lo+1:]...)
 		if len(p.ids) == 0 {
 			delete(ix.post, hash)
@@ -260,12 +257,10 @@ func sortPostings(p *postings) {
 		return
 	}
 	ids := make([]DocID, n)
-	freq := make([]uint32, n)
 	widths := make([]uint32, n)
 	total := uint32(0)
 	for i, o := range ord {
 		ids[i] = p.ids[o]
-		freq[i] = p.freq[o]
 		widths[i] = p.off[o+1] - p.off[o]
 		total += widths[i]
 	}
@@ -276,7 +271,7 @@ func sortPostings(p *postings) {
 		pos = append(pos, p.pos[p.off[o]:p.off[o+1]]...)
 	}
 	off[n] = uint32(len(pos))
-	p.ids, p.freq, p.pos, p.off = ids, freq, pos, off
+	p.ids, p.pos, p.off = ids, pos, off
 }
 
 // isIdentity reports whether ord is the identity permutation.

@@ -999,7 +999,7 @@ func (ix *Index) scoreTerm(term uint64, boost float64, docs map[DocID]docMeta, a
 	avg := float64(ix.tokens) / float64(ix.nDocs)
 	tf, dl, sc := ix.scoreTF[:0], ix.scoreDL[:0], ix.scoreOut[:0]
 	for i, id := range p.ids {
-		tf = append(tf, float64(p.freq[i]))
+		tf = append(tf, float64(p.off[i+1]-p.off[i]))
 		dl = append(dl, float64(docs[id].length))
 	}
 	sc = bm25Scores(idf, avg, boost, tf, dl, sc)
