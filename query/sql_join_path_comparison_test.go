@@ -304,8 +304,11 @@ func TestLegacySQLJoinLayoutAndWarmAllocationGates(t *testing.T) {
 		// ranking scratch slice plus the restriction-engaged flag (24 + 8
 		// bytes incl. alignment), both nil/false until an ORDER BY
 		// SCORE() ... LIMIT statement restricts its scan.
-		if got := unsafe.Sizeof(joinBinding{}); got != 3760 {
-			t.Fatalf("joinBinding size = %d, want unchanged 3760", got)
+		// 3760 before verdict/sort skipping: the Workspace gains the
+		// restricting plan pointer (8 bytes), matched by the sort-skip
+		// reader so foreign plans never skip.
+		if got := unsafe.Sizeof(joinBinding{}); got != 3768 {
+			t.Fatalf("joinBinding size = %d, want unchanged 3768", got)
 		}
 		if got := unsafe.Offsetof(joinBinding{}.lits); got != 8 {
 			t.Fatalf("joinBinding.lits offset = %d, want unchanged 8", got)
@@ -335,8 +338,10 @@ func TestLegacySQLJoinLayoutAndWarmAllocationGates(t *testing.T) {
 		// Score ranking scratch slice plus a bool flag padded to 4 (16
 		// bytes), shifting the tail by the delta exactly like the 64-bit
 		// pin above.
-		if got := unsafe.Sizeof(joinBinding{}); got != 1892 {
-			t.Fatalf("joinBinding size = %d, want unchanged 1892", got)
+		// 1892 before verdict/sort skipping: the Workspace gains a 4-byte
+		// restricting plan pointer.
+		if got := unsafe.Sizeof(joinBinding{}); got != 1896 {
+			t.Fatalf("joinBinding size = %d, want unchanged 1896", got)
 		}
 		if got := unsafe.Offsetof(joinBinding{}.lits); got != 4 {
 			t.Fatalf("joinBinding.lits offset = %d, want unchanged 4", got)

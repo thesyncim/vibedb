@@ -159,6 +159,10 @@ func bindScorePlan(s *Statement, p *plan) error {
 	// tin_topk.go). The spec is shape-only, so cached lowerings stay valid;
 	// any decline keeps the ordinary scan.
 	p.tinTopK = decideTinTopK(s, p, r, match)
+	r.tinTopKPlan = nil
+	if p.tinTopK.set {
+		r.tinTopKPlan = p
+	}
 	return nil
 }
 

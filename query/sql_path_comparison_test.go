@@ -354,8 +354,11 @@ func TestSQLPathComparisonColdScalarLayoutGate(t *testing.T) {
 		// borrowed query/statistics pointers and the serial transient
 		// scratch (8 + 8 + 8 + 192 bytes), all cold per-statement storage
 		// that warms across executions instead of allocating per row.
-		if got := unsafe.Sizeof(statementScalar{}); got != 1064 {
-			t.Fatalf("unsafe.Sizeof(statementScalar{}) = %d, want 1064", got)
+		// 1064 before verdict/sort skipping: the program gains the
+		// restricting plan pointer (8 bytes), matched against the
+		// executing Workspace so foreign plans never skip.
+		if got := unsafe.Sizeof(statementScalar{}); got != 1072 {
+			t.Fatalf("unsafe.Sizeof(statementScalar{}) = %d, want 1072", got)
 		}
 		if got := unsafe.Sizeof(statementScalarPredicate{}); got != 72 {
 			t.Fatalf("unsafe.Sizeof(statementScalarPredicate{}) = %d, want unchanged 72", got)
@@ -364,8 +367,10 @@ func TestSQLPathComparisonColdScalarLayoutGate(t *testing.T) {
 			t.Fatalf("unsafe.Sizeof(relationJoinKey{}) = %d, want unchanged 160", got)
 		}
 	case 4:
-		if got := unsafe.Sizeof(statementScalar{}); got != 440 {
-			t.Fatalf("unsafe.Sizeof(statementScalar{}) = %d, want 440", got)
+		// 440 before verdict/sort skipping: the program gains a 4-byte
+		// restricting plan pointer.
+		if got := unsafe.Sizeof(statementScalar{}); got != 444 {
+			t.Fatalf("unsafe.Sizeof(statementScalar{}) = %d, want 444", got)
 		}
 		if got := unsafe.Sizeof(statementScalarPredicate{}); got != 44 {
 			t.Fatalf("unsafe.Sizeof(statementScalarPredicate{}) = %d, want unchanged 44", got)

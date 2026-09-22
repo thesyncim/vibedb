@@ -196,6 +196,11 @@ type statementScalar struct {
 	scoreQuery   *tin.Query
 	scoreStats   *tin.ScoreStats
 	scoreScratch tin.TextScratch
+	// tinTopKPlan is the plan an index-driven top-K restriction was
+	// decided for, or nil. executeOrdered skips key evaluation and the
+	// sort only when the executing Workspace names this same plan,
+	// so a restriction can never skip work for a foreign plan.
+	tinTopKPlan *plan
 }
 
 func (s *Statement) scalarStatement() *statementScalar {
@@ -1710,6 +1715,14 @@ func (r *statementScalar) executeOrdered(
 	ordered.arena = ordered.arena[:0]
 	orderCharge := int64(0)
 	defer func() { frame.intermediate.release(orderCharge) }()
+	// Ranked input arrives in exactly the sort's order (score direction
+	// with scan-order ties, the full sort's prefix contract), so key
+	// evaluation and the sort itself are skipped: rows keep input order
+	// into the unchanged OFFSET/LIMIT slice. The plan-pointer match
+	// proves this execution's scan was restricted for this statement's
+	// own plan; any foreign or unrestricted scan sorts normally.
+	ranked := r.tinTopKPlan != nil && exec.Workspace.tinTopKUsed &&
+		exec.Workspace.tinTopKPlan == r.tinTopKPlan
 
 	perRow := saturatedBytes(
 		int64(unsafe.Sizeof(statementScalarOrderRow{})),
@@ -1763,27 +1776,29 @@ func (r *statementScalar) executeOrdered(
 		}
 		orderCharge = saturatedBytes(orderCharge, perRow)
 		keyBase := len(ordered.values)
-		for key := range ordered.order {
-			term := &ordered.order[key]
-			r.evalArena = r.evalArena[:0]
-			temporaryCharge := int64(0)
-			if err := r.evalNodes(
-				result, row, int(term.start), int(term.end), &r.evalArena,
-				&exec.Workspace.aggregateBudget, &frame.intermediate, &temporaryCharge,
-				options.Cancel,
-			); err != nil {
+		if !ranked {
+			for key := range ordered.order {
+				term := &ordered.order[key]
+				r.evalArena = r.evalArena[:0]
+				temporaryCharge := int64(0)
+				if err := r.evalNodes(
+					result, row, int(term.start), int(term.end), &r.evalArena,
+					&exec.Workspace.aggregateBudget, &frame.intermediate, &temporaryCharge,
+					options.Cancel,
+				); err != nil {
+					frame.intermediate.release(temporaryCharge)
+					return Cursor{}, err
+				}
+				value := r.values[term.root].value
+				ownedBytes := scalarOwnedBytes(value)
+				if err := frame.intermediate.reserve("scalar ORDER BY values", ownedBytes); err != nil {
+					frame.intermediate.release(temporaryCharge)
+					return Cursor{}, err
+				}
+				orderCharge = saturatedBytes(orderCharge, ownedBytes)
+				ordered.values = append(ordered.values, ownScalar(value, &ordered.arena))
 				frame.intermediate.release(temporaryCharge)
-				return Cursor{}, err
 			}
-			value := r.values[term.root].value
-			ownedBytes := scalarOwnedBytes(value)
-			if err := frame.intermediate.reserve("scalar ORDER BY values", ownedBytes); err != nil {
-				frame.intermediate.release(temporaryCharge)
-				return Cursor{}, err
-			}
-			orderCharge = saturatedBytes(orderCharge, ownedBytes)
-			ordered.values = append(ordered.values, ownScalar(value, &ordered.arena))
-			frame.intermediate.release(temporaryCharge)
 		}
 		ordered.rows = append(ordered.rows, statementScalarOrderRow{
 			input: row, keyBase: keyBase,
@@ -1793,7 +1808,7 @@ func (r *statementScalar) executeOrdered(
 	if err := cancellationCheckpoint(options.Cancel, len(ordered.rows)); err != nil {
 		return Cursor{}, err
 	}
-	if len(ordered.order) != 0 {
+	if len(ordered.order) != 0 && !ranked {
 		// OFFSET+LIMIT bounds the survivors the output reads, so a
 		// bounded selection replaces the full sort whenever it covers
 		// fewer rows. Stability carries over exactly (sequence

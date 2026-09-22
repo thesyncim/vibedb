@@ -175,6 +175,11 @@ type Workspace struct {
 	// through the index-driven top-K path. Tests assert engagement;
 	// production ignores it.
 	tinTopKUsed bool
+	// tinTopKPlan is the plan whose restriction engaged, set alongside
+	// tinTopKUsed. Sort-skip readers match it against their own
+	// statement's plan pointer, so a restriction decided for one plan
+	// can never skip work for another sharing this Workspace.
+	tinTopKPlan *plan
 	// matchScoreStats parallels matchQueries: the BM25 statistics for the
 	// SCORE() slot, refreshed per execution by the scalar stage (not by
 	// bindMatches) so statements without SCORE() pay nothing. Like
@@ -776,6 +781,7 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 	w.candidateUsed = 0
 	w.storeMaskUsed = 0
 	w.tinTopKUsed = false
+	w.tinTopKPlan = nil
 	w.text = w.text[:0]
 	w.lateText = w.lateText[:0]
 	w.groupKey = w.groupKey[:0]
@@ -830,6 +836,9 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 	// enumeration runs at all. Any decline falls through to the ordinary
 	// mask scan below, which resets the row list first.
 	topK := p.tinTopK.set && applyTinTopK(w, p.tinTopK)
+	if topK {
+		w.tinTopKPlan = p
+	}
 	compact := topK
 	scanRows := len(w.storeRows)
 	var masks []store.Mask
@@ -913,9 +922,36 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 		}
 		return p.emit(dst, ctx, selected, w)
 	}
-	selected, err := p.filterSnapshotRows(ctx, w, snapshot, compact, workers)
-	if err != nil {
-		return err
+	var selected []int
+	var err error
+	if w.tinTopKUsed && !p.hasSQLJoinComparison() && !p.runtimeSQLPaths && len(p.joins) == 0 &&
+		p.where != nil && p.where.kind == predMatch && len(p.where.kids) == 0 {
+		// The index restriction ranked exactly the rows the lone ==>
+		// verdict admits, so every scanned row keeps: extract the filter
+		// columns the later stages still read and take the identity
+		// selection, skipping the per-row re-tokenize. The shape guards
+		// re-prove the pushdown contract locally (no joins, no runtime
+		// path domains, a bare match predicate), so a plan that ever
+		// diverges from its spec falls back to the rechecked scan.
+		if err := ctx.extractSnapshotValues(p, snapshot, p.filterCols, w.storeRows, compact, &w.text, w); err != nil {
+			return err
+		}
+		if err := cancellationCheckpoint(w.cancel, ctx.rows); err != nil {
+			return err
+		}
+		selected = w.selected[:0]
+		for row := 0; row < ctx.rows; row++ {
+			selected = append(selected, row)
+		}
+		w.selected = selected
+		if err := w.eval.firstError(); err != nil {
+			return err
+		}
+	} else {
+		selected, err = p.filterSnapshotRows(ctx, w, snapshot, compact, workers)
+		if err != nil {
+			return err
+		}
 	}
 	if p.fanOutJoin >= 0 {
 		selected, err = ctx.materializeFanOut(p, snapshot, catalog, selected, compact, w)
