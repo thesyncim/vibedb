@@ -1,6 +1,7 @@
 package tin
 
 import (
+	"encoding/binary"
 	"fmt"
 	"slices"
 )
@@ -19,9 +20,12 @@ import (
 // semantics): the receiver answers with the segment's own document
 // frequencies, and the gatherer merges across segments. Open (unsealed)
 // lists never ship — the sender seals first, as durable generation
-// builds already do. An opened segment answers queries exactly like the
-// sender; it is built for the query-only replica case (a later Add
-// transparently unseals, as usual).
+// builds already do. Id gaps past 2^32 cannot seal (delta-coded ids)
+// and stay open, so only dense or generation-local id spaces ship;
+// sparse heap DocIDs beyond that range are a documented non-goal. An
+// opened segment answers queries exactly like the sender; it is built
+// for the query-only replica case (a later Add transparently unseals,
+// as usual).
 type Segment struct {
 	Dict   map[uint64]string
 	Lens   map[DocID]uint32
@@ -133,11 +137,7 @@ func MarshalSegment(seg *Segment) ([]byte, error) {
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
-	putU32(uint32(len(ids)))
-	for _, id := range ids {
-		putU64(uint64(id))
-		putU32(seg.Lens[id])
-	}
+	out = appendLensSection(out, ids, seg.Lens)
 	terms := make([]uint64, 0, len(seg.Lists))
 	for term := range seg.Lists {
 		terms = append(terms, term)
@@ -154,6 +154,100 @@ func MarshalSegment(seg *Segment) ([]byte, error) {
 		out = append(out, w...)
 	}
 	return out, nil
+}
+
+// Lens section layout (gaps and lengths uvarint): count u32, checked
+// against the header count by the caller, then mode u8 (0 = contiguous
+// ids, 1 = gapped) | base u64 |
+// gaps (mode 1 only, N-1 uvarints, each >= 1) | lengths (N uvarints).
+// Build ordinals and durable generations are contiguous, so the common
+// case stores ~2-3 bytes per document instead of 12; sparse heaps fall
+// back to delta gaps, which stay compact while ids cluster.
+func appendLensSection(out []byte, ids []DocID, lens map[DocID]uint32) []byte {
+	putU32 := func(v uint32) {
+		out = append(out, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+	}
+	putU64 := func(v uint64) {
+		putU32(uint32(v))
+		putU32(uint32(v >> 32))
+	}
+	putU32(uint32(len(ids)))
+	if len(ids) == 0 {
+		return out
+	}
+	contig := true
+	for i, id := range ids {
+		if uint64(id) != uint64(ids[0])+uint64(i) {
+			contig = false
+			break
+		}
+	}
+	if contig {
+		out = append(out, 0)
+	} else {
+		out = append(out, 1)
+	}
+	putU64(uint64(ids[0]))
+	prev := uint64(ids[0])
+	for _, id := range ids[1:] {
+		if !contig {
+			out = binary.AppendUvarint(out, uint64(id)-prev)
+		}
+		prev = uint64(id)
+	}
+	for _, id := range ids {
+		out = binary.AppendUvarint(out, uint64(lens[id]))
+	}
+	return out
+}
+
+// readLensSection decodes count lengths, failing closed on truncation,
+// bad modes, zero gaps, duplicate ids, or count mismatch. Decoded ids
+// feed a map sized exactly count, so corrupt values cannot over-allocate.
+func readLensSection(r *sealReader, count int) (map[DocID]uint32, error) {
+	lens := make(map[DocID]uint32, count)
+	if count == 0 {
+		return lens, nil
+	}
+	mode := r.byte()
+	if r.err != nil || mode > 1 {
+		return nil, fmt.Errorf("tin segment: bad lens mode")
+	}
+	base := r.u64()
+	if r.err != nil {
+		return nil, r.err
+	}
+	ids := make([]DocID, count)
+	ids[0] = DocID(base)
+	prev := base
+	for i := 1; i < count; i++ {
+		if mode == 0 {
+			prev++
+		} else {
+			gap, n := binary.Uvarint(r.b)
+			if n <= 0 {
+				return nil, fmt.Errorf("tin segment: bad lens gap")
+			}
+			r.b = r.b[n:]
+			if gap == 0 {
+				return nil, fmt.Errorf("tin segment: zero lens gap")
+			}
+			prev += gap
+		}
+		ids[i] = DocID(prev)
+	}
+	for _, id := range ids {
+		v, n := binary.Uvarint(r.b)
+		if n <= 0 || v > 0xffffffff {
+			return nil, fmt.Errorf("tin segment: bad lens length")
+		}
+		r.b = r.b[n:]
+		lens[id] = uint32(v)
+	}
+	if len(lens) != count {
+		return nil, fmt.Errorf("tin segment: duplicate lens ids")
+	}
+	return lens, nil
 }
 
 // UnmarshalSegment decodes a shipped segment, failing closed before any
@@ -196,18 +290,11 @@ func UnmarshalSegment(b []byte) (*Segment, error) {
 	if r.err != nil || n != seg.NDocs {
 		return nil, fmt.Errorf("tin segment: %d lengths for %d docs", n, seg.NDocs)
 	}
-	if n > len(r.b)/12 {
-		return nil, fmt.Errorf("tin segment: lengths escape wire")
+	lens, err := readLensSection(r, n)
+	if err != nil {
+		return nil, err
 	}
-	seg.Lens = make(map[DocID]uint32, n)
-	for range n {
-		id := DocID(r.u64())
-		length := r.u32()
-		if r.err != nil {
-			return nil, r.err
-		}
-		seg.Lens[id] = length
-	}
+	seg.Lens = lens
 	n = int(r.u32())
 	if r.err != nil || n < 0 || n > len(r.b)/13 {
 		return nil, fmt.Errorf("tin segment: bad list count %d", n)
