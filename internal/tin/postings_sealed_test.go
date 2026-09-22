@@ -507,3 +507,41 @@ func TestSealedSpace(t *testing.T) {
 		t.Fatalf("wide-gap match = %s", got)
 	}
 }
+
+// TestSealedBasesPacked proves position bases pack narrower than raw u32:
+// over the corpus the packed base stream holds strictly fewer words than
+// one per document, and every block's width is the exact minimum for its
+// maximum base (no over-wide streams, no truncation).
+func TestSealedBasesPacked(t *testing.T) {
+	_, sealed := sealTwin(t, sealedCorpusDocs())
+	var words, docs uint64
+	blocks := 0
+	for _, p := range sealed.post {
+		s := p.sealed
+		if s == nil {
+			continue
+		}
+		words += uint64(len(s.bases))
+		docs += uint64(s.n)
+		for b := range s.blk {
+			bl := &s.blk[b]
+			blocks++
+			var maxBase uint32
+			for k := uint32(0); k < bl.rows; k++ {
+				if v := s.sealedBase(bl, k); v > maxBase {
+					maxBase = v
+				}
+			}
+			if w := packWidth(maxBase); w != bl.baseW {
+				t.Fatalf("block width %d != exact minimum %d for max base %d", bl.baseW, w, maxBase)
+			}
+		}
+	}
+	if blocks == 0 {
+		t.Fatal("no sealed blocks for bases packing")
+	}
+	if words >= docs {
+		t.Fatalf("packed base words %d >= raw %d documents", words, docs)
+	}
+	t.Logf("packed base words %d vs raw %d (%.2fx)", words, docs, float64(docs)/float64(words))
+}

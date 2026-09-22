@@ -36,8 +36,9 @@ const sealedCkptPerBlock = sealedBlockRows / sealedCkptEvery
 
 // sealedPostings is one term's compressed posting list. first holds each
 // block's first document id raw (the block index); blk directories address
-// the packed streams. bases holds one raw position base per document,
-// indexed by global row.
+// the packed streams. bases holds the per-document position bases packed
+// at each block's own width (first positions run small: document lengths,
+// not corpus ids), concatenated block after block.
 type sealedPostings struct {
 	n     uint32
 	occ   uint64
@@ -49,16 +50,17 @@ type sealedPostings struct {
 	pos   []uint32
 }
 
-// sealedBlock directories one 128-row block. idW, cntW, posW are the packed
-// bit widths (1..32); idOff, cntOff, posOff are word offsets into the
-// streams; posCkpt holds the delta-stream bit offsets (relative to posOff)
-// of rows 0, 16, ..., 112. Counts need no checkpoints: fixed-width codes
-// seek arithmetically.
+// sealedBlock directories one 128-row block. idW, cntW, posW, baseW are the
+// packed bit widths (1..32); idOff, cntOff, posOff, baseOff are word offsets
+// into the streams; posCkpt holds the delta-stream bit offsets (relative to
+// posOff) of rows 0, 16, ..., 112. Counts and bases need no checkpoints:
+// fixed-width codes seek arithmetically.
 type sealedBlock struct {
 	rows            uint32
 	idW, cntW, posW uint8
+	baseW           uint8
 	idOff, cntOff   uint32
-	posOff          uint32
+	posOff, baseOff uint32
 	posCkpt         [sealedCkptPerBlock]uint32
 }
 
@@ -148,6 +150,7 @@ func sealPostings(p *postings) *sealedPostings {
 	}
 	var deltas [sealedBlockRows]uint32
 	var freqs [sealedBlockRows]uint32
+	var baseVals [sealedBlockRows]uint32
 	gapsBuf := make([]uint32, 0, 1024)
 	for b := range nb {
 		start := b * sealedBlockRows
@@ -160,14 +163,20 @@ func sealPostings(p *postings) *sealedPostings {
 		bl.rows = uint32(rows)
 		s.first[b] = uint64(p.ids[start])
 		// Widths pass over id deltas (block-first ids stay raw in first),
-		// frequencies, and position gaps (per-document bases excluded).
-		idW, cntW, posW := uint8(1), uint8(1), uint8(1)
+		// frequencies, position gaps, and per-document bases: a base is
+		// one document length, so the block width stays narrow while
+		// long-document corpora still encode exactly.
+		idW, cntW, posW, baseW := uint8(1), uint8(1), uint8(1), uint8(1)
 		for i := range rows {
 			g := i + start
 			c := p.off[g+1] - p.off[g]
 			freqs[i] = c
 			if w := packWidth(c); w > cntW {
 				cntW = w
+			}
+			baseVals[i] = p.pos[p.off[g]]
+			if w := packWidth(baseVals[i]); w > baseW {
+				baseW = w
 			}
 			if i > 0 {
 				d := uint64(p.ids[g]) - uint64(p.ids[g-1])
@@ -186,13 +195,16 @@ func sealPostings(p *postings) *sealedPostings {
 				}
 			}
 		}
-		bl.idW, bl.cntW, bl.posW = idW, cntW, posW
-		// Pack pass: id deltas skip the block-first raw id; counts stream
-		// whole; bases stay raw; gaps pack at posW with checkpoints.
+		bl.idW, bl.cntW, bl.posW, bl.baseW = idW, cntW, posW, baseW
+		// Pack pass: id deltas skip the block-first raw id; counts and
+		// bases stream whole at their widths; gaps pack at posW with
+		// checkpoints.
 		bl.idOff = uint32(len(s.ids))
 		s.ids = packAppend(deltas[:rows-1], idW, s.ids)
 		bl.cntOff = uint32(len(s.cnts))
 		s.cnts = packAppend(freqs[:rows], cntW, s.cnts)
+		bl.baseOff = uint32(len(s.bases))
+		s.bases = packAppend(baseVals[:rows], baseW, s.bases)
 		bl.posOff = uint32(len(s.pos))
 		// Gaps pack continuously at posW, so gap j sits at bit j*posW;
 		// checkpoints record the running bit total every 16 rows.
@@ -201,7 +213,6 @@ func sealPostings(p *postings) *sealedPostings {
 		for i := range rows {
 			g := i + start
 			c := freqs[i]
-			s.bases = append(s.bases, p.pos[p.off[g]])
 			if i%sealedCkptEvery == 0 {
 				bl.posCkpt[i/sealedCkptEvery] = posBits
 			}
@@ -217,16 +228,25 @@ func sealPostings(p *postings) *sealedPostings {
 }
 
 // sealedBytes reports the sealed footprint in bytes: blocks index, packed
-// streams, raw bases, and directories. Tests pin space savings against it.
+// streams (bases included), and directories. Tests pin space savings
+// against it.
 func (s *sealedPostings) sealedBytes() uint64 {
 	if s == nil {
 		return 0
 	}
-	// rows(4) + widths(4) + offsets(12) + checkpoints(8x4).
-	const blockDir = 4 + 4 + 12 + sealedCkptPerBlock*4
+	// rows(4) + widths(4) + offsets(16) + checkpoints(8x4).
+	const blockDir = 4 + 4 + 16 + sealedCkptPerBlock*4
 	return uint64(8*len(s.first) +
 		4*(len(s.ids)+len(s.cnts)+len(s.bases)+len(s.pos)) +
 		blockDir*len(s.blk))
+}
+
+// sealedBase reads one packed position base: fixed-width codes seek
+// arithmetically, so a random row costs one seek plus one pull, with
+// stack-only reader state.
+func (s *sealedPostings) sealedBase(bl *sealedBlock, wrow uint32) uint32 {
+	r := packReaderSeek(s.bases, bl.baseOff, wrow*uint32(bl.baseW))
+	return r.next(bl.baseW)
 }
 
 // docCount reports the posting list's document count in either layout.
@@ -253,6 +273,7 @@ func (p *postings) openSealed() {
 		bl := &s.blk[b]
 		idR := packReaderAt(s.ids, bl.idOff)
 		cntR := packReaderAt(s.cnts, bl.cntOff)
+		baseR := packReaderAt(s.bases, bl.baseOff)
 		id := DocID(s.first[b])
 		posBit := uint32(0)
 		for k := uint32(0); k < bl.rows; k++ {
@@ -261,8 +282,7 @@ func (p *postings) openSealed() {
 			}
 			c := cntR.next(bl.cntW)
 			ids = append(ids, id)
-			row := len(ids) - 1
-			cur := s.bases[row]
+			cur := baseR.next(bl.baseW)
 			pos = append(pos, cur)
 			// A block of single-occurrence documents packs no gaps at
 			// all; seeking an empty stream would read out of bounds.
@@ -309,24 +329,28 @@ func (s *sealedPostings) sealedAppendIDs(out []DocID) []DocID {
 const sealedBlkCacheEntries = 4
 
 // sealedBlkCache is one cached block decode: the sealed object plus block
-// number tag decoded ids and frequencies. Tags hold the sealed object
-// pointer: sealed objects are immutable and unsealing swaps in a new one,
-// so a tag hit can never read stale rows.
+// number tag decoded ids, frequencies, and position bases. Tags hold the
+// sealed object pointer: sealed objects are immutable and unsealing swaps
+// in a new one, so a tag hit can never read stale rows. Bases ride along
+// because row fetches follow finds into the same block; the 512-byte
+// transient per entry is scratch, never stored footprint.
 type sealedBlkCache struct {
-	src *sealedPostings
-	num int
-	ids []DocID
-	cnt []uint32
+	src  *sealedPostings
+	num  int
+	ids  []DocID
+	cnt  []uint32
+	base []uint32
 }
 
-// sealedBlock decodes one block's ids and frequencies into index-owned
-// staging, returning them. Phrase lookups visit candidate documents in
-// ascending order, so same-term consecutive lookups usually hit the cached
-// block and pay a binary search instead of a fresh prefix decode.
-func (ix *Index) sealedBlock(s *sealedPostings, b int) ([]DocID, []uint32) {
+// sealedBlock decodes one block's ids, frequencies, and position bases
+// into index-owned staging, returning them. Phrase lookups visit candidate
+// documents in ascending order, so same-term consecutive lookups usually
+// hit the cached block and pay a binary search instead of a fresh prefix
+// decode, and the row fetch behind them finds its base already decoded.
+func (ix *Index) sealedBlock(s *sealedPostings, b int) ([]DocID, []uint32, []uint32) {
 	for i := range ix.blk {
 		if ix.blk[i].src == s && ix.blk[i].num == b {
-			return ix.blk[i].ids, ix.blk[i].cnt
+			return ix.blk[i].ids, ix.blk[i].cnt, ix.blk[i].base
 		}
 	}
 	v := ix.blkVictim % sealedBlkCacheEntries
@@ -335,8 +359,10 @@ func (ix *Index) sealedBlock(s *sealedPostings, b int) ([]DocID, []uint32) {
 	bl := &s.blk[b]
 	idR := packReaderAt(s.ids, bl.idOff)
 	cntR := packReaderAt(s.cnts, bl.cntOff)
+	baseR := packReaderAt(s.bases, bl.baseOff)
 	ids := e.ids[:0]
 	cnts := e.cnt[:0]
+	bases := e.base[:0]
 	id := DocID(s.first[b])
 	for k := uint32(0); k < bl.rows; k++ {
 		if k > 0 {
@@ -344,10 +370,11 @@ func (ix *Index) sealedBlock(s *sealedPostings, b int) ([]DocID, []uint32) {
 		}
 		ids = append(ids, id)
 		cnts = append(cnts, cntR.next(bl.cntW))
+		bases = append(bases, baseR.next(bl.baseW))
 	}
-	e.ids, e.cnt = ids, cnts
+	e.ids, e.cnt, e.base = ids, cnts, bases
 	e.src, e.num = s, b
-	return ids, cnts
+	return ids, cnts, bases
 }
 
 // sealedFindRow locates doc's global row: binary search over the block
@@ -377,7 +404,7 @@ func (ix *Index) sealedFindRow(s *sealedPostings, doc DocID) (int, bool) {
 	}
 	if ix.missSrc == s && ix.missBlk == b {
 		ix.missSrc = nil
-		ids, _ := ix.sealedBlock(s, b)
+		ids, _, _ := ix.sealedBlock(s, b)
 		return binaryBlockRow(b, ids, doc)
 	}
 	ix.missSrc, ix.missBlk = s, b
@@ -428,9 +455,9 @@ func linearBlockRow(s *sealedPostings, b int, doc DocID) (int, bool) {
 // gaps decode.
 func (ix *Index) sealedRowAt(s *sealedPostings, b, wrow int, out []uint32) []uint32 {
 	bl := &s.blk[b]
-	_, cnts := ix.sealedBlock(s, b)
+	_, cnts, bases := ix.sealedBlock(s, b)
 	c := cnts[wrow]
-	base := s.bases[b*sealedBlockRows+wrow]
+	base := bases[wrow]
 	anchor := wrow / sealedCkptEvery * sealedCkptEvery
 	posBit := bl.posCkpt[anchor/sealedCkptEvery]
 	for i := anchor; i < wrow; i++ {
@@ -490,7 +517,7 @@ func (ix *Index) sealedRowPositions(s *sealedPostings, doc DocID, stage []uint32
 	// probes, a positions lookup always wants the block's counts next,
 	// so the fill always pays; alternating terms would defeat a
 	// miss-twice heuristic here.
-	ids, _ := ix.sealedBlock(s, b)
+	ids, _, _ := ix.sealedBlock(s, b)
 	row, ok := binaryBlockRow(b, ids, doc)
 	if !ok {
 		return nil, stage, false
@@ -509,6 +536,7 @@ func (ix *Index) sealedTermSpans(s *sealedPostings, out []spanHit, posBuf []uint
 		bl := &s.blk[b]
 		idR := packReaderAt(s.ids, bl.idOff)
 		cntR := packReaderAt(s.cnts, bl.cntOff)
+		baseR := packReaderAt(s.bases, bl.baseOff)
 		id := DocID(s.first[b])
 		posBit := uint32(0)
 		for k := uint32(0); k < bl.rows; k++ {
@@ -516,9 +544,8 @@ func (ix *Index) sealedTermSpans(s *sealedPostings, out []spanHit, posBuf []uint
 				id += DocID(idR.next(bl.idW))
 			}
 			c := cntR.next(bl.cntW)
-			row := b*sealedBlockRows + int(k)
 			pos := posBuf[:0]
-			cur := s.bases[row]
+			cur := baseR.next(bl.baseW)
 			pos = append(pos, cur)
 			if c > 1 {
 				posR := packReaderSeek(s.pos, bl.posOff, posBit)
