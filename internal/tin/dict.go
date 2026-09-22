@@ -71,7 +71,7 @@ func foldPattern(pat string) string {
 // posted reports whether hash has a live posting list.
 func (ix *Index) posted(hash uint64) bool {
 	p := ix.post[hash]
-	return p != nil && len(p.ids) > 0
+	return p != nil && p.docCount() > 0
 }
 
 // expandWildcard returns hashes of posted terms matching a folded `*`/`?`

@@ -110,6 +110,12 @@ func (s *Statement) lower(args []any) error {
 		var p *plan
 		p, err = c.compilePlan(&s.q)
 		if err == nil {
+			// SCORE() resolves after ==> slots are numbered: it needs the
+			// finished plan. A re-lowered statement reuses its persisted
+			// scalar deps and performs no duplicate surgery.
+			err = bindScorePlan(s, p)
+		}
+		if err == nil {
 			s.q.built = c.outcome(p, nil)
 			s.cached = s.canCacheLowering()
 			s.lowerErr = nil

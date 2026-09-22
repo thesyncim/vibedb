@@ -21,25 +21,30 @@ import (
 // the path, exactly like the heap path.
 
 // bindFilePredMatches resolves every ==> node under pd through resolve,
-// which parses against the owning durable snapshot's generation-pinned tin
-// index. Snapshots for plans without ==> nodes are never touched, so a nil
-// inner snapshot (a cataloged collection with no backing file) only errors
-// when its plan actually declares full text.
+// which returns the owning durable snapshot's generation-pinned tin build.
+// Parsing runs against the build's index — wildcard and fuzzy expansions
+// pin to the dictionary being scanned — and the build itself stays on the
+// slot for index-pruned candidate masks. Snapshots for plans without ==>
+// nodes are never touched, so a nil inner snapshot (a cataloged collection
+// with no backing file) only errors when its plan actually declares full
+// text.
 func bindFilePredMatches(
 	pd *compiledPredicate,
 	owner *plan,
-	resolve func(path string) (*tin.Index, error),
+	resolve func(path string) (*durable.TinBuild, error),
 	queries []tin.Query,
+	builds []*durable.TinBuild,
 ) error {
 	if pd == nil {
 		return nil
 	}
 	if pd.kind == predMatch {
-		if pd.col < 0 || pd.col >= len(owner.valuePaths) || pd.slot < 0 || pd.slot >= len(queries) {
+		if pd.col < 0 || pd.col >= len(owner.valuePaths) || pd.slot < 0 || pd.slot >= len(queries) ||
+			pd.slot >= len(builds) {
 			return fmt.Errorf("query: ==> node names an uncompiled path or slot")
 		}
 		path := owner.valuePaths[pd.col].indexPath()
-		ix, err := resolve(path)
+		build, err := resolve(path)
 		if err != nil {
 			if errors.Is(err, store.ErrIndexNotFound) {
 				return fmt.Errorf(
@@ -49,14 +54,21 @@ func bindFilePredMatches(
 			}
 			return err
 		}
-		q, err := ix.ParseTINQL(pd.pattern)
+		if build == nil || build.Index() == nil {
+			return fmt.Errorf(
+				"query: ==> over %s requires a tin index over that path (CREATE INDEX ... USING tin)",
+				path,
+			)
+		}
+		q, err := build.Index().ParseTINQL(pd.pattern)
 		if err != nil {
 			return fmt.Errorf("query: ==> over %s: invalid TINQL query: %v", path, err)
 		}
 		queries[pd.slot] = q
+		builds[pd.slot] = build
 	}
 	for _, kid := range pd.kids {
-		if err := bindFilePredMatches(kid, owner, resolve, queries); err != nil {
+		if err := bindFilePredMatches(kid, owner, resolve, queries, builds); err != nil {
 			return err
 		}
 	}
@@ -66,13 +78,16 @@ func bindFilePredMatches(
 // bindFilePlanMatches binds one plan level against its own durable snapshot,
 // recursing into join and mark inner plans with theirs. Inner snapshots come
 // from the database cut, the same source the join and mark binders pin.
+// builds parallels queries: the generation-pinned build each slot parsed
+// against, retained for index-pruned candidate masks.
 func bindFilePlanMatches(
 	p *plan,
 	snapshot *durable.Snapshot,
 	catalog durable.DatabaseSnapshot,
 	queries []tin.Query,
+	builds []*durable.TinBuild,
 ) error {
-	if err := bindFilePredMatches(p.where, p, fileTinResolver(snapshot), queries); err != nil {
+	if err := bindFilePredMatches(p.where, p, fileTinResolver(snapshot), queries, builds); err != nil {
 		return err
 	}
 	for i := range p.joins {
@@ -84,7 +99,7 @@ func bindFilePlanMatches(
 			)
 		}
 		if err := bindFilePlanMatches(
-			p.joins[i].inner, inner, catalog, queries,
+			p.joins[i].inner, inner, catalog, queries, builds,
 		); err != nil {
 			return err
 		}
@@ -98,7 +113,7 @@ func bindFilePlanMatches(
 			)
 		}
 		if err := bindFilePlanMatches(
-			p.marks[i].inner, inner, catalog, queries,
+			p.marks[i].inner, inner, catalog, queries, builds,
 		); err != nil {
 			return err
 		}
@@ -106,21 +121,21 @@ func bindFilePlanMatches(
 	return nil
 }
 
-// fileTinResolver parses against one durable snapshot. A nil snapshot — a
-// cataloged collection with no backing file — has no generation to parse
-// against, so any ==> over it is a statement error, never a silent
-// non-match.
+// fileTinResolver resolves the generation-pinned tin build for one durable
+// snapshot. A nil snapshot — a cataloged collection with no backing file —
+// has no generation to parse against, so any ==> over it is a statement
+// error, never a silent non-match.
 func fileTinResolver(
 	snapshot *durable.Snapshot,
-) func(path string) (*tin.Index, error) {
-	return func(path string) (*tin.Index, error) {
+) func(path string) (*durable.TinBuild, error) {
+	return func(path string) (*durable.TinBuild, error) {
 		if snapshot == nil {
 			return nil, fmt.Errorf(
 				"query: ==> over %s names a collection with no durable snapshot to parse against",
 				path,
 			)
 		}
-		return snapshot.TinIndexForPath(path)
+		return snapshot.TinBuildForPath(path)
 	}
 }
 
@@ -136,6 +151,9 @@ func (p *plan) bindFileMatches(
 ) error {
 	if p.matchCount == 0 {
 		w.matchQueries = w.matchQueries[:0]
+		w.matchTinBuilds = w.matchTinBuilds[:0]
+		w.matchTinRouter = nil
+		w.matchIndexes = w.matchIndexes[:0]
 		w.eval.bindMatches(nil)
 		return nil
 	}
@@ -145,9 +163,21 @@ func (p *plan) bindFileMatches(
 	for len(w.matchQueries) < p.matchCount {
 		w.matchQueries = append(w.matchQueries, tin.Query{})
 	}
+	for len(w.matchTinBuilds) < p.matchCount {
+		w.matchTinBuilds = append(w.matchTinBuilds, nil)
+	}
+	// Reslice to the exact count so workers aliasing the bindings see the
+	// same slots the calling evaluator gets; retained capacity past the
+	// count stays warm for the next execution.
 	w.matchQueries = w.matchQueries[:p.matchCount]
+	w.matchTinBuilds = w.matchTinBuilds[:p.matchCount]
+	// A Workspace reused across backends must not retain the other one's
+	// builds: a stale heap index would mask a file scan with foreign
+	// addresses. The router is live per execution for the same reason.
+	w.matchIndexes = w.matchIndexes[:0]
+	w.matchTinRouter = snapshot.PrimaryRouter()
 	queries := w.matchQueries
-	if err := bindFilePlanMatches(p, snapshot, catalog, queries); err != nil {
+	if err := bindFilePlanMatches(p, snapshot, catalog, queries, w.matchTinBuilds); err != nil {
 		return err
 	}
 	w.eval.bindMatches(queries)
@@ -166,6 +196,9 @@ func (p *plan) bindFileOverlayMatches(
 ) error {
 	if p.matchCount == 0 {
 		w.matchQueries = w.matchQueries[:0]
+		w.matchTinBuilds = w.matchTinBuilds[:0]
+		w.matchTinRouter = nil
+		w.matchIndexes = w.matchIndexes[:0]
 		w.eval.bindMatches(nil)
 		return nil
 	}
@@ -194,10 +227,18 @@ func (p *plan) bindFileOverlayMatches(
 	for len(w.matchQueries) < p.matchCount {
 		w.matchQueries = append(w.matchQueries, tin.Query{})
 	}
+	for len(w.matchTinBuilds) < p.matchCount {
+		w.matchTinBuilds = append(w.matchTinBuilds, nil)
+	}
 	w.matchQueries = w.matchQueries[:p.matchCount]
+	w.matchTinBuilds = w.matchTinBuilds[:p.matchCount]
+	// Same cross-backend hygiene as bindFileMatches: no stale heap index
+	// may survive on a Workspace the file path reuses.
+	w.matchIndexes = w.matchIndexes[:0]
+	w.matchTinRouter = snapshot.PrimaryRouter()
 	queries := w.matchQueries
 	if err := bindFilePredMatches(
-		p.where, p, fileTinResolver(snapshot), queries,
+		p.where, p, fileTinResolver(snapshot), queries, w.matchTinBuilds,
 	); err != nil {
 		return err
 	}

@@ -97,6 +97,8 @@ func (p *plan) bindMatches(w *Workspace, snapshot store.Snapshot, catalog store.
 	if p.matchCount == 0 {
 		w.matchQueries = w.matchQueries[:0]
 		w.matchIndexes = w.matchIndexes[:0]
+		w.matchTinBuilds = w.matchTinBuilds[:0]
+		w.matchTinRouter = nil
 		w.eval.bindMatches(nil)
 		return nil
 	}
@@ -111,6 +113,11 @@ func (p *plan) bindMatches(w *Workspace, snapshot store.Snapshot, catalog store.
 	// count stays warm for the next execution.
 	w.matchQueries = w.matchQueries[:p.matchCount]
 	w.matchIndexes = w.matchIndexes[:p.matchCount]
+	// A Workspace reused across backends must not retain the other one's
+	// builds: a stale durable build would mask a heap scan with foreign
+	// addresses.
+	w.matchTinBuilds = w.matchTinBuilds[:0]
+	w.matchTinRouter = nil
 	queries := w.matchQueries
 	if err := bindPlanMatches(p, snapshot, catalog, queries, w.matchIndexes); err != nil {
 		return err

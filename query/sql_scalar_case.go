@@ -1168,6 +1168,8 @@ func (r *statementScalar) nodeDomain(root int32) scalarCaseDomain {
 			return caseDomainBoolean
 		}
 		return r.conditionals[node.conditionalIndex].domain
+	case statementScalarScore:
+		return caseDomainNumeric
 	default:
 		return caseDomainDynamic
 	}

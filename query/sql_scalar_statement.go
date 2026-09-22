@@ -7,6 +7,7 @@ import (
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/pginput"
+	"github.com/thesyncim/vibedb/internal/tin"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
@@ -65,6 +66,12 @@ const (
 	statementScalarCaseNode
 	statementScalarConditionalNode
 	statementScalarBooleanNode
+	// statementScalarScore is SQL's SCORE(): the BM25 relevance of the row
+	// against the statement's single ==> query. dependency names the hidden
+	// result column carrying the match path's text; the slot lives once on
+	// the program (scoreSlot), since SCORE() binds exactly one ==> node.
+	// Appended last so existing node numbering never shifts.
+	statementScalarScore
 )
 
 type statementScalarNode struct {
@@ -164,6 +171,22 @@ type statementScalar struct {
 	cardinality        bool
 	groupedCardinality bool
 	hasAggregate       bool
+	// scoreSlot is the ==> slot every SCORE() node evaluates against, or -1
+	// when the statement uses no SCORE(). The query package's post-compile
+	// score pass sets it once SCORE()'s exactly-one-==> rule is proven;
+	// like the plan, it names where per-execution values live but never
+	// holds them, so the prepared program stays shareable.
+	scoreSlot int
+	// scoreQuery and scoreStats are the execution's bound ==> query and its
+	// BM25 statistics, borrowed read-only from the executing Workspace for
+	// the synchronous execution (the same aliasing discipline as
+	// evalScratch.matchQueries: no appends happen between bindScore and the
+	// last row, so the backing array cannot move). scoreScratch is this
+	// execution's serial transient scratch, reused across rows so warm
+	// scoring allocates nothing.
+	scoreQuery   *tin.Query
+	scoreStats   *tin.ScoreStats
+	scoreScratch tin.TextScratch
 }
 
 func (s *Statement) scalarStatement() *statementScalar {
@@ -268,6 +291,9 @@ func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 			"computed scalar WHERE expressions must run before grouping and cannot yet share a grouped statement")
 	}
 	runtime := new(statementScalar)
+	// Slot zero is a bound ==> node, so SCORE()'s slot starts unbound; the
+	// post-compile score pass resolves it or fails the prepare.
+	runtime.scoreSlot = -1
 	if err := runtime.compileWhere(s, s.tree.Where); err != nil {
 		return err
 	}
@@ -640,6 +666,13 @@ func (r *statementScalar) compileExpr(s *Statement, expr *sqlast.ScalarExpr) (in
 		})
 	case sqlast.ScalarCase:
 		return r.compileCase(s, expr)
+	case sqlast.ScalarScore:
+		// The ==> slot and the hidden text column resolve after ==> slots
+		// are numbered; until the score pass runs, dependency stays -1 so
+		// any evaluation before binding fails closed in evalNodes.
+		r.nodes = append(r.nodes, statementScalarNode{
+			kind: statementScalarScore, dependency: -1, left: -1, right: -1, pos: expr.Pos,
+		})
 	default:
 		return 0, fmt.Errorf("query: invalid scalar expression kind %d", expr.Kind)
 	}
@@ -976,6 +1009,8 @@ func (r *statementScalar) nodeType(root int32) ValueType {
 			return TypeBool
 		}
 		return r.conditionals[node.conditionalIndex].domain.schemaType()
+	case statementScalarScore:
+		return TypeNumber
 	default:
 		return TypeAny
 	}
@@ -1024,6 +1059,8 @@ func (r *statementScalar) nodeRepresentation(root int32) OutputRepresentation {
 			return OutputSQLBool
 		}
 		return r.conditionals[node.conditionalIndex].domain.representation()
+	case statementScalarScore:
+		return OutputSQLNumber
 	default:
 		return OutputJSON
 	}
@@ -1056,6 +1093,12 @@ func (r *statementScalar) evalNodes(
 			cell := result.Columns[node.dependency].Cells[row]
 			value = statementScalarValue{cell: cell, direct: true}
 			value.value = scalarFromResultCell(cell, arena)
+		case statementScalarScore:
+			var err error
+			value, err = r.evalScore(result, row, node, arena)
+			if err != nil {
+				return err
+			}
 		case statementScalarLiteral:
 			value.value = node.bound
 		case statementScalarNull:
@@ -1457,6 +1500,13 @@ func (r *statementScalar) execute(
 	inputRows := result.RowCount
 	if shapeErr := r.validateResult(result); shapeErr != nil {
 		return Cursor{}, shapeErr
+	}
+	// Borrow this execution's ==> query and statistics for SCORE(). The core
+	// scan bound its match slots before the scalar stage runs; statements
+	// without SCORE() skip the refresh entirely.
+	if err := r.bindScore(&exec.Workspace); err != nil {
+		result.abortResult()
+		return Cursor{}, err
 	}
 	inputBytes := result.resultBytesUsed
 	scratchBytes := scalarExecutionScratchBytes(len(r.nodes), len(r.outputs))

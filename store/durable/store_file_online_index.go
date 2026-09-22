@@ -166,8 +166,10 @@ func (c *Collection) createIndexContext(
 	}
 	// Tin declarations take the declare-only path below: postings build
 	// lazily per generation on first query use, so publication only persists
-	// the declaration. Routing here (before the build slot) keeps the exact
-	// pipeline from ever compiling a tin definition as exact.
+	// the declaration, after repartitioning wide stripes into the 256-slot
+	// geometry pruned masks address. Routing here (before the build slot)
+	// keeps the exact pipeline from ever compiling a tin definition as
+	// exact.
 	if definition.Kind == store.IndexTin {
 		return c.createTinIndexContext(ctx, definition)
 	}
@@ -455,6 +457,15 @@ func (c *Collection) createTinIndexContext(
 			c.writer.Unlock()
 			return store.IndexInfo{}, store.ErrIndexExists
 		}
+	}
+	// Tin masks address the same 256-slot leaf geometry exact postings do,
+	// so declaring tin repartitions scan-oriented stripes first, exactly
+	// like the exact online build below. Without it a tin-only collection
+	// keeps arbitrarily wide leaves its probes could never address, and
+	// every query would decline to the full scan.
+	if err := c.repartitionPrimaryForExactIndexLocked(ctx); err != nil {
+		c.writer.Unlock()
+		return store.IndexInfo{}, err
 	}
 	// Re-normalization rebuilds the canonical catalog from Indexes alone,
 	// so the new declaration rides with the existing tin definitions; the

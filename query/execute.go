@@ -6,8 +6,10 @@ import (
 	"math/bits"
 	"slices"
 
+	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/internal/tin"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
 )
@@ -145,8 +147,31 @@ type Workspace struct {
 	// when the plan carries no ==> node, so a reused Workspace never
 	// retains a build past its snapshot.
 	matchIndexes []*tin.Index
+	// matchTinBuilds parallels matchQueries on the durable path: the
+	// generation-pinned build each ==> slot parsed against, carrying the
+	// ordinal-to-stable-slot map for pruned candidate masks. Nil entries
+	// decline to the full scan. It lives here rather than in the plan
+	// because the build belongs to the executing snapshot's generation;
+	// like matchQueries it is rebound every execution and cleared when the
+	// plan carries no ==> node, so a reused Workspace never retains a
+	// build past its snapshot.
+	matchTinBuilds []*durable.TinBuild
+	// matchTinRouter is the live primary router the durable probe
+	// validates candidate buckets against at plan time. It is set before
+	// planning and read-only after, like matchQueries; a stale resolution
+	// only ever declines a probe, never misroutes one.
+	matchTinRouter *storeio.ResidentPrimaryRouter
+	// matchTinHits is scratch for ordinal-to-slot resolution during ==>
+	// pruning on the durable path.
+	matchTinHits []durable.TinSlotHit
 	// matchDocIDs is scratch for tin Match enumeration during ==> pruning.
 	matchDocIDs []tin.DocID
+	// matchScoreStats parallels matchQueries: the BM25 statistics for the
+	// SCORE() slot, refreshed per execution by the scalar stage (not by
+	// bindMatches) so statements without SCORE() pay nothing. Like
+	// matchQueries it is rebound every execution; entries beyond the live
+	// slots keep warm idf buffers for the next execution.
+	matchScoreStats []tin.ScoreStats
 	// correlations is the execution-local scalar tuple supplied by a containing
 	// APPLY. Compiled plans carry only slot ordinals; values are copied here at
 	// the synchronous child boundary and cleared before the Workspace is reused.

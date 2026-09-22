@@ -1,6 +1,7 @@
 package tin
 
 import (
+	"slices"
 	"unicode"
 	"unicode/utf8"
 )
@@ -126,6 +127,26 @@ func scanPairs(text string, out []tokPos) []tokPos {
 	}
 	s.flush()
 	return s.out
+}
+
+// sortTokPos orders pairs by (hash, pos), the document order transient
+// matching and scoring both require.
+func sortTokPos(pairs []tokPos) {
+	slices.SortFunc(pairs, func(a, b tokPos) int {
+		if a.hash != b.hash {
+			if a.hash < b.hash {
+				return -1
+			}
+			return 1
+		}
+		if a.pos < b.pos {
+			return -1
+		}
+		if a.pos > b.pos {
+			return 1
+		}
+		return 0
+	})
 }
 
 // pairScanner is scanString's state machine with the emit callback replaced

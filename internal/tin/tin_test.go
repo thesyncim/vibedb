@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func mustHash(t *testing.T, term string) uint64 {
+func mustHash(t testing.TB, term string) uint64 {
 	t.Helper()
 	h, n := FoldTerm(term)
 	if n != 1 {

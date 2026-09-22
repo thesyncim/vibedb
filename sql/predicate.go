@@ -237,7 +237,29 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 	leafPos := p.tok.pos
 	agg := AggNone
 	var path *PathExpr
-	switch kind, head, state := p.tryAggregate(); state {
+	// SCORE() enters scalar parsing only with its parentheses: a bare score
+	// is an ordinary path leaf because a field can be named score, exactly
+	// like count and sum stay paths without '('. The head is consumed either
+	// way, so a head-only SCORE continues through the shared leaf tail below.
+	scoreHead := false
+	if p.tok.kind == tokIdent && p.tok.kw == kwScore {
+		node, head, state, err := p.tryScore(scalarContextForPredicate(ctx))
+		if err != nil {
+			return nil, err
+		}
+		if state == scoreCall {
+			return p.parseScalarCondition(ctx, node, head.pos)
+		}
+		if state == scoreHeadOnly {
+			p2, err := p.continuePath(head, false)
+			if err != nil {
+				return nil, err
+			}
+			path, scoreHead = p2, true
+		}
+	}
+	if !scoreHead {
+		switch kind, head, state := p.tryAggregate(); state {
 	case aggCall:
 		if ctx != ctxHaving {
 			if p.inCaseTruth() {
@@ -265,6 +287,7 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 			return nil, err
 		}
 		path = p2
+		}
 	}
 	if scalarContinues(p.tok) {
 		column := ResultColumn{Agg: agg, Path: path, Pos: leafPos}

@@ -293,8 +293,15 @@ func TestLegacySQLJoinLayoutAndWarmAllocationGates(t *testing.T) {
 		// 3600 before ==> pruning: the Workspace gains the parallel
 		// build-pointer slice plus the DocID enumeration scratch (48
 		// bytes), both nil until an ==> node binds.
-		if got := unsafe.Sizeof(joinBinding{}); got != 3648 {
-			t.Fatalf("joinBinding size = %d, want unchanged 3648", got)
+		// 3648 before durable ==> pruning: the Workspace gains the
+		// durable build-pointer slice, the live primary router, and the
+		// ordinal-to-slot hit scratch (24 + 8 + 24 bytes), all nil until
+		// an ==> node binds against a durable database.
+		// 3704 before SCORE(): the Workspace gains the per-execution BM25
+		// statistics slice (24 bytes), refreshed only when the statement
+		// scores, so statements without SCORE() pay nothing per row.
+		if got := unsafe.Sizeof(joinBinding{}); got != 3728 {
+			t.Fatalf("joinBinding size = %d, want unchanged 3728", got)
 		}
 		if got := unsafe.Offsetof(joinBinding{}.lits); got != 8 {
 			t.Fatalf("joinBinding.lits offset = %d, want unchanged 8", got)

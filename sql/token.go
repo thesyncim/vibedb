@@ -186,6 +186,9 @@ const (
 	kwView
 	kwWindow
 	kwWith
+	// kwScore is appended last so the existing keyword numbering — and any
+	// diagnostic that prints it — never shifts.
+	kwScore
 )
 
 // maxKeywordLen is the longest keyword above. It bounds the stack buffer
@@ -407,6 +410,8 @@ func keywordOf(s string) keyword {
 		return kwRowNumber
 	case "SAVEPOINT":
 		return kwSavepoint
+	case "SCORE":
+		return kwScore
 	case "SELECT":
 		return kwSelect
 	case "SET":
@@ -484,7 +489,7 @@ func keywordOf(s string) keyword {
 func reserved(kw keyword) bool {
 	switch kw {
 	case kwNone,
-		kwCount, kwSum, kwAvg, kwMin, kwMax,
+		kwCount, kwSum, kwAvg, kwMin, kwMax, kwScore,
 		kwCumeDist, kwDenseRank, kwFirstValue, kwLag, kwLastValue,
 		kwLead, kwNthValue, kwNtile, kwPercentRank, kwRank, kwRowNumber,
 		kwMissing, kwNulls, kwFirst, kwLast, kwEscape,

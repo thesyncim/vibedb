@@ -316,6 +316,21 @@ executing snapshot's index, so a prepared statement sees each snapshot's own
 terms. Full-text match currently executes over in-memory collection
 snapshots; other sources reject it.
 
+`SCORE()` in the SELECT list, `ORDER BY`, or `WHERE` reports the row's BM25
+relevance for the statement's `==>` query, or 0 when the row does not match.
+A statement needs exactly one `==>` predicate to score: with none, or with
+several, the prepare fails instead of guessing which query ranks the rows.
+Only string values score; non-string, null, and absent values score 0, the
+same rows `==>` declines to match. `ORDER BY SCORE() DESC` ranks best first,
+and `WHERE SCORE() > cutoff` keeps only rows clearing a relevance bar.
+Statistics refresh per execution against the executing snapshot, so scores
+track each snapshot's own term frequencies, and warm executions allocate
+nothing beyond what the `==>` match itself already spends.
+
+```sql
+SELECT id, SCORE() FROM docs WHERE body ==> 'luxury AND goods' ORDER BY SCORE() DESC;
+```
+
 `IS NULL` is true for explicit JSON null and an absent path. `IS MISSING` is
 true only for absence. Projection and wire encoding render both as SQL NULL.
 Authored `value = NULL` and authored NULL members of IN are rejected; a bound

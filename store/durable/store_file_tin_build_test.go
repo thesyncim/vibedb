@@ -1,9 +1,11 @@
 package durable
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/tin"
 	"github.com/thesyncim/vibedb/store"
 )
 
@@ -114,6 +116,65 @@ func TestDurableTinSearchErrors(t *testing.T) {
 	}
 	if _, err := docs.TinSearch(snap, "/body", "(((", 10); err == nil {
 		t.Fatal("invalid TINQL = nil")
+	}
+}
+
+// TestDurableTinSealedBuildAgreesWithHeap proves the sealed generation
+// build reads exactly like an open heap index over the same documents:
+// generation builds seal after their single scan, so every TinSearch runs
+// the packed readers. Ordinals follow RangeRaw order on both sides.
+func TestDurableTinSealedBuildAgreesWithHeap(t *testing.T) {
+	_, docs := openTinDatabase(t)
+	snap, err := docs.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	var keys, texts []string
+	if err := snap.RangeRaw(func(key, value []byte) error {
+		var doc struct {
+			Body string `json:"body"`
+		}
+		if err := json.Unmarshal(value, &doc); err != nil {
+			return err
+		}
+		keys = append(keys, string(key))
+		texts = append(texts, doc.Body)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	heap := tin.NewIndex()
+	for i, text := range texts {
+		heap.Add(tin.DocID(i), text)
+	}
+	build, err := snap.TinBuildForPath("/body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, input := range []string{
+		"luxury", "luxury AND watches", `"luxury watches"`, "vintage OR cheap",
+	} {
+		q, err := build.Index().ParseTINQL(input)
+		if err != nil {
+			t.Fatalf("ParseTINQL(%q): %v", input, err)
+		}
+		want, err := docs.TinSearch(snap, "/body", input, 10)
+		if err != nil {
+			t.Fatalf("TinSearch(%q): %v", input, err)
+		}
+		got := heap.Score(q, 10, nil)
+		if len(got) != len(want) {
+			t.Fatalf("%q: heap %d hits, sealed %d", input, len(got), len(want))
+		}
+		for i := range got {
+			if key := keys[uint64(got[i].Doc)]; key != want[i].Key {
+				t.Fatalf("%q hit %d: heap key %q, sealed %q", input, i, key, want[i].Key)
+			}
+			if got[i].Score != want[i].Score {
+				t.Fatalf("%q hit %d: heap score %v, sealed %v", input, i, got[i].Score, want[i].Score)
+			}
+		}
 	}
 }
 

@@ -148,12 +148,19 @@ func (ix *Index) Match(q Query, out []DocID) []DocID {
 		return out
 	case OpTerm:
 		if p := ix.post[q.Term]; p != nil {
-			out = append(out, p.ids...)
+			if p.sealed == nil {
+				out = append(out, p.ids...)
+			} else {
+				out = p.sealed.sealedAppendIDs(out)
+			}
 		}
 		return out
 	case OpAnd:
 		if len(q.Kids) == 0 {
 			return out
+		}
+		if allTerms(q.Kids) {
+			return append(out, ix.matchTermsInto(q.Kids, nil)...)
 		}
 		acc := ix.matchInto(q.Kids[0], nil)
 		for _, k := range q.Kids[1:] {
@@ -186,12 +193,118 @@ func (ix *Index) Match(q Query, out []DocID) []DocID {
 	}
 }
 
+// gallopRatioGate selects probing over decoding: a list this many times
+// longer than the current driver is probed per driver element (block index
+// plus cached binary search, or plain binary search when open) instead of
+// decoded and merged. A probe costs ~100ns; a merge step ~3.5ns, so the
+// gate pays off whenever it fires — and equal-size conjunctions never
+// reach it, keeping the streaming merge.
+const gallopRatioGate = 64
+
+// allTerms reports whether every kid is a plain term.
+func allTerms(kids []Query) bool {
+	for _, k := range kids {
+		if k.Op != OpTerm {
+			return false
+		}
+	}
+	return true
+}
+
+// matchTermsInto intersects all-term kids layout-aware. The shortest list
+// drives: siblings near its size decode and merge (streaming, as before),
+// while hugely longer siblings are probed per driver element, so a rare
+// term never pays the common term's full decode. The driver appends into
+// out and filters in place; termLists stages the resolved postings in
+// index-owned scratch.
+func (ix *Index) matchTermsInto(kids []Query, out []DocID) []DocID {
+	if len(kids) == 0 {
+		return out
+	}
+	lists := ix.termLists[:0]
+	for _, k := range kids {
+		p := ix.post[k.Term]
+		if p == nil {
+			ix.termLists = lists
+			return out
+		}
+		lists = append(lists, p)
+	}
+	ix.termLists = lists
+	short := 0
+	for i := range lists {
+		if lists[i].docCount() < lists[short].docCount() {
+			short = i
+		}
+	}
+	lists[0], lists[short] = lists[short], lists[0]
+	base := len(out)
+	out = ix.appendList(out, lists[0])
+	driver := out[base:]
+	for _, l := range lists[1:] {
+		if len(driver) == 0 {
+			break
+		}
+		if l.docCount() >= gallopRatioGate*len(driver) {
+			w := 0
+			for _, d := range driver {
+				if ix.listContains(l, d) {
+					driver[w] = d
+					w++
+				}
+			}
+			driver = driver[:w]
+			continue
+		}
+		other := ix.appendList(nil, l)
+		driver = intersectScalar(driver, other, driver[:0])
+	}
+	return out[:base+len(driver)]
+}
+
+// appendList appends one posting list's ids in either layout.
+func (ix *Index) appendList(out []DocID, p *postings) []DocID {
+	if p.sealed == nil {
+		return append(out, p.ids...)
+	}
+	return p.sealed.sealedAppendIDs(out)
+}
+
+// listContains probes one document's membership in either layout: binary
+// search over the open array, block index plus cached binary search sealed.
+func (ix *Index) listContains(p *postings, doc DocID) bool {
+	if p.sealed == nil {
+		lo, hi := 0, len(p.ids)
+		for lo < hi {
+			m := lo + (hi-lo)/2
+			if p.ids[m] < doc {
+				lo = m + 1
+			} else {
+				hi = m
+			}
+		}
+		return lo < len(p.ids) && p.ids[lo] == doc
+	}
+	_, ok := ix.sealedFindRow(p.sealed, doc)
+	return ok
+}
+
 // matchInto is the document fast path shared by the boolean combinators.
 func (ix *Index) matchInto(q Query, out []DocID) []DocID {
 	switch q.Op {
+	case OpTerm:
+		// Terms stay on the document fast path even under booleans: span
+		// expansion would decode positions no boolean needs.
+		if p := ix.post[q.Term]; p != nil {
+			out = ix.appendList(out, p)
+		}
+		return out
 	case OpAnd:
 		if len(q.Kids) == 0 {
 			return out
+		}
+		if allTerms(q.Kids) {
+			return append(out, ix.matchTermsInto(q.Kids, nil)...)
 		}
 		acc := ix.matchInto(q.Kids[0], nil)
 		for _, k := range q.Kids[1:] {
@@ -240,10 +353,14 @@ func (ix *Index) evalInto(q Query, out []spanHit) []spanHit {
 	switch q.Op {
 	case OpTerm:
 		if p := ix.post[q.Term]; p != nil {
-			for i, id := range p.ids {
-				for _, pos := range positionsOf(p, i) {
-					out = append(out, spanHit{doc: id, start: pos, end: pos + 1})
+			if p.sealed == nil {
+				for i, id := range p.ids {
+					for _, pos := range positionsOf(p, i) {
+						out = append(out, spanHit{doc: id, start: pos, end: pos + 1})
+					}
 				}
+			} else {
+				out = ix.sealedTermSpans(p.sealed, out, ix.decPos)
 			}
 		}
 		return out
@@ -331,7 +448,9 @@ func (ix *Index) evalInto(q Query, out []spanHit) []spanHit {
 // both sides' spans per document (the union a boolean AND denotes over span
 // sets). Inputs must be (doc, start) ordered; output is too.
 func joinDocs(a, b []spanHit) []spanHit {
-	out := a[:0]
+	// Fresh output: interleaving both sides' spans per document pushes the
+	// write head past the read head, so aliasing a clobbers unread spans.
+	out := make([]spanHit, 0, len(a)+len(b))
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
 		switch {
@@ -687,23 +806,31 @@ func (ix *Index) phraseSpans(ph []PhrasePos, slop int, out []spanHit) []spanHit 
 	}
 	cands := ix.matchInto(Query{Op: OpOr, Kids: altKids}, nil)
 	slots := make([]uint32, len(ph))
+	// posStage carries every slot's positions for one candidate document:
+	// tails append sequentially and stay valid through the chain check,
+	// then reset for the next document. One buffer per phrase query.
+	var posStage []uint32
 	for _, doc := range cands {
 		meta, ok := ix.docs[doc]
 		if !ok {
 			continue
 		}
 		lists := make([][]uint32, len(ph))
+		stage := posStage[:0]
 		complete := true
 		for t, slot := range ph {
 			if slot.Any {
 				continue
 			}
-			lists[t] = ix.slotPositions(slot.Alts, doc)
+			var tail []uint32
+			tail, stage = ix.slotPositions(slot.Alts, doc, stage)
+			lists[t] = tail
 			if len(lists[t]) == 0 {
 				complete = false
 				break
 			}
 		}
+		posStage = stage
 		if !complete {
 			continue
 		}
@@ -717,10 +844,43 @@ func (ix *Index) phraseSpans(ph []PhrasePos, slop int, out []spanHit) []spanHit 
 }
 
 // slotPositions returns the ascending union of alts' positions in doc, or
-// nil when none occur there.
-func (ix *Index) slotPositions(alts []uint64, doc DocID) []uint32 {
+// nil when none occur there, plus the extended stage. Open single-term
+// lookups alias the posting list (no copy, as before); every other shape
+// decodes into the caller's stage tail, which stays valid until the caller
+// resets the stage.
+func (ix *Index) slotPositions(alts []uint64, doc DocID, stage []uint32) ([]uint32, []uint32) {
 	if len(alts) == 1 {
 		if p := ix.post[alts[0]]; p != nil {
+			if p.sealed == nil {
+				lo, hi := 0, len(p.ids)
+				for lo < hi {
+					m := lo + (hi-lo)/2
+					if p.ids[m] < doc {
+						lo = m + 1
+					} else {
+						hi = m
+					}
+				}
+				if lo < len(p.ids) && p.ids[lo] == doc {
+					return positionsOf(p, lo), stage
+				}
+				return nil, stage
+			}
+			if row, ok := ix.sealedFindRow(p.sealed, doc); ok {
+				base := len(stage)
+				stage = ix.sealedPositionsInto(p.sealed, row, stage)
+				return stage[base:], stage
+			}
+		}
+		return nil, stage
+	}
+	base := len(stage)
+	for _, h := range alts {
+		p := ix.post[h]
+		if p == nil {
+			continue
+		}
+		if p.sealed == nil {
 			lo, hi := 0, len(p.ids)
 			for lo < hi {
 				m := lo + (hi-lo)/2
@@ -731,32 +891,17 @@ func (ix *Index) slotPositions(alts []uint64, doc DocID) []uint32 {
 				}
 			}
 			if lo < len(p.ids) && p.ids[lo] == doc {
-				return positionsOf(p, lo)
+				stage = append(stage, positionsOf(p, lo)...)
 			}
-		}
-		return nil
-	}
-	var union []uint32
-	for _, h := range alts {
-		p := ix.post[h]
-		if p == nil {
 			continue
 		}
-		lo, hi := 0, len(p.ids)
-		for lo < hi {
-			m := lo + (hi-lo)/2
-			if p.ids[m] < doc {
-				lo = m + 1
-			} else {
-				hi = m
-			}
-		}
-		if lo < len(p.ids) && p.ids[lo] == doc {
-			union = append(union, positionsOf(p, lo)...)
+		if row, ok := ix.sealedFindRow(p.sealed, doc); ok {
+			stage = ix.sealedPositionsInto(p.sealed, row, stage)
 		}
 	}
-	slices.Sort(union)
-	return union
+	tail := stage[base:]
+	slices.Sort(tail)
+	return tail, stage
 }
 
 // chainFrom verifies the slot chain around one anchor occurrence. Forward
@@ -886,10 +1031,15 @@ func (ix *Index) scoreInto(q Query, docs map[DocID]docMeta, acc *[]Scored) {
 		}
 		mergeScores(acc)
 		// Summation ranges over the union; AND ranks only the intersection.
-		keep := ix.matchInto(q.Kids[0], nil)
-		for _, k := range q.Kids[1:] {
-			other := ix.matchInto(k, nil)
-			keep = intersectInto(keep, other, keep[:0])
+		var keep []DocID
+		if allTerms(q.Kids) {
+			keep = ix.matchTermsInto(q.Kids, nil)
+		} else {
+			keep = ix.matchInto(q.Kids[0], nil)
+			for _, k := range q.Kids[1:] {
+				other := ix.matchInto(k, nil)
+				keep = intersectInto(keep, other, keep[:0])
+			}
 		}
 		filterScored(acc, keep)
 		scaleScores(acc, q.boostOf())
@@ -995,15 +1145,21 @@ func (ix *Index) scoreTerm(term uint64, boost float64, docs map[DocID]docMeta, a
 	if p == nil || ix.nDocs == 0 {
 		return
 	}
-	idf := idf(ix.nDocs, len(p.ids))
+	idf := idf(ix.nDocs, p.docCount())
 	avg := float64(ix.tokens) / float64(ix.nDocs)
 	tf, dl, sc := ix.scoreTF[:0], ix.scoreDL[:0], ix.scoreOut[:0]
-	for i, id := range p.ids {
-		tf = append(tf, float64(p.off[i+1]-p.off[i]))
-		dl = append(dl, float64(docs[id].length))
+	var ids []DocID
+	if p.sealed == nil {
+		ids = p.ids
+		for i, id := range p.ids {
+			tf = append(tf, float64(p.off[i+1]-p.off[i]))
+			dl = append(dl, float64(docs[id].length))
+		}
+	} else {
+		ids, tf, dl = ix.sealedScoreGather(p.sealed, docs, tf, dl)
 	}
 	sc = bm25Scores(idf, avg, boost, tf, dl, sc)
-	for i, id := range p.ids {
+	for i, id := range ids {
 		*acc = append(*acc, Scored{Doc: id, Score: sc[i]})
 	}
 	ix.scoreTF, ix.scoreDL, ix.scoreOut = tf[:0], dl[:0], sc[:0]
@@ -1114,24 +1270,6 @@ func dedupeInto(s []DocID) []DocID {
 		}
 	}
 	return s[:w+1]
-}
-
-// intersectInto intersects two sorted lists into out.
-func intersectInto(a, b []DocID, out []DocID) []DocID {
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		switch {
-		case a[i] < b[j]:
-			i++
-		case a[i] > b[j]:
-			j++
-		default:
-			out = append(out, a[i])
-			i++
-			j++
-		}
-	}
-	return out
 }
 
 // differenceInto keeps elements of sorted a absent from sorted b.

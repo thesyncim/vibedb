@@ -29,12 +29,15 @@ import (
 // eviction never invalidates a live reader.
 const maxDurableTinCacheGenerations = 4
 
-// tinSnapshotBuild is one generation's full-text content: per-name indexes
-// plus the shared ordinal-to-key table.
+// tinSnapshotBuild is one generation's full-text content: per-name indexes,
+// the shared ordinal-to-key table, and the ordinal-to-stable-slot map that
+// prunes file scans to candidate masks. slots is nil when the build cannot
+// prune; probes then decline to the full scan.
 type tinSnapshotBuild struct {
 	generation uint64
 	indexes    map[string]*tin.Index
 	keys       [][]byte
+	slots      *tinSlotMap
 }
 
 // TinHit is one ranked full-text hit: the document key and its BM25 score.
@@ -229,6 +232,15 @@ func buildTinSnapshot(snap *Snapshot) (*tinSnapshotBuild, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Builds are immutable after publication, so seal every index now: the
+	// scan above is the list's only mutation, and all generation-pinned
+	// queries read packed postings from here on.
+	for _, ix := range build.indexes {
+		ix.Seal()
+	}
+	// The slot map joins the leaf walk against the indexed keys and only
+	// publishes when the join proves itself exact.
+	build.slots = joinTinSlots(build.keys, snap)
 	return build, nil
 }
 

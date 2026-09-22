@@ -69,6 +69,23 @@ type Index struct {
 	scoreTF  []float64
 	scoreDL  []float64
 	scoreOut []float64
+	// decIDs stages sealed document ids for scoring gathers; decPos stages
+	// one sealed row's positions for span expansion. Both are sequential
+	// staging under the index lock, never retained across calls.
+	decIDs []DocID
+	decPos []uint32
+	// blk caches decoded sealed blocks for random lookups (phrase slots)
+	// with a round-robin victim; blkVictim counts evictions. Same lock
+	// discipline as the decode staging above.
+	blk       [sealedBlkCacheEntries]sealedBlkCache
+	blkVictim uint64
+	// termLists stages resolved postings for layout-aware conjunctions,
+	// reused across calls under the same lock.
+	termLists []*postings
+	// missSrc/missBlk remembers the last uncached block probe so the
+	// second same-block lookup fills the block cache (see sealedFindRow).
+	missSrc *sealedPostings
+	missBlk int
 }
 
 // spellEntry is one vocabulary row ordered by spelling.
@@ -87,11 +104,14 @@ type docMeta struct {
 // postings is one term's posting list. ids is sorted exactly when the
 // index's sorted flag holds; pos holds per-document positions with offsets
 // in off (off has len(ids)+1), so the term frequency of entry i is always
-// off[i+1]-off[i] with no separate frequency array.
+// off[i+1]-off[i] with no separate frequency array. A sealed list packs the
+// same rows bit-packed and delta-coded (see postings_sealed.go) with the
+// open arrays released; readers branch on sealed, mutators unseal first.
 type postings struct {
 	ids []DocID
 	off []uint32
 	pos []uint32
+	sealed *sealedPostings
 }
 
 // NewIndex returns an empty Index.
@@ -161,6 +181,9 @@ func (ix *Index) appendLocked(id DocID, hash uint64, pos uint32, terms []uint64)
 		p = &postings{off: []uint32{0}}
 		ix.post[hash] = p
 	}
+	// Mutating a sealed list decodes it in place first; Seal is a
+	// build-final optimization, not a lock.
+	p.openSealed()
 	if n := len(p.ids); n > 0 && p.ids[n-1] == id {
 		p.pos = append(p.pos, pos)
 		p.off[n] = uint32(len(p.pos))
@@ -185,11 +208,18 @@ func (ix *Index) Remove(id DocID) bool {
 }
 
 func (ix *Index) removeLocked(id DocID, old docMeta) {
+	// Removal binary-searches posting lists, so an index that never
+	// matched (never sorted) must sort first: out-of-order Adds leave
+	// lists unsorted, and searching those misses live rows, ghosting
+	// replaced documents. The sort is amortized — the next Match would
+	// pay it anyway.
+	ix.ensureSorted()
 	for _, hash := range old.terms {
 		p := ix.post[hash]
 		if p == nil {
 			continue
 		}
+		p.openSealed()
 		n := len(p.ids)
 		lo, hi := 0, n
 		for lo < hi {
@@ -228,12 +258,43 @@ func (ix *Index) ensureSorted() {
 		return
 	}
 	for _, p := range ix.post {
-		if len(p.ids) < 2 {
+		// Sealed lists are sorted by construction; mutators unseal.
+		if p.sealed != nil || len(p.ids) < 2 {
 			continue
 		}
 		sortPostings(p)
 	}
 	ix.sorted = true
+}
+
+// Seal compresses every posting list bit-packed and delta-coded (see
+// postings_sealed.go) and releases the open arrays. Seal is terminal for a
+// build-final index: later Adds transparently unseal the lists they touch.
+// A list whose id gap escapes 32 bits stays open. Durable generation builds
+// seal after their single scan; heap callers seal explicitly.
+func (ix *Index) Seal() {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	ix.ensureSorted()
+	for _, p := range ix.post {
+		if p.sealed != nil {
+			continue
+		}
+		// Adopt the packed form only when it shrinks: the block
+		// directory costs ~52 bytes, so rare-term lists stay open.
+		// Compression never regresses space, by construction.
+		if s := sealPostings(p); s != nil && s.sealedBytes() < openBytesOf(p) {
+			p.sealed = s
+			p.ids, p.off, p.pos = nil, nil, nil
+		}
+	}
+	ix.sorted = true
+}
+
+// openBytesOf tallies one open list: 8 bytes per id, 4 per offset
+// boundary, 4 per position.
+func openBytesOf(p *postings) uint64 {
+	return 8*uint64(len(p.ids)) + 4*uint64(len(p.off)) + 4*uint64(len(p.pos))
 }
 
 // sortPostings orders one posting list by document. Adds usually arrive in

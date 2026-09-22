@@ -504,27 +504,52 @@ func singleColumnTinIndex(path string, indexes []store.IndexInfo) bool {
 func matchCandidateMasks(
 	p *compiledPredicate, w *Workspace,
 ) ([]store.Mask, bool, bool, error) {
-	if p.slot < 0 || p.slot >= len(w.matchQueries) || p.slot >= len(w.matchIndexes) {
+	if p.slot < 0 || p.slot >= len(w.matchQueries) {
 		return nil, false, false, nil
 	}
-	ix := w.matchIndexes[p.slot]
-	if ix == nil {
-		return nil, false, false, nil
+	if p.slot < len(w.matchIndexes) && w.matchIndexes[p.slot] != nil {
+		ix := w.matchIndexes[p.slot]
+		ids := ix.Match(w.matchQueries[p.slot], w.matchDocIDs[:0])
+		w.matchDocIDs = ids
+		if len(ids) == 0 {
+			return nil, true, false, nil
+		}
+		out := w.nextStoreMasks()
+		out = appendMatchMasks(out, ids)
+		if out == nil {
+			// A slot width beyond the 64-bit mask universe cannot be pruned
+			// exactly: decline rather than drop a document.
+			return nil, false, false, nil
+		}
+		w.keepStoreMasks(out)
+		return out, true, false, nil
 	}
-	ids := ix.Match(w.matchQueries[p.slot], w.matchDocIDs[:0])
-	w.matchDocIDs = ids
-	if len(ids) == 0 {
-		return nil, true, false, nil
+	// Durable twin: the generation-pinned build maps the same Match
+	// ordinals to stable-slot masks through its live table. Every decline
+	// below — no build, no router, skew, dense hits, dropped buckets —
+	// falls back to the exact full scan plus the per-row recheck.
+	if p.slot < len(w.matchTinBuilds) && w.matchTinBuilds[p.slot] != nil {
+		build := w.matchTinBuilds[p.slot]
+		if build.Index() == nil {
+			return nil, false, false, nil
+		}
+		ids := build.Index().Match(w.matchQueries[p.slot], w.matchDocIDs[:0])
+		w.matchDocIDs = ids
+		if len(ids) == 0 {
+			return nil, true, false, nil
+		}
+		out := w.nextStoreMasks()
+		var ok bool
+		out, w.matchTinHits, ok = build.AppendCandidateMasks(
+			w.matchTinRouter, ids, out, w.matchTinHits[:0],
+		)
+		if !ok {
+			return nil, false, false, nil
+		}
+		w.keepStoreMasks(out)
+		return out, true, false, nil
 	}
-	out := w.nextStoreMasks()
-	out = appendMatchMasks(out, ids)
-	if out == nil {
-		// A slot width beyond the 64-bit mask universe cannot be pruned
-		// exactly: decline rather than drop a document.
-		return nil, false, false, nil
-	}
-	w.keepStoreMasks(out)
-	return out, true, false, nil
+	return nil, false, false, nil
 }
 
 // appendMatchMasks folds ascending match DocIDs into ascending chunk masks.

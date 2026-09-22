@@ -350,8 +350,12 @@ func TestSQLPathComparisonColdScalarLayoutGate(t *testing.T) {
 	switch unsafe.Sizeof(uintptr(0)) {
 	case 8:
 		// Conditional expressions add one cold program slice (24 bytes).
-		if got := unsafe.Sizeof(statementScalar{}); got != 848 {
-			t.Fatalf("unsafe.Sizeof(statementScalar{}) = %d, want 848", got)
+		// 848 before SCORE(): the program gains the ==> slot plus the
+		// borrowed query/statistics pointers and the serial transient
+		// scratch (8 + 8 + 8 + 192 bytes), all cold per-statement storage
+		// that warms across executions instead of allocating per row.
+		if got := unsafe.Sizeof(statementScalar{}); got != 1064 {
+			t.Fatalf("unsafe.Sizeof(statementScalar{}) = %d, want 1064", got)
 		}
 		if got := unsafe.Sizeof(statementScalarPredicate{}); got != 72 {
 			t.Fatalf("unsafe.Sizeof(statementScalarPredicate{}) = %d, want unchanged 72", got)

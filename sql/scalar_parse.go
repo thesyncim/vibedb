@@ -591,6 +591,21 @@ func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) 
 		return node, nil
 	}
 
+	if node, head, state, err := p.tryScore(ctx); err != nil || state != scoreNothing {
+		if err != nil {
+			return nil, err
+		}
+		if state == scoreCall {
+			return node, nil
+		}
+		path, err := p.continuePath(head, false)
+		if err != nil {
+			return nil, p.normalizeUpdateScalarPrimaryError(ctx, pos, err)
+		}
+		node := p.newScalar(ScalarPath, path.Pos)
+		node.Path = path
+		return node, nil
+	}
 	switch agg, head, state := p.tryAggregate(); state {
 	case aggCall:
 		if ctx == scalarWhere || ctx == scalarJoin || ctx == scalarUpdate {

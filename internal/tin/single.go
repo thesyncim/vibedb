@@ -38,6 +38,16 @@ type TextScratch struct {
 	slots []uint32
 	lists [][]uint32
 	arena []spanHit
+	// comb stages one combinator's output (Then/Near/relations). Kid
+	// spans live in arena tails and out may alias those tails, so a
+	// combinator must not write results directly into out while it is
+	// still reading its inputs: the writes would clobber not-yet-read
+	// spans. Staging into comb (disjoint from the arena) and then
+	// appending to out is correct under any aliasing — append/copy is
+	// memmove — and stays zero-alloc: comb capacity converges on the
+	// largest combinator result. Each combinator fully consumes its
+	// staging before returning, so nested combinators safely reuse it.
+	comb []spanHit
 }
 
 // MatchSingle reports whether text matches q. q must be parsed (expansions
@@ -48,21 +58,7 @@ func MatchSingle(text string, q Query, scratch *TextScratch) bool {
 	// every call, while the slice-threading scanner allocates only on
 	// growth, so warm scratch makes this call free.
 	pairs := scanPairs(text, scratch.pairs[:0])
-	slices.SortFunc(pairs, func(a, b tokPos) int {
-		if a.hash != b.hash {
-			if a.hash < b.hash {
-				return -1
-			}
-			return 1
-		}
-		if a.pos < b.pos {
-			return -1
-		}
-		if a.pos > b.pos {
-			return 1
-		}
-		return 0
-	})
+	sortTokPos(pairs)
 	scratch.pairs = pairs
 	length := uint32(0)
 	for _, tp := range pairs {
@@ -88,11 +84,21 @@ func (v docView) evalTemp(q Query) []spanHit {
 	s := v.scratch
 	start := len(s.arena)
 	tmp := v.evalInto(q, s.arena[start:start])
-	if len(tmp) > cap(s.arena)-start {
-		s.arena = append(s.arena[:start], tmp...)
+	if len(tmp) == 0 {
+		return s.arena[start:start]
+	}
+	// Anchor only when tmp really is the current arena tail at start.
+	// A capacity heuristic is not enough: inner evals may reallocate
+	// the arena mid-call, so the tail slice captured above can have
+	// zero capacity while the arena now reports spare room; the final
+	// append then forks to a foreign array and anchoring would adopt
+	// the stale region instead of tmp's contents. Pointer-compare and
+	// copy a forked tail back, converging the arena on one array.
+	if start < len(s.arena) && &tmp[0] == &s.arena[start] && len(tmp) <= cap(s.arena)-start {
+		s.arena = s.arena[:start+len(tmp)]
 		return s.arena[start:]
 	}
-	s.arena = s.arena[:start+len(tmp)]
+	s.arena = append(s.arena[:start], tmp...)
 	return s.arena[start:]
 }
 
@@ -227,14 +233,20 @@ func (v docView) evalInto(q Query, out []spanHit) []spanHit {
 		if len(q.Kids) != 2 {
 			return out
 		}
-		return pairSpans(v.evalTemp(q.Kids[0]), v.evalTemp(q.Kids[1]), q.Dist, out)
+		staged := pairSpans(v.evalTemp(q.Kids[0]), v.evalTemp(q.Kids[1]), q.Dist, v.scratch.comb[:0])
+		v.scratch.comb = staged
+		return append(out, staged...)
 	case OpNear:
 		if len(q.Kids) != 2 {
 			return out
 		}
 		left, right := v.evalTemp(q.Kids[0]), v.evalTemp(q.Kids[1])
-		out = pairSpans(left, right, q.Dist, out)
-		return pairSpans(right, left, q.Dist, out)
+		staged := pairSpans(left, right, q.Dist, v.scratch.comb[:0])
+		v.scratch.comb = staged
+		out = append(out, staged...)
+		staged = pairSpans(right, left, q.Dist, v.scratch.comb[:0])
+		v.scratch.comb = staged
+		return append(out, staged...)
 	case OpWithin:
 		if len(q.Kids) != 1 {
 			return out
@@ -249,7 +261,9 @@ func (v docView) evalInto(q Query, out []spanHit) []spanHit {
 		if len(q.Kids) != 2 {
 			return out
 		}
-		return relateSingle(q.Op, q.Neg, v.evalTemp(q.Kids[0]), v.evalTemp(q.Kids[1]), out)
+		staged := relateSingle(q.Op, q.Neg, v.evalTemp(q.Kids[0]), v.evalTemp(q.Kids[1]), v.scratch.comb[:0])
+		v.scratch.comb = staged
+		return append(out, staged...)
 	case OpFilter:
 		if len(q.Kids) != 1 {
 			return out

@@ -967,6 +967,44 @@ func (p *Parser) tryAggregate() (AggKind, token, aggState) {
 	return AggNone, head, aggHeadOnly
 }
 
+const (
+	scoreNothing  scoreState = iota // not a SCORE token; caller falls through
+	scoreHeadOnly                    // SCORE without '(' is a path head, like count
+	scoreCall                        // SCORE() full-text relevance call
+)
+
+type scoreState uint8
+
+// tryScore decides whether the current token opens a SCORE() call, mirroring
+// tryAggregate's lookahead: SCORE is a relevance function only when a '('
+// follows it, so a document field named "score" still projects. The call
+// itself takes no arguments; anything inside the parentheses is a positioned
+// error, not a silent ignore.
+func (p *Parser) tryScore(ctx scalarExprContext) (*ScalarExpr, token, scoreState, error) {
+	if p.tok.kind != tokIdent || p.tok.kw != kwScore {
+		return nil, token{}, scoreNothing, nil
+	}
+	head := p.tok
+	p.advance()
+	if p.tok.kind != tokLParen {
+		return nil, head, scoreHeadOnly, nil
+	}
+	if ctx == scalarJoin || ctx == scalarUpdate {
+		return nil, head, scoreCall, newFeatureNotSupportedError(
+			p.lx.src, head.pos,
+			"SCORE() is not allowed in "+ctx.clause()+" because it scores the driving row's ==> match",
+		)
+	}
+	p.advance()
+	if p.tok.kind != tokRParen {
+		return nil, head, scoreCall, p.errfHere(
+			"SCORE() takes no arguments; score one ==> query per statement and order by its relevance",
+		)
+	}
+	p.advance()
+	return p.newScalar(ScalarScore, head.pos), head, scoreCall, nil
+}
+
 func (p *Parser) parseResultColumn() (ResultColumn, error) {
 	col := ResultColumn{Pos: p.tok.pos}
 	standaloneStar := false
@@ -1013,33 +1051,51 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 		}
 	} else {
 		standaloneStar = p.tok.kind == tokStar
-		switch agg, head, state := p.tryAggregate(); state {
-		case aggCall:
-			path, err := p.parseAggregateArgs(agg)
-			if err != nil {
-				return col, err
-			}
-			if p.atKeyword(kwOver) {
-				window, err := p.parseWindowOver(windowAggregateKind(agg), path, col.Pos)
-				if err != nil {
-					return col, err
-				}
-				col.Window = window
-			} else {
-				col.Agg, col.Path = agg, path
-			}
-		case aggHeadOnly:
-			path, err := p.continuePath(head, true)
+		// SCORE() is a scalar call, not an aggregate: a bare score stays a
+		// path head (fields can be named score) while score() parses into
+		// the scalar program. tryScore consumes the head either way.
+		scoreNode, scoreHead, scoreState, scoreErr := p.tryScore(scalarSelect)
+		if scoreErr != nil {
+			return col, scoreErr
+		}
+		switch scoreState {
+		case scoreCall:
+			col.Scalar = scoreNode
+		case scoreHeadOnly:
+			path, err := p.continuePath(scoreHead, true)
 			if err != nil {
 				return col, err
 			}
 			col.Path = path
 		default:
-			path, err := p.parseSelectPath()
-			if err != nil {
-				return col, err
+			switch agg, head, state := p.tryAggregate(); state {
+			case aggCall:
+				path, err := p.parseAggregateArgs(agg)
+				if err != nil {
+					return col, err
+				}
+				if p.atKeyword(kwOver) {
+					window, err := p.parseWindowOver(windowAggregateKind(agg), path, col.Pos)
+					if err != nil {
+						return col, err
+					}
+					col.Window = window
+				} else {
+					col.Agg, col.Path = agg, path
+				}
+			case aggHeadOnly:
+				path, err := p.continuePath(head, true)
+				if err != nil {
+					return col, err
+				}
+				col.Path = path
+			default:
+				path, err := p.parseSelectPath()
+				if err != nil {
+					return col, err
+				}
+				col.Path = path
 			}
-			col.Path = path
 		}
 	}
 	if scalarContinues(p.tok) {
@@ -1049,7 +1105,12 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 				"arithmetic over a window result is not supported by the scalar execution slice yet",
 			)
 		}
-		left := p.scalarFromColumn(col)
+		// A SCORE() call arrives with its scalar node already built;
+		// every other column derives its scalar from the path/aggregate.
+		left := col.Scalar
+		if left == nil {
+			left = p.scalarFromColumn(col)
+		}
 		expr, err := p.continueScalarExpression(left, scalarSelect)
 		if err != nil {
 			return col, err
@@ -1066,6 +1127,11 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 		if last.path == col.Path && last.document {
 			col.Alias = DocumentColumn
 		}
+	}
+	if col.Alias == "" {
+		// SCORE() names its output after the function; every other
+		// scalar column reaching this branch has no Scalar to name.
+		col.Alias = typedConstantOutputName(col.Scalar)
 	}
 	return col, nil
 }
@@ -1137,6 +1203,11 @@ func (p *Parser) parseTypedHeadResultColumn(col ResultColumn) (ResultColumn, err
 // replaces the weaker inner type name; any arithmetic or concatenation root
 // deliberately falls back to ?column?.
 func typedConstantOutputName(expr *ScalarExpr) string {
+	// SCORE() names its output like PostgreSQL names a function call: the
+	// function name, so SELECT SCORE() needs no alias to be addressable.
+	if expr != nil && expr.Kind == ScalarScore {
+		return "score"
+	}
 	if expr != nil && expr.Kind == ScalarBinary && expr.Op.Conditional() {
 		switch expr.Op {
 		case ScalarCoalesce:
@@ -2757,7 +2828,7 @@ func (p *Parser) parseOrderTerm(
 		}
 	} else {
 		_, conditional := conditionalScalarOp(p.tok)
-		if conditional || p.tok.kind == tokPlus || p.tok.kind == tokMinus || p.tok.kind == tokLParen || p.tok.kind == tokParam || p.tok.kind == tokString || p.atKeyword(kwCase) || p.atKeyword(kwCast) {
+		if conditional || p.tok.kind == tokPlus || p.tok.kind == tokMinus || p.tok.kind == tokLParen || p.tok.kind == tokParam || p.tok.kind == tokString || p.atKeyword(kwCase) || p.atKeyword(kwCast) || p.atKeyword(kwScore) {
 			var err error
 			expression, err = p.parseScalarExpression(scalarOrder)
 			if err != nil {
@@ -3111,7 +3182,7 @@ loop:
 	// wrong — into a message naming the five reductions that do exist.
 	if p.tok.kind == tokLParen {
 		return nil, p.errfHere(
-			"%q is not a supported function: the engine computes COUNT, SUM, AVG, MIN, and MAX, and no scalar functions",
+			"%q is not a supported function: the engine computes COUNT, SUM, AVG, MIN, and MAX, and SCORE() over a ==> full-text query",
 			head.text)
 	}
 	p.segScratch = segs
