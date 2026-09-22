@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // TINQL surface syntax. ParseTINQL compiles the query language documented by
@@ -864,15 +866,7 @@ func (p *tinParser) parseBareTerm(w string) (Query, error) {
 	}
 	p.pos = save
 	if sawWild {
-		folded := foldPattern(unescaped)
-		hashes, err := p.ix.expandWildcard(folded)
-		if err != nil {
-			return Query{}, err
-		}
-		if !p.eof() && p.s[p.pos] == '~' {
-			return Query{}, p.errorf("fuzzy ~ needs an exact term, not a wildcard")
-		}
-		return orOf(hashes), nil
+		return p.finishWildcard(unescaped)
 	}
 	hashes := foldTokens(unescaped)
 	switch len(hashes) {
@@ -885,6 +879,14 @@ func (p *tinParser) parseBareTerm(w string) (Query, error) {
 		}
 		return Query{Op: OpTerm, Term: term}, nil
 	default:
+		// A trailing ~ fuzzes the last piece of a hyphenated (or
+		// otherwise multi-token) word: `e-mail~1` phrases exact `e`
+		// with the neighborhood of `mail`.
+		if !p.eof() && p.s[p.pos] == '~' {
+			if q, ok, err := p.splitFuzzy(hashes, unescaped); err != nil || ok {
+				return q, err
+			}
+		}
 		// A hyphenated (or otherwise multi-token) word searches as an
 		// implicit adjacent phrase: `wi-fi` is `"wi fi"`.
 		slots := make([]PhrasePos, len(hashes))
@@ -895,29 +897,207 @@ func (p *tinParser) parseBareTerm(w string) (Query, error) {
 	}
 }
 
-// parseFuzzy parses ~N and ~P:N after an exact term hash.
-func (p *tinParser) parseFuzzy(term uint64) (Query, error) {
-	p.pos++ // ~
-	p.skipWS()
-	n, err := p.scanDigits("edit distance")
+// patternPiece is one tokenizer-boundary run of an unescaped wildcard or
+// fuzzy word: `e-mail*` splits into exact `e` and glob `mail*`.
+type patternPiece struct {
+	text string
+	wild bool // holds an unescaped * or ?
+}
+
+// splitPattern cuts an unescaped word at tokenizer boundaries for the
+// boundary-spanning rewrite. `*` and `?` never split (they are glob
+// operators, not text); a backslash always separates, matching FoldTerm,
+// which treats every surviving backslash as a boundary. Byte
+// classification reuses scanTab and the feed rune rule, so pieces agree
+// with the tokenizer by construction.
+func splitPattern(unescaped string) []patternPiece {
+	var out []patternPiece
+	for i := 0; i < len(unescaped); {
+		c := unescaped[i]
+		if c == '\\' {
+			i++
+			continue
+		}
+		if c < utf8.RuneSelf {
+			if scanTab[c] == 0 {
+				i++
+				continue
+			}
+		} else if word, size := patternWordRune(unescaped[i:]); !word {
+			i += size
+			continue
+		}
+		start := i
+		wild := false
+		for i < len(unescaped) {
+			c := unescaped[i]
+			if c == '*' || c == '?' {
+				wild = true
+				i++
+				continue
+			}
+			if c == '\\' {
+				break
+			}
+			if c < utf8.RuneSelf {
+				if scanTab[c] == 0 {
+					break
+				}
+				i++
+				continue
+			}
+			word, size := patternWordRune(unescaped[i:])
+			if !word {
+				break
+			}
+			i += size
+		}
+		out = append(out, patternPiece{text: unescaped[start:i], wild: wild})
+	}
+	return out
+}
+
+// patternWordRune mirrors the tokenizer feed rune rule: Latin-1 fold bytes
+// and Unicode letters/digits continue a piece, anything else separates.
+func patternWordRune(s string) (bool, int) {
+	r, size := utf8.DecodeRuneInString(s)
+	if r < utf8.RuneSelf {
+		return scanTab[byte(r)] != 0, size
+	}
+	if r < 256 {
+		return latinFold[byte(r)] != 0, size
+	}
+	if r == utf8.RuneError && size <= 1 {
+		return false, size
+	}
+	l := unicode.ToLower(r)
+	return unicode.IsLetter(l) || unicode.IsDigit(l), size
+}
+
+// finishWildcard expands a bare-term wildcard word. A pattern spanning
+// tokenizer boundaries (`e-mail*`) rewrites to an adjacent phrase of exact
+// and glob slots per PlanetScale's rule; anything else expands to
+// whole-pattern alternatives as before.
+func (p *tinParser) finishWildcard(unescaped string) (Query, error) {
+	if pieces := splitPattern(unescaped); len(pieces) > 1 {
+		slots := make([]PhrasePos, len(pieces))
+		for i, pc := range pieces {
+			var alts []uint64
+			if pc.wild {
+				var err error
+				alts, err = p.ix.expandWildcard(foldPattern(pc.text))
+				if err != nil {
+					return Query{}, err
+				}
+			} else {
+				h, n := FoldTerm(pc.text)
+				if n != 1 {
+					// Unreachable: exact pieces hold no glob chars
+					// and split at every tokenizer boundary.
+					// Keep the whole-pattern expansion instead of
+					// guessing a partial phrase.
+					return p.wholeWildcard(unescaped)
+				}
+				alts = []uint64{h}
+			}
+			if len(alts) == 0 {
+				return Query{Op: OpOr}, nil
+			}
+			slots[i] = PhrasePos{Alts: alts}
+		}
+		if !p.eof() && p.s[p.pos] == '~' {
+			return Query{}, p.errorf("fuzzy ~ needs an exact term, not a wildcard")
+		}
+		return Query{Op: OpPhrase, Phrase: slots}, nil
+	}
+	return p.wholeWildcard(unescaped)
+}
+
+// wholeWildcard expands one boundary-free pattern to alternatives.
+func (p *tinParser) wholeWildcard(unescaped string) (Query, error) {
+	hashes, err := p.ix.expandWildcard(foldPattern(unescaped))
 	if err != nil {
 		return Query{}, err
 	}
-	prefix := 1
+	if !p.eof() && p.s[p.pos] == '~' {
+		return Query{}, p.errorf("fuzzy ~ needs an exact term, not a wildcard")
+	}
+	return orOf(hashes), nil
+}
+
+// splitFuzzy phrases the exact leading pieces of a multi-token word with
+// the fuzzy neighborhood of its last piece. It reports ok=false when the
+// pieces do not line up one token each, leaving the caller on the implicit
+// phrase path (and its trailing-~ error).
+func (p *tinParser) splitFuzzy(hashes []uint64, unescaped string) (Query, bool, error) {
+	pieces := splitPattern(unescaped)
+	if len(pieces) != len(hashes) {
+		return Query{}, false, nil
+	}
+	for _, pc := range pieces {
+		if pc.wild {
+			return Query{}, false, nil
+		}
+		if _, n := FoldTerm(pc.text); n != 1 {
+			return Query{}, false, nil
+		}
+	}
+	alts, err := p.scanFuzzyHashes(hashes[len(hashes)-1])
+	if err != nil {
+		return Query{}, true, err
+	}
+	slots := make([]PhrasePos, len(hashes))
+	for i, h := range hashes[:len(hashes)-1] {
+		slots[i] = PhrasePos{Alts: []uint64{h}}
+	}
+	slots[len(slots)-1] = PhrasePos{Alts: alts}
+	return Query{Op: OpPhrase, Phrase: slots}, true, nil
+}
+
+// parseFuzzy parses ~N and ~P:N after an exact term hash.
+func (p *tinParser) parseFuzzy(term uint64) (Query, error) {
+	alts, err := p.scanFuzzyHashes(term)
+	if err != nil {
+		return Query{}, err
+	}
+	return orOf(alts), nil
+}
+
+// scanFuzzyHashes consumes ~N or ~P:N and returns the neighborhood hashes
+// of the dictionary spelling of term. A spelling the dictionary does not
+// know has no neighborhood and matches nothing.
+func (p *tinParser) scanFuzzyHashes(term uint64) ([]uint64, error) {
+	prefix, n, err := p.scanFuzzyParams()
+	if err != nil {
+		return nil, err
+	}
+	// The dictionary spelling of the exact term anchors the neighborhood.
+	spell, ok := p.ix.dict[term]
+	if !ok {
+		return nil, nil
+	}
+	return p.ix.expandFuzzy(spell, prefix, n), nil
+}
+
+// scanFuzzyParams consumes ~N or ~P:N, returning the prefix length and the
+// edit distance.
+func (p *tinParser) scanFuzzyParams() (prefix, n int, err error) {
+	p.pos++ // ~
+	p.skipWS()
+	n, err = p.scanDigits("edit distance")
+	if err != nil {
+		return 0, 0, err
+	}
+	prefix = 1
 	if !p.eof() && p.s[p.pos] == ':' {
 		p.pos++
 		prefix = n
 		n, err = p.scanDigits("edit distance")
 		if err != nil {
-			return Query{}, err
+			return 0, 0, err
 		}
 	}
-	// The dictionary spelling of the exact term anchors the neighborhood.
-	spell, ok := p.ix.dict[term]
-	if !ok {
-		return Query{Op: OpOr}, nil
-	}
-	return orOf(p.ix.expandFuzzy(spell, prefix, n)), nil
+	return prefix, n, nil
 }
 
 // parseRangeBound parses a range bound word or `*` (open).
@@ -1061,14 +1241,32 @@ func (p *tinParser) parseContains() (Query, error) {
 	if err != nil {
 		return Query{}, err
 	}
+	// CONTAINS takes the same word shapes as a bare term — wildcards and
+	// fuzzy included — but never creates a phrase: a wildcard expands to
+	// whole-pattern alternatives and a multi-token word stays a single
+	// term, which has no spelling in the token dictionary and matches
+	// nothing.
 	if sawWild {
-		return Query{}, p.errorf("CONTAINS needs a plain term")
+		return p.wholeWildcard(unescaped)
 	}
 	hashes := foldTokens(unescaped)
-	if len(hashes) != 1 {
+	switch len(hashes) {
+	case 0:
 		return Query{}, p.errorf("CONTAINS needs exactly one term")
+	case 1:
+		term := hashes[0]
+		if !p.eof() && p.s[p.pos] == '~' {
+			return p.parseFuzzy(term)
+		}
+		return Query{Op: OpTerm, Term: term}, nil
+	default:
+		if !p.eof() && p.s[p.pos] == '~' {
+			if _, _, err := p.scanFuzzyParams(); err != nil {
+				return Query{}, err
+			}
+		}
+		return Query{Op: OpOr}, nil
 	}
-	return Query{Op: OpTerm, Term: hashes[0]}, nil
 }
 
 // parseAtLeast parses AT LEAST N[%] OF [...].

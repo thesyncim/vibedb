@@ -201,7 +201,9 @@ func TestTINQLErrors(t *testing.T) {
 	ix.Add(1, "wi fi apple")
 	for _, input := range []string{
 		`""`, `[]`, `["a"`, `"abc`, `(apple`, `apple)`, `* TO`,
-		`apple~`, `apple~x`, `apple^`, `apple^10001`, `wi-fi~2`,
+		`apple~`, `apple~x`, `apple^`, `apple^10001`,
+		// `wi-fi~2` was here: split fuzzy now phrases exact `wi` with
+		// the neighborhood of `fi` (TestParitySplitFuzzy).
 		`apple NOT peel`, `NOT apple`, `THEN/2 apple`, `apple THEN apple`,
 		`apple THEN/ apple`, `apple IN NOWHERE 5`, `apple IN WORDS 1`,
 		`AT MOST 2 OF [a b]`, `ALL [a b]`, `MATCHES`, `a,b`,

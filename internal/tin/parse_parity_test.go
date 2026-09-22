@@ -178,3 +178,56 @@ func TestParityFirstLastEdges(t *testing.T) {
 	parityMatchWant(t, ix, `w0 IN FIRST 100 WORDS`, []DocID{1})
 	parityMatchWant(t, ix, `w5 IN LAST 100 WORDS`, []DocID{1})
 }
+
+// PlanetScale parity: a wildcard pattern spanning tokenizer boundaries
+// rewrites to an adjacent phrase of exact and glob slots: `e-mail*` is
+// `"e [MATCHES mail.*]"`. A pattern without boundaries stays whole-pattern
+// alternatives, so `ma*il` never becomes a phrase of `ma` and `il`.
+func TestParitySplitWildcard(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "reach me at e-mail lists")
+	ix.Add(2, "email lists here")
+	ix.Add(3, "e-mailx marks the spot")
+	ix.Add(4, "e xyz mail lists")
+	parityMatchWant(t, ix, `e-mail*`, []DocID{1, 3})
+	parityMatchWant(t, ix, `e\,mail*`, []DocID{1, 3})
+	parityMatchWant(t, ix, `mail*`, []DocID{1, 3, 4})
+	parityMatchWant(t, ix, `ma*il`, []DocID{1, 4})
+}
+
+// PlanetScale parity: fuzzy splits a hyphenated word first, so `e-mail~1`
+// phrases exact `e` with the edit neighborhood of `mail`.
+func TestParitySplitFuzzy(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "send e-mail now")
+	ix.Add(2, "send e-maul now")
+	ix.Add(3, "send e-xyz now")
+	ix.Add(4, "send email now")
+	parityMatchWant(t, ix, `e-mail`, []DocID{1})
+	parityMatchWant(t, ix, `e-mail~1`, []DocID{1, 2})
+	if _, err := ix.ParseTINQL(`e-mail~`); err == nil {
+		t.Fatalf("e-mail~ parsed without an edit distance, want error")
+	}
+}
+
+// PlanetScale parity: CONTAINS takes wildcards and fuzzy but never creates
+// a phrase — a multi-token word stays a single term with only the spelling
+// match, which the token dictionary cannot hold.
+func TestParityContainsShapes(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "wi-fi network")
+	ix.Add(2, "mail server")
+	ix.Add(3, "email server")
+	ix.Add(4, "wimax network")
+	parityMatchWant(t, ix, `wi-fi`, []DocID{1})
+	parityMatchWant(t, ix, `CONTAINS wi-fi`, nil)
+	parityMatchWant(t, ix, `CONTAINS mail`, []DocID{2})
+	parityMatchWant(t, ix, `CONTAINS mail*`, []DocID{2})
+	parityMatchWant(t, ix, `CONTAINS ma?l`, []DocID{2})
+	parityMatchWant(t, ix, `CONTAINS e-mail*`, nil)
+	parityMatchWant(t, ix, `CONTAINS mail~1`, []DocID{2})
+	parityMatchWant(t, ix, `CONTAINS wi-fi~1`, nil)
+	if _, err := ix.ParseTINQL(`CONTAINS ...`); err == nil {
+		t.Fatalf("CONTAINS ... parsed without a term, want error")
+	}
+}
