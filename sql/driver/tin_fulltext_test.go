@@ -109,6 +109,9 @@ func TestTinFullTextEndToEnd(t *testing.T) {
 	if _, err := db.Exec(`CREATE INDEX fts_body_tin ON fts(body) USING tin`); err == nil {
 		t.Fatal("duplicate CREATE INDEX USING tin = nil, want ErrIndexExists")
 	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS fts_body_tin ON fts(body) USING tin`); err != nil {
+		t.Fatalf("IF NOT EXISTS over duplicate = %v, want success", err)
+	}
 	// ==> over a path with no tin index is a statement error naming it.
 	if _, err := db.Query(
 		`SELECT id FROM fts WHERE missing ==> 'luxury'`,
