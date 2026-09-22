@@ -74,6 +74,13 @@ func ScoreSingle(text string, q Query, st *ScoreStats, scratch *TextScratch) flo
 		return 0
 	}
 	pairs := scanPairs(text, scratch.pairs[:0])
+	if !needsPositions(q) {
+		view := docView{pairs: pairs, length: uint32(len(pairs)), scratch: scratch}
+		cur := scoreCursor{st: st}
+		score, _ := view.scoreSingleUnsorted(q, &cur)
+		scratch.pairs = pairs[:0]
+		return score
+	}
 	sortTokPos(pairs)
 	view := docView{pairs: pairs, length: uint32(len(pairs)), scratch: scratch}
 	scratch.arena = scratch.arena[:0]
@@ -81,6 +88,114 @@ func ScoreSingle(text string, q Query, st *ScoreStats, scratch *TextScratch) flo
 	score, _ := view.scoreSingleInto(q, &cur)
 	scratch.pairs = pairs[:0]
 	return score
+}
+
+// scoreSingleUnsorted mirrors scoreSingleInto over unsorted pairs for
+// queries that never observe positions: term frequencies are linear
+// counts, and the tree walk consumes pinned idfs in the same preorder,
+// so values are bit-identical to the sorted path. Positional operators
+// cannot reach here (needsPositions gates); the default arm still
+// consumes idfs exactly like RefreshScoreStats' walk, so the cursor
+// stays in sync even if the two ever disagree.
+func (v docView) scoreSingleUnsorted(q Query, cur *scoreCursor) (float64, bool) {
+	st := cur.st
+	dl := float64(len(v.pairs))
+	count := func(term uint64) float64 {
+		n := 0
+		for _, tp := range v.pairs {
+			if tp.hash == term {
+				n++
+			}
+		}
+		return float64(n)
+	}
+	switch q.Op {
+	case OpTerm:
+		idf := cur.nextIdf()
+		if st.nDocs == 0 {
+			return 0, false
+		}
+		tf := count(q.Term)
+		if tf == 0 {
+			return 0, false
+		}
+		return bm25One(idf, st.avg, q.boostOf(), tf, dl), true
+	case OpAnd:
+		if len(q.Kids) == 0 {
+			return 0, false
+		}
+		var sum float64
+		matched := true
+		for _, k := range q.Kids {
+			s, ok := v.scoreSingleUnsorted(k, cur)
+			if !ok {
+				matched = false
+				continue
+			}
+			sum += s
+		}
+		if !matched {
+			return 0, false
+		}
+		return sum * q.boostOf(), true
+	case OpOr:
+		var sum float64
+		matched := false
+		for _, k := range q.Kids {
+			s, ok := v.scoreSingleUnsorted(k, cur)
+			if ok {
+				matched = true
+				sum += s
+			}
+		}
+		if !matched {
+			return 0, false
+		}
+		return sum * q.boostOf(), true
+	case OpAndNot:
+		if len(q.Kids) == 0 {
+			return 0, false
+		}
+		s, ok := v.scoreSingleUnsorted(q.Kids[0], cur)
+		if !ok {
+			return 0, false
+		}
+		for _, k := range q.Kids[1:] {
+			_, banned := v.scoreSingleUnsorted(k, cur)
+			if banned {
+				return 0, false
+			}
+		}
+		return s * q.boostOf(), true
+	case OpAll:
+		return q.boostOf(), true
+	case OpAtLeast:
+		var sum float64
+		matched := 0
+		for _, k := range q.Kids {
+			s, ok := v.scoreSingleUnsorted(k, cur)
+			if ok {
+				matched++
+				sum += s
+			}
+		}
+		if matched < q.Threshold {
+			return 0, false
+		}
+		return sum * q.boostOf(), true
+	default:
+		switch q.Op {
+		case OpTerm, OpPhrase,
+			OpThen, OpNear, OpWithin,
+			OpEncloses, OpEnclosedBy, OpOverlapping, OpBefore, OpAfter,
+			OpFilter:
+			cur.nextIdf()
+		}
+		for _, k := range q.Kids {
+			v.scoreSingleUnsorted(k, cur)
+		}
+		return 0, false
+	}
 }
 
 // scoreCursor walks the pinned idfs in preorder, mirroring

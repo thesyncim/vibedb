@@ -50,6 +50,85 @@ type TextScratch struct {
 	comb []spanHit
 }
 
+// needsPositions reports whether q can observe token positions or order.
+// Term/boolean structure only tests membership per term, so unsorted
+// pairs answer it with linear scans; phrases, proximity, relations, and
+// positional filters read positions and force the sorted path. Unknown
+// operators conservatively need positions.
+func needsPositions(q Query) bool {
+	switch q.Op {
+	case OpPhrase, OpThen, OpNear, OpWithin,
+		OpEncloses, OpEnclosedBy, OpOverlapping, OpBefore, OpAfter,
+		OpFilter:
+		return true
+	case OpTerm, OpAnd, OpOr, OpAndNot, OpAll, OpAtLeast:
+		for _, k := range q.Kids {
+			if needsPositions(k) {
+				return true
+			}
+		}
+		return false
+	default:
+		return true
+	}
+}
+
+// matchUnsorted answers boolean structure over unsorted pairs: no term
+// observes positions, so membership is a linear scan with early exit and
+// the combinators fold booleans instead of span lists. Emptiness matches
+// evalInto exactly (an AtLeast with nothing matched is empty even when
+// its threshold is zero).
+func matchUnsorted(pairs []tokPos, q Query) bool {
+	switch q.Op {
+	case OpTerm:
+		for _, tp := range pairs {
+			if tp.hash == q.Term {
+				return true
+			}
+		}
+		return false
+	case OpAll:
+		return true
+	case OpAnd:
+		if len(q.Kids) == 0 {
+			return false
+		}
+		for _, k := range q.Kids {
+			if !matchUnsorted(pairs, k) {
+				return false
+			}
+		}
+		return true
+	case OpOr:
+		for _, k := range q.Kids {
+			if matchUnsorted(pairs, k) {
+				return true
+			}
+		}
+		return false
+	case OpAndNot:
+		if len(q.Kids) == 0 || !matchUnsorted(pairs, q.Kids[0]) {
+			return false
+		}
+		for _, k := range q.Kids[1:] {
+			if matchUnsorted(pairs, k) {
+				return false
+			}
+		}
+		return true
+	case OpAtLeast:
+		matched := 0
+		for _, k := range q.Kids {
+			if matchUnsorted(pairs, k) {
+				matched++
+			}
+		}
+		return matched > 0 && matched >= q.Threshold
+	default:
+		return false
+	}
+}
+
 // MatchSingle reports whether text matches q. q must be parsed (expansions
 // resolved); expansion operators never appear because ParseTINQL desugars
 // them, and a zero OpOr (empty expansion) matches nothing.
@@ -58,6 +137,10 @@ func MatchSingle(text string, q Query, scratch *TextScratch) bool {
 	// every call, while the slice-threading scanner allocates only on
 	// growth, so warm scratch makes this call free.
 	pairs := scanPairs(text, scratch.pairs[:0])
+	if !needsPositions(q) {
+		scratch.pairs = pairs
+		return matchUnsorted(pairs, q)
+	}
 	sortTokPos(pairs)
 	scratch.pairs = pairs
 	length := uint32(0)

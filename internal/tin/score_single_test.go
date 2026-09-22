@@ -105,3 +105,111 @@ func TestScoreSingleZeroAlloc(t *testing.T) {
 		t.Fatalf("ScoreSingle allocated %v per run, want 0", n)
 	}
 }
+
+// TestScoreSingleUnsortedExact pins the sort-free path bit-identical to
+// the sorted one: same counts, same idf order, same formula, same
+// summation order — only the sort is gone.
+func TestScoreSingleUnsortedExact(t *testing.T) {
+	ix := NewIndex()
+	for id, text := range scoreCorpusDocs {
+		ix.Add(DocID(id+1), text)
+	}
+	inputs := []string{
+		`apple`, `fuji`, `apple AND fuji`, `apple OR dog`, `apple AND NOT pie`,
+		`[apple dog peach]`, `AT LEAST 2 OF [apple dog peach pie]`, `ALL OF [apple fuji]`,
+		`appl*`, `p?ach`, `apple~1`, `aardvark TO cat`, `MATCHES fuji`,
+		`CONTAINS banana`, `jalapeno`, `apple^2`, `*`,
+		`(apple OR dog) AND (fuji OR peach) AND NOT pie`,
+	}
+	var stats ScoreStats
+	for _, input := range inputs {
+		q, err := ix.ParseTINQL(input)
+		if err != nil {
+			t.Fatalf("ParseTINQL(%q): %v", input, err)
+		}
+		if needsPositions(q) {
+			t.Fatalf("%q needs positions, want sort-free", input)
+		}
+		ix.RefreshScoreStats(q, &stats)
+		for id, text := range scoreCorpusDocs {
+			var scratch TextScratch
+			pairs := scanPairs(text, scratch.pairs[:0])
+			sorted := append([]tokPos(nil), pairs...)
+			sortTokPos(sorted)
+			av := docView{pairs: sorted, length: uint32(len(sorted)), scratch: &scratch}
+			acur := scoreCursor{st: &stats}
+			want, wok := av.scoreSingleInto(q, &acur)
+			bv := docView{pairs: pairs, length: uint32(len(pairs)), scratch: &scratch}
+			bcur := scoreCursor{st: &stats}
+			got, gok := bv.scoreSingleUnsorted(q, &bcur)
+			if got != want || gok != wok {
+				t.Fatalf("%q doc %d: unsorted (%v,%v) != sorted (%v,%v)",
+					input, id+1, got, gok, want, wok)
+			}
+		}
+	}
+}
+
+// TestNeedsPositions classifies every operator: only phrases, proximity,
+// relations, and positional filters observe order.
+func TestNeedsPositions(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "apple fuji pie")
+	inputs := map[string]bool{
+		`apple`: false, `apple AND fuji`: false, `apple OR fuji`: false,
+		`apple AND NOT fuji`: false, `AT LEAST 1 OF [apple fuji]`: false,
+		`*`: false, `appl*`: false, `apple^2`: false,
+		`"apple fuji"`: true, `"apple fuji"~1`: true,
+		`apple THEN/0 fuji`: true, `apple NEAR/1 fuji`: true,
+		`(apple OR fuji) WITHIN 3`:              true,
+		`(apple NEAR/1 fuji) ENCLOSES apple`:    true,
+		`apple ENCLOSED BY (apple NEAR/1 fuji)`: true,
+		`apple NOT OVERLAPPING fuji`:            true,
+		`apple BEFORE fuji`:                     true, `apple AFTER fuji`: true,
+		`apple IN FIRST 1 WORDS`:           true,
+		`(apple AND fuji) OR "apple fuji"`: true,
+	}
+	for input, want := range inputs {
+		q, err := ix.ParseTINQL(input)
+		if err != nil {
+			t.Fatalf("ParseTINQL(%q): %v", input, err)
+		}
+		if got := needsPositions(q); got != want {
+			t.Fatalf("%q: needsPositions = %v, want %v", input, got, want)
+		}
+	}
+}
+
+var transientBenchDoc = "fuji apple juicy red pie apple apple banana " +
+	"lazy dog sleeps all day near the river bank security critical"
+
+// benchmarkTransient runs MatchSingle/ScoreSingle over one document so
+// the sort-free term lane pins against the sorted phrase lane.
+func benchmarkTransient(b *testing.B, input string, score bool) {
+	b.Helper()
+	ix := NewIndex()
+	ix.Add(1, transientBenchDoc)
+	q, err := ix.ParseTINQL(input)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var scratch TextScratch
+	var stats ScoreStats
+	ix.RefreshScoreStats(q, &stats)
+	b.ReportAllocs()
+	b.ResetTimer()
+	if score {
+		for i := 0; i < b.N; i++ {
+			_ = ScoreSingle(transientBenchDoc, q, &stats, &scratch)
+		}
+		return
+	}
+	for i := 0; i < b.N; i++ {
+		_ = MatchSingle(transientBenchDoc, q, &scratch)
+	}
+}
+
+func BenchmarkTransientMatchTerm(b *testing.B)   { benchmarkTransient(b, `apple AND banana`, false) }
+func BenchmarkTransientMatchPhrase(b *testing.B) { benchmarkTransient(b, `"apple banana"`, false) }
+func BenchmarkTransientScoreTerm(b *testing.B)   { benchmarkTransient(b, `apple AND banana`, true) }
+func BenchmarkTransientScorePhrase(b *testing.B) { benchmarkTransient(b, `"apple banana"`, true) }
