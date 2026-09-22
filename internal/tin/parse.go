@@ -1321,9 +1321,14 @@ func (p *tinParser) parseAtLeast() (Query, error) {
 	if err != nil {
 		return Query{}, err
 	}
+	// Percentages resolve with 64-bit math, then saturate: any threshold
+	// past the list length matches nothing, so capping there keeps the
+	// outcome while ruling out overflow entirely.
 	threshold := n
 	if pct {
-		threshold = (n*len(alts) + 99) / 100
+		threshold = int(min((uint64(n)*uint64(len(alts))+99)/100, uint64(len(alts)+1)))
+	} else if threshold > len(alts)+1 {
+		threshold = len(alts) + 1
 	}
 	return Query{Op: OpAtLeast, Kids: alts, Threshold: threshold}, nil
 }
