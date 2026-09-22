@@ -134,6 +134,13 @@ func (ix *Index) scoreSealedTopK(s *sealedPostings, idfV, avg, boost float64, to
 	dl := ix.scoreDL[:0]
 	sc := ix.scoreOut[:0]
 	ids := ix.decIDs[:0]
+	// Hoisted length-cache probe, mirroring scoreOpenTopK: decoded ids
+	// walk document order, so rows share one dense length array; the
+	// slow path is docLength itself.
+	var larr []uint32
+	var lbase uint64
+	var lkey uint32
+	lok := false
 	for b := range s.blk {
 		bl := &s.blk[b]
 		rows := int(bl.rows)
@@ -155,11 +162,28 @@ func (ix *Index) scoreSealedTopK(s *sealedPostings, idfV, avg, boost float64, to
 			c := cntR.next(bl.cntW)
 			ids = append(ids, id)
 			tf = append(tf, float64(c))
+			key := uint32(uint64(id) >> 32)
+			slot := uint64(id) & 0xffffffff
+			if lok && key == lkey {
+				if d := slot - lbase; d < uint64(len(larr)) {
+					dl = append(dl, float64(larr[d]))
+					continue
+				}
+			}
 			dl = append(dl, float64(ix.docLength(id)))
+			lok = ix.lenCacheOK
+			lkey = ix.lenCacheKey
+			larr = ix.lenCacheArr
+			lbase = ix.lenCacheBase
 		}
 		sc = bm25Scores(idfV, avg, boost, tf, dl, sc[:0])
 		for i, id := range ids[base:] {
-			h = heapPush(h, topK, Scored{Doc: id, Score: sc[i]})
+			// heapPush re-checks this first; skipping the call for
+			// rejected rows keeps the hot loop call-free.
+			c := Scored{Doc: id, Score: sc[i]}
+			if len(h) < topK || worseScored(h[0], c) {
+				h = heapPush(h, topK, c)
+			}
 		}
 	}
 	ix.decIDs = ids
