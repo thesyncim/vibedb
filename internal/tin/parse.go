@@ -71,6 +71,22 @@ type tinParser struct {
 	// noImplicit disables juxtaposition-AND inside [...] lists, where
 	// whitespace separates alternatives instead.
 	noImplicit bool
+	// implicitOperand marks the juxtaposition-AND path of parseAnd: the
+	// operand arrived with no explicit operator. A term starting with
+	// ':' is rejected there (it needs an explicit operator after
+	// another expression); explicit positions allow it.
+	implicitOperand bool
+}
+
+// rejectSpanStar errors when a span, relation, or positional operator
+// takes the document-level match-all as a direct operand.
+func (p *tinParser) rejectSpanStar(kids ...Query) error {
+	for _, k := range kids {
+		if k.Op == OpAll {
+			return p.errorf("MatchAll (*) is not valid inside a span/positional context")
+		}
+	}
+	return nil
 }
 
 func (p *tinParser) errorf(format string, args ...interface{}) error {
@@ -278,7 +294,9 @@ func (p *tinParser) parseAnd() (Query, error) {
 		if p.noImplicit || p.noImplicitAhead() {
 			return left, nil
 		}
+		p.implicitOperand = true
 		right, err := p.parseAndNot()
+		p.implicitOperand = false
 		if err != nil {
 			return Query{}, err
 		}
@@ -395,6 +413,9 @@ func (p *tinParser) parseFilter() (Query, error) {
 	if err != nil {
 		return Query{}, err
 	}
+	if err := p.rejectSpanStar(left); err != nil {
+		return Query{}, err
+	}
 	return Query{Op: OpFilter, Kids: []Query{left}, Filter: spec}, nil
 }
 
@@ -453,7 +474,10 @@ func (p *tinParser) parseFilterSpec() (FilterSpec, error) {
 		if err != nil {
 			return FilterSpec{}, err
 		}
-		return FilterSpec{Kind: FilterWords, Lo: x, Hi: y}, nil
+		// Query positions are 1-based; evaluation windows are 0-based
+		// [Lo, Hi+1), so IN WORDS x TO y keeps tokens x-1..y-1. The
+		// evaluator clamps both ends into the document.
+		return FilterSpec{Kind: FilterWords, Lo: x - 1, Hi: y - 1}, nil
 	default:
 		return FilterSpec{}, p.errorf("expected FIRST, LAST, MIDDLE, or WORDS after IN")
 	}
@@ -527,6 +551,9 @@ func (p *tinParser) parseRel() (Query, error) {
 		}
 		right, err := p.parseProx()
 		if err != nil {
+			return Query{}, err
+		}
+		if err := p.rejectSpanStar(left, right); err != nil {
 			return Query{}, err
 		}
 		left = Query{Op: op, Kids: []Query{left, right}, Neg: neg}
@@ -616,6 +643,9 @@ func (p *tinParser) parseProx() (Query, error) {
 		if err != nil {
 			return Query{}, err
 		}
+		if err := p.rejectSpanStar(left, right); err != nil {
+			return Query{}, err
+		}
 		if ordered {
 			left = Query{Op: OpThen, Kids: []Query{left, right}, Dist: n}
 		} else {
@@ -641,6 +671,9 @@ func (p *tinParser) parseWithin() (Query, error) {
 	p.scanWord()
 	n, err := p.scanDigits("width")
 	if err != nil {
+		return Query{}, err
+	}
+	if err := p.rejectSpanStar(node); err != nil {
 		return Query{}, err
 	}
 	return Query{Op: OpWithin, Kids: []Query{node}, Dist: n}, nil
@@ -772,6 +805,9 @@ func (p *tinParser) parseStar() (Query, error) {
 // parseBareTerm handles plain terms, wildcards, fuzzy match, implicit
 // phrases (`wi-fi`), and `A TO B` ranges.
 func (p *tinParser) parseBareTerm(w string) (Query, error) {
+	if p.implicitOperand && strings.HasPrefix(w, ":") {
+		return Query{}, p.errorf("a term starting with ':' needs an explicit operator after another expression")
+	}
 	if _, _, attached := splitAttachedProx(w); attached {
 		return Query{}, p.errorf("proximity operator needs a left operand")
 	}

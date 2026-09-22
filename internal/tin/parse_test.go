@@ -124,7 +124,12 @@ func TestTINQLRelations(t *testing.T) {
 	expectDocs(t,
 		`(security NEAR/10 threat) ENCLOSES critical`,
 		parseMatch(t, docs, `(security NEAR/10 threat) ENCLOSES critical`), 1)
-	expectDocs(t, `* NOT ENCLOSES spam`, parseMatch(t, docs, `* NOT ENCLOSES spam`), 1, 2, 4, 5)
+	// `* NOT ENCLOSES spam` used to be valid here, but the TINQL
+	// reference bans match-all inside span/relation/positional
+	// operators; TestParitySpanStarRejected pins the error.
+	expectDocs(t,
+		`(security OR title) NOT ENCLOSES spam`,
+		parseMatch(t, docs, `(security OR title) NOT ENCLOSES spam`), 1, 4)
 	expectDocs(t,
 		`critical ENCLOSED BY (security NEAR/10 threat)`,
 		parseMatch(t, docs, `critical ENCLOSED BY (security NEAR/10 threat)`), 1)
@@ -146,8 +151,10 @@ func TestTINQLPositionalFilters(t *testing.T) {
 	expectDocs(t, `apple IN FIRST 2%`, parseMatch(t, docs, `apple IN FIRST 2%`), 1)
 	expectDocs(t, `apple IN LAST 2%`, parseMatch(t, docs, `apple IN LAST 2%`), 2)
 	expectDocs(t, `apple IN MIDDLE 50%`, parseMatch(t, docs, `apple IN MIDDLE 50%`))
-	expectDocs(t, `apple IN WORDS 0 TO 0`, parseMatch(t, docs, `apple IN WORDS 0 TO 0`), 1)
-	expectDocs(t, `apple IN WORDS 99 TO 99`, parseMatch(t, docs, `apple IN WORDS 99 TO 99`), 2)
+	// Query positions are 1-based (TINQL reference): the apple at token 0
+	// is position 1, the apple at token 99 of 100 is position 100.
+	expectDocs(t, `apple IN WORDS 1 TO 1`, parseMatch(t, docs, `apple IN WORDS 1 TO 1`), 1)
+	expectDocs(t, `apple IN WORDS 100 TO 100`, parseMatch(t, docs, `apple IN WORDS 100 TO 100`), 2)
 }
 
 func TestTINQLExpansions(t *testing.T) {

@@ -16,10 +16,10 @@ var scoreCorpusInputs = []string{
 	`(security NEAR/5 threat) ENCLOSES critical`,
 	`critical ENCLOSED BY (security NEAR/5 threat)`,
 	`title NOT OVERLAPPING disclaimer`, `alpha BEFORE gamma`, `gamma AFTER alpha`,
-	`apple IN FIRST 2 WORDS`, `day IN LAST 2 WORDS`, `*`, `* NOT ENCLOSES apple`,
+	`apple IN FIRST 2 WORDS`, `day IN LAST 2 WORDS`, `*`, `(fuji OR dog) NOT ENCLOSES apple`,
 	`appl*`, `p?ach`, `apple~1`, `aardvark TO cat`, `MATCHES fuji`,
 	`CONTAINS banana`, `wi-fi`, `jalapeno`, `apple^2`, `"apple banana"^1.5`,
-	`(apple OR dog) WITHIN 4`, `apple IN WORDS 0 TO 2`,
+	`(apple OR dog) WITHIN 4`, `apple IN WORDS 1 TO 3`,
 }
 
 var scoreCorpusDocs = []string{
