@@ -69,6 +69,18 @@ type Index struct {
 	scoreTF  []float64
 	scoreDL  []float64
 	scoreOut []float64
+	// topHeap stages the bounded worst-first heap for single-term top-K
+	// scoring; capacity persists across calls under the index lock.
+	topHeap []Scored
+	// andKeep/andSums/andDL stage a selective AND's intersection, its
+	// accumulated scores, and its lengths; andPTF/andPDL/andPIdx stage
+	// one kid's paired-slot frequencies, lengths, and keep indexes.
+	andKeep []DocID
+	andSums []float64
+	andDL   []float64
+	andPTF  []float64
+	andPDL  []float64
+	andPIdx []int
 	// decIDs stages sealed document ids for scoring gathers; decPos stages
 	// one sealed row's positions for span expansion. Both are sequential
 	// staging under the index lock, never retained across calls.
@@ -93,12 +105,19 @@ type Index struct {
 	// so a zeroed removal slot is never observed.
 	docBase uint64
 	docLens []uint32
+	// minDocLen is the shortest length ever noted. Removals can only
+	// leave it stale-low, which keeps block score upper bounds valid
+	// (conservative); clearing every document re-establishes it.
+	minDocLen uint32
 }
 
 // noteDocLength tracks id's length in the dense array. Call with the
 // document not yet inserted so an empty map plus a nil array means the
 // first document ever (which establishes the base).
 func (ix *Index) noteDocLength(id DocID, length uint32) {
+	if len(ix.docs) == 0 || length < ix.minDocLen {
+		ix.minDocLen = length
+	}
 	if ix.docLens == nil {
 		if len(ix.docs) != 0 {
 			return

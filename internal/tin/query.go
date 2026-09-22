@@ -998,6 +998,18 @@ func (ix *Index) Score(q Query, topK int, out []Scored) []Scored {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	ix.ensureSorted()
+	if topK > 0 {
+		switch q.Op {
+		case OpTerm:
+			if s, ok := ix.scoreSingleTopK(q.Term, q.boostOf(), topK, out); ok {
+				return s
+			}
+		case OpAnd:
+			if s, ok := ix.scoreAndTopK(q, topK, out); ok {
+				return s
+			}
+		}
+	}
 	ix.scratchS = ix.scratchS[:0]
 	ix.scoreInto(q, &ix.scratchS)
 	s := ix.scratchS
