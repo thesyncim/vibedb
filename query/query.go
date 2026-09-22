@@ -301,6 +301,11 @@ type plan struct {
 	order    []planOrder
 	limit    int
 	hasLimit bool
+	// tinTopK carries an index-driven top-K row restriction for ORDER BY
+	// SCORE() ... LIMIT scalar statements, decided in bindScorePlan where
+	// the finished plan and the scalar program are both visible. The zero
+	// value keeps the ordinary scan.
+	tinTopK tinTopKSpec
 }
 
 // A planColumn is one compiled SELECT column.

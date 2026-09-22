@@ -154,6 +154,11 @@ func bindScorePlan(s *Statement, p *plan) error {
 		}
 	}
 	r.scoreSlot = match.slot
+	// A WHERE that is exactly this ==> with a single ORDER BY SCORE() key
+	// and a LIMIT lets the index rank the scan's survivors directly (see
+	// tin_topk.go). The spec is shape-only, so cached lowerings stay valid;
+	// any decline keeps the ordinary scan.
+	p.tinTopK = decideTinTopK(s, p, r, match)
 	return nil
 }
 

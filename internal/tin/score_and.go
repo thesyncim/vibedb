@@ -24,15 +24,16 @@ package tin
 // (the same standard as the wide-vs-scalar kernel differential), while
 // single-term paths stay bit-identical.
 
-// andGatePre / andGatePost bound the restricted path's work change. The
-// pre-gate compares the smallest kid against the total without matching
-// (a clearly unselective conjunction never pays a second match); the
-// post-gate compares the actual intersection (a large keep falls back to
-// streaming, which wins per-document at scale).
-const (
-	andGatePre  = 2
-	andGatePost = 8
-)
+// andGatePre bounds the restricted path's work change: it compares the
+// smallest kid against the total without matching, so a clearly
+// unselective conjunction never pays a second match. The post-gate runs
+// after the intersect, when the keep set is known, and compares keep work
+// against streaming work directly: the intersect already tracked every
+// keep doc's per-list position, so scoring the keep is direct reads plus
+// kernel rows with no further probes, while streaming would score every
+// list whole plus merge, filter, and select. The keep path proceeds
+// whenever its document work does not exceed the total streaming work.
+const andGatePre = 2
 
 // scoreAndTopK appends an all-term AND's best topK hits in rank order,
 // reporting false when the query falls outside the fast path (non-term
@@ -74,7 +75,7 @@ func (ix *Index) scoreAndTopK(q Query, topK int, out []Scored) ([]Scored, bool) 
 		return out, false
 	}
 	keep, poss := ix.andIntersect(lists)
-	if int64(len(keep))*int64(len(lists)) > int64(total)/andGatePost {
+	if int64(len(keep))*int64(len(lists)) > int64(total) {
 		return out, false
 	}
 	if len(keep) == 0 || ix.nDocs == 0 {

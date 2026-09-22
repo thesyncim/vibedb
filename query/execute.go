@@ -166,6 +166,15 @@ type Workspace struct {
 	matchTinHits []durable.TinSlotHit
 	// matchDocIDs is scratch for tin Match enumeration during ==> pruning.
 	matchDocIDs []tin.DocID
+	// matchScored is scratch for tin Score rankings during index-driven
+	// top-K restriction. It lives on the Workspace so warm executions
+	// reuse its capacity; entries are valid only for the execution that
+	// filled them.
+	matchScored []tin.Scored
+	// tinTopKUsed reports whether the last execution restricted its scan
+	// through the index-driven top-K path. Tests assert engagement;
+	// production ignores it.
+	tinTopKUsed bool
 	// matchScoreStats parallels matchQueries: the BM25 statistics for the
 	// SCORE() slot, refreshed per execution by the scalar stage (not by
 	// bindMatches) so statements without SCORE() pay nothing. Like
@@ -766,6 +775,7 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 	}
 	w.candidateUsed = 0
 	w.storeMaskUsed = 0
+	w.tinTopKUsed = false
 	w.text = w.text[:0]
 	w.lateText = w.lateText[:0]
 	w.groupKey = w.groupKey[:0]
@@ -815,41 +825,54 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 			return nil
 		}
 	}
-	masks, err := p.storeCandidateMasks(snapshot, w)
-	if err != nil {
-		return err
-	}
-	if err := w.checkCanceled(); err != nil {
-		return err
-	}
-	candidateCount := 0
-	for i, mask := range masks {
-		if err := cancellationCheckpoint(w.cancel, i); err != nil {
+	// An index-driven top-K restriction replaces the mask probe outright:
+	// the ranked survivors arrive in score order, so no candidate
+	// enumeration runs at all. Any decline falls through to the ordinary
+	// mask scan below, which resets the row list first.
+	topK := p.tinTopK.set && applyTinTopK(w, p.tinTopK)
+	compact := topK
+	scanRows := len(w.storeRows)
+	var masks []store.Mask
+	if !topK {
+		var err error
+		masks, err = p.storeCandidateMasks(snapshot, w)
+		if err != nil {
 			return err
 		}
-		candidateCount += bits.OnesCount64(mask.Bits)
-	}
-	compact := masks != nil && candidateCount <= snapshot.Len()/2
-	scanRows := snapshot.Len()
-	if compact {
-		scanRows = candidateCount
+		if err := w.checkCanceled(); err != nil {
+			return err
+		}
+		candidateCount := 0
+		for i, mask := range masks {
+			if err := cancellationCheckpoint(w.cancel, i); err != nil {
+				return err
+			}
+			candidateCount += bits.OnesCount64(mask.Bits)
+		}
+		compact = masks != nil && candidateCount <= snapshot.Len()/2
+		scanRows = snapshot.Len()
+		if compact {
+			scanRows = candidateCount
+		}
 	}
 	if err := w.activeHeapWorkBudget().admitRows(
 		p, scanRows, heapWorkSnapshot, workers,
 	); err != nil {
 		return err
 	}
-	w.storeRows = w.storeRows[:0]
-	if compact {
-		for i, mask := range masks {
-			if err := cancellationCheckpoint(w.cancel, i); err != nil {
-				return err
-			}
-			for word := mask.Bits; word != 0; word &= word - 1 {
-				w.storeRows = append(w.storeRows, store.Location{
-					Chunk: mask.Chunk,
-					Slot:  uint8(bits.TrailingZeros64(word)),
-				})
+	if !topK {
+		w.storeRows = w.storeRows[:0]
+		if compact {
+			for i, mask := range masks {
+				if err := cancellationCheckpoint(w.cancel, i); err != nil {
+					return err
+				}
+				for word := mask.Bits; word != 0; word &= word - 1 {
+					w.storeRows = append(w.storeRows, store.Location{
+						Chunk: mask.Chunk,
+						Slot:  uint8(bits.TrailingZeros64(word)),
+					})
+				}
 			}
 		}
 	}
