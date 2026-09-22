@@ -206,3 +206,37 @@ func TestTinSearchGoAPI(t *testing.T) {
 		t.Fatalf("fresh snapshot = (%+v, %v), want 3 hits", grew, err)
 	}
 }
+
+// Two tin definitions over one path hold identical content, but path
+// resolution must still pick one deterministically: Go map iteration order
+// is random, so TinIndexForPath resolves to the smallest catalog name,
+// matching the name-sorted catalog. Resolving a hundred times must yield
+// one index object: the "aa_tin" build, never a "zz_tin" twin.
+func TestTinIndexForPathResolvesSmallestName(t *testing.T) {
+	c := &Collection{}
+	putDoc(t, c, "a", `{"title":"fuji apple pie"}`)
+	for _, name := range []string{"zz_tin", "aa_tin"} {
+		if _, err := c.CreateIndex(IndexDefinition{
+			Name: name, Paths: []string{"/title"}, Kind: IndexTin,
+		}); err != nil {
+			t.Fatalf("CreateIndex(%s): %v", name, err)
+		}
+	}
+	snap, err := c.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := c.TinIndex(snap, "aa_tin")
+	if err != nil {
+		t.Fatalf("TinIndex(aa_tin): %v", err)
+	}
+	for range 100 {
+		got, err := c.TinIndexForPath(snap, "/title")
+		if err != nil {
+			t.Fatalf("TinIndexForPath: %v", err)
+		}
+		if got != want {
+			t.Fatal("TinIndexForPath resolved outside the smallest catalog name")
+		}
+	}
+}

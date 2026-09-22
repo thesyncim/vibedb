@@ -225,9 +225,12 @@ func (c *Collection) TinIndexForPath(s Snapshot, path string) (*tin.Index, error
 	c.mu.Lock()
 	name := ""
 	for candidate, tdef := range c.tinDefs {
-		if tdef.path == path {
+		// Definitions over one path hold identical content, but the
+		// winner must still be deterministic: Go map order is random,
+		// so resolve to the smallest catalog name, matching the
+		// name-sorted catalog indexInfosLocked publishes.
+		if tdef.path == path && (name == "" || candidate < name) {
 			name = candidate
-			break
 		}
 	}
 	c.mu.Unlock()

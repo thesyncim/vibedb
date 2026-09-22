@@ -6,14 +6,14 @@
 // The hot paths are allocation-free in steady state: the tokenizer streams
 // token hashes to a callback, Match and Score reuse index-owned scratch, and
 // the bulk ASCII fold has a GOEXPERIMENT=simd vector kernel with a scalar
-// fallback (see fold_simd.go and fold_nosimd.go). The package depends only on
-// the standard library.
+// fallback (see fold_wide.go, selected per arch by fold_enable_amd64.go and
+// fold_enable_arm64.go). The package depends only on the standard library.
 //
-// Roadmap: this slice lands the core (terms, phrases with slop, AND/OR/AND
-// NOT, match-all, BM25). Later slices add the TINQL surface (fuzzy,
-// wildcard, ranges, MATCHES, proximity, span relations, positional filters),
-// SQL DDL (CREATE INDEX ... USING tin) with the ==> operator, store
-// persistence, the Go Collection API, and pgwire exposure.
+// Landed surface: terms, phrases with slop, AND/OR/AND NOT, match-all,
+// BM25, fuzzy, wildcard, ranges, MATCHES, proximity, span relations,
+// positional filters, SQL DDL (CREATE INDEX ... USING tin) with the ==>
+// operator, heap and durable store persistence, the Go Collection API, and
+// pgwire exposure.
 package tin
 
 import "sync"
