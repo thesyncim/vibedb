@@ -143,6 +143,24 @@ func TestParityByTerm(t *testing.T) {
 	parityMatchWant(t, ix, `100%`, nil)
 }
 
+// TestParityMatchesClosers pins regex-pattern termination: unescaped
+// whitespace ends the pattern, while ) and ] close groups and classes
+// opened inside and end the pattern otherwise.
+func TestParityMatchesClosers(t *testing.T) {
+	ix := NewIndex()
+	ix.Add(1, "hops and dreams")
+	ix.Add(2, "hop scotch")
+	ix.Add(3, "abc day")
+	ix.Add(4, "xbc day")
+	parityMatchWant(t, ix, `(MATCHES hop.*s)`, []DocID{1})
+	parityMatchWant(t, ix, `MATCHES [abc]x`, nil)
+	parityMatchWant(t, ix, `MATCHES [abc]`, nil)
+	parityMatchWant(t, ix, `MATCHES [ab]c`, nil)
+	parityMatchWant(t, ix, `MATCHES (ho)+ps`, []DocID{1})
+	parityMustFail(t, ix, `MATCHES a(b`)
+	parityMustFail(t, ix, `MATCHES`)
+}
+
 func TestParityColonTerm(t *testing.T) {
 	ix := NewIndex()
 	parityMustFail(t, ix, `beer :tag`)

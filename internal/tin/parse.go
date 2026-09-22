@@ -984,27 +984,59 @@ func orOf(hashes []uint64) Query {
 }
 
 // parseMatches parses MATCHES <regex>: a full-term match over spellings,
-// unfolded (patterns address the normalized dictionary form).
+// unfolded (patterns address the normalized dictionary form). The pattern
+// runs to unescaped whitespace; unescaped ) and ] close a group or class
+// opened inside the pattern and end it otherwise.
 func (p *tinParser) parseMatches() (Query, error) {
 	p.skipWS()
 	start := p.pos
 	var sb []byte
+	groups, classes := 0, 0
 	for p.pos < len(p.s) {
 		c := p.s[p.pos]
 		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
 			break
 		}
-		if c == '\\' && p.pos+1 < len(p.s) && p.s[p.pos+1] == ' ' {
-			sb = append(sb, ' ')
+		if c == '\\' && p.pos+1 < len(p.s) {
+			// `\ ` is a literal space; every other sequence passes
+			// through untouched (an escaped bracket never opens or
+			// closes a group or class).
+			if p.s[p.pos+1] == ' ' {
+				sb = append(sb, ' ')
+			} else {
+				sb = append(sb, '\\', p.s[p.pos+1])
+			}
 			p.pos += 2
 			continue
 		}
-		if c == '(' || c == ')' || c == '[' || c == ']' || c == '"' {
+		switch c {
+		case '(':
+			if classes == 0 {
+				groups++
+			}
+		case '[':
+			if classes == 0 {
+				classes++
+			}
+		case ')':
+			if classes == 0 {
+				if groups == 0 {
+					goto done
+				}
+				groups--
+			}
+		case ']':
+			if classes == 0 {
+				goto done
+			}
+			classes--
+		case '"':
 			return Query{}, p.errorf("regex ends at %q; escape whitespace as \\ ", string(c))
 		}
 		sb = append(sb, c)
 		p.pos++
 	}
+done:
 	if p.pos == start {
 		return Query{}, p.errorf("expected a pattern after MATCHES")
 	}
