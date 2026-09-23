@@ -469,10 +469,6 @@ func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.O
 		inbound, err := receiver.DecodeInbound(rafttransport.PeerIdentity{
 			TrustDomain: receiver.TrustDomain(), Node: sender.LocalNode(),
 		}, frame)
-		if errors.Is(err, rafttransport.ErrRetiredAuthority) &&
-			cluster.isSafeRetiredGenerationDrop(receiverIndex, outbound) {
-			return
-		}
 		if err != nil {
 			cluster.t.Fatalf("decode %s %d->%d: %v", outbound.Message.GetType(), outbound.From, outbound.To, err)
 		}
@@ -498,30 +494,6 @@ func (cluster *realTransferCluster) route(senderIndex int, outbound raftmember.O
 			deliver()
 		}
 	}
-}
-
-// isSafeRetiredGenerationDrop recognizes only an in-flight frame from the
-// exact authority retired by source removal when both endpoints remain members
-// of the receiver's committed configuration. Source removal deliberately revokes the
-// whole prior transport authority so the receiver must reject, rather than
-// authenticate, this frame. A real stream drops that rejected frame; the
-// deterministic harness must model the same behavior without masking a frame
-// from the removed source or an unrelated stale authority.
-func (cluster *realTransferCluster) isSafeRetiredGenerationDrop(
-	receiverIndex int,
-	outbound raftmember.OutboundMessage,
-) bool {
-	fromRole, fromErr := cluster.registries[receiverIndex].Role(outbound.Group, outbound.From)
-	toRole, toErr := cluster.registries[receiverIndex].Role(outbound.Group, outbound.To)
-	if fromErr != nil || toErr != nil || fromRole == rafttransport.MemberEnrolled ||
-		toRole == rafttransport.MemberEnrolled {
-		return false
-	}
-	publication, err := cluster.hosts[receiverIndex].Publication(outbound.Group)
-	receiverVersion, found := cluster.registries[receiverIndex].ReplicaSetVersion(outbound.Group)
-	return err == nil && found && publication.ReplicaSetVersion == receiverVersion &&
-		confHasMember(publication.ConfState, outbound.From) &&
-		confHasMember(publication.ConfState, outbound.To)
 }
 
 func confHasMember(conf *pb.ConfState, member uint64) bool {

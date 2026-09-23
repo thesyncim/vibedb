@@ -128,16 +128,21 @@ func (authority *NativeDurableRequestExecutionPinAuthority) AcquireOrRecover(
 		return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{},
 			errors.Join(err, pinErr, ErrDurableRequestConflict)
 	}
-	var retainedRelease executionpin.Command
 	if execution.terminalCut != nil {
 		if err = validateDurableRequestPreparedCut(execution, *execution.terminalCut); err != nil {
 			return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, err
 		}
 		if execution.terminalCut.SchemaPin.Revision != 0 {
-			_, retainedRelease, err = durableRequestTerminalReleaseCommand(execution, *execution.terminalCut)
+			if _, err := durableRequestTerminalReleaseCommand(execution, *execution.terminalCut); err != nil {
+				return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, err
+			}
+			proof, err := executionpin.OpenCompletion(execution.terminalCut.SchemaPin.Completion)
 			if err != nil {
 				return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, err
 			}
+			// The same ledger commit owns the released pin and this proof.
+			// Recovery needs no gateway session or fresh side-effect authority.
+			return route, proof.Acquire, proof.Lease, nil
 		}
 	}
 	session, principal, releaseSession, openErr := authority.sessions.OpenExecutionPinSession(ctx, execution, route)
@@ -158,10 +163,9 @@ func (authority *NativeDurableRequestExecutionPinAuthority) AcquireOrRecover(
 
 	for attempt := 0; attempt < 4; attempt++ {
 		// A live ReadIndex observation proves the pin, not completion of this
-		// session's exact pending command. Settle the journal first so a later
-		// terminal release can use the next sequence. Retained release replay
-		// is owned by the terminal coordinator and must not be rewritten here.
-		if session.pending && retainedRelease.Operation != executionpin.OperationRelease {
+		// session's exact pending command. Settle the journal before deriving
+		// authority for more work.
+		if session.pending {
 			outer, openCommandErr := replication.OpenCommand(session.command)
 			nested, nestedErr := outer.OpenExecutionPin()
 			if openCommandErr != nil || nestedErr != nil || nested.PinID != pin || nested.Binding != binding ||
@@ -185,21 +189,6 @@ func (authority *NativeDurableRequestExecutionPinAuthority) AcquireOrRecover(
 			if read.Record.Binding != binding || !acquireOK || !leaseOK {
 				return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, ErrDurableRequestConflict
 			}
-			if retainedRelease.Operation == executionpin.OperationRelease {
-				acquireDigest, digestErr := executionpin.AcquireCertificateDigest(acquire)
-				if digestErr != nil || acquireDigest != retainedRelease.AcquireCertificateDigest ||
-					read.Record.PrepareTerminalDigest != retainedRelease.PrepareTerminalDigest ||
-					(read.Record.Status != executionpin.StatusActive && read.Record.Status != executionpin.StatusReleased) ||
-					lease.Controller != retainedRelease.ExpectedController ||
-					lease.ControllerEpoch != retainedRelease.ExpectedControllerEpoch ||
-					lease.LeaseAppliedThrough != retainedRelease.ExpectedLeaseAppliedThrough ||
-					lease.Revision != retainedRelease.ExpectedLeaseRevision {
-					return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, ErrDurableRequestConflict
-				}
-				// This pair is only for exact terminal release replay. Frozen and
-				// released records both fail the ordinary wave side-effect fence.
-				return route, acquire, lease, nil
-			}
 			if executionpin.ValidateSideEffectFence(lease, read.Record, read.Applied) == nil {
 				if durableRequestPinControllerMatches(lease, principal) {
 					return route, acquire, lease, nil
@@ -213,9 +202,6 @@ func (authority *NativeDurableRequestExecutionPinAuthority) AcquireOrRecover(
 			if !durableRequestPinRecoverableAtNextApply(read.Record, read.Applied) {
 				return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, ErrDurableRequestConflict
 			}
-		}
-		if retainedRelease.Operation == executionpin.OperationRelease {
-			return ReplicatedRoute{}, executionpin.AcquireCertificate{}, executionpin.LeaseCertificate{}, ErrDurableRequestConflict
 		}
 
 		transition := executionpin.Command{

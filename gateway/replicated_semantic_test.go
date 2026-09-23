@@ -76,7 +76,8 @@ func TestReplicatedNodeClientPhysicalSelectionIdentityAndEncodingStats(t *testin
 		t.Fatal(err)
 	}
 	probe := shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe, Authority: actor, Capability: serviceauthz.CapabilityDataRead,
-		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration}}
+		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+			Command: route.Command}}
 	if _, err := client.DoReplicated(t.Context(), endpoint, &probe); err != nil {
 		t.Fatal(err)
 	}

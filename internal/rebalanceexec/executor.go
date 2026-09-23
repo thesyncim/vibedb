@@ -131,6 +131,7 @@ type CatalogDrainCertifier interface {
 }
 
 type SourceRetirementRequest struct {
+	Survivors            []gateway.ReplicatedEndpoint
 	Operation            [32]byte
 	Step                 [32]byte
 	Group                raftmember.GroupKey
@@ -189,6 +190,15 @@ func (executor *Executor) ExecuteReplicaMove(
 		execution.PublicationApplied == 0 || execution.PublicationReplicaSet == 0 ||
 		!validExecutionAction(plan, execution) {
 		return ErrExecutionFence
+	}
+	if key, owned := plan.TransitionKey(); owned && execution.Action.Kind == rebalance.ActionAddLearner {
+		owner, ok := executor.options.Catalog.(gateway.DistributionTransitionOwner)
+		if !ok {
+			return ErrExecutionFence
+		}
+		if _, err := executor.acquireTransitionOwner(ctx, owner, key); err != nil {
+			return err
+		}
 	}
 	switch execution.Action.Kind {
 	case rebalance.ActionAwaitLeader, rebalance.ActionAwaitSnapshotInstall,
@@ -249,19 +259,20 @@ func (executor *Executor) executeMembership(
 	if err != nil || !found {
 		return errors.Join(err, ErrGrantUnavailable)
 	}
-	if err = validateGrant(plan, grant); err != nil {
-		return err
+	if err = ValidateMembershipGrant(plan, grant); err != nil {
+		return fmt.Errorf("membership grant does not match move: grant generation=%d source=%d target=%d, move generation=%d source=%d target=%d: %w",
+			grant.CatalogGeneration, grant.SourceMember, grant.TargetMember,
+			plan.CatalogGeneration(), plan.RetiringMember(), plan.TargetMember(), err)
 	}
 	cut, err := executor.resolve(ctx, operation, plan, execution)
-	if err != nil || [16]byte(cut.Target.Node) != grant.TargetNode {
-		return errors.Join(err, ErrExecutionFence)
+	if err != nil {
+		return fmt.Errorf("resolve membership move route: %w", err)
 	}
-	if execution.Action.Kind == rebalance.ActionRemoveSource && execution.LeaderTerm == 0 {
-		return ErrExecutionFence
+	if [16]byte(cut.Target.Node) != grant.TargetNode {
+		return fmt.Errorf("membership target node differs from grant: route=%x grant=%x: %w", cut.Target.Node, grant.TargetNode, ErrExecutionFence)
 	}
 	cut.Membership.Serving.Command.ReplicaSetVersion = execution.PublicationReplicaSet
 	kind := raftservice.MembershipAddLearner
-	transferTerm := uint64(0)
 	switch execution.Action.Kind {
 	case rebalance.ActionAddLearner:
 		kind = raftservice.MembershipAddLearner
@@ -271,14 +282,12 @@ func (executor *Executor) executeMembership(
 		kind = raftservice.MembershipTransferLeader
 	case rebalance.ActionRemoveSource:
 		kind = raftservice.MembershipRemoveVoter
-		transferTerm = execution.LeaderTerm
 	}
 	request := shardservice.ReplicatedMembershipRequest{
 		Kind: kind, TransitionID: grant.TransitionID, MetadataEpoch: grant.MetadataEpoch,
 		CatalogGeneration:         grant.CatalogGeneration,
 		ExpectedReplicaSetVersion: execution.PublicationReplicaSet,
 		SourceMember:              plan.RetiringMember(), TargetMember: plan.TargetMember(),
-		TransferTerm: transferTerm,
 	}
 	_, err = executor.options.Membership.ApplyMembership(ctx, cut.Membership, request)
 	return err
@@ -365,7 +374,7 @@ func (executor *Executor) executeCatalog(
 	if err != nil || !found {
 		return errors.Join(err, ErrGrantUnavailable)
 	}
-	if err = validateGrant(plan, grant); err != nil {
+	if err = ValidateMembershipGrant(plan, grant); err != nil {
 		return err
 	}
 	cut, err := executor.resolve(ctx, operation, plan, execution)
@@ -373,6 +382,9 @@ func (executor *Executor) executeCatalog(
 		cut.Command.ReplicaSetVersion != execution.PublicationReplicaSet ||
 		cut.Command.OwnershipEpoch == 0 || !cut.Command.Valid() {
 		return errors.Join(err, ErrExecutionFence)
+	}
+	if plan.TransitionRequired(cut.Catalog) {
+		return executor.executeReceiptPublication(ctx, operation, plan, execution, cut, gateway.TransitionPhasePreRemove)
 	}
 	target := gateway.ReplicatedReplicaDescriptor{
 		Member: cut.Target.Member, Node: cut.Target.Node, StoreID: cut.Target.StoreID,
@@ -386,7 +398,7 @@ func (executor *Executor) executeCatalog(
 		grant, target, cut.Command,
 	)
 	if err != nil {
-		return err
+		return replicaReplacementTransitionError(plan, cut, grant, err)
 	}
 	err = executor.options.Catalog.PublishReplicaReplacement(
 		ctx, plan.CatalogGeneration(), next, grant,
@@ -404,6 +416,57 @@ func (executor *Executor) executeCatalog(
 	return nil
 }
 
+// replicaReplacementTransitionError adds the exact catalog and Raft fence
+// evidence needed to diagnose a rejected certified cut. This formatting is
+// deliberately confined to the error path; the successful publication path
+// does not enumerate descriptors or allocate diagnostic strings.
+func replicaReplacementTransitionError(
+	plan *rebalance.Plan,
+	cut MoveRoute,
+	grant membershipgrant.Grant,
+	cause error,
+) error {
+	var old raftservice.CommandFence
+	request := plan.Request()
+	if cut.Catalog != nil && plan != nil {
+		for _, descriptor := range cut.Catalog.ReplicatedShardDescriptors() {
+			if descriptor.Group == plan.Group() && descriptor.Distribution == request.Distribution &&
+				descriptor.Shard == request.Shard {
+				old = descriptor.Command
+				break
+			}
+		}
+	}
+	targetManifest := plan.TargetManifest()
+	version := distribution.RoutingVersion(0)
+	var leaders []distribution.EndpointID
+	if targetManifest != nil {
+		version = targetManifest.Version()
+		for shardOrdinal := 0; shardOrdinal < targetManifest.ShardCount(); shardOrdinal++ {
+			metadata, ok := targetManifest.ShardMetadataAt(shardOrdinal)
+			if !ok || metadata.ID != request.Shard {
+				continue
+			}
+			leaders = make([]distribution.EndpointID, 0, metadata.LeaderCount)
+			for leaderOrdinal := 0; leaderOrdinal < metadata.LeaderCount; leaderOrdinal++ {
+				if leader, found := targetManifest.ShardLeaderAt(shardOrdinal, leaderOrdinal); found {
+					leaders = append(leaders, leader)
+				}
+			}
+			break
+		}
+	}
+	return fmt.Errorf(
+		"build certified replica replacement: %w (group=%x grant-initial-rs=%d old-command=[rs=%d policy=%d protection=%d owner=%d schema=%d route=%d route-generation=%d] observed-command=[rs=%d policy=%d protection=%d owner=%d schema=%d route=%d route-generation=%d] target-manifest-version=%d leaders=%q)",
+		cause, grant.Group.GroupID, grant.InitialReplicaSetVersion,
+		old.ReplicaSetVersion, old.ActivePolicyGeneration, old.ProtectionEpoch,
+		old.OwnershipEpoch, old.SchemaGeneration, old.RoutingVersion, old.RouteGeneration,
+		cut.Command.ReplicaSetVersion, cut.Command.ActivePolicyGeneration, cut.Command.ProtectionEpoch,
+		cut.Command.OwnershipEpoch, cut.Command.SchemaGeneration, cut.Command.RoutingVersion, cut.Command.RouteGeneration,
+		version, leaders,
+	)
+}
+
 func (executor *Executor) executeCatalogRefresh(
 	ctx context.Context,
 	operation rebalance.OperationID,
@@ -417,16 +480,18 @@ func (executor *Executor) executeCatalogRefresh(
 	if err != nil || !found {
 		return errors.Join(err, ErrGrantUnavailable)
 	}
-	if err = validateGrant(plan, grant); err != nil {
+	if err = ValidateMembershipGrant(plan, grant); err != nil {
 		return err
 	}
 	cut, err := executor.resolve(ctx, operation, plan, execution)
 	if err != nil || cut.Catalog == nil ||
-		cut.Catalog.Generation() != plan.NextCatalogGeneration() ||
 		cut.Command.ReplicaSetVersion != execution.Action.ReplicaSetVersion ||
 		cut.Command.ReplicaSetVersion != execution.PublicationReplicaSet ||
 		!cut.Command.Valid() {
 		return errors.Join(err, ErrExecutionFence)
+	}
+	if plan.TransitionRequired(cut.Catalog) {
+		return executor.executeReceiptPublication(ctx, operation, plan, execution, cut, gateway.TransitionPhasePostRemove)
 	}
 	next, err := gateway.BuildReplicaReplacementPostRemoveTransition(
 		cut.Catalog, plan.PostRemoveCatalogGeneration(), grant,
@@ -454,6 +519,76 @@ func (executor *Executor) executeCatalogRefresh(
 	return nil
 }
 
+func (executor *Executor) executeReceiptPublication(
+	ctx context.Context,
+	operation rebalance.OperationID,
+	plan *rebalance.Plan,
+	execution rebalance.ReplicatedMoveExecution,
+	cut MoveRoute,
+	phase gateway.TransitionPhase,
+) error {
+	publisher, ok := executor.options.Catalog.(gateway.GroupTransitionPublisher)
+	if !ok {
+		return ErrExecutionFence
+	}
+	owner, ok := executor.options.Catalog.(gateway.DistributionTransitionOwner)
+	if !ok {
+		return ErrExecutionFence
+	}
+	intent, ok := plan.TransitionIntent()
+	if !ok || intent.Key.OperationID != [32]byte(operation) {
+		return ErrExecutionFence
+	}
+	lease, err := executor.acquireTransitionOwner(ctx, owner, intent.Key)
+	if err != nil || !lease.Valid() || lease.Distribution != intent.Key.Distribution || lease.OperationID != intent.Key.OperationID {
+		return errors.Join(err, ErrExecutionFence)
+	}
+	target := gateway.ReplicatedReplicaDescriptor{
+		Member: cut.Target.Member, Node: cut.Target.Node, StoreID: cut.Target.StoreID,
+		NodeIncarnation: cut.Target.NodeIncarnation,
+		Endpoint:        distribution.EndpointID(cut.Target.Endpoint),
+		NativeEndpoint:  distribution.EndpointID(cut.Target.NativeEndpoint),
+		ControlEndpoint: distribution.EndpointID(cut.Target.ControlEndpoint),
+	}
+	if !target.ValidForTransition() {
+		return ErrExecutionFence
+	}
+	next, err := plan.CatalogSnapshotAtHead(cut.Catalog, phase, target, cut.Command)
+	if err != nil || next == nil || next.Generation() != execution.Action.CatalogGeneration {
+		return errors.Join(err, ErrExecutionFence)
+	}
+	receipt, err := publisher.PublishGroupTransition(ctx, lease, intent, phase, next, execution.TransitionReceiptDigest)
+	if errors.Is(err, gateway.ErrReplicatedCatalogPending) {
+		if err = executor.options.Catalog.RetryPending(ctx); err != nil {
+			return err
+		}
+		receipt, err = publisher.PublishGroupTransition(ctx, lease, intent, phase, next, execution.TransitionReceiptDigest)
+	}
+	if err != nil {
+		return err
+	}
+	if !receipt.Valid() || receipt.Key != intent.Key || receipt.Phase != phase ||
+		receipt.CommittedHeadGeneration != next.Generation() ||
+		receipt.CommittedDistributionVersion != intent.TargetDistributionVersion {
+		return ErrExecutionFence
+	}
+	descriptor, found := transitionDescriptor(next, intent.Key.Group)
+	if !found || receipt.CommittedGroupDigest != gateway.DigestReplicatedShardDescriptor(descriptor) ||
+		receipt.CommittedRouteDigest != gateway.DigestRouteFor(next, intent.Key.Distribution, intent.Key.Shard) {
+		return ErrExecutionFence
+	}
+	return nil
+}
+
+func transitionDescriptor(snapshot *gateway.Snapshot, group raftmember.GroupKey) (gateway.ReplicatedShardDescriptor, bool) {
+	for _, descriptor := range snapshot.ReplicatedShardDescriptors() {
+		if descriptor.Group == group {
+			return descriptor, true
+		}
+	}
+	return gateway.ReplicatedShardDescriptor{}, false
+}
+
 func (executor *Executor) executeRetirement(
 	ctx context.Context,
 	operation rebalance.OperationID,
@@ -465,7 +600,7 @@ func (executor *Executor) executeRetirement(
 		return err
 	}
 	if found {
-		if err = validateGrant(plan, grant); err != nil {
+		if err = ValidateMembershipGrant(plan, grant); err != nil {
 			return err
 		}
 	}
@@ -487,12 +622,16 @@ func (executor *Executor) executeRetirement(
 			AllocationGeneration: cut.Membership.Serving.AllocationGeneration,
 			Command:              cut.Command,
 			Source:               cut.Retiring, Target: cut.Target, Term: execution.LeaderTerm,
+			Survivors: cut.Membership.Serving.Replicas,
 		})
 		if err != nil {
 			return err
 		}
 	}
 	if !found {
+		if _, owned := plan.TransitionKey(); owned {
+			return executor.releaseReceiptOwner(ctx, plan)
+		}
 		return nil
 	}
 	err = executor.options.Catalog.FinalizeReplicaReplacement(ctx, grant)
@@ -508,6 +647,47 @@ func (executor *Executor) executeRetirement(
 	if err != nil || stillPresent {
 		return errors.Join(err, ErrExecutionFence)
 	}
+	if plan.TransitionRequired(cut.Catalog) {
+		if err = executor.releaseReceiptOwner(ctx, plan); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (executor *Executor) releaseReceiptOwner(ctx context.Context, plan *rebalance.Plan) error {
+	owner, ownerOK := executor.options.Catalog.(gateway.DistributionTransitionOwner)
+	reader, readerOK := executor.options.Catalog.(gateway.GroupTransitionReceiptReader)
+	if !ownerOK || !readerOK {
+		return ErrExecutionFence
+	}
+	key, ok := plan.TransitionKey()
+	if !ok {
+		return ErrExecutionFence
+	}
+	receipt, found, err := reader.ReadGroupPublicationReceipt(ctx, key)
+	if err != nil || !found || !receipt.Valid() || receipt.Key != key {
+		return errors.Join(err, ErrExecutionFence)
+	}
+	if releaser, ok := executor.options.Catalog.(interface {
+		ReleaseCompletedDistributionTransition(context.Context, gateway.GroupPublicationReceipt) error
+	}); ok {
+		err := releaser.ReleaseCompletedDistributionTransition(ctx, receipt)
+		if errors.Is(err, gateway.ErrReplicatedCatalogPending) {
+			if err = executor.options.Catalog.RetryPending(ctx); err != nil {
+				return err
+			}
+			err = releaser.ReleaseCompletedDistributionTransition(ctx, receipt)
+		}
+		return err
+	}
+	lease, err := executor.acquireTransitionOwner(ctx, owner, key)
+	if err != nil || !lease.Valid() {
+		return errors.Join(err, ErrExecutionFence)
+	}
+	if err = owner.ReleaseDistributionTransition(ctx, lease, receipt); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -522,7 +702,10 @@ func (executor *Executor) resolve(
 		!exactRetiringReplica(cut.Retiring, plan.RetiringReplica()) ||
 		cut.SnapshotSource.Member != plan.SnapshotSourceMember() ||
 		cut.Target.Member != plan.TargetMember() {
-		return MoveRoute{}, errors.Join(err, ErrExecutionFence)
+		return MoveRoute{}, fmt.Errorf("move route identity differs: group=%x expected=%x source=%d expected=%d target=%d expected=%d retiring_exact=%t: %w",
+			cut.Membership.Serving.Group.GroupID, plan.Group().GroupID,
+			cut.SnapshotSource.Member, plan.SnapshotSourceMember(), cut.Target.Member, plan.TargetMember(),
+			exactRetiringReplica(cut.Retiring, plan.RetiringReplica()), errors.Join(err, ErrExecutionFence))
 	}
 	return cut, nil
 }
@@ -534,10 +717,19 @@ func exactRetiringReplica(endpoint gateway.ReplicatedEndpoint, identity rebalanc
 		distribution.EndpointID(endpoint.ControlEndpoint) == identity.ControlEndpoint
 }
 
-func validateGrant(plan *rebalance.Plan, grant membershipgrant.Grant) error {
+// ValidateMembershipGrant matches a move against an already-authorized durable
+// grant. Group provenance survives unrelated catalog publications; detached
+// plans without that proof require their exact original head.
+func ValidateMembershipGrant(plan *rebalance.Plan, grant membershipgrant.Grant) error {
 	if plan == nil || !grant.Valid() || grant.Group != plan.Group() ||
-		grant.CatalogGeneration != plan.CatalogGeneration() ||
 		grant.SourceMember != plan.RetiringMember() || grant.TargetMember != plan.TargetMember() {
+		return ErrExecutionFence
+	}
+	if intent, found := plan.TransitionIntent(); found {
+		if !gateway.GroupTransitionMatchesGrant(intent, grant) {
+			return ErrExecutionFence
+		}
+	} else if grant.CatalogGeneration != plan.CatalogGeneration() {
 		return ErrExecutionFence
 	}
 	return nil
@@ -545,6 +737,14 @@ func validateGrant(plan *rebalance.Plan, grant membershipgrant.Grant) error {
 
 func validExecutionAction(plan *rebalance.Plan, execution rebalance.ReplicatedMoveExecution) bool {
 	action := execution.Action
+	if _, owned := plan.TransitionKey(); owned {
+		switch action.Kind {
+		case rebalance.ActionPublishCatalog, rebalance.ActionAwaitCatalogDrain:
+			return action.Member == 0 && action.CatalogGeneration > plan.CatalogGeneration() && action.ReplicaSetVersion == 0
+		case rebalance.ActionRefreshCatalogFence:
+			return action.Member == 0 && action.CatalogGeneration > plan.CatalogGeneration() && action.ReplicaSetVersion == execution.PublicationReplicaSet
+		}
+	}
 	switch action.Kind {
 	case rebalance.ActionAddLearner, rebalance.ActionAwaitSnapshotInstall,
 		rebalance.ActionAwaitCatchUp,
@@ -576,4 +776,15 @@ func validExecutionAction(plan *rebalance.Plan, execution rebalance.ReplicatedMo
 	default:
 		return false
 	}
+}
+
+func (executor *Executor) acquireTransitionOwner(ctx context.Context, owner gateway.DistributionTransitionOwner, key gateway.GroupTransitionKey) (gateway.GroupTransitionOwnerLease, error) {
+	lease, err := owner.AcquireDistributionTransition(ctx, key)
+	if errors.Is(err, gateway.ErrReplicatedCatalogPending) {
+		if err = executor.options.Catalog.RetryPending(ctx); err != nil {
+			return gateway.GroupTransitionOwnerLease{}, err
+		}
+		return owner.AcquireDistributionTransition(ctx, key)
+	}
+	return lease, err
 }

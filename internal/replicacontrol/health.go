@@ -110,5 +110,14 @@ func validHealthObservation(observation HealthObservation) bool {
 		observation.LeaderID != 0 && observation.Term != 0 &&
 		observation.Commit != 0 && observation.Applied != 0 &&
 		observation.Applied <= observation.Commit &&
-		observation.ReplicaSetVersion == request.ExpectedReplicaSetVersion
+		// >= rather than ==: ExpectedReplicaSetVersion is a floor the caller
+		// last confirmed (from its own catalog cut), not a value the live
+		// group must still match exactly. An unrelated or already-in-flight
+		// membership change on this same group can legitimately advance the
+		// live replica-set version past that floor well before the catalog
+		// is republished to catch up; requiring an exact match would reject
+		// every health round from that point on, since the live version can
+		// never regress back to the frozen floor. Mirrors the >= floor
+		// ObserveReplicaMove and ObserveReplicaHealth already use.
+		observation.ReplicaSetVersion >= request.ExpectedReplicaSetVersion
 }

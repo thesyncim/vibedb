@@ -94,6 +94,17 @@ type Machine struct {
 	// been validated during source recovery.
 	legacySchemaSourceCommand [sha256.Size]byte
 	poison                    atomic.Pointer[machinePoison]
+
+	// logicalEpochSeq is a seqlock for the applied command epochs. It lets the
+	// serving owner reject a data proposal whose catalog fence is behind the
+	// applied binding without copying a state snapshot on the write path.
+	logicalEpochSeq        atomic.Uint64
+	logicalPolicy          atomic.Uint64
+	logicalProtection      atomic.Uint64
+	logicalOwnership       atomic.Uint64
+	logicalSchema          atomic.Uint64
+	logicalRouting         atomic.Uint64
+	logicalRouteGeneration atomic.Uint64
 }
 
 // machinePoison is published independently of mu so a reader can fail closed
@@ -373,7 +384,9 @@ func OpenBundle(
 	if state.BootstrapDigest != bootstrapDigest || state.SessionCount != sessionCount ||
 		state.SessionSlotCount != slotCount || state.AuthorityBindingCount != authorityCount ||
 		state.SessionCount > options.MaxSessions {
-		return nil, fmt.Errorf("%w: persisted publication disagrees with construction", ErrStateCorrupt)
+		return nil, fmt.Errorf("%w: persisted publication bootstrap_match=%v sessions=%d/%d slots=%d/%d authorities=%d/%d max_sessions=%d",
+			ErrStateCorrupt, state.BootstrapDigest == bootstrapDigest, state.SessionCount, sessionCount,
+			state.SessionSlotCount, slotCount, state.AuthorityBindingCount, authorityCount, options.MaxSessions)
 	}
 	if sourceRecovery {
 		if err := m.validateOpenedSchemaSource(state, prepared); err != nil {
@@ -385,7 +398,9 @@ func OpenBundle(
 		state.RelationPlacementDigest != relationPlacementStateDigest(
 			state.Binding.SchemaGeneration, m.manifestDigest, m.relations,
 		)) {
-		return nil, fmt.Errorf("%w: persisted publication disagrees with construction", ErrStateCorrupt)
+		return nil, fmt.Errorf("%w: persisted publication binding_match=%v apply_contract_match=%v placement_match=%v",
+			ErrStateCorrupt, bindingMatchesFenceOrigin(binding, state), state.ApplyContractDigest == prepared.applyContract,
+			state.RelationPlacementDigest == relationPlacementStateDigest(state.Binding.SchemaGeneration, m.manifestDigest, m.relations))
 	}
 	if state.LastKind == RecordSchema && !sourceRecovery {
 		if err := validateOpenedSchemaTransition(
@@ -421,6 +436,7 @@ func OpenBundle(
 		m.relations[i].placementApplied = state.Applied
 	}
 	m.binding = state.Binding
+	m.publishLogicalEpochs(state.Binding)
 	m.distribution = []byte(state.Binding.Distribution)
 	m.shard = []byte(state.Binding.Shard)
 	m.initialized = true

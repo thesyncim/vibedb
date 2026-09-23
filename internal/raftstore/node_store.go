@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore/seglog"
@@ -822,7 +823,27 @@ func (s *NodeStore) publishGroupCheckpointSequenced(group uint64, snapshot *pb.S
 	return nil
 }
 
-func (s *NodeStore) PersistWave(ready []NodeReady) error { return s.persistWave(ready, false) }
+func (s *NodeStore) PersistWave(ready []NodeReady) error { return s.persistUnsequencedWave(ready) }
+
+// persistUnsequencedWave is the synchronous (no device sequencer) persist
+// path. Seal backpressure is transient engine maintenance, not a refusal of
+// the Ready: like the device sequencer, wait for the pending seal and retry
+// the exact wave so direct callers observe only durable success or a real
+// failure.
+func (s *NodeStore) persistUnsequencedWave(ready []NodeReady) error {
+	for {
+		err := s.persistWave(ready, false)
+		if !errors.Is(err, ErrDurabilityBackpressure) {
+			return err
+		}
+		if waitErr := s.engine.WaitSeal(); waitErr != nil {
+			return errors.Join(ErrPersistenceUnknown, err, waitErr)
+		}
+		// Backpressure without a pending seal means the metadata lane is
+		// replenishing reserves or checkpointing; yield so it can publish.
+		time.Sleep(50 * time.Microsecond)
+	}
+}
 
 // PersistReadySeries persists one bounded same-group series as one logical
 // node wave batch. The caller's descriptors and every value reachable through
@@ -838,12 +859,12 @@ func (s *NodeStore) PersistReadySeries(group uint64, batches []raftmodel.Persist
 		if s == nil {
 			return ErrBounds
 		}
-		return s.persistWave([]NodeReady{{GroupID: group, seriesCount: uint8(MaxReadySeries + 1)}}, false)
+		return s.persistUnsequencedWave([]NodeReady{{GroupID: group, seriesCount: uint8(MaxReadySeries + 1)}})
 	}
 	var item NodeReady
 	item.GroupID, item.seriesCount = group, uint8(len(batches))
 	copy(item.series[:], batches)
-	return s.persistWave([]NodeReady{item}, false)
+	return s.persistUnsequencedWave([]NodeReady{item})
 }
 
 func (s *NodeStore) persistSequencedWave(ready []NodeReady) error { return s.persistWave(ready, true) }
@@ -1634,6 +1655,16 @@ func (s *NodeStore) RegisterGroupWithSnapshot(descriptor GroupDescriptor, snapsh
 }
 
 func (s *NodeStore) registerGroupSequenced(descriptor GroupDescriptor, snapshot *pb.Snapshot) (GroupIncarnation, error) {
+	return s.registerGroupSequencedAt(descriptor, snapshot, 1, nil)
+}
+
+// registerGroupSequencedAt is the node-log publication primitive used by a
+// dynamic learner install. The requested incarnation is authenticated in the
+// same descriptor/checkpoint wave; it is never inferred from a local counter
+// after the controller has committed the target identity.
+func (s *NodeStore) registerGroupSequencedAt(
+	descriptor GroupDescriptor, snapshot *pb.Snapshot, incarnation uint64, replaces *GroupDescriptor,
+) (GroupIncarnation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
@@ -1642,12 +1673,27 @@ func (s *NodeStore) registerGroupSequenced(descriptor GroupDescriptor, snapshot 
 	if s.sequencer == nil {
 		return GroupIncarnation{}, ErrInvalid
 	}
-	return s.registerGroupLocked(descriptor, snapshot)
+	return s.registerGroupLockedMode(descriptor, snapshot, incarnation, true, replaces)
 }
 
 func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb.Snapshot) (GroupIncarnation, error) {
+	return s.registerGroupLockedMode(descriptor, snapshot, 1, false, nil)
+}
+
+func (s *NodeStore) registerGroupLockedAt(
+	descriptor GroupDescriptor, snapshot *pb.Snapshot, incarnation uint64,
+) (GroupIncarnation, error) {
+	return s.registerGroupLockedMode(descriptor, snapshot, incarnation, true, nil)
+}
+
+// Ordinary descriptor retries preserve the existing incarnation. Dynamic installs
+// must additionally match the incarnation committed by their controller.
+func (s *NodeStore) registerGroupLockedMode(descriptor GroupDescriptor, snapshot *pb.Snapshot, incarnation uint64, exactIncarnation bool, replaces *GroupDescriptor) (GroupIncarnation, error) {
 	if descriptor.LogKey != 0 || validateGroupDescriptor(descriptor, true) != nil {
 		return GroupIncarnation{}, ErrBounds
+	}
+	if incarnation == 0 {
+		return GroupIncarnation{}, ErrInvalid
 	}
 	if snapshot != nil {
 		if err := validateSnapshotBase(snapshot, descriptor.MemberID); err != nil {
@@ -1657,7 +1703,52 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 	position, found := slices.BinarySearchFunc(s.descriptorOrder, descriptor.GroupID, func(index uint32, target [16]byte) int {
 		return bytes.Compare(s.descriptors[index].GroupID[:], target[:])
 	})
-	if found {
+	var previous GroupDescriptor
+	var retiredIncarnation uint64
+	if !found && replaces != nil {
+		return GroupIncarnation{}, ErrIdentityMismatch
+	}
+	if found && replaces != nil {
+		existing := s.descriptors[s.descriptorOrder[position]]
+		request := descriptor
+		request.LogKey = existing.LogKey
+		if existing == request {
+			var predecessor GroupDescriptor
+			for _, retained := range s.descriptors[:existing.LogKey-1] {
+				if retained.GroupID == existing.GroupID {
+					predecessor = retained
+				}
+			}
+			if predecessor != *replaces {
+				return GroupIncarnation{}, ErrIdentityMismatch
+			}
+		} else {
+			if existing != *replaces || !replacementDescriptor(existing, descriptor) || snapshot == nil {
+				return GroupIncarnation{}, ErrIdentityMismatch
+			}
+			conf := snapshot.GetMetadata().GetConfState()
+			if slices.Contains(conf.Voters, existing.MemberID) || slices.Contains(conf.Learners, existing.MemberID) ||
+				len(conf.VotersOutgoing) != 0 || len(conf.LearnersNext) != 0 || conf.GetAutoLeave() {
+				return GroupIncarnation{}, ErrIdentityMismatch
+			}
+			state, ok := s.engine.Summary(existing.LogKey)
+			if !ok || state.NodeIncarnation == math.MaxUint64 {
+				return GroupIncarnation{}, ErrCorrupt
+			}
+			metadata, ok := s.engine.Metadata(existing.LogKey)
+			if !ok || snapshot.GetMetadata().GetIndex() < metadata.Hard.Commit {
+				return GroupIncarnation{}, ErrRetryConflict
+			}
+			for _, retained := range s.descriptors {
+				if retained.GroupID == descriptor.GroupID &&
+					(retained.MemberID == descriptor.MemberID || retained.StoreID == descriptor.StoreID) {
+					return GroupIncarnation{}, ErrIdentityMismatch
+				}
+			}
+			previous, retiredIncarnation = existing, state.NodeIncarnation+1
+		}
+	}
+	if found && previous.LogKey == 0 {
 		existing := s.descriptors[s.descriptorOrder[position]]
 		request := descriptor
 		request.LogKey = existing.LogKey
@@ -1697,6 +1788,9 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 				return GroupIncarnation{}, ErrRetryConflict
 			}
 		}
+		if exactIncarnation && state.NodeIncarnation != incarnation {
+			return GroupIncarnation{}, ErrRetryConflict
+		}
 		return GroupIncarnation{GroupID: existing.LogKey, Incarnation: state.NodeIncarnation}, nil
 	}
 	// Capacity limits apply to new groups, not exact unknown-outcome retries.
@@ -1727,7 +1821,7 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 		return GroupIncarnation{}, err
 	}
 	s.waveEntryArena[0] = seglog.Entry{Index: descriptor.LogKey, Term: 1, DataOffset: 0, DataBytes: uint64(len(s.plainArena))}
-	s.waveBatches[0] = seglog.ReadyBatch{GroupID: descriptor.LogKey, BeginIncarnation: 1}
+	s.waveBatches[0] = seglog.ReadyBatch{GroupID: descriptor.LogKey, BeginIncarnation: incarnation}
 	if snapshot != nil {
 		s.waveCheckpoint[0] = checkpoint
 		s.waveHard[0] = seglog.HardState{Term: checkpoint.Term, Commit: checkpoint.Index}
@@ -1744,10 +1838,18 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 	}
 	var waveID seglog.WaveID
 	copy(waveID[:], digest[:16])
-	if err = s.packWaveExtents(waveID, 2); err != nil {
+	waveCount := 2
+	if previous.LogKey != 0 {
+		s.waveBatches[2] = seglog.ReadyBatch{GroupID: previous.LogKey, BeginIncarnation: retiredIncarnation}
+		waveCount = 3
+		// Physical waves use ascending log keys; the old replica predates
+		// both the new replica and the descriptor catalog.
+		s.waveBatches[0], s.waveBatches[1], s.waveBatches[2] = s.waveBatches[2], s.waveBatches[0], s.waveBatches[1]
+	}
+	if err = s.packWaveExtents(waveID, waveCount); err != nil {
 		return GroupIncarnation{}, err
 	}
-	if err = s.engine.PersistWave(seglog.Wave{ID: waveID, Batches: s.waveBatches[:2], Blob: s.cipherArena}); err != nil {
+	if err = s.engine.PersistWave(seglog.Wave{ID: waveID, Batches: s.waveBatches[:waveCount], Blob: s.cipherArena}); err != nil {
 		if fatal := s.engine.FatalError(); fatal != nil {
 			s.poisonLocked(fatal)
 			return GroupIncarnation{}, errors.Join(ErrPersistenceUnknown, err, fatal)
@@ -1759,13 +1861,18 @@ func (s *NodeStore) registerGroupLocked(descriptor GroupDescriptor, snapshot *pb
 		return GroupIncarnation{}, errors.Join(ErrPersistenceUnknown, err)
 	}
 	s.descriptors = append(s.descriptors, descriptor)
-	s.descriptorOrder = append(s.descriptorOrder, 0)
-	copy(s.descriptorOrder[position+1:], s.descriptorOrder[position:len(s.descriptorOrder)-1])
+	if !found {
+		s.descriptorOrder = append(s.descriptorOrder, 0)
+		copy(s.descriptorOrder[position+1:], s.descriptorOrder[position:len(s.descriptorOrder)-1])
+	}
 	s.descriptorOrder[position] = uint32(len(s.descriptors) - 1)
 	s.nextLogKey++
 	s.publishCoordinatesLocked(nodeDescriptorGroup, nil, nil)
 	s.publishCoordinatesLocked(descriptor.LogKey, nil, nil)
-	return GroupIncarnation{GroupID: descriptor.LogKey, Incarnation: 1}, nil
+	if previous.LogKey != 0 {
+		s.publishCoordinatesLocked(previous.LogKey, nil, nil)
+	}
+	return GroupIncarnation{GroupID: descriptor.LogKey, Incarnation: incarnation}, nil
 }
 
 func nodeWaveID(ready []NodeReady) seglog.WaveID {
@@ -1789,6 +1896,22 @@ func nodeWaveID(ready []NodeReady) seglog.WaveID {
 func (s *NodeStore) Group(group uint64) *GroupView { return &GroupView{store: s, group: group} }
 
 func (s *NodeStore) NodeIdentity() NodeIdentity { return s.identity }
+
+// GroupDescriptors returns the current authenticated descriptor catalog in
+// log-key order. The snapshot is detached while the store lock is held so a
+// physical-node source resolver can discover a newly adopted catalog group
+// without retaining a mutable descriptor reference or racing registration.
+func (s *NodeStore) GroupDescriptors() ([]GroupDescriptor, error) {
+	if s == nil {
+		return nil, ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.usable(); err != nil {
+		return nil, err
+	}
+	return slices.Clone(s.descriptors), nil
+}
 
 func (s *NodeStore) SetDataSyncForTesting(sync func(*os.File) error) {
 	s.engine.SetDataSyncForTesting(sync)
@@ -1840,6 +1963,26 @@ func (v *GroupView) NodeIncarnation() (uint64, error) {
 	return state.NodeIncarnation, nil
 }
 
+// ReadyCursor returns the authenticated persistence sequence for the current
+// incarnation. A recovered runtime that retains that certified incarnation
+// must continue after this cursor instead of reusing ReadyID one.
+func (v *GroupView) ReadyCursor() (incarnation, readyID uint64, err error) {
+	v.store.mu.Lock()
+	defer v.store.mu.Unlock()
+	if err := v.store.usable(); err != nil {
+		return 0, 0, err
+	}
+	state, ok := v.store.engine.Summary(v.group)
+	if !ok || state.NodeIncarnation == 0 {
+		return 0, 0, ErrInvalid
+	}
+	readyID = state.ReadyID
+	if hint, ok := v.store.commitHints[v.group]; ok {
+		readyID = max(readyID, hint.readyID)
+	}
+	return state.NodeIncarnation, readyID, nil
+}
+
 // NodeIdentity returns the immutable physical-node identity authenticated by
 // this group view's owning node log.
 func (v *GroupView) NodeIdentity() (NodeIdentity, error) {
@@ -1874,7 +2017,13 @@ func (v *GroupView) CapacityProfile() (CapacityProfile, error) {
 
 func (s *NodeStore) rebuildDescriptors(limit int) error {
 	metadata, ok := s.engine.Metadata(nodeDescriptorGroup)
-	if !ok || metadata.LastIndex == 0 || metadata.LastIndex > uint64(limit) || metadata.Hard.Term != 1 || metadata.Hard.Vote != 0 || metadata.Hard.Commit != metadata.LastIndex {
+	if !ok || metadata.LastIndex > uint64(limit) || metadata.Hard.Term != 1 || metadata.Hard.Vote != 0 || metadata.Hard.Commit != metadata.LastIndex {
+		return ErrCorrupt
+	}
+	// A prepared capacity node has a durable descriptor-group hard state but
+	// no descriptors until its first enrollment. Accept only that exact genesis
+	// state; an absent or partially truncated descriptor catalog is corruption.
+	if metadata.LastIndex == 0 && metadata != (seglog.GroupMetadata{Hard: seglog.HardState{Term: 1}, FirstIndex: 1}) {
 		return ErrCorrupt
 	}
 	descriptors := make([]GroupDescriptor, 0, limit)
@@ -1915,11 +2064,27 @@ func (s *NodeStore) rebuildDescriptors(limit int) error {
 		descriptors = append(descriptors, descriptor)
 		order = append(order, uint32(len(descriptors)-1))
 	}
-	slices.SortFunc(order, func(a, b uint32) int { return bytes.Compare(descriptors[a].GroupID[:], descriptors[b].GroupID[:]) })
-	for i := 1; i < len(order); i++ {
-		if bytes.Compare(descriptors[order[i-1]].GroupID[:], descriptors[order[i]].GroupID[:]) >= 0 {
-			return ErrCorrupt
+	// Every replica keeps its immutable log. The latest authenticated
+	// descriptor for each group is the only current lookup target.
+	order = order[:0]
+	for index, descriptor := range descriptors {
+		position, found := slices.BinarySearchFunc(order, descriptor.GroupID, func(i uint32, group [16]byte) int {
+			return bytes.Compare(descriptors[i].GroupID[:], group[:])
+		})
+		if found {
+			if !replacementDescriptor(descriptors[order[position]], descriptor) {
+				return ErrCorrupt
+			}
+			for _, prior := range descriptors[:index] {
+				if prior.GroupID == descriptor.GroupID && (prior.MemberID == descriptor.MemberID || prior.StoreID == descriptor.StoreID) {
+					return ErrCorrupt
+				}
+			}
+		} else {
+			order = append(order, 0)
+			copy(order[position+1:], order[position:len(order)-1])
 		}
+		order[position] = uint32(index)
 	}
 	s.descriptors, s.descriptorOrder, s.nextLogKey = descriptors, order, uint64(len(descriptors))+1
 	return nil
@@ -2280,4 +2445,12 @@ func writeNodeMeta(dir string, identity NodeIdentity, key Key, logID [16]byte, b
 		return err
 	}
 	return errors.Join(directory.Sync(), directory.Close())
+}
+
+func replacementDescriptor(previous, next GroupDescriptor) bool {
+	if previous.MemberID == next.MemberID || previous.StoreID == next.StoreID {
+		return false
+	}
+	next.LogKey, next.MemberID, next.StoreID = previous.LogKey, previous.MemberID, previous.StoreID
+	return next == previous
 }

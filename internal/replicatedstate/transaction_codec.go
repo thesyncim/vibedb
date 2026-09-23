@@ -125,10 +125,10 @@ type TransactionControl struct {
 	// cancellation witnesses. It binds a missing target's exact manifest
 	// position without growing every durable control.
 	TargetOrdinal uint32
-	// PrepareResultCode is the immutable vote produced by an atomic
-	// stage+prepare. Zero denotes a legacy split-stage control which has not yet
-	// recorded a vote; the durable nonzero values are ResultApplied,
-	// ResultIndexConflict, and ResultWrongShard.
+	// PrepareResultCode is the immutable prepare vote. For non-fused controls,
+	// zero means no vote. Fused direct controls encode ResultIntentBusy in the
+	// otherwise-unused zero vote bits; the explicit FusedPath flag disambiguates
+	// it from legacy split-stage controls and cancellation witnesses.
 	PrepareResultCode uint32
 	// FusedPath permanently distinguishes controls created by atomic prepare
 	// operations from legacy split controls. The bit survives finish/retire so
@@ -339,6 +339,12 @@ func AppendTransactionControl(dst []byte, control TransactionControl) ([]byte, e
 		frame[15] |= 2 << 4
 	case ResultWrongShard:
 		frame[15] |= 3 << 4
+	case ResultIntentBusy:
+		// Fused direct controls use the otherwise-unused zero vote as the
+		// durable IntentBusy witness. Non-fused controls keep zero as "no vote".
+		if !transactionDirectIntentBusyResult(control) {
+			return dst[:start], ErrTransactionStateCorrupt
+		}
 	default:
 		return dst[:start], ErrTransactionStateCorrupt
 	}
@@ -440,6 +446,9 @@ func OpenTransactionControlInto(
 	view.CoordinatorDecision = distributedtxn.CoordinatorState((src[15] >> 1) & 7)
 	switch (src[15] >> 4) & 3 {
 	case 0:
+		if view.FusedPath && !view.CancellationWitness {
+			view.PrepareResultCode = ResultIntentBusy
+		}
 	case 1:
 		view.PrepareResultCode = ResultApplied
 	case 2:
@@ -1011,7 +1020,8 @@ func transactionControlValid(control TransactionControl) bool {
 		control.CoordinatorTargetOrdinal != 0 ||
 		(control.PrepareResultCode != 0 && control.PrepareResultCode != ResultApplied &&
 			control.PrepareResultCode != ResultIndexConflict &&
-			control.PrepareResultCode != ResultWrongShard) {
+			control.PrepareResultCode != ResultWrongShard &&
+			!transactionDirectIntentBusyResult(control)) {
 		return false
 	}
 	if (control.PrepareResultCode != 0) !=
@@ -1035,6 +1045,16 @@ func transactionControlValid(control TransactionControl) bool {
 	default:
 		return !control.AffectedRowsValid && control.AffectedRows == 0
 	}
+}
+
+func transactionDirectIntentBusyResult(control TransactionControl) bool {
+	return control.PrepareResultCode == ResultIntentBusy &&
+		control.Role == distributedtxn.ReplicatedRoleTarget && control.FusedPath &&
+		!control.CancellationWitness &&
+		distributedtxn.TargetState(control.State) == distributedtxn.TargetReleased &&
+		control.LastOperation == distributedtxn.ReplicatedApplySingleTarget &&
+		control.PrepareResultCode == control.LastResultCode &&
+		control.LastExpectedRevision == control.Revision
 }
 
 func transactionCoordinatorAffectedRowsValid(control TransactionControl) bool {

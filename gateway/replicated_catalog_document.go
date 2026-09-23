@@ -47,6 +47,9 @@ var (
 		'o', 'p', 'e', 'r', 'a', 't', 'i', 'o', 'n', '/',
 		'd', 'i', 'r', 'e', 'c', 't', 'o', 'r', 'y',
 	}
+	replicatedServiceDirectoryDocumentID = [...]byte{
+		's', 'e', 'r', 'v', 'i', 'c', 'e', '/', 'd', 'i', 'r', 'e', 'c', 't', 'o', 'r', 'y',
+	}
 	replicatedOperationDocumentPrefix = [...]byte{
 		'o', 'p', 'e', 'r', 'a', 't', 'i', 'o', 'n', '/',
 	}
@@ -58,6 +61,9 @@ var (
 	replicatedCatalogGenesisKey     = fixedControlPlaneKey(replicatedCatalogGenesisDocumentID[:])
 	replicatedOperationDirectoryKey = fixedControlPlaneKey(
 		replicatedOperationDirectoryDocumentID[:],
+	)
+	replicatedServiceDirectoryKey = fixedControlPlaneKey(
+		replicatedServiceDirectoryDocumentID[:],
 	)
 )
 

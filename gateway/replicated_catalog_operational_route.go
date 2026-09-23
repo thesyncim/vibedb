@@ -3,28 +3,51 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
+// catalogProbeResultError adds the fixed identity and raft fields needed to
+// diagnose a failed startup discovery. The response remains the authenticated
+// wire result; this only formats local context around the original error.
+func catalogProbeResultError(endpoint ReplicatedEndpoint, response *shardservice.ReplicatedResponse, cause error) error {
+	if response == nil {
+		return fmt.Errorf("gateway: catalog probe member=%d endpoint=%q response=nil: %w", endpoint.Member, endpoint.Address, cause)
+	}
+	state := response.State
+	return fmt.Errorf("gateway: catalog probe member=%d endpoint=%q kind=%d refusal=%d has_state=%t state_member=%d state_store=%x state_incarnation=%d leader=%d term=%d commit=%d applied=%d checkpoint=%d: %w",
+		endpoint.Member, endpoint.Address, response.Kind, response.Refusal, response.HasState,
+		state.Fence.MemberID, state.Fence.StoreID, state.Fence.NodeIncarnation,
+		state.LeaderID, state.Fence.Term, state.Commit, state.Applied, state.CheckpointApplied, cause)
+}
+
 func catalogBootstrapRoute(route ReplicatedRoute) bool {
 	return validReplicatedRoute(route) && route.Distribution == ReplicatedCatalogDistribution &&
 		route.Shard == ReplicatedCatalogShard
 }
 
-// The catalog RF3 is the authority for its own placement. Its bootstrap
-// coordinates cannot also require a catalog publication between each adjacent
-// membership step: that would prevent the controller from journaling the step.
-// Only placement coordinates may advance. Policy, protection, schema, full
-// group/allocation, and authenticated physical member identities remain exact.
-func catalogCommandProgression(before, after raftservice.CommandFence) bool {
+// CatalogCommandProgression reports whether a retained catalog command may be
+// used by the private genesis/recovery path. The catalog RF3 is the authority
+// for its own placement, so its bootstrap coordinates cannot also require a
+// catalog publication between each adjacent membership step: that would
+// prevent the controller from journaling the step. Only placement coordinates
+// may advance. Policy, protection, schema, full group/allocation, and
+// authenticated physical member identities remain exact.
+func CatalogCommandProgression(before, after raftservice.CommandFence) bool {
 	return before.Valid() && after.Valid() && before.ActivePolicyGeneration == after.ActivePolicyGeneration &&
 		before.ProtectionEpoch == after.ProtectionEpoch && before.SchemaGeneration == after.SchemaGeneration &&
 		before.RelationManifestDigest == after.RelationManifestDigest &&
 		after.ReplicaSetVersion >= before.ReplicaSetVersion && after.OwnershipEpoch >= before.OwnershipEpoch &&
 		after.RoutingVersion >= before.RoutingVersion && after.RouteGeneration >= before.RouteGeneration
+}
+
+func catalogCommandProgression(before, after raftservice.CommandFence) bool {
+	return CatalogCommandProgression(before, after)
 }
 
 func (session *NativeSession) catalogOperationalRoute(ctx context.Context) (ReplicatedRoute, error) {
@@ -41,15 +64,54 @@ func (executor *ReplicatedExecutor) catalogOperationalRoute(ctx context.Context,
 	if executor == nil || ctx == nil || !catalogBootstrapRoute(bootstrap) {
 		return ReplicatedRoute{}, ErrReplicatedCatalog
 	}
+	route, err := executor.catalogOperationalRouteOnce(ctx, bootstrap, snapshot)
+	if err == nil || !retryCatalogDiscovery(err) {
+		return route, err
+	}
+	// A fast authenticated leaderless response must not exhaust the proposal
+	// count before an election finishes. Discovery is read-only: give readiness
+	// the configured attempt timeout, bounded further by the caller's deadline.
+	// Create the recovery timer only after a transient failure; normal discovery
+	// retains its single-sweep fast path. Identity and authority failures remain
+	// terminal, and mutating proposals retain their separate attempt bound.
+	recoveryCtx, cancel := context.WithTimeout(ctx, executor.attemptTimeout)
+	defer cancel()
 	for attempt := 0; ; attempt++ {
-		route, err := executor.catalogOperationalRouteOnce(ctx, bootstrap, snapshot)
-		if err == nil || !errors.Is(err, errReplicatedLeaderUnobserved) || attempt+1 >= executor.maxAttempts {
-			return route, err
-		}
-		if waitErr := waitReplicatedFailoverRetry(ctx, attempt); waitErr != nil {
+		if waitErr := waitReplicatedFailoverRetry(recoveryCtx, attempt); waitErr != nil {
 			return ReplicatedRoute{}, errors.Join(err, waitErr)
 		}
+		route, err = executor.catalogOperationalRouteOnce(recoveryCtx, bootstrap, snapshot)
+		if err == nil || !retryCatalogDiscovery(err) {
+			return route, err
+		}
 	}
+}
+
+func retryCatalogDiscovery(err error) bool {
+	// Each failed transport checkout is discarded by the authenticated pool.
+	// All three retained streams can have expired while the catalog was idle,
+	// so a sweep consisting entirely of EOFs must be allowed to dial afresh.
+	// Keep identity, command-fence and authorization failures terminal even
+	// when another candidate in the same sweep has a transport failure.
+	if !errors.Is(err, ErrReplicatedLeader) || errors.Is(err, ErrReplicatedRoute) ||
+		errors.Is(err, ErrReplicatedUnauthorized) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var refusal *ReplicatedRefusalError
+	if errors.As(err, &refusal) && refusal.Code == shardservice.ReplicatedRefusalUnavailable {
+		// A physical receiver can answer before its canonical service-directory
+		// gate is installed. This is a bounded readiness condition, not a
+		// reachable-leader failure: retry the complete authenticated sweep so a
+		// later gate installation can be observed. Other typed refusals remain
+		// terminal above or below.
+		return true
+	}
+	if errors.Is(err, errReplicatedLeaderUnobserved) || errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError)
 }
 
 func (executor *ReplicatedExecutor) catalogOperationalRouteOnce(ctx context.Context, bootstrap ReplicatedRoute,
@@ -67,8 +129,9 @@ func (executor *ReplicatedExecutor) catalogOperationalRouteOnce(ctx context.Cont
 		if ok {
 			count = copy(candidates[:], membership.Serving.Replicas)
 		}
-		if ok && membership.HasEnrolledTarget && !replicatedRouteContainsMember(membership.Serving, membership.EnrolledTarget.Member) {
-			candidates[count] = membership.EnrolledTarget
+		transitionReplica := membership.extraControlEndpoint()
+		if ok && transitionReplica.Member != 0 && !replicatedRouteContainsMember(membership.Serving, transitionReplica.Member) {
+			candidates[count] = transitionReplica
 			count++
 		}
 	}
@@ -92,6 +155,9 @@ func (executor *ReplicatedExecutor) catalogOperationalRouteOnce(ctx context.Cont
 			}
 		}
 		route.Replicas[index] = endpoint
+		if !clearPromotedCatalogDiscoveryHint(&route) {
+			return ReplicatedRoute{}, ErrReplicatedRoute
+		}
 		executor.leaderHints.publish(route, endpoint, state)
 		return route, nil
 	}
@@ -121,28 +187,39 @@ func (executor *ReplicatedExecutor) catalogOperationalRouteOnce(ctx context.Cont
 		} else {
 			response, err = executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
 				Operation: shardservice.ReplicatedProbe, Capability: serviceauthz.CapabilityTopology,
-				Fence: shardservice.ReplicatedFence{Group: bootstrap.Group, AllocationGeneration: bootstrap.AllocationGeneration},
+				Fence: shardservice.ReplicatedFence{Group: bootstrap.Group, AllocationGeneration: bootstrap.AllocationGeneration,
+					Command: bootstrap.Command},
 			})
 		}
 		if err != nil {
-			joined = errors.Join(joined, err)
+			joined = errors.Join(joined, catalogProbeResultError(endpoint, response, err))
+			continue
+		}
+		if validReplicatedUnavailableWithoutState(response) {
+			// A mandatory service-directory gate can be absent while the physical
+			// receiver is still installing the certified cut. Keep this probe in
+			// the bounded discovery sweep; an installed gate's Unauthorized reply
+			// remains terminal below.
+			joined = errors.Join(joined, catalogProbeResultError(endpoint, response,
+				&ReplicatedRefusalError{Code: response.Refusal}))
 			continue
 		}
 		if validReplicatedUnauthorizedWithoutState(response) {
-			return ReplicatedRoute{}, &ReplicatedRefusalError{Code: response.Refusal}
+			return ReplicatedRoute{}, catalogProbeResultError(endpoint, response, &ReplicatedRefusalError{Code: response.Refusal})
 		}
 		if response == nil || !catalogCommandProgression(bootstrap.Command, response.State.Fence.Command) {
-			joined = errors.Join(joined, ErrReplicatedRoute)
+			joined = errors.Join(joined, catalogProbeResultError(endpoint, response, ErrReplicatedRoute))
 			continue
 		}
 		route := bootstrap
 		route.Command = response.State.Fence.Command
 		observed, bindErr := bindReplicatedObservation(route, endpoint, response)
 		if bindErr != nil || response.State.LeaderID != endpoint.Member {
-			joined = errors.Join(joined, bindErr)
+			cause := bindErr
 			if bindErr == nil {
-				joined = errors.Join(joined, errReplicatedLeaderUnobserved)
+				cause = errReplicatedLeaderUnobserved
 			}
+			joined = errors.Join(joined, catalogProbeResultError(endpoint, response, cause))
 			continue
 		}
 		// This is an ephemeral control reachability set, never a published
@@ -154,6 +231,9 @@ func (executor *ReplicatedExecutor) catalogOperationalRouteOnce(ctx context.Cont
 		} else {
 			route.Replicas[index] = observed
 		}
+		if !clearPromotedCatalogDiscoveryHint(&route) {
+			return ReplicatedRoute{}, ErrReplicatedRoute
+		}
 		executor.leaderHints.publish(route, observed, response.State)
 		return route, nil
 	}
@@ -161,4 +241,35 @@ func (executor *ReplicatedExecutor) catalogOperationalRouteOnce(ctx context.Cont
 		joined = errReplicatedLeaderUnobserved
 	}
 	return ReplicatedRoute{}, errors.Join(ErrReplicatedLeader, joined)
+}
+
+func clearPromotedCatalogDiscoveryHint(route *ReplicatedRoute) bool {
+	if route == nil || !route.hasDiscoveryReplica {
+		return true
+	}
+	for _, serving := range route.Replicas {
+		if serving.Member != route.discoveryReplica.Member {
+			if serving.Node == route.discoveryReplica.Node || serving.StoreID == route.discoveryReplica.StoreID {
+				// A node hosts at most one member of a group. A different,
+				// freshly authenticated member on the hint's node or store proves
+				// the hint names a retired placement: the member moved away and
+				// the node was later reused for this group. It can no longer help
+				// discovery, and keeping it would invalidate every route.
+				route.discoveryReplica = ReplicatedEndpoint{}
+				route.hasDiscoveryReplica = false
+				break
+			}
+			continue
+		}
+		if serving.Node != route.discoveryReplica.Node || serving.StoreID != route.discoveryReplica.StoreID {
+			return false
+		}
+		// The hint has become one of the freshly authenticated serving
+		// candidates. Its runtime incarnation may have advanced since the
+		// bootstrap image, but member/node/store identity is stable.
+		route.discoveryReplica = ReplicatedEndpoint{}
+		route.hasDiscoveryReplica = false
+		break
+	}
+	return validReplicatedRoute(*route)
 }

@@ -513,6 +513,95 @@ func TestTransactionSingleTargetAppliesAndRetainsExactResultInOneEntry(t *testin
 	}
 }
 
+func TestSingleTargetIntentBusyIsRetainedAndReleasedRetryCanApply(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	key := []byte("owned-by-transaction")
+	value := []byte(`{"id":"owned-by-transaction","v":1}`)
+	stageID := transactionCodecID(247)
+	stageBatches := []replication.RelationMutationBatch{{
+		Relation: 1,
+		Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsentOrEqual, Key: key, Value: value,
+		}},
+	}}
+	stage := transactionTargetStageCommand(t, fixture, stageID, stageBatches)
+	applyTransactionCommand(t, fixture.machine, 3, stage)
+
+	makeDirect := func(id distributedtxn.ID, sequence uint64) []byte {
+		batches := []replication.RelationMutationBatch{{
+			Relation: 1,
+			Mutations: []replication.Mutation{{
+				Kind: replication.MutationPutAbsentOrEqual, Key: key, Value: value,
+			}},
+		}}
+		control := fusedTargetControl(
+			t, fixture, id, distributedtxn.ReplicatedApplySingleTarget, sequence, batches,
+		)
+		return transactionCompletionCommand(t, fixture.binding, control, batches)
+	}
+	directID := transactionCodecID(248)
+	direct := makeDirect(directID, 1)
+	if err := fixture.machine.AdmitCommand(direct); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.machine.ApplyNormal(normalMeta(4), direct); err != nil {
+		t.Fatal(err)
+	}
+	completion, result := openTransactionCompletion(t, fixture.machine, direct)
+	if completion.ResultCode != ResultIntentBusy || result.AffectedRowsValid || result.Revision != 1 {
+		t.Fatalf("blocked direct completion=%+v result=%+v", completion, result)
+	}
+	controlKey, _ := TransactionControlStorageKey(distributedtxn.ReplicatedRoleTarget, directID)
+	witness, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
+	if err != nil || !found {
+		t.Fatalf("read intent-busy witness: found=%v err=%v", found, err)
+	}
+	retained, err := OpenTransactionControl(witness)
+	if err != nil || retained.PrepareResultCode != ResultIntentBusy ||
+		retained.LastResultCode != ResultIntentBusy ||
+		retained.LastOperation != distributedtxn.ReplicatedApplySingleTarget ||
+		!retained.FusedPath || retained.AffectedRowsValid {
+		t.Fatalf("intent-busy witness=%+v err=%v", retained.TransactionControl, err)
+	}
+
+	if err := fixture.machine.AdmitCommand(direct); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.machine.ApplyNormal(normalMeta(5), direct); err != nil {
+		t.Fatal(err)
+	}
+	retryCompletion, retryResult := openTransactionCompletion(t, fixture.machine, direct)
+	if retryCompletion.ResultCode != ResultIntentBusy || retryResult != result {
+		t.Fatalf("exact retry completion=%+v result=%+v want=%+v", retryCompletion, retryResult, result)
+	}
+	witnessAfter, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
+	if err != nil || !found || !bytes.Equal(witnessAfter, witness) {
+		t.Fatalf("exact retry changed witness: found=%v equal=%v err=%v", found, bytes.Equal(witnessAfter, witness), err)
+	}
+
+	abort := transactionTargetTransitionCommand(
+		t, fixture, stageID, distributedtxn.ReplicatedAbortTarget, 1,
+	)
+	applyTransactionCommand(t, fixture.machine, 6, abort)
+	release := transactionTargetTransitionCommand(
+		t, fixture, stageID, distributedtxn.ReplicatedReleaseTarget, 2,
+	)
+	applyTransactionCommand(t, fixture.machine, 7, release)
+
+	newID := transactionCodecID(249)
+	newRequest := makeDirect(newID, 2)
+	if err := fixture.machine.AdmitCommand(newRequest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.machine.ApplyNormal(normalMeta(8), newRequest); err != nil {
+		t.Fatal(err)
+	}
+	newCompletion, newResult := openTransactionCompletion(t, fixture.machine, newRequest)
+	if newCompletion.ResultCode != ResultApplied || !newResult.AffectedRowsValid || newResult.AffectedRows != 1 {
+		t.Fatalf("new identity after release completion=%+v result=%+v", newCompletion, newResult)
+	}
+}
+
 func TestTransactionFusedPrepareApplyReleaseIsOneAtomicFinish(t *testing.T) {
 	fixture := newRelationBundleFixture(t, true)
 	id := transactionCodecID(241)
@@ -1602,6 +1691,24 @@ func TestSingleTargetConditionalUpdateIsAtomicAndReplayStable(t *testing.T) {
 	value, found, err := fixture.base.Collection.AppendRaw(nil, key)
 	if err != nil || !found || !bytes.Equal(value, after) {
 		t.Fatalf("conditional update value=%s found=%v err=%v", value, found, err)
+	}
+	controlKey, _ := TransactionControlStorageKey(distributedtxn.ReplicatedRoleTarget, id)
+	witness, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
+	if err != nil || !found {
+		t.Fatalf("read stale-guard witness: found=%v err=%v", found, err)
+	}
+	if err := fixture.machine.AdmitCommand(stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.machine.ApplyNormal(normalMeta(7), stale); err != nil {
+		t.Fatal(err)
+	}
+	retryCompletion, retryResult := openTransactionCompletion(t, fixture.machine, stale)
+	witnessAfter, found, err := fixture.system.Collection.AppendRaw(nil, controlKey[:])
+	if err != nil || !found || retryCompletion.ResultCode != ResultIndexConflict ||
+		retryResult.AffectedRowsValid || !bytes.Equal(witnessAfter, witness) {
+		t.Fatalf("exact stale-guard retry=%+v result=%+v witnessEqual=%t found=%t err=%v",
+			retryCompletion, retryResult, bytes.Equal(witnessAfter, witness), found, err)
 	}
 }
 

@@ -18,6 +18,9 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftserve"
+	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/storeio"
@@ -41,6 +44,7 @@ type postgresDirectPending struct {
 	identity durableExecBatchIdentity
 	queries  []gateway.Query
 	plan     *gateway.DurableSQLDirectPlan
+	unknown  bool
 }
 type postgresDirectSlot struct {
 	index       int
@@ -65,6 +69,9 @@ type postgresDirectPool struct {
 	service  postgresDurableService
 	prepared postgresPreparedDirectService
 	slots    chan *postgresDirectSlot
+	// admissionWindow bounds waiting for catalog convergence after
+	// pre-admission refusals; zero uses preAdmissionWriteRecoveryWindow.
+	admissionWindow time.Duration
 }
 
 func openPostgresDirectPool(path string, authority serviceauthz.Authority, service postgresDurableService) (_ *postgresDirectPool, err error) {
@@ -296,9 +303,21 @@ func postgresWriteQueryNeedsSizeCheck(q gateway.Query) bool {
 func (p *postgresDirectPool) resolve(ctx context.Context, slot *postgresDirectSlot) (*gateway.Result, error) {
 	pending := slot.pending
 	region := trace.StartRegion(ctx, "pg.direct.execute")
-	result, err := p.prepared.ExecutePreparedDirectBatch(ctx, p.record.Authority, pending.identity, pending.queries, pending.plan)
+	result, err := p.prepared.ExecutePreparedDirectBatch(
+		ctx, p.record.Authority, pending.identity, pending.queries, pending.plan, pending.unknown,
+	)
 	region.End()
 	if errors.Is(err, gateway.ErrDurableSQLAborted) {
+		if os.Getenv("VIBEDB_RF3_DIAGNOSTIC_ABORT_REASON") == "1" {
+			queryDigest := sha256.Sum256([]byte(pending.queries[0].SQL))
+			fmt.Fprintf(os.Stderr,
+				"VIBEDB_RF3_DIRECT_ABORT_ATTEMPT time=%s issuer_sequence=%d request_id=%x installation=%x epoch=%d issuer_lane=%d pool_lane=%d prior_unknown=%t group=%v allocation_generation=%d query_sha256=%x error=%q\n",
+				time.Now().UTC().Format(time.RFC3339Nano), pending.identity.IssuerSequence, pending.identity.RequestID,
+				pending.identity.Reference.Installation, pending.identity.Reference.Epoch,
+				pending.identity.Reference.LaneOrdinal, slot.index, pending.unknown,
+				pending.plan.Target.Route.Group, pending.plan.Target.Route.AllocationGeneration,
+				queryDigest, err)
+		}
 		slot.pending = nil
 		return nil, err
 	}
@@ -306,6 +325,11 @@ func (p *postgresDirectPool) resolve(ctx context.Context, slot *postgresDirectSl
 		err = errInvalidDurableRequestAdapter
 	}
 	if err != nil {
+		if !pending.unknown && errors.Is(err, gateway.ErrDurableSQLNotAdmitted) {
+			slot.pending = nil
+			return nil, err
+		}
+		pending.unknown = true
 		return nil, postgresDirectUnknown(pending.identity.RequestID, err)
 	}
 	slot.pending = nil
@@ -316,22 +340,72 @@ func (p *postgresDirectPool) resolve(ctx context.Context, slot *postgresDirectSl
 // therefore be retried without creating an ambiguous write. Wait instead of
 // spinning through every replica while the leader's response budget is full.
 func (p *postgresDirectPool) prepare(ctx context.Context, id durableExecBatchIdentity, queries []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
-	for attempt := 0; ; attempt++ {
+	return p.prepareWithServingFenceWindow(ctx, id, queries, 10*time.Second)
+}
+
+func (p *postgresDirectPool) prepareWithServingFenceWindow(
+	ctx context.Context,
+	id durableExecBatchIdentity,
+	queries []gateway.Query,
+	servingFenceWindow time.Duration,
+) (*gateway.DurableSQLDirectPlan, error) {
+	var servingFenceUntil time.Time
+	transientAttempt := 0
+	for {
 		plan, err := p.prepared.PrepareDirectBatch(ctx, p.record.Authority, id, queries)
-		if err == nil || attempt == 7 || ctx.Err() != nil ||
-			errors.Is(err, gateway.ErrReplicatedMembershipTransition) ||
-			errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		if err == nil {
+			return plan, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, errors.Join(err, ctxErr)
+		}
+		if errors.Is(err, gateway.ErrReplicatedUnauthorized) ||
+			errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return plan, err
+		}
+		if postgresDirectServingFenceRetry(err) {
+			if servingFenceUntil.IsZero() {
+				servingFenceUntil = time.Now().Add(servingFenceWindow)
+			}
+			remaining := time.Until(servingFenceUntil)
+			if remaining <= 0 {
+				return plan, err
+			}
+			delay := min(100*time.Millisecond, remaining)
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, errors.Join(err, ctx.Err())
+			case <-timer.C:
+				if time.Until(servingFenceUntil) <= 0 {
+					return plan, err
+				}
+			}
+			continue
+		}
+		if transientAttempt == 7 ||
+			errors.Is(err, gateway.ErrReplicatedRoute) ||
 			!(errors.Is(err, raftmodel.ErrAdmissionBound) || errors.Is(err, gateway.ErrReplicatedLeader) || errors.Is(err, gateway.ErrReplicatedReadBehind)) {
 			return plan, err
 		}
-		timer := time.NewTimer(time.Duration(1<<min(attempt, 4)) * time.Millisecond)
+		timer := time.NewTimer(time.Duration(1<<min(transientAttempt, 4)) * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return nil, errors.Join(err, ctx.Err())
 		case <-timer.C:
 		}
+		transientAttempt++
 	}
+}
+
+func postgresDirectServingFenceRetry(err error) bool {
+	return err != nil && errors.Is(err, gateway.ErrDurableSQLNotAdmitted) &&
+		errors.Is(err, raftservice.ErrServingFence) &&
+		!errors.Is(err, durable.ErrCommitOutcomeUnknown) &&
+		!errors.Is(err, gateway.ErrReplicatedUnauthorized) &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 // handled=false is possible only before a proposal. Unknown commands are never
@@ -369,7 +443,13 @@ func (p *postgresDirectPool) Write(ctx context.Context, q gateway.Query) (*gatew
 		}
 	}
 	queries := []gateway.Query{owned}
-	for attempt := 0; attempt < 8; attempt++ {
+	const maxAbortedWrites = 8
+	var abortedWrites, admissionRefusals int
+	// Pre-admission refusals persist until the catalog publication for an
+	// applied membership or ownership transition reaches this gateway; wait for
+	// that convergence within a time budget, not a fixed number of probes.
+	var admissionDeadline time.Time
+	for {
 		if err = ctx.Err(); err != nil {
 			return nil, true, err
 		}
@@ -388,11 +468,100 @@ func (p *postgresDirectPool) Write(ctx context.Context, q gateway.Query) (*gatew
 		}
 		slot.pending = &postgresDirectPending{identity: id, queries: queries, plan: plan}
 		result, err := p.resolve(ctx, slot)
-		if !errors.Is(err, gateway.ErrDurableSQLAborted) {
+		aborted := errors.Is(err, gateway.ErrDurableSQLAborted)
+		retryAborted := aborted && postgresDirectAbortRetry(err)
+		retryAdmission := slot.pending == nil && postgresDirectPreAdmissionRetry(err)
+		if aborted && !retryAborted {
+			return nil, true, err
+		}
+		if !retryAborted && !retryAdmission {
 			return result, true, err
 		}
+		if retryAborted {
+			abortedWrites++
+			if abortedWrites == maxAbortedWrites {
+				return nil, true, err
+			}
+			continue
+		}
+		if admissionRefusals == 0 {
+			window := p.admissionWindow
+			if window <= 0 {
+				window = preAdmissionWriteRecoveryWindow
+			}
+			admissionDeadline = time.Now().Add(window)
+		} else if !time.Now().Before(admissionDeadline) {
+			return nil, true, err
+		}
+		timer := time.NewTimer(preAdmissionWriteRetryDelay(admissionRefusals))
+		admissionRefusals++
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, true, errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+		// Never mint a new identity for a write the cluster may already hold
+		// when the original one can still settle it. While the logical route
+		// is unchanged (a replica move or ownership advance, not a split),
+		// re-drive this exact identity through direct recovery: the target's
+		// durable transaction control returns the retained outcome if the
+		// refused-looking attempt was in fact admitted, or applies it once.
+		// A new identity on the same route would turn such an attempt into a
+		// duplicate write (an IndexConflict on the client's own row).
+		if current, prepareErr := p.prepare(ctx, id, queries); prepareErr == nil && current != nil &&
+			gateway.DirectMutationRecoverableRoute(plan.Target.Route, current.Target.Route) {
+			slot.pending = &postgresDirectPending{identity: id, queries: queries, plan: plan, unknown: true}
+			for {
+				result, err = p.resolve(ctx, slot)
+				if err == nil || !postgresDirectRecoveryRefused(err) || !time.Now().Before(admissionDeadline) {
+					break
+				}
+				// Every retry reuses this identity, so waiting for the route to
+				// converge cannot duplicate the write.
+				timer := time.NewTimer(preAdmissionWriteRetryDelay(admissionRefusals))
+				admissionRefusals++
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return nil, true, errors.Join(err, ctx.Err())
+				case <-timer.C:
+				}
+			}
+			if !errors.Is(err, gateway.ErrDurableSQLAborted) {
+				return result, true, err
+			}
+			if !postgresDirectAbortRetry(err) {
+				return nil, true, err
+			}
+			abortedWrites++
+			if abortedWrites == maxAbortedWrites {
+				return nil, true, err
+			}
+		}
 	}
-	return nil, true, gateway.ErrDurableSQLAborted
+}
+
+// postgresDirectRecoveryRefused reports that a retained-identity recovery
+// attempt was itself refused before admission because the route has not yet
+// converged. The earlier attempt's outcome is still unknown, but retrying the
+// same identity is safe.
+func postgresDirectRecoveryRefused(err error) bool {
+	return err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) &&
+		(errors.Is(err, raftservice.ErrServingFence) || errors.Is(err, raftserve.ErrProposalRefused)) &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+}
+
+func postgresDirectAbortRetry(err error) bool {
+	code, ok := gateway.DurableSQLAbortResultCode(err)
+	return ok && (code == replicatedstate.ResultIntentBusy ||
+		code == replicatedstate.ResultTransactionConflict)
+}
+
+func postgresDirectPreAdmissionRetry(err error) bool {
+	return err != nil && errors.Is(err, gateway.ErrDurableSQLNotAdmitted) &&
+		!errors.Is(err, durable.ErrCommitOutcomeUnknown) &&
+		(errors.Is(err, raftservice.ErrServingFence) || errors.Is(err, raftserve.ErrProposalRefused))
 }
 
 // A context-aware, writer-preferring table gate lets direct requests overlap

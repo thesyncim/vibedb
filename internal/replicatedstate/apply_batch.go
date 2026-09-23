@@ -202,19 +202,6 @@ func (workspace *normalBatchWorkspace) attemptedOverlay(ordinal int) *logicalOve
 	return &workspace.attemptedExtra[ordinal]
 }
 
-func isSingleTargetBatchCommand(data []byte) bool {
-	command, err := replication.OpenCommand(data)
-	return err == nil && isSingleTargetCommand(command)
-}
-
-func isSingleTargetCommand(command replication.CommandView) bool {
-	if command.Kind() != replication.CommandTransaction {
-		return false
-	}
-	control, err := distributedtxn.OpenReplicatedCommand(command.TransactionBytes())
-	return err == nil && control.Operation == distributedtxn.ReplicatedApplySingleTarget
-}
-
 // ApplyNormalBatch plans a bounded consecutive normal-entry run against one
 // coherent durable cut plus binary-key logical overlays, then publishes the
 // exact accepted prefix through one CheckpointGroup transaction. It is
@@ -295,22 +282,7 @@ func (m *Machine) applyNormalBatch(
 		return 0, raftmodel.Publication{}, nil
 	}
 
-	var systemBase pointSnapshot
-	var relationSnapshots relationPointSnapshots
-	if isSingleTargetBatchCommand(first.Data) {
-		systemBase.live = m.system.Collection
-		relationSnapshots.count = uint16(len(m.relations))
-		for ordinal := range m.relations {
-			relationSnapshots.values[ordinal].live = m.relations[ordinal].target.Collection
-		}
-	} else {
-		systemSnapshot, snapshots, err := m.captureHotBundleApplyCutLocked()
-		if err != nil {
-			return 0, raftmodel.Publication{}, m.fail(err)
-		}
-		systemBase.value = systemSnapshot
-		relationSnapshots = snapshots
-	}
+	systemBase, relationSnapshots := m.liveBundleApplyCutLocked()
 	batch := normalBatchWorkspacePool.Get().(*normalBatchWorkspace)
 	defer func() {
 		telemetry := normalBatchTelemetry{
@@ -327,9 +299,7 @@ func (m *Machine) applyNormalBatch(
 	}()
 	batch.system.resetPoint(systemBase)
 	if !batch.prepareRelationOverlays(relationSnapshots) {
-		return 0, raftmodel.Publication{}, m.fail(errors.Join(
-			ErrInconsistentSnapshot, m.applyCut.Close(),
-		))
+		return 0, raftmodel.Publication{}, m.fail(ErrInconsistentSnapshot)
 	}
 	planningSnapshots := relationSnapshots
 	for ordinal := range m.relations {
@@ -344,7 +314,7 @@ func (m *Machine) applyNormalBatch(
 		if stateErr == nil {
 			stateErr = ErrStateCorrupt
 		}
-		return 0, raftmodel.Publication{}, m.fail(errors.Join(stateErr, m.applyCut.Close()))
+		return 0, raftmodel.Publication{}, m.fail(stateErr)
 	}
 	stateEnvelopeBytes := len(batch.state)
 	confBytes := proto.Size(m.state.ConfState)
@@ -353,7 +323,7 @@ func (m *Machine) applyNormalBatch(
 	)
 	if stateErr != nil || len(batch.conf) != confBytes {
 		return 0, raftmodel.Publication{}, m.fail(errors.Join(
-			ErrStateCorrupt, stateErr, m.applyCut.Close(),
+			ErrStateCorrupt, stateErr,
 		))
 	}
 	batch.state = batch.state[:0]
@@ -596,13 +566,12 @@ func (m *Machine) applyNormalBatch(
 			finalizeErr = ErrAdmissionBound
 		}
 	}
-	closeErr := m.applyCut.Close()
-	if finalizeErr != nil || closeErr != nil {
+	if finalizeErr != nil {
 		if completions != nil {
 			completions.Reset()
 		}
 		clear(dataChainWitnesses[:planned])
-		return 0, raftmodel.Publication{}, m.fail(errors.Join(finalizeErr, closeErr))
+		return 0, raftmodel.Publication{}, m.fail(finalizeErr)
 	}
 	if planned == 0 {
 		if deferredErr == nil {

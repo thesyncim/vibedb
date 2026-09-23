@@ -120,7 +120,7 @@ func prepareRF3NodeTestInput(t *testing.T) prepareRF3NodeManifest {
 			WAL:       prepareRF3WAL{KeyID: input.NodeLog.KeyID, KeyMaterialPath: keySource, WrappedKey: "opaque-test-key", MaxFileBytes: 256 << 20, MaxRecordBytes: raftstore.DefaultMaxRecordBytes, MaxRecords: 4096, MaxEntries: 16384, MaxLiveBytes: raftstore.DefaultMaxLiveBytes},
 			Apply:     prepareRF3Apply{MaxSessions: 32, RetryWindow: 8, MaxCollections: 16, MaxDocuments: 1024, MaxBytes: 384 << 20, ShardKey: "/id"},
 			Listeners: rf3ManifestListeners{Peer: "127.0.0.1:21001", Native: "127.0.0.1:22001", Snapshot: "127.0.0.1:22501", Control: "127.0.0.1:23001"},
-			TLS:       rf3ManifestTLS{Certificate: credentials[0].Certificate, Key: credentials[0].Key, Roots: roots, IdentityOID: rf3CommandIdentityOID.String()}, AuthorizationPolicy: policy,
+			TLS:       rf3ManifestTLS{PeerKeys: rf3CommandPeerKeys(credentials[0]), Certificate: credentials[0].Certificate, Key: credentials[0].Key, Roots: roots, IdentityOID: rf3CommandIdentityOID.String()}, AuthorizationPolicy: policy,
 			SplitControl: prepareRF3SplitControl{MaxRecords: 4096, MaxFileBytes: 64 << 20, MaxChildOperations: 8, StageCheckpointBytes: 32 << 20},
 		}
 		for j, node := range nodes {
@@ -250,7 +250,7 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 			store[15] += byte(j)
 			member.StoreID = idString(store[:])
 			member.Listeners = rf3ManifestListeners{Peer: addresses[i][0], Native: addresses[i][1], Snapshot: addresses[i][2], Control: addresses[i][3]}
-			member.TLS = rf3ManifestTLS{Certificate: credentials[i].Certificate, Key: credentials[i].Key, Roots: roots, IdentityOID: rf3CommandIdentityOID.String()}
+			member.TLS = rf3ManifestTLS{PeerKeys: rf3CommandPeerKeys(credentials[i]), Certificate: credentials[i].Certificate, Key: credentials[i].Key, Roots: roots, IdentityOID: rf3CommandIdentityOID.String()}
 			member.Members = append([]prepareRF3Member(nil), member.Members...)
 			for k := range member.Members {
 				member.Members[k].PeerAddress = addresses[k][0]
@@ -270,6 +270,18 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 		}
 		profiles = append(profiles, profile)
 		nativeAddresses[i] = addresses[i][1]
+	}
+	owner, err := openRF3NodeOwner(manifests[0], profiles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := prepareRF3GroupSetOnNode(manifests[0], profiles[0], sqldriver.ReplicatedOpenOptions{}, owner)
+	if err != nil {
+		_ = owner.Close()
+		t.Fatal(err)
+	}
+	if err := closePreparedRF3Groups(set.groups, owner.Close()); err != nil {
+		t.Fatal(err)
 	}
 	for restart := range 2 {
 		ctx, cancel := context.WithCancel(t.Context())
@@ -326,8 +338,8 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 			}
 		}
 		t.Cleanup(stop)
-		for _, bundle := range manifests[0].Groups {
-			waitRF3CommandLeader(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration)
+		for index, bundle := range manifests[0].Groups {
+			waitRF3CommandLeaderWithProbeCommand(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration, rf3CommandFenceFromManifestGroup(t, manifests[0], index))
 		}
 		// A diagnostic signal is consumed by the serving loop and must not
 		// terminate the process. Send two snapshots and require the second
@@ -345,8 +357,8 @@ func TestServeRF3NodeLogThreeServersRestart(t *testing.T) {
 				manifests[i] = appendRF3LiveNodeTestGroup(t, inputs[i], manifests[i])
 				reloads[i] <- syscall.SIGHUP
 			}
-			for _, bundle := range manifests[0].Groups {
-				waitRF3CommandLeader(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration)
+			for index, bundle := range manifests[0].Groups {
+				waitRF3CommandLeaderWithProbeCommand(t, nativeAddresses, nodes, profiles, bundle.Route.Group, bundle.Route.AllocationGeneration, template.Groups[0].Authority.ActivePolicyGeneration, rf3CommandFenceFromManifestGroup(t, manifests[0], index))
 			}
 		}
 		stop()

@@ -49,10 +49,16 @@ func (client *AuthenticatedReplicatedClient) probeReplicatedBound(
 	if err != nil {
 		return nil, err
 	}
-	response, err := connection.encoder.RoundTripReplicated(ctx, connection.conn, &shardservice.ReplicatedRequest{
+	request := &shardservice.ReplicatedRequest{
 		Operation: shardservice.ReplicatedProbe, Authority: authority, Capability: capability,
-		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration},
-	})
+		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+			Command: route.Command},
+	}
+	if err := attachFrontendContinuation(ctx, request); err != nil {
+		client.release(connection, false)
+		return nil, err
+	}
+	response, err := connection.encoder.RoundTripReplicated(ctx, connection.conn, request)
 	healthy := err == nil && context.Cause(ctx) == nil
 	if err == nil && !validReplicatedUnauthorizedWithoutState(response) {
 		if catalog && response != nil && catalogCommandProgression(route.Command, response.State.Fence.Command) {
@@ -82,10 +88,8 @@ func bindReplicatedObservation(route ReplicatedRoute, endpoint ReplicatedEndpoin
 			observation := *response
 			observation.Kind, observation.Refusal = shardservice.ReplicatedHandshake, 0
 			if _, err := bindReplicatedObservation(route, endpoint, &observation); err != nil {
-				// Retain the original refusal beside any authenticated
-				// observation hint. A refusal is a terminal sibling for the
-				// SQL transition classifier; it must not be hidden by the
-				// compatibility handshake conversion.
+				// Preserve both the authenticated refusal and the invalid
+				// observation; neither grants serving authority.
 				return ReplicatedEndpoint{}, errors.Join(
 					&ReplicatedRefusalError{Code: response.Refusal}, err,
 				)
@@ -106,25 +110,14 @@ func bindReplicatedObservation(route ReplicatedRoute, endpoint ReplicatedEndpoin
 		return ReplicatedEndpoint{}, ErrReplicatedRoute
 	}
 	if !replicatedObservedCommandMatches(route, fence.Command) {
-		if !route.membershipStable &&
-			fence.Command.ReplicaSetVersion > route.Command.ReplicaSetVersion &&
-			replicatedMembershipTransitionCommandsMatch(route.Command, fence.Command) {
-			return ReplicatedEndpoint{}, &ReplicatedMembershipTransitionError{
-				CatalogCommand: route.Command, ObservedCommand: fence.Command,
-			}
-		}
-		return ReplicatedEndpoint{}, fmt.Errorf("%w: observed command differs: catalog=%+v replica=%+v", ErrReplicatedRoute, route.Command, fence.Command)
+		// The authenticated physical identity matches, but its serving contract
+		// has changed. Reject this route and let the caller refresh the certified
+		// catalog; never adopt command authority from a probe response.
+		return ReplicatedEndpoint{}, fmt.Errorf("%w: observed command differs: catalog=%+v replica=%+v",
+			errors.Join(ErrReplicatedRoute, raftservice.ErrServingFence), route.Command, fence.Command)
 	}
 	endpoint.NodeIncarnation = fence.NodeIncarnation
 	return endpoint, nil
-}
-
-func replicatedMembershipTransitionCommandsMatch(
-	catalog, observed raftservice.CommandFence,
-) bool {
-	catalog.ReplicaSetVersion = 0
-	observed.ReplicaSetVersion = 0
-	return catalog == observed
 }
 
 func replicatedObservedCommandMatches(route ReplicatedRoute, observed raftservice.CommandFence) bool {
@@ -143,7 +136,8 @@ func (executor *ReplicatedExecutor) probeReplicated(ctx context.Context, route R
 	if !ok {
 		response, err := executor.doReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
 			Operation: shardservice.ReplicatedProbe, Capability: capability,
-			Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration},
+			Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+				Command: route.Command},
 		})
 		return response, endpoint, err
 	}

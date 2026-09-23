@@ -377,17 +377,17 @@ func TestApplyNormalBatchOnePhysicalUpdateZeroSyncAndBoundedWarmScratch(t *testi
 			t.Fatalf("batch was not one zero-sync physical update: before=%+v after=%+v",
 				before, after)
 		}
-		// Completion lookups acquire coherent snapshots and therefore establish
-		// the next explicit checkpoint boundary only after the zero-sync batch
-		// assertions above.
-		if err := fixture.group.Checkpoint(); err != nil {
-			t.Fatal(err)
-		}
+		// Completion lookup observes the just-published cut without forcing the
+		// replay-backed batch into physical roots.
 		for index := range commands {
 			lookup, lookupErr := fixture.machine.LookupCompletion(commands[index])
 			if lookupErr != nil || lookup.AppliedSequence != firstApplied+uint64(index) {
 				t.Fatalf("completion %d = %+v, %v", index, lookup, lookupErr)
 			}
+		}
+		if afterLookup := fixture.group.Stats(); afterLookup.BarrierSyncs != after.BarrierSyncs ||
+			afterLookup.PhysicalCheckpoints != after.PhysicalCheckpoints {
+			t.Fatalf("completion lookup checkpointed the batch: before=%+v after=%+v", after, afterLookup)
 		}
 		return normalBatchRetainedCapacityBytes(fixture.machine)
 	}
@@ -1588,6 +1588,11 @@ func TestApplyNormalBatchUnknownOutcomeCertifiesNoPrefixAndPoisons(t *testing.T)
 		t.Fatal(err)
 	}
 	_, open, _ := applySessionOpen(t, fixture.machine, 2, commandValue(fixture.binding, 1))
+	// Establish the recovery prefix explicitly. Completion reads no longer
+	// checkpoint the replay-backed session open as an incidental side effect.
+	if err := fixture.group.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
 	beforePublication := fixture.machine.Published()
 	command := encodeCommand(t, commandValue(fixture.binding, 1))
 	entries := normalBatchEntries(3, command, nil)

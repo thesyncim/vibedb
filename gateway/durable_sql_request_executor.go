@@ -5,10 +5,14 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
+	"time"
 
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -21,6 +25,42 @@ var ErrDurableSQLRequest = errors.New("gateway: durable RF3 SQL request is unava
 // was never admitted; recovery must always retain that earlier identity.
 var ErrDurableSQLNotAdmitted = errors.New("gateway: SQL request was not admitted by this invocation")
 var ErrDurableSQLAborted = errors.New("gateway: durable SQL transaction aborted")
+
+const durableSQLAbortDiagnosticEnvironment = "VIBEDB_RF3_DIAGNOSTIC_ABORT_REASON"
+const durableSQLAbortDiagnosticTableEnvironment = "VIBEDB_RF3_DIAGNOSTIC_ABORT_TABLE"
+
+// DurableSQLAbortError carries the exact replicated result which durably
+// rejected a prepared direct write. Callers must distinguish retryable intent
+// and transaction-control conflicts from permanent row precondition failures.
+type DurableSQLAbortError struct {
+	ResultCode uint32
+}
+
+func (err *DurableSQLAbortError) Error() string {
+	if err == nil {
+		return ErrDurableSQLAborted.Error()
+	}
+	if os.Getenv(durableSQLAbortDiagnosticEnvironment) == "1" {
+		return fmt.Sprintf("%s: VIBEDB_RF3_DIRECT_ABORT result_code=%d", ErrDurableSQLAborted, err.ResultCode)
+	}
+	return ErrDurableSQLAborted.Error()
+}
+
+func (*DurableSQLAbortError) Unwrap() error { return ErrDurableSQLAborted }
+
+// DurableSQLAbortResultCode returns the typed replicated result code retained
+// by an abort error. An untyped sentinel is terminal and must not be retried.
+func DurableSQLAbortResultCode(err error) (uint32, bool) {
+	var abort *DurableSQLAbortError
+	if !errors.As(err, &abort) || abort == nil {
+		return 0, false
+	}
+	return abort.ResultCode, true
+}
+
+func durableSQLAborted(resultCode uint32) error {
+	return &DurableSQLAbortError{ResultCode: resultCode}
+}
 
 // DurableSQLExecutionMode fixes the consensus protocol for one durable issuer
 // lane. Direct and coordinated lanes require independent sequence counters.
@@ -150,8 +190,6 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 	var targets []ReplicatedTransactionTarget
 	var handled bool
 	refreshedMiss := false
-	refreshState := newDurableSQLCatalogRefreshState(executor.data)
-	membershipReplayDone := false
 	for {
 		if contextErr := context.Cause(opctx); contextErr != nil {
 			return DurableSQLRequestResult{}, contextErr
@@ -174,42 +212,13 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 		targets, handled, err = executor.planner.planReplicatedSQLTransactionWithData(
 			opctx, lease.snapshot, queries, profile, executor.data,
 		)
-		if isReplicatedMembershipTransitionPlanningError(err) {
-			transitionErr := err
-			staleGeneration := lease.generation
-			// A pre-admission planning lease must not remain pinned while the
-			// exact request replay or the catalog authority waits for a newer
-			// membership publication.
-			lease.release()
-			if contextErr := context.Cause(opctx); contextErr != nil {
-				err = errors.Join(transitionErr, contextErr)
-				membershipReplayDone = true
-				break
-			}
-			result, found, replayErr := executor.Replay(opctx, key)
-			if found {
-				admitted = true
-				return result, replayErr
-			}
-			if replayErr != nil {
-				err = errors.Join(transitionErr, replayErr)
-				membershipReplayDone = true
-				break
-			}
-			if refreshErr := refreshState.refreshMembership(opctx, executor.planner, staleGeneration); refreshErr != nil {
-				err = errors.Join(transitionErr, refreshErr)
-				membershipReplayDone = true
-				break
-			}
-			continue
-		}
 		if !errors.Is(err, ErrTableNotPlaced) || refreshedMiss {
 			break
 		}
 		refreshedMiss = true
 		staleGeneration := lease.generation
 		lease.release()
-		if refreshErr := refreshState.refreshMissing(opctx, executor.planner, staleGeneration); refreshErr != nil {
+		if refreshErr := executor.planner.refreshAfterCatalogMiss(opctx, staleGeneration); refreshErr != nil {
 			// Keep the existing lowering-failure replay path intact. The
 			// request may already have a retained terminal recipe even when
 			// this process still has stale table metadata; refresh failure
@@ -220,7 +229,7 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 	}
 	defer lease.release()
 	if err != nil || !handled || len(targets) == 0 {
-		if err != nil && !membershipReplayDone {
+		if err != nil {
 			// Planning happens before the fused ledger Create. An exact retry can
 			// therefore observe its own prepared intent or a committed row whose
 			// computed UPDATE now evaluates differently. Recover the authenticated
@@ -242,7 +251,7 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 		directSQLMutationEligible(queries, targets) {
 		admitted = true
 		direct, directErr := executor.executeDirect(
-			opctx, key, tenant, lease.generation, targets[0],
+			opctx, key, tenant, lease.generation, targets[0], false,
 		)
 		if direct.Result != nil && !direct.duplicate {
 			executor.observeMutationPressure(lease.snapshot, targets)
@@ -250,7 +259,7 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 		if directErr != nil {
 			if errors.Is(directErr, ErrReplicatedTransactionConflict) {
 				return direct.DurableSQLRequestResult, fmt.Errorf(
-					"gateway: direct SQL execution: %w", ErrDurableSQLAborted,
+					"gateway: direct SQL execution: %w", durableSQLAborted(direct.resultCode),
 				)
 			}
 			return DurableSQLRequestResult{}, fmt.Errorf("gateway: direct SQL execution: %w", directErr)
@@ -308,7 +317,8 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 
 type directSQLRequestResult struct {
 	DurableSQLRequestResult
-	duplicate bool
+	duplicate  bool
+	resultCode uint32
 }
 
 func (executor *DurableSQLRequestExecutor) executeDirect(
@@ -317,10 +327,33 @@ func (executor *DurableSQLRequestExecutor) executeDirect(
 	tenant []byte,
 	catalogGeneration uint64,
 	target ReplicatedTransactionTarget,
+	priorUnknown bool,
 ) (directSQLRequestResult, error) {
-	direct, err := executor.data.DirectMutate(ctx, ReplicatedDirectMutation{
+	request := ReplicatedDirectMutation{
 		Key: key.RequestKey, RequestDigest: key.Digest, Tenant: tenant, Target: target,
-	})
+	}
+	var direct ReplicatedDirectMutationResult
+	var err error
+	recoveryAttempted := priorUnknown
+	if priorUnknown {
+		catalogGeneration, request, direct, err = executor.retryDirectOutcome(
+			ctx, request, catalogGeneration,
+		)
+	} else {
+		direct, err = executor.data.DirectMutate(ctx, request)
+		if errors.Is(err, raftservice.ErrOutcomeUnknown) {
+			diagnoseDirectSQLRecovery(request, direct, key, false, err)
+			originalErr := err
+			recoveryAttempted = true
+			catalogGeneration, request, direct, err = executor.retryDirectOutcome(
+				ctx, request, catalogGeneration,
+			)
+			if err != nil {
+				err = errors.Join(originalErr, err)
+			}
+		}
+	}
+	diagnoseDirectSQLRecovery(request, direct, key, recoveryAttempted, err)
 	if direct.ID == (distributedtxn.ID{}) {
 		return directSQLRequestResult{}, err
 	}
@@ -333,12 +366,46 @@ func (executor *DurableSQLRequestExecutor) executeDirect(
 				Generation: catalogGeneration, ShardsFanned: 1, Retries: direct.Retries,
 			},
 		},
-		duplicate: direct.Duplicate,
+		duplicate: direct.Duplicate, resultCode: direct.ResultCode,
 	}
 	if executor.planner != nil {
 		executor.planner.metrics.observeRoute(distribution.RouteTargeted, 1, ScatterNone)
 	}
 	return result, err
+}
+
+// diagnoseDirectSQLRecovery emits only outcome-unknown and deterministic
+// transaction outcomes for one opt-in distribution. It is an error-path
+// aid for a retained request identity; the ordinary successful SQL path does
+// not inspect or format the diagnostic fields.
+func diagnoseDirectSQLRecovery(
+	request ReplicatedDirectMutation,
+	direct ReplicatedDirectMutationResult,
+	key DurableRequestLedgerKey,
+	priorUnknown bool,
+	err error,
+) {
+	if !errors.Is(err, raftservice.ErrOutcomeUnknown) &&
+		(direct.ResultCode == 0 || direct.Committed) {
+		return
+	}
+	if os.Getenv(durableSQLAbortDiagnosticEnvironment) != "1" {
+		return
+	}
+	table := os.Getenv(durableSQLAbortDiagnosticTableEnvironment)
+	if table == "" || !strings.Contains(string(request.Target.Route.Distribution), table) {
+		return
+	}
+	route := request.Target.Route
+	fence := route.Command
+	planDigest, _ := replication.TransactionMutationDigest(request.Target.Batches)
+	fmt.Fprintf(os.Stderr,
+		"VIBEDB_RF3_DIRECT_SQL_OUTCOME time=%s distribution=%s issuer_sequence=%d request_id=%x issuer_epoch=%d issuer_lane=%x prior_unknown=%t group=%v allocation_generation=%d replica_set=%d ownership=%d routing=%d route_generation=%d schema_generation=%d request_digest=%x plan_digest=%x transaction_id=%x result_code=%d applied=%d committed=%t duplicate=%t error=%q\n",
+		time.Now().UTC().Format(time.RFC3339Nano), route.Distribution,
+		key.IssuerSequence, key.Request, key.IssuerEpoch, key.IssuerLane, priorUnknown,
+		route.Group, route.AllocationGeneration, fence.ReplicaSetVersion, fence.OwnershipEpoch,
+		fence.RoutingVersion, fence.RouteGeneration, fence.SchemaGeneration, request.RequestDigest, planDigest,
+		direct.ID, direct.ResultCode, direct.Applied, direct.Committed, direct.Duplicate, err)
 }
 
 func directSQLMutationEligible(
@@ -434,7 +501,7 @@ func (executor *DurableSQLRequestExecutor) ReplayRequestWithTenant(
 		return executor.Replay(opctx, key)
 	}
 	direct, directErr := executor.executeDirect(
-		opctx, key, tenant, lease.generation, targets[0],
+		opctx, key, tenant, lease.generation, targets[0], false,
 	)
 	if direct.Result == nil || direct.Result.TransactionID == (replication.ID128{}) {
 		return DurableSQLRequestResult{}, true, directErr
@@ -443,7 +510,7 @@ func (executor *DurableSQLRequestExecutor) ReplayRequestWithTenant(
 		executor.observeMutationPressure(lease.snapshot, targets)
 	}
 	if errors.Is(directErr, ErrReplicatedTransactionConflict) {
-		return direct.DurableSQLRequestResult, true, ErrDurableSQLAborted
+		return direct.DurableSQLRequestResult, true, durableSQLAborted(direct.resultCode)
 	}
 	return direct.DurableSQLRequestResult, true, directErr
 }

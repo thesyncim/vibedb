@@ -10,15 +10,20 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/frontenddrain"
+	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replicacontrol"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/internal/servicemetrics"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/internal/shardcontrol"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
@@ -118,6 +123,11 @@ func bootstrapPreparedRF3(
 	if err := validateBootstrapRF3Topology(bootstrap, member); err != nil {
 		return err
 	}
+	migrationBudget, err := openRF3MigrationBudget(member)
+	if err != nil {
+		return err
+	}
+	defer migrationBudget.Close()
 	profile, err := servicetls.LoadProfile(
 		member.TLS.Certificate, member.TLS.Key, member.TLS.Roots,
 		member.TLS.IdentityOID, time.Now,
@@ -177,6 +187,35 @@ func bootstrapPreparedRF3(
 	if err != nil {
 		return err
 	}
+	// A cold target is already visible in the physical control directory while
+	// it waits for its snapshot. Gateway capacity and health loops therefore
+	// continue to send the ordinary metrics and observation discriminators to
+	// this listener. Keep those requests on authenticated handlers during the
+	// cold interval; the observation handler reports the absence of an adopted
+	// replica instead of rejecting a valid control stream at the mux boundary.
+	metricsControl, err := servicemetrics.NewService(servicemetrics.ServiceOptions{
+		Provider: &coldRF3MetricsProvider{},
+		Authorize: func(identity rafttransport.PeerIdentity) bool {
+			return identity.TrustDomain == profile.LocalIdentity().TrustDomain &&
+				policy.Check(identity.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline,
+	})
+	if err != nil {
+		return err
+	}
+	observationControl, err := replicacontrol.NewService(replicacontrol.ServiceOptions{
+		Observer: rf3RetiredControlOwner{},
+		Authorize: func(identity rafttransport.PeerIdentity, request replicacontrol.Request) bool {
+			return identity.TrustDomain == profile.LocalIdentity().TrustDomain &&
+				policy.Check(identity.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow &&
+				request.Group == groupFromBinding(base.Binding) && request.TargetMember == base.Binding.MemberID
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 4,
+	})
+	if err != nil {
+		return err
+	}
 	database, err := sqldriver.OpenReplicatedSnapshotTarget(member.SQL.Path, base, applyIdentity,
 		sqldriver.ReplicatedOpenOptions{WriterLockContext: parent, WriterLockDeadline: time.Now().Add(rf3StartupWriterLockWait)})
 	if err != nil {
@@ -208,6 +247,7 @@ func bootstrapPreparedRF3(
 		snapshottransfer.Limits{
 			MaxArtifacts: 1, MaxArtifactBytes: bootstrap.MaxArtifactBytes,
 			MaxDiskBytes: bootstrap.MaxArtifactBytes + snapshottransfer.DescriptorBytes + 1<<20,
+			Budget:       migrationBudget,
 		},
 	)
 	if err != nil {
@@ -257,15 +297,44 @@ func bootstrapPreparedRF3(
 	}
 	receiver := &snapshottransfer.Receiver{
 		Repository: repository, Opener: opener,
+		Budget:        migrationBudget,
 		ReadDeadline:  func() time.Time { return time.Now().Add(bootstrapRF3NetworkTimeout) },
 		WriteDeadline: func() time.Time { return time.Now().Add(bootstrapRF3NetworkTimeout) },
-		Workspace:     make([]byte, snapshottransfer.AbsoluteMaxChunkBytes),
 	}
 	installer := &coldRF3Installer{
 		repository: repository, cursor: cursor, database: database,
 		base: base, apply: applyIdentity, staticBootstrap: staticBootstrap,
 		walPath: member.WAL.Path, walKey: key, walOptions: member.WAL.Options,
 		host: host, settlement: new(snapshottransfer.LearnerInstallSettlement),
+		budget: migrationBudget,
+	}
+	coldCapacityGroup := &preparedColdRF3Group{group: groupFromBinding(base.Binding),
+		authority:  coldRF3GrantAuthority{group: groupFromBinding(base.Binding), members: member.Members, target: *target},
+		repository: repository, cursor: cursor, journal: journal, database: database, key: key, installer: installer}
+	var capacityRevision atomic.Uint64
+	capacityDirectory, err := newRF3CapacitySourceDirectory(nil, []*preparedColdRF3Group{coldCapacityGroup}, nil,
+		func(ctx context.Context, _ replicacontrol.CapacityRequest, samples []replicacontrol.CapacitySourceSample) (replicacontrol.NodeCapacity, error) {
+			return RF3CapacityNodeFromPhysical(ctx, profile.LocalIdentity().Node, target.NodeIncarnation,
+				uint64(max(raftstore.DefaultMaxFileBytes, int64(member.WAL.Options.MaxFileBytes))), migrationBudget, &capacityRevision, samples)
+		})
+	if err != nil {
+		return err
+	}
+	capacityProvider, err := replicacontrol.NewCapacityProvider(capacityDirectory)
+	if err != nil {
+		return err
+	}
+	capacityControl, err := replicacontrol.NewCapacityService(replicacontrol.CapacityServiceOptions{
+		Observer: capacityProvider,
+		Authorize: func(identity rafttransport.PeerIdentity, request replicacontrol.CapacityRequest) bool {
+			return identity.TrustDomain == profile.LocalIdentity().TrustDomain &&
+				policy.Check(identity.Node, serviceauthz.CapabilityTopology) == serviceauthz.DecisionAllow &&
+				request.Group == groupFromBinding(base.Binding) && request.TargetMember == base.Binding.MemberID
+		},
+		ReadDeadline: deadline, WriteDeadline: deadline, MaxConcurrent: 4,
+	})
+	if err != nil {
+		return err
 	}
 	service, err := snapshottransfer.NewBootstrapControlService(
 		snapshottransfer.BootstrapControlOptions{
@@ -287,6 +356,18 @@ func bootstrapPreparedRF3(
 	if err != nil {
 		return err
 	}
+	preparedAckControl, preparedAckReader, preparedAckTransport, err := newRF3NonmanagedPreparedAckService(
+		profile, policy, target.NodeIncarnation, deadline,
+	)
+	if err != nil {
+		return err
+	}
+	if preparedAckTransport != nil {
+		defer func() { _ = preparedAckTransport.Close() }()
+	}
+	if preparedAckReader != nil {
+		defer func() { _ = preparedAckReader.Close() }()
+	}
 	complete := make(chan struct{}, 1)
 	controlMux, err := shardcontrol.New(
 		shardcontrol.Route{
@@ -299,6 +380,10 @@ func bootstrapPreparedRF3(
 				Handler: service, Complete: complete,
 			},
 		},
+		shardcontrol.Route{Discriminator: replicacontrol.CapacityRequestDiscriminator(), Handler: capacityControl},
+		shardcontrol.Route{Discriminator: replicacontrol.RequestDiscriminator(), Handler: observationControl},
+		shardcontrol.Route{Discriminator: servicemetrics.RequestDiscriminator(), Handler: metricsControl},
+		shardcontrol.Route{Discriminator: frontenddrain.PreparedAckDiscriminator, Handler: preparedAckControl},
 	)
 	if err != nil {
 		return err
@@ -423,6 +508,7 @@ type coldRF3Installer struct {
 	walOptions      raftstore.Options
 	host            *multiraft.Host
 	settlement      *snapshottransfer.LearnerInstallSettlement
+	budget          *migrationbudget.Budget
 	installed       raftmember.RuntimeIdentity
 }
 
@@ -438,7 +524,7 @@ func (installer *coldRF3Installer) ObserveInstalled(
 }
 
 func (installer *coldRF3Installer) InstallPublishedLearner(
-	_ context.Context,
+	ctx context.Context,
 	descriptor snapshottransfer.Descriptor,
 ) (raftmember.RuntimeIdentity, error) {
 	manifest, err := installer.repository.Manifest(descriptor)
@@ -448,6 +534,7 @@ func (installer *coldRF3Installer) InstallPublishedLearner(
 	identity, err := snapshottransfer.InstallPublishedLearner(snapshottransfer.LearnerInstallPlan{
 		Repository: installer.repository, Descriptor: descriptor, Cursor: installer.cursor,
 		Database: installer.database, SQLIdentity: installer.base,
+		Context: ctx, Budget: installer.budget,
 		ApplyOptions:      replicatedApplyOptions(installer.apply),
 		StageOptions:      replicatedstate.SnapshotArtifactStageOptions{},
 		StaticBootstrap:   installer.staticBootstrap,

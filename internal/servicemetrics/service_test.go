@@ -17,6 +17,7 @@ type testProvider struct {
 	group    raftmember.GroupKey
 	member   uint64
 	stages   StageMetricsSnapshot
+	budget   MigrationBudgetSnapshot
 }
 
 type aggregateOnlyProvider struct {
@@ -27,7 +28,8 @@ func (provider aggregateOnlyProvider) ProgressMetrics() raftservice.ProgressMetr
 	return provider.snapshot
 }
 
-func (provider testProvider) StageMetrics() StageMetricsSnapshot { return provider.stages }
+func (provider testProvider) StageMetrics() StageMetricsSnapshot              { return provider.stages }
+func (provider testProvider) MigrationBudgetMetrics() MigrationBudgetSnapshot { return provider.budget }
 
 func (provider testProvider) ProgressMetrics() raftservice.ProgressMetricsSnapshot {
 	return provider.snapshot
@@ -44,6 +46,7 @@ type testConnection struct {
 }
 
 func (connection *testConnection) PeerIdentity() rafttransport.PeerIdentity { return connection.peer }
+func (*testConnection) PeerKeyDigest() [32]byte                             { return [32]byte{} }
 func (*testConnection) TrafficClass() rafttransport.TrafficClass {
 	return rafttransport.TrafficShardControl
 }
@@ -180,9 +183,10 @@ func TestMetricsNodeStageSnapshotIsAuthenticatedAndCanonical(t *testing.T) {
 		SplitControlRequests: 18, SplitControlCompletions: 19, SplitControlFaults: 20,
 		BootstrapRequests: 21, BootstrapChunks: 22, BootstrapBytes: 23, BootstrapCompletions: 24,
 		BootstrapFaults: 25, BootstrapResidentBytes: 26, BootstrapInflight: 27}
-	encoded := appendResponse(Snapshot{Stages: stages})
+	budget := MigrationBudgetSnapshot{ThrottledCalls: 28, ThrottledBytes: 29, PeakActive: 2, MaxActive: 4}
+	encoded := appendResponse(Snapshot{Stages: stages, Budget: budget})
 	opened, err := OpenResponse(encoded[:])
-	if err != nil || opened.Stages != stages || opened.Group != (raftmember.GroupKey{}) || opened.Member != 0 {
+	if err != nil || opened.Stages != stages || opened.Budget != budget || opened.Group != (raftmember.GroupKey{}) || opened.Member != 0 {
 		t.Fatalf("snapshot=%+v err=%v", opened, err)
 	}
 	encoded[200] ^= 1

@@ -68,6 +68,15 @@ cut merely because their routes came from one catalog generation.
 Publication only moves forward. Exact-predecessor cutovers compare-and-publish; a stale
 controller must re-observe and replan, not publish an unrelated higher generation.
 
+Warm and cold catalog readers install the same complete, authenticated ReadIndex cut.
+The canonical head is bound to the immutable genesis and its atomic generation/length/digest
+witness. This witness is a digest record, not an independent signature: authority comes from
+the authenticated catalog service and its Raft commit. Writers validate membership grants,
+distribution ownership and predecessor CAS before publication. Readers check current proof,
+structure and monotone identity fences; they do not replay historical membership receipts.
+Operation receipts remain for completion and idempotent retries. A reader may miss intermediate
+catalog generations without losing recovery progress.
+
 ## Raft persistence and reads
 
 The current profile uses pre-vote, quorum checking, safe ReadIndex, heartbeat tick 1, and
@@ -182,10 +191,27 @@ ID, cluster incarnation, and node ID; subject names, DNS names, and common names
 peer authority. Ordinary Raft, snapshot data, shard-native, SQL, client, and control traffic use
 separate ALPN classes. Handshake and stream deadlines are mandatory.
 
-TLS authenticates a node. The per-group registry then checks whether that node is enrolled and
-whether the exact committed roster/version authorizes its voter or learner role. Frames are
-checked for group, source, destination, trust domain, roster, role, size, and transition grant
-before protobuf allocation or Raft admission.
+TLS authenticates a node and its pinned physical incarnation/key. The per-group registry checks
+the exact source and destination member mappings and current durable membership. Ordinary Raft
+frames carry no roster digest or applied membership generation: those positions may legitimately
+differ after a lost configuration append or commit, including across a cold restart.
+
+This is crash-fault Raft with trusted, authenticated members, not Byzantine consensus. Inbound
+append and heartbeat messages from a current member or the exact active installed grant target
+reach Raft's term/log checks: a follower can miss both addition and promotion before that target
+becomes leader. The grant must match the follower's exact initial membership cut. A compromised
+authorized replication participant could therefore inject leader-origin replication messages;
+transport does not provide Byzantine leader authentication. Generic endpoint enrollment, an old
+or revoked grant, and removed identities grant no such access. The local producer requires its
+own committed voter role, and the Raft owner emits leader messages only after election. Election
+traffic requires current voter roles or an exact locally durable promotion entry bound to the
+installed grant; a local learner cannot campaign. Configuration entries still require that exact
+grant's ordered transitions or exact retained durable-log evidence.
+
+Application serving, snapshots and read-authority frames retain their strict current ownership
+and membership fences. In particular, read-authority frames carry the exact current roster digest
+and applied membership version. Receiving ordinary replication never publishes those authorities
+without the normal durable apply boundary.
 
 Delivery remains a lossy, duplicating boundary:
 
@@ -227,9 +253,16 @@ stateDiagram-v2
 ```
 
 The grant binds one source, one target, the initial three voters, catalog generation, and exact
-transition digest. Adding the learner does not authorize removal. Promotion must be durably
+transition digest. Its generation identifies the authorization cut; unrelated catalog updates
+do not invalidate an unchanged group. Move admission and recovery still require the exact
+initial roster, replica-set fence, enrolled target, source descriptor, and current durable
+distribution owner or publication receipt. Adding the learner does not authorize removal. Promotion must be durably
 observed. Removal is accepted only from the four-voter intermediate state, with no learner or
 joint configuration, after an exact same-term leadership transfer when needed.
+
+Scaling status includes the current move execution error when its controller is reachable.
+This bounded diagnostic clears after a successful pass; only durable catalog and retirement
+proofs determine completion or safe-to-stop.
 
 Absence of a grant is not by itself revocation; revocation requires a linearizable catalog
 observation. After restart, durable membership returns, but volatile leadership does not. The

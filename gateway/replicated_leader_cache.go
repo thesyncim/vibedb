@@ -19,15 +19,18 @@ type replicatedLeaderHintKey struct {
 
 type replicatedLeaderHintEntry struct {
 	catalogIncarnation uint64
+	catalogReplicaSet  uint64
 	endpoint           ReplicatedEndpoint
 	state              shardservice.ReplicatedMemberState
 	valid              bool
 }
 
 func (entry *replicatedLeaderHintEntry) matches(key replicatedLeaderHintKey) bool {
+	command := entry.state.Fence.Command
+	command.ReplicaSetVersion = entry.catalogReplicaSet
 	return entry.valid && entry.state.Fence.Group == key.group &&
 		entry.state.Fence.AllocationGeneration == key.allocationGeneration &&
-		entry.state.Fence.Command == key.command
+		command == key.command
 }
 
 // A set owns at most four exact route hints. The final set may expose fewer
@@ -162,7 +165,8 @@ func (cache *replicatedLeaderHintCache) publish(
 	if !sameReplicatedEndpoint(catalogEndpoint, physical) {
 		return
 	}
-	next := replicatedLeaderHintEntry{catalogIncarnation: catalogEndpoint.NodeIncarnation, endpoint: endpoint, state: state, valid: true}
+	next := replicatedLeaderHintEntry{catalogIncarnation: catalogEndpoint.NodeIncarnation,
+		catalogReplicaSet: route.Command.ReplicaSetVersion, endpoint: endpoint, state: state, valid: true}
 	key := replicatedLeaderKey(route)
 	set := cache.set(key)
 	if set == nil {

@@ -295,12 +295,16 @@ func (o *logicalOverlay) recordResolved(
 			entry.baseFound = knownBaseFound
 			entry.baseLength = knownBaseLength
 			entry.baseDigest = knownBaseDigest
-		} else if o.base != nil {
+		} else if o.base != nil || o.live != nil {
 			var err error
 			if deleted {
-				entry.baseFound, err = o.base.ContainsKey(key)
+				if o.live != nil {
+					entry.baseFound, err = o.live.ContainsKey(key)
+				} else {
+					entry.baseFound, err = o.base.ContainsKey(key)
+				}
 			} else {
-				o.probe, entry.baseFound, err = o.base.AppendRaw(o.probe[:0], key)
+				o.probe, entry.baseFound, err = (pointSnapshot{value: o.base, live: o.live}).appendRaw(o.probe[:0], key)
 				baseLoaded = err == nil
 			}
 			if err != nil {
@@ -328,7 +332,7 @@ func (o *logicalOverlay) recordResolved(
 			if baseLoaded {
 				baseFound = entry.baseFound
 			} else {
-				o.probe, baseFound, err = o.base.AppendRaw(o.probe[:0], key)
+				o.probe, baseFound, err = (pointSnapshot{value: o.base, live: o.live}).appendRaw(o.probe[:0], key)
 				if err != nil {
 					return err
 				}

@@ -142,6 +142,10 @@ func TestAuthenticatedExecutionPeerTwoGroupsProgressWithTransportPerPeer(t *test
 		}
 		addresses[member] = listeners[member].Addr().String()
 	}
+	for member := range nodes {
+		registries[member] = pinnedPeerTestRegistry(t, nodes[member], members, rafttransport.Limits{MaxGroups: 2, MaxMembers: len(members)}, profiles)
+	}
+
 	deadline := func() time.Time { return time.Now().Add(5 * time.Second) }
 	peers := make([]*AuthenticatedExecutionPeerRuntime, voters)
 	owners := make([]*ExecutionOwners, voters)
@@ -326,10 +330,9 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 	var ownerHiddenBeforeCommit bool
 	var transportPresentDuringCommit bool
 	var ownerHiddenAfterCommit bool
-	if err = transportRegistry.InstallGroup(
-		executionTestRoster(dynamicIdentity.Group, local),
-		func(publish func()) error {
-			return owners.installGroup(dynamicGroup, func() {
+	if err = owners.installGroup(dynamicGroup, func(install func(func()) error) error {
+		return transportRegistry.InstallGroup(executionTestRoster(dynamicIdentity.Group, local), func(publish func()) error {
+			return install(func() {
 				initialPointSlot = owners.byGroup.Load().values[dynamicIdentity.Group].point
 				installedGeneration = owners.owners[lane].members[dynamicIdentity.Group].generation
 				if initialPointSlot != nil {
@@ -346,8 +349,8 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 				_, routeErr = owners.owner(dynamicIdentity.Group)
 				ownerHiddenAfterCommit = errors.Is(routeErr, ErrExecutionGroup)
 			})
-		},
-	); err != nil {
+		})
+	}); err != nil {
 		t.Fatalf("install dynamic group: %v", err)
 	}
 	if initialPointSlot == nil || !initialPointViewReady {
@@ -376,8 +379,8 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 	removeDynamicGroup := func(identity raftmember.RuntimeIdentity) error {
 		deadline := time.Now().Add(5 * time.Second)
 		for {
-			removeErr := transportRegistry.RemoveGroup(identity.Group, func(withdraw func()) error {
-				return owners.removeGroup(identity, withdraw)
+			removeErr := owners.removeGroup(identity, func(remove func(func()) error) error {
+				return transportRegistry.RemoveGroup(identity.Group, remove)
 			})
 			if removeErr == nil || time.Now().After(deadline) {
 				return removeErr
@@ -388,8 +391,7 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 	}
-	err = removeDynamicGroup(dynamicIdentity)
-	if err != nil {
+	if err = removeDynamicGroup(dynamicIdentity); err != nil {
 		t.Fatalf("remove dynamic group did not quiesce: %v", err)
 	}
 	if _, err = owners.Probe(context.Background(), dynamicIdentity.Group); !errors.Is(err, ErrExecutionGroup) {
@@ -411,15 +413,14 @@ func TestExecutionOwnersInstallAndRemoveDynamicGroupAtomically(t *testing.T) {
 		Command: rf3CommandFence(replacementIdentity, replacementBase), Read: replacementRead,
 		Recovery: replacementRead}
 	var replacementPointSlot *pointReadViewSlot
-	if err = transportRegistry.InstallGroup(
-		executionTestRoster(replacementIdentity.Group, local),
-		func(publish func()) error {
-			return owners.installGroup(replacementGroup, func() {
+	if err = owners.installGroup(replacementGroup, func(install func(func()) error) error {
+		return transportRegistry.InstallGroup(executionTestRoster(replacementIdentity.Group, local), func(publish func()) error {
+			return install(func() {
 				replacementPointSlot = owners.byGroup.Load().values[replacementIdentity.Group].point
 				publish()
 			})
-		},
-	); err != nil {
+		})
+	}); err != nil {
 		t.Fatalf("reinstall dynamic group: %v", err)
 	}
 	if replacementPointSlot == nil || replacementPointSlot == initialPointSlot {

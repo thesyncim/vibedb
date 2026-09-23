@@ -89,8 +89,8 @@ func TestDurableRequestBuiltProgramCompletesExactTerminalContract(t *testing.T) 
 				t.Fatal(err)
 			}
 			ledger := &terminalCoordinatorLedger{head: head, continuation: continuation}
-			pin := &terminalCoordinatorPin{t: t, route: build.Home.borrowedRoute(), tenant: program.Tenant,
-				retryHome: program.Identity.RetryHome, clientID: replication.ID128{3}, epoch: 2, sequence: 2, record: acquired.Record}
+			pin := &terminalCoordinatorPin{record: acquired.Record}
+			ledger.pin = pin
 			coordinator, err := newDurableRequestTerminalCoordinator(ledger, pin)
 			if err != nil {
 				t.Fatal(err)
@@ -122,7 +122,7 @@ func TestDurableRequestBuiltProgramCompletesExactTerminalContract(t *testing.T) 
 				t.Fatal(err)
 			}
 			again, err := requestledger.AppendTerminal(nil, retry.Terminal)
-			if err != nil || !bytes.Equal(encoded, again) || len(pin.attempts) != 1 || len(ledger.operations) != 4 {
+			if err != nil || !bytes.Equal(encoded, again) || len(pin.attempts) != 1 || len(ledger.operations) != 3 {
 				t.Fatalf("exact terminal retry changed proof or repeated side effects: %v", err)
 			}
 			runBuiltTerminalRecoveryCases(t, execution, authority, state, head, continuation, acquired.Record)

@@ -3,6 +3,7 @@ package snapshottransfer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -35,8 +36,12 @@ type RetainedSourceExportOptions struct {
 	// receive the same pointer; nil keeps the package usable by offline tools.
 	Budget *migrationbudget.Budget
 
-	RuntimeIdentity   raftmember.RuntimeIdentity
-	SourceNode        rafttransport.NodeID
+	RuntimeIdentity raftmember.RuntimeIdentity
+	SourceNode      rafttransport.NodeID
+	// DynamicTarget admits the exact target carried by an authenticated
+	// membership request. Static replacement manifests instead seal the three
+	// target fields below at provider construction.
+	DynamicTarget     bool
 	TargetMember      uint64
 	TargetStore       [16]byte
 	TargetIncarnation uint64
@@ -60,6 +65,15 @@ type RetainedSourceExportProvider struct {
 	closed      bool
 	activePlans int
 	plansIdle   *sync.Cond
+	// pins keeps one cut per exact export request. A short RPC deadline must
+	// not mint a newer applied index and abandon the bytes already written.
+	pins map[SourceControlRequest]*retainedExportPin
+}
+
+type retainedExportPin struct {
+	snapshot    *replicatedstate.ReadSnapshot
+	terminalErr error
+	busy        bool
 }
 
 // InstallAbandonmentExitFaultForQualification installs one deterministic
@@ -117,14 +131,17 @@ func (provider *RetainedSourceExportProvider) NewDataService(
 func OpenRetainedSourceExportProvider(
 	options RetainedSourceExportOptions,
 ) (*RetainedSourceExportProvider, error) {
+	staticTarget := options.TargetMember != 0 && options.TargetMember != options.RuntimeIdentity.MemberID &&
+		options.TargetStore != ([16]byte{}) && options.TargetIncarnation != 0
+	dynamicTarget := options.DynamicTarget && options.TargetMember == 0 &&
+		options.TargetStore == ([16]byte{}) && options.TargetIncarnation == 0
 	if options.Cut == nil || options.RuntimeIdentity.Group == (raftmember.GroupKey{}) ||
 		options.RuntimeIdentity.AllocationGeneration == 0 ||
 		options.RuntimeIdentity.MemberID == 0 || options.RuntimeIdentity.StoreID == ([16]byte{}) ||
 		options.RuntimeIdentity.NodeIncarnation == 0 ||
 		options.RuntimeIdentity.RelationManifestDigest == ([32]byte{}) ||
 		options.SourceNode == (rafttransport.NodeID{}) ||
-		options.TargetMember == 0 || options.TargetMember == options.RuntimeIdentity.MemberID ||
-		options.TargetStore == ([16]byte{}) || options.TargetIncarnation == 0 ||
+		(!staticTarget && !dynamicTarget) ||
 		options.ChunkBytes < MinChunkBytes || options.ChunkBytes > AbsoluteMaxChunkBytes ||
 		options.MaxConcurrent <= 0 || options.MaxConcurrent > AbsoluteMaxSourceConcurrency {
 		return nil, ErrSourceControl
@@ -235,12 +252,30 @@ func (provider *RetainedSourceExportProvider) AbandonSourceExport(
 	if cause := context.Cause(ctx); cause != nil {
 		return cause
 	}
-	provider.mu.RLock()
-	defer provider.mu.RUnlock()
-	if provider.closed || provider.repository == nil {
-		return ErrSourceControl
+	repository, _, err := provider.retainPlan()
+	if err != nil {
+		return err
 	}
-	_, err := provider.repository.AbandonArtifact(witness)
+	pin, err := provider.claimIdleExportPin(request)
+	if err != nil {
+		provider.releasePlan()
+		return err
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		provider.idleExportPin(request, pin)
+		provider.releasePlan()
+		return cause
+	}
+	_, err = repository.AbandonArtifact(witness)
+	if err != nil {
+		provider.idleExportPin(request, pin)
+		provider.releasePlan()
+		return err
+	}
+	if pin != nil {
+		err = provider.finishExportPin(request, pin, true)
+	}
+	provider.releasePlan()
 	return err
 }
 
@@ -307,27 +342,64 @@ func (provider *RetainedSourceExportProvider) PinSourceExport(
 			workspace.artifact = bytes[:0:chunk]
 			workspace.transfer = bytes[chunk : chunk : 2*chunk]
 		}
-		cut, cutErr := provider.options.Cut.SnapshotArtifactCut()
-		if cutErr != nil || cut == nil {
+		pin, existing, pinErr := provider.checkoutExportPin(request)
+		if pinErr != nil {
 			returnWorkspace()
-			if cutErr != nil {
-				return SourceExportPlan{}, cutErr
+			return SourceExportPlan{}, pinErr
+		}
+		cut := pin.snapshot
+		if !existing {
+			var cutErr error
+			cut, cutErr = provider.options.Cut.SnapshotArtifactCut()
+			if cutErr != nil || cut == nil {
+				provider.dropExportPin(request, pin)
+				returnWorkspace()
+				if cutErr != nil {
+					return SourceExportPlan{}, cutErr
+				}
+				return SourceExportPlan{}, ErrSourceControl
 			}
-			return SourceExportPlan{}, ErrSourceControl
+			fence := cut.Fence()
+			publication := cut.Publication()
+			if fence.ReplicaSetVersion < request.ReplicaSetVersion ||
+				publication.ReplicaSetVersion < request.ReplicaSetVersion {
+				// This replica has not applied the requested membership yet; a
+				// follower donor routinely trails the leader's AddLearner. That is
+				// not a verdict on the request: release the pin rather than
+				// terminalizing it, so the exact retry takes a fresh cut once the
+				// local apply catches up.
+				behindErr := fmt.Errorf("%w: source cut membership requested=%d fence=%d publication=%d",
+					ErrSourceNotCaughtUp, request.ReplicaSetVersion, fence.ReplicaSetVersion,
+					publication.ReplicaSetVersion)
+				behindErr = errors.Join(behindErr, cut.Close())
+				provider.dropExportPin(request, pin)
+				returnWorkspace()
+				return SourceExportPlan{}, behindErr
+			}
+			if fence.ReplicaSetVersion != request.ReplicaSetVersion ||
+				publication.ReplicaSetVersion != request.ReplicaSetVersion ||
+				publication.ConfState == nil ||
+				!slices.Contains(publication.ConfState.GetVoters(), request.SourceMember) ||
+				!slices.Contains(publication.ConfState.GetLearners(), request.TargetMember) ||
+				slices.Contains(publication.ConfState.GetVoters(), request.TargetMember) {
+				staleErr := fmt.Errorf("%w: source cut membership requested=%d fence=%d publication=%d source=%d target=%d voters=%v learners=%v", ErrStaleFence,
+					request.ReplicaSetVersion, fence.ReplicaSetVersion, publication.ReplicaSetVersion,
+					request.SourceMember, request.TargetMember, publication.ConfState.GetVoters(), publication.ConfState.GetLearners())
+				staleErr = errors.Join(staleErr, provider.failExportPin(request, pin, staleErr), cut.Close())
+				returnWorkspace()
+				return SourceExportPlan{}, staleErr
+			}
+			if !provider.publishExportPin(request, pin, cut) {
+				_ = cut.Close()
+				provider.dropExportPin(request, pin)
+				returnWorkspace()
+				return SourceExportPlan{}, ErrSourceControl
+			}
 		}
 		fence := cut.Fence()
-		publication := cut.Publication()
-		if fence.ReplicaSetVersion != request.ReplicaSetVersion ||
-			publication.ReplicaSetVersion != request.ReplicaSetVersion ||
-			publication.ConfState == nil ||
-			!slices.Contains(publication.ConfState.GetVoters(), request.SourceMember) ||
-			!slices.Contains(publication.ConfState.GetLearners(), request.TargetMember) ||
-			slices.Contains(publication.ConfState.GetVoters(), request.TargetMember) {
-			_ = cut.Close()
-			returnWorkspace()
-			return SourceExportPlan{}, ErrStaleFence
-		}
 		var releaseOnce sync.Once
+		var finalizeOnce sync.Once
+		var finalizeErr error
 		return SourceExportPlan{
 			Repository: repository, Snapshot: cut, ExpectedFence: fence,
 			Context: ctx, Budget: budget,
@@ -336,8 +408,22 @@ func (provider *RetainedSourceExportProvider) PinSourceExport(
 			TargetMember: request.TargetMember, TargetStore: request.TargetStore,
 			TargetIncarnation: request.TargetIncarnation, ChunkBytes: provider.options.ChunkBytes,
 			ArtifactWorkspace: workspace.artifact, TransferWorkspace: workspace.transfer,
+			Finalize: func(cause error) error {
+				if cause != nil && !permanentSourceExportFailure(cause) {
+					return nil
+				}
+				finalizeOnce.Do(func() {
+					if cause == nil {
+						finalizeErr = provider.finishExportPin(request, pin, true)
+					} else {
+						finalizeErr = provider.failExportPin(request, pin, cause)
+					}
+				})
+				return finalizeErr
+			},
 			Release: func() {
 				releaseOnce.Do(func() {
+					provider.idleExportPin(request, pin)
 					returnWorkspace()
 				})
 			},
@@ -364,6 +450,161 @@ func (provider *RetainedSourceExportProvider) retainPlan() (*Repository, *migrat
 	return provider.repository, provider.options.Budget, nil
 }
 
+// checkoutExportPin reserves the exact request before creating a new cut.
+// This makes same-request exclusion atomic and bounds retained cuts even when
+// every export is canceled before its first repository write.
+func (provider *RetainedSourceExportProvider) checkoutExportPin(
+	request SourceControlRequest,
+) (*retainedExportPin, bool, error) {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if provider.closed || provider.repository == nil {
+		return nil, false, ErrSourceControl
+	}
+	if pin := provider.pins[request]; pin != nil {
+		if pin.terminalErr != nil {
+			return nil, false, pin.terminalErr
+		}
+		if pin.busy || pin.snapshot == nil {
+			return nil, false, ErrBound
+		}
+		pin.busy = true
+		return pin, true, nil
+	}
+	if len(provider.pins) >= provider.options.MaxConcurrent {
+		return nil, false, ErrBound
+	}
+	if provider.pins == nil {
+		provider.pins = make(map[SourceControlRequest]*retainedExportPin, provider.options.MaxConcurrent)
+	}
+	pin := &retainedExportPin{busy: true}
+	provider.pins[request] = pin
+	return pin, false, nil
+}
+
+// failExportPin releases a permanently invalid cut but keeps a bounded
+// terminal record for the request. A retry returns the same failure instead
+// of silently capturing a later applied index under the old request identity.
+func (provider *RetainedSourceExportProvider) failExportPin(
+	request SourceControlRequest,
+	expected *retainedExportPin,
+	terminalErr error,
+) error {
+	provider.mu.Lock()
+	pin := provider.pins[request]
+	if pin == nil || pin != expected {
+		provider.mu.Unlock()
+		return nil
+	}
+	if !pin.busy {
+		provider.mu.Unlock()
+		return ErrBound
+	}
+	snapshot := pin.snapshot
+	pin.snapshot = nil
+	pin.terminalErr = terminalErr
+	provider.mu.Unlock()
+	if snapshot != nil {
+		return snapshot.Close()
+	}
+	return nil
+}
+
+func permanentSourceExportFailure(err error) bool {
+	return errors.Is(err, ErrSourceControl) || errors.Is(err, ErrSourceConflict) ||
+		errors.Is(err, ErrStaleFence) || errors.Is(err, ErrDescriptor) || errors.Is(err, ErrChunk) ||
+		errors.Is(err, replicatedstate.ErrSnapshotArtifact) ||
+		errors.Is(err, replicatedstate.ErrSnapshotArtifactBound) ||
+		errors.Is(err, replicatedstate.ErrSnapshotBase) ||
+		errors.Is(err, replicatedstate.ErrInvalidBinding)
+}
+
+func (provider *RetainedSourceExportProvider) publishExportPin(
+	request SourceControlRequest,
+	pin *retainedExportPin,
+	snapshot *replicatedstate.ReadSnapshot,
+) bool {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if provider.closed || provider.pins[request] != pin || !pin.busy || pin.snapshot != nil {
+		return false
+	}
+	pin.snapshot = snapshot
+	return true
+}
+
+func (provider *RetainedSourceExportProvider) dropExportPin(
+	request SourceControlRequest,
+	pin *retainedExportPin,
+) {
+	if pin == nil {
+		return
+	}
+	provider.mu.Lock()
+	if provider.pins[request] == pin {
+		delete(provider.pins, request)
+	}
+	provider.mu.Unlock()
+}
+
+func (provider *RetainedSourceExportProvider) idleExportPin(
+	request SourceControlRequest,
+	pin *retainedExportPin,
+) {
+	if pin == nil {
+		return
+	}
+	provider.mu.Lock()
+	if provider.pins[request] == pin {
+		pin.busy = false
+	}
+	provider.mu.Unlock()
+}
+
+func (provider *RetainedSourceExportProvider) claimIdleExportPin(
+	request SourceControlRequest,
+) (*retainedExportPin, error) {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if provider.closed || provider.repository == nil {
+		return nil, ErrSourceControl
+	}
+	pin := provider.pins[request]
+	if pin != nil {
+		if pin.busy {
+			return nil, ErrBound
+		}
+		pin.busy = true
+	}
+	return pin, nil
+}
+
+// finishExportPin removes and closes the exact checked-out cut. Busy cuts are
+// only finalized by their owning plan after artifact publication; control
+// release and abandonment may retire only idle cuts.
+func (provider *RetainedSourceExportProvider) finishExportPin(
+	request SourceControlRequest,
+	expected *retainedExportPin,
+	allowBusy bool,
+) error {
+	provider.mu.Lock()
+	pin := provider.pins[request]
+	if pin == nil || expected != nil && pin != expected {
+		provider.mu.Unlock()
+		return nil
+	}
+	if pin.busy && !allowBusy {
+		provider.mu.Unlock()
+		return ErrBound
+	}
+	delete(provider.pins, request)
+	provider.mu.Unlock()
+	if pin.snapshot != nil {
+		return pin.snapshot.Close()
+	}
+	return nil
+}
+
 func (provider *RetainedSourceExportProvider) releasePlan() {
 	provider.mu.Lock()
 	if provider.activePlans > 0 {
@@ -378,10 +619,13 @@ func (provider *RetainedSourceExportProvider) releasePlan() {
 func (provider *RetainedSourceExportProvider) matchesRequest(request SourceControlRequest) bool {
 	options := provider.options
 	identity := options.RuntimeIdentity
-	return validSourceControlRequest(request) && request.Group == identity.Group &&
-		request.SourceMember == identity.MemberID && request.SourceNode == options.SourceNode &&
+	if !validSourceControlRequest(request) || request.Group != identity.Group ||
+		request.SourceMember != identity.MemberID || request.SourceNode != options.SourceNode {
+		return false
+	}
+	return options.DynamicTarget ||
 		request.TargetMember == options.TargetMember && request.TargetStore == options.TargetStore &&
-		request.TargetIncarnation == options.TargetIncarnation
+			request.TargetIncarnation == options.TargetIncarnation
 }
 
 func (provider *RetainedSourceExportProvider) ReleaseSourceExport(
@@ -396,14 +640,32 @@ func (provider *RetainedSourceExportProvider) ReleaseSourceExport(
 	if cause := context.Cause(ctx); cause != nil {
 		return cause
 	}
-	provider.mu.RLock()
-	defer provider.mu.RUnlock()
-	if provider.closed || provider.repository == nil {
-		return ErrSourceControl
+	repository, _, err := provider.retainPlan()
+	if err != nil {
+		return err
 	}
-	return provider.repository.ReleasePublished(ArtifactReleaseRequest{
+	pin, err := provider.claimIdleExportPin(request)
+	if err != nil {
+		provider.releasePlan()
+		return err
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		provider.idleExportPin(request, pin)
+		provider.releasePlan()
+		return cause
+	}
+	if err = repository.ReleasePublished(ArtifactReleaseRequest{
 		Operation: request.Operation, Step: request.Step, Descriptor: descriptor,
-	})
+	}); err != nil {
+		provider.idleExportPin(request, pin)
+		provider.releasePlan()
+		return err
+	}
+	if pin != nil {
+		err = provider.finishExportPin(request, pin, true)
+	}
+	provider.releasePlan()
+	return err
 }
 
 // Close releases the repository writer claim. Callers must first stop the
@@ -425,8 +687,19 @@ func (provider *RetainedSourceExportProvider) Close() error {
 		provider.plansIdle.Wait()
 	}
 	repository := provider.repository
+	pins := provider.pins
+	provider.pins = nil
 	provider.mu.Unlock()
-	return repository.Close()
+	var closeErr error
+	for _, pin := range pins {
+		if pin.snapshot != nil {
+			closeErr = errors.Join(closeErr, pin.snapshot.Close())
+		}
+	}
+	if repository != nil {
+		closeErr = errors.Join(closeErr, repository.Close())
+	}
+	return closeErr
 }
 
 // findPublishedSource is a bounded restart lookup over repository metadata.

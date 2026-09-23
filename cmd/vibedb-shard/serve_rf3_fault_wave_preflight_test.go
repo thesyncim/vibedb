@@ -75,6 +75,7 @@ func newRF3FaultWaveTestServer(t testing.TB, connections, handshakes int, owner 
 		Command: commandFenceFromPublication(fixture.authority, identity, 1),
 		Status: raftmember.RuntimeStatus{MemberID: identity.MemberID, LeaderID: identity.MemberID,
 			Term: 2, Commit: 9, Applied: 9, CheckpointApplied: 9}}
+	fixture.probeCommand = owner.state.Command
 	server, err := shardservice.NewReplicatedServer(owner, 1<<20, 10*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -119,7 +120,8 @@ func newRF3FaultWaveTestServer(t testing.TB, connections, handshakes int, owner 
 	request := &shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
 		Authority:  serviceauthz.Authority{Node: fixture.nodes[1], Generation: fixture.authority.ActivePolicyGeneration},
 		Capability: serviceauthz.CapabilityTopology,
-		Fence:      shardservice.ReplicatedFence{Group: identity.Group, AllocationGeneration: identity.AllocationGeneration}}
+		Fence: shardservice.ReplicatedFence{Group: identity.Group, AllocationGeneration: identity.AllocationGeneration,
+			Command: owner.state.Command}}
 	return fixture, server, tls, request
 }
 

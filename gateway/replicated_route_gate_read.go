@@ -39,7 +39,10 @@ func (executor *ReplicatedExecutor) ReadRouteGate(
 		// A wave acquires gates across several groups. Refresh their leaders
 		// before admission so one stopped co-located voter cannot consume a
 		// full RPC timeout per group from the shared request deadline.
-		endpoint, state, err := executor.discoverLeaderFresh(
+		// Count election waits on this loop. discoverLeaderFresh would absorb
+		// them inside one attempt and report Retries=0 after the replacement
+		// term is already visible.
+		endpoint, state, err := executor.discoverLeaderOnce(
 			ctx, route, preferred, serviceauthz.CapabilityDataWrite,
 		)
 		if err != nil {

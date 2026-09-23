@@ -235,7 +235,7 @@ func TestReplicaActionFencesOwnershipAndRetirementExactly(t *testing.T) {
 		}, command: fence.Command}
 		owner := &Owner{host: host, members: map[raftmember.GroupKey]ownerMember{group: member}}
 		for range 3 {
-			if err := owner.applyOwnershipTransition(fence, command); err != nil {
+			if err := owner.applyOwnershipTransition(fence, command, false); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -250,17 +250,17 @@ func TestReplicaActionFencesOwnershipAndRetirementExactly(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := owner.applyOwnershipTransition(fence, conflict); !errors.Is(err, ErrServingFence) || host.proposals != 1 {
+		if err := owner.applyOwnershipTransition(fence, conflict, false); !errors.Is(err, ErrServingFence) || host.proposals != 1 {
 			t.Fatalf("conflicting in-flight transition = %v, proposals=%d", err, host.proposals)
 		}
 		// A definite core refusal must not suppress a later successful retry.
 		owner.members[group] = member
 		host.admissionErr = raftmodel.ErrReadyPending
-		if err := owner.applyOwnershipTransition(fence, command); !errors.Is(err, host.admissionErr) {
+		if err := owner.applyOwnershipTransition(fence, command, false); !errors.Is(err, host.admissionErr) {
 			t.Fatal(err)
 		}
 		host.admissionErr = nil
-		if err := owner.applyOwnershipTransition(fence, command); err != nil || host.proposals != 3 {
+		if err := owner.applyOwnershipTransition(fence, command, false); err != nil || host.proposals != 3 {
 			t.Fatalf("retry after core refusal = %v, proposals=%d", err, host.proposals)
 		}
 		// A successor term must be able to retry if the prior term lost its
@@ -268,7 +268,7 @@ func TestReplicaActionFencesOwnershipAndRetirementExactly(t *testing.T) {
 		nextTerm := fence
 		nextTerm.Term++
 		host.status.Term = nextTerm.Term
-		if err := owner.applyOwnershipTransition(nextTerm, command); err != nil || host.proposals != 4 {
+		if err := owner.applyOwnershipTransition(nextTerm, command, false); err != nil || host.proposals != 4 {
 			t.Fatalf("successor term retry = %v, proposals=%d", err, host.proposals)
 		}
 	})

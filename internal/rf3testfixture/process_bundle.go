@@ -3,8 +3,12 @@ package rf3testfixture
 import (
 	"bytes"
 	"errors"
+	"path/filepath"
 	"strconv"
 
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
+	"github.com/thesyncim/vibedb/internal/raftstore"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
 	vibejson "github.com/thesyncim/vibejson"
 )
 
@@ -30,6 +34,177 @@ var processManifestGroupFields = [...]string{
 	"child_registry",
 	"members",
 	"enrolled_target",
+}
+
+// ProcessNodeLogManifest is the physical-node portion of the managed RF3
+// manifest. It is kept in the fixture package so external-process tests and
+// operator compositions use the same canonical node-log grammar as
+// prepare-node-rf3 without importing command-private types.
+type ProcessNodeLogManifest struct {
+	Format          uint16                     `json:"format"`
+	Path            string                     `json:"path"`
+	KeyID           string                     `json:"key_id"`
+	WrappedKey      string                     `json:"wrapped_key,omitempty"`
+	KeyMaterialPath string                     `json:"key_material_path"`
+	Options         raftstore.NodeStoreOptions `json:"options"`
+}
+
+// ProcessNodeMetadata carries the immutable physical identity that must
+// survive singleton-group composition. CatalogGenesis is an already
+// canonical JSON object because its command-owned type lives in
+// cmd/vibedb-shard; the composition helper validates and places it at the
+// exact grammar position rather than decoding it into a second type.
+type ProcessNodeMetadata struct {
+	NodeLog              ProcessNodeLogManifest
+	NodeIncarnation      uint64
+	GatewaySeeds         []nodecontrol.BootstrapGatewaySeed
+	CanonicalSourceSeeds []nodecontrol.BootstrapGatewaySeed
+	CatalogGenesis       []byte
+}
+
+// CombineProcessManifestsWithNodeMetadata composes prepared singleton groups
+// and prefixes the complete physical-node identity. The physical node log,
+// incarnation, and authenticated source pins are common to every group;
+// catalog genesis is inserted after split_control, where the serve-rf3 parser
+// requires it. This is the fixture-side counterpart of prepare-node-rf3's
+// atomic physical publication and deliberately has no catalog bootstrap
+// fallback.
+func CombineProcessManifestsWithNodeMetadata(
+	metadata ProcessNodeMetadata, documents ...[]byte,
+) ([]byte, error) {
+	if err := validateProcessNodeMetadata(metadata); err != nil {
+		return nil, err
+	}
+	bundle, err := CombineProcessManifests(documents...)
+	if err != nil {
+		return nil, err
+	}
+	nodeLog, err := vibejson.Marshal(&metadata.NodeLog)
+	if err != nil {
+		return nil, errors.Join(ErrProcessManifestBundle, err)
+	}
+	prefix := make([]byte, 0, len(bundle)+len(nodeLog)+512)
+	prefix = append(prefix, `{"node_log":`...)
+	prefix = append(prefix, nodeLog...)
+	prefix = append(prefix, `,"node_incarnation":`...)
+	prefix = strconv.AppendUint(prefix, metadata.NodeIncarnation, 10)
+	prefix = append(prefix, ',')
+	if len(bundle) < 2 || bundle[0] != '{' {
+		return nil, ErrProcessManifestBundle
+	}
+	prefix = append(prefix, bundle[1:]...)
+	var seeds []byte
+	if len(metadata.GatewaySeeds) != 0 {
+		encoded, marshalErr := vibejson.Marshal(&metadata.GatewaySeeds)
+		if marshalErr != nil {
+			return nil, errors.Join(ErrProcessManifestBundle, marshalErr)
+		}
+		seeds = append(seeds, `,"bootstrap_gateway_seeds":`...)
+		seeds = append(seeds, encoded...)
+	}
+	if len(metadata.CanonicalSourceSeeds) != 0 {
+		encoded, marshalErr := vibejson.Marshal(&metadata.CanonicalSourceSeeds)
+		if marshalErr != nil {
+			return nil, errors.Join(ErrProcessManifestBundle, marshalErr)
+		}
+		seeds = append(seeds, `,"canonical_source_seeds":`...)
+		seeds = append(seeds, encoded...)
+	}
+	if len(seeds) != 0 {
+		position := bytes.Index(prefix, []byte(`,"replica_control":`))
+		if position < 0 {
+			return nil, ErrProcessManifestBundle
+		}
+		inserted := make([]byte, 0, len(prefix)+len(seeds))
+		inserted = append(inserted, prefix[:position]...)
+		inserted = append(inserted, seeds...)
+		inserted = append(inserted, prefix[position:]...)
+		prefix = inserted
+	}
+	if len(metadata.CatalogGenesis) == 0 {
+		return prefix, nil
+	}
+	position := bytes.Index(prefix, []byte(`,"groups":`))
+	if position < 0 {
+		return nil, ErrProcessManifestBundle
+	}
+	result := make([]byte, 0, len(prefix)+len(metadata.CatalogGenesis)+20)
+	result = append(result, prefix[:position]...)
+	result = append(result, `,"catalog_genesis":`...)
+	result = append(result, metadata.CatalogGenesis...)
+	result = append(result, prefix[position:]...)
+	if len(result) > maxProcessManifestBundleBytes {
+		return nil, ErrProcessManifestBundle
+	}
+	return result, nil
+}
+
+// CombineManagedProcessManifests composes singleton groups and prefixes the
+// physical-node identity the serve-rf3 parser requires for a grouped
+// manifest. The node-log path is unique to root so group WAL key material
+// can stay distinct; callers that actually serve must still create that log.
+func CombineManagedProcessManifests(root string, documents ...[]byte) ([]byte, error) {
+	if root == "" {
+		return nil, ErrProcessManifestBundle
+	}
+	if !filepath.IsAbs(root) {
+		abs, err := filepath.Abs(root)
+		if err != nil {
+			return nil, errors.Join(ErrProcessManifestBundle, err)
+		}
+		root = abs
+	}
+	root = filepath.Clean(root)
+	if root == "/" {
+		return nil, ErrProcessManifestBundle
+	}
+	return CombineProcessManifestsWithNodeMetadata(ProcessNodeMetadata{
+		NodeLog: ProcessNodeLogManifest{
+			Format: 1, Path: filepath.Join(root, "node-log"), KeyID: "managed-node-key",
+			KeyMaterialPath: filepath.Join(root, "node-key-material"),
+			Options:         raftstore.NodeStoreOptions{MaxGroups: 64},
+		},
+		NodeIncarnation: 1,
+	}, documents...)
+}
+
+func validateProcessNodeMetadata(metadata ProcessNodeMetadata) error {
+	log := metadata.NodeLog
+	if log.Format != 1 || log.KeyID == "" || metadata.NodeIncarnation == 0 ||
+		!filepath.IsAbs(log.Path) || filepath.Clean(log.Path) != log.Path ||
+		!filepath.IsAbs(log.KeyMaterialPath) || filepath.Clean(log.KeyMaterialPath) != log.KeyMaterialPath ||
+		log.Path == "/" || log.KeyMaterialPath == "/" || log.Path == log.KeyMaterialPath {
+		return ErrProcessManifestBundle
+	}
+	for _, seeds := range [][]nodecontrol.BootstrapGatewaySeed{metadata.GatewaySeeds, metadata.CanonicalSourceSeeds} {
+		if len(seeds) > nodecontrol.MaxBootstrapGatewaySeeds {
+			return ErrProcessManifestBundle
+		}
+		seen := make(map[rafttransport.NodeID]struct{}, len(seeds))
+		for _, seed := range seeds {
+			if !seed.Valid() {
+				return ErrProcessManifestBundle
+			}
+			if _, found := seen[seed.NodeID]; found {
+				return ErrProcessManifestBundle
+			}
+			seen[seed.NodeID] = struct{}{}
+		}
+	}
+	if len(metadata.CatalogGenesis) != 0 {
+		document, err := vibejson.Parse(metadata.CatalogGenesis)
+		if err != nil {
+			return errors.Join(ErrProcessManifestBundle, err)
+		}
+		if _, ok := document.Object(); !ok {
+			return ErrProcessManifestBundle
+		}
+		canonical, err := document.MarshalJSON()
+		if err != nil || !bytes.Equal(canonical, metadata.CatalogGenesis) {
+			return errors.Join(ErrProcessManifestBundle, err)
+		}
+	}
+	return nil
 }
 
 // CombineProcessManifests composes independently prepared singleton groups

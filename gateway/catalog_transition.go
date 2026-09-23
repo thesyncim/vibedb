@@ -97,11 +97,13 @@ func BuildReplicaReplacementTransition(
 			if descriptor.Replicas[replicaIndex].Member != grant.SourceMember {
 				continue
 			}
+			displaced := descriptor.Replicas[replicaIndex]
 			descriptor.Replicas[replicaIndex] = target
-			// The cold enrollment is consumed by this certified cut. Keeping it
-			// alongside the now-serving target would duplicate the same immutable
-			// member/node/store identity and make the successor catalog invalid.
+			// The cold enrollment is consumed by this certified cut. Keep the
+			// exact displaced voter in the bounded transition slot until G+2: it
+			// may still be the leader while Raft applies source removal.
 			descriptor.EnrolledTarget = nil
+			descriptor.RetiringSource = &displaced
 			descriptor.Command = nextCommand
 			changed = true
 			break

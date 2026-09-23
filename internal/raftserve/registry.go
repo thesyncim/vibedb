@@ -1477,6 +1477,30 @@ func (registry *Registry) hasPendingOwnedGroup(
 	return registry.groupTable[index].pendingAttempts != 0
 }
 
+// GroupHasPendingProposals reports admitted or still-registering proposals for
+// one group. A closed or corrupt registry fails closed so a caller does not
+// treat an unreadable pipeline as idle.
+func (registry *Registry) GroupHasPendingProposals(group raftmember.GroupKey) bool {
+	if registry == nil {
+		return true
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if registry.closed || registry.failure != nil {
+		return true
+	}
+	index, found, err := registry.findGroupLocked(group)
+	if err != nil {
+		registry.poisonLocked(err)
+		return true
+	}
+	if !found {
+		return false
+	}
+	slot := &registry.groupTable[index]
+	return slot.pendingAttempts != 0 || slot.lifecycleAttempts != 0
+}
+
 func (registry *Registry) hasPendingGroup(group raftmember.GroupKey) bool {
 	if registry == nil {
 		return true

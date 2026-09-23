@@ -3,8 +3,10 @@ package rebalanceexec
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -121,6 +123,12 @@ func TestControllerSubmitSetRefusesSecondOperationForMovingGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	prepared, directory, err := controller.Prepare(t.Context(), plan)
+	if err != nil || prepared.ID != [32]byte(plan.OperationID()) || prepared.State != gateway.ReplicatedOperationPlanned ||
+		len(directory) != 0 || len(journal.records) != 0 || len(fixture.membershipRequests) != 0 {
+		t.Fatalf("prepare published or executed before enrollment handoff: record=%+v directory=%x records=%d membership=%d err=%v",
+			prepared, directory, len(journal.records), len(fixture.membershipRequests), err)
+	}
 	if _, err = controller.SubmitSet(context.Background(), []*rebalance.Plan{plan}); err != nil {
 		t.Fatal(err)
 	}
@@ -178,10 +186,34 @@ func TestControllerDiscoversOnlyMovesAndResumesFromJournal(t *testing.T) {
 	}
 	observer.cut.LeaderStatus.Commit = 6
 	observer.cut.LeaderStatus.Applied = 6
+	fixture.bootstrapErr = ErrExecutionFence
+	if _, err := controller.RunPass(context.Background()); !errors.Is(err, ErrExecutionFence) ||
+		controller.LastFailure([32]byte(plan.OperationID())) == "" || controller.LastFailure([32]byte{0xff}) != "" {
+		t.Fatalf("missing or misattributed active move diagnostic: %v", err)
+	}
+	failedDiagnostic := controller.DiagnosticSnapshot(context.Background())
+	if !failedDiagnostic.LastPassAvailable || !failedDiagnostic.LastAttemptAvailable ||
+		failedDiagnostic.LastAttempt.Action != "create-snapshot-base" ||
+		!strings.Contains(failedDiagnostic.LastAttempt.Error, ErrExecutionFence.Error()) ||
+		!failedDiagnostic.CurrentMoveAvailable ||
+		!strings.Contains(failedDiagnostic.CurrentMove.LastFailure, "failure_at=") {
+		t.Fatalf("failed move diagnostic omitted action, cursor, or timestamp: %+v", failedDiagnostic)
+	}
+	fixture.bootstrapErr = nil
 	pass, err := controller.RunPass(context.Background())
 	if err != nil || pass.Discovered != 2 || pass.Moves != 1 || pass.Advanced != 1 ||
-		pass.Completed != 0 || len(fixture.snapshotRequests) != 1 {
+		pass.Completed != 0 || len(fixture.snapshotRequests) != 2 || controller.LastFailure([32]byte(plan.OperationID())) != "" {
 		t.Fatalf("pass=%+v snapshots=%d err=%v", pass, len(fixture.snapshotRequests), err)
+	}
+	diagnostic := controller.DiagnosticSnapshot(context.Background())
+	record := journal.records[[32]byte(plan.OperationID())]
+	if !diagnostic.LastPassAvailable || diagnostic.LastPass.Pass.Moves != 1 ||
+		diagnostic.LastPass.FinishedAt.IsZero() || !diagnostic.LastAttemptAvailable ||
+		diagnostic.LastAttempt.Action != "create-snapshot-base" || diagnostic.LastAttempt.Error != "" ||
+		!diagnostic.CurrentMoveAvailable || diagnostic.CurrentMove.OperationID != fmt.Sprintf("%x", record.ID) ||
+		diagnostic.CurrentMove.Revision != record.Revision || diagnostic.CurrentMove.Cursor != record.Cursor ||
+		diagnostic.CurrentMove.LastFailure != "" {
+		t.Fatalf("successful move diagnostic=%+v durable=%+v", diagnostic, record)
 	}
 }
 

@@ -1,11 +1,61 @@
 package servicetls
 
 import (
+	"encoding/binary"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 )
+
+func TestNodeAuthorizerMergeBoundsUniqueIdentities(t *testing.T) {
+	nodes := make([]rafttransport.NodeID, AbsoluteMaxIdentities+1)
+	for index := range nodes {
+		binary.BigEndian.PutUint64(nodes[index][8:], uint64(index+1))
+	}
+	for _, test := range []struct {
+		name     string
+		initial  []rafttransport.NodeID
+		incoming []rafttransport.NodeID
+		want     []rafttransport.NodeID
+		wantErr  error
+	}{
+		{
+			name: "full roster is idempotent", initial: nodes[:AbsoluteMaxIdentities],
+			incoming: nodes[:AbsoluteMaxIdentities], want: nodes[:AbsoluteMaxIdentities],
+		},
+		{
+			name: "overlap fills roster", initial: nodes[:AbsoluteMaxIdentities-1],
+			incoming: nodes[AbsoluteMaxIdentities-2 : AbsoluteMaxIdentities], want: nodes[:AbsoluteMaxIdentities],
+		},
+		{
+			name: "full roster accepts subset", initial: nodes[:AbsoluteMaxIdentities],
+			incoming: nodes[1:3], want: nodes[:AbsoluteMaxIdentities],
+		},
+		{
+			name: "overflow preserves roster", initial: nodes[:AbsoluteMaxIdentities],
+			incoming: nodes[AbsoluteMaxIdentities-1:], want: nodes[:AbsoluteMaxIdentities], wantErr: ErrBound,
+		},
+		{
+			name: "overflow during interleaved union preserves roster", initial: nodes[1:],
+			incoming: []rafttransport.NodeID{nodes[0], nodes[AbsoluteMaxIdentities]}, want: nodes[1:], wantErr: ErrBound,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authorizer, err := NewNodeAuthorizer(test.initial)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := authorizer.Merge(test.incoming); !errors.Is(err, test.wantErr) {
+				t.Fatalf("Merge() = %v, want %v", err, test.wantErr)
+			}
+			if got := authorizer.Nodes(); !slices.Equal(got, test.want) {
+				t.Fatalf("merged roster differs: got %d identities, want %d", len(got), len(test.want))
+			}
+		})
+	}
+}
 
 func TestNodeAuthorizerOwnsUniqueExactBinaryNodes(t *testing.T) {
 	first, second := rafttransport.NodeID{1}, rafttransport.NodeID{2}

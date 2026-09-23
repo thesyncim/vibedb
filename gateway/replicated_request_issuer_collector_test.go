@@ -208,16 +208,7 @@ func issuerCollectorGCComplete(
 	if err != nil {
 		t.Fatal(err)
 	}
-	head, err = requestledger.InstallSchemaPinRelease(head, prepared, release)
-	if err != nil {
-		t.Fatal(err)
-	}
-	intent := release
-	release, err = requestledger.RecordVerifiedSchemaPinReleased(release, release.Revision+1, []byte("released"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	head, err = requestledger.MarkSchemaPinReleased(head, prepared, intent, release)
+	head, release, err = requestledger.CompleteSchemaPinRelease(head, prepared, release, []byte("released"))
 	if err != nil {
 		t.Fatal(err)
 	}

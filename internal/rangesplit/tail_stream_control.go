@@ -22,7 +22,7 @@ const (
 	TailStreamResponseBytes = tailStreamFrameHeaderBytes + tailStreamBindingBytes +
 		2*sha256.Size + childStageCursorBytes + tailStreamDigestBytes
 	MaxTailStreamRequestBytes = tailStreamFrameHeaderBytes + tailStreamBindingBytes +
-		childStageCursorBytes + MaxTailBatchWireBytes + tailStreamDigestBytes
+		MaxTailBatchWireBytes + tailStreamDigestBytes
 )
 
 var (
@@ -61,12 +61,11 @@ func NewTailStreamBinding(
 	return binding, nil
 }
 
-// TailStreamRequest carries one fully authenticated child-local batch and the
-// exact durable cursor it is advancing. Batch operation slices borrow the raw
-// request and are valid only while raw remains immutable.
+// TailStreamRequest carries one fully authenticated child-local batch. Each
+// receiver checks its own durable cursor; a sender's observation can be stale
+// after a lost acknowledgement. Batch operation slices borrow the raw request.
 type TailStreamRequest struct {
 	Binding TailStreamBinding
-	Before  ChildStageCursor
 	Batch   TailBatch
 	digest  [sha256.Size]byte
 }
@@ -102,7 +101,7 @@ func MeasureTailStreamRequest(request TailStreamRequest) (int, error) {
 		return 0, errors.Join(ErrTailStream, err)
 	}
 	batchBytes := tailBatchWireHeaderBytes + operationBytes + sha256.Size
-	total := tailStreamFrameHeaderBytes + tailStreamBindingBytes + childStageCursorBytes +
+	total := tailStreamFrameHeaderBytes + tailStreamBindingBytes +
 		batchBytes + sha256.Size
 	if batchBytes > MaxTailBatchWireBytes || total > MaxTailStreamRequestBytes {
 		return 0, ErrTailStream
@@ -124,22 +123,16 @@ func AppendTailStreamRequestWithWorkspace(
 		return dst, ErrTailStream
 	}
 	start := len(dst)
-	dst = append(dst, make([]byte, tailStreamFrameHeaderBytes+tailStreamBindingBytes+childStageCursorBytes)...)
+	dst = append(dst, make([]byte, tailStreamFrameHeaderBytes+tailStreamBindingBytes)...)
 	frame := dst[start:]
 	clear(frame)
 	copy(frame[:8], tailStreamRequestMagic[:])
 	binary.LittleEndian.PutUint16(frame[8:10], tailStreamWireFormat)
 	binary.LittleEndian.PutUint16(frame[10:12], tailStreamFrameHeaderBytes)
 	binary.LittleEndian.PutUint32(frame[16:20], tailStreamBindingBytes)
-	binary.LittleEndian.PutUint32(frame[20:24], childStageCursorBytes)
 	appendTailStreamBinding(frame[tailStreamFrameHeaderBytes:tailStreamFrameHeaderBytes+tailStreamBindingBytes], request.Binding)
-	cursorStart := tailStreamFrameHeaderBytes + tailStreamBindingBytes
-	encoded, err := AppendChildStageCursorWithWorkspace(frame[:cursorStart], &request.Before, &workspace.cursor)
-	if err != nil {
-		return dst[:start], errors.Join(ErrTailStream, err)
-	}
-	frame = encoded
 	batchStart := len(frame)
+	var err error
 	frame, err = AppendTailBatchWithWorkspace(frame, request.Batch, &workspace.batch)
 	if err != nil {
 		return dst[:start], errors.Join(ErrTailStream, err)
@@ -167,7 +160,7 @@ func OpenTailStreamRequestWithWorkspace(
 	raw []byte,
 	workspace *TailStreamCodecWorkspace,
 ) (TailStreamRequest, error) {
-	minimum := tailStreamFrameHeaderBytes + tailStreamBindingBytes + childStageCursorBytes +
+	minimum := tailStreamFrameHeaderBytes + tailStreamBindingBytes +
 		tailBatchWireHeaderBytes + 2*sha256.Size
 	if workspace == nil || len(raw) < minimum || len(raw) > MaxTailStreamRequestBytes ||
 		!bytes.Equal(raw[:8], tailStreamRequestMagic[:]) ||
@@ -175,7 +168,7 @@ func OpenTailStreamRequestWithWorkspace(
 		binary.LittleEndian.Uint16(raw[10:12]) != tailStreamFrameHeaderBytes ||
 		uint64(binary.LittleEndian.Uint32(raw[12:16])) != uint64(len(raw)) ||
 		binary.LittleEndian.Uint32(raw[16:20]) != tailStreamBindingBytes ||
-		binary.LittleEndian.Uint32(raw[20:24]) != childStageCursorBytes ||
+		!allChildArtifactZero(raw[20:24]) ||
 		!allChildArtifactZero(raw[28:32]) {
 		return TailStreamRequest{}, ErrTailStream
 	}
@@ -184,7 +177,7 @@ func OpenTailStreamRequestWithWorkspace(
 		return TailStreamRequest{}, ErrTailStream
 	}
 	batchBytes := int(binary.LittleEndian.Uint32(raw[24:28]))
-	batchStart := tailStreamFrameHeaderBytes + tailStreamBindingBytes + childStageCursorBytes
+	batchStart := tailStreamFrameHeaderBytes + tailStreamBindingBytes
 	if batchBytes < tailBatchWireHeaderBytes+sha256.Size || batchBytes > MaxTailBatchWireBytes ||
 		batchStart+batchBytes+sha256.Size != len(raw) {
 		return TailStreamRequest{}, ErrTailStream
@@ -193,17 +186,11 @@ func OpenTailStreamRequestWithWorkspace(
 	if err != nil {
 		return TailStreamRequest{}, err
 	}
-	cursor, err := decodeChildStageCursor(
-		raw[tailStreamFrameHeaderBytes+tailStreamBindingBytes:batchStart], &workspace.cursor,
-	)
-	if err != nil {
-		return TailStreamRequest{}, errors.Join(ErrTailStream, err)
-	}
 	batch, err := OpenTailBatchWithWorkspace(raw[batchStart:batchStart+batchBytes], &workspace.batch)
 	if err != nil {
 		return TailStreamRequest{}, errors.Join(ErrTailStream, err)
 	}
-	request := TailStreamRequest{Binding: binding, Before: cursor, Batch: batch, digest: workspace.digest}
+	request := TailStreamRequest{Binding: binding, Batch: batch, digest: workspace.digest}
 	if err = validateTailStreamRequestShape(request); err != nil {
 		return TailStreamRequest{}, err
 	}
@@ -211,7 +198,8 @@ func OpenTailStreamRequestWithWorkspace(
 }
 
 // ValidateTailStreamRequest verifies all immutable operation, plan, artifact,
-// source-cut, cursor, and batch bindings before a destination applies bytes.
+// source-cut, and batch bindings before a destination applies bytes. The
+// destination independently verifies the batch against its durable cursor.
 func (p *Partitioner) ValidateTailStreamRequest(
 	operation [sha256.Size]byte,
 	manifest ChildArtifactManifest,
@@ -220,17 +208,11 @@ func (p *Partitioner) ValidateTailStreamRequest(
 ) error {
 	want, err := NewTailStreamBinding(operation, manifest)
 	if err != nil || request.Binding != want || workspace == nil ||
-		p.ValidateChildStageCursor(manifest, request.Before) != nil ||
 		p.VerifyTailBatch(request.Batch, workspace) != nil ||
-		request.Before.phase != ChildStageTail || request.Before.child != want.Child ||
-		request.Before.planDigest != want.PlanDigest ||
-		request.Before.placementDigest != want.PlacementDigest ||
-		request.Before.artifactDigest != want.ArtifactDigest ||
 		request.Batch.Child != want.Child || request.Batch.PlanDigest != want.PlanDigest ||
 		request.Batch.PlacementDigest != want.PlacementDigest ||
 		request.Batch.SourceBaseDigest != want.Source.BaseDigest ||
-		request.Batch.ChildBaseDigest != want.ArtifactDigest ||
-		!cursorImmediatelyPrecedesBatch(request.Before, request.Batch) {
+		request.Batch.ChildBaseDigest != want.ArtifactDigest {
 		return errors.Join(ErrTailStream, err)
 	}
 	return nil
@@ -381,12 +363,7 @@ func validateTailStreamRequestShape(request TailStreamRequest) error {
 		request.Batch.PlanDigest != request.Binding.PlanDigest ||
 		request.Batch.PlacementDigest != request.Binding.PlacementDigest ||
 		request.Batch.SourceBaseDigest != request.Binding.Source.BaseDigest ||
-		request.Batch.ChildBaseDigest != request.Binding.ArtifactDigest ||
-		request.Before.Child() != request.Binding.Child ||
-		request.Before.PlanDigest() != request.Binding.PlanDigest ||
-		request.Before.PlacementDigest() != request.Binding.PlacementDigest ||
-		request.Before.ArtifactDigest() != request.Binding.ArtifactDigest ||
-		!cursorImmediatelyPrecedesBatch(request.Before, request.Batch) {
+		request.Batch.ChildBaseDigest != request.Binding.ArtifactDigest {
 		return ErrTailStream
 	}
 	return nil

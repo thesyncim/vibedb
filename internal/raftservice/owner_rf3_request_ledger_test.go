@@ -434,8 +434,11 @@ func TestMultiGroupRF3DurableCallerConstructsAuthorizedProbe(t *testing.T) {
 		Authority: authority, Capability: serviceauthz.CapabilityDataWrite,
 		Fence: shardservice.ReplicatedFence{AllocationGeneration: 7, Group: raftmember.GroupKey{
 			ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}, TopologyRecoveryEpoch: 3,
-			ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4},
-		}}}
+			ShardIncarnation: [16]byte{3}, GroupID: [16]byte{4}},
+			Command: raftservice.CommandFence{ReplicaSetVersion: 1, ActivePolicyGeneration: 1,
+				ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1,
+				RelationManifestDigest: [32]byte{1}, RoutingVersion: 1, RouteGeneration: 1},
+		}}
 	var wire bytes.Buffer
 	if err := shardservice.EncodeReplicatedRequest(&wire, request); err != nil {
 		t.Fatalf("caller-bound route-gate probe is not encodable: %v", err)
@@ -458,10 +461,22 @@ func newMultiGroupRF3DurableGateway(
 	principal serviceauthz.Authority,
 ) multiGroupRF3DurableGateway {
 	t.Helper()
+	return newMultiGroupRF3DurableGatewayWithAttempts(t, cluster, snapshot, ackKey, principal, 1)
+}
+
+func newMultiGroupRF3DurableGatewayWithAttempts(
+	t testing.TB,
+	cluster *multiGroupTransactionRF3Cluster,
+	snapshot *gateway.Snapshot,
+	ackKey gateway.DurableRequestAckDerivationKey,
+	principal serviceauthz.Authority,
+	maxAttempts int,
+) multiGroupRF3DurableGateway {
+	t.Helper()
 	client := newMultiGroupRequestLedgerRF3RoundTripper(t, cluster)
 	native, err := gateway.NewReplicatedExecutorWithOptions(
 		client, gateway.ReplicatedExecutorOptions{
-			MaxAttempts: 1, AttemptTimeout: 10 * time.Second, LeaderHintCapacity: 16,
+			MaxAttempts: maxAttempts, AttemptTimeout: 10 * time.Second, LeaderHintCapacity: 16,
 		},
 	)
 	if err != nil {
@@ -507,8 +522,8 @@ func newMultiGroupRF3DurableGateway(
 	if err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := gateway.NewDurableRequestTerminalCoordinatorWithSessionFactory(
-		ledger, native, sessions,
+	terminal, err := gateway.NewDurableRequestTerminalCoordinator(
+		ledger, native, principal,
 	)
 	if err != nil {
 		t.Fatal(err)

@@ -55,6 +55,14 @@ func TestOrdinaryTransportReconnectsAfterPeerReadEOF(t *testing.T) {
 			return false
 		}
 	})
+	stats, err := transport.Stats(fixture.remote[0].Node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failure := stats.LastFailure; failure.Node != fixture.remote[0].Node ||
+		failure.Phase != peerFailurePhaseRead || failure.Cause != "eof" {
+		t.Fatalf("peer read failure snapshot = %+v", failure)
+	}
 	if err := transport.Send(fixture.outbound(0, 2)); err != nil {
 		t.Fatal(err)
 	}

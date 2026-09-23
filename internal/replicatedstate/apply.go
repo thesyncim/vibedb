@@ -429,20 +429,17 @@ func (m *Machine) applyNormal(meta raftmodel.ApplyMeta, data []byte, completion 
 	if !m.immutableBindingMatches(command) {
 		return raftmodel.Publication{}, m.fail(ErrWrongBinding)
 	}
-	systemSnapshot, relationSnapshots, err := m.captureHotBundleApplyCutLocked()
-	if err != nil {
-		return raftmodel.Publication{}, m.fail(err)
-	}
+	systemSnapshot, relationSnapshots := m.liveBundleApplyCutLocked()
 	if command.Kind() == replication.CommandRequestLedger {
 		ledgerPlan, planErr := m.planRequestLedgerCommand(
-			command, m.state, pointSnapshot{value: systemSnapshot},
+			command, meta.Index, m.state, systemSnapshot,
 		)
-		err = errors.Join(planErr, m.applyCut.Close())
+		err = planErr
 		if err != nil {
 			return raftmodel.Publication{}, m.fail(err)
 		}
 		next := m.nextState(meta, RecordNormal, digest)
-		if err := applyRequestLedgerStateDelta(&next, ledgerPlan.delta); err != nil {
+		if err := errors.Join(applyRequestLedgerStateDelta(&next, ledgerPlan.delta), applyExecutionPinStateDelta(&next, ledgerPlan.pinDelta)); err != nil {
 			return raftmodel.Publication{}, m.fail(err)
 		}
 		if err := m.persistTransitionRows(
@@ -466,9 +463,9 @@ func (m *Machine) applyNormal(meta raftmodel.ApplyMeta, data []byte, completion 
 	if command.Kind() == replication.CommandTransaction {
 		transactionPlan, planErr := m.planTransactionCommand(
 			command, meta.Index, m.state,
-			pointSnapshot{value: systemSnapshot}, relationSnapshots, nil,
+			systemSnapshot, relationSnapshots, nil,
 		)
-		err = errors.Join(planErr, m.applyCut.Close())
+		err = planErr
 		if err != nil {
 			return raftmodel.Publication{}, m.fail(err)
 		}
@@ -488,10 +485,10 @@ func (m *Machine) applyNormal(meta raftmodel.ApplyMeta, data []byte, completion 
 	}
 	plan, planErr := m.planBundleCommand(
 		command, meta.Index, m.state,
-		pointSnapshot{value: systemSnapshot}, relationSnapshots,
+		systemSnapshot, relationSnapshots,
 		nil,
 	)
-	err = errors.Join(planErr, m.applyCut.Close())
+	err = planErr
 	if err != nil {
 		return raftmodel.Publication{}, m.fail(err)
 	}
@@ -830,37 +827,16 @@ func (m *Machine) AdmitCommand(data []byte) error {
 	if !m.immutableBindingMatches(command) {
 		return ErrWrongBinding
 	}
-	var systemBase pointSnapshot
-	var relationSnapshots relationPointSnapshots
-	if isSingleTargetCommand(command) {
-		// ReplicatedApply's database read lock excludes the sole apply writer for
-		// the complete admission call. Read the current journal-backed overlays
-		// directly so proposal admission never turns a dirty certified suffix
-		// into an otherwise unnecessary physical checkpoint.
-		systemBase.live = m.system.Collection
-		relationSnapshots.count = uint16(len(m.relations))
-		for ordinal := range m.relations {
-			relationSnapshots.values[ordinal].live = m.relations[ordinal].target.Collection
-		}
-	} else {
-		systemSnapshot, snapshots, err := m.captureHotBundleApplyCutLocked()
-		if err != nil {
-			return m.fail(err)
-		}
-		systemBase.value = systemSnapshot
-		relationSnapshots = snapshots
-	}
+	systemBase, relationSnapshots := m.liveBundleApplyCutLocked()
 	if command.Kind() == replication.CommandRequestLedger {
 		ledgerPlan, planErr := m.planRequestLedgerCommand(
-			command, m.state, systemBase,
+			command, m.state.Applied+1, m.state, systemBase,
 		)
-		closeErr := m.applyCut.Close()
-		if planErr != nil || closeErr != nil {
-			joined := errors.Join(planErr, closeErr)
-			if closeErr == nil && errors.Is(planErr, ErrAdmissionBound) {
+		if planErr != nil {
+			if errors.Is(planErr, ErrAdmissionBound) {
 				return planErr
 			}
-			return m.fail(joined)
+			return m.fail(planErr)
 		}
 		next := m.nextState(
 			raftmodel.ApplyMeta{Index: m.state.Applied + 1, Term: 1, Type: pb.EntryNormal},
@@ -869,7 +845,7 @@ func (m *Machine) AdmitCommand(data []byte) error {
 				command.Bytes(),
 			),
 		)
-		if stateErr := applyRequestLedgerStateDelta(&next, ledgerPlan.delta); stateErr != nil {
+		if stateErr := errors.Join(applyRequestLedgerStateDelta(&next, ledgerPlan.delta), applyExecutionPinStateDelta(&next, ledgerPlan.pinDelta)); stateErr != nil {
 			return m.fail(stateErr)
 		}
 		return m.checkTransitionCapacityWithCaptureRows(
@@ -881,13 +857,11 @@ func (m *Machine) AdmitCommand(data []byte) error {
 			command, m.state.Applied+1, m.state,
 			systemBase, relationSnapshots, &m.commandPlanScratch,
 		)
-		closeErr := m.applyCut.Close()
-		if planErr != nil || closeErr != nil {
-			joined := errors.Join(planErr, closeErr)
-			if closeErr == nil && errors.Is(planErr, ErrAdmissionBound) {
+		if planErr != nil {
+			if errors.Is(planErr, ErrAdmissionBound) {
 				return planErr
 			}
-			return m.fail(joined)
+			return m.fail(planErr)
 		}
 		if transactionPlan.command.refusal != nil {
 			return transactionPlan.command.refusal
@@ -897,7 +871,8 @@ func (m *Machine) AdmitCommand(data []byte) error {
 		}
 		if transactionPlan.command.resultCode != ResultApplied &&
 			transactionPlan.command.resultCode != ResultTransactionConflict &&
-			transactionPlan.command.resultCode != ResultIndexConflict {
+			transactionPlan.command.resultCode != ResultIndexConflict &&
+			transactionPlan.command.resultCode != ResultIntentBusy {
 			return ErrAdmissionBound
 		}
 		next, stateErr := m.hypotheticalTransactionState(command, transactionPlan)
@@ -914,13 +889,11 @@ func (m *Machine) AdmitCommand(data []byte) error {
 		systemBase, relationSnapshots,
 		&m.commandPlanScratch,
 	)
-	closeErr := m.applyCut.Close()
-	if planErr != nil || closeErr != nil {
-		joined := errors.Join(planErr, closeErr)
-		if closeErr == nil && errors.Is(planErr, ErrAdmissionBound) {
+	if planErr != nil {
+		if errors.Is(planErr, ErrAdmissionBound) {
 			return planErr
 		}
-		return m.fail(joined)
+		return m.fail(planErr)
 	}
 	switch {
 	case plan.conflict:
@@ -1134,19 +1107,17 @@ func (m *Machine) captureBundleApplyCutLocked() (
 	return cut, systemSnapshot, snapshots, nil
 }
 
-func (m *Machine) captureHotBundleApplyCutLocked() (
-	*durable.Snapshot,
-	relationPointSnapshots,
-	error,
-) {
-	if err := durable.SnapshotCollectionsInto(&m.applyCut, m.members); err != nil {
-		return nil, relationPointSnapshots{}, err
+// liveBundleApplyCutLocked is an ephemeral cut under m.mu. The machine is
+// the only collection writer and completes planning before publication, so
+// points and synchronous scans see one applied state without materializing
+// physical roots. Detached/exported snapshots use captureBundleApplyCutLocked.
+func (m *Machine) liveBundleApplyCutLocked() (pointSnapshot, relationPointSnapshots) {
+	var relations relationPointSnapshots
+	relations.count = uint16(len(m.relations))
+	for i := range m.relations {
+		relations.values[i].live = m.relations[i].target.Collection
 	}
-	systemSnapshot, snapshots, err := m.bundleSnapshotsFromCutLocked(&m.applyCut)
-	if err != nil {
-		return nil, relationPointSnapshots{}, errors.Join(err, m.applyCut.Close())
-	}
-	return systemSnapshot, snapshots, nil
+	return pointSnapshot{live: m.system.Collection}, relations
 }
 
 func (m *Machine) bundleSnapshotsFromCutLocked(
@@ -1384,15 +1355,31 @@ func (m *Machine) planBundleCommandUnaccounted(
 			return plan, nil
 		}
 		if !m.mutableBindingMatchesState(command, state) {
-			// The terminal sequence cannot retain a stale completion because that
-			// would strand an active epoch at MaxUint64. Leave the session
-			// unchanged so the same sequence can be proposed with refreshed
-			// mutable fences. The Raft apply position still advances.
-			if command.ClientSequence == math.MaxUint64 {
-				plan.refusal = ErrStaleCommand
-				return plan, nil
+			// A released route-session pin is a narrow exception: its exact seq3
+			// route-gate outcome is retained beside the session ring, so seq4 can
+			// finish cleanup after a schema or placement fence advances. The
+			// predicate is derived entirely from replicated rows and the encoded
+			// seq4/ACK3 command; it is replay-stable and cannot be requested by an
+			// ordinary stale session.
+			settle, settleErr := m.routeSessionRetireCanSettleStale(
+				command, state, systemSnapshot, session, scratch,
+			)
+			if settleErr != nil {
+				return commandPlan{}, settleErr
 			}
-			plan.resultCode = ResultStaleFence
+			if !settle {
+				// The terminal sequence cannot retain a stale completion because that
+				// would strand an active epoch at MaxUint64. Leave the session
+				// unchanged so the same sequence can be proposed with refreshed
+				// mutable fences. The Raft apply position still advances.
+				if command.ClientSequence == math.MaxUint64 {
+					plan.refusal = ErrStaleCommand
+					return plan, nil
+				}
+				plan.resultCode = ResultStaleFence
+			} else {
+				plan.resultCode = ResultSessionRetired
+			}
 		} else {
 			plan.resultCode = ResultSessionRetired
 		}
@@ -2945,6 +2932,7 @@ func (m *Machine) persistTransitionRows(
 		m.shard = []byte(next.Binding.Shard)
 	}
 	m.binding = next.Binding
+	m.publishLogicalEpochs(next.Binding)
 	m.initialized = true
 	m.publication = publicationFromState(next)
 	if len(captureRecord) != 0 {

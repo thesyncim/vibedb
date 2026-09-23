@@ -3,6 +3,7 @@ package main
 import (
 	"path/filepath"
 
+	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibejson"
 )
@@ -18,10 +19,13 @@ type devNodeLogManifest struct {
 }
 
 type devPrepareNodeManifest struct {
-	Root    string               `json:"root"`
-	NodeLog devNodeLogManifest   `json:"node_log"`
-	Gateway *devGatewayConfig    `json:"gateway,omitempty"`
-	Groups  []devPrepareManifest `json:"groups"`
+	Root                 string                             `json:"root"`
+	NodeLog              devNodeLogManifest                 `json:"node_log"`
+	Gateway              *devGatewayConfig                  `json:"gateway,omitempty"`
+	CatalogGenesis       *devCatalogGenesisConfig           `json:"catalog_genesis,omitempty"`
+	GatewaySeeds         []nodecontrol.BootstrapGatewaySeed `json:"bootstrap_gateway_seeds,omitempty"`
+	CanonicalSourceSeeds []nodecontrol.BootstrapGatewaySeed `json:"canonical_source_seeds,omitempty"`
+	Groups               []devPrepareManifest               `json:"groups"`
 }
 
 func prepareDevNode(binary, memberPreparation string) error {

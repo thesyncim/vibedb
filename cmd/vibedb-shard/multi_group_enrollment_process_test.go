@@ -194,6 +194,15 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 	}
 	first := prepare("first", identity1, target1, 0)
 	second := prepare("second", identity2, target2, 0)
+	firstCommand := commandFenceFromPublication(authority, raftmember.RuntimeIdentity{
+		RelationManifestDigest: first.RelationManifestDigest,
+	}, 1)
+	secondCommand := commandFenceFromPublication(authority, raftmember.RuntimeIdentity{
+		RelationManifestDigest: second.RelationManifestDigest,
+	}, 1)
+	if !firstCommand.Valid() || !secondCommand.Valid() {
+		t.Fatal("multi-group enrollment command fence is invalid")
+	}
 	for member := 1; member < rf3CommandMembers; member++ {
 		firstPeer := prepare(fmt.Sprintf("first-%d", member), identity1, target1, member)
 		secondPeer := prepare(fmt.Sprintf("second-%d", member), identity2, target2, member)
@@ -334,10 +343,15 @@ func TestServeRF3ProcessRoutesTwoEnrolledGroups(t *testing.T) {
 	for _, item := range groups {
 		group := raftmember.GroupKey{ClusterID: item.identity.ClusterID, ClusterIncarnation: item.identity.ClusterIncarnation,
 			TopologyRecoveryEpoch: rf3CommandGroup().TopologyRecoveryEpoch, ShardIncarnation: item.identity.ShardIncarnation, GroupID: item.identity.GroupID}
+		probeCommand := firstCommand
+		if item.identity.GroupID != identity1.GroupID {
+			probeCommand = secondCommand
+		}
 		committed := false
 		for until := time.Now().Add(30 * time.Second); time.Now().Before(until); {
-			state, probeErr := probeRF3CommandMember(t.Context(), addresses.Native, nodes[0], profile,
-				profile.LocalIdentity().Node, group, item.identity.AllocationGeneration, authority.ActivePolicyGeneration)
+			state, probeErr := probeRF3CommandMemberWithCommand(t.Context(), addresses.Native, nodes[0], profile,
+				profile.LocalIdentity().Node, group, item.identity.AllocationGeneration, authority.ActivePolicyGeneration,
+				probeCommand)
 			if probeErr == nil && state.Commit > 1 && state.Applied >= state.Commit {
 				committed = true
 				break

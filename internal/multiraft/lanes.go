@@ -298,6 +298,12 @@ func (lane *ExecutionLane) Publication(key raftmember.GroupKey) (raftmodel.Publi
 	}
 	return lane.set.Publication(key)
 }
+func (lane *ExecutionLane) ConfigurationReplay(key raftmember.GroupKey) (raftmember.CommittedConfigurationReplay, error) {
+	if err := lane.accepts(key); err != nil {
+		return nil, err
+	}
+	return lane.set.ConfigurationReplay(key)
+}
 func (lane *ExecutionLane) Status(key raftmember.GroupKey) (raftmember.RuntimeStatus, error) {
 	if err := lane.accepts(key); err != nil {
 		return raftmember.RuntimeStatus{}, err
@@ -327,6 +333,12 @@ func (lane *ExecutionLane) SnapshotAuthorizationFence(key raftmember.GroupKey) (
 		return replicatedstate.SnapshotFence{}, err
 	}
 	return lane.set.SnapshotAuthorizationFence(key)
+}
+func (lane *ExecutionLane) PublishedLogicalEpochs(key raftmember.GroupKey) (uint64, uint64, uint64, uint64, uint64, uint64, bool) {
+	if err := lane.accepts(key); err != nil {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	return lane.set.PublishedLogicalEpochs(key)
 }
 func (lane *ExecutionLane) SnapshotBaseCertificate(key raftmember.GroupKey) (replicatedstate.SnapshotBaseCertificate, error) {
 	if err := lane.accepts(key); err != nil {
@@ -869,6 +881,27 @@ func (set *ExecutionLanes) Publication(key raftmember.GroupKey) (raftmodel.Publi
 	return result, err
 }
 
+// ConfigurationReplay serializes capability acquisition with the owning lane.
+// Entry verification through the returned capability does not acquire the lane.
+func (set *ExecutionLanes) ConfigurationReplay(key raftmember.GroupKey) (raftmember.CommittedConfigurationReplay, error) {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return nil, err
+	}
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	lane.counters.calls++
+	if set.state.Load() != executionLanesOpen {
+		lane.counters.rejected++
+		return nil, ErrHostClosed
+	}
+	result, err := lane.host.ConfigurationReplay(key)
+	if err != nil {
+		lane.counters.rejected++
+	}
+	return result, err
+}
+
 func (set *ExecutionLanes) SnapshotState(key raftmember.GroupKey) (replicatedstate.State, error) {
 	lane, err := set.laneFor(key)
 	if err != nil {
@@ -907,6 +940,21 @@ func (set *ExecutionLanes) SnapshotAuthorizationFence(
 		lane.counters.rejected++
 	}
 	return result, err
+}
+
+func (set *ExecutionLanes) PublishedLogicalEpochs(
+	key raftmember.GroupKey,
+) (policy, protection, ownership, schema, routing, generation uint64, ok bool) {
+	lane, err := set.laneFor(key)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	if set.state.Load() != executionLanesOpen || lane.host == nil {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	return lane.host.PublishedLogicalEpochs(key)
 }
 
 func (set *ExecutionLanes) SnapshotBaseCertificate(

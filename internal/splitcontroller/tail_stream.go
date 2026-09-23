@@ -156,7 +156,7 @@ func (service *TailStreamService) Serve(ctx context.Context, connection rafttran
 	switch {
 	case !ok:
 		return ErrTailStreamConflict
-	case current == request.Before || current.ResumesTailBatch(request.Before, request.Batch):
+	case current.CanApplyTailBatch(request.Batch):
 		if err = resolved.Target.ApplyTail(ctx, request.Batch); err != nil {
 			return err
 		}
@@ -354,13 +354,11 @@ func ResolveLocalTailStreamTarget(
 }
 
 type RemoteTailSink struct {
-	mu          sync.Mutex
 	ctx         context.Context
 	client      *TailStreamClient
 	destination rafttransport.NodeID
 	trustDomain rafttransport.TrustDomain
 	binding     rangesplit.TailStreamBinding
-	cursor      rangesplit.ChildStageCursor
 }
 
 func NewRemoteTailSink(
@@ -369,18 +367,14 @@ func NewRemoteTailSink(
 	destination rafttransport.NodeID,
 	trustDomain rafttransport.TrustDomain,
 	binding rangesplit.TailStreamBinding,
-	cursor rangesplit.ChildStageCursor,
 ) (*RemoteTailSink, error) {
 	if ctx == nil || client == nil || destination == (rafttransport.NodeID{}) ||
-		trustDomain == (rafttransport.TrustDomain{}) || cursor.Child() != binding.Child ||
-		cursor.PlanDigest() != binding.PlanDigest ||
-		cursor.PlacementDigest() != binding.PlacementDigest ||
-		cursor.ArtifactDigest() != binding.ArtifactDigest {
+		trustDomain == (rafttransport.TrustDomain{}) {
 		return nil, ErrTailStreamControl
 	}
 	return &RemoteTailSink{
 		ctx: ctx, client: client, destination: destination, trustDomain: trustDomain,
-		binding: binding, cursor: cursor,
+		binding: binding,
 	}, nil
 }
 
@@ -388,24 +382,9 @@ func (sink *RemoteTailSink) Apply(batch rangesplit.TailBatch) error {
 	if sink == nil {
 		return ErrTailStreamControl
 	}
-	sink.mu.Lock()
-	defer sink.mu.Unlock()
-	request := rangesplit.TailStreamRequest{Binding: sink.binding, Before: sink.cursor, Batch: batch}
-	next, err := sink.client.Apply(sink.ctx, sink.destination, sink.trustDomain, request)
-	if err != nil {
-		return err
-	}
-	sink.cursor = next
-	return nil
-}
-
-func (sink *RemoteTailSink) Cursor() rangesplit.ChildStageCursor {
-	if sink == nil {
-		return rangesplit.ChildStageCursor{}
-	}
-	sink.mu.Lock()
-	defer sink.mu.Unlock()
-	return sink.cursor
+	request := rangesplit.TailStreamRequest{Binding: sink.binding, Batch: batch}
+	_, err := sink.client.Apply(sink.ctx, sink.destination, sink.trustDomain, request)
+	return err
 }
 
 type tailStreamByteBudget struct {
@@ -441,16 +420,16 @@ func validateTailStreamRequestHeader(header []byte) (int, error) {
 		binary.LittleEndian.Uint16(header[8:10]) != 0 ||
 		binary.LittleEndian.Uint16(header[10:12]) != 32 ||
 		binary.LittleEndian.Uint32(header[16:20]) != 256 ||
-		binary.LittleEndian.Uint32(header[20:24]) != rangesplit.ChildStageCursorEncodedBytes ||
+		!allSplitTailZero(header[20:24]) ||
 		!allSplitTailZero(header[28:32]) {
 		return 0, ErrTailStreamControl
 	}
 	total := uint64(binary.LittleEndian.Uint32(header[12:16]))
 	batch := uint64(binary.LittleEndian.Uint32(header[24:28]))
-	minimum := uint64(32 + 256 + rangesplit.ChildStageCursorEncodedBytes + 440 + 2*32)
+	minimum := uint64(32 + 256 + 440 + 2*32)
 	if total < minimum || total > rangesplit.MaxTailStreamRequestBytes ||
 		batch < 440+32 || batch > uint64(rangesplit.MaxTailBatchWireBytes) ||
-		total != 32+256+rangesplit.ChildStageCursorEncodedBytes+batch+32 || total > math.MaxInt {
+		total != 32+256+batch+32 || total > math.MaxInt {
 		return 0, ErrTailStreamControl
 	}
 	return int(total), nil

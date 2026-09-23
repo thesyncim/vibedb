@@ -91,6 +91,25 @@ func TestRF3MembershipSettlementWaitsForExactConfiguration(t *testing.T) {
 				mutations["wrong transfer leader"] = func(o *replicacontrol.Observation, _ *shardservice.ReplicatedMemberState) {
 					o.Status.LeaderID = request.SourceMember
 				}
+				mutations["non-voter transfer leader"] = func(o *replicacontrol.Observation, s *shardservice.ReplicatedMemberState) {
+					o.Status.LeaderID, s.LeaderID = 99, 99
+				}
+				mutations["split leader view"] = func(o *replicacontrol.Observation, s *shardservice.ReplicatedMemberState) {
+					s.LeaderID = 2
+				}
+			}
+			if kind == raftservice.MembershipTransferLeader {
+				// A continuing voter is the preferred transferee.
+				continuing, continuingState := observed, state
+				continuing.Status.LeaderID, continuingState.LeaderID = 2, 2
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				if _, err := rf3AwaitMembershipSettlement(ctx, before, request,
+					func(context.Context) (shardservice.ReplicatedMemberState, replicacontrol.Observation, error) {
+						return continuingState, continuing, nil
+					}); err != nil {
+					t.Fatalf("continuing-voter transfer did not settle: %v", err)
+				}
 			}
 			for name, mutate := range mutations {
 				t.Run(name, func(t *testing.T) {

@@ -5,14 +5,140 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"path/filepath"
 	"testing"
 
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/store/durable"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
+
+// A staged snapshot (range split child or restore) is a new Raft group with its
+// own transaction-control history. It must not inherit the source group's
+// retained direct results, and it must not fabricate one either: a replay of
+// the source's logical command is evaluated against the child's current image
+// and that verdict is then retained exactly. Lost-ack recovery is therefore
+// confined to the source group; the gateway refuses to rebind a retained
+// direct request across a group change and reports the outcome as unknown.
+func TestStagedSnapshotStartsFreshDirectMutationHistory(t *testing.T) {
+	source := newMachineFixture(t)
+	if _, err := source.machine.InstallSnapshot(source.bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	documentKey := []byte("lost-ack-row")
+	document := []byte(`{"id":"lost-ack-row","n":1}`)
+	batches := []replication.RelationMutationBatch{{
+		Relation: 1, Mutations: []replication.Mutation{{
+			Kind: replication.MutationPutAbsent, Key: documentKey, Value: document,
+		}},
+	}}
+	id := transactionCodecID(0x31)
+	sourceRoute := relationBundleFixture{binding: source.binding}
+	sourceControl := fusedTargetControl(
+		t, sourceRoute, id, distributedtxn.ReplicatedApplySingleTarget, 1, batches,
+	)
+	sourceCommand := transactionCompletionCommand(t, source.binding, sourceControl, batches)
+	first := applyTransactionCommand(t, source.machine, 2, sourceCommand)
+	if first.AffectedRows != 1 || !first.AffectedRowsValid {
+		t.Fatalf("source direct apply result=%+v", first)
+	}
+	// The caller loses the response here. On the source group, exact replay
+	// still returns the retained terminal result.
+	if replay := applyTransactionCommand(t, source.machine, 3, sourceCommand); replay != first {
+		t.Fatalf("source exact replay=%+v original=%+v", replay, first)
+	}
+
+	childDir := t.TempDir()
+	childSystem := createTargetAt(t, childDir, "system", durable.Options{OpaqueValues: true})
+	childUser := createTargetAt(t, childDir, "user", durable.Options{})
+	sourceImage, err := source.user.Collection.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = sourceImage.RangeRaw(func(key, value []byte) error {
+		_, putErr := childUser.Collection.Put(key, value)
+		return putErr
+	})
+	if closeErr := sourceImage.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	childBinding := source.binding
+	childBinding.GroupID[0] ^= 0x80
+	childLog, err := durable.NewTxnLog(filepath.Clean(childDir), durable.TxnLogOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = childLog.Close() })
+	childOptions := stagedSnapshotMachineOptions(t, childDir, childUser)
+	cut := StagedSnapshotCut{
+		Applied: source.machine.state.Applied, Term: source.machine.state.LastTerm,
+		EntryDigest: sha256.Sum256([]byte("direct-mutation-lost-ack-split-cut")),
+	}
+	child, _, manifest, err := InitializeStagedSnapshot(
+		childBinding, testBootstrap(), childSystem,
+		UserCollection{Name: "docs", Target: childUser}, childLog, childOptions,
+		cut, SnapshotArtifactOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.SystemRows != 0 || childSystem.Collection.Len() != 1 {
+		t.Fatalf("child snapshot system image rows=%d local rows=%d", manifest.SystemRows, childSystem.Collection.Len())
+	}
+	childRow, found, err := child.user.Collection.AppendRaw(nil, documentKey)
+	if err != nil || !found || !bytes.Equal(childRow, document) {
+		t.Fatalf("child imported user row=%q found=%v err=%v", childRow, found, err)
+	}
+	controlKey, err := TransactionControlStorageKey(distributedtxn.ReplicatedRoleTarget, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := childSystem.Collection.AppendRaw(nil, controlKey[:]); err != nil || found {
+		t.Fatalf("child imported source direct result control: found=%v err=%v", found, err)
+	}
+	childRoute := relationBundleFixture{binding: childBinding}
+	childControl := fusedTargetControl(
+		t, childRoute, id, distributedtxn.ReplicatedApplySingleTarget, 1, batches,
+	)
+	childCommand := transactionCompletionCommand(t, childBinding, childControl, batches)
+	if err := child.AdmitCommand(childCommand); err != nil {
+		t.Fatalf("admit child exact replay: %v", err)
+	}
+	if _, err := child.ApplyNormal(normalMeta(cut.Applied+1), childCommand); err != nil {
+		t.Fatalf("apply child exact replay: %v", err)
+	}
+	completion, replay := openTransactionCompletion(t, child, childCommand)
+	if completion.ResultCode != ResultIndexConflict || replay.AffectedRowsValid {
+		t.Fatalf("child replay completion=%+v result=%+v, want fresh IndexConflict verdict", completion, replay)
+	}
+	childRow, found, err = child.user.Collection.AppendRaw(childRow[:0], documentKey)
+	if err != nil || !found || !bytes.Equal(childRow, document) {
+		t.Fatalf("child row after replay=%q found=%v err=%v", childRow, found, err)
+	}
+	witness, found, err := childSystem.Collection.AppendRaw(nil, controlKey[:])
+	if err != nil || !found {
+		t.Fatalf("child did not retain its own verdict: found=%v err=%v", found, err)
+	}
+	if err := child.AdmitCommand(childCommand); err != nil {
+		t.Fatalf("admit child second replay: %v", err)
+	}
+	if _, err := child.ApplyNormal(normalMeta(cut.Applied+2), childCommand); err != nil {
+		t.Fatalf("apply child second replay: %v", err)
+	}
+	again, againResult := openTransactionCompletion(t, child, childCommand)
+	witnessAfter, found, err := childSystem.Collection.AppendRaw(nil, controlKey[:])
+	if err != nil || !found || again.ResultCode != ResultIndexConflict || againResult != replay ||
+		!bytes.Equal(witnessAfter, witness) {
+		t.Fatalf("child second replay=%+v result=%+v witnessEqual=%t err=%v",
+			again, againResult, bytes.Equal(witnessAfter, witness), err)
+	}
+}
 
 type stagedSnapshotCountingValidator struct {
 	puts int

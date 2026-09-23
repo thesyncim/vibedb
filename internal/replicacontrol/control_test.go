@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,6 +41,7 @@ type testConnection struct {
 func (connection *testConnection) PeerIdentity() rafttransport.PeerIdentity {
 	return connection.identity
 }
+func (*testConnection) PeerKeyDigest() [32]byte { return [32]byte{} }
 func (connection *testConnection) TrafficClass() rafttransport.TrafficClass {
 	return connection.class
 }
@@ -55,7 +57,9 @@ func (function openerFunc) OpenShardControl(
 func TestCodecRoundTripIsCanonicalBoundedAndStrict(t *testing.T) {
 	request, cut := controlFixture()
 	observation := Observation{Request: request, Publication: cut.Publication,
-		Status: cut.Status, Progress: cut.TargetProgress, ProgressFound: true, State: cut.State}
+		Status: cut.Status, StoreID: cut.Identity.StoreID,
+		NodeIncarnation: cut.Identity.NodeIncarnation, Progress: cut.TargetProgress,
+		ProgressFound: true, State: cut.State}
 	requestBytes, err := AppendRequest(nil, request)
 	if err != nil || len(requestBytes) != RequestBytes {
 		t.Fatalf("request bytes=%d err=%v", len(requestBytes), err)
@@ -70,6 +74,7 @@ func TestCodecRoundTripIsCanonicalBoundedAndStrict(t *testing.T) {
 	}
 	opened, err := OpenResponse(encoded)
 	if err != nil || opened.Request != request || opened.Status != observation.Status ||
+		opened.StoreID != cut.Identity.StoreID || opened.NodeIncarnation != cut.Identity.NodeIncarnation ||
 		opened.Progress != observation.Progress || !opened.ProgressFound ||
 		!proto.Equal(opened.State.ConfState, observation.State.ConfState) ||
 		opened.State.Applied != observation.State.Applied {
@@ -211,6 +216,46 @@ func TestServiceRejectsWrongTrafficAndStaleReplicaSetBeforeResponse(t *testing.T
 	_ = left.Close()
 }
 
+func TestServiceUnauthorizedAdmissionIncludesCorrelationContext(t *testing.T) {
+	request, cut := controlFixture()
+	domain := rafttransport.TrustDomain{ClusterID: request.Group.ClusterID,
+		ClusterIncarnation: request.Group.ClusterIncarnation}
+	deadline := func() time.Time { return time.Now().Add(time.Second) }
+	service, err := NewService(ServiceOptions{
+		Observer: observerFunc(func(context.Context, raftmember.GroupKey, uint64) (raftservice.ReplicaObservation, error) {
+			return cut, nil
+		}),
+		AuthorizeAuthenticated: func(rafttransport.PeerBinding, Request) bool { return false },
+		ReadDeadline:           deadline, WriteDeadline: deadline, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, right := net.Pipe()
+	defer left.Close()
+	server := &testConnection{Conn: right,
+		identity: rafttransport.PeerIdentity{TrustDomain: domain, Node: rafttransport.NodeID{9}},
+		class:    rafttransport.TrafficShardControl}
+	done := make(chan error, 1)
+	go func() { done <- service.Serve(context.Background(), server) }()
+	if err := WriteRequest(left, request); err != nil {
+		t.Fatal(err)
+	}
+	serveErr := <-done
+	if !errors.Is(serveErr, ErrUnauthorized) {
+		t.Fatalf("admission error=%v, want ErrUnauthorized", serveErr)
+	}
+	for _, field := range []string{
+		"group=", "target_member=2", "peer_node=", "domain_match=true",
+		"key_present=false", "authorized=false", "expected_replica_set=17",
+		"operation_set=true", "step_set=true", "health_only=false",
+	} {
+		if !strings.Contains(serveErr.Error(), field) {
+			t.Fatalf("admission error=%q missing %q", serveErr, field)
+		}
+	}
+}
+
 func controlFixture() (Request, raftservice.ReplicaObservation) {
 	id := func(seed byte) [16]byte {
 		var value [16]byte
@@ -240,8 +285,12 @@ func controlFixture() (Request, raftservice.ReplicaObservation) {
 	status := raftmember.RuntimeStatus{MemberID: 2, LeaderID: 2, Term: 4, Commit: state.Applied,
 		Applied: state.Applied, CheckpointApplied: state.Applied, RaftState: raft.StateLeader}
 	progress := raftmodel.MemberProgress{Match: status.Commit, Next: status.Commit + 1, RecentActive: true}
-	return request, raftservice.ReplicaObservation{Publication: publication, Status: status,
-		TargetProgress: progress, ProgressFound: true, State: state}
+	return request, raftservice.ReplicaObservation{Identity: raftmember.RuntimeIdentity{
+		Group: group, Distribution: state.Binding.Distribution, Shard: state.Binding.Shard,
+		AllocationGeneration: state.Binding.AllocationGeneration, MemberID: status.MemberID,
+		StoreID: id(3), NodeIncarnation: 4, RelationManifestDigest: digest},
+		Publication: publication, Status: status, TargetProgress: progress,
+		ProgressFound: true, State: state}
 }
 
 func TestHealthCodecIsFixedStrictAndDistinctFromFullCut(t *testing.T) {
@@ -293,7 +342,8 @@ func TestHealthCodecIsFixedStrictAndDistinctFromFullCut(t *testing.T) {
 	}
 	fullRequest, fullCut := controlFixture()
 	full, err := AppendResponse(nil, Observation{Request: fullRequest,
-		Publication: fullCut.Publication, Status: fullCut.Status, Progress: fullCut.TargetProgress,
+		Publication: fullCut.Publication, Status: fullCut.Status, StoreID: fullCut.Identity.StoreID,
+		NodeIncarnation: fullCut.Identity.NodeIncarnation, Progress: fullCut.TargetProgress,
 		ProgressFound: true, State: fullCut.State})
 	if err != nil {
 		t.Fatal(err)
@@ -389,7 +439,10 @@ func TestHealthServiceUsesAuthorizedHealthObserverOnly(t *testing.T) {
 		{name: "wrong group", calls: 1, want: ErrStale, mutate: func(observer *healthControlObserver, _ *rafttransport.PeerIdentity) {
 			observer.cut.Identity.Group.GroupID[0]++
 		}},
-		{name: "stale version", calls: 1, want: ErrStale, mutate: func(observer *healthControlObserver, _ *rafttransport.PeerIdentity) {
+		{name: "regressed version", calls: 1, want: ErrStale, mutate: func(observer *healthControlObserver, _ *rafttransport.PeerIdentity) {
+			observer.cut.Publication.ReplicaSetVersion--
+		}},
+		{name: "advanced version", calls: 1, mutate: func(observer *healthControlObserver, _ *rafttransport.PeerIdentity) {
 			observer.cut.Publication.ReplicaSetVersion++
 		}},
 		{name: "denied principal", deny: true, want: ErrUnauthorized},

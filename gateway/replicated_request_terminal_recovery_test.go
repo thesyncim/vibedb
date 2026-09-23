@@ -2,50 +2,14 @@ package gateway
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
-	"github.com/thesyncim/vibedb/internal/replicatedstate"
-	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 )
-
-type terminalRecoveryPin struct {
-	*terminalCoordinatorPin
-	delegated serviceauthz.Authority
-}
-
-func (pin *terminalRecoveryPin) RetryExact(ctx context.Context, exact []byte) (ReplicatedResult, error) {
-	pin.delegated, _ = serviceauthz.FromContext(ctx)
-	return pin.terminalCoordinatorPin.RetryExact(ctx, exact)
-}
-
-type terminalRecoveryLedger struct {
-	*terminalCoordinatorLedger
-	pin *terminalRecoveryPin
-}
-
-func (ledger *terminalRecoveryLedger) ApplyCAS(ctx context.Context, home DurableRequestLedgerHome, key requestledger.RequestKey, cas DurableRequestLifecycleCAS) (DurableRequestLifecycleCASResult, error) {
-	result, err := ledger.terminalCoordinatorLedger.ApplyCAS(ctx, home, key, cas)
-	if cas.Operation == requestledger.OperationBeginSchemaPinRelease && ledger.head.Revision == cas.Revision {
-		outer, openErr := replication.OpenCommand(cas.SchemaPin.Command)
-		command, nestedErr := outer.OpenExecutionPin()
-		if openErr != nil || nestedErr != nil {
-			return DurableRequestLifecycleCASResult{}, errors.Join(openErr, nestedErr)
-		}
-		// Model the production atomic ledger-intent + pin-freeze transition,
-		// including an outcome-unknown response after both replacements.
-		ledger.pin.record, openErr = executionpin.FreezeRelease(ledger.pin.record, command)
-		if openErr != nil {
-			return DurableRequestLifecycleCASResult{}, openErr
-		}
-	}
-	return result, err
-}
 
 func runBuiltTerminalRecoveryCases(t *testing.T, execution DurableRequestTypedExecutionContext, authority DurableRequestTerminalAuthority, state durableDistributedState, head requestledger.HeadRecord, continuation requestledger.ContinuationRecord, record executionpin.Record) {
 	t.Helper()
@@ -54,15 +18,13 @@ func runBuiltTerminalRecoveryCases(t *testing.T, execution DurableRequestTypedEx
 		op   requestledger.Operation
 	}{
 		{"prepared_new_lease", requestledger.OperationPrepareTerminal},
-		{"retained_release_new_gateway", requestledger.OperationBeginSchemaPinRelease},
-		{"retained_proof_new_gateway", requestledger.OperationRecordSchemaPinReleased},
+		{"atomic_release_new_gateway", requestledger.OperationReleaseSchemaPin},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			pin := &terminalRecoveryPin{terminalCoordinatorPin: &terminalCoordinatorPin{
-				t: t, route: execution.Home.borrowedRoute(), tenant: execution.Recipe.Tenant,
-				retryHome: execution.Recipe.Identity.RetryHome, clientID: replication.ID128{3}, epoch: 2, sequence: 2, record: record}}
-			ledger := &terminalRecoveryLedger{terminalCoordinatorLedger: &terminalCoordinatorLedger{
-				head: head, continuation: continuation, fault: test.op}, pin: pin}
+			pin := &terminalCoordinatorPin{record: record}
+			ledger := &terminalCoordinatorLedger{
+				pin:  pin,
+				head: head, continuation: continuation, fault: test.op}
 			coordinator, err := newDurableRequestTerminalCoordinator(ledger, pin)
 			if err != nil {
 				t.Fatal(err)
@@ -81,7 +43,7 @@ func runBuiltTerminalRecoveryCases(t *testing.T, execution DurableRequestTypedEx
 			resumed.terminalCut = &cut
 			principal := serviceauthz.Authority{Node: rafttransport.NodeID{9}, Generation: 5}
 			if test.op == requestledger.OperationPrepareTerminal {
-				// A prepared result without a release intent may extend its live
+				// A prepared result without a committed release may extend its live
 				// lease. That must not regenerate its already-owned ACK capability.
 				renew := authority.Release
 				renew.Operation, renew.NextController, renew.NextControllerEpoch = executionpin.OperationRenew, record.Controller, record.ControllerEpoch
@@ -153,10 +115,9 @@ func runBuiltTerminalRecoveryCases(t *testing.T, execution DurableRequestTypedEx
 			if err != nil || !bytes.Equal(preparedBytes, after) {
 				t.Fatal("terminal recovery rewrote the immutable prepared result", err)
 			}
-			if test.op == requestledger.OperationBeginSchemaPinRelease {
-				if pin.delegated.Node != rafttransport.NodeID(authority.Release.AuthorityNode) || pin.delegated.Generation != authority.Release.AuthorityGeneration ||
-					len(pin.attempts) != 1 || !bytes.Equal(pin.attempts[0], cut.SchemaPin.Command) {
-					t.Fatal("retained release changed original authority or exact command bytes")
+			if test.op == requestledger.OperationReleaseSchemaPin {
+				if len(pin.attempts) != 1 || !bytes.Equal(pin.attempts[0], cut.SchemaPin.Command) {
+					t.Fatal("gateway replacement repeated the committed release")
 				}
 			}
 		})
@@ -167,22 +128,14 @@ func runBuiltTerminalRecoveryCases(t *testing.T, execution DurableRequestTypedEx
 // the proof format boundary rather than just a corrupt envelope checksum.
 func terminalCutWithWrongProofFormat(t *testing.T, cut durableRequestTerminalReadCut) durableRequestTerminalReadCut {
 	t.Helper()
-	c, err := replication.OpenCompletion(cut.SchemaPin.Completion)
+	c, err := executionpin.OpenCompletion(cut.SchemaPin.Completion)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const format = replicatedstate.ResultFormatMutation
-	wrong, err := replication.AppendCompletionBytes(nil, replication.CompletionBytes{
-		ClusterID: c.ClusterID, ClusterIncarnation: c.ClusterIncarnation, TopologyRecoveryEpoch: c.TopologyRecoveryEpoch,
-		Distribution: c.Distribution, Shard: c.Shard, AllocationGeneration: c.AllocationGeneration,
-		ShardIncarnation: c.ShardIncarnation, GroupID: c.GroupID, ReplicaSetVersion: c.ReplicaSetVersion,
-		ActivePolicyGeneration: c.ActivePolicyGeneration, ProtectionEpoch: c.ProtectionEpoch,
-		RoutingVersion: c.RoutingVersion, RouteGeneration: c.RouteGeneration,
-		Tenant: c.Tenant, ClientID: c.ClientID, ClientEpoch: c.ClientEpoch, ClientSequence: c.ClientSequence,
-		Fingerprint: c.Fingerprint, RetryHome: c.RetryHome, AppliedSequence: c.AppliedSequence,
-		ResultCode: c.ResultCode, ResultFormat: format, Storage: c.Storage, ResultLength: c.ResultLength,
-		ResultDigest: replication.CompletionResultDigest(c.ResultCode, format, c.InlineResult), InlineResult: c.InlineResult,
-	})
+	c.Operation = executionpin.OperationAcquire
+	c.Status = executionpin.StatusActive
+	c.Terminal = executionpin.TerminalCertificate{}
+	wrong, err := executionpin.AppendCompletion(nil, c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,17 +145,10 @@ func terminalCutWithWrongProofFormat(t *testing.T, cut durableRequestTerminalRea
 	if err != nil {
 		t.Fatal(err)
 	}
-	prior, err = requestledger.InstallSchemaPinRelease(prior, cut.Prepared, intent)
+	cut.Head, cut.SchemaPin, err = requestledger.CompleteSchemaPinRelease(prior, cut.Prepared, intent, wrong)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cut.SchemaPin, err = requestledger.RecordVerifiedSchemaPinReleased(intent, intent.Revision+1, wrong)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cut.Head, err = requestledger.MarkSchemaPinReleased(prior, cut.Prepared, intent, cut.SchemaPin)
-	if err != nil {
-		t.Fatal(err)
-	}
+
 	return cut
 }

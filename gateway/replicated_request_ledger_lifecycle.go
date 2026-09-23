@@ -333,8 +333,7 @@ func durableRequestLifecycleCommand(
 		command.RequestDigest, command.PlanRoot = cas.Prepared.RequestDigest, cas.Prepared.PlanRoot
 		command.SubjectDigest = cas.Prepared.PreparedDigest
 		command.Payload, err = requestledger.AppendPreparedTerminal(nil, cas.Prepared)
-	case requestledger.OperationBeginSchemaPinRelease,
-		requestledger.OperationRecordSchemaPinReleased:
+	case requestledger.OperationReleaseSchemaPin:
 		command.RequestDigest, command.PlanRoot = cas.SchemaPin.RequestDigest, cas.SchemaPin.PlanRoot
 		command.SubjectDigest = cas.SchemaPin.RecordDigest
 		command.Payload, err = requestledger.AppendSchemaPinRelease(nil, cas.SchemaPin)

@@ -416,7 +416,7 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 				GlobalIndexes:       restoreRF3GlobalRelations(schemas[ordinal]),
 				WAL:                 prepareRF3WAL{"rf3-command-key", keyPath, "restore-process-wrapped-key", restoreRF3TargetWALBytes, raftstore.DefaultMaxRecordBytes, 4096, 16384, raftstore.DefaultMaxLiveBytes},
 				Listeners:           rf3ManifestListeners{Peer: fixture.peerAddresses[member], Native: fixture.nativeAddresses[member], Snapshot: fixture.snapshotAddresses[member], Control: fixture.controlAddresses[member]},
-				TLS:                 rf3ManifestTLS{Certificate: fixture.credentials[member].Certificate, Key: fixture.credentials[member].Key, Roots: roots, IdentityOID: rf3testfixture.ProcessIdentityOID},
+				TLS:                 rf3ManifestTLS{PeerKeys: rf3CommandPeerKeys(fixture.credentials[member]), Certificate: fixture.credentials[member].Certificate, Key: fixture.credentials[member].Key, Roots: roots, IdentityOID: rf3testfixture.ProcessIdentityOID},
 				AuthorizationPolicy: policyPath, SplitControl: prepareRF3SplitControl{MaxRecords: 4096, MaxFileBytes: 64 << 20, MaxChildOperations: 8, StageCheckpointBytes: 32 << 20}}
 			for index, node := range fixture.nodes {
 				input.Members = append(input.Members, prepareRF3Member{MemberID: uint64(index + 1), NodeID: idString(node[:]), PeerAddress: fixture.peerAddresses[index]})
@@ -448,6 +448,30 @@ func newRestoredRF3ProcessFixture(t *testing.T) ([2]*rf3FaultFixture, gateway.Re
 			if err != nil {
 				t.Fatal(err)
 			}
+		}
+		serving, loadErr := loadRF3Manifest(fixture.manifestPaths[0])
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		bundles := serving.groupBundles()
+		if len(bundles) == 0 {
+			t.Fatal("restored RF3 serving manifest has no groups")
+		}
+		base, _, identityErr := loadRF3RetainedIdentities(serving.withGroup(bundles[0]))
+		if identityErr != nil {
+			t.Fatal(identityErr)
+		}
+		digest, digestErr := sqldriver.ReplicatedRelationManifestDigest(base)
+		if digestErr != nil {
+			t.Fatal(digestErr)
+		}
+		fixture.probeCommand = commandFenceFromPublication(
+			base.Binding.Authority,
+			raftmember.RuntimeIdentity{RelationManifestDigest: digest},
+			1,
+		)
+		if !fixture.probeCommand.Valid() {
+			t.Fatalf("restored RF3 probe command is invalid: %+v", fixture.probeCommand)
 		}
 	}
 	return fixtures, gateway.RestoreActivationOptions{Root: activationRoot, Staging: staging, Operation: operation, Installer: installer, Catalog: catalog, Gate: gate, Operator: serviceauthz.Authority{Node: operatorNode, Generation: 5}}, snapshot
@@ -602,10 +626,10 @@ func restoreRF3AssertClosed(t *testing.T, fixture *rf3FaultFixture, member int) 
 	t.Helper()
 	response, err := fixture.roundTrip(t, member, &shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
 		Authority: serviceauthz.Authority{Node: fixture.nodes[(member+1)%3], Generation: 5}, Capability: serviceauthz.CapabilityTopology,
-		Fence: shardservice.ReplicatedFence{Group: fixture.group, AllocationGeneration: 23}})
+		Fence: shardservice.ReplicatedFence{Group: fixture.group, AllocationGeneration: 23, Command: fixture.probeCommand}})
 	if err != nil || response.Kind != shardservice.ReplicatedRefusal ||
 		response.Refusal != shardservice.ReplicatedRefusalUnavailable || !response.HasState {
-		t.Fatalf("restored member %d served without a fresh catalog grant: %+v", member+1, response)
+		t.Fatalf("restored member %d served without a fresh catalog grant: %+v err=%v", member+1, response, err)
 	}
 }
 
@@ -929,9 +953,9 @@ func restoreRF3ProbeContext(
 	member int,
 ) (shardservice.ReplicatedMemberState, error) {
 	client := (member + 1) % rf3CommandMembers
-	return probeRF3CommandMember(ctx, fixture.nativeAddresses[member], fixture.nodes[member],
+	return probeRF3CommandMemberWithCommand(ctx, fixture.nativeAddresses[member], fixture.nodes[member],
 		fixture.profiles[client], fixture.nodes[client], fixture.group,
-		rf3CommandStoreIdentity(1).AllocationGeneration, fixture.authority.ActivePolicyGeneration)
+		rf3CommandStoreIdentity(1).AllocationGeneration, fixture.authority.ActivePolicyGeneration, fixture.probeCommand)
 }
 
 func restoreRF3ReadRelation(t *testing.T, fixture *rf3FaultFixture, leader int, state shardservice.ReplicatedMemberState, relation replication.RelationID, key, want []byte, found bool) {

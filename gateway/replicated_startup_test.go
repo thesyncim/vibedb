@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -26,6 +28,127 @@ type startupElectionClient struct {
 	unauthorized     bool
 	wrongFence       bool
 	afterFirstSweep  func()
+	leaderlessUntil  time.Time
+}
+
+type unavailableProposalClient struct {
+	*startupElectionClient
+	readyAt   time.Time
+	withState bool
+	refused   [][]byte
+}
+
+type ownershipDiscoveryClient struct {
+	*startupElectionClient
+	proposed int
+}
+
+func (client *ownershipDiscoveryClient) ProbeReplicated(ctx context.Context, route ReplicatedRoute, endpoint ReplicatedEndpoint,
+	capability serviceauthz.Capability,
+) (*shardservice.ReplicatedResponse, error) {
+	response, err := client.startupElectionClient.DoReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe})
+	if err == nil {
+		_, err = bindReplicatedObservation(route, endpoint, response)
+	}
+	return response, err
+}
+
+func (client *ownershipDiscoveryClient) DoReplicated(ctx context.Context, endpoint ReplicatedEndpoint, request *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
+	client.proposed++
+	state := client.states[endpoint.Address]
+	for address, state := range client.states {
+		state.Fence.Command.OwnershipEpoch++
+		client.states[address] = state
+	}
+	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedOutcomeUnknown, HasState: true, State: state}, nil
+}
+
+func TestReplicatedOwnershipDiscoveryPreservesAdmissionKnowledge(t *testing.T) {
+	for _, priorProposal := range []bool{false, true} {
+		t.Run(fmt.Sprint(priorProposal), func(t *testing.T) {
+			route, command, states := testReplicatedRouteCommand(t)
+			if !priorProposal {
+				for address, state := range states {
+					state.Fence.Command.OwnershipEpoch++
+					states[address] = state
+				}
+			}
+			client := &ownershipDiscoveryClient{startupElectionClient: &startupElectionClient{states: states}}
+			executor, err := NewReplicatedExecutor(client, 2, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = executor.Propose(t.Context(), route, command)
+			if !errors.Is(err, raftservice.ErrServingFence) || errors.Is(err, errReplicatedNotAdmitted) == priorProposal ||
+				errors.Is(err, raftservice.ErrOutcomeUnknown) != priorProposal {
+				t.Fatalf("prior=%t proposed=%d err=%v", priorProposal, client.proposed, err)
+			}
+			if priorProposal {
+				var unknown *raftservice.UnknownOutcomeError
+				if client.proposed != 1 || !errors.As(err, &unknown) || !bytes.Equal(unknown.Command, command) {
+					t.Fatal("ambiguous recipe changed")
+				}
+			} else if client.proposed != 0 {
+				t.Fatal("stale route reached proposal")
+			}
+		})
+	}
+}
+
+func (client *unavailableProposalClient) DoReplicated(ctx context.Context, endpoint ReplicatedEndpoint,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	if request.Operation == shardservice.ReplicatedPropose && time.Now().Before(client.readyAt) {
+		client.refused = append(client.refused, bytes.Clone(request.Command))
+		response := &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedRefusal,
+			Refusal: shardservice.ReplicatedRefusalUnavailable}
+		if client.withState {
+			response.HasState, response.State = true, client.states[endpoint.Address]
+		}
+		return response, nil
+	}
+	return client.startupElectionClient.DoReplicated(ctx, endpoint, request)
+}
+
+func TestReplicatedExecutorWaitsForDefiniteUnavailableWithoutChangingCommand(t *testing.T) {
+	for _, withState := range []bool{false, true} {
+		synctest.Test(t, func(t *testing.T) {
+			route, command, states := testReplicatedRouteCommand(t)
+			client := &unavailableProposalClient{startupElectionClient: &startupElectionClient{states: states},
+				readyAt: time.Now().Add(1500 * time.Millisecond), withState: withState}
+			executor, err := NewReplicatedExecutor(client, 1, 3*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := executor.Propose(t.Context(), route, command)
+			if err != nil || len(client.commands) != 1 || len(client.refused) < 2 || result.Retries != len(client.refused) {
+				t.Fatalf("state=%t result=%+v admitted=%d refused=%d err=%v", withState, result, len(client.commands), len(client.refused), err)
+			}
+			for _, sent := range append(client.refused, client.commands...) {
+				if !bytes.Equal(sent, command) {
+					t.Fatal("readiness retry changed immutable command")
+				}
+			}
+		})
+	}
+}
+
+func TestReplicatedExecutorUnavailableDeadlineIsDefinite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		route, command, states := testReplicatedRouteCommand(t)
+		client := &unavailableProposalClient{startupElectionClient: &startupElectionClient{states: states},
+			readyAt: time.Now().Add(time.Minute), withState: true}
+		executor, err := NewReplicatedExecutor(client, 1, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		_, err = executor.Propose(t.Context(), route, command)
+		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, raftservice.ErrOutcomeUnknown) ||
+			time.Since(started) != time.Second || len(client.commands) != 0 {
+			t.Fatalf("elapsed=%s admitted=%d err=%v", time.Since(started), len(client.commands), err)
+		}
+	})
 }
 
 func (client *startupElectionClient) DoReplicated(_ context.Context, endpoint ReplicatedEndpoint,
@@ -41,7 +164,7 @@ func (client *startupElectionClient) DoReplicated(_ context.Context, endpoint Re
 			return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedRefusal,
 				Refusal: shardservice.ReplicatedRefusalUnauthorized}, nil
 		}
-		if client.probes <= client.leaderlessSweeps*len(client.states) {
+		if client.probes <= client.leaderlessSweeps*len(client.states) || time.Now().Before(client.leaderlessUntil) {
 			state.LeaderID = 0
 		}
 		if client.wrongFence {
@@ -77,6 +200,21 @@ func (client *startupElectionClient) DoReplicated(_ context.Context, endpoint Re
 		Completion: completion}, nil
 }
 
+func TestReplicatedExecutorElectionWaitDoesNotSpendProposalAttempts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		route, command, states := testReplicatedRouteCommand(t)
+		client := &startupElectionClient{states: states, leaderlessUntil: time.Now().Add(1500 * time.Millisecond)}
+		executor, err := NewReplicatedExecutor(client, 1, 3*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := executor.Propose(t.Context(), route, command)
+		if err != nil || result.Retries != 0 || len(client.commands) != 1 || !bytes.Equal(client.commands[0], command) {
+			t.Fatalf("election consumed proposal allowance: result=%+v proposals=%d err=%v", result, len(client.commands), err)
+		}
+	})
+}
+
 func TestReplicatedExecutorRetriesInitialLeaderlessDiscovery(t *testing.T) {
 	route, command, states := testReplicatedRouteCommand(t)
 	client := &startupElectionClient{states: states, leaderlessSweeps: 2}
@@ -85,7 +223,7 @@ func TestReplicatedExecutorRetriesInitialLeaderlessDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := executor.Propose(t.Context(), route, command)
-	if err != nil || result.Retries != 2 || client.probes != 8 || len(client.commands) != 1 ||
+	if err != nil || result.Retries != 0 || client.probes != 8 || len(client.commands) != 1 ||
 		!bytes.Equal(client.commands[0], command) {
 		t.Fatalf("initial election: result=%+v probes=%d proposals=%d error=%v",
 			result, client.probes, len(client.commands), err)
@@ -126,9 +264,11 @@ func TestReplicatedExecutorInitialElectionExhaustionIsBoundedAndDiagnosable(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = executor.Propose(t.Context(), route, command)
+	ctx, cancel := context.WithTimeout(t.Context(), 80*time.Millisecond)
+	defer cancel()
+	_, err = executor.Propose(ctx, route, command)
 	if !errors.Is(err, ErrReplicatedLeader) || errors.Is(err, raftservice.ErrOutcomeUnknown) ||
-		client.probes != 6 || len(client.commands) != 0 ||
+		!errors.Is(err, context.DeadlineExceeded) || client.probes < 3 || len(client.commands) != 0 ||
 		!strings.Contains(err.Error(), "no authenticated replica reported itself as leader") {
 		t.Fatalf("bounded election: probes=%d proposals=%d error=%v", client.probes, len(client.commands), err)
 	}

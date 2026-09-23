@@ -41,6 +41,9 @@ type rf3SplitServingRuntime struct {
 
 type rf3SplitServingOptions struct {
 	inventory     *rf3AdoptedGroupInventory
+	schemas       *rf3SchemaActivator
+	nodeOwner     *rf3NodeOwner
+	children      *rf3DynamicChildResources
 	childPreparer *rf3GroupChildPreparer
 	manifest      rf3Manifest
 	prepared      []preparedRF3Group
@@ -54,13 +57,22 @@ type rf3SplitServingOptions struct {
 	// frontend principal in a fused node. Storage identity remains unchanged
 	// for exact physical-node admission and split data-transfer grants.
 	topologyProfile *rafttransport.PeerTLS
+	topologyActions func(raftmember.RuntimeIdentity, *splitcontroller.RuntimeStoreLease, *sqldriver.ReplicatedApply) (rf3SplitTopologyActions, error)
 	policy          *serviceauthz.Policy
 	deadline        rafttransport.DeadlineFunc
 }
 
+// Source mutations retain their exact plan authority while the serving node
+// may obtain execution through an independent local frontend or a scoped
+// controller proxy. The storage peer never acquires general delegation.
+type rf3SplitTopologyActions interface {
+	splitcontroller.SourceCaptureActivationProposerFactory
+	splitcontroller.RetainedPruneProposerFactory
+}
+
 func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServingRuntime, error) {
 	maxOperations := options.manifest.SplitControl.operationLimit()
-	if len(options.prepared) == 0 || len(options.prepared) != len(options.identities) ||
+	if len(options.prepared) != len(options.identities) ||
 		len(options.prepared) != len(options.commands) || options.owners == nil || options.registrar == nil ||
 		options.profile == nil || options.policy == nil || options.deadline == nil || maxOperations <= 0 {
 		return nil, errRF3Serving
@@ -87,9 +99,12 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 			Registry:     observation.registries[index],
 		}
 	}
-	registries, err := splitcontroller.NewLocalPlanAdmissionRegistries(
-		options.profile.LocalIdentity().Node, retained, maxOperations, nil,
-	)
+	var registries *splitcontroller.LocalPlanAdmissionRegistries
+	if len(retained) == 0 {
+		registries, err = splitcontroller.NewEmptyLocalPlanAdmissionRegistries(options.profile.LocalIdentity().Node, maxOperations, nil)
+	} else {
+		registries, err = splitcontroller.NewLocalPlanAdmissionRegistries(options.profile.LocalIdentity().Node, retained, maxOperations, nil)
+	}
 	if err != nil {
 		return closeOnError(err)
 	}
@@ -118,8 +133,8 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 	authority := serviceauthz.Authority{
 		Node: topologyProfile.LocalIdentity().Node, Generation: options.policy.Generation(),
 	}
-	if options.policy.Check(authority.Node, serviceauthz.CapabilityTopology) != serviceauthz.DecisionAllow ||
-		options.policy.Check(authority.Node, serviceauthz.CapabilityDelegate) != serviceauthz.DecisionAllow {
+	if options.topologyActions == nil && (options.policy.Check(authority.Node, serviceauthz.CapabilityTopology) != serviceauthz.DecisionAllow ||
+		options.policy.Check(authority.Node, serviceauthz.CapabilityDelegate) != serviceauthz.DecisionAllow) {
 		return closeOnError(errRF3Serving)
 	}
 	makeSource := func(identity raftmember.RuntimeIdentity, command raftservice.CommandFence, apply *sqldriver.ReplicatedApply, registry *splitcontroller.RuntimeStoreRegistry) (splitcontroller.AdmittedSourceRuntime, error) {
@@ -173,8 +188,14 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 				if openErr != nil {
 					return nil, openErr
 				}
-				topologyFactory := &rf3RetainedPruneFactory{
+				var topologyFactory rf3SplitTopologyActions = &rf3RetainedPruneFactory{
 					tls: topologyProfile, authority: authority, lease: lease, source: apply,
+				}
+				if options.topologyActions != nil {
+					topologyFactory, openErr = options.topologyActions(identity, lease, apply)
+					if openErr != nil || topologyFactory == nil {
+						return nil, errors.Join(errRF3Serving, openErr)
+					}
 				}
 				composite, openErr := splitcontroller.NewCompositeShardActionExecutor(splitcontroller.CompositeShardActionExecutorOptions{
 					Operation: plan.OperationID(), Actions: splitcontroller.SourceSplitActionMask(),
@@ -213,7 +234,7 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 			return closeOnError(err)
 		}
 	}
-	liveSources := &rf3AdoptedSourceResolver{registries: registries, inventory: options.inventory,
+	liveSources := &rf3AdoptedSourceResolver{registries: registries, inventory: options.inventory, hosted: options.schemas,
 		observation: observation.provider, owners: options.owners, makeSource: makeSource,
 		live: make(map[raftmember.GroupKey]rf3RetainedSource)}
 	for index, identity := range options.identities {
@@ -231,7 +252,26 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 		registryIndex, childRegistry, found := rf3SplitChildRegistryForTarget(
 			options.manifest, [32]byte(plan.OperationID()), child, replica,
 		)
-		if !found {
+		var bootstrap *pb.Snapshot
+		dynamic := false
+		if options.children != nil {
+			resources, resolved, err := options.children.ResolveResources([32]byte(plan.OperationID()), child, replica)
+			if err != nil {
+				return nil, err
+			}
+			if resolved {
+				childRegistry, bootstrap, found = resources.Registry, resources.Bootstrap, true
+				dynamic = resources.Slot == rf3DynamicTemplateSlot
+				registryIndex = resources.Slot
+			}
+		}
+		if !found || !dynamic && (registryIndex < 0 || registryIndex >= len(options.prepared) || registryIndex >= len(staticBootstraps)) {
+			return nil, errRF3Serving
+		}
+		if bootstrap == nil && !dynamic {
+			bootstrap = staticBootstraps[registryIndex]
+		}
+		if bootstrap == nil {
 			return nil, errRF3Serving
 		}
 		if replay, group, restored, replayErr := liveSources.adoptedChildReplay(plan, admission, child, replica); replayErr != nil {
@@ -250,7 +290,12 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 		if openErr != nil {
 			return nil, openErr
 		}
-		key, openErr := loadRF3SplitChildWALKey(childRegistry, &options.prepared[registryIndex])
+		var key raftstore.Key
+		if dynamic {
+			key, openErr = loadRF3SplitChildNodeWALKey(childRegistry, options.nodeOwner)
+		} else {
+			key, openErr = loadRF3SplitChildWALKey(childRegistry, &options.prepared[registryIndex])
+		}
 		if openErr != nil {
 			return nil, openErr
 		}
@@ -259,7 +304,7 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 		executor, openErr := splitcontroller.NewLazyReplicatedChildExecutor(
 			splitcontroller.LazyReplicatedChildExecutorOptions{
 				Plan: plan, PlanDigest: admission.PlanDigest, Child: child, Replica: replica, Lease: lease,
-				Registrar: options.registrar, StaticBootstrap: proto.Clone(staticBootstraps[registryIndex]).(*pb.Snapshot),
+				Registrar: options.registrar, StaticBootstrap: proto.Clone(bootstrap).(*pb.Snapshot),
 				AdoptionCheckpoint: adoptionCheckpoint,
 				ArtifactOptions:    replicatedstate.SnapshotArtifactOptions{}, WALKey: key,
 				WALOptions:      childRegistry.WAL.Options,
@@ -387,18 +432,36 @@ func newRF3SplitServingRuntime(options rf3SplitServingOptions) (*rf3SplitServing
 // A node-backed source has no per-group WAL handle. Authenticate the child
 // provider key against the physical log that actually retains its metadata.
 func loadRF3SplitChildWALKey(registry rf3ManifestSplitChildRegistry, source *preparedRF3Group) (raftstore.Key, error) {
+	if source == nil {
+		return raftstore.Key{}, errRF3Serving
+	}
+	if source.nodeOwner != nil {
+		return loadRF3SplitChildNodeWALKey(registry, source.nodeOwner)
+	}
 	key, err := loadRF3WALKey(registry.WAL.KeyID, registry.WAL.KeyMaterialPath)
 	if err != nil {
 		return raftstore.Key{}, err
 	}
-	if source.nodeOwner != nil {
-		key.Wrapped, err = source.nodeOwner.store.AuthenticatedWrappedKeyMetadata(key)
-	} else {
-		key.Wrapped, err = source.wal.AuthenticatedWrappedKeyMetadata(key)
-	}
+	key.Wrapped, err = source.wal.AuthenticatedWrappedKeyMetadata(key)
 	if err != nil {
 		clear(key.Material[:])
 		return raftstore.Key{}, fmt.Errorf("authenticate split child WAL key metadata: %w", err)
+	}
+	return key, nil
+}
+
+func loadRF3SplitChildNodeWALKey(registry rf3ManifestSplitChildRegistry, owner *rf3NodeOwner) (raftstore.Key, error) {
+	if owner == nil || owner.store == nil {
+		return raftstore.Key{}, errRF3Serving
+	}
+	key, err := loadRF3WALKey(registry.WAL.KeyID, registry.WAL.KeyMaterialPath)
+	if err != nil {
+		return raftstore.Key{}, err
+	}
+	key.Wrapped, err = owner.store.AuthenticatedWrappedKeyMetadata(key)
+	if err != nil {
+		clear(key.Material[:])
+		return raftstore.Key{}, fmt.Errorf("authenticate split child node WAL key metadata: %w", err)
 	}
 	return key, nil
 }

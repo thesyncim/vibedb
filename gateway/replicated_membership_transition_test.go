@@ -15,362 +15,12 @@ import (
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
-// transitionProbeClient returns an authenticated-looking handshake through
-// the production probe path. That keeps the aggregation test coupled to the
-// same bindReplicatedObservation checks used by real clients.
-type transitionProbeClient struct {
-	route    ReplicatedRoute
-	observed raftservice.CommandFence
-}
-
-func (client *transitionProbeClient) ProbeReplicated(
-	_ context.Context,
-	route ReplicatedRoute,
-	endpoint ReplicatedEndpoint,
-	_ serviceauthz.Capability,
-) (*shardservice.ReplicatedResponse, error) {
-	state := shardservice.ReplicatedMemberState{
-		Fence: shardservice.ReplicatedFence{
-			Group: route.Group, AllocationGeneration: route.AllocationGeneration,
-			Command: client.observed, MemberID: endpoint.Member,
-			StoreID: endpoint.StoreID, NodeIncarnation: endpoint.NodeIncarnation,
-			Term: 7,
-		},
-		LeaderID: 1, Commit: 8, Applied: 8, CheckpointApplied: 8,
-	}
-	return &shardservice.ReplicatedResponse{
-		Kind: shardservice.ReplicatedHandshake, HasState: true, State: state,
-	}, nil
-}
-
-func (client *transitionProbeClient) DoReplicated(
-	ctx context.Context,
-	endpoint ReplicatedEndpoint,
-	request *shardservice.ReplicatedRequest,
-) (*shardservice.ReplicatedResponse, error) {
-	if request != nil && request.Operation == shardservice.ReplicatedProbe {
-		return client.ProbeReplicated(ctx, client.route, endpoint, request.Capability)
-	}
-	return nil, ErrReplicatedRoute
-}
-
-func TestReplicatedMembershipTransitionEmitterAuthenticatesAllFences(t *testing.T) {
-	route, _, states := testReplicatedRouteCommand(t)
-	endpoint := route.Replicas[0]
-	base := states[endpoint.Address]
-	observed := base.Fence.Command
-	observed.ReplicaSetVersion++
-	response := &shardservice.ReplicatedResponse{
-		Kind: shardservice.ReplicatedHandshake, HasState: true, State: base,
-	}
-	response.State.Fence.Command = observed
-
-	got, err := bindReplicatedObservation(route, endpoint, response)
-	var transition *ReplicatedMembershipTransitionError
-	if !errors.As(err, &transition) || !errors.Is(err, ErrReplicatedMembershipTransition) || got != (ReplicatedEndpoint{}) {
-		t.Fatalf("valid transition got=%+v err=%v", got, err)
-	}
-	if transition.CatalogCommand != route.Command || transition.ObservedCommand != observed {
-		t.Fatalf("transition evidence=%+v want catalog=%+v observed=%+v", transition, route.Command, observed)
-	}
-	if !isReplicatedMembershipTransitionPlanningError(err) {
-		t.Fatal("authenticated transition was not planning-eligible")
-	}
-
-	for name, mutate := range map[string]func(*ReplicatedRoute, *ReplicatedEndpoint, *shardservice.ReplicatedResponse){
-		"group": func(r *ReplicatedRoute, _ *ReplicatedEndpoint, response *shardservice.ReplicatedResponse) {
-			response.State.Fence.Group.GroupID[0]++
-		},
-		"allocation": func(_ *ReplicatedRoute, _ *ReplicatedEndpoint, response *shardservice.ReplicatedResponse) {
-			response.State.Fence.AllocationGeneration++
-		},
-		"member": func(_ *ReplicatedRoute, _ *ReplicatedEndpoint, response *shardservice.ReplicatedResponse) {
-			response.State.Fence.MemberID++
-		},
-		"store": func(_ *ReplicatedRoute, _ *ReplicatedEndpoint, response *shardservice.ReplicatedResponse) {
-			response.State.Fence.StoreID[0]++
-		},
-		"incarnation": func(_ *ReplicatedRoute, endpoint *ReplicatedEndpoint, response *shardservice.ReplicatedResponse) {
-			response.State.Fence.NodeIncarnation = endpoint.NodeIncarnation - 1
-		},
-		"membership-rollback": func(r *ReplicatedRoute, _ *ReplicatedEndpoint, response *shardservice.ReplicatedResponse) {
-			response.State.Fence.Command.ReplicaSetVersion = r.Command.ReplicaSetVersion - 1
-		},
-		"policy": func(_ *ReplicatedRoute, _ *ReplicatedEndpoint, response *shardservice.ReplicatedResponse) {
-			response.State.Fence.Command.ActivePolicyGeneration++
-		},
-		"protection": func(_ *ReplicatedRoute, _ *ReplicatedEndpoint, response *shardservice.ReplicatedResponse) {
-			response.State.Fence.Command.ProtectionEpoch++
-		},
-		"ownership": func(_ *ReplicatedRoute, _ *ReplicatedEndpoint, response *shardservice.ReplicatedResponse) {
-			response.State.Fence.Command.OwnershipEpoch++
-		},
-		"schema": func(_ *ReplicatedRoute, _ *ReplicatedEndpoint, response *shardservice.ReplicatedResponse) {
-			response.State.Fence.Command.SchemaGeneration++
-		},
-		"manifest": func(_ *ReplicatedRoute, _ *ReplicatedEndpoint, response *shardservice.ReplicatedResponse) {
-			response.State.Fence.Command.RelationManifestDigest[0]++
-		},
-		"routing": func(_ *ReplicatedRoute, _ *ReplicatedEndpoint, response *shardservice.ReplicatedResponse) {
-			response.State.Fence.Command.RoutingVersion++
-		},
-		"route-generation": func(_ *ReplicatedRoute, _ *ReplicatedEndpoint, response *shardservice.ReplicatedResponse) {
-			response.State.Fence.Command.RouteGeneration++
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			candidate := *response
-			candidate.State = response.State
-			candidate.State.Fence = response.State.Fence
-			candidate.State.Fence.Group = response.State.Fence.Group
-			candidate.State.Fence.Command = response.State.Fence.Command
-			candidate.State.Fence.Command.RelationManifestDigest = response.State.Fence.Command.RelationManifestDigest
-			candidate.State.Fence.StoreID = response.State.Fence.StoreID
-			candidate.State.Fence.Group.GroupID = response.State.Fence.Group.GroupID
-			candidate.State.Fence.Group.ClusterID = response.State.Fence.Group.ClusterID
-			candidate.State.Fence.Group.ClusterIncarnation = response.State.Fence.Group.ClusterIncarnation
-			candidate.State.Fence.Group.ShardIncarnation = response.State.Fence.Group.ShardIncarnation
-			candidate.State.Fence.Group.TopologyRecoveryEpoch = response.State.Fence.Group.TopologyRecoveryEpoch
-			mutate(&route, &endpoint, &candidate)
-			got, candidateErr := bindReplicatedObservation(route, endpoint, &candidate)
-			if got != (ReplicatedEndpoint{}) || candidateErr == nil || !errors.Is(candidateErr, ErrReplicatedRoute) {
-				t.Fatalf("got=%+v err=%v", got, candidateErr)
-			}
-			if isReplicatedMembershipTransitionPlanningError(candidateErr) {
-				t.Fatalf("ineligible fence was classified as a transition: %v", candidateErr)
-			}
-		})
-	}
-
-	stable := route
-	stable.membershipStable = true
-	stableResponse := *response
-	stableResponse.State = response.State
-	stableResponse.State.Fence = response.State.Fence
-	stableResponse.State.Fence.Command.ReplicaSetVersion = route.Command.ReplicaSetVersion + 1
-	got, err = bindReplicatedObservation(stable, endpoint, &stableResponse)
-	if err != nil || got.NodeIncarnation != endpoint.NodeIncarnation {
-		t.Fatalf("stable higher command got=%+v err=%v", got, err)
-	}
-}
-
-func TestReplicatedMembershipTransitionUnavailableStateRetainsRefusal(t *testing.T) {
-	route, _, states := testReplicatedRouteCommand(t)
-	endpoint := route.Replicas[0]
-	state := states[endpoint.Address]
-	state.Fence.Command.ReplicaSetVersion++
-	response := &shardservice.ReplicatedResponse{
-		Kind: shardservice.ReplicatedRefusal, Refusal: shardservice.ReplicatedRefusalUnavailable,
-		HasState: true, State: state,
-	}
-	_, err := bindReplicatedObservation(route, endpoint, response)
-	var refusal *ReplicatedRefusalError
-	var transition *ReplicatedMembershipTransitionError
-	if !errors.As(err, &refusal) || !errors.As(err, &transition) || !errors.Is(err, ErrReplicatedMembershipTransition) {
-		t.Fatalf("unavailable attached state lost refusal/observation: %T %v", err, err)
-	}
-	if isReplicatedMembershipTransitionPlanningError(err) {
-		t.Fatal("unavailable refusal became a refresh hint")
-	}
-}
-
-type cyclicTransitionError struct{}
-
-func (*cyclicTransitionError) Error() string   { return "cyclic transition wrapper" }
-func (e *cyclicTransitionError) Unwrap() error { return e }
-func (e *cyclicTransitionError) Is(error) bool { return false }
-
-func TestReplicatedMembershipTransitionClassifierBoundsAndRejectsMixedTrees(t *testing.T) {
-	route, _, states := testReplicatedRouteCommand(t)
-	endpoint := route.Replicas[0]
-	state := states[endpoint.Address]
-	state.Fence.Command.ReplicaSetVersion++
-	_, hintErr := bindReplicatedObservation(route, endpoint, &shardservice.ReplicatedResponse{
-		Kind: shardservice.ReplicatedHandshake, HasState: true, State: state,
-	})
-	if hintErr == nil || !isReplicatedMembershipTransitionPlanningError(hintErr) {
-		t.Fatalf("hint=%v", hintErr)
-	}
-	for name, err := range map[string]error{
-		"bare":             hintErr,
-		"wrapped":          fmt.Errorf("preimage: %w", hintErr),
-		"leader-aggregate": errors.Join(ErrReplicatedLeader, hintErr),
-		"mixed-route":      errors.Join(ErrReplicatedLeader, hintErr, ErrReplicatedRoute),
-		"mixed-context":    errors.Join(ErrReplicatedLeader, hintErr, context.Canceled),
-		"mixed-refusal":    errors.Join(ErrReplicatedLeader, hintErr, &ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalUnavailable}),
-		"cyclic":           errors.Join(ErrReplicatedLeader, hintErr, new(cyclicTransitionError)),
-	} {
-		want := name == "bare" || name == "wrapped" || name == "leader-aggregate"
-		if got := isReplicatedMembershipTransitionPlanningError(err); got != want {
-			t.Errorf("%s classified=%t want=%t err=%v", name, got, want, err)
-		}
-	}
-
-	invalid := &ReplicatedMembershipTransitionError{
-		CatalogCommand: route.Command, ObservedCommand: route.Command,
-	}
-	for _, err := range []error{invalid, fmt.Errorf("%w", invalid), errors.Join(ErrReplicatedLeader, invalid)} {
-		if isReplicatedMembershipTransitionPlanningError(err) {
-			t.Fatalf("invalid hint accepted: %v", err)
-		}
-	}
-
-	// The shipped SQL route is RF3. Keep this exact production aggregation shape
-	// covered separately from the wider defensive bound below.
-	rf3Client := &transitionProbeClient{route: route, observed: route.Command}
-	rf3Client.observed.ReplicaSetVersion++
-	rf3Executor, err := NewReplicatedExecutor(rf3Client, AbsoluteMaxReplicatedAttempts, time.Millisecond)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = rf3Executor.ReadPoint(context.Background(), route, ReplicatedPointRead{
-		Relation: 1, Key: []byte("rf3-aggregation"), MinimumApplied: 1,
-		MaxValueBytes: 128, Linearizable: true,
-	})
-	if err == nil || !isReplicatedMembershipTransitionPlanningError(err) {
-		t.Fatalf("RF3 read aggregation err=%v eligible=%t", err, isReplicatedMembershipTransitionPlanningError(err))
-	}
-
-	// Exercise the complete production read/discovery aggregation shape: all
-	// sixteen attempts probe the maximum supported 64-member route, and every
-	// probe passes through bindReplicatedObservation before being aggregated.
-	wide := route
-	wide.Replicas = make([]ReplicatedEndpoint, AbsoluteMaxReplicatedRouteMembers)
-	for index := range wide.Replicas {
-		wide.Replicas[index] = route.Replicas[index%len(route.Replicas)]
-		wide.Replicas[index].Member = uint64(index + 1)
-		wide.Replicas[index].Node[0] = byte(index + 1)
-		wide.Replicas[index].StoreID[0] = byte(index + 1)
-		wide.Replicas[index].NativeEndpoint = fmt.Sprintf("n-%d", index+1)
-		wide.Replicas[index].Address = fmt.Sprintf("m-%d", index+1)
-		wide.Replicas[index].NodeIncarnation = uint64(index + 11)
-	}
-	wide.membershipStable = false
-	client := &transitionProbeClient{route: wide, observed: wide.Command}
-	client.observed.ReplicaSetVersion++
-	data, err := NewReplicatedExecutor(client, AbsoluteMaxReplicatedAttempts, time.Millisecond)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = data.ReadPoint(context.Background(), wide, ReplicatedPointRead{
-		Relation: 1, Key: []byte("k"), MinimumApplied: 1, MaxValueBytes: 128,
-		Linearizable: true,
-	})
-	if err == nil || !isReplicatedMembershipTransitionPlanningError(err) {
-		t.Fatalf("full read aggregation err=%v eligible=%t", err, isReplicatedMembershipTransitionPlanningError(err))
-	}
-}
-
-func TestDurableSQLCatalogRefreshStateRequiresProgressAndReleasesOldLease(t *testing.T) {
-	data, err := NewReplicatedExecutor(new(replicatedSQLIndexedReadClient), 2, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	holder := NewCatalogHolder(testSnapshot(t, 1))
-	planner := NewExecutor(nil, holder, Options{Refresh: func(_ context.Context, stale uint64) (*Snapshot, error) {
-		if stale != 1 {
-			t.Fatalf("stale generation=%d", stale)
-		}
-		return testSnapshot(t, 2), nil
-	}})
-	lease := holder.pinCurrent()
-	lease.release()
-	var state = newDurableSQLCatalogRefreshState(data)
-	if err := state.refreshMembership(t.Context(), planner, 1); err != nil {
-		t.Fatal(err)
-	}
-	if state.cycles != 1 || holder.Current().Generation() != 2 {
-		t.Fatalf("cycles=%d generation=%d", state.cycles, holder.Current().Generation())
-	}
-}
-
-func TestDurableSQLCatalogRefreshStateSameGenerationConsumesBudget(t *testing.T) {
-	data, err := NewReplicatedExecutor(new(replicatedSQLIndexedReadClient), 1, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	holder := NewCatalogHolder(testSnapshot(t, 1))
-	calls := 0
-	planner := NewExecutor(nil, holder, Options{Refresh: func(_ context.Context, stale uint64) (*Snapshot, error) {
-		calls++
-		return testSnapshot(t, stale), nil
-	}})
-	state := newDurableSQLCatalogRefreshState(data)
-	err = state.refreshMembership(t.Context(), planner, 1)
-	if !errors.Is(err, ErrStaleGeneration) || calls != 1 || state.cycles != 1 || holder.Current().Generation() != 1 {
-		t.Fatalf("err=%v calls=%d cycles=%d generation=%d", err, calls, state.cycles, holder.Current().Generation())
-	}
-}
-
-func TestDurableSQLCatalogRefreshStateCancellationStopsBeforeReplan(t *testing.T) {
-	data, err := NewReplicatedExecutor(new(replicatedSQLIndexedReadClient), 2, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	holder := NewCatalogHolder(testSnapshot(t, 1))
-	calls := 0
-	ctx, cancel := context.WithCancel(t.Context())
-	planner := NewExecutor(nil, holder, Options{Refresh: func(ctx context.Context, _ uint64) (*Snapshot, error) {
-		calls++
-		cancel()
-		return testSnapshot(t, 2), nil
-	}})
-	state := newDurableSQLCatalogRefreshState(data)
-	err = state.refreshMembership(ctx, planner, 1)
-	if !errors.Is(err, context.Canceled) || calls != 1 || state.cycles != 1 || holder.Current().Generation() != 2 {
-		t.Fatalf("err=%v calls=%d cycles=%d generation=%d", err, calls, state.cycles, holder.Current().Generation())
-	}
-}
-
-func TestDurableSQLCatalogRefreshStateChargesAlreadyAdvancedGeneration(t *testing.T) {
-	data, err := NewReplicatedExecutor(new(replicatedSQLIndexedReadClient), 2, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	holder := NewCatalogHolder(testSnapshot(t, 1))
-	calls := 0
-	planner := NewExecutor(nil, holder, Options{Refresh: func(_ context.Context, stale uint64) (*Snapshot, error) {
-		calls++
-		return testSnapshot(t, stale+1), nil
-	}})
-	state := newDurableSQLCatalogRefreshState(data)
-	for attempt := 0; attempt < 2; attempt++ {
-		if err := state.refreshMembership(t.Context(), planner, 1); err != nil {
-			t.Fatalf("refresh attempt %d: %v", attempt+1, err)
-		}
-	}
-	if state.cycles != 2 || calls != 1 || holder.Current().Generation() != 2 {
-		t.Fatalf("advanced generation was not charged: cycles=%d calls=%d generation=%d", state.cycles, calls, holder.Current().Generation())
-	}
-	if err := state.refreshMembership(t.Context(), planner, 1); !errors.Is(err, ErrStaleGeneration) || state.cycles != 2 {
-		t.Fatalf("refresh budget exceeded: err=%v cycles=%d", err, state.cycles)
-	}
-}
-
-func TestDurableSQLCatalogRefreshStateDoesNotRetryJoinedStaleTerminal(t *testing.T) {
-	data, err := NewReplicatedExecutor(new(replicatedSQLIndexedReadClient), 2, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	holder := NewCatalogHolder(testSnapshot(t, 1))
-	terminal := errors.New("terminal catalog refresh failure")
-	calls := 0
-	planner := NewExecutor(nil, holder, Options{Refresh: func(_ context.Context, _ uint64) (*Snapshot, error) {
-		calls++
-		return nil, errors.Join(ErrStaleGeneration, terminal)
-	}})
-	state := newDurableSQLCatalogRefreshState(data)
-	err = state.refreshMembership(t.Context(), planner, 1)
-	if !errors.Is(err, ErrStaleGeneration) || !errors.Is(err, terminal) || calls != 1 || state.cycles != 1 {
-		t.Fatalf("joined terminal was retried or hidden: err=%v calls=%d cycles=%d", err, calls, state.cycles)
-	}
-}
-
 type membershipTransitionSQLClient struct {
 	delegate        *replicatedSQLIndexedReadClient
 	transition      bool
 	observedCommand raftservice.CommandFence
 	probes          int
+	probeErr        error
 }
 
 func (client *membershipTransitionSQLClient) ProbeReplicated(
@@ -380,9 +30,13 @@ func (client *membershipTransitionSQLClient) ProbeReplicated(
 	capability serviceauthz.Capability,
 ) (*shardservice.ReplicatedResponse, error) {
 	client.probes++
+	if client.probeErr != nil {
+		return nil, client.probeErr
+	}
 	response, err := client.delegate.DoReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{
 		Operation: shardservice.ReplicatedProbe, Capability: capability,
-		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration},
+		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+			Command: route.Command},
 	})
 	if err != nil || !client.transition {
 		if err == nil && response != nil && response.HasState && client.observedCommand.Valid() {
@@ -405,7 +59,7 @@ func (client *membershipTransitionSQLClient) DoReplicated(
 	request *shardservice.ReplicatedRequest,
 ) (*shardservice.ReplicatedResponse, error) {
 	response, err := client.delegate.DoReplicated(ctx, endpoint, request)
-	if err == nil && response != nil && response.HasState && !client.transition && client.observedCommand.Valid() {
+	if err == nil && response != nil && response.HasState && client.observedCommand.Valid() {
 		response.State.Fence.MemberID = endpoint.Member
 		response.State.Fence.StoreID = endpoint.StoreID
 		response.State.Fence.NodeIncarnation = endpoint.NodeIncarnation
@@ -546,29 +200,29 @@ func membershipTransitionSQLFixture(
 	return executor, client, holder, fresh, ledger, pins, topology, key, tenant, queries
 }
 
-func TestDurableSQLExecuteRefreshesAuthenticatedMembershipTransitionBeforeBegin(t *testing.T) {
+func TestDurableSQLPlanningContinuesAcrossMembershipOnlyProgress(t *testing.T) {
 	executor, client, holder, fresh, ledger, pins, topology, key, tenant, queries := membershipTransitionSQLFixture(t)
 	_, err := executor.Execute(t.Context(), key, tenant, queries)
 	if !errors.Is(err, errTypedServicePin) {
-		t.Fatalf("execution did not reach the one post-refresh admission: %v", err)
+		t.Fatalf("membership progress interrupted logical admission: %v", err)
 	}
-	if holder.Current() == nil || holder.Current().Generation() != fresh.Generation() || topology.Current() == nil || topology.Current().Generation != fresh.Generation() ||
-		client.transition || client.probes < 4 || ledger.applies != 1 || pins.called != 1 {
+	if holder.Current() == nil || holder.Current().Generation() != fresh.Generation()-1 || topology.Current() == nil || topology.Current().Generation != fresh.Generation()-1 ||
+		!client.transition || client.probes == 0 || ledger.applies != 1 || pins.called != 1 {
 		t.Fatalf("refresh/replan state holder=%p fresh=%p topology=%+v transition=%t probes=%d applies=%d pins=%d",
 			holder.Current(), fresh, topology.Current(), client.transition, client.probes, ledger.applies, pins.called)
 	}
 }
 
-func TestDurableSQLPrepareDirectRefreshesWithoutLedgerReplay(t *testing.T) {
+func TestDurableSQLPrepareDirectKeepsLogicalCatalogDuringMembershipProgress(t *testing.T) {
 	executor, client, _, fresh, ledger, pins, _, key, tenant, queries := membershipTransitionSQLFixture(t)
 	plan, err := (&DurableSQLRequestExecutor{planner: executor.planner, data: executor.data, singleFast: true}).PrepareDirect(
 		t.Context(), key, tenant, queries,
 	)
-	if err != nil || plan == nil || plan.CatalogGeneration != fresh.Generation() {
-		t.Fatalf("direct preimage did not refresh/replan: plan=%+v err=%v", plan, err)
+	if err != nil || plan == nil || plan.CatalogGeneration != fresh.Generation()-1 {
+		t.Fatalf("membership progress interrupted direct preimage: plan=%+v err=%v", plan, err)
 	}
-	if client.transition || client.probes < 4 || executor.planner.catalog.Current() == nil ||
-		executor.planner.catalog.Current().Generation() != fresh.Generation() || ledger.applies != 0 || pins.called != 0 {
+	if !client.transition || client.probes == 0 || executor.planner.catalog.Current() == nil ||
+		executor.planner.catalog.Current().Generation() != fresh.Generation()-1 || ledger.applies != 0 || pins.called != 0 {
 		t.Fatalf("direct refresh leaked ledger/admission: transition=%t probes=%d applies=%d pins=%d",
 			client.transition, client.probes, ledger.applies, pins.called)
 	}
@@ -588,8 +242,9 @@ func (ledger *membershipReplayErrorLedger) ReadRow(
 	return DurableRequestLifecycleRow{}, ledger.err
 }
 
-func TestDurableSQLMembershipTransitionReplayErrorStopsBeforeRefreshOrBegin(t *testing.T) {
+func TestDurableSQLPlanningFailurePreservesReplayError(t *testing.T) {
 	executor, client, holder, _, _, pins, _, key, tenant, queries := membershipTransitionSQLFixture(t)
+	client.probeErr = ErrReplicatedRoute
 	const replayErrText = "retained replay unavailable"
 	ledger := &membershipReplayErrorLedger{err: errors.New(replayErrText)}
 	topology, err := NewCatalogDurableRequestLedgerTopologyHolder(holder)
@@ -612,7 +267,7 @@ func TestDurableSQLMembershipTransitionReplayErrorStopsBeforeRefreshOrBegin(t *t
 	}
 }
 
-func TestDurableSQLMembershipTransitionReplayFoundIsAuthoritative(t *testing.T) {
+func TestDurableSQLMembershipProgressRetainsTerminalReplayAuthority(t *testing.T) {
 	executor, client, holder, _, _, pins, _, _, _, queries := membershipTransitionSQLFixture(t)
 	targets := durableFaultTargets(t)
 	requestDigest := replication.Digest(replicatedSQLTransactionRequestDigest(queries))

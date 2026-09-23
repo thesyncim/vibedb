@@ -132,6 +132,15 @@ func sourceExportFixture(t testing.TB, limits Limits) (
 	*replicatedstate.ReadSnapshot,
 	SourceExportPlan,
 ) {
+	cut, _, plan := sourceExportFixtureWithMachine(t, limits)
+	return cut, plan
+}
+
+func sourceExportFixtureWithMachine(t testing.TB, limits Limits) (
+	*replicatedstate.ReadSnapshot,
+	*replicatedstate.Machine,
+	SourceExportPlan,
+) {
 	t.Helper()
 	root := t.TempDir()
 	open := func(name string, options durable.Options) *durable.Collection {
@@ -217,7 +226,7 @@ func sourceExportFixture(t testing.TB, limits Limits) (
 		TopologyRecoveryEpoch: binding.TopologyRecoveryEpoch,
 		ShardIncarnation:      binding.ShardIncarnation, GroupID: binding.GroupID,
 	}
-	return cut, SourceExportPlan{
+	return cut, machine, SourceExportPlan{
 		Repository: repository, Snapshot: cut, ExpectedFence: cut.Fence(), Group: group,
 		SourceMember: 1, TargetMember: 2, TargetStore: id(20), TargetIncarnation: 21,
 		ChunkBytes:        MinChunkBytes,

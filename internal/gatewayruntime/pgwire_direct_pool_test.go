@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/raftservice"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -29,6 +31,7 @@ type directPoolService struct {
 	postgresWriteServiceStub // OpenIssuer is stateless; other inherited methods are unused.
 	prepare                  func(context.Context, durableExecBatchIdentity, []gateway.Query) (*gateway.DurableSQLDirectPlan, error)
 	execute                  func(context.Context, durableExecBatchIdentity, []gateway.Query, *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error)
+	executeUnknown           func(context.Context, durableExecBatchIdentity, []gateway.Query, *gateway.DurableSQLDirectPlan, bool) (durableExecBatchExecuteResult, error)
 }
 
 func (s *directPoolService) PrepareDirectBatch(ctx context.Context, _ serviceauthz.Authority, id durableExecBatchIdentity, q []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
@@ -37,7 +40,10 @@ func (s *directPoolService) PrepareDirectBatch(ctx context.Context, _ serviceaut
 	}
 	return &gateway.DurableSQLDirectPlan{Key: requestledger.RequestKey{Request: requestledger.RequestID(id.RequestID), IssuerSequence: id.IssuerSequence}}, nil
 }
-func (s *directPoolService) ExecutePreparedDirectBatch(ctx context.Context, _ serviceauthz.Authority, id durableExecBatchIdentity, q []gateway.Query, plan *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+func (s *directPoolService) ExecutePreparedDirectBatch(ctx context.Context, _ serviceauthz.Authority, id durableExecBatchIdentity, q []gateway.Query, plan *gateway.DurableSQLDirectPlan, priorUnknown bool) (durableExecBatchExecuteResult, error) {
+	if s.executeUnknown != nil {
+		return s.executeUnknown(ctx, id, q, plan, priorUnknown)
+	}
 	if s.execute != nil {
 		return s.execute(ctx, id, q, plan)
 	}
@@ -348,6 +354,88 @@ func TestPostgreSQLDirectUnknownRetainsExactCommand(t *testing.T) {
 		t.Fatal(prepared, executed)
 	}
 }
+
+func TestPostgreSQLDirectPreAdmissionRefusalDoesNotPoisonLane(t *testing.T) {
+	for _, priorUnknown := range []bool{false, true} {
+		t.Run(fmt.Sprint(priorUnknown), func(t *testing.T) {
+			s := &directPoolService{}
+			p := testDirectPool(t, s)
+			for i := 1; i < postgresDirectLanes; i++ {
+				<-p.slots
+			}
+			var first durableExecBatchIdentity
+			var firstPlan *gateway.DurableSQLDirectPlan
+			calls := 0
+			s.execute = func(_ context.Context, id durableExecBatchIdentity, q []gateway.Query, plan *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+				calls++
+				if calls == 1 {
+					first, firstPlan = id, plan
+					if priorUnknown {
+						return durableExecBatchExecuteResult{}, errors.New("lost reply")
+					}
+				}
+				if priorUnknown && calls <= 3 && (id != first || plan != firstPlan || q[0].SQL != "UPDATE docs SET n=n+1 WHERE id='a'") {
+					t.Fatal("unresolved recipe changed")
+				}
+				if calls == 1 || priorUnknown && calls == 2 {
+					return durableExecBatchExecuteResult{}, errors.Join(gateway.ErrDurableSQLNotAdmitted,
+						&gateway.ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalUnavailable})
+				}
+				return durableExecBatchExecuteResult{Direct: true, Result: &gateway.Result{RowsAffected: 1}}, nil
+			}
+			_, _, err := p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"})
+			if errors.Is(err, durable.ErrCommitOutcomeUnknown) != priorUnknown {
+				t.Fatalf("first err=%v", err)
+			}
+			_, _, err = p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='b'"})
+			if priorUnknown {
+				if !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+					t.Fatalf("earlier unknown was discarded: %v", err)
+				}
+				_, _, err = p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='b'"})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestPostgreSQLDirectPriorUnknownReachesPreparedExecutor(t *testing.T) {
+	s := &directPoolService{}
+	p := testDirectPool(t, s)
+	for i := 1; i < postgresDirectLanes; i++ {
+		<-p.slots
+	}
+	type invocation struct {
+		identity durableExecBatchIdentity
+		query    string
+		plan     *gateway.DurableSQLDirectPlan
+		unknown  bool
+	}
+	var calls []invocation
+	s.executeUnknown = func(_ context.Context, id durableExecBatchIdentity, queries []gateway.Query, plan *gateway.DurableSQLDirectPlan, priorUnknown bool) (durableExecBatchExecuteResult, error) {
+		calls = append(calls, invocation{identity: id, query: queries[0].SQL, plan: plan, unknown: priorUnknown})
+		if len(calls) == 1 {
+			return durableExecBatchExecuteResult{}, raftservice.ErrOutcomeUnknown
+		}
+		return durableExecBatchExecuteResult{
+			Direct: true, Result: &gateway.Result{RowsAffected: 1},
+		}, nil
+	}
+	if _, _, err := p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"}); !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
+		t.Fatalf("first write error=%v", err)
+	}
+	if _, _, err := p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='b'"}); err != nil {
+		t.Fatalf("write after recovery error=%v", err)
+	}
+	if len(calls) != 3 || calls[0].unknown || !calls[1].unknown || calls[0].identity != calls[1].identity ||
+		calls[0].plan != calls[1].plan || calls[0].query != calls[1].query || calls[2].unknown ||
+		calls[2].identity == calls[1].identity || calls[2].query != "UPDATE docs SET n=n+1 WHERE id='b'" {
+		t.Fatalf("prepared recovery calls=%+v", calls)
+	}
+}
+
 func TestPostgreSQLDirectAbortRetriesWithNewIdentity(t *testing.T) {
 	s := &directPoolService{}
 	p := testDirectPool(t, s)
@@ -355,7 +443,9 @@ func TestPostgreSQLDirectAbortRetriesWithNewIdentity(t *testing.T) {
 	s.execute = func(_ context.Context, id durableExecBatchIdentity, _ []gateway.Query, _ *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
 		ids = append(ids, id)
 		if len(ids) < 3 {
-			return durableExecBatchExecuteResult{}, gateway.ErrDurableSQLAborted
+			return durableExecBatchExecuteResult{}, &gateway.DurableSQLAbortError{
+				ResultCode: replicatedstate.ResultTransactionConflict,
+			}
 		}
 		return durableExecBatchExecuteResult{Direct: true, Result: &gateway.Result{RowsAffected: 1}}, nil
 	}
@@ -366,6 +456,121 @@ func TestPostgreSQLDirectAbortRetriesWithNewIdentity(t *testing.T) {
 		if ids[i].IssuerSequence != ids[i-1].IssuerSequence+1 || ids[i].RequestID == ids[i-1].RequestID || ids[i].Reference != ids[0].Reference {
 			t.Fatal(ids)
 		}
+	}
+}
+
+func TestPostgreSQLDirectRetryBudgetsAndTerminalErrorStayTyped(t *testing.T) {
+	t.Run("independent abort budget", func(t *testing.T) {
+		s := &directPoolService{}
+		p := testDirectPool(t, s)
+		var ids []durableExecBatchIdentity
+		s.execute = func(_ context.Context, id durableExecBatchIdentity, _ []gateway.Query, _ *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+			ids = append(ids, id)
+			if len(ids) == 1 {
+				return durableExecBatchExecuteResult{}, errors.Join(gateway.ErrDurableSQLNotAdmitted, raftservice.ErrServingFence)
+			}
+			return durableExecBatchExecuteResult{}, &gateway.DurableSQLAbortError{
+				ResultCode: replicatedstate.ResultTransactionConflict,
+			}
+		}
+		_, _, err := p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"})
+		if !errors.Is(err, gateway.ErrDurableSQLAborted) || errors.Is(err, gateway.ErrDurableSQLNotAdmitted) {
+			t.Fatalf("terminal aborted write error=%v", err)
+		}
+		if len(ids) != 9 {
+			t.Fatalf("execute calls=%d, want one admission refusal and eight durable aborts", len(ids))
+		}
+		for i := 1; i < len(ids); i++ {
+			if ids[i].IssuerSequence != ids[i-1].IssuerSequence+1 || ids[i].RequestID == ids[i-1].RequestID || ids[i].Reference != ids[0].Reference {
+				t.Fatalf("retry did not use the next identity: %+v", ids)
+			}
+		}
+	})
+
+	t.Run("admission exhaustion", func(t *testing.T) {
+		s := &directPoolService{}
+		p := testDirectPool(t, s)
+		const window = 300 * time.Millisecond
+		p.admissionWindow = window
+		calls := 0
+		s.execute = func(context.Context, durableExecBatchIdentity, []gateway.Query, *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+			calls++
+			return durableExecBatchExecuteResult{}, errors.Join(gateway.ErrDurableSQLNotAdmitted, raftservice.ErrServingFence)
+		}
+		started := time.Now()
+		_, _, err := p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"})
+		elapsed := time.Since(started)
+		if !errors.Is(err, gateway.ErrDurableSQLNotAdmitted) || errors.Is(err, gateway.ErrDurableSQLAborted) {
+			t.Fatalf("terminal admission refusal error=%v", err)
+		}
+		// Refusals persist until the catalog converges, so they are retried for
+		// the whole window with capped backoff, then surface typed.
+		if elapsed < window || elapsed > window+time.Second || calls < 3 {
+			t.Fatalf("admission retry elapsed=%s calls=%d, want the %s convergence window", elapsed, calls, window)
+		}
+	})
+
+	t.Run("permanent row conflict executes once", func(t *testing.T) {
+		s := &directPoolService{}
+		p := testDirectPool(t, s)
+		var ids []durableExecBatchIdentity
+		s.execute = func(_ context.Context, id durableExecBatchIdentity, _ []gateway.Query, _ *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+			ids = append(ids, id)
+			return durableExecBatchExecuteResult{}, &gateway.DurableSQLAbortError{
+				ResultCode: replicatedstate.ResultIndexConflict,
+			}
+		}
+		_, _, err := p.Write(t.Context(), gateway.Query{SQL: "INSERT INTO docs VALUES ('stable-id')"})
+		code, typed := gateway.DurableSQLAbortResultCode(err)
+		if !errors.Is(err, gateway.ErrDurableSQLAborted) || !typed ||
+			code != replicatedstate.ResultIndexConflict || len(ids) != 1 {
+			t.Fatalf("permanent conflict code=%d typed=%t calls=%d err=%v", code, typed, len(ids), err)
+		}
+	})
+
+	t.Run("intent busy retries with fresh identity", func(t *testing.T) {
+		s := &directPoolService{}
+		p := testDirectPool(t, s)
+		var ids []durableExecBatchIdentity
+		s.execute = func(_ context.Context, id durableExecBatchIdentity, _ []gateway.Query, _ *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+			ids = append(ids, id)
+			if len(ids) == 1 {
+				return durableExecBatchExecuteResult{}, &gateway.DurableSQLAbortError{
+					ResultCode: replicatedstate.ResultIntentBusy,
+				}
+			}
+			return durableExecBatchExecuteResult{Direct: true, Result: &gateway.Result{RowsAffected: 1}}, nil
+		}
+		if _, _, err := p.Write(t.Context(), gateway.Query{SQL: "INSERT INTO docs VALUES ('stable-id')"}); err != nil {
+			t.Fatal(err)
+		}
+		if len(ids) != 2 || ids[0].IssuerSequence+1 != ids[1].IssuerSequence ||
+			ids[0].RequestID == ids[1].RequestID || ids[0].Reference != ids[1].Reference {
+			t.Fatalf("intent retry identities=%+v", ids)
+		}
+	})
+}
+
+func TestPostgreSQLDirectStalePlanRetriesAfterDefiniteRefusal(t *testing.T) {
+	s := &directPoolService{}
+	p := testDirectPool(t, s)
+	var first durableExecBatchIdentity
+	var firstPlan *gateway.DurableSQLDirectPlan
+	calls := 0
+	s.execute = func(_ context.Context, id durableExecBatchIdentity, q []gateway.Query, plan *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+		calls++
+		if calls == 1 {
+			first, firstPlan = id, plan
+			return durableExecBatchExecuteResult{}, errors.Join(gateway.ErrDurableSQLNotAdmitted, raftservice.ErrServingFence)
+		}
+		if calls != 2 || id.RequestID == first.RequestID || id.IssuerSequence != first.IssuerSequence+1 || plan == firstPlan ||
+			q[0].SQL != "UPDATE docs SET n=n+1 WHERE id='a'" {
+			t.Fatal("definite stale plan did not acquire a fresh recipe for the same statement")
+		}
+		return durableExecBatchExecuteResult{Direct: true, Result: &gateway.Result{RowsAffected: 1}}, nil
+	}
+	if _, _, err := p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"}); err != nil || calls != 2 {
+		t.Fatalf("calls=%d err=%v", calls, err)
 	}
 }
 func TestPostgreSQLDirectSameTableOverlapsAndCloseCancels(t *testing.T) {
@@ -544,8 +749,8 @@ func (s *legacyAndDirectService) PrepareDirectBatch(ctx context.Context, authori
 	s.mu.Unlock()
 	return (&directPoolService{}).PrepareDirectBatch(ctx, authority, id, q)
 }
-func (s *legacyAndDirectService) ExecutePreparedDirectBatch(ctx context.Context, authority serviceauthz.Authority, id durableExecBatchIdentity, q []gateway.Query, p *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
-	return (&directPoolService{}).ExecutePreparedDirectBatch(ctx, authority, id, q, p)
+func (s *legacyAndDirectService) ExecutePreparedDirectBatch(ctx context.Context, authority serviceauthz.Authority, id durableExecBatchIdentity, q []gateway.Query, p *gateway.DurableSQLDirectPlan, priorUnknown bool) (durableExecBatchExecuteResult, error) {
+	return (&directPoolService{}).ExecutePreparedDirectBatch(ctx, authority, id, q, p, priorUnknown)
 }
 func TestPostgreSQLDirectWaitsForLegacyPendingTable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "outbox")
@@ -618,6 +823,133 @@ func TestPostgreSQLDirectPreparationBackpressureDoesNotProposeOrRenumber(t *test
 	}
 }
 
+func TestPostgreSQLDirectPreparationRetriesServingFenceWithStableIdentity(t *testing.T) {
+	s := &directPoolService{}
+	p := testDirectPool(t, s)
+	var original durableExecBatchIdentity
+	attempts, executions := 0, 0
+	s.prepare = func(_ context.Context, id durableExecBatchIdentity, _ []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
+		attempts++
+		if attempts == 1 {
+			original = id
+		} else if id != original {
+			t.Fatalf("prepare identity changed across stale fence: first=%+v got=%+v", original, id)
+		}
+		if attempts <= 9 {
+			return nil, errors.Join(
+				gateway.ErrDurableSQLNotAdmitted,
+				gateway.ErrReplicatedRoute,
+				raftservice.ErrServingFence,
+			)
+		}
+		return &gateway.DurableSQLDirectPlan{CatalogGeneration: 2}, nil
+	}
+	s.execute = func(_ context.Context, id durableExecBatchIdentity, _ []gateway.Query, plan *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+		executions++
+		if id != original || plan.CatalogGeneration != 2 || attempts != 10 {
+			t.Fatalf("executed before current route prepared: id=%+v plan=%+v attempts=%d", id, plan, attempts)
+		}
+		return durableExecBatchExecuteResult{Direct: true, Result: &gateway.Result{RowsAffected: 1}}, nil
+	}
+	if _, _, err := p.Write(t.Context(), gateway.Query{SQL: "INSERT INTO docs(id) VALUES ('a')"}); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 10 || executions != 1 {
+		t.Fatalf("prepare attempts=%d execute calls=%d, want 10 and 1", attempts, executions)
+	}
+}
+
+func TestPostgreSQLDirectPreparationServingFenceRetryIsTypedAndBounded(t *testing.T) {
+	t.Run("generic route does not enter long retry", func(t *testing.T) {
+		s := &directPoolService{}
+		p := testDirectPool(t, s)
+		attempts := 0
+		s.prepare = func(context.Context, durableExecBatchIdentity, []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
+			attempts++
+			return nil, errors.Join(gateway.ErrDurableSQLNotAdmitted, gateway.ErrReplicatedRoute, gateway.ErrReplicatedLeader)
+		}
+		_, _, err := p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"})
+		if !errors.Is(err, gateway.ErrReplicatedRoute) || attempts != 1 {
+			t.Fatalf("attempts=%d err=%v", attempts, err)
+		}
+	})
+
+	t.Run("unauthorized stale fence does not retry", func(t *testing.T) {
+		s := &directPoolService{}
+		p := testDirectPool(t, s)
+		attempts := 0
+		s.prepare = func(context.Context, durableExecBatchIdentity, []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
+			attempts++
+			return nil, errors.Join(gateway.ErrDurableSQLNotAdmitted, raftservice.ErrServingFence, gateway.ErrReplicatedUnauthorized)
+		}
+		_, _, err := p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"})
+		if !errors.Is(err, gateway.ErrReplicatedUnauthorized) || attempts != 1 {
+			t.Fatalf("attempts=%d err=%v", attempts, err)
+		}
+	})
+
+	t.Run("unknown outcome does not enter long retry", func(t *testing.T) {
+		s := &directPoolService{}
+		p := testDirectPool(t, s)
+		attempts := 0
+		s.prepare = func(context.Context, durableExecBatchIdentity, []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
+			attempts++
+			return nil, errors.Join(gateway.ErrDurableSQLNotAdmitted, raftservice.ErrServingFence, gateway.ErrReplicatedRoute, durable.ErrCommitOutcomeUnknown)
+		}
+		_, _, err := p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"})
+		if !errors.Is(err, durable.ErrCommitOutcomeUnknown) || attempts != 1 {
+			t.Fatalf("attempts=%d err=%v", attempts, err)
+		}
+	})
+
+	t.Run("canceled context stops after current prepare", func(t *testing.T) {
+		s := &directPoolService{}
+		p := testDirectPool(t, s)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		attempts := 0
+		s.prepare = func(context.Context, durableExecBatchIdentity, []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
+			attempts++
+			cancel()
+			return nil, errors.Join(gateway.ErrDurableSQLNotAdmitted, raftservice.ErrServingFence)
+		}
+		_, _, err := p.Write(ctx, gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"})
+		if !errors.Is(err, context.Canceled) || attempts != 1 {
+			t.Fatalf("attempts=%d err=%v", attempts, err)
+		}
+	})
+
+	t.Run("short injected budget bounds retries", func(t *testing.T) {
+		s := &directPoolService{}
+		p := testDirectPool(t, s)
+		attempts := 0
+		s.prepare = func(context.Context, durableExecBatchIdentity, []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
+			attempts++
+			return nil, errors.Join(gateway.ErrDurableSQLNotAdmitted, raftservice.ErrServingFence)
+		}
+		started := time.Now()
+		_, err := p.prepareWithServingFenceWindow(t.Context(), durableExecBatchIdentity{}, []gateway.Query{{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"}}, 225*time.Millisecond)
+		elapsed := time.Since(started)
+		if !errors.Is(err, raftservice.ErrServingFence) || attempts < 2 || attempts > 3 || elapsed < 220*time.Millisecond || elapsed > 450*time.Millisecond {
+			t.Fatalf("attempts=%d elapsed=%s err=%v", attempts, elapsed, err)
+		}
+	})
+
+	t.Run("deadline error stops after current prepare", func(t *testing.T) {
+		s := &directPoolService{}
+		p := testDirectPool(t, s)
+		attempts := 0
+		s.prepare = func(context.Context, durableExecBatchIdentity, []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
+			attempts++
+			return nil, errors.Join(gateway.ErrDurableSQLNotAdmitted, raftservice.ErrServingFence, context.DeadlineExceeded)
+		}
+		_, err := p.prepareWithServingFenceWindow(t.Context(), durableExecBatchIdentity{}, []gateway.Query{{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"}}, time.Second)
+		if !errors.Is(err, context.DeadlineExceeded) || attempts != 1 {
+			t.Fatalf("attempts=%d err=%v", attempts, err)
+		}
+	})
+}
+
 func TestPostgreSQLDirectPreparationCancellationAndRetryBound(t *testing.T) {
 	for _, cancelled := range []bool{false, true} {
 		t.Run(fmt.Sprint(cancelled), func(t *testing.T) {
@@ -643,6 +975,66 @@ func TestPostgreSQLDirectPreparationCancellationAndRetryBound(t *testing.T) {
 			}
 			if cancelled && attempts != 1 || !cancelled && attempts != 8 {
 				t.Fatal(attempts)
+			}
+		})
+	}
+}
+
+// A write refused before admission may still have been admitted by a racing
+// path. While the logical route is unchanged the pool must re-drive the same
+// request identity through recovery, never mint a new one: a new identity
+// would turn an admitted attempt into a duplicate insert.
+func TestPostgreSQLDirectAdmissionRetryKeepsIdentityOnSameRoute(t *testing.T) {
+	route := catalogRouteSeedRoute(t, catalogRouteSeedSnapshot(t, 1, "127.0.0.1:7101"))
+	advanced := route
+	advanced.Command.OwnershipEpoch++
+	advanced.Command.RoutingVersion++
+	advanced.Command.RouteGeneration++
+	split := advanced
+	split.Group.GroupID[0] ^= 0xff
+	for _, test := range []struct {
+		name         string
+		next         gateway.ReplicatedRoute
+		sameIdentity bool
+	}{
+		{name: "ownership advance keeps identity", next: advanced, sameIdentity: true},
+		{name: "group change mints identity", next: split, sameIdentity: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := &directPoolService{}
+			prepares := 0
+			s.prepare = func(_ context.Context, id durableExecBatchIdentity, _ []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
+				prepares++
+				plan := &gateway.DurableSQLDirectPlan{Key: requestledger.RequestKey{
+					Request: requestledger.RequestID(id.RequestID), IssuerSequence: id.IssuerSequence}}
+				plan.Target.Route = route
+				if prepares > 1 {
+					plan.Target.Route = test.next
+				}
+				return plan, nil
+			}
+			type call struct {
+				id           durableExecBatchIdentity
+				priorUnknown bool
+			}
+			var calls []call
+			s.executeUnknown = func(_ context.Context, id durableExecBatchIdentity, _ []gateway.Query, _ *gateway.DurableSQLDirectPlan, priorUnknown bool) (durableExecBatchExecuteResult, error) {
+				calls = append(calls, call{id: id, priorUnknown: priorUnknown})
+				if len(calls) == 1 {
+					return durableExecBatchExecuteResult{}, errors.Join(gateway.ErrDurableSQLNotAdmitted, raftservice.ErrServingFence)
+				}
+				return durableExecBatchExecuteResult{Direct: true, Result: &gateway.Result{RowsAffected: 1}}, nil
+			}
+			p := testDirectPool(t, s)
+			p.admissionWindow = time.Second
+			result, _, err := p.Write(t.Context(), gateway.Query{SQL: "INSERT INTO docs VALUES ('a')"})
+			if err != nil || result == nil || result.RowsAffected != 1 || len(calls) != 2 {
+				t.Fatalf("result=%+v calls=%+v err=%v", result, calls, err)
+			}
+			same := calls[1].id.RequestID == calls[0].id.RequestID &&
+				calls[1].id.IssuerSequence == calls[0].id.IssuerSequence
+			if same != test.sameIdentity || calls[1].priorUnknown != test.sameIdentity {
+				t.Fatalf("retry identity same=%t priorUnknown=%t, want %t", same, calls[1].priorUnknown, test.sameIdentity)
 			}
 		})
 	}

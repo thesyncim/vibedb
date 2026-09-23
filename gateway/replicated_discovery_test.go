@@ -15,8 +15,9 @@ import (
 )
 
 type electionWithOfflinePeerClient struct {
-	states map[string]shardservice.ReplicatedMemberState
-	probes atomic.Int64
+	states     map[string]shardservice.ReplicatedMemberState
+	probes     atomic.Int64
+	leaderless bool
 }
 
 func (*electionWithOfflinePeerClient) parallelReplicatedDiscovery() {}
@@ -28,7 +29,7 @@ func (client *electionWithOfflinePeerClient) DoReplicated(_ context.Context, end
 		return nil, io.EOF
 	}
 	state := client.states[endpoint.Address]
-	if client.probes.Add(1) == 1 {
+	if client.probes.Add(1) == 1 || client.leaderless {
 		state.LeaderID = 0
 	}
 	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake, HasState: true, State: state}, nil
@@ -47,8 +48,11 @@ func TestCatalogDiscoveryRetriesElectionWithOfflinePeer(t *testing.T) {
 		t.Fatalf("one offline peer suppressed a bounded election retry: route=%+v probes=%d err=%v", observed, client.probes.Load(), err)
 	}
 	client.probes.Store(0)
-	executor.maxAttempts = 1
-	if _, err = executor.catalogOperationalRoute(t.Context(), route, nil); !errors.Is(err, errReplicatedLeaderUnobserved) || !errors.Is(err, io.EOF) {
+	client.leaderless = true
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, err = executor.catalogOperationalRoute(ctx, route, nil); !errors.Is(err, errReplicatedLeaderUnobserved) ||
+		!errors.Is(err, io.EOF) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("exhausted sweep lost election/transport causes: %v", err)
 	}
 }

@@ -62,6 +62,10 @@ func TestPeerServerAuthenticatesDeliversAndRejectsAboveExactStreamBound(t *testi
 		TrustDomain: domain, Node: serverNode,
 	})
 
+	profiles := []*rafttransport.PeerTLS{clientTLS, serverTLS}
+	clientRegistry = pinnedPeerTestRegistry(t, clientNode, members, rafttransport.Limits{MaxGroups: 1, MaxMembers: 2}, profiles)
+	serverRegistry = pinnedPeerTestRegistry(t, serverNode, members, rafttransport.Limits{MaxGroups: 1, MaxMembers: 2}, profiles)
+
 	delivered := make(chan rafttransport.Inbound, 1)
 	receiver, err := rafttransport.NewOrdinaryReceiver(rafttransport.OrdinaryReceiverOptions{
 		Registry: serverRegistry,
@@ -256,3 +260,16 @@ func peerServerTestNode(seed byte) (node rafttransport.NodeID) {
 }
 
 func peerServerU64(value uint64) *uint64 { return &value }
+
+func pinnedPeerTestRegistry(t testing.TB, local rafttransport.NodeID, members []rafttransport.Member, limits rafttransport.Limits, profiles []*rafttransport.PeerTLS) *rafttransport.StaticRegistry {
+	t.Helper()
+	peers := make([]rafttransport.PhysicalPeer, len(profiles))
+	for index, profile := range profiles {
+		peers[index] = rafttransport.PhysicalPeer{NodeID: profile.LocalIdentity().Node, TrustDomain: profile.LocalIdentity().TrustDomain, Incarnation: 1, Revision: 1, ServiceKeyDigest: profile.LocalServiceKeyDigest(), State: rafttransport.PeerEnrolled}
+	}
+	registry, err := rafttransport.NewStaticRegistryWithDirectory(local, members, peers, 1, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return registry
+}

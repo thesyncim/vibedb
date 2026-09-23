@@ -212,9 +212,6 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 	if len(nodeOwners) == 1 {
 		nodeOwner = nodeOwners[0]
 	}
-	if (current.NodeLog != nil) != (nodeOwner != nil) {
-		return errInvalidRF3Manifest
-	}
 	next, err := loadRF3Manifest(current.reloadPath)
 	if err != nil {
 		return err
@@ -312,11 +309,17 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 				return err
 			}
 		}
+		if (current.NodeLog != nil) != (nodeOwner != nil) {
+			return errInvalidRF3Manifest
+		}
 		set, err := prepareRF3GroupSetOnNode(next.withGroup(bundle), profile, sqldriver.ReplicatedOpenOptions{
 			WriterLockContext: ctx, WriterLockDeadline: time.Now().Add(rf3StartupWriterLockWait),
 		}, nodeOwner)
 		if err != nil {
 			return err
+		}
+		if len(set.groups) != 1 {
+			return closePreparedRF3Groups(set.groups, errInvalidRF3Manifest)
 		}
 		item := &set.groups[0]
 		if item.restoreOperation != ([32]byte{}) {
@@ -330,7 +333,10 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 			return item.close(err)
 		}
 		identity := runtime.Identity()
-		command := commandFenceFromPublication(item.base.Binding.Authority, identity, item.publication.ReplicaSetVersion)
+		command, err := currentRF3CommandFence(item.apply, identity, item.publication)
+		if err != nil {
+			return errors.Join(err, runtime.Close())
+		}
 		if err := ctx.Err(); err != nil {
 			return errors.Join(err, runtime.Close())
 		}
@@ -367,7 +373,7 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 		inventory.publishNativeChild(identity)
 		inventory.mu.Unlock()
 		schemas.mu.Lock()
-		schemas.groups[identity.Group] = &rf3SchemaGeneration{identity: identity, path: item.manifest.SQL.Path,
+		schemas.groups[identity.Group] = &rf3SchemaGeneration{manifest: item.manifest, identity: identity, path: item.manifest.SQL.Path,
 			wal: item.recoveryLog(), base: item.base.Clone(), applyID: item.applyIdentity, apply: item.apply}
 		schemas.mu.Unlock()
 		current.Groups = append(current.groupBundles(), bundle)

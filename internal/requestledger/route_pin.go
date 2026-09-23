@@ -8,11 +8,10 @@ import (
 const (
 	MaxRouteGatePinCommandBytes    = 1113
 	MaxRouteGatePinCompletionBytes = 1185
-	// These frozen cross-package maxima include the outer replication envelope,
-	// three 255-byte identities, and the fixed execution-pin body/proof. A
-	// replicatedstate cross-package test prevents either side drifting.
-	MaxExecutionPinCommandBytes    = 1465
-	MaxExecutionPinCompletionBytes = 1949
+	// Atomic ledger release stores only the fixed pin command and proof;
+	// neither carries a separate replication/session envelope.
+	MaxExecutionPinCommandBytes    = 436
+	MaxExecutionPinCompletionBytes = 888
 	routePinHeaderBytes            = 416
 	MaxRoutePinRecordBytes         = routePinHeaderBytes + MaxRouteGatePinCommandBytes + MaxRouteGatePinCompletionBytes + checksumBytes
 )

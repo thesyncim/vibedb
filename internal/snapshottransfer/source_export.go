@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"hash"
 	"io"
 
@@ -42,8 +43,12 @@ type SourceExportPlan struct {
 	ArtifactWorkspace []byte
 	TransferWorkspace []byte
 	// Release returns caller-owned workspace or other bounded plan resources.
-	// Snapshot ownership remains separate and is always closed by the exporter.
+	// The provider owns Snapshot for the plan's full lifetime.
 	Release func()
+	// Finalize releases the provider's pin after publication, or records a
+	// permanent failure while keeping the exact request from minting a new cut.
+	// Transient failures leave the immutable cut available to an exact retry.
+	Finalize func(error) error
 }
 
 // ExportPinnedSnapshot publishes one deterministic artifact from the same
@@ -66,7 +71,10 @@ func ExportPinnedSnapshot(plan SourceExportPlan) (
 		publication.ReplicaSetVersion != fence.ReplicaSetVersion ||
 		publication.Applied != fence.Applied ||
 		!exactLearnerConfState(publication.ConfState, plan.SourceMember, plan.TargetMember) {
-		return Descriptor{}, replicatedstate.SnapshotArtifactManifest{}, ErrStaleFence
+		return Descriptor{}, replicatedstate.SnapshotArtifactManifest{}, fmt.Errorf("%w: pinned source publication fence_match=%t applied=%d/%d membership=%d/%d source=%d target=%d voters=%v learners=%v", ErrStaleFence,
+			fence == plan.ExpectedFence, publication.Applied, fence.Applied,
+			publication.ReplicaSetVersion, fence.ReplicaSetVersion, plan.SourceMember, plan.TargetMember,
+			publication.ConfState.GetVoters(), publication.ConfState.GetLearners())
 	}
 	ctx := budgetContext(plan.Context)
 	lease := plan.lease
@@ -106,7 +114,7 @@ func ExportPinnedSnapshot(plan SourceExportPlan) (
 
 	offset, complete, err := plan.Repository.OffsetContextWithLease(ctx, lease, descriptor)
 	if err != nil {
-		return Descriptor{}, replicatedstate.SnapshotArtifactManifest{}, err
+		return descriptor, manifest, err
 	}
 	if complete {
 		return descriptor, manifest, nil
@@ -136,7 +144,7 @@ func ExportPinnedSnapshot(plan SourceExportPlan) (
 	if written.EncodedBytes != manifest.EncodedBytes || written.Digest != manifest.Digest ||
 		written.ImageDigest != manifest.ImageDigest ||
 		written.CaptureImageDigest != manifest.CaptureImageDigest {
-		return descriptor, replicatedstate.SnapshotArtifactManifest{}, ErrStaleFence
+		return descriptor, replicatedstate.SnapshotArtifactManifest{}, fmt.Errorf("%w: immutable source artifact changed between export passes", ErrStaleFence)
 	}
 	return descriptor, manifest, nil
 }

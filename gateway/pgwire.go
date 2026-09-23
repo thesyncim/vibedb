@@ -605,6 +605,12 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 		SQL: p.compiled.SQL(), Params: params, ParamTypes: p.paramTypes, Class: ClassBatch,
 	}, profile, p.compiled.NumParams(), &p.execution)
 	if err != nil {
+		// A failed read exposes no rows or effects. Once the certified catalog
+		// refresh is exhausted, report a serialization failure so the caller
+		// can retry the same statement after publication catches up.
+		if errors.Is(err, ErrStaleGeneration) {
+			return errors.Join(driver.ErrTransactionConflict, err)
+		}
 		return err
 	}
 	if len(result.Rows) > s.rows {

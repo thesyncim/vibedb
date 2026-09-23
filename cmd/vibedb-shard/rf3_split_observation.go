@@ -27,7 +27,7 @@ func newRF3SplitObservationRuntime(
 	deadline rafttransport.DeadlineFunc,
 	maxOperations int,
 ) (*rf3SplitObservationRuntime, error) {
-	if len(prepared) == 0 || len(prepared) != len(identities) || len(prepared) != len(commands) ||
+	if len(prepared) != len(identities) || len(prepared) != len(commands) ||
 		owners == nil || registry == nil || policy == nil || deadline == nil ||
 		maxOperations <= 0 || maxOperations > maxRF3SplitChildOperations {
 		return nil, errRF3Serving
@@ -60,7 +60,13 @@ func newRF3SplitObservationRuntime(
 			Registry: registry, Capture: item.apply,
 		})
 	}
-	provider, err := splitcontroller.NewLocalPlanObservationProvider(owners, groups)
+	var provider *splitcontroller.LocalPlanObservationProvider
+	var err error
+	if len(groups) == 0 {
+		provider, err = splitcontroller.NewEmptyLocalPlanObservationProvider(owners)
+	} else {
+		provider, err = splitcontroller.NewLocalPlanObservationProvider(owners, groups)
+	}
 	if err != nil {
 		return closeOnError(err)
 	}

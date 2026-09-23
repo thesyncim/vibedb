@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/raftserve"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -51,7 +53,7 @@ type postgresModeDurableService interface {
 
 type postgresPreparedDirectService interface {
 	PrepareDirectBatch(context.Context, serviceauthz.Authority, durableExecBatchIdentity, []gateway.Query) (*gateway.DurableSQLDirectPlan, error)
-	ExecutePreparedDirectBatch(context.Context, serviceauthz.Authority, durableExecBatchIdentity, []gateway.Query, *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error)
+	ExecutePreparedDirectBatch(context.Context, serviceauthz.Authority, durableExecBatchIdentity, []gateway.Query, *gateway.DurableSQLDirectPlan, bool) (durableExecBatchExecuteResult, error)
 }
 
 type postgresCoordinatedIssuer struct {
@@ -342,7 +344,9 @@ func (w *postgresDurableWriter) resolve(ctx context.Context, fresh bool) (*gatew
 			return nil, errInvalidDurableRequestAdapter
 		}
 		region := trace.StartRegion(ctx, "pg.direct.execute")
-		result, err = service.ExecutePreparedDirectBatch(ctx, w.record.Authority, w.record.Identity, queries, w.record.DirectPlan)
+		result, err = service.ExecutePreparedDirectBatch(
+			ctx, w.record.Authority, w.record.Identity, queries, w.record.DirectPlan, !fresh,
+		)
 		region.End()
 		found = true
 	} else if !fresh {
@@ -363,19 +367,20 @@ func (w *postgresDurableWriter) resolve(ctx context.Context, fresh bool) (*gatew
 		}
 	}
 	if err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) {
-		if fresh && errors.Is(err, gateway.ErrDurableSQLNotAdmitted) {
-			// This invocation had no earlier unknown attempt. Reuse the sequence
-			// but never the failed command's nonce for the next independent write.
-			w.record.Query = nil
-			w.record.DirectPlan = nil
-			w.record.Identity = durableExecBatchIdentity{}
-			w.record.Version = postgresWriteJournalVersionUntyped
-			if saveErr := w.save(); saveErr != nil {
+		if fresh && errors.Is(err, gateway.ErrDurableSQLNotAdmitted) && !preAdmissionWriteRetry(err) {
+			// A definite refusal checked by one authority before any proposal
+			// (mode, version, authorization). Reuse the sequence but never the
+			// failed command's nonce for the next independent write.
+			if saveErr := w.dropRefusedRecipe(); saveErr != nil {
 				// The old durable outbox may still authorize recovery. A refusal
 				// is final only after its removal is durable too.
 				return nil, errors.Join(durable.ErrCommitOutcomeUnknown, err, saveErr)
 			}
 		}
+		// A transient serving-fence or proposal refusal keeps the exact recipe
+		// and identity: under a topology change a racing path may still have
+		// admitted the attempt. Write retries this identity, which the request
+		// ledger settles exactly once; a new identity could apply it twice.
 		return nil, err
 	}
 	if w.record.Mode == gateway.DurableSQLCoordinated && result.Direct ||
@@ -458,7 +463,88 @@ func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauth
 		errors.Is(err, gateway.ErrDurableSQLNotAdmitted) && w.record.Query == nil && w.poison == nil {
 		return w.writeFresh(ctx, authority, q, gateway.DurableSQLCoordinated)
 	}
+	// A membership or ownership transition refuses the prepared fence before
+	// Raft admits the command, so the sequence was not consumed. Replicas fence
+	// the old route as soon as the transition applies, which precedes the
+	// catalog publication that carries the new route; the refusal persists until
+	// that publication reaches this gateway. Replan against the refreshed
+	// catalog until it converges, bounded by time rather than attempt count so
+	// a slower publication under load is still absorbed.
+	//
+	// A refused attempt that was executed keeps its recipe, and every retry
+	// re-drives that same identity: the ledger returns the retained outcome if
+	// it was in fact admitted, or applies it once. Only a statement that never
+	// reached execution (or a direct plan whose group changed, which recovery
+	// cannot rebind) is re-planned under a new identity.
+	deadline := time.Now().Add(preAdmissionWriteRecoveryWindow)
+	for attempt := 0; preAdmissionWriteRetry(err) && w.poison == nil &&
+		ctx.Err() == nil && time.Now().Before(deadline); attempt++ {
+		timer := time.NewTimer(preAdmissionWriteRetryDelay(attempt))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		if w.record.Query != nil && w.retainedIdentityRecoverable(ctx, authority) {
+			result, err = w.resolve(ctx, false)
+			continue
+		}
+		if w.record.Query != nil {
+			if dropErr := w.dropRefusedRecipe(); dropErr != nil {
+				return nil, w.outcomeError(w.record.Identity.RequestID, errors.Join(err, dropErr), false)
+			}
+		}
+		result, err = w.writeFresh(ctx, authority, q, mode)
+	}
+	if err != nil && w.record.Query != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) {
+		// The retained attempt could not be settled within the window. Its
+		// outcome is unknown; it is resolved before the next statement.
+		return nil, w.outcomeError(w.record.Identity.RequestID, err, false)
+	}
 	return result, err
+}
+
+// retainedIdentityRecoverable reports whether the retained recipe can be
+// re-driven under its own identity. Coordinated and legacy statements are
+// re-planned from SQL on every attempt, so they always can. A prepared direct
+// plan can only be rebound to the same logical group; after a split its
+// identity cannot be recovered on the new route.
+func (w *postgresDurableWriter) retainedIdentityRecoverable(ctx context.Context, authority serviceauthz.Authority) bool {
+	if w.record.DirectPlan == nil {
+		return true
+	}
+	service, ok := w.service.(postgresPreparedDirectService)
+	if !ok || w.record.Query == nil {
+		return false
+	}
+	current, err := service.PrepareDirectBatch(ctx, authority, w.record.Identity, []gateway.Query{*w.record.Query})
+	return err == nil && current != nil &&
+		gateway.DirectMutationRecoverableRoute(w.record.DirectPlan.Target.Route, current.Target.Route)
+}
+
+// dropRefusedRecipe durably discards a refused direct recipe that recovery
+// cannot rebind, so the statement is re-planned under a new identity.
+func (w *postgresDurableWriter) dropRefusedRecipe() error {
+	w.record.Query = nil
+	w.record.DirectPlan = nil
+	w.record.Identity = durableExecBatchIdentity{}
+	w.record.Version = postgresWriteJournalVersionUntyped
+	return w.save()
+}
+
+const preAdmissionWriteRecoveryWindow = 10 * time.Second
+
+func preAdmissionWriteRetryDelay(attempt int) time.Duration {
+	const initial, ceiling = 20 * time.Millisecond, 250 * time.Millisecond
+	delay := initial << min(attempt, 4)
+	return min(delay, ceiling)
+}
+
+func preAdmissionWriteRetry(err error) bool {
+	return err != nil && errors.Is(err, gateway.ErrDurableSQLNotAdmitted) &&
+		!errors.Is(err, durable.ErrCommitOutcomeUnknown) &&
+		(errors.Is(err, raftserve.ErrProposalRefused) || errors.Is(err, raftservice.ErrServingFence))
 }
 
 func (w *postgresDurableWriter) writeFresh(ctx context.Context, authority serviceauthz.Authority, q gateway.Query, mode gateway.DurableSQLExecutionMode) (*gateway.Result, error) {

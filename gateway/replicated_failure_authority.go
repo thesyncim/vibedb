@@ -424,7 +424,16 @@ func validReplicaHealthRevision(catalog *Snapshot, revision ReplicaHealthRevisio
 	}
 	var workspace [ServingReplicaCount]ReplicatedEndpoint
 	route, ok := catalog.ResolveReplicatedRoute(revision.Distribution, revision.Shard, workspace[:0])
-	if !ok || route.Group != revision.Group || route.Command.ReplicaSetVersion != revision.ReplicaSetVersion {
+	// revision.ReplicaSetVersion is the live wire-observed value at the
+	// moment this health round ran; route.Command.ReplicaSetVersion is the
+	// catalog's last-published snapshot, a floor the observation must have
+	// already reached - not a value it must still match exactly. An
+	// unrelated or already-in-flight membership change on this same group
+	// can legitimately advance the live version past that floor well before
+	// the catalog is republished to catch up; requiring an exact match would
+	// permanently reject every health revision publish for this group once
+	// that happens, since the live version can never regress back to match.
+	if !ok || route.Group != revision.Group || revision.ReplicaSetVersion < route.Command.ReplicaSetVersion {
 		return false
 	}
 	suspect, ok := endpointByMember(route.Replicas, revision.SuspectMember)

@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -279,7 +280,7 @@ func TestReplicatedExecutorKeepsBoundedRetryAliveThroughLeaderlessElection(t *te
 	}
 	completion, completionErr := replication.OpenCompletion(result.Completion)
 	if completionErr != nil || completion.ResultCode != replicatedstate.ResultApplied ||
-		result.Retries != 2 || client.leaderlessProbes != len(states) ||
+		result.Retries != 1 || client.leaderlessProbes != len(states) ||
 		!slices.Equal(client.addresses, []string{"m1", "m3"}) ||
 		len(client.commands) != 2 || !bytes.Equal(client.commands[0], command) ||
 		!bytes.Equal(client.commands[1], command) {
@@ -770,10 +771,6 @@ func TestReplicatedExecutorRejectsMalformedMembershipBeforeDiscovery(t *testing.
 		{"zero_source", func(request *shardservice.ReplicatedMembershipRequest) { request.SourceMember = 0 }, raftservice.ErrMembershipMalformed},
 		{"zero_target", func(request *shardservice.ReplicatedMembershipRequest) { request.TargetMember = 0 }, raftservice.ErrMembershipMalformed},
 		{"same_members", func(request *shardservice.ReplicatedMembershipRequest) { request.TargetMember = request.SourceMember }, raftservice.ErrMembershipMalformed},
-		{"term_without_remove", func(request *shardservice.ReplicatedMembershipRequest) { request.TransferTerm = 9 }, raftservice.ErrMembershipMalformed},
-		{"remove_without_term", func(request *shardservice.ReplicatedMembershipRequest) {
-			request.Kind = raftservice.MembershipRemoveVoter
-		}, raftservice.ErrMembershipMalformed},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -856,7 +853,7 @@ func TestReplicatedExecutorRemovesUnroutedSourceAfterCertifiedCutover(t *testing
 		Kind: raftservice.MembershipRemoveVoter, TransitionID: [16]byte{10},
 		MetadataEpoch: 11, CatalogGeneration: 12,
 		ExpectedReplicaSetVersion: serving.Command.ReplicaSetVersion,
-		SourceMember:              2, TargetMember: target.Member, TransferTerm: transferTerm,
+		SourceMember:              2, TargetMember: target.Member,
 	}
 	client := &transferReplicatedClient{states: states}
 	executor, err := NewReplicatedExecutor(client, 3, time.Second)
@@ -865,8 +862,7 @@ func TestReplicatedExecutorRemovesUnroutedSourceAfterCertifiedCutover(t *testing
 	}
 	result, err := executor.ApplyMembership(context.Background(), cutover, request)
 	if err != nil || result.State.Fence.MemberID != target.Member ||
-		client.membershipAt != target.Member || client.membership != request ||
-		client.membership.TransferTerm != transferTerm {
+		client.membershipAt != target.Member || client.membership != request {
 		t.Fatalf("result=%+v endpoint=%d sent=%+v err=%v",
 			result, client.membershipAt, client.membership, err)
 	}
@@ -911,7 +907,7 @@ func TestReplicatedExecutorPostCutoverRouteDoesNotAdmitEarlierMembershipSteps(t 
 		Kind: raftservice.MembershipRemoveVoter, TransitionID: [16]byte{12},
 		MetadataEpoch: 13, CatalogGeneration: 14,
 		ExpectedReplicaSetVersion: serving.Command.ReplicaSetVersion,
-		SourceMember:              1, TargetMember: target.Member, TransferTerm: 15,
+		SourceMember:              1, TargetMember: target.Member,
 	}
 	if _, err := executor.ApplyMembership(
 		context.Background(), cutover, uncutSource,
@@ -920,7 +916,55 @@ func TestReplicatedExecutorPostCutoverRouteDoesNotAdmitEarlierMembershipSteps(t 
 	}
 }
 
-func TestReplicatedExecutorTransferReturnsConsumableLeaderTermWitness(t *testing.T) {
+type restartedTransferReplicatedClient struct{ *transferReplicatedClient }
+
+func (client restartedTransferReplicatedClient) ProbeReplicated(ctx context.Context, _ ReplicatedRoute, endpoint ReplicatedEndpoint, _ serviceauthz.Capability) (*shardservice.ReplicatedResponse, error) {
+	return client.DoReplicated(ctx, endpoint, &shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe})
+}
+
+func TestReplicatedExecutorTransfersRestartedRetiringLeaderAfterCatalogCutover(t *testing.T) {
+	for _, lostResponse := range []bool{false, true} {
+		serving, _, states := testReplicatedRouteCommand(t)
+		membership, states := testReplicatedMembershipRoute(serving, states)
+		source, target := serving.Replicas[1], membership.EnrolledTarget
+		serving.Replicas[1] = target
+		for address, state := range states {
+			state.LeaderID, state.Fence.Term = source.Member, 12
+			state.Fence.NodeIncarnation++ // same durable replica, restarted process
+			states[address] = state
+		}
+		cutover := ReplicatedMembershipRoute{Serving: serving, RetiringSource: source}
+		client := &transferReplicatedClient{states: states, failAfterMove: lostResponse}
+		executor, err := NewReplicatedExecutor(restartedTransferReplicatedClient{client}, 3, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := shardservice.ReplicatedMembershipRequest{
+			Kind: raftservice.MembershipTransferLeader, TransitionID: [16]byte{10},
+			MetadataEpoch: 11, CatalogGeneration: 12,
+			ExpectedReplicaSetVersion: serving.Command.ReplicaSetVersion,
+			SourceMember:              source.Member, TargetMember: target.Member,
+		}
+		result, err := executor.ApplyMembership(t.Context(), cutover, request)
+		if err != nil || client.membershipAt != source.Member ||
+			result.TransferWitness.TargetMember != target.Member || result.TransferWitness.Term <= 12 {
+			t.Fatalf("retiring leader was unreachable after catalog publication (lost response=%t): result=%+v sent-to=%d err=%v", lostResponse, result, client.membershipAt, err)
+		}
+		// The next controller process needs no retiring route after removal.
+		delete(states, source.Address)
+		executor, err = NewReplicatedExecutor(restartedTransferReplicatedClient{client}, 3, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cutover.RetiringSource = ReplicatedEndpoint{}
+		request.Kind = raftservice.MembershipRemoveVoter
+		if result, err = executor.ApplyMembership(t.Context(), cutover, request); err != nil || result.State.LeaderID != target.Member {
+			t.Fatalf("removal could not resume through surviving roster: result=%+v err=%v", result, err)
+		}
+	}
+}
+
+func TestReplicatedExecutorTransferThenRemovalSurvivesAnotherElection(t *testing.T) {
 	for _, failAfterMove := range []bool{false, true} {
 		route, _, states := testReplicatedRouteCommand(t)
 		membershipRoute, states := testReplicatedMembershipRoute(route, states)
@@ -946,9 +990,9 @@ func TestReplicatedExecutorTransferReturnsConsumableLeaderTermWitness(t *testing
 		}
 		remove := membership
 		remove.Kind = raftservice.MembershipRemoveVoter
-		remove.TransferTerm = result.TransferWitness.Term
-		if remove.TransferTerm == 0 {
-			t.Fatal("removal did not consume a transfer term")
+		for address, state := range client.states {
+			state.Fence.Term++
+			client.states[address] = state
 		}
 		removed, removeErr := executor.ApplyMembership(
 			context.Background(), membershipRoute, remove,
@@ -964,6 +1008,7 @@ func TestReplicatedExecutorObservesTransferAfterUnknownWithoutResend(t *testing.
 	route, _, states := testReplicatedRouteCommand(t)
 	membershipRoute, states := testReplicatedMembershipRoute(route, states)
 	target := uint64(4)
+	source := states["m2"].LeaderID
 	afterTerm := states["m2"].Fence.Term
 	for address, state := range states {
 		state.LeaderID = target
@@ -976,10 +1021,61 @@ func TestReplicatedExecutorObservesTransferAfterUnknownWithoutResend(t *testing.
 		t.Fatal(err)
 	}
 	result, err := executor.ObserveMembershipTransfer(context.Background(), membershipRoute,
-		target, afterTerm)
+		source, target, afterTerm)
 	if err != nil || client.moved || result.TransferWitness.TargetMember != target ||
 		result.TransferWitness.Term != afterTerm+1 || result.State.Fence.MemberID != target {
 		t.Fatalf("observation result=%+v moved=%t err=%v", result, client.moved, err)
+	}
+}
+
+// The retiring source hands leadership to a continuing voter that both the
+// source and destination routes contain. That is a settled transfer; the
+// source itself in a later term is not.
+func TestReplicatedExecutorObservesTransferToContinuingVoter(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	membershipRoute, states := testReplicatedMembershipRoute(route, states)
+	target := uint64(4)
+	source := states["m2"].LeaderID
+	afterTerm := states["m2"].Fence.Term
+	continuing := uint64(0)
+	for _, replica := range membershipRoute.Serving.Replicas {
+		if replica.Member != source {
+			continuing = replica.Member
+			break
+		}
+	}
+	if continuing == 0 || continuing == target {
+		t.Fatalf("fixture has no continuing voter: source=%d route=%+v", source, membershipRoute.Serving.Replicas)
+	}
+	lead := func(leader uint64) map[string]shardservice.ReplicatedMemberState {
+		next := make(map[string]shardservice.ReplicatedMemberState, len(states))
+		for address, state := range states {
+			state.LeaderID = leader
+			state.Fence.Term = afterTerm + 1
+			next[address] = state
+		}
+		return next
+	}
+	client := &transferReplicatedClient{states: lead(continuing)}
+	executor, err := NewReplicatedExecutor(client, 3, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.ObserveMembershipTransfer(context.Background(), membershipRoute,
+		source, target, afterTerm)
+	if err != nil || result.TransferWitness.TargetMember != continuing ||
+		result.State.Fence.MemberID != continuing || result.State.LeaderID != continuing {
+		t.Fatalf("continuing-voter transfer result=%+v err=%v", result, err)
+	}
+
+	client = &transferReplicatedClient{states: lead(source)}
+	executor, err = NewReplicatedExecutor(client, 3, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := executor.ObserveMembershipTransfer(context.Background(), membershipRoute,
+		source, target, afterTerm); !errors.Is(err, raftservice.ErrOutcomeUnknown) {
+		t.Fatalf("re-elected source witnessed as transfer: result=%+v err=%v", result, err)
 	}
 }
 
@@ -1594,6 +1690,27 @@ func TestReplicatedExecutorTreatsChangedStaleFenceAsDefinite(t *testing.T) {
 	if !errors.Is(err, raftservice.ErrServingFence) ||
 		errors.Is(err, raftservice.ErrOutcomeUnknown) || client.proposals != 1 {
 		t.Fatalf("error=%T %v proposals=%d", err, err, client.proposals)
+	}
+}
+
+func TestReplicatedExecutorPreservesStaleFenceCauseDuringUnknownRecovery(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	oldState := states["m2"]
+	newState := oldState
+	newState.Fence.Command.OwnershipEpoch++
+	newState.Fence.Command.RoutingVersion++
+	newState.Fence.Command.RouteGeneration++
+	client := &staleFenceReplicatedClient{oldState: oldState, newState: newState}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = executor.propose(context.Background(), route, command, nil, true,
+		serviceauthz.CapabilityDataWrite, replicatedUnknownCommandClone)
+	var unknown *raftservice.UnknownOutcomeError
+	if !errors.As(err, &unknown) || !errors.Is(err, raftservice.ErrServingFence) ||
+		client.proposals != 1 || !bytes.Equal(unknown.Command, command) {
+		t.Fatalf("unknown stale-fence recovery=%T %v proposals=%d", err, err, client.proposals)
 	}
 }
 

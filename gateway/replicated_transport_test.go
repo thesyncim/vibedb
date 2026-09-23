@@ -107,6 +107,7 @@ func TestReplicatedCapabilityControlReserveClassification(t *testing.T) {
 func (connection *testAuthenticatedConnection) PeerIdentity() rafttransport.PeerIdentity {
 	return connection.identity
 }
+func (*testAuthenticatedConnection) PeerKeyDigest() [32]byte { return [32]byte{} }
 func (*testAuthenticatedConnection) TrafficClass() rafttransport.TrafficClass {
 	return rafttransport.TrafficShardNative
 }
@@ -558,7 +559,9 @@ func TestAuthenticatedReplicatedClientReusesExclusiveStreamAndPoisonsIdentityMis
 			}
 		}
 	})
-	request := &shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe, Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration}}
+	request := &shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
+		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+			Command: route.Command}}
 	for attempt := 0; attempt < 2; attempt++ {
 		requestCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 		if _, err := client.DoReplicated(requestCtx, endpoint, request); err != nil {

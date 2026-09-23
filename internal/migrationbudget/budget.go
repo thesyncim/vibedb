@@ -95,6 +95,15 @@ type PressureConfig struct {
 	RecoveryWindows uint32
 	RecoveryStepPPM uint32
 	MinimumScalePPM uint32
+	// HighSchedulingNanos and SevereSchedulingNanos classify the p99 Go
+	// scheduling latency of the serving process. It measures CPU contention
+	// directly, which the node log queue does not: snapshot encode, transfer
+	// and apply can starve foreground work on a shared host while the log is
+	// idle. This signal only downshifts rates (never pauses), so migration
+	// keeps its minimum share even when foreground load alone saturates the
+	// CPU. Both zero disables it.
+	HighSchedulingNanos   uint64
+	SevereSchedulingNanos uint64
 }
 
 // DefaultPressureConfig keeps migration responsive to a saturated node log
@@ -112,6 +121,10 @@ func DefaultPressureConfig() PressureConfig {
 		RecoveryWindows: 3,
 		RecoveryStepPPM: 125_000,
 		MinimumScalePPM: 125_000,
+		// Idle Go processes schedule runnable goroutines within tens of
+		// microseconds; a p99 in the milliseconds means cores are oversubscribed.
+		HighSchedulingNanos:   uint64(5 * time.Millisecond),
+		SevereSchedulingNanos: uint64(20 * time.Millisecond),
 	}
 }
 
@@ -171,7 +184,9 @@ func (config PressureConfig) validate() error {
 		config.HighWaitNanos == 0 || config.SevereWaitNanos < config.HighWaitNanos ||
 		config.PauseWindows == 0 || config.RecoveryWindows == 0 ||
 		config.RecoveryStepPPM == 0 || config.RecoveryStepPPM > pressureScaleMax ||
-		config.MinimumScalePPM == 0 || config.MinimumScalePPM > pressureScaleMax {
+		config.MinimumScalePPM == 0 || config.MinimumScalePPM > pressureScaleMax ||
+		(config.HighSchedulingNanos == 0) != (config.SevereSchedulingNanos == 0) ||
+		config.SevereSchedulingNanos < config.HighSchedulingNanos {
 		return ErrInvalidConfig
 	}
 	return nil
@@ -201,7 +216,10 @@ type PressureSample struct {
 	BackpressureSubmissions uint64
 	ReadyQueueWaitNanos     uint64
 	ReadySubmissions        uint64
-	Initial                 bool
+	// SchedulingLatencyNanos is the p99 goroutine scheduling latency observed
+	// in this sample's interval. Zero means unavailable.
+	SchedulingLatencyNanos uint64
+	Initial                bool
 }
 
 // PressureStatus is a detached, constant-size view of foreground feedback.
@@ -214,6 +232,7 @@ type PressureStatus struct {
 	Timestamp               time.Time
 	QueuePressurePPM        uint32
 	WaitPressurePPM         uint32
+	SchedulingPressurePPM   uint32
 	BackpressureSubmissions uint64
 	BackpressureTotal       uint64
 	ScalePPM                uint32
@@ -315,6 +334,7 @@ type Budget struct {
 	networkReceive tokenBucket
 
 	waiting        atomic.Int64
+	peakActive     atomic.Uint64
 	acquires       atomic.Uint64
 	cancellations  atomic.Uint64
 	releases       atomic.Uint64
@@ -541,6 +561,7 @@ func (budget *Budget) Acquire(ctx context.Context) (*Lease, error) {
 		select {
 		case budget.active <- struct{}{}:
 			budget.waiting.Add(-1)
+			budget.updatePeakActive()
 			if err := ctx.Err(); err != nil {
 				<-budget.active
 				budget.cancellations.Add(1)
@@ -574,6 +595,16 @@ func (budget *Budget) Acquire(ctx context.Context) (*Lease, error) {
 		case <-budget.closed:
 			budget.waiting.Add(-1)
 			return nil, ErrClosed
+		}
+	}
+}
+
+func (budget *Budget) updatePeakActive() {
+	current := uint64(len(budget.active))
+	for {
+		prior := budget.peakActive.Load()
+		if current <= prior || budget.peakActive.CompareAndSwap(prior, current) {
+			return
 		}
 	}
 }
@@ -834,6 +865,7 @@ func (budget *Budget) consumeChunkWithPressure(ctx context.Context, cost Cost, w
 type Metrics struct {
 	Active                     int
 	ActiveCapacity             int
+	PeakActive                 int
 	Waiting                    int
 	Acquires                   uint64
 	Cancellations              uint64
@@ -865,6 +897,7 @@ type Metrics struct {
 type ResourceMetrics struct {
 	ConsumedBytes               uint64
 	ThrottleEvents              uint64
+	ThrottledBytes              uint64
 	ThrottledNanos              uint64
 	AvailableBytes              uint64
 	RateBytesPerSecond          uint64
@@ -881,7 +914,8 @@ func (budget *Budget) Metrics() Metrics {
 	}
 	result := Metrics{
 		Active: len(budget.active), ActiveCapacity: cap(budget.active),
-		Waiting: int(maxInt64(budget.waiting.Load())), Acquires: budget.acquires.Load(),
+		PeakActive: int(budget.peakActive.Load()),
+		Waiting:    int(maxInt64(budget.waiting.Load())), Acquires: budget.acquires.Load(),
 		Cancellations: budget.cancellations.Load(), Releases: budget.releases.Load(),
 		ConsumeCalls: budget.consumeCalls.Load(), ConsumeErrors: budget.consumeErrors.Load(),
 		BufferWaiters:  int(maxInt64(budget.bufferWaiters.Load())),
@@ -918,6 +952,7 @@ type tokenBucket struct {
 	last      time.Time
 	consumed  atomic.Uint64
 	throttle  atomic.Uint64
+	throttled atomic.Uint64
 	waitNanos atomic.Uint64
 }
 
@@ -1001,6 +1036,7 @@ func (bucket *tokenBucket) takeChunk(ctx context.Context, amount uint64, budget 
 		timer := budget.clock.NewTimer(delay)
 		select {
 		case <-timer.C():
+			bucket.throttled.Add(amount)
 			bucket.waitNanos.Add(durationNanosSince(started, budget.clock.Now()))
 		case <-ctx.Done():
 			if !timer.Stop() {
@@ -1065,6 +1101,7 @@ func (bucket *tokenBucket) takePart(ctx context.Context, amount uint64, budget *
 		timer := budget.clock.NewTimer(delay)
 		select {
 		case <-timer.C():
+			bucket.throttled.Add(amount)
 			bucket.waitNanos.Add(durationNanosSince(started, budget.clock.Now()))
 		case <-ctx.Done():
 			if !timer.Stop() {
@@ -1102,6 +1139,7 @@ func (bucket *tokenBucket) metrics(now time.Time) ResourceMetrics {
 	result := ResourceMetrics{
 		ConsumedBytes:      bucket.consumed.Load(),
 		ThrottleEvents:     bucket.throttle.Load(),
+		ThrottledBytes:     bucket.throttled.Load(),
 		ThrottledNanos:     bucket.waitNanos.Load(),
 		AvailableBytes:     uint64(maxFloat(bucket.tokens)),
 		RateBytesPerSecond: bucket.rate, BurstBytes: bucket.burst,

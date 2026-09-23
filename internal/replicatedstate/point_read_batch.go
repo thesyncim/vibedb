@@ -6,7 +6,6 @@ import (
 	"slices"
 
 	"github.com/thesyncim/vibedb/internal/replication"
-	"github.com/thesyncim/vibedb/store/durable"
 )
 
 const (
@@ -213,9 +212,10 @@ func (value PointReadBatchValue) Lookup(index int) (raw []byte, found bool, ok b
 	return value.payload[offset : offset+length : offset+length], found, true
 }
 
-// PointReadBatchInto captures one all-relation generation, rejects the whole
-// batch if any key is covered by an active intent, then materializes the
-// positional result. It never returns a partial batch.
+// PointReadBatchInto holds the machine publication lock across intent checks
+// and value copies. The machine exclusively owns every relation's mutations,
+// so live point reads share one applied cut without retaining a store snapshot
+// or forcing a physical checkpoint. It never returns a partial batch.
 func (m *Machine) PointReadBatchInto(
 	packed []byte,
 	minimumApplied uint64,
@@ -231,8 +231,8 @@ func (m *Machine) PointReadBatchInto(
 	if !ok || fixed > maxResultBytes {
 		return PointReadBatchResult{}, ErrReadBufferBound
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if err := m.checkUsable(); err != nil {
 		return PointReadBatchResult{}, err
 	}
@@ -255,25 +255,11 @@ func (m *Machine) PointReadBatchInto(
 	if m.publication.Applied < minimumApplied {
 		return PointReadBatchResult{}, ErrReadBehind
 	}
-	if err := durable.SnapshotCollectionsInto(&m.applyCut, m.members); err != nil {
-		return PointReadBatchResult{}, m.fail(err)
-	}
-	closeCut := func(cause error) (PointReadBatchResult, error) {
-		if closeErr := m.applyCut.Close(); closeErr != nil {
-			return PointReadBatchResult{}, errors.Join(cause, closeErr)
-		}
-		return PointReadBatchResult{}, cause
-	}
-	systemSnapshot, ok := m.applyCut.CollectionHandle(m.system.Collection)
-	if !ok || systemSnapshot == nil {
-		_, closeErr := closeCut(ErrInconsistentSnapshot)
-		return PointReadBatchResult{}, m.fail(closeErr)
-	}
 	// This complete first pass is the atomic visibility gate. No user value is
 	// copied until every point is proven free of an active transaction intent.
 	err = request.each(func(_ uint32, relation replication.RelationID, key []byte) error {
 		_, blocked, lookupErr := lookupTransactionIntentOwner(
-			pointSnapshot{value: systemSnapshot}, relation, key,
+			pointSnapshot{live: m.system.Collection}, relation, key,
 		)
 		if lookupErr != nil {
 			return lookupErr
@@ -284,11 +270,10 @@ func (m *Machine) PointReadBatchInto(
 		return nil
 	})
 	if err != nil {
-		_, closeErr := closeCut(err)
 		if errors.Is(err, ErrTransactionIntentActive) {
-			return PointReadBatchResult{}, closeErr
+			return PointReadBatchResult{}, err
 		}
-		return PointReadBatchResult{}, m.fail(closeErr)
+		return PointReadBatchResult{}, m.fail(err)
 	}
 	dst = slices.Grow(dst[:0], maxResultBytes)
 	dst = binary.LittleEndian.AppendUint32(dst, request.count)
@@ -299,19 +284,16 @@ func (m *Machine) PointReadBatchInto(
 	var scratch []byte
 	err = request.each(func(ordinal uint32, relation replication.RelationID, key []byte) error {
 		selected := m.relations[int(relation)-1]
-		snapshot, exists := m.applyCut.CollectionHandle(selected.target.Collection)
-		if !exists || snapshot == nil {
-			return ErrInconsistentSnapshot
-		}
 		start := len(dst)
 		maximum := selected.target.Limits.MaxDocumentBytes
 		direct := cap(dst)-len(dst) >= maximum
 		readDst := dst
 		if !direct {
-			scratch = slices.Grow(scratch[:0], maximum)
+			// AppendRaw grows to the actual document size. The schema maximum
+			// is an admission bound, not a scratch allocation requirement.
 			readDst = scratch[:0]
 		}
-		value, found, readErr := snapshot.AppendRaw(readDst, key)
+		value, found, readErr := selected.target.Collection.AppendRaw(readDst, key)
 		if readErr != nil {
 			return readErr
 		}
@@ -319,8 +301,11 @@ func (m *Machine) PointReadBatchInto(
 		if direct {
 			valueBytes -= start
 			dst = value
-		} else if valueBytes <= maxResultBytes-len(dst) {
-			dst = append(dst, value...)
+		} else {
+			scratch = value[:0]
+			if valueBytes <= maxResultBytes-len(dst) {
+				dst = append(dst, value...)
+			}
 		}
 		if valueBytes > maxResultBytes-start || len(dst) > maxResultBytes ||
 			len(dst)-start > replication.MaxMutationValueBytes {
@@ -333,11 +318,10 @@ func (m *Machine) PointReadBatchInto(
 		return nil
 	})
 	if err != nil {
-		_, closeErr := closeCut(err)
 		if errors.Is(err, ErrReadBufferBound) {
-			return PointReadBatchResult{}, closeErr
+			return PointReadBatchResult{}, err
 		}
-		return PointReadBatchResult{}, m.fail(closeErr)
+		return PointReadBatchResult{}, m.fail(err)
 	}
 	result := PointReadBatchResult{Fence: SnapshotFence{
 		Binding: m.state.Binding, RelationManifestDigest: m.manifestDigest,
@@ -346,8 +330,5 @@ func (m *Machine) PointReadBatchInto(
 		LastEntryDigest: m.state.LastEntryDigest, DataChainDigest: m.state.DataChainDigest,
 		SnapshotBaseDigest: m.state.SnapshotBaseDigest,
 	}, Data: dst}
-	if err := m.applyCut.Close(); err != nil {
-		return PointReadBatchResult{}, m.fail(err)
-	}
 	return result, nil
 }

@@ -41,7 +41,8 @@ func TestAuthenticatedReplicatedDiscoveryRebindsRestartButOperationsRemainExact(
 	}
 	request := &shardservice.ReplicatedRequest{Operation: shardservice.ReplicatedProbe,
 		Authority: serviceauthz.Authority{Node: [16]byte{7}, Generation: 5}, Capability: serviceauthz.CapabilityDataRead,
-		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration}}
+		Fence: shardservice.ReplicatedFence{Group: route.Group, AllocationGeneration: route.AllocationGeneration,
+			Command: route.Command}}
 	if _, err := client.DoReplicated(ctx, endpoint, request); !errors.Is(err, ErrReplicatedRoute) {
 		t.Fatalf("strict old incarnation accepted: %v", err)
 	}

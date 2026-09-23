@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/frontenddrain"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
@@ -48,18 +49,29 @@ func replicatedRequestDigest(command []byte) [sha256.Size]byte {
 // connection admission; connection authentication remains an explicit outer
 // listener capability.
 type ReplicatedServer struct {
-	owner                replicatedOwner
-	state                atomic.Uint32
-	requestTimeout       time.Duration
-	frames               replicatedFrameByteBudget
-	sqlHints             replicatedSQLBudgetHints
-	authorization        *serviceauthz.Gate
-	audit                serviceauthz.AuditSink
-	serving              func(raftservice.ServingState) bool
-	transition           func(raftservice.ServingState, *ReplicatedRequest) bool
-	concurrentServing    raftservice.ConcurrentReadAuthorization
-	concurrentTransition func(raftservice.ServingState, *ReplicatedRequest) bool
-	local                atomic.Pointer[replicatedLocalBinding]
+	owner                              replicatedOwner
+	state                              atomic.Uint32
+	requestTimeout                     time.Duration
+	frames                             replicatedFrameByteBudget
+	sqlHints                           replicatedSQLBudgetHints
+	authorization                      *serviceauthz.Gate
+	directory                          atomic.Pointer[serviceauthz.ServiceDirectoryGate]
+	serviceDirectoryRequired           atomic.Bool
+	directoryCutMu                     sync.Mutex
+	directoryCoordinates               frontenddrain.PreparedAckCutReadFloor
+	directoryCoordinatesSet            bool
+	serviceDirectoryRefreshMu          sync.Mutex
+	serviceDirectoryRefreshFlight      chan struct{}
+	serviceDirectoryRefreshReader      FrontendDrainServiceCutReader
+	serviceDirectoryRefreshNode        rafttransport.NodeID
+	serviceDirectoryRefreshIncarnation uint64
+	serviceDirectoryRefreshKey         [sha256.Size]byte
+	audit                              serviceauthz.AuditSink
+	serving                            func(raftservice.ServingState) bool
+	transition                         func(raftservice.ServingState, *ReplicatedRequest) bool
+	concurrentServing                  raftservice.ConcurrentReadAuthorization
+	concurrentTransition               func(raftservice.ServingState, *ReplicatedRequest) bool
+	local                              atomic.Pointer[replicatedLocalBinding]
 
 	accepted      atomic.Uint64
 	rejected      atomic.Uint64
@@ -91,6 +103,76 @@ func (server *ReplicatedServer) BindAuthorization(
 	}
 	server.authorization, server.audit = gate, audit
 	return nil
+}
+
+// SetRequireServiceDirectory makes native and local semantic requests wait
+// for a complete catalog-derived service cut. Production fused receivers set
+// this before starting their listener; an absent directory then fails closed
+// instead of falling back to the static Policy delegate roster.
+func (server *ReplicatedServer) SetRequireServiceDirectory(required bool) error {
+	if server == nil || server.state.Load() != replicatedServerReady {
+		return ErrReplicatedWire
+	}
+	server.serviceDirectoryRequired.Store(required)
+	return nil
+}
+
+// BindServiceDirectoryGate installs the committed service-identity fence in
+// addition to the existing operator/user Policy gate. Applying a directory
+// cut never mutates Policy.Generation.
+func (server *ReplicatedServer) BindServiceDirectoryGate(
+	directory *serviceauthz.ServiceDirectoryGate,
+) error {
+	if server == nil || directory == nil || server.state.Load() == replicatedServerClosed {
+		return ErrReplicatedWire
+	}
+	server.directoryCutMu.Lock()
+	defer server.directoryCutMu.Unlock()
+	return server.bindServiceDirectoryGateLocked(directory)
+}
+
+func (server *ReplicatedServer) bindServiceDirectoryGateLocked(
+	directory *serviceauthz.ServiceDirectoryGate,
+) error {
+	cut, ok := directory.Cut()
+	if !ok {
+		return ErrReplicatedWire
+	}
+	// A receiver keeps one gate instance for its entire lifetime. Once the
+	// first certified cut is published, every subsequent source proof is
+	// applied through ServiceDirectoryGate's monotonic CAS instead of swapping
+	// a fresh pointer over an in-flight request. This preserves the transition
+	// and tombstone history that ApplyCommittedCut uses to reject rollback.
+	for {
+		current := server.directory.Load()
+		if current == nil {
+			if server.directory.CompareAndSwap(nil, directory) {
+				return nil
+			}
+			continue
+		}
+		return current.ApplyCommittedCut(cut)
+	}
+}
+
+// ServiceDirectoryGate returns the currently installed immutable gate. The
+// pointer is stable after the first bind; callers that need a point-in-time
+// value should use ServiceDirectoryRevision or the gate's Cut method.
+func (server *ReplicatedServer) ServiceDirectoryGate() *serviceauthz.ServiceDirectoryGate {
+	if server == nil {
+		return nil
+	}
+	return server.directory.Load()
+}
+
+// ServiceDirectoryRevision reports the revision of the gate retained by this
+// receiver after a committed-cut install.
+func (server *ReplicatedServer) ServiceDirectoryRevision() uint64 {
+	gate := server.ServiceDirectoryGate()
+	if gate == nil {
+		return 0
+	}
+	return gate.Revision()
 }
 
 // BindLocalGatewayPeerTLS binds a validated gateway credential to the local
@@ -134,7 +216,9 @@ func (server *ReplicatedServer) BindLocalGatewayPeerTLS(
 	}
 	bindingCtx, cancel := context.WithCancel(context.Background())
 	binding := &replicatedLocalBinding{
-		principal: principal, node: storage.Node, storage: storageTLS, generation: storageGeneration,
+		principal:   principal,
+		servicePeer: serviceauthz.AuthenticatedPeer{Identity: principal, KeyDigest: gatewayProfile.LocalPeerKeyDigest()},
+		node:        storage.Node, storage: storageTLS, generation: storageGeneration,
 		gatewayProof: gatewayProof, storageProof: storageProof, ctx: bindingCtx, cancel: cancel,
 	}
 	storageTLS.mu.Lock()
@@ -464,7 +548,7 @@ func (server *ReplicatedServer) ServeReplicatedConn(
 	ctx context.Context,
 	conn net.Conn,
 ) error {
-	return server.serveReplicatedConn(ctx, conn, rafttransport.NodeID{}, false)
+	return server.serveReplicatedConn(ctx, conn, rafttransport.NodeID{}, false, serviceauthz.AuthenticatedPeer{})
 }
 
 func (server *ReplicatedServer) serveReplicatedConn(
@@ -472,6 +556,7 @@ func (server *ReplicatedServer) serveReplicatedConn(
 	conn net.Conn,
 	peer rafttransport.NodeID,
 	authenticated bool,
+	directoryPeer serviceauthz.AuthenticatedPeer,
 ) error {
 	if server == nil || server.owner == nil || ctx == nil || conn == nil ||
 		server.requestTimeout <= 0 || server.frames.limit <= 0 {
@@ -483,7 +568,7 @@ func (server *ReplicatedServer) serveReplicatedConn(
 	// connection reuses a single arena.
 	var enc FrameEncoder
 	for {
-		err := server.serveReplicatedRequestAuthorized(ctx, conn, peer, authenticated, &enc)
+		err := server.serveReplicatedRequestAuthorized(ctx, conn, peer, authenticated, directoryPeer, &enc)
 		if err != nil {
 			if errors.Is(err, errFrameBudget) {
 				server.frameRejected.Add(1)
@@ -502,7 +587,8 @@ func (server *ReplicatedServer) serveReplicatedRequest(
 
 ) error {
 	var enc FrameEncoder
-	return server.serveReplicatedRequestAuthorized(ctx, conn, rafttransport.NodeID{}, false, &enc)
+	return server.serveReplicatedRequestAuthorized(ctx, conn, rafttransport.NodeID{}, false,
+		serviceauthz.AuthenticatedPeer{}, &enc)
 }
 
 func (server *ReplicatedServer) serveReplicatedRequestAuthorized(
@@ -510,6 +596,7 @@ func (server *ReplicatedServer) serveReplicatedRequestAuthorized(
 	conn net.Conn,
 	peer rafttransport.NodeID,
 	authenticated bool,
+	directoryPeer serviceauthz.AuthenticatedPeer,
 	enc *FrameEncoder,
 ) error {
 	requestCtx, cancel := context.WithTimeout(ctx, server.requestTimeout)
@@ -524,7 +611,23 @@ func (server *ReplicatedServer) serveReplicatedRequestAuthorized(
 	}
 	defer server.frames.release(charged)
 	if authenticated {
-		if !server.authorizeReplicated(peer, request) {
+		directory := server.directory.Load()
+		if server.serviceDirectoryRequired.Load() && directory == nil {
+			// A mandatory committed gate may still be installing during startup.
+			// This is an authenticated, no-state availability response: callers may
+			// probe another physical source, while an installed gate that rejects the
+			// peer remains an explicit Unauthorized response below.
+			return enc.EncodeReplicatedResponse(conn, &ReplicatedResponse{
+				Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
+			})
+		}
+		if directory != nil {
+			if !server.authorizeReplicatedPeerWithDirectoryRefresh(requestCtx, directoryPeer, request) {
+				return enc.EncodeReplicatedResponse(conn, &ReplicatedResponse{
+					Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnauthorized,
+				})
+			}
+		} else if !server.authorizeReplicated(peer, request) {
 			return enc.EncodeReplicatedResponse(conn, &ReplicatedResponse{
 				Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnauthorized,
 			})
@@ -559,6 +662,80 @@ func (server *ReplicatedServer) authorizeReplicated(
 	}
 	return serviceauthz.CheckAndAudit(server.authorization, server.audit,
 		request.Authority.Node, generation, request.Capability) == serviceauthz.DecisionAllow
+}
+
+// authorizeReplicatedPeer consumes the verified TLS leaf binding when a
+// committed service directory is installed. The dynamic gate replaces only
+// the authenticated service Delegate lookup; forwarded user authority still
+// goes through the unchanged static Policy gate below.
+func (server *ReplicatedServer) authorizeReplicatedPeer(
+	peer serviceauthz.AuthenticatedPeer,
+	request *ReplicatedRequest,
+) bool {
+	return server.authorizeReplicatedPeerWithDirectory(server.directory.Load(), peer, request)
+}
+
+func (server *ReplicatedServer) authorizeReplicatedPeerWithDirectory(
+	directory *serviceauthz.ServiceDirectoryGate,
+	peer serviceauthz.AuthenticatedPeer,
+	request *ReplicatedRequest,
+) bool {
+	if server == nil || request == nil || !peer.Valid() || server.authorization == nil {
+		return false
+	}
+	if directory == nil {
+		return server.authorizeReplicated(peer.Identity.Node, request)
+	}
+	scope, scoped := FrontendContinuationScopeForReplicatedRequest(request)
+	if scoped && request.Continuation != nil {
+		var scopeOK bool
+		scope, scopeOK = FrontendContinuationScopeForReplicatedRequestWithProtocol(request,
+			request.Continuation.Scope.Protocol)
+		if !scopeOK {
+			return false
+		}
+	}
+	if request.Continuation != nil {
+		if !scoped || directory.CheckFrontendContinuation(peer, request.Authority.Generation,
+			*request.Continuation, scope) != serviceauthz.DecisionAllow {
+			return false
+		}
+		if scope.Action != serviceauthz.FrontendActionForwardedData {
+			return directory.CheckInternalFrontendContinuation(peer, request.Authority,
+				*request.Continuation, scope) == serviceauthz.DecisionAllow
+		}
+	} else if scoped && scope.Action != serviceauthz.FrontendActionForwardedData &&
+		request.Authority.Node == peer.Identity.Node {
+		// A draining gateway must finish its own catalog, ledger, pin, and
+		// recovery work under the exact committed internal resource fence. This
+		// is not frontend delegation: it has no connection token and cannot
+		// authorize forwarded user data. Check it before CheckDelegate, whose
+		// empty legacy service fence intentionally denies a Draining principal.
+		if directory.CheckInternalScope(peer, request.Authority, scope) != serviceauthz.DecisionAllow {
+			return false
+		}
+		return true
+	} else if directory.CheckDelegate(peer, request.Authority.Generation,
+		serviceFenceForReplicatedRequest(request)) != serviceauthz.DecisionAllow {
+		return false
+	}
+	if scoped && scope.Action != serviceauthz.FrontendActionForwardedData {
+		return false
+	}
+	if !scoped && replicatedRequestRequiresServiceScope(request) {
+		return false
+	}
+	if request.Authority.Node != peer.Identity.Node && directory.ManagedPrincipal(request.Authority.Node) {
+		// A directory-managed service authority must be admitted by its own
+		// current authenticated binding. The legacy Policy remains the user and
+		// operator authority, but cannot resurrect a retired service principal.
+		return false
+	}
+	if request.Capability == serviceauthz.CapabilityRequestLedger && request.Authority.Node != peer.Identity.Node {
+		return false
+	}
+	return serviceauthz.CheckAndAudit(server.authorization, server.audit,
+		request.Authority.Node, request.Authority.Generation, request.Capability) == serviceauthz.DecisionAllow
 }
 
 func (server *ReplicatedServer) executeReplicated(
@@ -680,7 +857,6 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 			ExpectedReplicaSetVersion: request.Membership.ExpectedReplicaSetVersion,
 			SourceMember:              request.Membership.SourceMember,
 			TargetMember:              request.Membership.TargetMember,
-			TransferTerm:              request.Membership.TransferTerm,
 		})
 		if refreshed, refreshErr := server.owner.Probe(ctx, request.Fence.Group); refreshErr == nil {
 			wireState = replicatedWireState(refreshed)
@@ -1003,6 +1179,9 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 	if request.Operation == ReplicatedRouteGateRead {
 		return server.readRouteGate(ctx, request, wireState, readAuthorize)
 	}
+	if request.Operation == ReplicatedRouteSettlement {
+		return server.readRouteReleaseReceipt(ctx, request, wireState, readAuthorize)
+	}
 	if request.Operation == ReplicatedExecutionPinRead {
 		wireRead := request.ExecutionPinRead
 		result, readLease, readErr := server.owner.ReadExecutionPin(ctx,
@@ -1211,7 +1390,7 @@ func replicatedReadOperation(operation ReplicatedOperation) bool {
 	switch operation {
 	case ReplicatedReadLeader, ReplicatedReadFollower, ReplicatedReadBatchLeader,
 		ReplicatedTransactionRead, ReplicatedRequestLedgerRead,
-		ReplicatedExecutionPinRead, ReplicatedRouteGateRead:
+		ReplicatedExecutionPinRead, ReplicatedRouteGateRead, ReplicatedRouteSettlement:
 		return true
 	default:
 		return false

@@ -87,8 +87,9 @@ func OpenCollectionsWithSeededCheckpointGroup(
 
 // OpenCollectionsWithSnapshotCheckpointGroup is the non-serving recovery
 // boundary for a streamed snapshot, which can already contain hidden rows
-// before its seed certificate is created. Without a certificate, every member
-// and the marker must have clean journals; no pending transaction is replayed.
+// before its seed certificate is created. Without a certificate, standalone
+// snapshot writes may remain in member journals; the marker must be empty and
+// conditional transaction records are forbidden.
 // An existing certificate must describe a seeded image, and is checked before
 // recovery can mutate any member or checkpoint. The caller must authenticate
 // the complete artifact and cursor before granting serving authority.
@@ -443,11 +444,10 @@ func openCollectionsWithCheckpointGroup(
 }
 
 // validateMissingCheckpointGroupActivation distinguishes the one legitimate
-// missing-certificate state from loss of an already-active certificate. SQL
-// publishes the empty fixed target files before creating format 0, so a
-// crash in that narrow seam has an empty marker, empty durable roots, and empty
-// journals. Anything else must fail before generic recovery can fold records
-// using txn.vtm as authority.
+// missing-certificate states from loss of an already-active certificate. SQL
+// publishes empty fixed target files before creating format 0. Snapshot staging
+// may additionally contain standalone writes, but never transactions. Validate
+// that distinction before generic recovery can fold any journal records.
 func validateMissingCheckpointGroupActivation(
 	log *TxnLog,
 	requests []TransactionCollectionOpen,
@@ -477,7 +477,7 @@ func validateMissingCheckpointGroupActivation(
 	}
 	recovery, err := loadDatabaseTxnRecoveryFromLog(log, requests)
 	if err != nil {
-		return fmt.Errorf("%w: missing certificate has recovery state: %v", ErrCheckpointGroupCorrupt, err)
+		return fmt.Errorf("%w: missing certificate has recovery state: %w", ErrCheckpointGroupCorrupt, err)
 	}
 	cleanup := func(collections []*Collection) error {
 		var result error
@@ -529,17 +529,26 @@ func validateMissingCheckpointGroupActivation(
 		)
 		if openErr != nil {
 			return errors.Join(
-				fmt.Errorf("%w: inspect missing-certificate member: %v", ErrCheckpointGroupCorrupt, openErr),
+				fmt.Errorf("%w: inspect missing-certificate member: %w", ErrCheckpointGroupCorrupt, openErr),
 				cleanup(collections),
 			)
 		}
 		collections = append(collections, collection)
-		if !snapshotTarget && (seedPendingMember == "" || i == seedIndex) && collection.Len() != 0 ||
-			collection.journal == nil || collection.journal.Cursor() != 0 {
+		if collection.journal == nil || !snapshotTarget &&
+			((seedPendingMember == "" || i == seedIndex) && collection.Len() != 0 || collection.journal.Cursor() != 0) {
 			return errors.Join(
 				fmt.Errorf("%w: missing certificate beside non-empty member %d", ErrCheckpointGroupCorrupt, i),
 				cleanup(collections),
 			)
+		}
+		if snapshotTarget {
+			_, txnID, _, journalErr := journalConditionalIdentity(collection.journal)
+			if journalErr != nil || txnID != 0 {
+				return errors.Join(
+					fmt.Errorf("%w: snapshot member %d has transactional journal state", ErrCheckpointGroupCorrupt, i),
+					journalErr, cleanup(collections),
+				)
+			}
 		}
 	}
 	if cleanupErr := cleanup(collections); cleanupErr != nil {

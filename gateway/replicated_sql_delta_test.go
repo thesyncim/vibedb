@@ -201,7 +201,7 @@ func TestPreparedDirectIntegerUpdatePublishesJID1ThroughDirectExecutor(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := executor.ExecutePreparedDirect(ctx, key, tenant, queries, plan)
+	result, err := executor.ExecutePreparedDirect(ctx, key, tenant, queries, plan, false)
 	if err != nil || !result.Direct || result.Result == nil || result.Result.RowsAffected != 1 {
 		t.Fatalf("direct result=%+v err=%v", result, err)
 	}
@@ -252,7 +252,7 @@ func TestPreparedDirectMultiIntegerUpdatePublishesJID2ThroughDirectExecutor(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := executor.ExecutePreparedDirect(ctx, key, tenant, queries, plan)
+	result, err := executor.ExecutePreparedDirect(ctx, key, tenant, queries, plan, false)
 	if err != nil || !result.Direct || result.Result == nil || result.Result.RowsAffected != 1 {
 		t.Fatalf("direct result=%+v err=%v", result, err)
 	}
@@ -312,7 +312,7 @@ func TestPreparedDirectIntegerUpdateReplaysSameJID1AfterGatewayReplan(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = executor.ExecutePreparedDirect(ctx, key, tenant, queries, plan); err != nil {
+	if _, err = executor.ExecutePreparedDirect(ctx, key, tenant, queries, plan, false); err != nil {
 		t.Fatal(err)
 	}
 	replayed, found, err := executor.ReplayRequestWithTenant(ctx, key, tenant, queries)

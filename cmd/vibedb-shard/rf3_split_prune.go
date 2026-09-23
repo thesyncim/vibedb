@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
+	"github.com/thesyncim/vibedb/shardservice"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
@@ -25,7 +26,16 @@ type rf3RetainedPruneFactory struct {
 	authority serviceauthz.Authority
 	lease     *splitcontroller.RuntimeStoreLease
 	source    *sqldriver.ReplicatedApply
+	transport rf3SplitTopologyTransportFactory
 }
+
+type rf3SplitTopologyTransport interface {
+	gateway.ReplicatedRoundTripper
+	ProbeReplicated(context.Context, gateway.ReplicatedRoute, gateway.ReplicatedEndpoint, serviceauthz.Capability) (*shardservice.ReplicatedResponse, error)
+	Close() error
+}
+
+type rf3SplitTopologyTransportFactory func(context.Context) (rf3SplitTopologyTransport, error)
 
 func (factory *rf3RetainedPruneFactory) RetireSourceCaptureActivationSession(ctx context.Context, plan *splitcontroller.Plan, observed splitcontroller.Observation) error {
 	if factory == nil || factory.source == nil || plan == nil || observed.Catalog == nil {
@@ -46,7 +56,7 @@ func (factory *rf3RetainedPruneFactory) RetireSourceCaptureActivationSession(ctx
 	if !found {
 		return errRF3Serving
 	}
-	pool, executor, err := newRF3SplitTopologyTransport(factory.tls)
+	pool, executor, err := openRF3SplitTopologyTransport(ctx, factory.tls, factory.transport)
 	if err != nil {
 		return err
 	}
@@ -84,7 +94,7 @@ func (factory *rf3RetainedPruneFactory) OpenSourceCaptureActivationProposer(
 		factory.tls, factory.authority, factory.lease,
 		splitcontroller.SourceCaptureClientID(plan.OperationID()),
 		splitcontroller.SourceCaptureTenant(plan.OperationID()),
-		[]byte("vibedb/split-capture/retry-home\x00"), true,
+		[]byte("vibedb/split-capture/retry-home\x00"), true, factory.transport,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -112,7 +122,7 @@ func (factory *rf3RetainedPruneFactory) OpenRetainedPruneProposer(
 		factory.tls, factory.authority, factory.lease,
 		splitcontroller.RetainedPruneClientID(plan.OperationID()),
 		splitcontroller.RetainedPruneTenant(plan.OperationID()),
-		[]byte("vibedb/split-prune/retry-home\x00"), false,
+		[]byte("vibedb/split-prune/retry-home\x00"), false, factory.transport,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -138,6 +148,7 @@ func openRF3SplitTopologySession(
 	tenant []byte,
 	retryDomain []byte,
 	capture bool,
+	transport rf3SplitTopologyTransportFactory,
 ) (*gateway.NativeSession, func() error, error) {
 	if ctx == nil || catalog == nil || tls == nil || lease == nil ||
 		clientID == (replication.ID128{}) || len(tenant) == 0 || len(retryDomain) == 0 {
@@ -157,7 +168,7 @@ func openRF3SplitTopologySession(
 	if err != nil {
 		return nil, nil, err
 	}
-	pool, executor, err := newRF3SplitTopologyTransport(tls)
+	pool, executor, err := openRF3SplitTopologyTransport(ctx, tls, transport)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -214,6 +225,26 @@ func openRF3SplitTopologySession(
 		return nil, release, errors.Join(err, release())
 	}
 	return session, release, nil
+}
+
+func openRF3SplitTopologyTransport(ctx context.Context, tls *rafttransport.PeerTLS,
+	factory rf3SplitTopologyTransportFactory,
+) (rf3SplitTopologyTransport, *gateway.ReplicatedExecutor, error) {
+	if factory == nil {
+		return newRF3SplitTopologyTransport(tls)
+	}
+	transport, err := factory(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if transport == nil {
+		return nil, nil, errRF3Serving
+	}
+	executor, err := gateway.NewReplicatedExecutor(transport, 3, rf3RequestTimeout)
+	if err != nil {
+		return nil, nil, errors.Join(err, transport.Close())
+	}
+	return transport, executor, nil
 }
 
 func newRF3SplitTopologyTransport(tls *rafttransport.PeerTLS) (*gateway.AuthenticatedReplicatedClient, *gateway.ReplicatedExecutor, error) {

@@ -93,7 +93,7 @@ func openRF3ChildAdmissionStore(path string, manifest [32]byte, limit int, succe
 		slot := &slots[index]
 		copy(slot.operation[:], raw[position:position+32])
 		group := binary.LittleEndian.Uint64(raw[position+32 : position+40])
-		if group >= maxRF3ManifestGroups {
+		if group >= maxRF3ManifestGroups && group != rf3DynamicTemplateSlot {
 			return closeError(errRF3Serving)
 		}
 		slot.group = int(group)
@@ -115,7 +115,7 @@ func openRF3ChildAdmissionStore(path string, manifest [32]byte, limit int, succe
 				children++
 			}
 		}
-		if slot.operation != ([32]byte{}) && (children == 0 || slot.group < 0 || slot.group >= previousGroups) {
+		if slot.operation != ([32]byte{}) && (children == 0 || slot.group < 0 || slot.group >= previousGroups && slot.group != rf3DynamicTemplateSlot) {
 			return closeError(errRF3Serving)
 		}
 		for prior := 0; prior < index; prior++ {

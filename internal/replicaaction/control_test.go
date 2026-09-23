@@ -39,6 +39,9 @@ func (journal *memoryJournal) PublishReplicaAction(_ context.Context, expected u
 	if (!found && expected != 0) || (found && current.Revision != expected) {
 		return ErrConflict
 	}
+	if found && !equalRequest(current.Request, record.Request) && !restartRetirementRequest(current.Request, record.Request) {
+		return ErrConflict
+	}
 	journal.records[replicaActionJournalKey(record.Request.Operation, record.Request.Kind)] = Record{Request: cloneRequest(record.Request), Revision: record.Revision, State: record.State}
 	if journal.publishUnknown {
 		journal.publishUnknown = false

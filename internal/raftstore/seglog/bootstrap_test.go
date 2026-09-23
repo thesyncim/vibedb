@@ -24,7 +24,10 @@ func TestBootstrapIncarnationDoesNotWeakenExistingGroupFence(t *testing.T) {
 		{"commit-behind", func(_ *engineGroup, b *ReadyBatch) { b.Hard.Commit = 40 }},
 		{"commit-ahead", func(_ *engineGroup, b *ReadyBatch) { b.Hard.Commit = 42 }},
 		{"new-vote", func(_ *engineGroup, b *ReadyBatch) { b.Hard.Vote = 1 }},
-		{"skipped-incarnation", func(_ *engineGroup, b *ReadyBatch) { b.BeginIncarnation = 2 }},
+		{"skipped-existing-incarnation", func(g *engineGroup, b *ReadyBatch) {
+			g.NodeIncarnation = 1
+			*b = ReadyBatch{GroupID: 1, BeginIncarnation: 3}
+		}},
 		{"appended-entry", func(_ *engineGroup, b *ReadyBatch) { b.Entries = []Entry{{Index: 1, Term: 1}} }},
 		{"prefix", func(_ *engineGroup, b *ReadyBatch) { b.TruncateIndex, b.TruncateTerm = 41, 7 }},
 		{"suffix", func(_ *engineGroup, b *ReadyBatch) { b.ReplaceFrom = 1 }},
@@ -58,7 +61,7 @@ func TestBootstrapIncarnationRotatesAndRecoversWithCheckpoint(t *testing.T) {
 	}
 	checkpoint := Checkpoint{ID: [16]byte{2}, Index: 41, Term: 7}
 	hard := HardState{Term: 7, Commit: 41}
-	bootstrap := Wave{ID: WaveID{1}, Batches: []ReadyBatch{{GroupID: 1, BeginIncarnation: 1, Checkpoint: &checkpoint, Hard: &hard}}}
+	bootstrap := Wave{ID: WaveID{1}, Batches: []ReadyBatch{{GroupID: 1, BeginIncarnation: 7, Checkpoint: &checkpoint, Hard: &hard}}}
 	if err = engine.PersistWave(bootstrap); err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +79,7 @@ func TestBootstrapIncarnationRotatesAndRecoversWithCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	state, exists := engine.Metadata(1)
-	if !exists || state.NodeIncarnation != 1 || state.ReadyID != 0 || state.Checkpoint != checkpoint || state.Hard != hard {
+	if !exists || state.NodeIncarnation != 7 || state.ReadyID != 0 || state.Checkpoint != checkpoint || state.Hard != hard {
 		t.Fatalf("recovered bootstrap=%+v exists=%v", state, exists)
 	}
 	if err = engine.DeepVerify(); err != nil {

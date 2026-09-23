@@ -1676,6 +1676,13 @@ func consumeSnapshotArtifactRows(
 					return false, fmt.Errorf("%w: hidden state row", ErrSnapshotArtifact)
 				}
 				stateRowSeen = true
+			case len(key) == 18 && bytes.Equal(key[:2], sessionFencePrefix[:]):
+				fence, err := openSessionFence(value)
+				want := sessionFenceKey(fence.routing, fence.generation)
+				if err != nil || !bytes.Equal(key, want[:]) {
+					return false, errors.Join(err,
+						fmt.Errorf("%w: historical session fence", ErrSnapshotArtifact))
+				}
 			case len(key) == sha256.Size+1 && key[0] == 1:
 			case len(key) == sha256.Size+3 && key[0] == 2:
 			case len(key) == sha256.Size+1 && key[0] == 3:

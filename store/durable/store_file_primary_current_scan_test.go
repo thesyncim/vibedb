@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -13,6 +15,40 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
+
+func TestRangeRawCurrentPreservesBinaryOverflowKeys(t *testing.T) {
+	file, err := os.OpenFile(filepath.Join(t.TempDir(), "opaque.vdb"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	options := concurrentPrimaryTestOptions()
+	options.OpaqueValues = true
+	collection, err := Create(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = collection.Close() })
+	oracle := make(map[string][]byte)
+	for i := byte(1); i <= 2; i++ {
+		key := append(bytes.Repeat([]byte{0, 0x91}, 8), i)
+		value := bytes.Repeat([]byte{i + 10}, 8<<10)
+		if _, err := collection.Put(key, value); err != nil {
+			t.Fatal(err)
+		}
+		oracle[string(key)] = value
+	}
+	if err := collection.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	assertBufferedCurrentScan(t, collection, oracle)
+	// Reuse the same rooted overflow rows while an inline overlay is present.
+	if _, err := collection.Put([]byte("overlay"), []byte("small")); err != nil {
+		t.Fatal(err)
+	}
+	oracle["overlay"] = []byte("small")
+	assertBufferedCurrentScan(t, collection, oracle)
+}
 
 func bufferedCurrentScanOracle(
 	fixture concurrentPrimaryTestFixture,

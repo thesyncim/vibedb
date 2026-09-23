@@ -240,19 +240,7 @@ func TestRequestLedgerImageScannerReopensSchemaReleasePhases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	releasingHead, err := requestledger.InstallSchemaPinRelease(preparedHead, prepared, intent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	intentRaw, _ := requestledger.AppendSchemaPinRelease(nil, intent)
-	t.Run("releasing", func(t *testing.T) {
-		scanRequestLedgerImage(t, releasingHead, base(releasingHead, intentRaw))
-	})
-	released, err := requestledger.RecordVerifiedSchemaPinReleased(intent, 10, []byte("released-schema"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	releasedHead, err := requestledger.MarkSchemaPinReleased(releasingHead, prepared, intent, released)
+	releasedHead, released, err := requestledger.CompleteSchemaPinRelease(preparedHead, prepared, intent, []byte("released-schema"))
 	if err != nil {
 		t.Fatal(err)
 	}

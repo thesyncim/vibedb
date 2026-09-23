@@ -465,3 +465,17 @@ func TestNewDurableRequestLedgerKeyRejectsIncompleteIssuerTuple(t *testing.T) {
 		t.Fatalf("incomplete key error=%v", err)
 	}
 }
+
+func TestDurableSQLAbortAlwaysCarriesResultCode(t *testing.T) {
+	t.Setenv(durableSQLAbortDiagnosticEnvironment, "")
+	err := durableSQLAborted(13)
+	code, ok := DurableSQLAbortResultCode(err)
+	if !errors.Is(err, ErrDurableSQLAborted) || !ok || code != 13 || err.Error() != ErrDurableSQLAborted.Error() {
+		t.Fatalf("diagnostic disabled typed abort error=%v code=%d typed=%t", err, code, ok)
+	}
+	t.Setenv(durableSQLAbortDiagnosticEnvironment, "1")
+	err = durableSQLAborted(13)
+	if !errors.Is(err, ErrDurableSQLAborted) || !strings.Contains(err.Error(), "VIBEDB_RF3_DIRECT_ABORT result_code=13") {
+		t.Fatalf("diagnostic abort error=%v", err)
+	}
+}

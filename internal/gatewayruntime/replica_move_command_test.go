@@ -1,6 +1,7 @@
 package gatewayruntime
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -12,6 +13,74 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicacontrol"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 )
+
+func TestReplicaMoveColdDiscoveryRetainsSourceUntilRemovalReceipt(t *testing.T) {
+	catalog, _, observed := gatewayHotShardMoveFixture(t)
+	catalog = gateway.NewCatalogHolder(catalog).Current()
+	plan, err := rebalance.PlanReplicaMove(catalog, observed.publication, rebalance.MoveRequest{
+		Distribution: "data", Shard: "all", Group: observed.grant.Group,
+		RetiringMember: 1, SnapshotSourceMember: 2, TargetMember: 4, Source: "one", Target: "target",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := rebalance.AppendReplicaMoveIntent(nil, catalog, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := rebalance.InspectReplicaMoveIntent(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := intent.Transition.SourceDescriptor.Command
+	command.ReplicaSetVersion += 2
+	command.OwnershipEpoch++
+	command.RoutingVersion++
+	command.RouteGeneration++
+	published, err := gateway.BuildGroupOwnedShardTransition(catalog, intent.Transition,
+		gateway.TransitionPhasePreRemove, gateway.ReplicatedReplicaDescriptor{}, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postCommand := command
+	postCommand.ReplicaSetVersion++
+	postPublished, err := gateway.BuildGroupOwnedShardTransition(
+		published, intent.Transition, gateway.TransitionPhasePostRemove,
+		intent.Transition.Replacement, postCommand,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []struct {
+		catalog *gateway.Snapshot
+		phase   gateway.TransitionPhase
+	}{
+		{published, gateway.TransitionPhasePreRemove},
+		{postPublished, gateway.TransitionPhasePostRemove},
+	} {
+		cut, err := resolveGatewayReplicaMoveRoute(state.catalog, intent.Request, intent.Transition, state.phase)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if slices.ContainsFunc(cut.Membership.Serving.Replicas, func(e gateway.ReplicatedEndpoint) bool { return e.Member == 1 }) {
+			t.Fatal("retiring source returned to public serving roster")
+		}
+		candidates := cut.Membership.AppendControlEndpoints(nil)
+		hasSource := slices.ContainsFunc(candidates, func(e gateway.ReplicatedEndpoint) bool { return e.Member == 1 })
+		if hasSource != (state.phase == gateway.TransitionPhasePreRemove) || len(candidates) > 4 {
+			t.Fatalf("phase=%d has source=%t candidates=%d", state.phase, hasSource, len(candidates))
+		}
+		if state.phase == gateway.TransitionPhasePreRemove && (cut.Membership.RetiringSource.NativeEndpoint != "one-native" ||
+			cut.Membership.RetiringSource.Address != "127.0.0.1:11" || cut.Membership.RetiringSource.ControlEndpoint != "one-control") {
+			t.Fatalf("durable source endpoint was not restored: %+v", cut.Membership.RetiringSource)
+		}
+	}
+	wrong := intent.Request
+	wrong.RetiringReplica.StoreID[0]++
+	if _, err := resolveGatewayReplicaMoveRoute(published, wrong, intent.Transition, gateway.TransitionPhasePreRemove); err == nil {
+		t.Fatal("unrelated source identity admitted to transition discovery")
+	}
+}
 
 func TestReplicaMoveCommandUsesAuthenticatedPostOwnershipCut(t *testing.T) {
 	_, membership, _ := gatewayMembershipFixture()
@@ -32,7 +101,7 @@ func TestReplicaMoveCommandUsesAuthenticatedPostOwnershipCut(t *testing.T) {
 		State:       replicatedstate.State{Binding: binding},
 	}
 	execution := rebalance.ReplicatedMoveExecution{PublicationApplied: 11, PublicationReplicaSet: 10, Proof: [32]byte{1}}
-	got, err := observeGatewayReplicaMoveCommand(t.Context(), gatewayTestObservationClient{observation}, cut,
+	got, err := observeGatewayReplicaMoveCommand(t.Context(), gatewayTestObservationClient{observation: observation}, cut,
 		rebalance.OperationID{1}, execution)
 	want := route.Command
 	want.ReplicaSetVersion, want.OwnershipEpoch, want.RoutingVersion, want.RouteGeneration = 10, 5, 8, 9
@@ -52,20 +121,20 @@ func TestReplicaMoveCommandUsesAuthenticatedPostOwnershipCut(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			wrong := observation
 			mutate(&wrong)
-			if _, err := observeGatewayReplicaMoveCommand(t.Context(), gatewayTestObservationClient{wrong}, cut,
+			if _, err := observeGatewayReplicaMoveCommand(t.Context(), gatewayTestObservationClient{observation: wrong}, cut,
 				rebalance.OperationID{1}, execution); err == nil {
 				t.Fatal("unrelated authority became a publication command")
 			}
 		})
 	}
-	if got := gatewayReplicaMoveObservationCandidates(membership); len(got) != gateway.ServingReplicaCount+1 {
+	if got := membership.AppendControlEndpoints(nil); len(got) != gateway.ServingReplicaCount+1 {
 		t.Fatalf("promoted enrolled leader not discoverable: %v", got)
 	}
 	membership.Serving.Replicas = append([]gateway.ReplicatedEndpoint(nil), membership.Serving.Replicas...)
 	membership.Serving.Replicas[0] = membership.EnrolledTarget
 	membership.HasEnrolledTarget = false
 	membership.EnrolledTarget = gateway.ReplicatedEndpoint{}
-	if got := gatewayReplicaMoveObservationCandidates(membership); len(got) != gateway.ServingReplicaCount {
+	if got := membership.AppendControlEndpoints(nil); len(got) != gateway.ServingReplicaCount {
 		t.Fatalf("published target duplicated in observation set: %v", got)
 	}
 }

@@ -38,7 +38,7 @@ func RequestDiscriminator() [8]byte { return requestMagic }
 
 const (
 	RequestBytes                   = 184
-	responseHeaderBytes            = 280
+	responseHeaderBytes            = 304
 	MaxSnapshotBaseEnvelopeBytes   = replicatedstate.MaxSnapshotBaseCertificateBytes + 1024
 	MaxResponseBytes               = responseHeaderBytes + replicatedstate.MaxStateEnvelopeBytes + MaxSnapshotBaseEnvelopeBytes
 	AbsoluteMaxConcurrentObservers = 256
@@ -65,15 +65,20 @@ type Request struct {
 
 // Observation is a complete local cut. Status.LeaderID/Term/LeadTransferee are
 // the transfer witness. Progress is authoritative only when ProgressFound is
-// true; State is the local durable target-state witness.
+// true; State is the local durable target-state witness. StoreID and
+// NodeIncarnation identify the exact adopted runtime that produced the cut;
+// they let a controller refresh a restart-advanced control identity before a
+// durable retirement action.
 type Observation struct {
-	Request       Request
-	Publication   raftmodel.Publication
-	Status        raftmember.RuntimeStatus
-	Progress      raftmodel.MemberProgress
-	ProgressFound bool
-	State         replicatedstate.State
-	SnapshotBase  *replicatedstate.SnapshotBaseCertificate
+	Request         Request
+	Publication     raftmodel.Publication
+	Status          raftmember.RuntimeStatus
+	StoreID         [16]byte
+	NodeIncarnation uint64
+	Progress        raftmodel.MemberProgress
+	ProgressFound   bool
+	State           replicatedstate.State
+	SnapshotBase    *replicatedstate.SnapshotBaseCertificate
 }
 
 func (observation Observation) TransferWitness(target uint64) (settled, inFlight bool) {
@@ -95,32 +100,35 @@ type HealthObserver interface {
 }
 
 type AuthorizeFunc func(rafttransport.PeerIdentity, Request) bool
+type AuthenticatedAuthorizeFunc func(rafttransport.PeerBinding, Request) bool
 
 type ServiceOptions struct {
-	Observer      Observer
-	Authorize     AuthorizeFunc
-	ReadDeadline  rafttransport.DeadlineFunc
-	WriteDeadline rafttransport.DeadlineFunc
-	MaxConcurrent int
+	Observer               Observer
+	Authorize              AuthorizeFunc
+	AuthorizeAuthenticated AuthenticatedAuthorizeFunc
+	ReadDeadline           rafttransport.DeadlineFunc
+	WriteDeadline          rafttransport.DeadlineFunc
+	MaxConcurrent          int
 }
 
 type Service struct {
-	observer      Observer
-	authorize     AuthorizeFunc
-	readDeadline  rafttransport.DeadlineFunc
-	writeDeadline rafttransport.DeadlineFunc
-	slots         chan struct{}
-	stripes       []sync.Mutex
+	observer               Observer
+	authorize              AuthorizeFunc
+	authorizeAuthenticated AuthenticatedAuthorizeFunc
+	readDeadline           rafttransport.DeadlineFunc
+	writeDeadline          rafttransport.DeadlineFunc
+	slots                  chan struct{}
+	stripes                []sync.Mutex
 }
 
 func NewService(options ServiceOptions) (*Service, error) {
-	if options.Observer == nil || options.Authorize == nil || options.ReadDeadline == nil ||
+	if options.Observer == nil || (options.Authorize == nil && options.AuthorizeAuthenticated == nil) || options.ReadDeadline == nil ||
 		options.WriteDeadline == nil || options.MaxConcurrent <= 0 ||
 		options.MaxConcurrent > AbsoluteMaxConcurrentObservers {
 		return nil, ErrControl
 	}
 	return &Service{
-		observer: options.Observer, authorize: options.Authorize,
+		observer: options.Observer, authorize: options.Authorize, authorizeAuthenticated: options.AuthorizeAuthenticated,
 		readDeadline: options.ReadDeadline, writeDeadline: options.WriteDeadline,
 		slots:   make(chan struct{}, options.MaxConcurrent),
 		stripes: make([]sync.Mutex, options.MaxConcurrent),
@@ -177,8 +185,15 @@ func (service *Service) serveRequest(ctx context.Context, connection rafttranspo
 	wantDomain := rafttransport.TrustDomain{
 		ClusterID: request.Group.ClusterID, ClusterIncarnation: request.Group.ClusterIncarnation,
 	}
-	if peer.TrustDomain != wantDomain || !service.authorize(peer, request) {
-		return ErrUnauthorized
+	authorized := false
+	binding := rafttransport.PeerBinding{Identity: peer, ServiceKeyDigest: connection.PeerKeyDigest()}
+	if service.authorizeAuthenticated != nil {
+		authorized = service.authorizeAuthenticated(binding, request)
+	} else if service.authorize != nil {
+		authorized = service.authorize(peer, request)
+	}
+	if peer.TrustDomain != wantDomain || !authorized {
+		return observationAdmissionFailure(binding, wantDomain, request, authorized)
 	}
 	select {
 	case service.slots <- struct{}{}:
@@ -221,8 +236,9 @@ func (service *Service) serveRequest(ctx context.Context, connection rafttranspo
 		return err
 	}
 	observation := Observation{Request: request, Publication: cut.Publication,
-		Status: cut.Status, Progress: cut.TargetProgress, ProgressFound: cut.ProgressFound,
-		State: cut.State, SnapshotBase: cut.SnapshotBase}
+		Status: cut.Status, StoreID: cut.Identity.StoreID,
+		NodeIncarnation: cut.Identity.NodeIncarnation, Progress: cut.TargetProgress,
+		ProgressFound: cut.ProgressFound, State: cut.State, SnapshotBase: cut.SnapshotBase}
 	if request.ExpectedReplicaSetVersion == 0 {
 		observation.Request.ExpectedReplicaSetVersion = cut.Publication.ReplicaSetVersion
 	}
@@ -243,6 +259,22 @@ func (service *Service) serveRequest(ctx context.Context, connection rafttranspo
 		return err
 	}
 	return WriteResponse(connection, observation)
+}
+
+// observationAdmissionFailure keeps a rejected control request correlated to
+// its authenticated stream and fence without exposing a key, grant, or
+// payload. The authorization decision itself remains unchanged by this
+// diagnostic wrapper.
+func observationAdmissionFailure(
+	binding rafttransport.PeerBinding,
+	wantDomain rafttransport.TrustDomain,
+	request Request,
+	authorized bool,
+) error {
+	return fmt.Errorf("%w: group=%x target_member=%d peer_node=%x domain_match=%t key_present=%t authorized=%t expected_replica_set=%d operation_set=%t step_set=%t health_only=%t",
+		ErrUnauthorized, request.Group.GroupID, request.TargetMember, binding.Identity.Node,
+		binding.Identity.TrustDomain == wantDomain, binding.ServiceKeyDigest != ([32]byte{}), authorized,
+		request.ExpectedReplicaSetVersion, request.Operation != ([32]byte{}), request.Step != ([32]byte{}), request.HealthOnly)
 }
 
 func AppendRequest(dst []byte, request Request) ([]byte, error) {
@@ -360,6 +392,8 @@ func AppendResponse(dst []byte, observation Observation) ([]byte, error) {
 	binary.BigEndian.PutUint32(b[264:268], uint32(len(state)))
 	binary.BigEndian.PutUint32(b[268:272], uint32(len(snapshotBase)))
 	binary.BigEndian.PutUint32(b[272:276], uint32(total))
+	binary.BigEndian.PutUint64(b[280:288], observation.NodeIncarnation)
+	copy(b[288:304], observation.StoreID[:])
 	copy(b[responseHeaderBytes:], state)
 	copy(b[responseHeaderBytes+len(state):], snapshotBase)
 	return dst, nil
@@ -391,6 +425,8 @@ func OpenResponse(raw []byte) (Observation, error) {
 	for index := range status {
 		*status[index] = binary.BigEndian.Uint64(raw[176+index*8 : 184+index*8])
 	}
+	observation.NodeIncarnation = binary.BigEndian.Uint64(raw[280:288])
+	copy(observation.StoreID[:], raw[288:304])
 	observation.Status.RaftState = raft.StateType(raw[232])
 	observation.ProgressFound = raw[9] == 1
 	observation.Progress.Learner = raw[233] == 1
@@ -471,6 +507,7 @@ func validObservation(observation Observation) bool {
 		observation.Publication.DataChainDigest != state.DataChainDigest ||
 		!proto.Equal(observation.Publication.ConfState, state.ConfState) ||
 		observation.Status.MemberID == 0 || observation.Status.Term == 0 ||
+		observation.StoreID == ([16]byte{}) || observation.NodeIncarnation == 0 ||
 		observation.Status.Applied != state.Applied || !stateMatchesGroup(state, observation.Request.Group) ||
 		observation.Status.RaftState > raft.StatePreCandidate {
 		return false

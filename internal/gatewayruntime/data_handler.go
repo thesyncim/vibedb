@@ -57,7 +57,7 @@ func nativeDataResponseForError(err error) nativeDataWireResponse {
 		return nativeDataError(nativeDataResponseInternal, false)
 	}
 	switch {
-	case errors.Is(err, raftservice.ErrServingFence):
+	case errors.Is(err, raftservice.ErrServingFence), errors.Is(err, gateway.ErrStaleGeneration):
 		// A definite data-route fence remains the public failure even when the
 		// trusted topology refresh also fails validation, authorization, or
 		// transport. Do not misattribute internal control-plane failures to the

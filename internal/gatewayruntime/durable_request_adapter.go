@@ -229,12 +229,19 @@ func (service *replicatedDurableRequestService) PrepareDirectBatch(ctx context.C
 	return sql.PrepareDirect(ctx, key, tenant[:], queries)
 }
 
-func (service *replicatedDurableRequestService) ExecutePreparedDirectBatch(ctx context.Context, authority serviceauthz.Authority, identity durableExecBatchIdentity, queries []gateway.Query, plan *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+func (service *replicatedDurableRequestService) ExecutePreparedDirectBatch(
+	ctx context.Context,
+	authority serviceauthz.Authority,
+	identity durableExecBatchIdentity,
+	queries []gateway.Query,
+	plan *gateway.DurableSQLDirectPlan,
+	priorUnknown bool,
+) (durableExecBatchExecuteResult, error) {
 	if service == nil || service.issuers == nil || ctx == nil || !authority.Valid() || !validDurableExecBatchIdentity(identity) {
 		return durableExecBatchExecuteResult{}, errInvalidDurableRequestAdapter
 	}
 	sql, ok := service.sql.(interface {
-		ExecutePreparedDirect(context.Context, requestledger.RequestKey, []byte, []gateway.Query, *gateway.DurableSQLDirectPlan) (gateway.DurableSQLRequestResult, error)
+		ExecutePreparedDirect(context.Context, requestledger.RequestKey, []byte, []gateway.Query, *gateway.DurableSQLDirectPlan, bool) (gateway.DurableSQLRequestResult, error)
 	})
 	if !ok {
 		return durableExecBatchExecuteResult{}, errInvalidDurableRequestAdapter
@@ -247,7 +254,7 @@ func (service *replicatedDurableRequestService) ExecutePreparedDirectBatch(ctx c
 	if err != nil {
 		return durableExecBatchExecuteResult{}, err
 	}
-	result, err := sql.ExecutePreparedDirect(ctx, key, tenant[:], queries, plan)
+	result, err := sql.ExecutePreparedDirect(ctx, key, tenant[:], queries, plan, priorUnknown)
 	if err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) {
 		return durableExecBatchExecuteResult{}, err
 	}

@@ -860,3 +860,35 @@ func FuzzVerifySnapshotArtifact(f *testing.F) {
 		_, _ = VerifySnapshotArtifact(bytes.NewReader(data), SnapshotArtifactCallbacks{})
 	})
 }
+
+func TestSnapshotArtifactHistoricalSessionFenceGrammar(t *testing.T) {
+	fence := sessionFence{routing: 1, generation: 2, start: 1, end: 4, refs: 1, origin: sha256.Sum256([]byte("origin"))}
+	key := sessionFenceKey(fence.routing, fence.generation)
+	value, err := appendSessionFence(nil, fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"valid", "checksum", "key"} {
+		t.Run(kind, func(t *testing.T) {
+			k, v := bytes.Clone(key[:]), bytes.Clone(value)
+			if kind == "checksum" {
+				v[len(v)-1] ^= 1
+			}
+			if kind == "key" {
+				k[len(k)-1]++
+			}
+			payload := make([]byte, snapshotArtifactRowHeaderBytes+len(k)+len(v))
+			binary.LittleEndian.PutUint32(payload[0:4], uint32(len(k)))
+			binary.LittleEndian.PutUint32(payload[4:8], uint32(len(v)))
+			copy(payload[snapshotArtifactRowHeaderBytes:], k)
+			copy(payload[snapshotArtifactRowHeaderBytes+len(k):], v)
+			previous := make([]byte, replication.MaxMutationKeyBytes)
+			previousBytes := 0
+			_, err := consumeSnapshotArtifactRows(snapshotArtifactChunk{Collection: SnapshotArtifactSystem, Rows: 1},
+				payload, nil, previous, &previousBytes, nil, true, nil, nil)
+			if kind == "valid" && err != nil || kind != "valid" && !errors.Is(err, ErrSnapshotArtifact) {
+				t.Fatalf("historical fence grammar: %v", err)
+			}
+		})
+	}
+}

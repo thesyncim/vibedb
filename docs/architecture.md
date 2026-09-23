@@ -140,6 +140,20 @@ identity and sequencing rules; after an uncertain response, recovery must use
 the original identity. [Distributed write domains](distributed-write-lane-proposal.md)
 records the protocol and its introduction.
 
+Coordinated terminal publication uses three ledger transitions: persist the
+prepared result and ACK capability, atomically release the co-located execution
+pin with its certificate, then publish the terminal result. The release checks
+the current gateway principal and exact lease in the same Raft apply that
+removes the active pin. A lost reply or replacement gateway recovers the
+committed certificate from the ledger under its own service identity. It needs
+no separate release session, pending pin state, or original gateway credentials.
+
+Split tail requests contain the authenticated batch and immutable child binding.
+Each receiver checks its own durable cursor and accepts only the next entry,
+its pending crash receipt, or its exact completed result. Sender restarts need
+no remembered child cursor, and the source acknowledges only after every
+prepared replica has durably recognized the batch.
+
 RF3 is a placement and membership policy above the generic Raft kernel.
 Ordinary Raft `MsgSnap` is refused; snapshots move through a separate certified,
 non-serving artifact pipeline. Replica replacement uses sequential membership

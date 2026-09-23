@@ -76,7 +76,7 @@ func (source *disappearingGrantSource) ReadMembershipGrant(
 	return membershipgrant.Grant{}, false, nil
 }
 
-func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *testing.T) {
+func TestCommittedAuthoritySeparatesEnrollmentAndUsesCurrentMembership(t *testing.T) {
 	group := testGroup(31)
 	members := []Member{
 		{Group: group, ReplicaSetVersion: 5, MemberID: 1, Node: testNode(1), Role: MemberVoter},
@@ -117,9 +117,6 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 			t.Fatal(err)
 		}
 	}
-	if view, _ := target.currentAuthority(group); view.previous == nil || view.previous.previous != nil {
-		t.Fatal("authority retained more than one adjacent generation")
-	}
 	if role, err := target.Role(group, 3); err != nil || role != MemberLearner {
 		t.Fatalf("learner role=%d err=%v", role, err)
 	}
@@ -127,8 +124,8 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 	if _, err := follower.DecodeInbound(testPeerIdentity(follower, testNode(1)), initialFrame); err != nil {
 		t.Fatalf("adjacent prior generation: %v", err)
 	}
-	if _, err := follower.DecodeInbound(testPeerIdentity(follower, testNode(3)), preLearnerIllegal); !errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrRetiredAuthority) {
-		t.Fatalf("old-generation learner-origin leader frame = %v", err)
+	if _, err := follower.DecodeInbound(testPeerIdentity(follower, testNode(3)), preLearnerIllegal); err != nil {
+		t.Fatalf("authenticated current learner replication = %v", err)
 	}
 	learnerFrame := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgAppResp, 1, 2))
 	voters := &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}
@@ -137,8 +134,8 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 			t.Fatal(err)
 		}
 	}
-	if _, err := follower.DecodeInbound(testPeerIdentity(follower, testNode(1)), initialFrame); !errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrRetiredAuthority) {
-		t.Fatalf("two-generations-old frame = %v", err)
+	if _, err := follower.DecodeInbound(testPeerIdentity(follower, testNode(1)), initialFrame); err != nil {
+		t.Fatalf("current voter frame across configuration changes = %v", err)
 	}
 	if _, err := follower.DecodeInbound(testPeerIdentity(follower, testNode(1)), learnerFrame); err != nil {
 		t.Fatalf("promotion-adjacent frame: %v", err)
@@ -146,6 +143,7 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 	preRemovalSource := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgHeartbeat, 1, 3))
 	preRemovalVote := frameTestEncode(t, leader, group, frameTestMessage(pb.MsgVote, 1, 3))
 	preRemovalRemaining := frameTestEncode(t, follower, group, frameTestMessage(pb.MsgAppResp, 2, 3))
+	preRemovalRemainingVote := frameTestEncode(t, follower, group, frameTestMessage(pb.MsgVote, 2, 3))
 	removed := &pb.ConfState{Voters: []uint64{2, 3, 4}}
 	for _, registry := range []*StaticRegistry{leader, follower, target} {
 		// Normal entries may separate configuration entries, so authority
@@ -154,18 +152,17 @@ func TestCommittedAuthoritySeparatesEnrollmentAndBoundsAdjacentGenerations(t *te
 			t.Fatal(err)
 		}
 	}
-	if view, _ := target.currentAuthority(group); view.allowPrevious || view.previous != nil ||
-		view.retiredVersion != 7 {
-		t.Fatal("source removal retained prior roles or lost exact retired version")
-	}
-	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(1)), preRemovalSource); !errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrRetiredAuthority) {
+	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(1)), preRemovalSource); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("removed-source frame = %v", err)
 	}
-	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(1)), preRemovalVote); !errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrRetiredAuthority) {
+	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(1)), preRemovalVote); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("removed-source vote = %v", err)
 	}
-	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(2)), preRemovalRemaining); !errors.Is(err, ErrUnauthorized) || !errors.Is(err, ErrRetiredAuthority) {
-		t.Fatalf("retained-member retired frame = %v", err)
+	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(2)), preRemovalRemaining); err != nil {
+		t.Fatalf("retained-member committed-prefix acknowledgement = %v", err)
+	}
+	if _, err := target.DecodeInbound(testPeerIdentity(target, testNode(2)), preRemovalRemainingVote); err != nil {
+		t.Fatalf("retained-member election reaches Raft = %v", err)
 	}
 	if _, err := target.Role(group, 1); !errors.Is(err, ErrMemberNotFound) {
 		t.Fatalf("removed source retained role: %v", err)
@@ -420,6 +417,8 @@ func TestLaggingAuthorityAcceptsOnlyExactGrantedAdjacentConfiguration(t *testing
 		t.Fatalf("exact adjacent configuration = %v", err)
 	}
 	wrong := authorizedConfigurationMessage(t, group, pb.ConfChangeAddNode, 3, 1, 3)
+	wrong.Index = frameU64(8)
+	wrong.Entries[0].Index = frameU64(9)
 	wrongFrame, _, err := sender.EncodeOutbound(nil, raftmember.OutboundMessage{
 		Group: group, From: 1, To: 3, Message: wrong})
 	if err != nil {
@@ -467,7 +466,7 @@ func TestDurablePromotionProofGrantsOnlyTargetElectionExchange(t *testing.T) {
 		t.Fatal(err)
 	}
 	header, _, err := parseFrame(frame)
-	if err != nil || header.version != 8 {
+	if err != nil || header.version != 0 {
 		t.Fatalf("election frame version=%d err=%v", header.version, err)
 	}
 	if _, err = target.DecodeInbound(testPeerIdentity(target, testNode(2)), frame); err != nil {
@@ -484,7 +483,6 @@ func TestDurablePromotionProofGrantsOnlyTargetElectionExchange(t *testing.T) {
 	}
 	for _, disallowed := range []*pb.Message{
 		frameTestMessage(pb.MsgVote, 3, 2),
-		frameTestMessage(pb.MsgVoteResp, 1, 3),
 	} {
 		from, to := disallowed.GetFrom(), disallowed.GetTo()
 		local := candidate
@@ -500,7 +498,7 @@ func TestDurablePromotionProofGrantsOnlyTargetElectionExchange(t *testing.T) {
 	}
 	heartbeat := frameTestEncode(t, candidate, group, frameTestMessage(pb.MsgHeartbeat, 2, 3))
 	heartbeatHeader, _, err := parseFrame(heartbeat)
-	if err != nil || heartbeatHeader.version != 6 {
+	if err != nil || heartbeatHeader.version != 0 {
 		t.Fatalf("ordinary learner heartbeat version=%d err=%v", heartbeatHeader.version, err)
 	}
 	if err = candidate.ClearDurablePromotion(group); err != nil {

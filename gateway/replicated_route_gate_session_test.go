@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -26,24 +27,34 @@ import (
 // This adapter bypasses Raft only: session admission, durable apply, result
 // lookup, wire grammars, and restart all use their production implementations.
 type routeSessionMachineClient struct {
-	mu           sync.Mutex
-	machine      *replicatedstate.Machine
-	batched      bool
-	state        shardservice.ReplicatedMemberState
-	hide         bool
-	first, retry []byte
+	mu              sync.Mutex
+	machine         *replicatedstate.Machine
+	batched         bool
+	state           shardservice.ReplicatedMemberState
+	hide            bool
+	first, retry    []byte
+	hideDirect      bool
+	firstDirect     []byte
+	retryDirect     []byte
+	onDirectLost    func() error
+	proposalMembers []uint64
 }
 
 func (client *routeSessionMachineClient) DoReplicated(_ context.Context, endpoint ReplicatedEndpoint, request *shardservice.ReplicatedRequest) (*shardservice.ReplicatedResponse, error) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
+	state := client.state
+	state.Fence.MemberID = endpoint.Member
+	state.Fence.StoreID = endpoint.StoreID
+	state.Fence.NodeIncarnation = endpoint.NodeIncarnation
+	if request.Operation != shardservice.ReplicatedProbe && request.Operation != shardservice.ReplicatedRouteGateRead {
+		client.proposalMembers = append(client.proposalMembers, endpoint.Member)
+	}
 	var frame bytes.Buffer
 	if err := shardservice.EncodeReplicatedRequest(&frame, request); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("encode operation=%d fence=%+v command_bytes=%d: %w", request.Operation, request.Fence, len(request.Command), err)
 	}
 	if request.Operation == shardservice.ReplicatedProbe {
-		state := client.state
-		state.Fence.MemberID, state.Fence.StoreID, state.Fence.NodeIncarnation = endpoint.Member, endpoint.StoreID, endpoint.NodeIncarnation
 		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedHandshake, HasState: true, State: state}, nil
 	}
 	if request.Operation == shardservice.ReplicatedRouteGateRead {
@@ -56,7 +67,7 @@ func (client *routeSessionMachineClient) DoReplicated(_ context.Context, endpoin
 			return nil, err
 		}
 		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedRouteGateReadResult,
-			HasState: true, State: client.state, ReadApplied: result.Fence.Applied, Value: value}, nil
+			HasState: true, State: state, ReadApplied: result.Fence.Applied, Value: value}, nil
 	}
 	if err := client.machine.AdmitCommand(request.Command); err != nil {
 		return nil, err
@@ -78,10 +89,11 @@ func (client *routeSessionMachineClient) DoReplicated(_ context.Context, endpoin
 		}
 	}
 	client.state.Applied, client.state.Commit = index, index
+	state.Applied, state.Commit = index, index
 	lookup, err := client.machine.LookupCompletion(request.Command)
 	if errors.Is(err, replicatedstate.ErrSessionReleased) {
 		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedRefusal, Refusal: shardservice.ReplicatedRefusalDeterministic,
-			HasState: true, State: client.state, RequestDigest: replicatedRequestDigest(request.Command),
+			HasState: true, State: state, RequestDigest: replicatedRequestDigest(request.Command),
 			Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionReleased, AppliedIndex: index}}, nil
 	}
 	if err != nil {
@@ -91,6 +103,21 @@ func (client *routeSessionMachineClient) DoReplicated(_ context.Context, endpoin
 	if err != nil {
 		return nil, err
 	}
+	if command.Kind() == replication.CommandTransaction {
+		if client.hideDirect {
+			client.hideDirect = false
+			client.firstDirect = bytes.Clone(lookup.Bytes)
+			if client.onDirectLost != nil {
+				if err := client.onDirectLost(); err != nil {
+					return nil, err
+				}
+			}
+			return nil, errors.New("lost committed direct mutation response")
+		}
+		if len(client.firstDirect) != 0 {
+			client.retryDirect = bytes.Clone(lookup.Bytes)
+		}
+	}
 	if command.Kind() == replication.CommandRouteGate && client.hide {
 		client.hide = false
 		client.first = bytes.Clone(lookup.Bytes)
@@ -99,13 +126,13 @@ func (client *routeSessionMachineClient) DoReplicated(_ context.Context, endpoin
 	if command.Kind() == replication.CommandRouteGate && len(client.first) != 0 {
 		client.retry = bytes.Clone(lookup.Bytes)
 	}
-	response := &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedCompletion, HasState: true, State: client.state,
+	response := &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedCompletion, HasState: true, State: state,
 		RequestDigest: replicatedRequestDigest(request.Command), Completion: lookup.Bytes,
 		Outcome: raftserve.Outcome{Code: raftserve.OutcomeCompletion, AppliedIndex: index,
 			CompletionAppliedSequence: lookup.AppliedSequence, CompletionBytes: len(lookup.Bytes)}}
 	frame.Reset()
 	if err := shardservice.EncodeReplicatedResponse(&frame, response); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("encode response kind=%d state=%+v outcome=%+v: %w", response.Kind, response.State, response.Outcome, err)
 	}
 	return response, nil
 }
@@ -126,6 +153,16 @@ func newRouteSessionMachine(t *testing.T) (ReplicatedRoute, *routeSessionMachine
 func newRouteSessionMachineWithCheckpoint(t *testing.T, checkpoint bool) (ReplicatedRoute, *routeSessionMachineClient, func()) {
 	t.Helper()
 	route, _, states := testReplicatedRouteCommand(t)
+	return newRouteSessionMachineForRoute(t, route, states["m2"], checkpoint)
+}
+
+func newRouteSessionMachineForRoute(
+	t *testing.T,
+	route ReplicatedRoute,
+	state shardservice.ReplicatedMemberState,
+	checkpoint bool,
+) (ReplicatedRoute, *routeSessionMachineClient, func()) {
+	t.Helper()
 	dir := t.TempDir()
 	open := func(name string, opaque bool) replicatedstate.CollectionTarget {
 		file, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
@@ -159,10 +196,19 @@ func newRouteSessionMachineWithCheckpoint(t *testing.T, checkpoint bool) (Replic
 	binding := replicatedstate.Binding{ClusterID: route.Group.ClusterID, ClusterIncarnation: route.Group.ClusterIncarnation,
 		TopologyRecoveryEpoch: route.Group.TopologyRecoveryEpoch, Distribution: string(route.Distribution), Shard: string(route.Shard),
 		AllocationGeneration: route.AllocationGeneration, ShardIncarnation: route.Group.ShardIncarnation, GroupID: route.Group.GroupID,
-		ActivePolicyGeneration: 1, ProtectionEpoch: 1, OwnershipEpoch: 1, SchemaGeneration: 1, RoutingVersion: 1, RouteGeneration: 1,
-		OwnedRange: distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}
+		ActivePolicyGeneration: route.Command.ActivePolicyGeneration,
+		ProtectionEpoch:        route.Command.ProtectionEpoch,
+		OwnershipEpoch:         route.Command.OwnershipEpoch,
+		SchemaGeneration:       route.Command.SchemaGeneration,
+		RoutingVersion:         route.Command.RoutingVersion,
+		RouteGeneration:        route.Command.RouteGeneration,
+		OwnedRange:             distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}}}
 	index, term := uint64(1), uint64(1)
-	bootstrap := &pb.Snapshot{Data: []byte("route-session-test"), Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}}}}
+	voters := make([]uint64, len(route.Replicas))
+	for i := range route.Replicas {
+		voters[i] = route.Replicas[i].Member
+	}
+	bootstrap := &pb.Snapshot{Data: []byte("route-session-test"), Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term, ConfState: &pb.ConfState{Voters: voters}}}
 	options := replicatedstate.Options{MaxSessions: 8, RetryWindow: 8,
 		TxnLimits: durable.TxnLimits{MaxCollections: 2, MaxDocuments: user.Limits.MaxDistinctMutations + 4, MaxBytes: 64 << 20}}
 	if checkpoint {
@@ -176,7 +222,7 @@ func newRouteSessionMachineWithCheckpoint(t *testing.T, checkpoint bool) (Replic
 		t.Cleanup(func() { _ = group.Close() })
 		options.CheckpointGroup = group
 	}
-	client := &routeSessionMachineClient{state: states["m2"], batched: checkpoint}
+	client := &routeSessionMachineClient{state: state, batched: checkpoint}
 	reopen := func() {
 		machine, err := replicatedstate.Open(binding, bootstrap, system, replicatedstate.UserCollection{Name: "docs", Target: user}, log, options)
 		if err != nil {

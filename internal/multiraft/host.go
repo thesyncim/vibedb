@@ -207,6 +207,10 @@ type commitMetricsRuntime interface {
 	CommitMetrics() raftmodel.CommitMetrics
 }
 
+type logicalEpochRuntime interface {
+	PublishedLogicalEpochs() (policy, protection, ownership, schema, routing, generation uint64, ok bool)
+}
+
 type memberRuntime interface {
 	Identity() raftmember.RuntimeIdentity
 	Failure() error
@@ -254,6 +258,10 @@ type pipelinedRuntime interface {
 
 type snapshotBaseRuntime interface {
 	SnapshotBaseCertificate() (replicatedstate.SnapshotBaseCertificate, error)
+}
+
+type configurationReplayRuntime interface {
+	ConfigurationReplay() (raftmember.CommittedConfigurationReplay, error)
 }
 
 type schemaGenerationRuntime interface {
@@ -1346,6 +1354,21 @@ func (host *Host) Publication(key raftmember.GroupKey) (raftmodel.Publication, e
 	return group.runtime.Publication()
 }
 
+// ConfigurationReplay obtains the group's durable configuration replay
+// capability while the caller owns the Host. The capability may subsequently
+// verify entries independently of the Runtime's serialized execution.
+func (host *Host) ConfigurationReplay(key raftmember.GroupKey) (raftmember.CommittedConfigurationReplay, error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return nil, err
+	}
+	source, ok := group.runtime.(configurationReplayRuntime)
+	if !ok {
+		return nil, nil
+	}
+	return source.ConfigurationReplay()
+}
+
 // DurablePromotion returns the exact bounded durable-log witness for an
 // unapplied target promotion.
 func (host *Host) DurablePromotion(
@@ -1379,6 +1402,23 @@ func (host *Host) SnapshotAuthorizationFence(
 		return replicatedstate.SnapshotFence{}, err
 	}
 	return group.runtime.SnapshotAuthorizationFence()
+}
+
+// PublishedLogicalEpochs returns the applied command epochs for one group.
+// A runtime that does not publish them reports ok false so admission keeps
+// its existing fence check.
+func (host *Host) PublishedLogicalEpochs(
+	key raftmember.GroupKey,
+) (policy, protection, ownership, schema, routing, generation uint64, ok bool) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	source, implemented := group.runtime.(logicalEpochRuntime)
+	if !implemented {
+		return 0, 0, 0, 0, 0, 0, false
+	}
+	return source.PublishedLogicalEpochs()
 }
 
 // SnapshotBaseCertificate returns the exact immutable certificate retained by

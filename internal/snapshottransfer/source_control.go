@@ -19,6 +19,9 @@ var (
 	ErrSourceMissing        = errors.New("snapshottransfer: source export operation is missing")
 	ErrSourceConflict       = errors.New("snapshottransfer: source export operation conflicts")
 	ErrSourceOutcomeUnknown = errors.New("snapshottransfer: source export outcome is unknown")
+	// ErrSourceNotCaughtUp is a transient refusal: the donor replica has not
+	// yet applied the membership named by the request.
+	ErrSourceNotCaughtUp = errors.New("snapshottransfer: source replica has not applied the requested membership")
 )
 
 // SourceControlRequestDiscriminator identifies this fixed grammar on the
@@ -96,9 +99,10 @@ type SourceControlAbandoner interface {
 	AbandonReplicaMoveSnapshot(context.Context, SourceControlRequest, ArtifactAbandonmentWitness) error
 }
 
-// SourceExportPlanProvider owns source-specific Raft ReadIndex fencing and
-// durable artifact discovery. PinSourceExport returns a newly owned immutable
-// ReadSnapshot; PinnedSourceControlExporter always closes it.
+// SourceExportPlanProvider owns source-specific Raft ReadIndex fencing,
+// immutable-cut retention, and durable artifact discovery. Release returns
+// temporary plan resources; Finalize ends the provider's pin only after
+// publication or records a terminal permanent error.
 type SourceExportPlanProvider interface {
 	ObserveSourceExport(context.Context, SourceControlRequest) (Descriptor, bool, error)
 	PinSourceExport(context.Context, SourceControlRequest) (SourceExportPlan, error)
@@ -123,7 +127,7 @@ func (exporter PinnedSourceControlExporter) ObserveReplicaMoveSnapshot(
 func (exporter PinnedSourceControlExporter) ExportReplicaMoveSnapshot(
 	ctx context.Context,
 	request SourceControlRequest,
-) (result Descriptor, resultErr error) {
+) (Descriptor, error) {
 	if exporter.Provider == nil || ctx == nil || !validSourceControlRequest(request) {
 		return Descriptor{}, ErrSourceControl
 	}
@@ -131,22 +135,52 @@ func (exporter PinnedSourceControlExporter) ExportReplicaMoveSnapshot(
 	if err != nil {
 		return Descriptor{}, err
 	}
-	if plan.Release != nil {
-		defer plan.Release()
-	}
+	defer func() {
+		if plan.Release != nil {
+			plan.Release()
+		}
+	}()
 	if plan.Snapshot == nil {
 		return Descriptor{}, ErrSourceControl
 	}
-	defer func() { resultErr = errors.Join(resultErr, plan.Snapshot.Close()) }()
 	if plan.Group != request.Group || plan.SourceMember != request.SourceMember ||
 		plan.TargetMember != request.TargetMember || plan.TargetStore != request.TargetStore ||
 		plan.TargetIncarnation != request.TargetIncarnation ||
 		plan.ExpectedFence.ReplicaSetVersion != request.ReplicaSetVersion {
-		return Descriptor{}, ErrSourceConflict
+		err = ErrSourceConflict
+		if plan.Finalize != nil {
+			err = errors.Join(err, plan.Finalize(err))
+		}
+		return Descriptor{}, err
 	}
 	descriptor, _, err := ExportPinnedSnapshot(plan)
 	if err != nil {
-		return Descriptor{}, err
+		// Cancellation or an IO error can arrive after the repository has
+		// durably published the artifact. Settle that exact descriptor before
+		// deciding whether the provider still owns a resumable cut.
+		if descriptor.Valid() {
+			_, complete, settleErr := plan.Repository.Offset(descriptor)
+			if settleErr == nil && complete {
+				if plan.Finalize != nil {
+					if completeErr := plan.Finalize(nil); completeErr != nil {
+						return descriptor, errors.Join(err, completeErr)
+					}
+				}
+				if cause := context.Cause(ctx); cause != nil {
+					return descriptor, cause
+				}
+				return descriptor, nil
+			}
+		}
+		if plan.Finalize != nil {
+			err = errors.Join(err, plan.Finalize(err))
+		}
+		return descriptor, err
+	}
+	if plan.Finalize != nil {
+		if err = plan.Finalize(nil); err != nil {
+			return Descriptor{}, err
+		}
 	}
 	if cause := context.Cause(ctx); cause != nil {
 		// The repository may already be complete. Returning the cancellation is

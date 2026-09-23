@@ -139,7 +139,7 @@ func TestRecoverReplicatedCatalogRouteSeedStartupChangedWithoutJournal(t *testin
 			},
 		},
 	)
-	if !errors.Is(err, gateway.ErrReplicatedCatalogRouteRestartRequired) || settlements != 0 {
+	if err != nil || settlements != 0 {
 		t.Fatalf("journal-free changed recovery settlements=%d err=%v", settlements, err)
 	}
 	assertPromotedCatalogRouteSeedState(t, recovered, 2)
@@ -170,7 +170,7 @@ func TestRecoverReplicatedCatalogRouteSeedStartupSettlesExactOldBinding(t *testi
 			},
 		},
 	)
-	if !errors.Is(err, gateway.ErrReplicatedCatalogRouteRestartRequired) ||
+	if err != nil ||
 		journalChecks != 1 || settlements != 1 {
 		t.Fatalf("changed recovery checks=%d settlements=%d err=%v",
 			journalChecks, settlements, err)
@@ -346,7 +346,7 @@ func catalogRouteSeedRoute(t testing.TB, snapshot *gateway.Snapshot) gateway.Rep
 }
 
 func catalogRouteSeedSnapshot(
-	t testing.TB, generation uint64, firstNativeAddress string,
+	t testing.TB, generation uint64, firstNativeAddress string, physical ...gateway.NodeRecord,
 ) *gateway.Snapshot {
 	t.Helper()
 	leaders := []distribution.EndpointID{"one", "two", "three"}
@@ -377,6 +377,14 @@ func catalogRouteSeedSnapshot(
 			NativeEndpoint:  distribution.EndpointID(string(name) + "-native"),
 			ControlEndpoint: distribution.EndpointID(string(name) + "-control"),
 		}
+	}
+	if len(physical) != 0 {
+		if len(physical) != 1 {
+			t.Fatal("expected one physical catalog source")
+		}
+		node := physical[0]
+		replicas[0].Node, replicas[0].NodeIncarnation = node.NodeID, node.Incarnation
+		endpoints["one"], endpoints["one-native"], endpoints["one-control"] = node.DataAddress, node.NativeAddress, node.ControlAddress
 	}
 	group := raftmember.GroupKey{
 		ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},

@@ -279,6 +279,7 @@ func newReplicatedCatalogGateway(
 	clientID replication.ID128,
 	retryHome replication.RetryHome,
 	lease time.Duration,
+	participants gateway.GatewayParticipantScanner,
 	injected ...gateway.ReplicatedRoundTripper,
 ) (*gateway.Executor, *gateway.CatalogHolder, *gateway.ReplicatedCatalogAuthority,
 	*gateway.ReplicatedExecutor, *gateway.AuthenticatedReplicatedClient, error) {
@@ -341,7 +342,33 @@ func newReplicatedCatalogGateway(
 		return nil, nil, nil, nil, nil, err
 	}
 	holder := gateway.NewCatalogHolder(nil)
-	newSession := func(sessionRoute gateway.ReplicatedRoute) (*gateway.NativeSession, error) {
+	currentJournalPath := journalPath
+	handoffPath := catalogSessionHandoffPath(journalPath)
+	handoff, handoffFound, handoffErr := loadCatalogSessionHandoff(handoffPath)
+	if handoffErr != nil {
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
+		}
+		return nil, nil, nil, nil, nil, handoffErr
+	}
+	if handoffFound && !catalogSessionHandoffPathsValid(handoff, journalPath) {
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
+		}
+		return nil, nil, nil, nil, nil, gateway.ErrReplicatedCatalogConflict
+	}
+	if handoffFound {
+		var resumeErr error
+		currentJournalPath, resumeErr = catalogSessionResumeJournalPath(handoff, journalPath)
+		if resumeErr != nil {
+			if replicatedPool != nil {
+				_ = replicatedPool.Close()
+			}
+			return nil, nil, nil, nil, nil, resumeErr
+		}
+	}
+	newSession := func(sessionRoute gateway.ReplicatedRoute, sessionJournalPath string,
+		bootstrapSnapshot *gateway.Snapshot) (*gateway.NativeSession, error) {
 		binding, bindingErr := gateway.NativeSessionJournalBinding(
 			sessionRoute, string(distributionName), string(shardID),
 			[]byte{replicatedCatalogControllerTenant}, relation,
@@ -352,7 +379,7 @@ func newReplicatedCatalogGateway(
 		}
 		journal, journalErr := gateway.OpenNativeSessionJournal(
 			gateway.NativeSessionJournalOptions{
-				Path: journalPath, ClientID: clientID, RetryHome: retryHome,
+				Path: sessionJournalPath, ClientID: clientID, RetryHome: retryHome,
 				MaxCommandBytes: replication.MaxCommandBytes, Binding: binding,
 			},
 		)
@@ -361,7 +388,7 @@ func newReplicatedCatalogGateway(
 		}
 		return gateway.NewNativeSession(gateway.NativeSessionOptions{
 			Executor: replicated, Route: sessionRoute,
-			CatalogBootstrap: routeSeed,
+			CatalogBootstrap: bootstrapSnapshot,
 			Distribution:     string(distributionName), Shard: string(shardID),
 			Tenant: []byte{replicatedCatalogControllerTenant}, ClientID: clientID,
 			RetryHome: retryHome, Resolver: gateway.BaseRelationResolver{Relation: relation},
@@ -370,41 +397,312 @@ func newReplicatedCatalogGateway(
 			InitialCommandBytes: 4 << 10, MaxCommandBytes: replication.MaxCommandBytes,
 		})
 	}
-	routeSeed, route, routeSeedState, err = recoverReplicatedCatalogRouteSeedStartup(
-		ctx, journalPath, routeSeed, route, routeSeedState,
-		replicatedCatalogRouteSeedStartupHooks{
-			journalPresent: gateway.NativeSessionJournalPresent,
-			settleOldSession: func(settleCtx context.Context, oldRoute gateway.ReplicatedRoute) error {
-				recoverySession, recoveryErr := newSession(oldRoute)
-				authorized, authorizeErr := serviceauthz.WithAuthority(
-					settleCtx, internalAuthority,
+	authorizedContext, err := serviceauthz.WithAuthority(ctx, internalAuthority)
+	if err != nil {
+		if replicatedPool != nil {
+			_ = replicatedPool.Close()
+		}
+		return nil, nil, nil, nil, nil, err
+	}
+	var resumedSession *gateway.NativeSession
+	resumeCatalogHandoff := func() error {
+		// A crash can occur after the route-seed rename and before the handoff
+		// record reaches Complete. Reconcile that durable active cut first; the
+		// absence of a pending file is not permission to fall back to the base
+		// journal path.
+		if handoffFound && handoff.Phase == catalogSessionHandoffComplete {
+			// Complete is also the durable pointer to the exact journal binding.
+			// Catalog generations may advance afterwards for metadata or an
+			// address-only reachability publication while retaining that binding.
+			// Requiring the old generation number here would reopen the base
+			// journal after a cleanly completed handoff and strand recovery.
+			active, activeExists := routeSeedState.Active()
+			if activeExists && active != nil && active.Generation() >= handoff.NextGeneration {
+				var activeReplicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+				activeRoute, activeOK := active.ResolveReplicatedRoute(
+					gateway.ReplicatedCatalogDistribution, gateway.ReplicatedCatalogShard,
+					activeReplicas[:0],
 				)
-				if recoveryErr != nil || authorizeErr != nil {
-					return errors.Join(recoveryErr, authorizeErr)
+				binding, bindingErr := gateway.NativeSessionJournalBinding(
+					activeRoute, string(gateway.ReplicatedCatalogDistribution),
+					string(gateway.ReplicatedCatalogShard), []byte{replicatedCatalogControllerTenant},
+					relation, serviceauthz.CapabilityTopology,
+				)
+				expectedPath := catalogSessionJournalPath(journalPath, handoff.NextGeneration)
+				if activeOK && bindingErr == nil && binding == handoff.NextBinding &&
+					handoff.CurrentJournalPath == expectedPath && handoff.NextJournalPath == expectedPath &&
+					catalogSessionHandoffPathsValid(handoff, journalPath) {
+					nextSession, openErr := newSession(activeRoute, expectedPath, active)
+					if openErr != nil {
+						return openErr
+					}
+					if openErr = settleReplicatedCatalogSessionStartup(
+						authorizedContext, nextSession, attempts, lease,
+					); openErr != nil {
+						return openErr
+					}
+					resumedSession = nextSession
+					currentJournalPath = expectedPath
+					routeSeed, route = active, activeRoute
+					return nil
 				}
-				status := recoverySession.Status()
-				if !status.Pending && !status.Active && !status.Retired && !status.Released {
+			}
+		}
+		if handoffFound && handoff.Phase >= catalogSessionHandoffNewReady {
+			active, activeExists := routeSeedState.Active()
+			if activeExists && active != nil && active.Generation() == handoff.NextGeneration {
+				var activeReplicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+				activeRoute, activeOK := active.ResolveReplicatedRoute(
+					gateway.ReplicatedCatalogDistribution, gateway.ReplicatedCatalogShard,
+					activeReplicas[:0],
+				)
+				if !activeOK {
+					return gateway.ErrReplicatedCatalogMissing
+				}
+				digest, digestErr := gateway.CatalogSnapshotDigest(active)
+				binding, bindingErr := gateway.NativeSessionJournalBinding(
+					activeRoute, string(gateway.ReplicatedCatalogDistribution),
+					string(gateway.ReplicatedCatalogShard), []byte{replicatedCatalogControllerTenant},
+					relation, serviceauthz.CapabilityTopology,
+				)
+				expectedPath := catalogSessionJournalPath(journalPath, handoff.NextGeneration)
+				if digestErr != nil || bindingErr != nil || digest != handoff.NextSnapshotDigest ||
+					binding != handoff.NextBinding || handoff.NextJournalPath != expectedPath ||
+					handoff.CurrentJournalPath != expectedPath ||
+					!catalogSessionHandoffPathsValid(handoff, journalPath) {
+					return errors.Join(digestErr, bindingErr, gateway.ErrReplicatedCatalogConflict)
+				}
+				nextSession, openErr := newSession(activeRoute, expectedPath, active)
+				if openErr != nil {
+					return openErr
+				}
+				if openErr = settleReplicatedCatalogSessionStartup(
+					authorizedContext, nextSession, attempts, lease,
+				); openErr != nil {
+					return openErr
+				}
+				resumedSession = nextSession
+				currentJournalPath = expectedPath
+				routeSeed, route = active, activeRoute
+				pendingAfterRecovery, pendingAfterRecoveryExists := routeSeedState.Pending()
+				if pendingAfterRecoveryExists {
+					// The pending file may already describe a subsequent catalog
+					// move observed after this handoff. Promote only the candidate
+					// named by this durable transition. A newer candidate is
+					// handled below as a fresh serialized rollover.
+					if pendingAfterRecovery == nil || pendingAfterRecovery.Generation() < handoff.NextGeneration {
+						return gateway.ErrReplicatedCatalogConflict
+					}
+					if pendingAfterRecovery.Generation() == handoff.NextGeneration {
+						refreshed, promoteErr := routeSeedState.PromotePendingAndReload()
+						if promoteErr != nil {
+							return promoteErr
+						}
+						routeSeedState = refreshed
+					}
+				}
+				if handoff.Phase != catalogSessionHandoffComplete {
+					handoff, openErr = catalogSessionHandoffPhaseAdvance(
+						handoff, catalogSessionHandoffComplete, expectedPath,
+					)
+					if openErr != nil {
+						return openErr
+					}
+					if openErr = storeCatalogSessionHandoff(handoffPath, handoff); openErr != nil {
+						return openErr
+					}
+				}
+				if pendingAfterRecoveryExists && pendingAfterRecovery.Generation() > handoff.NextGeneration {
+					// The active session and seed now agree on the completed
+					// predecessor. Keep that exact next journal as the old
+					// binding while the following candidate goes through its own
+					// durable handoff record.
+					handoffFound = false
+				} else {
+					return nil
+				}
+			}
+		}
+		pending, pendingExists := routeSeedState.Pending()
+		if !pendingExists {
+			if handoffFound {
+				// Every nonterminal record names a candidate that must still be
+				// present, and a complete record must agree with the active seed.
+				// Missing evidence is never permission to reopen a predecessor.
+				return gateway.ErrReplicatedCatalogConflict
+			}
+			return nil
+		}
+		var pendingReplicas [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+		pendingRoute, pendingOK := pending.ResolveReplicatedRoute(
+			gateway.ReplicatedCatalogDistribution, gateway.ReplicatedCatalogShard,
+			pendingReplicas[:0],
+		)
+		if !pendingOK {
+			return gateway.ErrReplicatedCatalogMissing
+		}
+		changed := !sameReplicatedCatalogRoute(route, pendingRoute)
+		if !changed {
+			if handoffFound && handoff.Phase != catalogSessionHandoffComplete {
+				return gateway.ErrReplicatedCatalogConflict
+			}
+			refreshed, promoteErr := routeSeedState.PromotePendingAndReload()
+			if promoteErr != nil {
+				return promoteErr
+			}
+			routeSeedState, routeSeed = refreshed, pending
+			return nil
+		}
+		active, activeExists := routeSeedState.Active()
+		if !activeExists || active == nil {
+			return gateway.ErrReplicatedCatalogConflict
+		}
+		if handoffFound && handoff.Phase == catalogSessionHandoffComplete {
+			// The complete record is the durable current-journal pointer. A
+			// subsequent catalog move starts a fresh transition record.
+			handoffFound = false
+		}
+		if !handoffFound {
+			nextPath := catalogSessionJournalPath(journalPath, pending.Generation())
+			handoff, err = catalogSessionHandoffFromRoutes(
+				route, pendingRoute, active, pending, currentJournalPath, nextPath, relation,
+				catalogSessionJournalGeneration(journalPath, currentJournalPath),
+			)
+			if err != nil {
+				return err
+			}
+			if !catalogSessionHandoffPathsValid(handoff, journalPath) {
+				return gateway.ErrReplicatedCatalogConflict
+			}
+			if err = storeCatalogSessionHandoff(handoffPath, handoff); err != nil {
+				return err
+			}
+			handoffFound = true
+		} else {
+			if handoff.OldGeneration != active.Generation() ||
+				handoff.NextGeneration != pending.Generation() {
+				return gateway.ErrReplicatedCatalogConflict
+			}
+			if evidenceErr := validateCatalogSessionHandoffEvidence(
+				handoff, route, pendingRoute, active, pending, relation,
+			); evidenceErr != nil {
+				return evidenceErr
+			}
+			expectedNextPath := catalogSessionJournalPath(journalPath, pending.Generation())
+			expectedCurrentPath := handoff.OldJournalPath
+			if handoff.Phase >= catalogSessionHandoffNewReady {
+				expectedCurrentPath = handoff.NextJournalPath
+			}
+			if !catalogSessionHandoffPathsValid(handoff, journalPath) ||
+				handoff.NextJournalPath != expectedNextPath || currentJournalPath != expectedCurrentPath {
+				return gateway.ErrReplicatedCatalogConflict
+			}
+		}
+		var nextSession *gateway.NativeSession
+		if handoff.Phase <= catalogSessionHandoffPrepared {
+			present, presentErr := gateway.NativeSessionJournalPresent(handoff.OldJournalPath)
+			if presentErr != nil {
+				return presentErr
+			}
+			if present {
+				oldSession, openErr := newSession(route, handoff.OldJournalPath, active)
+				if openErr != nil {
+					return openErr
+				}
+				status := oldSession.Status()
+				if status.Pending {
+					if settleErr := oldSession.SettleCatalogRouteHandoff(
+						authorizedContext, pendingRoute, pending,
+					); settleErr != nil {
+						return settleErr
+					}
+					// Settling the retained command leaves the predecessor
+					// journal active. Re-read the phase before deciding whether
+					// its retire/release proof can continue.
+					status = oldSession.Status()
+				}
+				if status.Active || status.Retired || status.Released {
+					var settleErr error
+					if status.Released {
+						settleErr = oldSession.RetireReleaseAndDestroy(authorizedContext)
+					} else {
+						settleErr = oldSession.RetireReleaseAndDestroyViaCatalogRoute(
+							authorizedContext, pendingRoute, pending,
+						)
+					}
+					if settleErr != nil {
+						return settleErr
+					}
+				} else {
 					return gateway.ErrReplicatedCatalogConflict
 				}
-				return recoverySession.RetireReleaseAndDestroy(authorized)
-			},
-		},
-	)
-	if err != nil {
+			}
+			handoff, err = catalogSessionHandoffPhaseAdvance(
+				handoff, catalogSessionHandoffOldSettled, handoff.OldJournalPath,
+			)
+			if err != nil {
+				return err
+			}
+			if err = storeCatalogSessionHandoff(handoffPath, handoff); err != nil {
+				return err
+			}
+		}
+		if handoff.Phase <= catalogSessionHandoffOldSettled {
+			nextSession, err = newSession(pendingRoute, handoff.NextJournalPath, pending)
+			if err != nil {
+				return err
+			}
+			if err = settleReplicatedCatalogSessionStartup(
+				authorizedContext, nextSession, attempts, lease,
+			); err != nil {
+				return err
+			}
+			handoff, err = catalogSessionHandoffPhaseAdvance(
+				handoff, catalogSessionHandoffNewReady, handoff.NextJournalPath,
+			)
+			if err != nil {
+				return err
+			}
+			if err = storeCatalogSessionHandoff(handoffPath, handoff); err != nil {
+				return err
+			}
+		}
+		if nextSession == nil {
+			nextSession, err = newSession(pendingRoute, handoff.NextJournalPath, pending)
+			if err != nil {
+				return err
+			}
+			if err = settleReplicatedCatalogSessionStartup(
+				authorizedContext, nextSession, attempts, lease,
+			); err != nil {
+				return err
+			}
+		}
+		refreshed, promoteErr := routeSeedState.PromotePendingAndReload()
+		if promoteErr != nil {
+			return promoteErr
+		}
+		routeSeedState, routeSeed, route = refreshed, pending, pendingRoute
+		resumedSession = nextSession
+		handoff, err = catalogSessionHandoffPhaseAdvance(
+			handoff, catalogSessionHandoffComplete, handoff.NextJournalPath,
+		)
+		if err != nil {
+			return err
+		}
+		return storeCatalogSessionHandoff(handoffPath, handoff)
+	}
+	if err = resumeCatalogHandoff(); err != nil {
 		if replicatedPool != nil {
 			_ = replicatedPool.Close()
 		}
 		return nil, nil, nil, nil, nil, err
 	}
 	_, routeSeedExists := routeSeedState.Active()
-	session, err := newSession(route)
-	if err != nil {
-		if replicatedPool != nil {
-			_ = replicatedPool.Close()
-		}
-		return nil, nil, nil, nil, nil, err
+	session := resumedSession
+	if session == nil {
+		session, err = newSession(route, currentJournalPath, routeSeed)
 	}
-	authorizedContext, err := serviceauthz.WithAuthority(ctx, internalAuthority)
 	if err != nil {
 		if replicatedPool != nil {
 			_ = replicatedPool.Close()
@@ -420,9 +718,109 @@ func newReplicatedCatalogGateway(
 		}
 		return nil, nil, nil, nil, nil, err
 	}
+	currentSession := session
+	rollover := func(
+		rolloverCtx context.Context, oldRoute, nextRoute gateway.ReplicatedRoute,
+		nextSnapshot *gateway.Snapshot,
+	) (gateway.ReplicatedCatalogSessionRolloverResult, error) {
+		oldSnapshot := holder.Current()
+		if oldSnapshot == nil {
+			oldSnapshot = routeSeed
+		}
+		nextPath := catalogSessionJournalPath(journalPath, nextSnapshot.Generation())
+		handoff, handoffErr := catalogSessionHandoffFromRoutes(
+			oldRoute, nextRoute, oldSnapshot, nextSnapshot,
+			currentJournalPath, nextPath, relation,
+			catalogSessionJournalGeneration(journalPath, currentJournalPath),
+		)
+		if handoffErr != nil {
+			return gateway.ReplicatedCatalogSessionRolloverResult{}, handoffErr
+		}
+		if !catalogSessionHandoffPathsValid(handoff, journalPath) {
+			return gateway.ReplicatedCatalogSessionRolloverResult{}, gateway.ErrReplicatedCatalogConflict
+		}
+		if handoffErr = storeCatalogSessionHandoff(handoffPath, handoff); handoffErr != nil {
+			return gateway.ReplicatedCatalogSessionRolloverResult{}, handoffErr
+		}
+		currentRoute, currentRouteOK := currentSession.CatalogRoute()
+		if currentSession == nil || !currentRouteOK || !sameReplicatedCatalogRoute(currentRoute, oldRoute) {
+			return gateway.ReplicatedCatalogSessionRolloverResult{}, gateway.ErrNativeSession
+		}
+		status := currentSession.Status()
+		if status.Pending {
+			if handoffErr = currentSession.SettleCatalogRouteHandoff(
+				rolloverCtx, nextRoute, nextSnapshot,
+			); handoffErr != nil {
+				return gateway.ReplicatedCatalogSessionRolloverResult{}, handoffErr
+			}
+			// RetryPending settles the exact old bytes but leaves this
+			// predecessor active until the explicit Retire and Release
+			// commands below. Refresh the phase after that settlement.
+			status = currentSession.Status()
+		}
+		if status.Active || status.Retired || status.Released {
+			if status.Released {
+				handoffErr = currentSession.RetireReleaseAndDestroy(rolloverCtx)
+			} else {
+				handoffErr = currentSession.RetireReleaseAndDestroyViaCatalogRoute(
+					rolloverCtx, nextRoute, nextSnapshot,
+				)
+			}
+			if handoffErr != nil {
+				return gateway.ReplicatedCatalogSessionRolloverResult{}, handoffErr
+			}
+		} else {
+			return gateway.ReplicatedCatalogSessionRolloverResult{}, gateway.ErrNativeSession
+		}
+		handoff, handoffErr = catalogSessionHandoffPhaseAdvance(
+			handoff, catalogSessionHandoffOldSettled, currentJournalPath,
+		)
+		if handoffErr != nil {
+			return gateway.ReplicatedCatalogSessionRolloverResult{}, handoffErr
+		}
+		if handoffErr = storeCatalogSessionHandoff(handoffPath, handoff); handoffErr != nil {
+			return gateway.ReplicatedCatalogSessionRolloverResult{}, handoffErr
+		}
+		nextSession, openErr := newSession(nextRoute, nextPath, nextSnapshot)
+		if openErr != nil {
+			return gateway.ReplicatedCatalogSessionRolloverResult{}, openErr
+		}
+		if openErr = settleReplicatedCatalogSessionStartup(
+			rolloverCtx, nextSession, attempts, lease,
+		); openErr != nil {
+			return gateway.ReplicatedCatalogSessionRolloverResult{}, openErr
+		}
+		handoff, handoffErr = catalogSessionHandoffPhaseAdvance(
+			handoff, catalogSessionHandoffNewReady, nextPath,
+		)
+		if handoffErr != nil {
+			return gateway.ReplicatedCatalogSessionRolloverResult{}, handoffErr
+		}
+		if handoffErr = storeCatalogSessionHandoff(handoffPath, handoff); handoffErr != nil {
+			return gateway.ReplicatedCatalogSessionRolloverResult{}, handoffErr
+		}
+		currentSession = nextSession
+		currentJournalPath = nextPath
+		return gateway.ReplicatedCatalogSessionRolloverResult{
+			Session: nextSession,
+			Complete: func() error {
+				complete, found, loadErr := loadCatalogSessionHandoff(handoffPath)
+				if loadErr != nil || !found || complete.Transition != handoff.Transition {
+					return errors.Join(loadErr, gateway.ErrReplicatedCatalog)
+				}
+				complete, loadErr = catalogSessionHandoffPhaseAdvance(
+					complete, catalogSessionHandoffComplete, nextPath,
+				)
+				if loadErr != nil {
+					return loadErr
+				}
+				return storeCatalogSessionHandoff(handoffPath, complete)
+			},
+		}, nil
+	}
 	authority, err := gateway.NewReplicatedCatalogAuthority(gateway.ReplicatedCatalogAuthorityOptions{
 		Executor: replicated, Route: route, Relation: relation, Holder: holder, Session: session,
-		Authority: internalAuthority,
+		Authority: internalAuthority, SessionRollover: rollover, GatewayParticipants: participants,
 	})
 	if err != nil {
 		if replicatedPool != nil {
@@ -610,10 +1008,9 @@ func recoverReplicatedCatalogRouteSeedStartup(
 	if err != nil {
 		return nil, gateway.ReplicatedRoute{}, gateway.ReplicatedCatalogRouteSeedState{}, err
 	}
-	if changed {
-		return pending, pendingRoute, refreshed,
-			gateway.ErrReplicatedCatalogRouteRestartRequired
-	}
+	// The predecessor has been durably settled before the candidate is
+	// promoted. Returning the new route lets startup continue on the live
+	// binding; a process restart is no longer the normal route-change path.
 	return pending, pendingRoute, refreshed, nil
 }
 
@@ -700,6 +1097,13 @@ func serveGatewayDurableData(
 			if ctx.Err() != nil {
 				return nil
 			}
+			if errors.Is(err, errFrontendAdmissionDrained) {
+				// Frontend drain closes admission but deliberately leaves the
+				// serving context alive. Keep existing native sessions running;
+				// the normal runtime drain will cancel this context and join them.
+				<-ctx.Done()
+				return nil
+			}
 			return err
 		}
 		wg.Add(1)
@@ -771,6 +1175,13 @@ func serveAuthenticatedGatewayDurableData(
 					return capability.Authorize(ctx, required, nil) == serviceauthz.DecisionAllow
 				})
 		})
+	if errors.Is(err, errFrontendAdmissionDrained) {
+		// servicetls waits its accepted workers before returning the sentinel.
+		// Do not cancel their context here: an admitted frontend session remains
+		// valid until it finishes or the owning Runtime.Drain is requested.
+		<-ctx.Done()
+		err = nil
+	}
 	return errors.Join(servingListener.acceptErr, nonCanceledError(err, context.Cause(ctx)))
 }
 
@@ -787,6 +1198,9 @@ type gatewayCancellationListener struct {
 
 func (listener *gatewayCancellationListener) Accept() (net.Conn, error) {
 	conn, err := listener.Listener.Accept()
+	if errors.Is(err, errFrontendAdmissionDrained) {
+		return conn, err
+	}
 	if err != nil && listener.ctx.Err() == nil {
 		listener.acceptErr = err
 		listener.cancel()
@@ -827,6 +1241,7 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 	data nativeDataReader, durable durableRequestService, logf func(string, ...any),
 	authorize func(serviceauthz.Capability) bool,
 ) {
+	ctx = serviceauthz.FrontendConnectionContextFromConn(ctx, conn)
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
@@ -844,6 +1259,18 @@ func handleConnPolicyDurable(ctx context.Context, conn net.Conn, exec *gateway.E
 			owner, _ := ctx.Value(gatewayDDLForwardContextKey{}).(*gatewayDDLForwardOwner)
 			serveGatewayDDLForward(ctx, conn, owner, line)
 			return
+		}
+		// Cluster-control envelopes use the same authenticated gateway-client
+		// listener and canonical NDJSON framing as query traffic.  Dispatch them
+		// before the SQL/native grammars so an operator request cannot be
+		// interpreted as a user operation with a coincidentally similar field.
+		if clusterControlRequestCandidate(line) {
+			if server := clusterControlServerFromContext(ctx); server != nil {
+				if err := server.ServeLine(ctx, conn, line); err != nil && ctx.Err() == nil {
+					logf("gateway: cluster control: %v", err)
+				}
+				return
+			}
 		}
 		structuredExecCandidate := durableExecBatchRequestCandidate(line)
 		backupCandidate := gatewayBackupRequestCandidate(line)

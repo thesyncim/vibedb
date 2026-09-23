@@ -21,11 +21,6 @@ var (
 	// ErrUnauthorized reports a frame whose authenticated node is not the
 	// statically registered source, or whose destination is not local.
 	ErrUnauthorized = errors.New("rafttransport: unauthorized Raft message")
-	// ErrRetiredAuthority identifies an otherwise bounded frame carrying the
-	// exact authority generation revoked by the receiver's source removal.
-	// Callers may drop and recover from this class, but must still apply current
-	// membership checks before treating the rejection as benign.
-	ErrRetiredAuthority = errors.New("rafttransport: retired replica-set authority")
 	// ErrInvalidFrame reports malformed or noncanonical frame bytes.
 	ErrInvalidFrame = errors.New("rafttransport: invalid frame")
 	// ErrUnsupportedFrame reports a well-formed frame feature this static,
@@ -36,14 +31,15 @@ var (
 )
 
 const (
-	// FrameHeaderBytes is the fixed current frame-header size. The numeric
-	// codec discriminator is a fail-closed sentinel, not a compatibility API.
-	FrameHeaderBytes = 140
+	// Ordinary Raft frames carry identity and routing, not a second membership
+	// generation protocol. Raft reconciles term, log and configuration position.
+	FrameHeaderBytes          = 100
+	AuthorityFrameHeaderBytes = FrameHeaderBytes + 40
 	// MaxFrameBytes lets an authenticated stream reader reject a declared length
 	// before allocating a frame buffer.
-	MaxFrameBytes = FrameHeaderBytes + raftmodel.MaxInboundMessageBytes
+	MaxFrameBytes = AuthorityFrameHeaderBytes + raftmodel.MaxInboundMessageBytes
 
-	frameCodecFormat   uint16 = 1
+	frameCodecFormat   uint16 = 2
 	frameKindOrdinary  byte   = 1
 	frameKindAuthority byte   = 2
 )
@@ -130,45 +126,18 @@ func (registry *StaticRegistry) preflightOutbound(
 	if !ok {
 		return outboundFramePlan{}, fmt.Errorf("%w: missing committed authority", ErrUnauthorized)
 	}
-	roster, ok := registry.rosterDigest(outbound.Group)
-	if !ok {
-		return outboundFramePlan{}, fmt.Errorf("%w: missing group roster", ErrUnauthorized)
-	}
 	if outbound.Authority != nil {
+		roster, ok := registry.rosterDigest(outbound.Group)
+		if !ok {
+			return outboundFramePlan{}, fmt.Errorf("%w: missing group roster", ErrUnauthorized)
+		}
 		return registry.preflightAuthorityOutbound(outbound, view, destination, roster)
 	}
 	size, err := raftmember.MeasureOrdinaryMessage(outbound.Message)
 	if err != nil {
 		return outboundFramePlan{}, classifyOrdinaryError(err)
 	}
-	version := view.version
-	// A peer can still use the previous membership after an additive change:
-	// either its configuration append or the commit notification may have
-	// been lost during reconnect. A heartbeat tagged with the new generation
-	// is then rejected before Raft can answer and trigger append retry. Use
-	// the retained, already-authorized view where both roles permit heartbeats.
-	// This never grants voting rights, and removal disables the prior view.
-	if outbound.Message.GetType() == pb.MsgHeartbeat && view.allowPrevious &&
-		view.previous != nil &&
-		(view.previous.roles[outbound.To] == MemberVoter || view.previous.roles[outbound.To] == MemberLearner) &&
-		view.previous.roles[outbound.From] == MemberVoter {
-		view = view.previous
-		version = view.version
-	}
-	// A surviving voter may have the removal entry but not its commit.
-	// Send only its heartbeat under the exact retired version; validate both
-	// endpoints below against the CURRENT roster, so the removed source can
-	// neither send nor receive this catch-up traffic.
-	if outbound.Message.GetType() == pb.MsgHeartbeat && view.retiredVersion != 0 &&
-		view.roles[outbound.From] == MemberVoter && view.roles[outbound.To] == MemberVoter {
-		version = view.retiredVersion
-	}
-	if election, electionOK := certifiedPromotionElectionAuthority(view, outbound.Message,
-		view.promotionVersion()); electionOK {
-		view = election
-		version = election.version
-	}
-	if err := registry.validateAuthorizedMessage(outbound.Group, view, outbound.Message); err != nil {
+	if err := validateAuthorizedMessage(view, outbound.Message, true); err != nil {
 		if retiredOutboundDestination(view, outbound.Message) {
 			return outboundFramePlan{}, fmt.Errorf("%w: %w", err, errRetiredOutboundDestination)
 		}
@@ -183,8 +152,6 @@ func (registry *StaticRegistry) preflightOutbound(
 	return outboundFramePlan{
 		kind:        frameKindOrdinary,
 		destination: destination,
-		roster:      roster,
-		version:     version,
 		payloadSize: size,
 		frameSize:   FrameHeaderBytes + size,
 	}, nil
@@ -226,7 +193,7 @@ func (registry *StaticRegistry) preflightAuthorityOutbound(
 	return outboundFramePlan{
 		kind: frameKindAuthority, destination: destination, roster: roster,
 		version: view.version, payloadSize: raftauthority.CanonicalMessageBytes,
-		frameSize: FrameHeaderBytes + raftauthority.CanonicalMessageBytes,
+		frameSize: AuthorityFrameHeaderBytes + raftauthority.CanonicalMessageBytes,
 	}, nil
 }
 
@@ -252,7 +219,11 @@ func (registry *StaticRegistry) appendOutbound(
 	outbound raftmember.OutboundMessage,
 	plan outboundFramePlan,
 ) ([]byte, error) {
-	if plan.frameSize < FrameHeaderBytes || plan.payloadSize != plan.frameSize-FrameHeaderBytes ||
+	headerBytes := FrameHeaderBytes
+	if plan.kind == frameKindAuthority {
+		headerBytes = AuthorityFrameHeaderBytes
+	}
+	if plan.frameSize < headerBytes || plan.payloadSize != plan.frameSize-headerBytes ||
 		len(dst) > math.MaxInt-plan.frameSize {
 		return dst, ErrFrameTooLarge
 	}
@@ -269,7 +240,9 @@ func (registry *StaticRegistry) appendOutbound(
 	// header-only reuse of dst's old backing array from overwriting message
 	// slices before MarshalAppend relocates the payload.
 	dst = slices.Grow(dst, plan.frameSize)
-	dst = append(dst, make([]byte, FrameHeaderBytes)...)
+	// Every header byte is written below. Reslicing the already reserved
+	// capacity avoids a variable-sized temporary allocation under race builds.
+	dst = dst[:start+headerBytes]
 	var err error
 	if plan.kind == frameKindAuthority {
 		dst, err = raftauthority.AppendCanonical(dst, *outbound.Authority)
@@ -285,17 +258,19 @@ func (registry *StaticRegistry) appendOutbound(
 	if len(dst) != start+plan.frameSize {
 		return dst[:start], fmt.Errorf("%w: payload size changed during encode", ErrInvalidFrame)
 	}
-	header := dst[start : start+FrameHeaderBytes]
+	header := dst[start : start+headerBytes]
 	copy(header[0:4], frameMagic[:])
 	binary.BigEndian.PutUint16(header[4:6], frameCodecFormat)
 	header[6] = plan.kind
 	header[7] = 0
 	appendGroupKey(header[8:80], outbound.Group)
-	copy(header[80:112], plan.roster[:])
-	binary.BigEndian.PutUint64(header[112:120], plan.version)
-	binary.BigEndian.PutUint64(header[120:128], outbound.From)
-	binary.BigEndian.PutUint64(header[128:136], outbound.To)
-	binary.BigEndian.PutUint32(header[136:140], uint32(plan.payloadSize))
+	binary.BigEndian.PutUint64(header[80:88], outbound.From)
+	binary.BigEndian.PutUint64(header[88:96], outbound.To)
+	binary.BigEndian.PutUint32(header[96:100], uint32(plan.payloadSize))
+	if plan.kind == frameKindAuthority {
+		copy(header[100:132], plan.roster[:])
+		binary.BigEndian.PutUint64(header[132:140], plan.version)
+	}
 	return dst, nil
 }
 
@@ -323,11 +298,11 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 	if err != nil || destination != registry.LocalNode() {
 		return Inbound{}, fmt.Errorf("%w: target member is not local", ErrUnauthorized)
 	}
-	roster, ok := registry.rosterDigest(header.group)
-	if !ok || roster != header.roster {
-		return Inbound{}, fmt.Errorf("%w: stable enrollment digest differs", ErrUnauthorized)
-	}
 	if header.kind == frameKindAuthority {
+		roster, ok := registry.rosterDigest(header.group)
+		if !ok || header.roster != roster {
+			return Inbound{}, fmt.Errorf("%w: read-authority enrollment digest differs", ErrUnauthorized)
+		}
 		return registry.decodeAuthorityInbound(header, payload)
 	}
 	if err := preflightOrdinaryPayload(payload); err != nil {
@@ -344,34 +319,26 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 	if _, err := raftmember.MeasureOrdinaryMessage(message); err != nil {
 		return Inbound{}, classifyOrdinaryError(err)
 	}
-	current, currentOK := registry.currentAuthority(header.group)
-	view, ok := registry.authorityAt(header.group, header.version)
+	view, ok := registry.currentAuthority(header.group)
 	if !ok {
-		if currentOK {
-			view, ok = certifiedPromotionElectionAuthority(current, message, header.version)
-		}
+		return Inbound{}, fmt.Errorf("%w: missing committed membership", ErrUnauthorized)
 	}
-	// Removal catch-up heartbeats and their responses can carry the exact
-	// retired version before or after both survivors apply removal. This
-	// admits no old-view append or voting traffic and never restores a
-	// removed member's authority.
-	if !ok && currentOK && current.retiredVersion != 0 && header.version == current.retiredVersion &&
-		(message.GetType() == pb.MsgHeartbeat || message.GetType() == pb.MsgHeartbeatResp) && current.roles[header.from] == MemberVoter && current.roles[header.to] == MemberVoter {
-		view, ok = current, true
+	// An append whose preceding index is already below our applied membership
+	// cut cannot append anything: Raft answers with its committed index. Strip
+	// the entire suffix before handing it to Raft, including any untrusted
+	// configuration bytes. This also permits a compacted follower to answer a
+	// reconnect probe without retaining an unbounded history of old grants.
+	// Current authenticated membership is still checked. No historical sender
+	// role is restored, and none of the discarded entries can reach Raft.
+	discardCommittedPrefix := view.replay != nil && message.GetType() == pb.MsgApp && message.GetIndex() < view.version
+	entries := message.Entries
+	if discardCommittedPrefix {
+		message.Entries = nil
 	}
-	if !ok {
-		view, ok = registry.prospectiveAuthority(header.group, header.version, message)
-	}
-	if !ok {
-		if currentOK && current.retiredVersion != 0 &&
-			current.retiredVersion == header.version &&
-			registry.validateAuthorizedMessage(header.group, current, message) == nil {
-			return Inbound{}, fmt.Errorf("%w: %w", ErrUnauthorized, ErrRetiredAuthority)
-		}
-		return Inbound{}, fmt.Errorf("%w: replica-set generation is outside bounded authority", ErrUnauthorized)
-	}
-	if err := registry.validateAuthorizedMessage(header.group, view, message); err != nil {
-		return Inbound{}, err
+	authorityErr := validateAuthorizedMessage(view, message, false)
+	message.Entries = entries
+	if authorityErr != nil {
+		return Inbound{}, authorityErr
 	}
 	scratch := registry.canonical.get(len(payload))
 	canonical, err := (proto.MarshalOptions{Deterministic: true}).MarshalAppend(
@@ -386,6 +353,9 @@ func (registry *StaticRegistry) DecodeInbound(authenticated PeerIdentity, frame 
 	registry.canonical.put(scratch)
 	if !equal {
 		return Inbound{}, fmt.Errorf("%w: noncanonical protobuf payload", ErrInvalidFrame)
+	}
+	if discardCommittedPrefix {
+		message.Entries = nil
 	}
 	return Inbound{Group: header.group, From: header.from, Message: message}, nil
 }
@@ -426,85 +396,6 @@ func (registry *StaticRegistry) decodeAuthorityInbound(
 	return Inbound{Group: header.group, From: header.from, Authority: &message}, nil
 }
 
-func (view *authorityView) promotionVersion() uint64 {
-	if view == nil || view.promotion == nil {
-		return 0
-	}
-	return view.promotion.Version
-}
-
-func certifiedPromotionElectionAuthority(
-	current *authorityView,
-	message *pb.Message,
-	version uint64,
-) (*authorityView, bool) {
-	if current == nil || current.promotion == nil || message == nil ||
-		version != current.promotion.Version ||
-		current.promotion.TargetMember != current.grant.TargetMember ||
-		current.roles[current.promotion.TargetMember] != MemberLearner {
-		return nil, false
-	}
-	target := current.promotion.TargetMember
-	from, to := message.GetFrom(), message.GetTo()
-	switch message.GetType() {
-	case pb.MsgVote, pb.MsgPreVote:
-		if to != target || current.roles[from] != MemberVoter {
-			return nil, false
-		}
-	case pb.MsgVoteResp, pb.MsgPreVoteResp:
-		if from != target || current.roles[to] != MemberVoter {
-			return nil, false
-		}
-	default:
-		return nil, false
-	}
-	roles := make(map[uint64]MemberRole, len(current.roles))
-	for member, role := range current.roles {
-		roles[member] = role
-	}
-	roles[target] = MemberVoter
-	return &authorityView{version: version, roles: roles, grant: current.grant}, true
-}
-
-func (registry *StaticRegistry) prospectiveAuthority(
-	group raftmember.GroupKey,
-	version uint64,
-	message *pb.Message,
-) (*authorityView, bool) {
-	current, ok := registry.currentAuthority(group)
-	if !ok || version <= current.version || message == nil {
-		return nil, false
-	}
-	for _, entry := range message.GetEntries() {
-		if entry == nil || entry.GetIndex() != version ||
-			(entry.GetType() != pb.EntryConfChange && entry.GetType() != pb.EntryConfChangeV2) {
-			continue
-		}
-		change, member, digest, err := openSingleConfChange(entry)
-		if err != nil || !authorizedConfChange(current, change, member, digest) {
-			return nil, false
-		}
-		roles := make(map[uint64]MemberRole, len(current.roles)+1)
-		for id, role := range current.roles {
-			roles[id] = role
-		}
-		switch change {
-		case pb.ConfChangeAddLearnerNode:
-			roles[member] = MemberLearner
-		case pb.ConfChangeAddNode:
-			roles[member] = MemberVoter
-		case pb.ConfChangeRemoveNode:
-			delete(roles, member)
-		default:
-			return nil, false
-		}
-		previous := &authorityView{version: current.version, roles: current.roles, grant: current.grant}
-		return &authorityView{version: version, roles: roles, grant: current.grant,
-			previous: previous}, true
-	}
-	return nil, false
-}
-
 func parseFrame(frame []byte) (frameHeader, []byte, error) {
 	if len(frame) < FrameHeaderBytes {
 		return frameHeader{}, nil, fmt.Errorf("%w: truncated header", ErrInvalidFrame)
@@ -520,25 +411,35 @@ func parseFrame(frame []byte) (frameHeader, []byte, error) {
 	header := frameHeader{
 		kind:        frame[6],
 		group:       openGroupKey(frame[8:80]),
-		version:     binary.BigEndian.Uint64(frame[112:120]),
-		from:        binary.BigEndian.Uint64(frame[120:128]),
-		to:          binary.BigEndian.Uint64(frame[128:136]),
-		payloadSize: binary.BigEndian.Uint32(frame[136:140]),
+		from:        binary.BigEndian.Uint64(frame[80:88]),
+		to:          binary.BigEndian.Uint64(frame[88:96]),
+		payloadSize: binary.BigEndian.Uint32(frame[96:100]),
 	}
-	copy(header.roster[:], frame[80:112])
+	headerBytes := FrameHeaderBytes
+	if header.kind == frameKindAuthority {
+		headerBytes = AuthorityFrameHeaderBytes
+		if len(frame) < headerBytes {
+			return frameHeader{}, nil, fmt.Errorf("%w: truncated authority header", ErrInvalidFrame)
+		}
+		copy(header.roster[:], frame[100:132])
+		header.version = binary.BigEndian.Uint64(frame[132:140])
+		if header.version == 0 || header.roster == ([32]byte{}) {
+			return frameHeader{}, nil, fmt.Errorf("%w: missing authority fence", ErrInvalidFrame)
+		}
+	}
 	if err := validateFrameGroup(header.group); err != nil {
 		return frameHeader{}, nil, err
 	}
-	if header.version == 0 || header.from == 0 || header.to == 0 || header.from == header.to {
+	if header.from == 0 || header.to == 0 || header.from == header.to {
 		return frameHeader{}, nil, fmt.Errorf("%w: invalid member IDs", ErrInvalidFrame)
 	}
 	if uint64(header.payloadSize) > uint64(raftmodel.MaxInboundMessageBytes) {
 		return frameHeader{}, nil, ErrFrameTooLarge
 	}
-	if len(frame)-FrameHeaderBytes != int(header.payloadSize) {
+	if len(frame)-headerBytes != int(header.payloadSize) {
 		return frameHeader{}, nil, fmt.Errorf("%w: payload length mismatch", ErrInvalidFrame)
 	}
-	return header, frame[FrameHeaderBytes:], nil
+	return header, frame[headerBytes:], nil
 }
 
 func appendGroupKey(dst []byte, group raftmember.GroupKey) {
@@ -609,45 +510,49 @@ func byteSlicesOverlap(left, right []byte) bool {
 	return leftStart-rightStart < uintptr(len(right))
 }
 
-func (registry *StaticRegistry) validateAuthorizedMessage(
-	group raftmember.GroupKey,
+func validateAuthorizedMessage(
 	view *authorityView,
 	message *pb.Message,
+	outbound bool,
 ) error {
 	if view == nil {
 		return fmt.Errorf("%w: missing dynamic authority", ErrUnauthorized)
 	}
 	fromRole := view.roles[message.GetFrom()]
 	toRole := view.roles[message.GetTo()]
-	configuration, err := validateAuthorizedConfiguration(view, message.GetEntries())
+	_, err := validateAuthorizedConfiguration(view, message.GetEntries())
 	if err != nil {
 		return err
 	}
-	// During learner addition, stable enrollment permits only the exact target
-	// to receive the matching configuration append and answer replication. It
-	// grants no vote or leader role before committed publication.
-	if toRole == MemberEnrolled && configuration && message.GetTo() == view.grant.TargetMember {
-		toRole = MemberLearner
-	}
-	if fromRole == MemberEnrolled && message.GetFrom() == view.grant.TargetMember &&
-		(message.GetType() == pb.MsgAppResp || message.GetType() == pb.MsgHeartbeatResp) {
-		fromRole = MemberLearner
+	switch message.GetType() {
+	case pb.MsgApp, pb.MsgHeartbeat, pb.MsgAppResp, pb.MsgHeartbeatResp:
+		fromRole = replicationRole(view, message.GetFrom())
+		toRole = replicationRole(view, message.GetTo())
 	}
 	if fromRole == MemberEnrolled || toRole == MemberEnrolled {
 		return fmt.Errorf("%w: member lacks committed role", ErrUnauthorized)
 	}
 	switch message.GetType() {
 	case pb.MsgApp, pb.MsgHeartbeat:
-		if fromRole != MemberVoter {
+		// Raft members are authenticated, non-Byzantine participants. A
+		// receiver may still know a newly elected leader as a learner because
+		// it missed promotion. Admit replication to Raft so term/log checks
+		// can reconcile that state; do not publish a voter or serving role.
+		// The local producer still requires its own committed voter role.
+		if outbound && view.roles[message.GetFrom()] != MemberVoter ||
+			fromRole != MemberVoter && fromRole != MemberLearner {
 			return fmt.Errorf("%w: learner cannot originate leader message", ErrUnauthorized)
 		}
 	case pb.MsgAppResp, pb.MsgHeartbeatResp:
-		if toRole != MemberVoter {
-			return fmt.Errorf("%w: response target is not a voter", ErrUnauthorized)
+		if toRole != MemberVoter && toRole != MemberLearner {
+			return fmt.Errorf("%w: response target is not a member", ErrUnauthorized)
 		}
 	case pb.MsgVote, pb.MsgVoteResp, pb.MsgPreVote, pb.MsgPreVoteResp:
-		if fromRole != MemberVoter || toRole != MemberVoter {
+		if !votingMember(view, message.GetFrom()) || !votingMember(view, message.GetTo()) {
 			return fmt.Errorf("%w: vote traffic requires voters", ErrUnauthorized)
+		}
+		if outbound && (message.GetType() == pb.MsgVote || message.GetType() == pb.MsgPreVote) && fromRole != MemberVoter {
+			return fmt.Errorf("%w: local learner cannot campaign", ErrUnauthorized)
 		}
 	case pb.MsgTimeoutNow:
 		if fromRole != MemberVoter || toRole != MemberVoter {
@@ -659,30 +564,86 @@ func (registry *StaticRegistry) validateAuthorizedMessage(
 	return nil
 }
 
+// Membership grants are the sole enrollment authority for replication. A
+// disconnected follower can miss addition and promotion before that exact
+// target becomes leader. Merely adding an endpoint or retaining an old grant
+// does not authorize it: the grant must still name this exact initial cut.
+func replicationRole(view *authorityView, member uint64) MemberRole {
+	if role := view.roles[member]; role != MemberEnrolled {
+		return role
+	}
+	if member == view.grant.TargetMember && view.grant.Valid() &&
+		view.version == view.grant.InitialReplicaSetVersion &&
+		exactInitialGrantCut(view.roles, view.grant) {
+		return MemberLearner
+	}
+	return MemberEnrolled
+}
+
+func votingMember(view *authorityView, member uint64) bool {
+	if view.roles[member] == MemberVoter {
+		return true
+	}
+	return view.roles[member] == MemberLearner && view.promotion != nil &&
+		view.promotion.TargetMember == member && view.grant.TargetMember == member &&
+		view.promotion.AuthorizationDigest == view.grant.Digest() &&
+		view.promotion.Version > view.version
+}
+
+// Configuration authorization is local to one append. It validates an exact
+// installed grant's ordered transitions without retaining projected membership
+// or authorizing any sender role. Historical entries require durable replay or
+// the same grant's already applied result.
 func validateAuthorizedConfiguration(view *authorityView, entries []*pb.Entry) (bool, error) {
 	found := false
-	for index := range entries {
-		entry := entries[index]
+	stage := grantConfigurationStage(view)
+	future := 0
+	for _, entry := range entries {
 		if entry.GetType() == pb.EntryNormal {
 			continue
 		}
-		if found || (entry.GetType() != pb.EntryConfChange && entry.GetType() != pb.EntryConfChangeV2) {
-			return false, fmt.Errorf("%w: unsupported configuration batch", ErrUnauthorized)
-		}
 		change, member, digest, err := openSingleConfChange(entry)
-		authorized := err == nil && authorizedConfChange(view, change, member, digest)
-		if !authorized && view.previous != nil {
-			authorized = err == nil && authorizedConfChange(view.previous, change, member, digest)
+		if err != nil {
+			return false, fmt.Errorf("%w: malformed configuration", ErrUnauthorized)
 		}
-		if !authorized && err == nil && entry.GetIndex() != 0 && entry.GetIndex() <= view.version {
-			authorized = authorizedCommittedConfReplay(view, change, member, digest)
+		if entry.GetIndex() != 0 && entry.GetIndex() <= view.version {
+			if view.replay != nil && view.replay.MatchesCommittedConfiguration(entry, view.version) ||
+				authorizedCommittedConfReplay(view, change, member, digest) {
+				found = true
+				continue
+			}
+			return false, fmt.Errorf("%w: unproven historical configuration", ErrUnauthorized)
 		}
-		if !authorized {
-			return false, fmt.Errorf("%w: configuration differs from metadata grant", ErrUnauthorized)
+		if !view.grant.Valid() || view.grant.Digest() != digest || future == 3 {
+			return false, fmt.Errorf("%w: configuration differs from installed grant", ErrUnauthorized)
 		}
+		valid := stage == 0 && change == pb.ConfChangeAddLearnerNode && member == view.grant.TargetMember ||
+			stage == 1 && change == pb.ConfChangeAddNode && member == view.grant.TargetMember ||
+			stage == 2 && change == pb.ConfChangeRemoveNode && member == view.grant.SourceMember
+		if !valid {
+			return false, fmt.Errorf("%w: configuration is outside ordered grant", ErrUnauthorized)
+		}
+		stage++
+		future++
 		found = true
 	}
 	return found, nil
+}
+
+func grantConfigurationStage(view *authorityView) int {
+	switch view.roles[view.grant.TargetMember] {
+	case MemberEnrolled:
+		return 0
+	case MemberLearner:
+		return 1
+	case MemberVoter:
+		if view.roles[view.grant.SourceMember] == MemberVoter {
+			return 2
+		}
+		return 3
+	default:
+		return -1
+	}
 }
 
 // A restarted/snapshot-installed member has its committed roles but not the
@@ -746,27 +707,4 @@ func openSingleConfChange(
 	}
 	copy(digest[:], change.GetContext())
 	return change.GetChanges()[0].GetType(), change.GetChanges()[0].GetNodeId(), digest, nil
-}
-
-func authorizedConfChange(
-	view *authorityView,
-	change pb.ConfChangeType,
-	member uint64,
-	digest [raftmember.MembershipTransitionDigestBytes]byte,
-) bool {
-	grant := view.grant
-	if grant == (membershipgrant.Grant{}) || grant.Digest() != digest {
-		return false
-	}
-	targetRole := view.roles[grant.TargetMember]
-	switch {
-	case targetRole == MemberEnrolled:
-		return change == pb.ConfChangeAddLearnerNode && member == grant.TargetMember
-	case targetRole == MemberLearner:
-		return change == pb.ConfChangeAddNode && member == grant.TargetMember
-	case targetRole == MemberVoter:
-		return change == pb.ConfChangeRemoveNode && member == grant.SourceMember
-	default:
-		return false
-	}
 }

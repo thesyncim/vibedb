@@ -87,8 +87,6 @@ func (m *Machine) LookupCompletionInto(
 // cut held by the machine publication lock. The zero value is ready for use.
 // It is single-consumer and must not be copied.
 type CompletionLookupWorkspace struct {
-	cut           durable.DatabaseSnapshot
-	catalog       [1]durable.NamedCollection
 	snapshot      pointSnapshot
 	owner         *Machine
 	scratch       commandPlanScratch
@@ -112,8 +110,8 @@ const maxCompletionLookupDecodeBytes = max(
 
 // BeginCompletionLookupBatch holds the machine publication lock until
 // EndCompletionLookupBatch. Exclusive machine ownership of collection mutations
-// makes direct transaction/ledger point reads an exact applied cut without
-// checkpointing. Native session lookups lazily acquire a retained scan snapshot.
+// makes all live point reads and ephemeral session scans an exact applied cut
+// without checkpointing. No collection view escapes the lock.
 func (m *Machine) BeginCompletionLookupBatch(
 	workspace *CompletionLookupWorkspace,
 	expected raftmodel.Publication,
@@ -230,8 +228,6 @@ func (m *Machine) EndCompletionLookupBatch(
 	if workspace == nil || workspace.owner != m {
 		return ErrCompletionWorkspaceBusy
 	}
-	err := workspace.cut.Close()
-	clear(workspace.catalog[:])
 	workspace.owner = nil
 	workspace.snapshot = pointSnapshot{}
 	workspace.scratch.sessionRead = workspace.sessionRead[:0]
@@ -239,7 +235,7 @@ func (m *Machine) EndCompletionLookupBatch(
 	workspace.scratch.slotRead = workspace.slotRead[:0]
 	workspace.scratch.decodeRead = workspace.decodeRead[:0]
 	m.mu.Unlock()
-	return err
+	return nil
 }
 
 // Release clears inactive reusable scratch retained by workspace.
@@ -250,10 +246,6 @@ func (workspace *CompletionLookupWorkspace) Release() error {
 	if workspace.owner != nil {
 		return ErrCompletionWorkspaceBusy
 	}
-	if err := workspace.cut.Release(); err != nil {
-		return err
-	}
-	clear(workspace.catalog[:])
 	workspace.snapshot = pointSnapshot{}
 	workspace.scratch = commandPlanScratch{}
 	clear(workspace.sessionRead[:])
@@ -324,22 +316,6 @@ func (m *Machine) lookupCompletionAtSnapshot(
 			command, completionScratch, workspace,
 		)
 	}
-	// Native session completion validation can scan historical slot prefixes.
-	// Those readers need a retained snapshot, unlike the exact point lookups
-	// used by transaction/ledger completions above. Capture it lazily under the
-	// same publication lock, preserving the batch's applied cut.
-	if workspace.snapshot.value == nil {
-		workspace.catalog[0] = durable.NamedCollection{Name: systemCollectionName, Collection: m.system.Collection}
-		if err := durable.SnapshotCollectionsInto(&workspace.cut, workspace.catalog[:]); err != nil {
-			return CompletionLookup{}, m.fail(err)
-		}
-		cut, ok := workspace.cut.Collection(systemCollectionName)
-		if !ok || cut == nil {
-			return CompletionLookup{}, m.fail(ErrInconsistentSnapshot)
-		}
-		workspace.snapshot = pointSnapshot{value: cut}
-	}
-	snapshot = workspace.snapshot
 	scratch := &workspace.scratch
 	authorityDigest := sessionAuthorityIdentityKey(command.AuthorityClass, command.Tenant, command.ClientID)
 	authorityKey := AuthorityBindingStorageKey(authorityDigest)

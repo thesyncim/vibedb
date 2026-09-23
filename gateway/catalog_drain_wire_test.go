@@ -21,6 +21,7 @@ type catalogDrainWirePeer struct {
 }
 
 func (peer *catalogDrainWirePeer) PeerIdentity() rafttransport.PeerIdentity { return peer.identity }
+func (*catalogDrainWirePeer) PeerKeyDigest() [32]byte                       { return [32]byte{} }
 func (*catalogDrainWirePeer) TrafficClass() rafttransport.TrafficClass {
 	return rafttransport.TrafficGatewayControl
 }

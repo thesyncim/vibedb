@@ -68,7 +68,8 @@ func TestServeAuthenticatedAllowlistAndRotationEndToEnd(t *testing.T) {
 	request := &ReplicatedRequest{Operation: ReplicatedProbe,
 		Authority:  serviceauthz.Authority{Node: client, Generation: 1},
 		Capability: serviceauthz.CapabilityMembership,
-		Fence:      ReplicatedFence{Group: fence.Group, AllocationGeneration: fence.AllocationGeneration}}
+		Fence: ReplicatedFence{Group: fence.Group, AllocationGeneration: fence.AllocationGeneration,
+			Command: fence.Command}}
 	first, err := dial(firstProfile)
 	if err != nil {
 		t.Fatal(err)

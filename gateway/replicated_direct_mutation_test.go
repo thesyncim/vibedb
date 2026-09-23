@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -9,11 +10,248 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
+
+func TestReplicatedDirectMutationRecoversLostReplyAcrossOwnershipAndPeerChange(t *testing.T) {
+	route, client, _ := newRouteSessionMachine(t)
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := serviceauthz.WithAuthority(
+		t.Context(), serviceauthz.Authority{Node: [16]byte{7}, Generation: 1},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenant := []byte("lost-direct-reply")
+	key := requestledger.RequestKey{
+		Scope:        requestledger.ScopeAuthenticated,
+		TenantDigest: requestledger.Digest(sha256.Sum256(tenant)),
+		Principal:    requestledger.PrincipalID{0x51}, Request: requestledger.RequestID{0x61},
+		IssuerEpoch: 7, IssuerSequence: 9, IssuerLane: requestledger.IssuerLane{0x71},
+	}
+	request := ReplicatedDirectMutation{
+		Key: key, RequestDigest: replication.Digest{0x81}, Tenant: tenant,
+		Target: ReplicatedTransactionTarget{
+			Route: route, BucketBits: 8,
+			IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}},
+			Batches: []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{
+				Kind: replication.MutationPutAbsent, Key: []byte("lost-reply-row"),
+				Value: []byte(`{"id":"lost-reply-row","n":1}`),
+			}}}},
+		},
+	}
+	client.hideDirect = true
+	first, err := executor.DirectMutate(ctx, request)
+	if !errors.Is(err, raftservice.ErrOutcomeUnknown) || first.ID != (distributedtxn.ID{}) ||
+		client.state.Applied != 2 || len(client.firstDirect) == 0 {
+		t.Fatalf("lost response first=%+v applied=%d err=%v", first, client.state.Applied, err)
+	}
+
+	request.Target.Route = advanceRouteSessionOwnership(t, client, route)
+	if request.Target.Route.Group != route.Group || request.Target.Route.AllocationGeneration != route.AllocationGeneration ||
+		request.Target.Route.Command.OwnershipEpoch != route.Command.OwnershipEpoch+1 ||
+		request.Target.Route.Replicas[2].Member == route.Replicas[2].Member ||
+		!directMutationRouteAdvanceAllowed(route, request.Target.Route) {
+		t.Fatalf("test did not advance the same allocation to new peers: old=%+v new=%+v", route, request.Target.Route)
+	}
+
+	retried, err := executor.DirectMutate(ctx, request)
+	if err != nil || !retried.Duplicate || !retried.Committed || retried.AffectedRows != 1 ||
+		retried.Applied != 2 || client.state.Applied != 5 || len(client.retryDirect) == 0 {
+		t.Fatalf("exact replay=%+v applied=%d first=%x retry=%x err=%v",
+			retried, client.state.Applied, client.firstDirect, client.retryDirect, err)
+	}
+	stored, err := client.machine.PointReadInto(
+		1, []byte("lost-reply-row"), client.state.Applied, replication.MaxMutationValueBytes, nil,
+	)
+	if err != nil || !stored.Found || !bytes.Equal(stored.Value, []byte(`{"id":"lost-reply-row","n":1}`)) {
+		t.Fatalf("replayed row=%q found=%v err=%v", stored.Value, stored.Found, err)
+	}
+}
+
+func TestReplicatedDirectMutationDiscoversStillServingRetiringSource(t *testing.T) {
+	route, client, _ := newRouteSessionMachine(t)
+	source := route.Replicas[0]
+	publication, err := client.machine.ApplyConfiguration(raftmodel.ApplyMeta{
+		Index: 2, Term: client.state.Fence.Term, Type: pb.EntryConfChangeV2,
+	}, &pb.ConfState{Voters: []uint64{1, 2, 3, 4}})
+	if err != nil {
+		t.Fatalf("install four-voter overlap configuration: %v", err)
+	}
+	client.state.Applied, client.state.Commit = publication.Applied, publication.Applied
+	route.Command.ReplicaSetVersion = publication.ReplicaSetVersion
+	client.state.Fence.Command = route.Command
+
+	target := ReplicatedEndpoint{
+		Member: 4, Node: [16]byte{4}, StoreID: [16]byte{44}, NodeIncarnation: 14,
+		Endpoint: "d4", DataAddress: "d4", NativeEndpoint: "n4", Address: "m4",
+		ControlEndpoint: "c4", ControlAddress: "c4",
+	}
+	route.Replicas = []ReplicatedEndpoint{target, route.Replicas[1], route.Replicas[2]}
+	route.discoveryReplica, route.hasDiscoveryReplica = source, true
+	client.state.LeaderID = source.Member
+	if !validReplicatedRoute(route) {
+		t.Fatalf("constructed source-discovery route is invalid: %+v source=%+v", route, source)
+	}
+
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := serviceauthz.WithAuthority(
+		t.Context(), serviceauthz.Authority{Node: [16]byte{7}, Generation: 1},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	documentKey := []byte("retiring-source-row")
+	document := []byte(`{"id":"retiring-source-row","n":1}`)
+	request := ReplicatedDirectMutation{
+		Key: requestledger.RequestKey{
+			Scope: requestledger.ScopeAuthenticated, TenantDigest: requestledger.Digest(sha256.Sum256([]byte("transition"))),
+			Principal: requestledger.PrincipalID{0x81}, Request: requestledger.RequestID{0x82},
+			IssuerEpoch: 1, IssuerSequence: 1, IssuerLane: requestledger.IssuerLane{0x83},
+		},
+		RequestDigest: replication.Digest{0x84}, Tenant: []byte("transition"),
+		Target: ReplicatedTransactionTarget{
+			Route: route, BucketBits: 8,
+			IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}},
+			Batches: []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{
+				Kind: replication.MutationPutAbsentOrEqual, Key: documentKey, Value: document,
+			}}}},
+		},
+	}
+	result, err := executor.DirectMutate(ctx, request)
+	if err != nil || !result.Committed || result.AffectedRows != 1 || result.Applied != 3 {
+		t.Fatalf("direct write through source leader result=%+v err=%v", result, err)
+	}
+	if len(client.proposalMembers) == 0 || client.proposalMembers[len(client.proposalMembers)-1] != source.Member {
+		t.Fatalf("data proposal did not reach the still-serving source %d: proposals=%v", source.Member, client.proposalMembers)
+	}
+	stored, err := client.machine.PointReadInto(1, documentKey, result.Applied, replication.MaxMutationValueBytes, nil)
+	if err != nil || !stored.Found || !bytes.Equal(stored.Value, document) {
+		t.Fatalf("source-led write value=%q found=%v err=%v", stored.Value, stored.Found, err)
+	}
+
+	removed, err := client.machine.ApplyConfiguration(raftmodel.ApplyMeta{
+		Index: client.state.Applied + 1, Term: client.state.Fence.Term, Type: pb.EntryConfChangeV2,
+	}, &pb.ConfState{Voters: []uint64{2, 3, 4}})
+	if err != nil {
+		t.Fatalf("remove source voter: %v", err)
+	}
+	client.state.Applied, client.state.Commit = removed.Applied, removed.Applied
+	route.Command.ReplicaSetVersion = removed.ReplicaSetVersion
+	client.state.Fence.Command = route.Command
+	client.state.LeaderID = source.Member // a removed member cannot remain authoritative.
+	route.hasDiscoveryReplica = false
+	route.discoveryReplica = ReplicatedEndpoint{}
+	proposalsBeforeRemovalRetry := len(client.proposalMembers)
+	request.Key.Request[0]++
+	request.Key.IssuerSequence++
+	request.RequestDigest[0]++
+	request.Target.Route = route
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if _, err = executor.DirectMutate(ctx, request); !errors.Is(err, ErrReplicatedLeader) {
+		t.Fatalf("G+2 route accepted a removed source leader: %v", err)
+	}
+	for _, member := range client.proposalMembers[proposalsBeforeRemovalRetry:] {
+		if member == source.Member {
+			t.Fatalf("post-remove mutation reached retired source member %d: %v", source.Member, client.proposalMembers)
+		}
+	}
+}
+
+func advanceRouteSessionOwnership(t *testing.T, client *routeSessionMachineClient, route ReplicatedRoute) ReplicatedRoute {
+	return advanceRouteSessionOwnershipMode(t, client, route, true)
+}
+
+func advanceRouteSessionOwnershipSameRoster(t *testing.T, client *routeSessionMachineClient, route ReplicatedRoute) ReplicatedRoute {
+	return advanceRouteSessionOwnershipMode(t, client, route, false)
+}
+
+func advanceRouteSessionOwnershipMode(t *testing.T, client *routeSessionMachineClient, route ReplicatedRoute, replacePeer bool) ReplicatedRoute {
+	t.Helper()
+	snapshot, err := client.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := snapshot.Fence()
+	if err = snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	expectedReplicaSetVersion := initial.ReplicaSetVersion
+	transitionIndex := client.state.Applied + 1
+	if replacePeer {
+		publication, applyErr := client.machine.ApplyConfiguration(raftmodel.ApplyMeta{
+			Index: transitionIndex, Term: client.state.Fence.Term, Type: pb.EntryConfChangeV2,
+		}, &pb.ConfState{Voters: []uint64{1, 2, 4}})
+		if applyErr != nil {
+			t.Fatalf("replace physical member: %v", applyErr)
+		}
+		expectedReplicaSetVersion = publication.ReplicaSetVersion
+		transitionIndex++
+	}
+	transition := replicatedstate.OwnershipTransition{
+		From: initial.Binding, ExpectedReplicaSetVersion: expectedReplicaSetVersion,
+		SourceMember: 1, TargetMember: 2,
+		ToOwnershipEpoch:  initial.Binding.OwnershipEpoch + 1,
+		ToRoutingVersion:  initial.Binding.RoutingVersion + 1,
+		ToRouteGeneration: initial.Binding.RouteGeneration + 1,
+		ToOwnedRange:      initial.Binding.OwnedRange,
+	}
+	command, err := replicatedstate.AppendOwnershipTransition(nil, transition)
+	if err != nil {
+		t.Fatalf("encode ownership transition: %v", err)
+	}
+	if err = client.machine.AdmitCommand(command); err != nil {
+		t.Fatalf("admit ownership transition: %v", err)
+	}
+	publication, err := client.machine.ApplyNormal(raftmodel.ApplyMeta{
+		Index: transitionIndex, Term: client.state.Fence.Term, Type: pb.EntryNormal,
+	}, command)
+	if err != nil {
+		t.Fatalf("apply ownership transition: %v", err)
+	}
+	currentSnapshot, err := client.machine.Snapshot("docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := currentSnapshot.Fence()
+	if err = currentSnapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	route.Command = raftservice.CommandFence{
+		ReplicaSetVersion:      current.ReplicaSetVersion,
+		ActivePolicyGeneration: current.Binding.ActivePolicyGeneration,
+		ProtectionEpoch:        current.Binding.ProtectionEpoch,
+		OwnershipEpoch:         current.Binding.OwnershipEpoch,
+		SchemaGeneration:       current.Binding.SchemaGeneration,
+		RelationManifestDigest: current.RelationManifestDigest,
+		RoutingVersion:         current.Binding.RoutingVersion,
+		RouteGeneration:        current.Binding.RouteGeneration,
+	}
+	if replacePeer {
+		replacement := ReplicatedEndpoint{
+			Member: 4, Node: [16]byte{4}, StoreID: [16]byte{44}, NodeIncarnation: 14,
+			Endpoint: "m4", DataAddress: "d4", NativeEndpoint: "n4", Address: "m4",
+			ControlEndpoint: "c4", ControlAddress: "c4",
+		}
+		route.Replicas = append(route.Replicas[:2:2], replacement)
+	}
+	client.state.Applied, client.state.Commit = publication.Applied, publication.Applied
+	client.state.Fence.Command = route.Command
+	return route
+}
 
 func TestReplicatedDirectMutationIsOneProposalWithCrossGatewayExactRetry(t *testing.T) {
 	route, client, _ := newRouteSessionMachine(t)
@@ -111,6 +349,86 @@ func TestReplicatedDirectMutationIsOneProposalWithCrossGatewayExactRetry(t *test
 	if !errors.Is(err, ErrReplicatedTransactionConflict) || stale.Committed ||
 		stale.ResultCode != replicatedstate.ResultTransactionConflict || client.state.Applied != 6 {
 		t.Fatalf("stale direct=%+v applied=%d err=%v", stale, client.state.Applied, err)
+	}
+}
+
+func TestReplicatedDirectMutationPropagatesRetainedIntentBusy(t *testing.T) {
+	route, client, _ := newRouteSessionMachine(t)
+	tenant := []byte("intent-busy")
+	rowKey := []byte("staged-row")
+	rowValue := []byte(`{"id":"staged-row","n":1}`)
+	batches := []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{
+		Kind: replication.MutationPutAbsentOrEqual, Key: rowKey, Value: rowValue,
+	}}}}
+	mutationDigest, err := replication.TransactionMutationDigest(batches)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageID := distributedtxn.ID{0x91}
+	stage, err := (&replicatedTransactionCommandEncoder{tenant: tenant}).appendExact(
+		nil, replication.RetryHome{1}, route, distributedtxn.ReplicatedCommand{
+			Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedStageTarget,
+			ID: stageID, PayloadKind: distributedtxn.ReplicatedPayloadTargetStage,
+			ControllerEpoch: 7, ExecutionPinDigest: distributedtxn.Digest{0x19},
+			Target: distributedtxn.TransactionTargetStage{
+				CoordinatorGroup:            distributedtxn.ID(route.Group.GroupID),
+				CoordinatorShardIncarnation: distributedtxn.ID(route.Group.ShardIncarnation),
+				CoordinatorAllocation:       route.AllocationGeneration,
+				BucketBits:                  8,
+				IntentScopes:                []distributedtxn.IntentScope{{Start: 0, End: 256}},
+				MutationDigest:              mutationDigest,
+			},
+		}, batches,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.machine.AdmitCommand(stage); err != nil {
+		t.Fatal(err)
+	}
+	stageIndex := client.state.Applied + 1
+	publication, err := client.machine.ApplyNormal(raftmodel.ApplyMeta{
+		Index: stageIndex, Term: client.state.Fence.Term, Type: pb.EntryNormal,
+	}, stage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.state.Applied, client.state.Commit = publication.Applied, publication.Applied
+
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := serviceauthz.WithAuthority(
+		t.Context(), serviceauthz.Authority{Node: [16]byte{7}, Generation: 1},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := requestledger.RequestKey{
+		Scope:        requestledger.ScopeAuthenticated,
+		TenantDigest: requestledger.Digest(sha256.Sum256(tenant)),
+		Principal:    requestledger.PrincipalID{0xa1}, Request: requestledger.RequestID{0xa2},
+		IssuerEpoch: 7, IssuerSequence: 1, IssuerLane: requestledger.IssuerLane{0xa3},
+	}
+	request := ReplicatedDirectMutation{
+		Key: key, RequestDigest: replication.Digest{0xa4}, Tenant: tenant,
+		Target: ReplicatedTransactionTarget{
+			Route: route, BucketBits: 8,
+			IntentScopes: []distributedtxn.IntentScope{{Start: 0, End: 256}},
+			Batches:      batches,
+		},
+	}
+	first, err := executor.DirectMutate(ctx, request)
+	if !errors.Is(err, ErrReplicatedTransactionConflict) || first.Committed ||
+		first.ResultCode != replicatedstate.ResultIntentBusy || first.ID == (distributedtxn.ID{}) {
+		t.Fatalf("intent-busy direct result=%+v err=%v", first, err)
+	}
+	retry, err := executor.DirectMutate(ctx, request)
+	if !errors.Is(err, ErrReplicatedTransactionConflict) || retry.Committed || !retry.Duplicate ||
+		retry.ResultCode != replicatedstate.ResultIntentBusy || retry.ID != first.ID ||
+		retry.Applied != first.Applied {
+		t.Fatalf("retained intent-busy retry=%+v first=%+v err=%v", retry, first, err)
 	}
 }
 

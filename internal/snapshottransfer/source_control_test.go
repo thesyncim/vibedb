@@ -200,7 +200,10 @@ func TestSourceControlReleaseRequiresCompleteAndRecoversAcrossJournalReopen(t *t
 	}
 }
 
-type testSourcePlanProvider struct{ plan SourceExportPlan }
+type testSourcePlanProvider struct {
+	plan      SourceExportPlan
+	finalized []error
+}
 
 func (provider *testSourcePlanProvider) ObserveSourceExport(
 	context.Context, SourceControlRequest,
@@ -219,7 +222,16 @@ func (provider *testSourcePlanProvider) ReleaseSourceExport(
 func (provider *testSourcePlanProvider) PinSourceExport(
 	context.Context, SourceControlRequest,
 ) (SourceExportPlan, error) {
-	return provider.plan, nil
+	// The provider owns the pinned cut; the exporter only reports the outcome.
+	plan := provider.plan
+	plan.Finalize = func(cause error) error {
+		provider.finalized = append(provider.finalized, cause)
+		if cause == nil {
+			return plan.Snapshot.Close()
+		}
+		return nil
+	}
+	return plan, nil
 }
 
 func TestPinnedSourceControlExporterUsesCertifiedArtifactPath(t *testing.T) {
@@ -231,10 +243,14 @@ func TestPinnedSourceControlExporterUsesCertifiedArtifactPath(t *testing.T) {
 		ReplicaSetVersion: plan.ExpectedFence.ReplicaSetVersion,
 		SourceNode:        rafttransport.NodeID{8},
 	}
-	exporter := PinnedSourceControlExporter{Provider: &testSourcePlanProvider{plan: plan}}
+	provider := &testSourcePlanProvider{plan: plan}
+	exporter := PinnedSourceControlExporter{Provider: provider}
 	descriptor, err := exporter.ExportReplicaMoveSnapshot(context.Background(), request)
 	if err != nil || !descriptorMatchesSourceRequest(descriptor, request) {
 		t.Fatalf("descriptor=%+v err=%v", descriptor, err)
+	}
+	if len(provider.finalized) != 1 || provider.finalized[0] != nil {
+		t.Fatalf("finalize calls=%v, want one successful publication", provider.finalized)
 	}
 	if stats := plan.Repository.Stats(); stats.Published != 1 || stats.Staged != 0 {
 		t.Fatalf("repository stats=%+v", stats)

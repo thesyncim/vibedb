@@ -49,6 +49,9 @@ func (executor *ReplicatedExecutor) ReadTransactionRecovery(
 		)
 		if err != nil {
 			joined = errors.Join(joined, err)
+			if terminalReplicatedDiscoveryError(err) {
+				return ReplicatedTransactionRecoveryResult{}, joined
+			}
 			preferred = 0
 			continue
 		}
