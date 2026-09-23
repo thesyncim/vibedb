@@ -48,6 +48,39 @@ func scanStringRec(text string, spell *[]byte, emit func(hash uint64, pos uint32
 	s.flush()
 }
 
+// scanBytes streams (hash, 0-based position) pairs for a caller-owned
+// buffer, folding on the fly exactly like scanString. It allocates
+// nothing and retains nothing: the byte-first ingest lane (AddBytes) so
+// buffer owners reuse memory instead of converting to string per call.
+func scanBytes(buf []byte, emit func(hash uint64, pos uint32)) {
+	scanBytesRec(buf, nil, func(h uint64, p uint32, _ []byte) { emit(h, p) })
+}
+
+// scanBytesRec is scanBytes with optional spelling capture: the byte twin
+// of scanStringRec, sharing the fold rule (foldByte/wordClass on ASCII,
+// runeBytes past them). Spellings alias the caller's spell staging exactly
+// like the string lane.
+func scanBytesRec(buf []byte, spell *[]byte, emit func(hash uint64, pos uint32, spelling []byte)) {
+	var s scanner
+	s.emit = emit
+	s.spell = spell
+	for i := 0; i < len(buf); {
+		c := buf[i]
+		if c < utf8.RuneSelf {
+			b := foldByte(c)
+			if wordClass[b] {
+				s.take(b)
+			} else {
+				s.flush()
+			}
+			i++
+			continue
+		}
+		i += s.runeBytes(buf[i:])
+	}
+	s.flush()
+}
+
 // scanFolded streams tokens from buf, whose ASCII bytes are already folded
 // (see foldASCII). Multibyte sequences pass the fold through, so the rune
 // path decodes them identically to scanString.
@@ -121,6 +154,48 @@ func init() {
 			scanTab[c] = b
 		}
 	}
+}
+
+// scanPairsBytes is scanPairs over a caller-owned buffer: same fused
+// scanTab machine, same token stream, no string conversion. The transient
+// byte lanes (MatchSingleBytes and company) build on it.
+func scanPairsBytes(buf []byte, out []tokPos) []tokPos {
+	s := pairScanner{out: out, h: fnvOffset}
+	i, n := 0, len(buf)
+	for i < n {
+		c := buf[i]
+		if c >= utf8.RuneSelf {
+			r, size := utf8.DecodeRune(buf[i:])
+			s.feed(r, size)
+			i += size
+			continue
+		}
+		if b := scanTab[c]; b == 0 {
+			s.flush()
+			i++
+			continue
+		}
+		if !s.inWord {
+			s.h = fnvOffset
+			s.inWord = true
+		}
+		h := s.h
+		for i < n {
+			c := buf[i]
+			if c >= utf8.RuneSelf {
+				break
+			}
+			b := scanTab[c]
+			if b == 0 {
+				break
+			}
+			h = mix(h, b)
+			i++
+		}
+		s.h = h
+	}
+	s.flush()
+	return s.out
 }
 
 func scanPairs(text string, out []tokPos) []tokPos {

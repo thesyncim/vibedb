@@ -377,6 +377,105 @@ func scanPairsUntil(text string, out []tokPos, q Query, needed []uint64, found [
 	return s.out, found, false, false
 }
 
+// scanPairsUntilBytes is scanPairsUntil over a caller-owned buffer: the
+// same fused machine and early-exit hooks, DecodeRune past multibyte
+// sequences, byte indexing elsewhere. Agreement with the string lane is
+// proved by TestScanPairsUntilAgrees; the two must stay structurally
+// identical for the same reason the score mirrors must.
+func scanPairsUntilBytes(buf []byte, out []tokPos, q Query, needed []uint64, found []tokPos) ([]tokPos, []tokPos, bool, bool) {
+	s := pairScanner{out: out, h: fnvOffset}
+	i, n, base := 0, len(buf), len(out)
+	for i < n {
+		if len(s.out) > base {
+			base = len(s.out)
+			h := s.out[base-1].hash
+			member := len(needed) == 1 && needed[0] == h
+			if !member {
+				for _, t := range needed {
+					if t == h {
+						member = true
+						break
+					}
+				}
+			}
+			if member {
+				dup := false
+				for _, tp := range found {
+					if tp.hash == h {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					found = append(found, tokPos{hash: h})
+					if d, v := decideUnsorted(q, found, false); d {
+						return s.out, found, true, v
+					}
+				}
+			}
+		}
+		c := buf[i]
+		if c >= utf8.RuneSelf {
+			r, size := utf8.DecodeRune(buf[i:])
+			s.feed(r, size)
+			i += size
+			continue
+		}
+		if b := scanTab[c]; b == 0 {
+			s.flush()
+			i++
+			continue
+		}
+		if !s.inWord {
+			s.h = fnvOffset
+			s.inWord = true
+		}
+		h := s.h
+		for i < n {
+			c := buf[i]
+			if c >= utf8.RuneSelf {
+				break
+			}
+			b := scanTab[c]
+			if b == 0 {
+				break
+			}
+			h = mix(h, b)
+			i++
+		}
+		s.h = h
+	}
+	s.flush()
+	if len(s.out) > base {
+		h := s.out[len(s.out)-1].hash
+		member := len(needed) == 1 && needed[0] == h
+		if !member {
+			for _, t := range needed {
+				if t == h {
+					member = true
+					break
+				}
+			}
+		}
+		if member {
+			dup := false
+			for _, tp := range found {
+				if tp.hash == h {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				found = append(found, tokPos{hash: h})
+				if d, v := decideUnsorted(q, found, false); d {
+					return s.out, found, true, v
+				}
+			}
+		}
+	}
+	return s.out, found, false, false
+}
+
 // matchStopScan answers term-boolean structure while scanning, stopping
 // once the distinct terms found decide the verdict: recheck candidates
 // are index-positive, so their terms are present and the exit fires on
@@ -400,6 +499,59 @@ func matchStopScan(text string, q Query, scratch *TextScratch) bool {
 		return verdict
 	}
 	return matchUnsorted(found, q)
+}
+
+// matchStopScanBytes is matchStopScan over a caller-owned buffer.
+func matchStopScanBytes(buf []byte, q Query, scratch *TextScratch) bool {
+	var neededBuf [stopCap]uint64
+	needed, ok := collectTerms(&q, neededBuf[:0])
+	if !ok || len(needed) == 0 {
+		pairs := scanPairsBytes(buf, scratch.pairs[:0])
+		scratch.pairs = pairs
+		return matchUnsorted(pairs, q)
+	}
+	var foundBuf [stopCap]tokPos
+	out, found, stopped, verdict := scanPairsUntilBytes(buf, scratch.pairs[:0], q, needed, foundBuf[:0])
+	scratch.pairs = out
+	if stopped {
+		return verdict
+	}
+	return matchUnsorted(found, q)
+}
+
+// MatchSingleBytes is MatchSingle over a caller-owned buffer: same lanes,
+// same verdicts, no string conversion. The query executor holds row text
+// as arena-backed views (byteview), so this is the lane it drives;
+// MatchSingle stays for string owners.
+func MatchSingleBytes(buf []byte, q Query, scratch *TextScratch) bool {
+	if !needsPositions(q) {
+		switch q.Op {
+		case OpTerm, OpOr, OpAtLeast, OpAll:
+			if q.Op == OpAll {
+				scratch.pairs = scratch.pairs[:0]
+				return true
+			}
+			return matchStopScanBytes(buf, q, scratch)
+		}
+		pairs := scanPairsBytes(buf, scratch.pairs[:0])
+		scratch.pairs = pairs
+		return matchUnsorted(pairs, q)
+	}
+	pairs := scanPairsBytes(buf, scratch.pairs[:0])
+	sortTokPos(pairs)
+	scratch.pairs = pairs
+	length := uint32(0)
+	for _, tp := range pairs {
+		if tp.pos+1 > length {
+			length = tp.pos + 1
+		}
+	}
+	view := docView{pairs: pairs, length: length, scratch: scratch}
+	scratch.arena = scratch.arena[:0]
+	spans := scratch.spans[:0]
+	spans = view.evalInto(q, spans)
+	scratch.spans = spans[:0]
+	return len(spans) > 0
 }
 
 func MatchSingle(text string, q Query, scratch *TextScratch) bool {

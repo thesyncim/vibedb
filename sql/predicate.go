@@ -260,33 +260,33 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 	}
 	if !scoreHead {
 		switch kind, head, state := p.tryAggregate(); state {
-	case aggCall:
-		if ctx != ctxHaving {
-			if p.inCaseTruth() {
-				return nil, newFeatureNotSupportedError(
-					p.lx.src, leafPos,
-					"aggregate predicates inside searched CASE require a combined grouped CASE stage",
-				)
+		case aggCall:
+			if ctx != ctxHaving {
+				if p.inCaseTruth() {
+					return nil, newFeatureNotSupportedError(
+						p.lx.src, leafPos,
+						"aggregate predicates inside searched CASE require a combined grouped CASE stage",
+					)
+				}
+				return nil, p.errfHere("an aggregate is not allowed in %s: rows are filtered before they are reduced; use HAVING", ctx)
 			}
-			return nil, p.errfHere("an aggregate is not allowed in %s: rows are filtered before they are reduced; use HAVING", ctx)
-		}
-		arg, err := p.parseAggregateArgs(kind)
-		if err != nil {
-			return nil, err
-		}
-		agg, path = kind, arg
-	case aggHeadOnly:
-		p2, err := p.continuePath(head, false)
-		if err != nil {
-			return nil, err
-		}
-		path = p2
-	default:
-		p2, err := p.parsePath(false)
-		if err != nil {
-			return nil, err
-		}
-		path = p2
+			arg, err := p.parseAggregateArgs(kind)
+			if err != nil {
+				return nil, err
+			}
+			agg, path = kind, arg
+		case aggHeadOnly:
+			p2, err := p.continuePath(head, false)
+			if err != nil {
+				return nil, err
+			}
+			path = p2
+		default:
+			p2, err := p.parsePath(false)
+			if err != nil {
+				return nil, err
+			}
+			path = p2
 		}
 	}
 	if scalarContinues(p.tok) {

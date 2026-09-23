@@ -164,6 +164,30 @@ func ScoreSingle(text string, q Query, st *ScoreStats, scratch *TextScratch) flo
 	return score
 }
 
+// ScoreSingleBytes is ScoreSingle over a caller-owned buffer: same lanes,
+// bit-identical scores, no string conversion. SQL SCORE() drives this lane;
+// ScoreSingle stays for string owners.
+func ScoreSingleBytes(buf []byte, q Query, st *ScoreStats, scratch *TextScratch) float64 {
+	if st == nil {
+		return 0
+	}
+	pairs := scanPairsBytes(buf, scratch.pairs[:0])
+	if !needsPositions(q) {
+		view := docView{pairs: pairs, length: uint32(len(pairs)), scratch: scratch}
+		cur := scoreCursor{st: st}
+		score, _ := view.scoreSingleUnsorted(q, &cur)
+		scratch.pairs = pairs[:0]
+		return score
+	}
+	sortTokPos(pairs)
+	view := docView{pairs: pairs, length: uint32(len(pairs)), scratch: scratch}
+	scratch.arena = scratch.arena[:0]
+	cur := scoreCursor{st: st}
+	score, _ := view.scoreSingleInto(q, &cur)
+	scratch.pairs = pairs[:0]
+	return score
+}
+
 // scoreSingleUnsorted mirrors scoreSingleInto over unsorted pairs for
 // queries that never observe positions: term frequencies are linear
 // counts, and the tree walk consumes pinned idfs in the same preorder,

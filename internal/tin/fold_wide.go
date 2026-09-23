@@ -37,3 +37,23 @@ func foldASCIIWide(dst []byte, src string) {
 		dst[i] = foldByte(src[i])
 	}
 }
+
+// foldASCIIWideBytes is foldASCIIWide over a caller-owned buffer: same
+// 16-byte windows, same tail. The window borrows the slice body the same
+// way the string lane borrows the string body.
+func foldASCIIWideBytes(dst, src []byte) {
+	if len(src) == 0 {
+		return
+	}
+	base := unsafe.Pointer(unsafe.SliceData(src))
+	i := 0
+	for ; i+16 <= len(src); i += 16 {
+		v := archsimd.LoadUint8x16(unsafe.Slice((*byte)(unsafe.Add(base, uintptr(i))), 16))
+		upper := v.GreaterEqual(foldWideA).And(v.LessEqual(foldWideZ))
+		folded := v.Add(foldWideDelta.Masked(upper))
+		folded.Store(dst[i : i+16])
+	}
+	for ; i < len(src); i++ {
+		dst[i] = foldByte(src[i])
+	}
+}

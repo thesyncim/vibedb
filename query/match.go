@@ -6,6 +6,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/tin"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // tinSegmentGateDocs is the snapshot size at which the heap ==> path fans
@@ -74,7 +75,9 @@ func evalMatch(s *evalScratch, p *compiledPredicate, cols [][]scalar, row int) b
 	if cell.kind != kindString {
 		return false
 	}
-	return tin.MatchSingle(cell.sval, s.matchQueries[p.slot], &s.matchScratch[p.slot])
+	// The cell holds an arena-backed view; the byte lane scans it without
+	// converting back to an owned string.
+	return tin.MatchSingleBytes(byteview.Bytes(cell.sval), s.matchQueries[p.slot], &s.matchScratch[p.slot])
 }
 
 // bindMatches points s at queries for one execution and gives it one match

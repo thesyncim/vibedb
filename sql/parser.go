@@ -969,8 +969,8 @@ func (p *Parser) tryAggregate() (AggKind, token, aggState) {
 
 const (
 	scoreNothing  scoreState = iota // not a SCORE token; caller falls through
-	scoreHeadOnly                    // SCORE without '(' is a path head, like count
-	scoreCall                        // SCORE() full-text relevance call
+	scoreHeadOnly                   // SCORE without '(' is a path head, like count
+	scoreCall                       // SCORE() full-text relevance call
 )
 
 type scoreState uint8

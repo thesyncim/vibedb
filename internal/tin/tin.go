@@ -290,6 +290,49 @@ func (ix *Index) Add(id DocID, text string) {
 	ix.sorted = false
 }
 
+// AddBytes indexes a caller-owned buffer under id, replacing any previous
+// document with the same id: the byte-first ingest lane. Analysis is
+// identical to Add (same fold threshold, same normalization, same emit),
+// so mixed Add/AddBytes indexes are indistinguishable.
+//
+// The buffer is used only for the call's duration and never retained:
+// postings keep hashes and positions, the vocabulary copies new spellings
+// into owned strings. Callers reuse one buffer across documents with no
+// per-call conversion; Add stays for string owners.
+func (ix *Index) AddBytes(id DocID, text []byte) {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+
+	if old, ok := ix.docs[id]; ok {
+		ix.removeLocked(id, old)
+	}
+
+	var length uint32
+	var terms []uint64
+	ix.spellBuf = ix.spellBuf[:0]
+	spell := &ix.spellBuf
+	emit := func(hash uint64, pos uint32, spelling []byte) {
+		length++
+		terms = ix.appendLocked(id, hash, pos, terms)
+		ix.learnLocked(hash, spelling)
+	}
+	if len(text) >= simdFoldThreshold && len(text) <= maxFoldDoc {
+		if cap(ix.foldBuf) < len(text) {
+			ix.foldBuf = make([]byte, len(text))
+		}
+		buf := ix.foldBuf[:len(text)]
+		foldASCIIBytes(buf, text)
+		scanFoldedRec(buf, spell, emit)
+	} else {
+		scanBytesRec(text, spell, emit)
+	}
+	ix.noteDocLength(id, length)
+	ix.docs[id] = docMeta{length: length, terms: terms}
+	ix.nDocs++
+	ix.tokens += uint64(length)
+	ix.sorted = false
+}
+
 // appendLocked appends one token occurrence and returns the document's term
 // list (extended when hash is new to the document, for exact Remove).
 func (ix *Index) appendLocked(id DocID, hash uint64, pos uint32, terms []uint64) []uint64 {

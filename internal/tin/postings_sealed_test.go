@@ -33,7 +33,7 @@ func TestPackRoundTripWidths(t *testing.T) {
 				case 2:
 					vals[i] = max >> 1
 				default:
-					vals[i] = uint32(i)*2654435761 & max
+					vals[i] = uint32(i) * 2654435761 & max
 				}
 			}
 			words := packAppend(vals, w, nil)

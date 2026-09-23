@@ -7,6 +7,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/tin"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // evalScore evaluates one SCORE() node: the BM25 relevance of the row's
@@ -26,7 +27,8 @@ func (r *statementScalar) evalScore(result *Result, row int, node *statementScal
 	}
 	var score float64
 	if text := scalarFromResultCell(cells[row], arena); text.kind == kindString && r.scoreQuery != nil {
-		score = tin.ScoreSingle(text.sval, *r.scoreQuery, r.scoreStats, &r.scoreScratch)
+		// Arena-backed view straight into the byte lane: no string copy.
+		score = tin.ScoreSingleBytes(byteview.Bytes(text.sval), *r.scoreQuery, r.scoreStats, &r.scoreScratch)
 	}
 	if math.IsNaN(score) || math.IsInf(score, 0) {
 		score = 0

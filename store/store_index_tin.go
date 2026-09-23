@@ -315,33 +315,45 @@ func buildTinIndex(state *State, tdef tinDefinition) (*tin.Index, error) {
 // (chunk, slot) document identities, so segment builds over disjoint
 // chunk sets stay mutually disjoint and union exactly.
 func addChunkToIndex(ix *tin.Index, id uint32, chunk *Chunk, pointer vibejson.CompiledPointer) error {
+	// One decode buffer serves the chunk's escaped strings; unescaped
+	// strings alias the source and never touch it.
+	var scratch []byte
 	for live := chunk.Live; live != 0; live &= live - 1 {
 		slot := bits.TrailingZeros64(live)
-		text, ok := tinSlotText(chunk, slot, pointer)
+		text, next, ok := tinSlotBytes(chunk, slot, pointer, scratch)
 		if !ok {
 			continue
 		}
-		ix.Add(TinDocID(id, slot), text)
+		scratch = next
+		ix.AddBytes(TinDocID(id, slot), text)
 	}
 	return nil
 }
 
-// tinSlotText extracts the decoded string at pointer for one live slot.
-func tinSlotText(chunk *Chunk, slot int, pointer vibejson.CompiledPointer) (string, bool) {
+// tinSlotBytes extracts the decoded string bytes at pointer for one live
+// slot: a source alias when the JSON string is unescaped (zero-copy),
+// otherwise decoded into scratch, which the caller reuses across slots.
+// The returned text is valid only until the next tinSlotBytes call reuses
+// the same scratch; AddBytes consumes it synchronously. Malformed content
+// and non-strings report ok == false, exactly like the string lane did.
+func tinSlotBytes(chunk *Chunk, slot int, pointer vibejson.CompiledPointer, scratch []byte) (text, next []byte, ok bool) {
 	if chunk == nil || chunk.Live&(uint64(1)<<uint(slot)) == 0 {
-		return "", false
+		return nil, scratch, false
 	}
 	row := [1]int{int(chunk.Ord[slot])}
 	var one [1]vibejson.RawValue
 	values, err := chunk.Docs.AppendPointerRows(one[:0], row[:], pointer)
 	if err != nil || len(values) != 1 {
-		return "", false
+		return nil, scratch, false
 	}
-	text, ok, err := values[0].Text()
+	if b, ok := values[0].StringBytes(); ok {
+		return b, scratch, true
+	}
+	dec, ok, err := values[0].AppendText(scratch[:0])
 	if err != nil || !ok {
-		return "", false
+		return nil, scratch, false
 	}
-	return text, true
+	return dec, dec, true
 }
 
 // TinIndexForPath returns the tin index built over snapshot s for the first

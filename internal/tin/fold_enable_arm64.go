@@ -6,5 +6,6 @@ package tin
 // runtime gate.
 func init() {
 	foldASCIIImpl = foldASCIIWide
+	foldASCIIBytesImpl = foldASCIIWideBytes
 	bm25Impl = bm25Wide
 }

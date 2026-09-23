@@ -958,6 +958,12 @@ func (ix *Index) matchPhraseDocs(ph []PhrasePos, slop int, out []DocID) []DocID 
 		sortDocIDs(out[base:])
 		return out
 	}
+	// The hot exact shape — slop-0, two slots, one alternative each —
+	// skips the union/sort/dedupe/chain lanes for the pair merge.
+	if slop == 0 && len(ph) == 2 && !ph[0].Any && !ph[1].Any &&
+		len(ph[0].Alts) == 1 && len(ph[1].Alts) == 1 {
+		return ix.matchExactPairDocs(ph[0].Alts[0], ph[1].Alts[0], out)
+	}
 	// Anchor alternatives union (a document holds the slot when it
 	// holds any alternative): the same union matchInto serves the span
 	// path, staged into the candidate lane.
@@ -1051,6 +1057,207 @@ func chainFrom(ph []PhrasePos, lists [][]uint32, docLen uint32, anchor int, anch
 		slots[t] = cur
 	}
 	return slots[0], slots[len(ph)-1], true
+}
+
+// matchExactPairDocs appends the documents where term hb occurs exactly one
+// position after ha: the slop-0, two-slot, single-alternative phrase, which
+// is the hot exact-phrase shape (a quoted two-word query). It skips the
+// generic lane's candidate union, sort, dedupe, per-slot union sorts, and
+// chain generality: a doc-level merge when both sides are open, otherwise a
+// walk of the smaller side in ascending order probing the other, then one
+// two-pointer adjacency walk per shared document. Verdicts equal
+// matchPhraseDocs on this shape: same postings, same slot positions
+// (positionsOf / sealedRowPositions), same ascending order, one hit per
+// document on the first adjacency. Open/open stages nothing and allocates
+// nothing; sealed sides decode into the match position stage. The keep set
+// rides caller-owned out, as in the generic lane.
+func (ix *Index) matchExactPairDocs(ha, hb uint64, out []DocID) []DocID {
+	pa := ix.post[ha]
+	pb := ix.post[hb]
+	if pa == nil || pb == nil {
+		return out
+	}
+	if pa == pb {
+		return ix.matchSelfPairDocs(pa, out)
+	}
+	if pa.sealed == nil && pb.sealed == nil {
+		i, j := 0, 0
+		ai, bj := pa.ids, pb.ids
+		for i < len(ai) && j < len(bj) {
+			a, b := ai[i], bj[j]
+			if a != b {
+				if a < b {
+					i++
+				} else {
+					j++
+				}
+				continue
+			}
+			if _, ok := ix.docs[a]; ok && adjacentPair(positionsOf(pa, i), positionsOf(pb, j)) {
+				out = append(out, a)
+			}
+			i++
+			j++
+		}
+		return out
+	}
+	drive, probe := pa, pb
+	driveSealed, probeSealed := pa.sealed != nil, pb.sealed != nil
+	if pairDocCount(pb) < pairDocCount(pa) {
+		drive, probe = pb, pa
+		driveSealed, probeSealed = probeSealed, driveSealed
+	}
+	stage := extendN(ix.matchPosStage[:0], 0)
+	if !driveSealed {
+		for i, doc := range drive.ids {
+			var other []uint32
+			if probeSealed {
+				var st2 []uint32
+				var ok bool
+				other, st2, ok = ix.sealedRowPositions(probe.sealed, doc, stage)
+				if !ok {
+					stage = st2
+					continue
+				}
+				stage = st2
+			} else {
+				lo, hi := 0, len(probe.ids)
+				for lo < hi {
+					m := lo + (hi-lo)/2
+					if probe.ids[m] < doc {
+						lo = m + 1
+					} else {
+						hi = m
+					}
+				}
+				if lo >= len(probe.ids) || probe.ids[lo] != doc {
+					continue
+				}
+				other = positionsOf(probe, lo)
+			}
+			// Order follows the query, not the walk: when the rarer side
+			// won the drive, its positions sit in other.
+			mine := positionsOf(drive, i)
+			if _, ok := ix.docs[doc]; ok {
+				if isHa := drive == pa; (isHa && adjacentPair(mine, other)) ||
+					(!isHa && adjacentPair(other, mine)) {
+					out = append(out, doc)
+				}
+			}
+		}
+		ix.matchPosStage = stage
+		return out
+	}
+	// Drive block rows by index, refetching the block's ids per document:
+	// a sealedBlock result aliases the shared 4-entry decoded-block cache
+	// and must never be held across the sealedRowAt/sealedRowPositions
+	// calls below, which evict it. The refetch is a tag hit.
+	for b := range drive.sealed.blk {
+		rows := drive.sealed.blk[b].rows
+		for k := uint32(0); k < rows; k++ {
+			ids, _, _ := ix.sealedBlock(drive.sealed, b)
+			doc := ids[k]
+			base := len(stage)
+			stage = ix.sealedRowAt(drive.sealed, b, int(k), stage)
+			mine := stage[base:]
+			var other []uint32
+			if probeSealed {
+				var st2 []uint32
+				var ok bool
+				other, st2, ok = ix.sealedRowPositions(probe.sealed, doc, stage)
+				if !ok {
+					stage = st2
+					continue
+				}
+				stage = st2
+			} else {
+				lo, hi := 0, len(probe.ids)
+				for lo < hi {
+					m := lo + (hi-lo)/2
+					if probe.ids[m] < doc {
+						lo = m + 1
+					} else {
+						hi = m
+					}
+				}
+				if lo >= len(probe.ids) || probe.ids[lo] != doc {
+					continue
+				}
+				other = positionsOf(probe, lo)
+			}
+			if _, ok := ix.docs[doc]; ok {
+				if isHa := drive == pa; (isHa && adjacentPair(mine, other)) ||
+					(!isHa && adjacentPair(other, mine)) {
+					out = append(out, doc)
+				}
+			}
+		}
+	}
+	ix.matchPosStage = stage
+	return out
+}
+
+// pairDocCount estimates a postings list's document count for drive-side
+// choice: open length or sealed row total.
+func pairDocCount(p *postings) int {
+	if p.sealed == nil {
+		return len(p.ids)
+	}
+	return int(p.sealed.n)
+}
+
+// matchSelfPairDocs appends the documents where one term occurs at two
+// adjacent positions: the "x x" phrase, where both slots share a postings
+// list. One ordered walk, one two-pointer self-adjacency check per row.
+func (ix *Index) matchSelfPairDocs(p *postings, out []DocID) []DocID {
+	if p.sealed == nil {
+		for i, doc := range p.ids {
+			pos := positionsOf(p, i)
+			if _, ok := ix.docs[doc]; ok && adjacentPair(pos, pos) {
+				out = append(out, doc)
+			}
+		}
+		return out
+	}
+	stage := extendN(ix.matchPosStage[:0], 0)
+	// Same no-hold rule as the pair drive above: refetch per document.
+	for b := range p.sealed.blk {
+		rows := p.sealed.blk[b].rows
+		for k := uint32(0); k < rows; k++ {
+			ids, _, _ := ix.sealedBlock(p.sealed, b)
+			doc := ids[k]
+			base := len(stage)
+			stage = ix.sealedRowAt(p.sealed, b, int(k), stage)
+			if _, ok := ix.docs[doc]; ok && adjacentPair(stage[base:], stage[base:]) {
+				out = append(out, doc)
+			}
+		}
+	}
+	ix.matchPosStage = stage
+	return out
+}
+
+// adjacentPair reports whether b holds a+1 for some a in a: a single
+// two-pointer walk over ascending position lists, exiting on the first
+// adjacency. The MaxUint32 guard keeps the +1 exact; no document reaches
+// a 4-billion-word length, so it never fires.
+func adjacentPair(a, b []uint32) bool {
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		if a[i] == ^uint32(0) {
+			i++
+			continue
+		}
+		want := a[i] + 1
+		if bj := b[j]; bj < want {
+			j++
+		} else if bj > want {
+			i++
+		} else {
+			return true
+		}
+	}
+	return false
 }
 
 // earliestAfter returns the first slot position in (cur, cur+1+slop].

@@ -24,6 +24,30 @@ func foldASCII(dst []byte, src string) {
 	foldASCIIImpl(dst, src)
 }
 
+// foldASCIIBytes is foldASCII over a caller-owned buffer: the byte-first
+// fold lane (AddBytes) so buffer owners never convert to string. The impl
+// var mirrors foldASCIIImpl and is selected by the same enable files.
+var foldASCIIBytesImpl = foldASCIIScalarBytes
+
+// foldASCIIBytes folds src's ASCII uppercase to lowercase into dst, which
+// must have at least len(src) bytes.
+func foldASCIIBytes(dst, src []byte) {
+	foldASCIIBytesImpl(dst, src)
+}
+
+// foldASCIIScalarBytes folds src into dst (which must have at least
+// len(src) bytes). Scalar tail of the wide kernel and the whole fold on
+// builds without one.
+func foldASCIIScalarBytes(dst, src []byte) {
+	for i := 0; i < len(src); i++ {
+		b := src[i]
+		if b >= 'A' && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+		dst[i] = b
+	}
+}
+
 // foldByte folds one ASCII byte to lowercase. Non-ASCII bytes pass through
 // for the rune path in token.go.
 func foldByte(b byte) byte {
