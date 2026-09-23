@@ -295,9 +295,16 @@ func (executor *DurableSQLRequestExecutor) retryDirectOutcome(
 	return catalogGeneration, request, direct, err
 }
 
+// retryableDirectOutcomeRecovery reports whether another recovery attempt may
+// settle an outcome that is still unknown. Every attempt re-drives the same
+// request identity, and the target's transaction control applies it at most
+// once, so any unknown outcome (a fence change, a leader change, or an
+// admitted proposal whose result was lost again) is retried within the
+// recovery window. Cancellation ends recovery early, and so does an invalid
+// route: the logical route changed group and recovery can never rebind it.
 func retryableDirectOutcomeRecovery(err error) bool {
 	return err != nil && errors.Is(err, raftservice.ErrOutcomeUnknown) &&
-		(errors.Is(err, raftservice.ErrServingFence) || errors.Is(err, ErrReplicatedLeader)) &&
+		!errors.Is(err, ErrReplicatedRoute) &&
 		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 

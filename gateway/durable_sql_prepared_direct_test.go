@@ -304,7 +304,7 @@ func TestDirectMutationRecoveryRouteRequiresSameLogicalAllocation(t *testing.T) 
 	}
 }
 
-func TestRetryableDirectOutcomeRecoveryRequiresTypedTransientUnknown(t *testing.T) {
+func TestRetryableDirectOutcomeRecoveryRetriesUnknownUntilStructural(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
@@ -312,6 +312,7 @@ func TestRetryableDirectOutcomeRecoveryRequiresTypedTransientUnknown(t *testing.
 	}{
 		{"unknown stale fence", errors.Join(raftservice.ErrOutcomeUnknown, raftservice.ErrServingFence), true},
 		{"unknown no leader", errors.Join(raftservice.ErrOutcomeUnknown, ErrReplicatedLeader), true},
+		{"admitted unknown lost again", errors.Join(raftservice.ErrOutcomeUnknown, raftservice.ErrOutcomeUnknown), true},
 		{"unknown invalid route", errors.Join(raftservice.ErrOutcomeUnknown, ErrReplicatedRoute), false},
 		{"definite stale fence", raftservice.ErrServingFence, false},
 		{"unknown canceled", errors.Join(raftservice.ErrOutcomeUnknown, ErrReplicatedLeader, context.Canceled), false},
