@@ -94,11 +94,11 @@ func TestBuildGroupOwnedShardTransitionReplacesNonFirstRouteLeader(t *testing.T)
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			candidate := *next
+			candidate := snapshotWithCatalogLineage(next, next.indexIDHighWater, next.shardGenerationHighWaters)
 			candidate.replicatedShards = append([]replicatedCatalogShard(nil), next.replicatedShards...)
 			candidate.replicatedReplicas = append([]ReplicatedEndpoint(nil), next.replicatedReplicas...)
-			mutate(&candidate)
-			if _, err := BuildGroupOwnedShardTransition(&candidate, intent, TransitionPhasePostRemove, target, postCommand); err == nil {
+			mutate(candidate)
+			if _, err := BuildGroupOwnedShardTransition(candidate, intent, TransitionPhasePostRemove, target, postCommand); err == nil {
 				t.Fatal("post-remove accepted an absent or forged retiring-source witness")
 			}
 		})

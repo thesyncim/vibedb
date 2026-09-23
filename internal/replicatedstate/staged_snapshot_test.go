@@ -16,7 +16,14 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestStagedSnapshotPreservesDirectMutationReplayResult(t *testing.T) {
+// A staged snapshot (range split child or restore) is a new Raft group with its
+// own transaction-control history. It must not inherit the source group's
+// retained direct results, and it must not fabricate one either: a replay of
+// the source's logical command is evaluated against the child's current image
+// and that verdict is then retained exactly. Lost-ack recovery is therefore
+// confined to the source group; the gateway refuses to rebind a retained
+// direct request across a group change and reports the outcome as unknown.
+func TestStagedSnapshotStartsFreshDirectMutationHistory(t *testing.T) {
 	source := newMachineFixture(t)
 	if _, err := source.machine.InstallSnapshot(source.bootstrap); err != nil {
 		t.Fatal(err)
@@ -107,8 +114,29 @@ func TestStagedSnapshotPreservesDirectMutationReplayResult(t *testing.T) {
 		t.Fatalf("apply child exact replay: %v", err)
 	}
 	completion, replay := openTransactionCompletion(t, child, childCommand)
-	if completion.ResultCode != ResultApplied || !replay.AffectedRowsValid || replay.AffectedRows != 1 {
-		t.Fatalf("child exact replay completion=%+v result=%+v, want retained Applied result", completion, replay)
+	if completion.ResultCode != ResultIndexConflict || replay.AffectedRowsValid {
+		t.Fatalf("child replay completion=%+v result=%+v, want fresh IndexConflict verdict", completion, replay)
+	}
+	childRow, found, err = child.user.Collection.AppendRaw(childRow[:0], documentKey)
+	if err != nil || !found || !bytes.Equal(childRow, document) {
+		t.Fatalf("child row after replay=%q found=%v err=%v", childRow, found, err)
+	}
+	witness, found, err := childSystem.Collection.AppendRaw(nil, controlKey[:])
+	if err != nil || !found {
+		t.Fatalf("child did not retain its own verdict: found=%v err=%v", found, err)
+	}
+	if err := child.AdmitCommand(childCommand); err != nil {
+		t.Fatalf("admit child second replay: %v", err)
+	}
+	if _, err := child.ApplyNormal(normalMeta(cut.Applied+2), childCommand); err != nil {
+		t.Fatalf("apply child second replay: %v", err)
+	}
+	again, againResult := openTransactionCompletion(t, child, childCommand)
+	witnessAfter, found, err := childSystem.Collection.AppendRaw(nil, controlKey[:])
+	if err != nil || !found || again.ResultCode != ResultIndexConflict || againResult != replay ||
+		!bytes.Equal(witnessAfter, witness) {
+		t.Fatalf("child second replay=%+v result=%+v witnessEqual=%t err=%v",
+			again, againResult, bytes.Equal(witnessAfter, witness), err)
 	}
 }
 
