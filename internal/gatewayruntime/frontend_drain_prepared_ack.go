@@ -447,7 +447,7 @@ func (runtime *Runtime) frontendDrainPreparedAckReceiversFromServiceCut(
 	for _, node := range cut.CurrentNodes() {
 		if !node.Valid() {
 			return nil, fmt.Errorf("%w: receiver roster has invalid current node %s incarnation=%d",
-				gateway.ErrScalingRevision, node.NodeID, node.Incarnation)
+				gateway.ErrScalingRevision, nodeIDHex(node.NodeID), node.Incarnation)
 		}
 		current[node.NodeID] = node
 	}
@@ -474,7 +474,7 @@ func (runtime *Runtime) frontendDrainPreparedAckReceiversFromServiceCut(
 				route.DataAddress != node.DataAddress || route.Address != node.NativeAddress ||
 				route.ControlAddress != node.ControlAddress {
 				return fmt.Errorf("%w: receiver route physical identity mismatch node=%s incarnation=%d route-node=%s route-incarnation=%d route-data=%q node-data=%q route-native=%q node-native=%q route-control=%q node-control=%q route-handles=(%q,%q,%q) node-handles=(%q,%q,%q)",
-					gateway.ErrScalingRevision, node.NodeID, node.Incarnation, route.Node, route.NodeIncarnation,
+					gateway.ErrScalingRevision, nodeIDHex(node.NodeID), node.Incarnation, nodeIDHex(route.Node), route.NodeIncarnation,
 					route.DataAddress, node.DataAddress, route.Address, node.NativeAddress,
 					route.ControlAddress, node.ControlAddress,
 					route.Endpoint, route.NativeEndpoint, route.ControlEndpoint,
@@ -502,7 +502,7 @@ func (runtime *Runtime) frontendDrainPreparedAckReceiversFromServiceCut(
 			node, found := current[replica.Node]
 			if !found || node.Incarnation != replica.NodeIncarnation {
 				return nil, fmt.Errorf("%w: receiver roster route index=%d replica index=%d node=%s found=%t node-incarnation=%d replica-incarnation=%d",
-					gateway.ErrScalingRevision, index, replicaIndex, replica.Node, found, node.Incarnation, replica.NodeIncarnation)
+					gateway.ErrScalingRevision, index, replicaIndex, nodeIDHex(replica.Node), found, node.Incarnation, replica.NodeIncarnation)
 			}
 			if err := add(node, &replica); err != nil {
 				return nil, err
@@ -520,7 +520,7 @@ func (runtime *Runtime) frontendDrainPreparedAckReceiversFromServiceCut(
 			if !found || node.Incarnation != binding.PhysicalIncarnation ||
 				node.ServiceKeyDigest != replication.Digest(binding.KeyDigest) {
 				return nil, fmt.Errorf("%w: receiver service binding node=%s found=%t node-incarnation=%d binding-incarnation=%d node-key=%x binding-key=%x",
-					gateway.ErrScalingIdentity, binding.PhysicalNode, found, node.Incarnation, binding.PhysicalIncarnation,
+					gateway.ErrScalingIdentity, nodeIDHex(binding.PhysicalNode), found, node.Incarnation, binding.PhysicalIncarnation,
 					node.ServiceKeyDigest, binding.KeyDigest)
 			}
 			if err := add(node, nil); err != nil {
@@ -675,7 +675,7 @@ func (runtime *Runtime) acknowledgeFrontendDrainPreparedAckPhysicalReceiver(
 	}
 	connection, err := opener.OpenShardControlEndpoint(ctx, receiver.endpoint)
 	if err != nil || connection == nil {
-		return fmt.Errorf("prepared frontend drain storage receiver %s: %w", receiver.node.NodeID, frontendParticipantRemoteError(ctx, err))
+		return fmt.Errorf("prepared frontend drain storage receiver %s: %w", nodeIDHex(receiver.node.NodeID), frontendParticipantRemoteError(ctx, err))
 	}
 	defer connection.Close()
 	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
@@ -918,7 +918,7 @@ func (runtime *Runtime) acknowledgeFrontendDrainPreparedAckGatewayReceiver(
 	}
 	connection, openErr := runtime.clusterControlOpener.OpenGatewayControlMember(ctx, member)
 	if openErr != nil || connection == nil {
-		return fmt.Errorf("prepared frontend drain receiver %s: %w", member.Node, frontendParticipantRemoteError(ctx, openErr))
+		return fmt.Errorf("prepared frontend drain receiver %s: %w", nodeIDHex(member.Node), frontendParticipantRemoteError(ctx, openErr))
 	}
 	defer connection.Close()
 	stop := context.AfterFunc(ctx, func() { _ = connection.Close() })
