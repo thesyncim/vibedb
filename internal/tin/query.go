@@ -166,7 +166,9 @@ func (ix *Index) Match(q Query, out []DocID) []DocID {
 			return out
 		}
 		if allTerms(q.Kids) {
-			return append(out, ix.matchTermsInto(q.Kids, nil)...)
+			// The keep set stages straight into caller-owned out:
+			// no intermediate array to copy and drop.
+			return ix.matchTermsInto(q.Kids, out)
 		}
 		acc := ix.matchInto(q.Kids[0], nil)
 		for _, k := range q.Kids[1:] {
@@ -194,6 +196,11 @@ func (ix *Index) Match(q Query, out []DocID) []DocID {
 		}
 		return append(out, acc...)
 	default:
+		if q.Op == OpPhrase {
+			// Phrases match at document level without span
+			// materialization: same verdicts, O(width) staging.
+			return ix.matchPhraseDocs(q.Phrase, q.Slop, out)
+		}
 		spans := ix.evalInto(q, nil)
 		return append(out, projectDocs(spans)...)
 	}
@@ -262,8 +269,11 @@ func (ix *Index) matchTermsInto(kids []Query, out []DocID) []DocID {
 			driver = driver[:w]
 			continue
 		}
-		other := ix.appendList(nil, l)
+		// Sibling decodes ride index-owned scratch, warm across calls:
+		// a rare term must never pay the common term's allocation.
+		other := ix.appendList(ix.matchOther[:0], l)
 		driver = intersectScalar(driver, other, driver[:0])
+		ix.matchOther = other
 	}
 	return out[:base+len(driver)]
 }
@@ -310,7 +320,9 @@ func (ix *Index) matchInto(q Query, out []DocID) []DocID {
 			return out
 		}
 		if allTerms(q.Kids) {
-			return append(out, ix.matchTermsInto(q.Kids, nil)...)
+			// The keep set stages straight into caller-owned out:
+			// no intermediate array to copy and drop.
+			return ix.matchTermsInto(q.Kids, out)
 		}
 		acc := ix.matchInto(q.Kids[0], nil)
 		for _, k := range q.Kids[1:] {
@@ -336,6 +348,11 @@ func (ix *Index) matchInto(q Query, out []DocID) []DocID {
 		}
 		return append(out, acc...)
 	default:
+		if q.Op == OpPhrase {
+			// Phrases match at document level without span
+			// materialization: same verdicts, O(width) staging.
+			return ix.matchPhraseDocs(q.Phrase, q.Slop, out)
+		}
 		spans := ix.evalInto(q, nil)
 		return append(out, projectDocs(spans)...)
 	}
@@ -908,6 +925,90 @@ func (ix *Index) slotPositions(alts []uint64, doc DocID, stage []uint32) ([]uint
 	return tail, stage
 }
 
+// matchPhraseDocs appends the documents matching a phrase query without
+// materializing per-occurrence span hits. Candidates come from the anchor
+// slot's term intersection (the same anchor phraseSpans uses); each
+// candidate proves out through one chainFrom walk that exits on the first
+// chained anchor position, so staging stays O(phrase width) per document
+// instead of O(hits). The verdict set is identical to
+// evalInto+projectDocs: same anchor, same slot positions (slotPositions),
+// same chain check over the same document lengths, same ascending order.
+// Match-only: scoring and span relations keep the span machinery, which
+// counts occurrences. All staging lanes are index-owned and written back
+// for the next call; the keep set itself rides caller-owned out.
+func (ix *Index) matchPhraseDocs(ph []PhrasePos, slop int, out []DocID) []DocID {
+	if len(ph) == 0 {
+		return out
+	}
+	anchor := -1
+	for i, slot := range ph {
+		if !slot.Any && len(slot.Alts) > 0 {
+			anchor = i
+			break
+		}
+	}
+	base := len(out)
+	if anchor == -1 {
+		// All-Any: every document with room for the window, ascending.
+		for id, meta := range ix.docs {
+			if uint32(len(ph)) <= meta.length {
+				out = append(out, id)
+			}
+		}
+		sortDocIDs(out[base:])
+		return out
+	}
+	// Anchor alternatives union (a document holds the slot when it
+	// holds any alternative): the same union matchInto serves the span
+	// path, staged into the candidate lane.
+	cands := extendN(ix.matchCands[:0], 0)
+	for _, h := range ph[anchor].Alts {
+		if p := ix.post[h]; p != nil {
+			cands = ix.appendList(cands, p)
+		}
+	}
+	sortDocIDs(cands)
+	cands = dedupeInto(cands)
+	lists := extendN(ix.matchSlotLists[:0], len(ph))
+	slots := extendN(ix.matchChainSlots[:0], len(ph))
+	stage := extendN(ix.matchPosStage[:0], 0)
+	for _, doc := range cands {
+		meta, ok := ix.docs[doc]
+		if !ok {
+			continue
+		}
+		stage = stage[:0]
+		complete := true
+		for t, slot := range ph {
+			if slot.Any {
+				lists[t] = nil
+				continue
+			}
+			var tail []uint32
+			tail, stage = ix.slotPositions(slot.Alts, doc, stage)
+			lists[t] = tail
+			if len(lists[t]) == 0 {
+				complete = false
+				break
+			}
+		}
+		if !complete {
+			continue
+		}
+		for _, a := range lists[anchor] {
+			if _, _, ok := chainFrom(ph, lists, meta.length, anchor, a, slop, slots); ok {
+				out = append(out, doc)
+				break
+			}
+		}
+	}
+	ix.matchCands = cands[:0]
+	ix.matchSlotLists = lists
+	ix.matchChainSlots = slots
+	ix.matchPosStage = stage
+	return out
+}
+
 // chainFrom verifies the slot chain around one anchor occurrence. Forward
 // slots take the earliest reachable position and backward slots the latest
 // reachable one; both greeds are complete because position lists ascend, so
@@ -1046,7 +1147,7 @@ func (ix *Index) scoreInto(q Query, acc *[]Scored) {
 		// Summation ranges over the union; AND ranks only the intersection.
 		var keep []DocID
 		if allTerms(q.Kids) {
-			keep = ix.matchTermsInto(q.Kids, nil)
+			keep = ix.matchTermsInto(q.Kids, ix.matchKeep[:0])
 		} else {
 			keep = ix.matchInto(q.Kids[0], nil)
 			for _, k := range q.Kids[1:] {
@@ -1055,6 +1156,7 @@ func (ix *Index) scoreInto(q Query, acc *[]Scored) {
 			}
 		}
 		filterScored(acc, keep)
+		ix.matchKeep = keep[:0]
 		scaleScores(acc, q.boostOf())
 	case OpOr:
 		for _, k := range q.Kids {

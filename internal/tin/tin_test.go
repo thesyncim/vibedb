@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -280,5 +281,84 @@ func TestZeroAllocSteadyState(t *testing.T) {
 		_ = ix.Score(Query{Op: OpTerm, Term: term}, 10, sout[:0])
 	}); n != 0 {
 		t.Fatalf("term Score allocated %v per run", n)
+	}
+}
+
+// TestMatchPhraseDocsAgreesWithSpans proves the document-level phrase
+// matcher returns exactly the span path's verdict set: same anchor,
+// same slot positions, same chain check. It runs every shape over open
+// and sealed layouts with a removed document in the mix (anchor repeats
+// exercise the first-chain early exit; Any slots, alternatives, slop,
+// and the empty phrase cover the lowering edges).
+func TestMatchPhraseDocsAgreesWithSpans(t *testing.T) {
+	docs := map[DocID]string{
+		1: "alpha beta gamma",
+		2: "alpha alpha beta",
+		3: "beta alpha",
+		4: "alpha gamma beta",
+		5: "delta epsilon",
+		6: "alpha beta alpha beta",
+		7: "x alpha y beta z",
+		8: "alpha beta",
+	}
+	build := func(seal bool) *Index {
+		ix := NewIndex()
+		addDocs(t, ix, docs)
+		if !ix.Remove(8) {
+			t.Fatal("remove did not drop doc 8")
+		}
+		if seal {
+			ix.Seal()
+		}
+		return ix
+	}
+	parsed := func(ix *Index, in string) Query {
+		t.Helper()
+		q, err := ix.ParseTINQL(in)
+		if err != nil {
+			t.Fatalf("ParseTINQL(%q): %v", in, err)
+		}
+		return q
+	}
+	for _, seal := range []bool{false, true} {
+		ix := build(seal)
+		inputs := []string{
+			`"alpha beta"`,
+			`"beta alpha"`,
+			`"alpha beta"~1`,
+			`"alpha gamma"~2`,
+			`"alpha _ beta"`,
+			`"alpha [beta gamma]"`,
+			`"[alpha beta] gamma"`,
+			`"zeta omega"`,
+			`"alpha alpha"`,
+			`"gamma beta"~1`,
+			`"delta epsilon"`,
+			`"x _ _ beta"`,
+		}
+		for _, in := range inputs {
+			q := parsed(ix, in)
+			got := ix.matchPhraseDocs(q.Phrase, q.Slop, nil)
+			spans := ix.evalInto(q, nil)
+			want := projectDocs(spans)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("seal=%v %q docs=%v spans=%v", seal, in, got, want)
+			}
+		}
+		// An AND with a phrase kid routes through matchInto, not the
+		// top-level Match default.
+		ph := parsed(ix, `"alpha beta"`)
+		gamma, err := ix.ParseTINQL(`gamma`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		and := Query{Op: OpAnd, Kids: []Query{ph, gamma}}
+		if got, want := ix.Match(and, nil), []DocID{1}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("seal=%v phrase AND gamma = %v, want %v", seal, got, want)
+		}
+		// Empty phrase matches nothing and preserves append content.
+		if got := ix.matchPhraseDocs(nil, 0, []DocID{7}); !reflect.DeepEqual(got, []DocID{7}) {
+			t.Fatalf("seal=%v empty phrase = %v, want [7]", seal, got)
+		}
 	}
 }

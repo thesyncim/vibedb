@@ -101,6 +101,22 @@ type Index struct {
 	// termLists stages resolved postings for layout-aware conjunctions,
 	// reused across calls under the same lock.
 	termLists []*postings
+	// matchKeep stages scoreInto's all-term keep set under the same
+	// lock; filterScored consumes it before any nested use.
+	matchKeep []DocID
+	// matchCands/matchSlotLists/matchChainSlots/matchPosStage stage one
+	// matchPhraseDocs call: anchor candidates, per-slot position tails,
+	// chain slots, and decoded position bytes. All are consumed
+	// synchronously before any nested phrase use; the keep set itself
+	// rides caller-owned out.
+	matchCands      []DocID
+	matchSlotLists  [][]uint32
+	matchChainSlots []uint32
+	matchPosStage   []uint32
+	// matchOther stages a merge-gated sibling decode for matchTermsInto,
+	// warm across calls under the same lock; the keep set itself always
+	// rides caller-owned out, never this lane.
+	matchOther []DocID
 	// missSrc/missBlk remembers the last uncached block probe so the
 	// second same-block lookup fills the block cache (see sealedFindRow).
 	missSrc *sealedPostings
