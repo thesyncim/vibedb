@@ -576,3 +576,54 @@ func TestRefreshSegmentedStatsExact(t *testing.T) {
 		}
 	}
 }
+
+// TestGatherPoolMatchMatchesSpawn proves the pooled match twins change
+// nothing: Match and MatchQueries equal the spawn-per-call gathers DocID
+// for DocID over terms, ANDs, ORs, and phrases, at every pool size, with
+// a nil shard and a short queries slice covered. DocOut buffers reset
+// between runs so no run aliases another.
+func TestGatherPoolMatchMatchesSpawn(t *testing.T) {
+	for _, workers := range []int{1, 2, 6, 7} {
+		shards := gatherShardCorpus(6, 500)
+		shards = append(shards, Shard{})
+		p := NewGatherPool(workers)
+		for _, pattern := range []string{"common", "zipf AND common", "common OR zipf", `"tied tie"`} {
+			q := gatherQuery(t, shards, pattern)
+			want := MatchGathered(shards, q, nil)
+			for i := range shards {
+				shards[i].DocOut = nil
+			}
+			if got := p.Match(shards, q, nil); !reflect.DeepEqual(got, want) {
+				t.Fatalf("workers=%d %s: %d ids, want %d", workers, pattern, len(got), len(want))
+			}
+			queries := make([]Query, len(shards))
+			for i := range shards {
+				if shards[i].Ix == nil {
+					continue
+				}
+				var err error
+				queries[i], err = shards[i].Ix.ParseTINQL(pattern)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			wantQ := MatchGatheredQueries(shards, queries, nil)
+			for i := range shards {
+				shards[i].DocOut = nil
+			}
+			if got := p.MatchQueries(shards, queries, nil); !reflect.DeepEqual(got, wantQ) {
+				t.Fatalf("workers=%d %s queries: %d ids, want %d", workers, pattern, len(got), len(wantQ))
+			}
+			// A queries slice shorter than shards serves the prefix.
+			short := queries[:len(shards)-2]
+			wantS := MatchGatheredQueries(shards, short, nil)
+			for i := range shards {
+				shards[i].DocOut = nil
+			}
+			if got := p.MatchQueries(shards, short, nil); !reflect.DeepEqual(got, wantS) {
+				t.Fatalf("workers=%d %s short: %d ids, want %d", workers, pattern, len(got), len(wantS))
+			}
+		}
+		p.Close()
+	}
+}

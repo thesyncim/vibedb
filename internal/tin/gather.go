@@ -367,6 +367,8 @@ const (
 	gatherOpScore gatherOp = iota
 	gatherOpPinned
 	gatherOpPinnedFull
+	gatherOpMatch
+	gatherOpMatchQueries
 )
 
 // gatherJob is one worker's share of one query: every worker receives the
@@ -379,11 +381,15 @@ type gatherJob struct {
 	oks    []bool
 	gs     *SegGlobals
 	q      Query
-	topK   int
-	worker int
-	of     int
-	op     gatherOp
-	wg     *sync.WaitGroup
+	// queries carries one query per shard for gatherOpMatchQueries;
+	// shorter than shards is legal, matching MatchGatheredQueries.
+	queries []Query
+	docRuns [][]DocID
+	topK    int
+	worker  int
+	of      int
+	op      gatherOp
+	wg      *sync.WaitGroup
 }
 
 // NewGatherPool starts n parked search workers.
@@ -429,6 +435,22 @@ func (p *GatherPool) serve(w int) {
 					job.shards[i].Out = s
 					job.runs[i] = s
 					job.oks[i] = ok
+				}
+			case gatherOpMatch:
+				for i := job.worker; i < len(job.shards); i += job.of {
+					if job.shards[i].Ix == nil {
+						continue
+					}
+					job.shards[i].DocOut = job.shards[i].Ix.Match(job.q, job.shards[i].DocOut[:0])
+					job.docRuns[i] = job.shards[i].DocOut
+				}
+			case gatherOpMatchQueries:
+				for i := job.worker; i < len(job.shards); i += job.of {
+					if job.shards[i].Ix == nil || i >= len(job.queries) {
+						continue
+					}
+					job.shards[i].DocOut = job.shards[i].Ix.Match(job.queries[i], job.shards[i].DocOut[:0])
+					job.docRuns[i] = job.shards[i].DocOut
 				}
 			default:
 				for i := job.worker; i < len(job.shards); i += job.of {
@@ -488,6 +510,29 @@ func (p *GatherPool) ScorePinnedFull(shards []Shard, q Query, gs *SegGlobals, ou
 		}
 	}
 	return mergeScored(runs, 0, out), true
+}
+
+// Match runs MatchGathered's per-shard work through the pool — the same
+// per-shard Match calls over the same DocOut buffers into the same union
+// merge — verdict-identical to MatchGathered. Beyond what the merge
+// itself spends, a warmed call adds only the runs slice and the shared
+// WaitGroup, independent of shard count. Buffer and concurrency rules
+// match Score.
+func (p *GatherPool) Match(shards []Shard, q Query, out []DocID) []DocID {
+	runs := make([][]DocID, len(shards))
+	p.dispatch(gatherJob{shards: shards, q: q, docRuns: runs, op: gatherOpMatch})
+	return mergeDocIDs(runs, out)
+}
+
+// MatchQueries runs MatchGatheredQueries' per-shard work through the pool:
+// queries parallels shards, a nil index's query is ignored, and the merge
+// is the same deduplicated union. Verdict-identical to
+// MatchGatheredQueries with the same warmed budget as Match; the queries
+// slice itself stays caller-owned.
+func (p *GatherPool) MatchQueries(shards []Shard, queries []Query, out []DocID) []DocID {
+	runs := make([][]DocID, len(shards))
+	p.dispatch(gatherJob{shards: shards, queries: queries, docRuns: runs, op: gatherOpMatchQueries})
+	return mergeDocIDs(runs, out)
 }
 
 // dispatch fans one job value out to the workers covering shards: at most

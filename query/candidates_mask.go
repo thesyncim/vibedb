@@ -534,9 +534,9 @@ func matchCandidateMasks(
 				}
 				queries[i] = qi
 			}
-			ids = tin.MatchGatheredQueries(shards, queries, w.matchDocIDs[:0])
+			ids = tinSegPool.MatchQueries(shards, queries, w.matchDocIDs[:0])
 		} else {
-			ids = tin.MatchGathered(shards, q, w.matchDocIDs[:0])
+			ids = tinSegPool.Match(shards, q, w.matchDocIDs[:0])
 		}
 		w.matchDocIDs = ids
 		if len(ids) == 0 {
