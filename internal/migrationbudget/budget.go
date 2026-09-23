@@ -95,6 +95,15 @@ type PressureConfig struct {
 	RecoveryWindows uint32
 	RecoveryStepPPM uint32
 	MinimumScalePPM uint32
+	// HighSchedulingNanos and SevereSchedulingNanos classify the p99 Go
+	// scheduling latency of the serving process. It measures CPU contention
+	// directly, which the node log queue does not: snapshot encode, transfer
+	// and apply can starve foreground work on a shared host while the log is
+	// idle. This signal only downshifts rates (never pauses), so migration
+	// keeps its minimum share even when foreground load alone saturates the
+	// CPU. Both zero disables it.
+	HighSchedulingNanos   uint64
+	SevereSchedulingNanos uint64
 }
 
 // DefaultPressureConfig keeps migration responsive to a saturated node log
@@ -112,6 +121,10 @@ func DefaultPressureConfig() PressureConfig {
 		RecoveryWindows: 3,
 		RecoveryStepPPM: 125_000,
 		MinimumScalePPM: 125_000,
+		// Idle Go processes schedule runnable goroutines within tens of
+		// microseconds; a p99 in the milliseconds means cores are oversubscribed.
+		HighSchedulingNanos:   uint64(5 * time.Millisecond),
+		SevereSchedulingNanos: uint64(20 * time.Millisecond),
 	}
 }
 
@@ -171,7 +184,9 @@ func (config PressureConfig) validate() error {
 		config.HighWaitNanos == 0 || config.SevereWaitNanos < config.HighWaitNanos ||
 		config.PauseWindows == 0 || config.RecoveryWindows == 0 ||
 		config.RecoveryStepPPM == 0 || config.RecoveryStepPPM > pressureScaleMax ||
-		config.MinimumScalePPM == 0 || config.MinimumScalePPM > pressureScaleMax {
+		config.MinimumScalePPM == 0 || config.MinimumScalePPM > pressureScaleMax ||
+		(config.HighSchedulingNanos == 0) != (config.SevereSchedulingNanos == 0) ||
+		config.SevereSchedulingNanos < config.HighSchedulingNanos {
 		return ErrInvalidConfig
 	}
 	return nil
@@ -201,7 +216,10 @@ type PressureSample struct {
 	BackpressureSubmissions uint64
 	ReadyQueueWaitNanos     uint64
 	ReadySubmissions        uint64
-	Initial                 bool
+	// SchedulingLatencyNanos is the p99 goroutine scheduling latency observed
+	// in this sample's interval. Zero means unavailable.
+	SchedulingLatencyNanos uint64
+	Initial                bool
 }
 
 // PressureStatus is a detached, constant-size view of foreground feedback.
@@ -214,6 +232,7 @@ type PressureStatus struct {
 	Timestamp               time.Time
 	QueuePressurePPM        uint32
 	WaitPressurePPM         uint32
+	SchedulingPressurePPM   uint32
 	BackpressureSubmissions uint64
 	BackpressureTotal       uint64
 	ScalePPM                uint32

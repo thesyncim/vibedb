@@ -21,6 +21,9 @@ func (owner *rf3NodeOwner) startMigrationPressureSampler(budget *migrationbudget
 		ticker := time.NewTicker(rf3MigrationPressureSampleInterval)
 		defer ticker.Stop()
 		baseline := sequencer.Stats()
+		// Foreground and migration share this process's CPUs; scheduling
+		// latency is the direct measure of their contention.
+		scheduling := migrationbudget.NewSchedulingLatencyProbe()
 		sequence := uint64(1)
 		budget.ApplyPressure(migrationbudget.PressureSample{
 			Sequence: sequence, Timestamp: time.Now(), QueueDepth: baseline.QueueDepth,
@@ -37,6 +40,7 @@ func (owner *rf3NodeOwner) startMigrationPressureSampler(budget *migrationbudget
 					BackpressureSubmissions: counterDelta(current.BackpressureSubmissions, baseline.BackpressureSubmissions),
 					ReadyQueueWaitNanos:     counterDelta(current.ReadyQueueWaitNanos, baseline.ReadyQueueWaitNanos),
 					ReadySubmissions:        counterDelta(current.ReadySubmissions, baseline.ReadySubmissions),
+					SchedulingLatencyNanos:  scheduling.P99Nanos(),
 				})
 				baseline = current
 			case <-stop:

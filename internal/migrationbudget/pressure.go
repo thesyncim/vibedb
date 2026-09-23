@@ -37,11 +37,16 @@ func (controller *pressureController) apply(sample PressureSample) (uint32, uint
 	if waitPressure > pressureScaleMax {
 		waitPressure = pressureScaleMax
 	}
+	schedulingPressure := uint32(0)
+	if controller.config.SevereSchedulingNanos != 0 {
+		schedulingPressure = waitRatio(sample.SchedulingLatencyNanos, controller.config.SevereSchedulingNanos)
+	}
 	if sample.Initial {
 		controller.state.Sequence = sample.Sequence
 		controller.state.Timestamp = sample.Timestamp
 		controller.state.QueuePressurePPM = queuePressure
 		controller.state.WaitPressurePPM = waitPressure
+		controller.state.SchedulingPressurePPM = schedulingPressure
 		controller.state.BackpressureSubmissions = sample.BackpressureSubmissions
 		controller.state.BackpressureTotal = sample.BackpressureSubmissions
 		if controller.state.ScalePPM == 0 {
@@ -59,6 +64,7 @@ func (controller *pressureController) apply(sample PressureSample) (uint32, uint
 	controller.state.Timestamp = sample.Timestamp
 	controller.state.QueuePressurePPM = queuePressure
 	controller.state.WaitPressurePPM = waitPressure
+	controller.state.SchedulingPressurePPM = schedulingPressure
 	controller.state.BackpressureSubmissions = sample.BackpressureSubmissions
 	if sample.BackpressureSubmissions > ^uint64(0)-controller.state.BackpressureTotal {
 		controller.state.BackpressureTotal = ^uint64(0)
@@ -66,13 +72,16 @@ func (controller *pressureController) apply(sample PressureSample) (uint32, uint
 		controller.state.BackpressureTotal += sample.BackpressureSubmissions
 	}
 
-	high := sample.BackpressureSubmissions != 0 ||
+	// CPU contention downshifts but never pauses: it is not counted as severe.
+	schedulingHigh := controller.config.SevereSchedulingNanos != 0 &&
+		schedulingPressure >= pressureRatio(controller.config.HighSchedulingNanos, controller.config.SevereSchedulingNanos)
+	high := sample.BackpressureSubmissions != 0 || schedulingHigh ||
 		queuePressure >= controller.config.HighQueuePPM ||
 		waitPressure >= pressureRatio(controller.config.HighWaitNanos, controller.config.SevereWaitNanos)
 	severe := sample.BackpressureSubmissions != 0 ||
 		queuePressure >= controller.config.SevereQueuePPM ||
 		waitPressure >= pressureScaleMax
-	low := sample.BackpressureSubmissions == 0 &&
+	low := sample.BackpressureSubmissions == 0 && !schedulingHigh &&
 		queuePressure <= controller.config.LowQueuePPM &&
 		waitPressure < pressureRatio(controller.config.HighWaitNanos, controller.config.SevereWaitNanos)
 
