@@ -853,9 +853,10 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 	compact := topK
 	scanRows := len(w.storeRows)
 	var masks []store.Mask
+	var maskExact bool
 	if !topK {
 		var err error
-		masks, err = p.storeCandidateMasks(snapshot, w)
+		masks, maskExact, err = p.storeCandidateMasksMode(snapshot, w, false)
 		if err != nil {
 			return err
 		}
@@ -935,15 +936,23 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 	}
 	var selected []int
 	var err error
-	if w.tinTopKUsed && !p.hasSQLJoinComparison() && !p.runtimeSQLPaths && len(p.joins) == 0 &&
+	// A lone ==> over an exact mask is verdict-proven twice: the top-K
+	// restriction ranked exactly the admitted rows, and an exact
+	// candidate mask enumerates exactly them (state-keyed index,
+	// injective slot addresses, Match/transient differential). Either
+	// way every scanned row keeps, so the identity selection skips the
+	// per-row re-tokenize. Compact is load-bearing for the mask half:
+	// only compact mode enumerates the verdict set in storeRows; a
+	// non-compact scan leaves storeRows empty and filters by mask probe
+	// plus recheck, so it stays on the rechecked path.
+	proven := w.tinTopKUsed || (compact && maskExact && masks != nil)
+	if proven && !p.hasSQLJoinComparison() && !p.runtimeSQLPaths && len(p.joins) == 0 &&
 		p.where != nil && p.where.kind == predMatch && len(p.where.kids) == 0 {
-		// The index restriction ranked exactly the rows the lone ==>
-		// verdict admits, so every scanned row keeps: extract the filter
-		// columns the later stages still read and take the identity
-		// selection, skipping the per-row re-tokenize. The shape guards
-		// re-prove the pushdown contract locally (no joins, no runtime
-		// path domains, a bare match predicate), so a plan that ever
-		// diverges from its spec falls back to the rechecked scan.
+		// Extract the filter columns the later stages still read and
+		// take the identity selection. The shape guards re-prove the
+		// pushdown contract locally (no joins, no runtime path domains,
+		// a bare match predicate), so a plan that ever diverges from
+		// its spec falls back to the rechecked scan.
 		if err := ctx.extractSnapshotValues(p, snapshot, p.filterCols, w.storeRows, compact, &w.text, w); err != nil {
 			return err
 		}

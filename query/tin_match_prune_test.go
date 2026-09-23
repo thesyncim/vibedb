@@ -4,15 +4,18 @@ import (
 	"math/bits"
 	"slices"
 	"testing"
+
+	"github.com/thesyncim/vibedb/store"
 )
 
 // ==> prunes heap snapshot scans with the slot's generation-pinned tin
-// postings instead of testing every row. The filter phase still rechecks
-// every candidate, so these tests prove two things separately: the query
-// answers stay exactly the hand-derived expectations, and the candidate
-// masks the planner produced are exactly the matching set (narrower than
-// the full scan, empty for a no-hit query, declining to nil without a
-// binding).
+// postings instead of testing every row. A lone ==> over an exact,
+// compact mask skips the recheck outright (identity selection); every
+// other shape still rechecks each candidate, so these tests prove two
+// things separately: the query answers stay exactly the hand-derived
+// expectations, and the candidate masks the planner produced are exactly
+// the matching set (narrower than the full scan, empty for a no-hit
+// query, declining to nil without a binding).
 func TestSQLMatchPrunesHeapSnapshotScan(t *testing.T) {
 	db := tinMatchDatabase(t, true)
 	catalog := db.Snapshot()
@@ -88,8 +91,10 @@ func TestSQLMatchPrunesHeapSnapshotScan(t *testing.T) {
 
 // Boolean combinations prune through the shared combinators: one postable
 // ==> conjunct narrows an AND, and an OR prunes when every disjunct is a
-// bounded ==> leaf. NOT ==> keeps the full scan — complementing a pruned
-// set is not selective — while still answering exactly.
+// bounded ==> leaf. NOT ==> prunes to the live complement and rechecks —
+// the complement is a superset (non-string bodies fall out under
+// three-valued logic), so it narrows but never answers directly — while
+// still answering exactly.
 func TestSQLMatchPrunesBooleanCombinations(t *testing.T) {
 	db := tinMatchDatabase(t, true)
 	catalog := db.Snapshot()
@@ -103,6 +108,7 @@ func TestSQLMatchPrunesBooleanCombinations(t *testing.T) {
 		sql    string
 		want   []string
 		pruned bool
+		bits   int
 	}{
 		{
 			name:   "and-both-match",
@@ -133,11 +139,17 @@ func TestSQLMatchPrunesBooleanCombinations(t *testing.T) {
 			pruned: false,
 		},
 		{
-			name:   "not-stays-full",
+			// NOT prunes to the live complement of the exact child set
+			// (d002, d004, d005, d006, d008) and rechecks: the numeric,
+			// missing, and empty bodies fall out under three-valued
+			// logic, leaving d002, d006, d008. The complement is a
+			// superset prune, never a direct answer.
+			name:   "not-prunes-complement",
 			q:      Select(Path("id")).Where(Not(Match("body", "luxury"))).OrderBy("id", Asc),
 			sql:    `SELECT o.id FROM docs AS o WHERE NOT o.body ==> 'luxury' ORDER BY o.id`,
 			want:   []string{"d002", "d006", "d008"},
-			pruned: false,
+			pruned: true,
+			bits:   5,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -170,6 +182,15 @@ func TestSQLMatchPrunesBooleanCombinations(t *testing.T) {
 			if !tc.pruned && masks != nil {
 				t.Fatalf("unbounded combination pruned to %d masks", len(masks))
 			}
+			if tc.bits > 0 {
+				count := 0
+				for _, mask := range masks {
+					count += bits.OnesCount64(mask.Bits)
+				}
+				if count != tc.bits {
+					t.Fatalf("masks cover %d rows, want %d", count, tc.bits)
+				}
+			}
 		})
 	}
 }
@@ -195,5 +216,86 @@ func TestSQLMatchPruningDeclinesUnbound(t *testing.T) {
 	}
 	if masks != nil {
 		t.Fatalf("unbound ==> pruned to %d masks, want the full scan", len(masks))
+	}
+}
+
+// TestSQLMatchExactSkipCoversMutations proves the recheck skip stays exact
+// when the snapshot moved under the index: a delete, an update, and
+// non-string bodies share the corpus with live text rows. Every query is a
+// lone ==> outside the top-K restriction (non-score orders, with and without
+// LIMIT), so compact shapes take the identity selection while unselective
+// ones keep the rechecked scan; both must answer the hand-derived sets.
+func TestSQLMatchExactSkipCoversMutations(t *testing.T) {
+	db := &store.Database{}
+	coll, err := db.CreateCollection("docs", store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(key, body string) {
+		t.Helper()
+		doc := `{"id":"` + key + `","body":` + body + `}`
+		if _, err := coll.Put(key, []byte(doc)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("k1", `"alpha beta"`)
+	put("k2", `"alpha gamma"`)
+	put("k3", `"beta gamma delta"`)
+	put("k4", `"alpha alpha beta"`)
+	put("k5", `7`)
+	put("k6", `"beta"`)
+	put("k7", `"alpha zeta"`)
+	put("k8", `"beta"`)
+	put("k8", `"alpha epsilon"`)
+	if _, err := coll.Delete("k7"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coll.Put("k9", []byte(`{"id":"k9"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coll.CreateIndex(store.IndexDefinition{
+		Name: "body_tin", Paths: []string{"/body"}, Kind: store.IndexTin,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coll.BackfillIndex("body_tin", 0); err != nil {
+		t.Fatal(err)
+	}
+	catalog := db.Snapshot()
+	for _, tc := range []struct {
+		name  string
+		tinql string
+		order string
+		want  []string
+	}{
+		{name: "and", tinql: "alpha AND beta", order: "ASC", want: []string{"k1", "k4"}},
+		{name: "term-selective", tinql: "epsilon", order: "ASC", want: []string{"k8"}},
+		{name: "term-beta", tinql: "beta", order: "ASC", want: []string{"k1", "k3", "k4", "k6"}},
+		{name: "term-beta-desc-limit", tinql: "beta", order: "DESC LIMIT 2", want: []string{"k6", "k4"}},
+		{name: "phrase", tinql: `"alpha beta"`, order: "ASC", want: []string{"k1", "k4"}},
+		{name: "phrase-slop", tinql: `"alpha beta"~1`, order: "ASC", want: []string{"k1", "k4"}},
+		{name: "near", tinql: "alpha NEAR/1 beta", order: "ASC", want: []string{"k1", "k4"}},
+		{name: "or", tinql: "epsilon OR delta", order: "ASC", want: []string{"k3", "k8"}},
+		{name: "delta", tinql: "delta", order: "ASC", want: []string{"k3"}},
+		{name: "deleted-term", tinql: "zeta", order: "ASC", want: nil},
+		{name: "unselective-alpha", tinql: "alpha", order: "ASC", want: []string{"k1", "k2", "k4", "k8"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			statement, err := PrepareStatement(
+				`SELECT o.id FROM docs AS o WHERE o.body ==> '` + tc.tinql + `' ORDER BY o.id ` + tc.order,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer statement.Release()
+			for _, workers := range []int{0, 4} {
+				exec := Exec{Options: ExecOptions{Workers: workers}}
+				got := tinMatchStatementIDs(t, statement, FromDatabase(catalog, "docs"), &exec)
+				exec.Release()
+				if !slices.Equal(got, tc.want) {
+					t.Fatalf("workers=%d ids=%v want=%v", workers, got, tc.want)
+				}
+			}
+		})
 	}
 }

@@ -494,13 +494,17 @@ func singleColumnTinIndex(path string, indexes []store.IndexInfo) bool {
 // matchCandidateMasks prunes ==> with the slot's generation-pinned tin
 // postings. Match enumerates every document the bound query accepts as DocIDs
 // packing (chunk, slot); folding them into ascending chunk masks feeds the
-// compact scan directly. TestMatchSingleAgreesWithIndex proves the Match set
-// is exactly the per-row verdict set, and the filter phase still rechecks
-// every candidate with evalMatch, so the probe reports exact=false and only
-// ever narrows the scan. A missing or out-of-range slot (an execution that
-// never bound, such as a join inner scan's private workspace) declines to
-// the full scan rather than erroring: an index is an optimization, and the
-// rechecked scan remains exact.
+// compact scan directly. The heap and segmented-heap probes report exact:
+// the index builds from the reading snapshot's own state (state-keyed,
+// immutable), DocIDs are injective (chunk, slot) addresses, and
+// TestMatchSingleAgreesWithIndex proves the Match set is exactly the
+// per-row verdict set — so a lone-==> compact scan over an exact mask
+// skips the evalMatch recheck outright. Compound shapes still recheck through the
+// shared combinators, which AND child exactness down. A missing or
+// out-of-range slot (an execution that never bound, such as a join inner
+// scan's private workspace) declines to the full scan rather than
+// erroring: an index is an optimization, and the rechecked scan remains
+// exact.
 func matchCandidateMasks(
 	p *compiledPredicate, w *Workspace,
 ) ([]store.Mask, bool, bool, error) {
@@ -546,7 +550,7 @@ func matchCandidateMasks(
 			return nil, false, false, nil
 		}
 		w.keepStoreMasks(out)
-		return out, true, false, nil
+		return out, true, true, nil
 	}
 	if p.slot < len(w.matchIndexes) && w.matchIndexes[p.slot] != nil {
 		ix := w.matchIndexes[p.slot]
@@ -563,7 +567,7 @@ func matchCandidateMasks(
 			return nil, false, false, nil
 		}
 		w.keepStoreMasks(out)
-		return out, true, false, nil
+		return out, true, true, nil
 	}
 	// Durable twin: the generation-pinned build maps the same Match
 	// ordinals to stable-slot masks through its live table. Every decline
