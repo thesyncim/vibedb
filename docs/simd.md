@@ -1,4 +1,4 @@
-# SIMD in compressed equality, ordered counts, and extrema
+# SIMD in compressed equality, ordered counts, extrema, and full-text kernels
 
 [Documentation](README.md) / [Design](design/README.md) · [Development status](status.md)
 
@@ -112,6 +112,30 @@ workload reaches the kernel, preserve its scalar oracle, and measure the
 integrated operation. The linked reports tie the measurements to their
 architecture, fixtures, and exact revision pairs.
 
+## Full-text fold and BM25 kernels
+
+The tin full-text engine has two vector kernels under the same build guard,
+`go1.27 && !go1.28 && goexperiment.simd`. The ASCII case fold (string and
+byte variants) folds 16-byte windows; the commit that introduced it recorded
+13.7 GB/s, 6.9x its scalar loop. The BM25 kernel scores document pairs in
+`Float64x2` lanes; its introducing commit recorded 1.79x scalar with zero
+allocations. ARM64 selects both unconditionally because NEON is baseline;
+AMD64 selects them only after the runtime AVX2 check. Every other build
+keeps the scalar fold and BM25 functions.
+
+The fold is exact, so both dispatches produce identical tokens. BM25 is not
+bit-identical across dispatches: compiler FMA fusion changes the scalar
+rounding, so the kernel is gated against scalar at a 1e-12 relative
+tolerance. Within one build, every multi-document scoring path, including an
+odd tail, runs through the same kernel lanes, so a document's score does not
+depend on how its postings were batched or sharded
+(`TestBM25BatchingIndependent`). Single-document scoring (`ScoreSingle`,
+SQL `SCORE()`) uses the scalar spelling.
+
+```sh
+GOEXPERIMENT=nosimd go test ./internal/tin
+```
+
 ## Source map
 
 - [internal/storeio/compact_stream_codec.go](../internal/storeio/compact_stream_codec.go): packed counters and exact stream comparisons.
@@ -132,3 +156,6 @@ architecture, fixtures, and exact revision pairs.
 - [internal/storeio/compact_stream_codec_test.go](../internal/storeio/compact_stream_codec_test.go): all-width and exact-number oracles.
 - [.github/workflows/packed-simd.yml](../.github/workflows/packed-simd.yml): paired native base/candidate evidence lane.
 - [.github/workflows/ci.yml](../.github/workflows/ci.yml): SIMD and portable parity on ARM64 and AMD64.
+- [internal/tin/fold_wide.go](../internal/tin/fold_wide.go) and [internal/tin/bm25_wide.go](../internal/tin/bm25_wide.go): full-text fold and BM25 vector kernels.
+- [internal/tin/fold_enable_arm64.go](../internal/tin/fold_enable_arm64.go) and [internal/tin/fold_enable_amd64.go](../internal/tin/fold_enable_amd64.go): full-text kernel dispatch.
+- [internal/tin/bm25.go](../internal/tin/bm25.go): scalar BM25 and the dispatch point.

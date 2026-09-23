@@ -38,6 +38,7 @@ permit concurrent reuse of one mutable execution workspace.
 | Primary point lookup | Resolve a complete primary key directly. | The source and predicate must support that key shape. |
 | Primary range | Traverse an admitted primary-key interval. | Preserve predicate, ordering, offset, and limit semantics. |
 | Exact secondary index | Probe scalar or compound postings to select candidate rows. | Recheck candidates against document values. |
+| Full-text (tin) index | Bind a generation-pinned tin index, parse TINQL against it, and restrict the scan to its matching documents; `ORDER BY SCORE() ... LIMIT` over a heap snapshot reads only the ranked hits. | Candidates are rechecked unless the index is provably exact for the scanned state (a lone `==>` over a compact heap mask); top-K output equals the full sort's prefix. |
 | Full scan | Visit the source when no admitted shortcut applies. | Charge intermediate and result work; cancellation still applies. |
 | Packed-column count or extrema | Count or reduce eligible compressed values without reconstructing documents. | Exact predicate, encoding, source, and overlay conditions must match. |
 
@@ -115,6 +116,7 @@ become invalid when the session executes again. See the
 | --- | --- |
 | Compilation and execution | [compiler.go](../../query/compiler.go), [execute.go](../../query/execute.go) |
 | Source candidates | [candidates.go](../../query/candidates.go), [store_candidates.go](../../query/store_candidates.go) |
+| Full-text match and scoring | [match.go](../../query/match.go), [match_file.go](../../query/match_file.go), [score.go](../../query/score.go), [tin_topk.go](../../query/tin_topk.go), [internal/tin](../../internal/tin/tin.go) |
 | Explain contract | [explain.go](../../query/explain.go), [explain tests](../../query/explain_test.go) |
 | Joins | [join.go](../../query/join.go), [join tests](../../query/join_test.go) |
 | Exact aggregation | [aggregate.go](../../query/aggregate.go), [exactness tests](../../query/aggregate_exact_test.go) |

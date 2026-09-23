@@ -162,7 +162,7 @@ update this table. A parser accepting a statement does not close a gap.
 | 2 | ALTER and migration lifecycle | 375 ALTER locations. Current ADD COLUMN is insufficient for historical migrations, type/default changes, drops, and index changes. |
 | 2 | Bulk and client/session behavior | 5 COPY and 10 session/catalog locations, plus ORM-generated connection and relation queries not established by static extraction. Requires wire/client tests and bounded bulk ingestion. |
 | 1 before application rollout | Distributed execution parity | Existing RF3 SQL mutation restrictions on ON CONFLICT, RETURNING, non-primary-key mutations, and bounded transactions still apply. Local database/sql success is not evidence that every RF3 path supports a feature. |
-| Excluded | Full-text search | 88 evidence locations retained only to identify the excluded surface. No tsvector/tsquery, ranking, tokenization, or full-text indexes are implemented here. |
+| Excluded | Full-text search | 88 evidence locations retained only to identify the excluded surface. PostgreSQL tsvector/tsquery, their functions, and GIN/GiST full-text indexes are not implemented. VibeDB's own full-text surface (`CREATE INDEX ... USING tin`, `==>`, `SCORE()`; see the [SQL reference](../reference/sql.md)) postdates this audit and uses different syntax, so these locations would need rewriting rather than running unchanged. |
 
 Start with keys and field types because the application's base schemas cannot
 be installed without them. Then qualify JSON/array reads and writes, index

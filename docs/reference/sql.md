@@ -26,7 +26,7 @@ borrows parser-arena storage only until the next parse or release.
 Operators:
 
 ```text
-=  !=  <>  <  <=  >  >=  @>
+=  !=  <>  <  <=  >  >=  @>  ==>
 +  -  *  /  %  ||  ::  ->  ->>
 ```
 
@@ -40,7 +40,7 @@ parameters are not part of the SQL parser.
 | Query | SELECT, VALUES, TABLE, UNION, INTERSECT, EXCEPT, EXPLAIN `[ANALYZE]` query |
 | DML | INSERT, UPDATE, DELETE; optional RETURNING |
 | Tables | CREATE TABLE, ALTER TABLE ADD COLUMN, DROP TABLE, TRUNCATE |
-| Indexes | CREATE `[UNIQUE]` INDEX, DROP INDEX |
+| Indexes | CREATE `[UNIQUE]` INDEX, CREATE INDEX ... USING tin, DROP INDEX |
 | Views | CREATE VIEW, DROP VIEW; read-only queries |
 | Savepoints | SAVEPOINT, RELEASE, ROLLBACK TO |
 | Wire-only transaction commands | BEGIN/START TRANSACTION, COMMIT, ROLLBACK |
@@ -100,10 +100,16 @@ non-null tuples. Index sort direction, expressions, predicates, collations,
 and INCLUDE are unsupported, as are USING methods other than `tin`.
 
 `USING tin` builds a full-text index over exactly one text path, for use
-with the `==>` predicate. Both in-memory and durable collections catalog
-tin indexes; on a durable collection the declaration publishes in a
-catalog-only generation and each generation's postings build lazily on
-first query use.
+with the `==>` predicate and `SCORE()`. Both in-memory and durable
+collections catalog tin indexes. On a durable collection the declaration
+publishes in a catalog-only generation (no scan or repartition), and each
+generation's postings build lazily on first query use and are then sealed
+into compressed blocks. `CREATE UNIQUE INDEX ... USING tin` is refused, a
+duplicate name fails unless `IF NOT EXISTS` is given, and a declaration over
+a path no document has is legal and matches nothing. A durable catalog holds
+at most 64 tin declarations. Declarations survive reopen, TRUNCATE, and the
+replicated RF3 schema image; DROP INDEX removes the declaration, after which
+`==>` over that path is a statement error.
 
 DROP TABLE/INDEX and TRUNCATE reject multiple objects, CASCADE/RESTRICT, and
 identity options. A table with dependent views cannot be dropped until its
@@ -307,29 +313,68 @@ SELECT id FROM docs WHERE body ==> 'luxury AND goods' ORDER BY id;
 ```
 
 `path ==> 'tinql'` tests the string at path against a TINQL full-text
-query: terms, wildcards, fuzzy match, phrases, boolean operators, and
-proximity. The path needs a tin index (exactly one text path, created with
-`USING tin`); without one the statement reports which path is missing it.
-Non-string, null, and absent values never match, and under `NOT` only string
-rows can fail the match, exactly like `LIKE`. The query parses against the
-executing snapshot's index, so a prepared statement sees each snapshot's own
-terms. Full-text match currently executes over in-memory collection
-snapshots; other sources reject it.
+query. The path needs a tin index (exactly one text path, created with
+`USING tin`); without one the statement reports which path is missing it,
+and an invalid query is a statement error. The right side may be a
+parameter. Non-string, null, and absent values never match, and under `NOT`
+only string rows can fail the match, exactly like `LIKE`. The query parses
+against the executing snapshot's index, so wildcard and fuzzy expansions see
+that snapshot's dictionary and a prepared statement sees each snapshot's own
+terms.
+
+`==>` executes over in-memory and durable collections. On a durable
+collection inside a transaction, a `==>` over a collection with staged,
+uncommitted writes is refused (the postings describe the committed
+generation, not the pending overlay), as is `==>` in a join inner plan or
+correlated subquery on that overlay path. Other sources without a tin
+catalog, such as bare segments and validated raw sources, reject `==>` with
+a statement error rather than answering an unbound non-match.
+
+TINQL follows the published PlanetScale TINQL reference; the parser's parity
+suite pins each documented rule. Text is folded for case and accents before
+matching.
+
+| Form | Examples |
+| --- | --- |
+| Terms, implicit AND, boolean | `luxury goods`, `a AND b`, `a OR b`, `a AND NOT b`, `(a OR b) c` |
+| Phrases, slop, gaps, per-position alternatives | `"fuji apple"`, `"fuji apple"~1`, `"xy [a b] z"` |
+| Wildcards, fuzzy, regular expressions, ranges | `brew*`, `apple~1`, `apple~0:1`, `(MATCHES hop.*s)`, `aardvark TO cat` |
+| Counting | `AT LEAST 2 OF [alpha beta gamma]`, `AT LEAST 50% OF [a b c d]`, `ALL OF [a b]` |
+| Proximity and order | `a NEAR/3 b`, `a THEN/0 b`, `(a OR b) WITHIN 4`, `a BEFORE b` |
+| Span relations | `(security NEAR/10 threat) ENCLOSES critical`, `apple ENCLOSED BY (apple NEAR/1 fuji)` |
+| Positional filters | `apple IN WORDS 1 TO 3` (1-based), `apple IN FIRST 5 WORDS`, `a IN LAST 25 %` |
+| Spelling-only match and boosts | `CONTAINS beer~1`, `"alpha beta"^1.5` |
+
+Numeric arguments must fit an unsigned 32-bit integer; boosts lie in
+`[0, 10000]`.
 
 `SCORE()` in the SELECT list, `ORDER BY`, or `WHERE` reports the row's BM25
 relevance for the statement's `==>` query, or 0 when the row does not match.
-A statement needs exactly one `==>` predicate to score: with none, or with
-several, the prepare fails instead of guessing which query ranks the rows.
-Only string values score; non-string, null, and absent values score 0, the
-same rows `==>` declines to match. `ORDER BY SCORE() DESC` ranks best first,
-and `WHERE SCORE() > cutoff` keeps only rows clearing a relevance bar.
+A statement needs exactly one `==>` predicate, in the top-level WHERE, to
+score: with none, with several, or with the only one inside a join or
+subquery, the prepare fails instead of guessing which query ranks the rows.
+`SCORE()` over a set operation or with GROUP BY/aggregates is not supported
+yet. Only string values score; non-string, null, and absent values score 0,
+the same rows `==>` declines to match. `ORDER BY SCORE() DESC` ranks best
+first, and `WHERE SCORE() > cutoff` keeps only rows clearing a relevance bar.
 Statistics refresh per execution against the executing snapshot, so scores
-track each snapshot's own term frequencies, and warm executions allocate
-nothing beyond what the `==>` match itself already spends.
+track each snapshot's own term frequencies. `SCORE` is a function only when
+followed by `(`; a bare `score` remains an ordinary field name, so
+`WHERE id = score` still compares two paths.
 
 ```sql
-SELECT id, SCORE() FROM docs WHERE body ==> 'luxury AND goods' ORDER BY SCORE() DESC;
+SELECT id, SCORE() FROM docs WHERE body ==> 'luxury AND goods' ORDER BY SCORE() DESC LIMIT 10;
 ```
+
+On an in-memory collection, a lone `==>` with a single `ORDER BY SCORE()`
+key and a LIMIT reads the index's ranked hits instead of scanning and sorting
+every row; the output is identical to the full sort's prefix, ties included.
+Snapshots of at least 32,768 documents on runtimes with two or more workers
+search up to eight index segments in parallel under one shared statistics
+view, so scores and rankings match the single index exactly. Descending
+term and all-term AND queries use the segments; ascending order uses them
+only for a lone term. Other `==>` statements use the index to restrict the
+scan to candidate rows on both collection kinds.
 
 `IS NULL` is true for explicit JSON null and an absent path. `IS MISSING` is
 true only for absence. Projection and wire encoding render both as SQL NULL.
@@ -470,4 +515,5 @@ triggers, policies, sequences, materialized views, and replication are outside t
 - CTE/set/window: [sql/parse_cte.go](../../sql/parse_cte.go), [sql/recursive_cte.go](../../sql/recursive_cte.go), [sql/set.go](../../sql/set.go), [sql/parser.go](../../sql/parser.go)
 - DML and RF3 images: [sql/parse_dml.go](../../sql/parse_dml.go), [sql/driver/write.go](../../sql/driver/write.go), [gateway/replicated_sql_transaction.go](../../gateway/replicated_sql_transaction.go)
 - DDL/views: [sql/parse_ddl.go](../../sql/parse_ddl.go), [sql/parse_drop.go](../../sql/parse_drop.go), [sql/parse_view.go](../../sql/parse_view.go)
+- Full text: [internal/tin/parse.go](../../internal/tin/parse.go), [query/match.go](../../query/match.go), [query/match_file.go](../../query/match_file.go), [query/score.go](../../query/score.go), [query/tin_topk.go](../../query/tin_topk.go), [sql/driver/tin_fulltext_test.go](../../sql/driver/tin_fulltext_test.go)
 - Runtime transactions: [sql/driver/tx.go](../../sql/driver/tx.go), [sql/driver/savepoint.go](../../sql/driver/savepoint.go)

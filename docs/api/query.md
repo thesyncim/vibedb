@@ -193,7 +193,11 @@ are two-valued, while SQL statements use three-valued logic.
 - `Match(path, tinql)` tests the string at path against a TINQL full-text
   query. Non-string, null, and absent values do not match. Execution
   requires a tin index over the path and parses the query against that
-  snapshot's index, so expansions stay pinned to the scanned state.
+  snapshot's index, so expansions stay pinned to the scanned state. Heap
+  and durable (`FromFile`) snapshots both bind it and use the index to
+  restrict the scan; a durable overlay with pending writes, bare segments,
+  and raw sources reject it with an error. See the
+  [SQL reference](../reference/sql.md) for the TINQL surface and `SCORE()`.
 - Numbers compare by exact decimal value, including integers beyond the exact
   `float64` range.
 - ORDER BY and GROUP BY use the defined total order null, bool, number, string,
