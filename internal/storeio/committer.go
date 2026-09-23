@@ -998,16 +998,21 @@ func (c *Committer) Wait(generation uint64) error {
 	c.waiters.Add(1)
 	defer c.waiters.Add(-1)
 	c.waitMu.Lock()
-	defer c.waitMu.Unlock()
 	for {
 		if failure := c.failure.Load(); failure != nil {
+			// The failing worker broadcasts under waitMu before it drains and
+			// signals failureNotified. Waiting for that signal while holding
+			// waitMu would deadlock the worker and this waiter forever.
+			c.waitMu.Unlock()
 			return c.waitFailure(failure)
 		}
 		if c.settled.Load() >= generation {
+			c.waitMu.Unlock()
 			return nil
 		}
 		select {
 		case <-c.done:
+			c.waitMu.Unlock()
 			return ErrClosed
 		default:
 		}
