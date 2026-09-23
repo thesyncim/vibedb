@@ -81,113 +81,86 @@ func TestSealWireRoundTrip(t *testing.T) {
 	}
 }
 
-// encodeSealedV1 emits the pre-packing wire layout for s with raw bases
-// from open: the exact historical bytes a v1 node would ship. It pins the
-// rolling-upgrade reader against the old layout, never today's marshal.
-func encodeSealedV1(t *testing.T, s *sealedPostings, open *postings) []byte {
-	t.Helper()
-	var out []byte
-	putU32 := func(v uint32) {
-		out = append(out, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+// TestSealSaturatedCheckpoint proves the 0xFFFF checkpoint escape stays
+// exact: 64 documents with 2500 occurrences each pack 2499 gap bits per
+// row, so anchors past row 16 saturate. Saturated rows must still decode
+// bit-identical positions through the rewalk path, round-trip byte-stable,
+// and agree with the open twin on term, phrase, and boosted queries.
+func TestSealSaturatedCheckpoint(t *testing.T) {
+	const docs, per = 64, 2500
+	body := strings.Repeat("zarg ", per)
+	texts := make(map[DocID]string, docs)
+	for i := 0; i < docs; i++ {
+		texts[DocID(1+i)] = body
 	}
-	putU64 := func(v uint64) {
-		putU32(uint32(v))
-		putU32(uint32(v >> 32))
-	}
-	out = append(out, sealWireMagic...)
-	out = append(out, sealWireVersion1)
-	putU32(s.n)
-	putU64(s.occ)
-	putU32(uint32(len(s.blk)))
-	for _, f := range s.first {
-		putU64(f)
-	}
-	for i := range s.blk {
-		bl := &s.blk[i]
-		putU32(bl.rows)
-		out = append(out, bl.idW, bl.cntW, bl.posW)
-		putU32(bl.idOff)
-		putU32(bl.cntOff)
-		putU32(bl.posOff)
-		for _, c := range bl.posCkpt {
-			putU32(c)
+	open, sealed := sealTwin(t, texts)
+	var term uint64
+	var s *sealedPostings
+	for h, p := range sealed.post {
+		if p.sealed != nil && p.sealed.n == docs {
+			term, s = h, p.sealed
 		}
 	}
-	putStream := func(w []uint32) {
-		putU32(uint32(len(w)))
-		for _, v := range w {
-			putU32(v)
+	if s == nil {
+		t.Fatal("zarg list did not seal")
+	}
+	saturated := false
+	for _, c := range s.blk[0].posCkpt {
+		if c == 0xFFFF {
+			saturated = true
 		}
 	}
-	putStream(s.ids)
-	putStream(s.cnts)
-	raw := make([]uint32, 0, s.n)
-	for g := 0; g < int(s.n); g++ {
-		raw = append(raw, open.pos[open.off[g]])
+	if !saturated {
+		t.Fatal("no checkpoint saturated, test is vacuous")
 	}
-	putStream(raw)
-	putStream(s.pos)
-	return out
-}
-
-// TestSealWireV1Compat proves a v1 shipment decodes to a queryable list:
-// every sealed list re-encoded in the pre-packing layout must decode and
-// agree with the v2 twin over the whole operator corpus (phrases and
-// proximity exercise packed-base seeks through the width-32 synthesis),
-// and the v1 wire must be larger on position-small corpora, proving the
-// packing saves space.
-func TestSealWireV1Compat(t *testing.T) {
-	open, sealed := sealTwin(t, sealedCorpusDocs())
-	// Raw bases come from the open twin, whose rows must sort into the
-	// sealed row order first (map-order Adds append unsorted).
-	open.mu.Lock()
-	open.ensureSorted()
-	open.mu.Unlock()
-	v1count := 0
-	var v1total, v2total int
-	for term, p := range sealed.post {
-		if p.sealed == nil {
-			continue
+	w, err := MarshalSealed(s)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	rt, err := UnmarshalSealed(w)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(rt, s) {
+		t.Fatal("round trip changed saturated structure")
+	}
+	w2, err := MarshalSealed(rt)
+	if err != nil || !bytes.Equal(w, w2) {
+		t.Fatal("remarshal unstable")
+	}
+	// Positions through saturated rows must match the open twin
+	// exactly, including a doc past the first saturated anchor.
+	op := open.post[term]
+	for _, doc := range []DocID{1, 33, 64} {
+		got, _, ok := sealed.sealedRowPositions(s, doc, nil)
+		if !ok {
+			t.Fatalf("doc %d: positions missing", doc)
 		}
-		op := open.post[term]
-		if op == nil {
-			t.Fatalf("term %x missing from open twin", term)
+		var want []uint32
+		for g, id := range op.ids {
+			if id == doc {
+				want = op.pos[op.off[g]:op.off[g+1]]
+				break
+			}
 		}
-		v1 := encodeSealedV1(t, p.sealed, op)
-		v2, err := MarshalSealed(p.sealed)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("doc %d: %d positions, want %d", doc, len(got), len(want))
+		}
+	}
+	for _, input := range []string{`zarg`, `"zarg zarg"`, `zarg^2`} {
+		qs, err := sealed.ParseTINQL(input)
 		if err != nil {
-			t.Fatalf("term %x: marshal: %v", term, err)
+			t.Fatalf("sealed parse %q: %v", input, err)
 		}
-		// Per-list v2 can cost up to 5 directory bytes more than v1
-		// when a tiny list's bases round up to whole words; the
-		// packing win is aggregate, and the adopt-if-smaller policy
-		// still pins every list against open.
-		v1total += len(v1)
-		v2total += len(v2)
-		s1, err := UnmarshalSealed(v1)
+		qo, err := open.ParseTINQL(input)
 		if err != nil {
-			t.Fatalf("term %x: v1 unmarshal: %v", term, err)
+			t.Fatalf("open parse %q: %v", input, err)
 		}
-		p.sealed = s1
-		v1count++
-	}
-	if v1count == 0 {
-		t.Fatal("no sealed lists for v1 compat")
-	}
-	if v1total <= v2total {
-		t.Fatalf("v1 wire %d bytes <= v2 %d, want larger", v1total, v2total)
-	}
-	t.Logf("v1 wire %d bytes vs v2 %d (%.2fx)", v1total, v2total, float64(v1total)/float64(v2total))
-	for _, input := range scoreCorpusInputs {
-		q, err := open.ParseTINQL(input)
-		if err != nil {
-			t.Fatalf("ParseTINQL(%q): %v", input, err)
+		if got, want := matchString(sealed, qs), matchString(open, qo); got != want {
+			t.Fatalf("%q match differs", input)
 		}
-		if got, want := matchString(sealed, q), matchString(open, q); got != want {
-			t.Fatalf("%q match:\n v1 %s\n open %s", input, got, want)
-		}
-		if got, want := scoreString(sealed, q), scoreString(open, q); got != want {
-			t.Fatalf("%q score:\n v1 %s\n open %s", input, got, want)
+		if got, want := scoreString(sealed, qs), scoreString(open, qo); got != want {
+			t.Fatalf("%q score differs", input)
 		}
 	}
 }
@@ -205,7 +178,7 @@ func TestSealWireRejects(t *testing.T) {
 		}
 	}
 	// Field offsets from the layout: header 21, first 8/block,
-	// directory 56/block (rows 4, widths 4, offsets 16, ckpts 32).
+	// directory 37/block (rows 1, widths 4, offsets 16, ckpts 16).
 	blk0 := 21 + 8*nb
 	corrupt := func(mut func([]byte)) []byte {
 		b := bytes.Clone(good)
@@ -213,30 +186,33 @@ func TestSealWireRejects(t *testing.T) {
 		return b
 	}
 	cases := map[string][]byte{
-		"empty":      {},
-		"short":      good[:3],
-		"magic":      corrupt(func(b []byte) { b[0] ^= 0xff }),
-		"version":    corrupt(func(b []byte) { b[4] = 3 }),
-		"versionV1":  corrupt(func(b []byte) { b[4] = 1 }),
+		"empty": {},
+		"short": good[:3],
+		"magic": corrupt(func(b []byte) { b[0] ^= 0xff }),
+		// The format is unreleased: exactly one version exists,
+		// so any other version byte fails closed.
+		"version":    corrupt(func(b []byte) { b[4] = 2 }),
 		"zeroBlocks": corrupt(func(b []byte) { b[17], b[18], b[19], b[20] = 0, 0, 0, 0 }),
 		"hugeBlocks": corrupt(func(b []byte) { b[17], b[18], b[19], b[20] = 0xff, 0xff, 0xff, 0xff }),
-		"zeroWidth":  corrupt(func(b []byte) { b[blk0+4] = 0 }),
-		"wideWidth":  corrupt(func(b []byte) { b[blk0+5] = 33 }),
+		"zeroWidth":  corrupt(func(b []byte) { b[blk0+1] = 0 }),
+		"wideWidth":  corrupt(func(b []byte) { b[blk0+2] = 33 }),
 		// baseW sits fourth in the widths; both directions fail.
-		"zeroBaseWidth": corrupt(func(b []byte) { b[blk0+7] = 0 }),
-		"wideBaseWidth": corrupt(func(b []byte) { b[blk0+7] = 33 }),
-		"badRows":       corrupt(func(b []byte) { b[blk0] ^= 0xff }),
+		"zeroBaseWidth": corrupt(func(b []byte) { b[blk0+4] = 0 }),
+		"wideBaseWidth": corrupt(func(b []byte) { b[blk0+4] = 33 }),
+		// rows rides as rows-1: 0xff decodes to 256 rows, over the
+		// 128-row cap.
+		"badRows": corrupt(func(b []byte) { b[blk0] = 0xff }),
 		"badOff": corrupt(func(b []byte) {
-			b[blk0+8], b[blk0+9], b[blk0+10], b[blk0+11] = 0xff, 0xff, 0xff, 0xff
+			b[blk0+5], b[blk0+6], b[blk0+7], b[blk0+8] = 0xff, 0xff, 0xff, 0xff
 		}),
 		"badBaseOff": corrupt(func(b []byte) {
-			b[blk0+20], b[blk0+21], b[blk0+22], b[blk0+23] = 0xff, 0xff, 0xff, 0xff
+			b[blk0+17], b[blk0+18], b[blk0+19], b[blk0+20] = 0xff, 0xff, 0xff, 0xff
 		}),
 		"truncTail": good[:len(good)-1],
 		"truncMid":  good[:len(good)/2],
 	}
 	// A stream length claiming gigabytes with no bytes behind it.
-	idsLen := blk0 + 56*nb
+	idsLen := blk0 + 37*nb
 	huge := corrupt(func(b []byte) {
 		b[idsLen], b[idsLen+1], b[idsLen+2], b[idsLen+3] = 0xff, 0xff, 0xff, 0xff
 	})

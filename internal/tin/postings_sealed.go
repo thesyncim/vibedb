@@ -28,8 +28,11 @@ import "math/bits"
 const sealedBlockRows = 128
 
 // sealedCkptEvery checkpoints stream bit offsets every 16 rows: 8
-// checkpoints per stream per block (0.5 bytes per document across both
-// streams) bound every random seek to a walk of at most 15 codes.
+// checkpoints per block, each a u16 (0.125 bytes per document), bound
+// every random seek to a walk of at most 15 codes. A block holding more
+// than 64K gap bits saturates a checkpoint at 0xFFFF; the reader then
+// rewalks the counts from the block start, which stays exact (see
+// sealedRowAt). Only colossal single-block position runs land there.
 const sealedCkptEvery = 16
 
 const sealedCkptPerBlock = sealedBlockRows / sealedCkptEvery
@@ -53,15 +56,16 @@ type sealedPostings struct {
 // sealedBlock directories one 128-row block. idW, cntW, posW, baseW are the
 // packed bit widths (1..32); idOff, cntOff, posOff, baseOff are word offsets
 // into the streams; posCkpt holds the delta-stream bit offsets (relative to
-// posOff) of rows 0, 16, ..., 112. Counts and bases need no checkpoints:
-// fixed-width codes seek arithmetically.
+// posOff) of rows 0, 16, ..., 112 as u16, saturating at 0xFFFF (see
+// sealedCkptEvery). Counts and bases need no checkpoints: fixed-width
+// codes seek arithmetically.
 type sealedBlock struct {
 	rows            uint32
 	idW, cntW, posW uint8
 	baseW           uint8
 	idOff, cntOff   uint32
 	posOff, baseOff uint32
-	posCkpt         [sealedCkptPerBlock]uint32
+	posCkpt         [sealedCkptPerBlock]uint16
 }
 
 // bitReader streams fixed-width codes LSB-first out of packed words. The
@@ -214,7 +218,7 @@ func sealPostings(p *postings) *sealedPostings {
 			g := i + start
 			c := freqs[i]
 			if i%sealedCkptEvery == 0 {
-				bl.posCkpt[i/sealedCkptEvery] = posBits
+				bl.posCkpt[i/sealedCkptEvery] = uint16(min(posBits, 0xFFFF))
 			}
 			base := p.off[g]
 			for k := base + 1; k < base+c; k++ {
@@ -234,8 +238,8 @@ func (s *sealedPostings) sealedBytes() uint64 {
 	if s == nil {
 		return 0
 	}
-	// rows(4) + widths(4) + offsets(16) + checkpoints(8x4).
-	const blockDir = 4 + 4 + 16 + sealedCkptPerBlock*4
+	// rows(4) + widths(4) + offsets(16) + checkpoints(8x2).
+	const blockDir = 4 + 4 + 16 + sealedCkptPerBlock*2
 	return uint64(8*len(s.first) +
 		4*(len(s.ids)+len(s.cnts)+len(s.bases)+len(s.pos)) +
 		blockDir*len(s.blk))
@@ -459,7 +463,17 @@ func (ix *Index) sealedRowAt(s *sealedPostings, b, wrow int, out []uint32) []uin
 	c := cnts[wrow]
 	base := bases[wrow]
 	anchor := wrow / sealedCkptEvery * sealedCkptEvery
-	posBit := bl.posCkpt[anchor/sealedCkptEvery]
+	posBit := uint32(bl.posCkpt[anchor/sealedCkptEvery])
+	if posBit == 0xFFFF {
+		// Saturated checkpoint: a block holding more than 64K gap
+		// bits. Rewalk the counts from the block start; the sum is
+		// the exact bit offset, only slower. A genuine 0xFFFF takes
+		// the same path and stays exact too.
+		posBit = 0
+		for i := 0; i < anchor; i++ {
+			posBit += (cnts[i] - 1) * uint32(bl.posW)
+		}
+	}
 	for i := anchor; i < wrow; i++ {
 		posBit += (cnts[i] - 1) * uint32(bl.posW)
 	}

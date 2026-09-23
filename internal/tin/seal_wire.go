@@ -8,15 +8,17 @@ import "fmt"
 // re-indexing, no rescan. Integers are little-endian; slice lengths ride
 // as u32 counts so unmarshal validates before allocating.
 //
-// Version 2 packs the per-document position bases at each block's own
-// width (v1 carried them raw); the reader still accepts v1 for rolling
-// upgrades, synthesizing width-32 raw bases per block.
+// The format is unreleased, so there is exactly one version and no
+// legacy readers: rows ride as rows-1 in one byte (blocks hold 1..128
+// rows), the per-document position bases pack at each block's own width,
+// and the eight position checkpoints ride as u16, saturating at 0xFFFF
+// exactly like the in-memory directory.
 //
-//	magic "tinS" (4) | version u8 (=2)
+//	magic "tinS" (4) | version u8 (=1)
 //	n u32 | occ u64 | nBlocks u32
 //	first[nBlocks] u64
-//	per block: rows u32 | idW cntW posW baseW u8 |
-//	  idOff cntOff posOff baseOff u32 | posCkpt[8] u32
+//	per block: rows-1 u8 | idW cntW posW baseW u8 |
+//	  idOff cntOff posOff baseOff u32 | posCkpt[8] u16
 //	idsLen u32 | ids[] u32 | cntsLen u32 | cnts[] u32 |
 //	basesLen u32 | bases[] u32 | posLen u32 | pos[] u32
 //
@@ -24,15 +26,12 @@ import "fmt"
 // allocation, unmarshal one per slice.
 const (
 	sealWireMagic   = "tinS"
-	sealWireVersion = 2
-	// sealWireVersion1 decodes the pre-packing layout: raw u32 bases,
-	// one per row, with no baseW/baseOff in the block directory.
-	sealWireVersion1 = 1
+	sealWireVersion = 1
 )
 
 // sealWireLen reports the exact marshaled size.
 func sealWireLen(s *sealedPostings) int {
-	const blkDir = 4 + 4 + 16 + sealedCkptPerBlock*4
+	const blkDir = 1 + 4 + 16 + sealedCkptPerBlock*2
 	return 4 + 1 + 4 + 8 + 4 +
 		8*len(s.first) +
 		blkDir*len(s.blk) +
@@ -55,6 +54,9 @@ func MarshalSealed(s *sealedPostings) ([]byte, error) {
 	putU32 := func(v uint32) {
 		out = append(out, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
 	}
+	putU16 := func(v uint16) {
+		out = append(out, byte(v), byte(v>>8))
+	}
 	putU64 := func(v uint64) {
 		putU32(uint32(v))
 		putU32(uint32(v >> 32))
@@ -67,14 +69,14 @@ func MarshalSealed(s *sealedPostings) ([]byte, error) {
 	}
 	for i := range s.blk {
 		bl := &s.blk[i]
-		putU32(bl.rows)
+		out = append(out, byte(bl.rows-1))
 		out = append(out, bl.idW, bl.cntW, bl.posW, bl.baseW)
 		putU32(bl.idOff)
 		putU32(bl.cntOff)
 		putU32(bl.posOff)
 		putU32(bl.baseOff)
 		for _, c := range bl.posCkpt {
-			putU32(c)
+			putU16(c)
 		}
 	}
 	putStream := func(w []uint32) {
@@ -98,11 +100,9 @@ func UnmarshalSealed(b []byte) (*sealedPostings, error) {
 	if string(r.bytes(4)) != sealWireMagic {
 		return nil, fmt.Errorf("tin seal wire: bad magic")
 	}
-	ver := r.byte()
-	if ver != sealWireVersion && ver != sealWireVersion1 {
+	if ver := r.byte(); ver != sealWireVersion {
 		return nil, fmt.Errorf("tin seal wire: bad version")
 	}
-	v1 := ver == sealWireVersion1
 	s := &sealedPostings{}
 	s.n = r.u32()
 	s.occ = r.u64()
@@ -110,13 +110,9 @@ func UnmarshalSealed(b []byte) (*sealedPostings, error) {
 	if r.err != nil {
 		return nil, r.err
 	}
-	// A block costs 8 first-bytes plus a 51-byte (v1) or 56-byte (v2)
-	// directory minimum, so this bounds both makes by the bytes
-	// actually present.
-	minDir := 56
-	if v1 {
-		minDir = 51
-	}
+	// A block costs 8 first-bytes plus a 37-byte directory minimum,
+	// so this bounds both makes by the bytes actually present.
+	const minDir = 8 + 37
 	if nb == 0 || nb > len(r.b)/minDir {
 		return nil, fmt.Errorf("tin seal wire: bad block count %d", nb)
 	}
@@ -128,18 +124,12 @@ func UnmarshalSealed(b []byte) (*sealedPostings, error) {
 	rows := uint64(0)
 	for i := range s.blk {
 		bl := &s.blk[i]
-		bl.rows = r.u32()
-		if v1 {
-			bl.idW, bl.cntW, bl.posW = r.byte(), r.byte(), r.byte()
-			bl.idOff, bl.cntOff = r.u32(), r.u32()
-			bl.posOff = r.u32()
-		} else {
-			bl.idW, bl.cntW, bl.posW, bl.baseW = r.byte(), r.byte(), r.byte(), r.byte()
-			bl.idOff, bl.cntOff = r.u32(), r.u32()
-			bl.posOff, bl.baseOff = r.u32(), r.u32()
-		}
+		bl.rows = uint32(r.byte()) + 1
+		bl.idW, bl.cntW, bl.posW, bl.baseW = r.byte(), r.byte(), r.byte(), r.byte()
+		bl.idOff, bl.cntOff = r.u32(), r.u32()
+		bl.posOff, bl.baseOff = r.u32(), r.u32()
 		for j := range bl.posCkpt {
-			bl.posCkpt[j] = r.u32()
+			bl.posCkpt[j] = r.u16()
 		}
 		if r.err != nil {
 			return nil, r.err
@@ -149,12 +139,7 @@ func UnmarshalSealed(b []byte) (*sealedPostings, error) {
 			bl.posW == 0 || bl.posW > 32 {
 			return nil, fmt.Errorf("tin seal wire: bad block %d", i)
 		}
-		if v1 {
-			// Raw v1 bases read through the same accessors at
-			// full width: block b opens at its first row's word.
-			bl.baseW = 32
-			bl.baseOff = uint32(i * sealedBlockRows)
-		} else if bl.baseW == 0 || bl.baseW > 32 {
+		if bl.baseW == 0 || bl.baseW > 32 {
 			return nil, fmt.Errorf("tin seal wire: bad block %d", i)
 		}
 		rows += uint64(bl.rows)
@@ -192,17 +177,11 @@ func UnmarshalSealed(b []byte) (*sealedPostings, error) {
 	if r.err != nil {
 		return nil, r.err
 	}
-	if v1 {
-		if len(s.bases) != int(s.n) {
-			return nil, fmt.Errorf("tin seal wire: %d bases for %d rows", len(s.bases), s.n)
-		}
-	} else {
-		for i := range s.blk {
-			bl := &s.blk[i]
-			baseEnd := uint64(bl.baseOff) + (uint64(bl.rows)*uint64(bl.baseW)+31)/32
-			if baseEnd > uint64(len(s.bases)) {
-				return nil, fmt.Errorf("tin seal wire: block %d bases escape stream", i)
-			}
+	for i := range s.blk {
+		bl := &s.blk[i]
+		baseEnd := uint64(bl.baseOff) + (uint64(bl.rows)*uint64(bl.baseW)+31)/32
+		if baseEnd > uint64(len(s.bases)) {
+			return nil, fmt.Errorf("tin seal wire: block %d bases escape stream", i)
 		}
 	}
 	for i := range s.blk {
@@ -238,6 +217,13 @@ func (r *sealReader) bytes(n int) []byte {
 func (r *sealReader) byte() uint8 {
 	if v := r.bytes(1); v != nil {
 		return v[0]
+	}
+	return 0
+}
+
+func (r *sealReader) u16() uint16 {
+	if v := r.bytes(2); v != nil {
+		return uint16(v[0]) | uint16(v[1])<<8
 	}
 	return 0
 }
