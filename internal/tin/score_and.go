@@ -103,21 +103,28 @@ func (ix *Index) scoreAndTopKCore(kids []Query, boost float64, topK int, out []S
 	if len(keep) == 0 || nDocs == 0 {
 		return out, true
 	}
-	dl := ix.andDL[:0]
-	for _, d := range keep {
-		dl = append(dl, float64(ix.docLength(d)))
+	// Bulk-extend the staging lanes once per query so the fill loops
+	// below store by index with no per-row bounds checks; sums are
+	// re-zeroed because the scratch persists across calls.
+	dl := extendN(ix.andDL[:0], len(keep))
+	for i, d := range keep {
+		dl[i] = float64(ix.docLength(d))
 	}
-	sums := ix.andSums[:0]
-	for range keep {
-		sums = append(sums, 0)
-	}
+	sums := extendN(ix.andSums[:0], len(keep))
+	clear(sums)
 	for ki, k := range kids {
 		p := lists[ki]
 		ix.andKidScores(p, idf(nDocs, df(k.Term)), avg, k.boostOf(), poss[ki], dl, sums)
 	}
 	h := ix.topHeap[:0]
 	for i, d := range keep {
-		h = heapPush(h, topK, Scored{Doc: d, Score: sums[i] * boost})
+		// heapPush re-checks this first; skipping the call for
+		// rejected rows keeps the hot loop call-free, mirroring the
+		// single-term path.
+		c := Scored{Doc: d, Score: sums[i] * boost}
+		if len(h) < topK || worseScored(h[0], c) {
+			h = heapPush(h, topK, c)
+		}
 	}
 	ix.topHeap = h[:0]
 	ix.andDL, ix.andSums = dl[:0], sums[:0]
@@ -134,12 +141,10 @@ func (ix *Index) andIntersect(lists []*postings) ([]DocID, [][]int) {
 	driver := ix.appendList(ix.andKeep[:0], lists[0])
 	ix.andKeep = driver
 	stride := len(driver)
-	pos := ix.andPos[:0]
-	for range lists {
-		for range stride {
-			pos = append(pos, 0)
-		}
-	}
+	// One bulk extension for all lanes: every slot is overwritten
+	// before any read in the loops below, so no per-slot append
+	// bounds checks and no zeroing.
+	pos := extendN(ix.andPos[:0], len(lists)*stride)
 	ix.andPos = pos
 	lane := func(k int) []int { return pos[k*stride : (k+1)*stride] }
 	for i := range driver {
@@ -148,8 +153,14 @@ func (ix *Index) andIntersect(lists []*postings) ([]DocID, [][]int) {
 	for o := 1; o < len(lists); o++ {
 		l := lists[o]
 		if l.docCount() < gallopRatioGate*len(driver) {
-			other := ix.appendList(ix.andOther[:0], l)
-			ix.andOther = other
+			// The sibling side is read-only in the merge, so an
+			// open list walks in place: only sealed lists pay the
+			// andOther decode.
+			other := l.ids
+			if l.sealed != nil {
+				other = ix.appendList(ix.andOther[:0], l)
+				ix.andOther = other
+			}
 			w, i, j := 0, 0, 0
 			for i < len(driver) && j < len(other) {
 				switch {
@@ -219,31 +230,43 @@ func (ix *Index) listPos(p *postings, doc DocID) (int, bool) {
 	return ix.sealedFindRow(p.sealed, doc)
 }
 
-// andFreqAt seeks one term frequency by list position: arithmetic
-// fixed-width seek sealed, offset difference open. No search involved.
-func (ix *Index) andFreqAt(p *postings, pos int) uint32 {
-	if p.sealed != nil {
-		s := p.sealed
-		bl := &s.blk[pos/sealedBlockRows]
-		wrow := uint32(pos % sealedBlockRows)
-		r := packReaderSeek(s.cnts, bl.cntOff, wrow*uint32(bl.cntW))
-		return r.next(bl.cntW)
-	}
-	return p.off[pos+1] - p.off[pos]
-}
-
 // andKidScores accumulates one term kid's boost-scaled BM25 over keep
 // into sums, reading frequencies by position. Positions below the list's
 // odd tail stage for the kernel; a matched tail runs scalar, exactly
 // like the kernel's own tail.
+// extendN grows s by n elements reusing capacity, allocating only on
+// growth; the caller overwrites every new element before reading, so
+// fill loops store by index with no per-row append bounds checks.
+func extendN[S ~[]E, E any](s S, n int) S {
+	if n > cap(s)-len(s) {
+		ns := make(S, len(s), len(s)+n)
+		copy(ns, s)
+		s = ns
+	}
+	return s[:len(s)+n]
+}
+
 func (ix *Index) andKidScores(p *postings, idfV, avg, kidBoost float64, poss []int, dl, sums []float64) {
-	ptf := ix.andPTF[:0]
-	pdl := ix.andPDL[:0]
-	pidx := ix.andPIdx[:0]
-	for i, pos := range poss {
-		ptf = append(ptf, float64(ix.andFreqAt(p, pos)))
-		pdl = append(pdl, dl[i])
-		pidx = append(pidx, i)
+	// Staging stores by index into one bulk extension: no per-row
+	// append bounds checks. The fill splits by layout so the hot
+	// loops stay call-free (andFreqAt does not inline); both stage
+	// the identical values in keep order.
+	ptf := extendN(ix.andPTF[:0], len(poss))
+	pdl := extendN(ix.andPDL[:0], len(poss))
+	if p.sealed == nil {
+		for i, pos := range poss {
+			ptf[i] = float64(p.off[pos+1] - p.off[pos])
+			pdl[i] = dl[i]
+		}
+	} else {
+		s := p.sealed
+		for i, pos := range poss {
+			bl := &s.blk[pos/sealedBlockRows]
+			wrow := uint32(pos % sealedBlockRows)
+			r := packReaderSeek(s.cnts, bl.cntOff, wrow*uint32(bl.cntW))
+			ptf[i] = float64(r.next(bl.cntW))
+			pdl[i] = dl[i]
+		}
 	}
 	// Every keep document rides the kernel lanes (odd counts pad
 	// inside bm25Scores): lane assignment never depends on list
@@ -252,10 +275,10 @@ func (ix *Index) andKidScores(p *postings, idfV, avg, kidBoost float64, poss []i
 	// measured 1-ulp flips that broke rank identity.
 	if len(ptf) > 0 {
 		sc := bm25Scores(idfV, avg, kidBoost, ptf, pdl, ix.scoreOut[:0])
-		for j, i := range pidx {
-			sums[i] += sc[j]
+		for j := range sc {
+			sums[j] += sc[j]
 		}
 		ix.scoreOut = sc[:0]
 	}
-	ix.andPTF, ix.andPDL, ix.andPIdx = ptf[:0], pdl[:0], pidx[:0]
+	ix.andPTF, ix.andPDL = ptf[:0], pdl[:0]
 }

@@ -73,14 +73,14 @@ type Index struct {
 	// scoring; capacity persists across calls under the index lock.
 	topHeap []Scored
 	// andKeep/andSums/andDL stage a selective AND's intersection, its
-	// accumulated scores, and its lengths; andPTF/andPDL/andPIdx stage
-	// one kid's paired-slot frequencies, lengths, and keep indexes.
+	// accumulated scores, and its lengths; andPTF/andPDL stage one
+	// kid's paired-slot frequencies and lengths, index-aligned with
+	// the keep set so kid scores accumulate in place.
 	andKeep []DocID
 	andSums []float64
 	andDL   []float64
 	andPTF  []float64
 	andPDL  []float64
-	andPIdx []int
 	// andKids stages the shortest-first kid order; andOther stages a
 	// merge-gated sibling decode; andPos/andPoss stage per-list
 	// position lanes for the keep set.

@@ -168,23 +168,27 @@ func (ix *Index) scoreSealedTopK(s *sealedPostings, idfV, avg, boost float64, to
 		cntR := packReaderAt(s.cnts, bl.cntOff)
 		id := DocID(s.first[b])
 		base := len(ids)
-		tf, dl = tf[:0], dl[:0]
+		// Stores by index into one bulk extension per block: the
+		// decode loop carries no append bounds checks.
+		ids = extendN(ids, rows)
+		tf = extendN(tf[:0], rows)
+		dl = extendN(dl[:0], rows)
 		for k := 0; k < rows; k++ {
 			if k > 0 {
 				id += DocID(idR.next(bl.idW))
 			}
 			c := cntR.next(bl.cntW)
-			ids = append(ids, id)
-			tf = append(tf, float64(c))
+			ids[base+k] = id
+			tf[k] = float64(c)
 			key := uint32(uint64(id) >> 32)
 			slot := uint64(id) & 0xffffffff
 			if lok && key == lkey {
 				if d := slot - lbase; d < uint64(len(larr)) {
-					dl = append(dl, float64(larr[d]))
+					dl[k] = float64(larr[d])
 					continue
 				}
 			}
-			dl = append(dl, float64(ix.docLength(id)))
+			dl[k] = float64(ix.docLength(id))
 			lok = ix.lenCacheOK
 			lkey = ix.lenCacheKey
 			larr = ix.lenCacheArr
@@ -229,12 +233,14 @@ func (ix *Index) scoreOpenTopK(p *postings, idfV, avg, boost float64, topK int, 
 		}
 		rows := end - base
 		maxF := uint32(0)
-		tf = tf[:0]
-		dl = dl[:0]
+		// Stores by index into one bulk extension per chunk: the
+		// fill loop carries no append bounds checks.
+		tf = extendN(tf[:0], rows)
+		dl = extendN(dl[:0], rows)
 		for i := 0; i < rows; i++ {
 			id := p.ids[base+i]
 			f := p.off[base+i+1] - p.off[base+i]
-			tf = append(tf, float64(f))
+			tf[i] = float64(f)
 			if f > maxF {
 				maxF = f
 			}
@@ -243,11 +249,11 @@ func (ix *Index) scoreOpenTopK(p *postings, idfV, avg, boost float64, topK int, 
 			slot := uint64(id) & 0xffffffff
 			if lok && key == lkey {
 				if d := slot - lbase; d < uint64(len(larr)) {
-					dl = append(dl, float64(larr[d]))
+					dl[i] = float64(larr[d])
 					continue
 				}
 			}
-			dl = append(dl, float64(ix.docLength(id)))
+			dl[i] = float64(ix.docLength(id))
 			lok = ix.lenCacheOK
 			lkey = ix.lenCacheKey
 			larr = ix.lenCacheArr
