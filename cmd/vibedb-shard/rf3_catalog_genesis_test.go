@@ -495,6 +495,10 @@ func TestRF3CatalogGenesisRetryableTransientOutcomes(t *testing.T) {
 		errors.Join(fmt.Errorf("private command: %w", raftservice.ErrOutcomeUnknown), errRF3CatalogGenesis),
 		raftmodel.ErrReadLeadershipLost,
 		fmt.Errorf("existing catalog read: %w", raftmodel.ErrReadLeadershipLost),
+		// An election during session retirement: the local owner refused the
+		// submission, so the session reports it was not admitted.
+		fmt.Errorf("rf3 catalog genesis session retire: local owner: %w: %w",
+			raftmodel.ErrNotLeader, errors.New("replicated command was not admitted by this invocation")),
 	} {
 		if !rf3CatalogGenesisRetryable(err) {
 			t.Fatalf("transient error %v was not retryable", err)

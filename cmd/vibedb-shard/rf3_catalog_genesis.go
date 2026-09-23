@@ -366,9 +366,9 @@ func (client *rf3LocalCatalogGenesisClient) DoReplicated(
 			candidate.Identity.StoreID == client.store &&
 			candidate.Identity.NodeIncarnation == client.nodeIncarnationValue && candidate.Command == client.command
 	})
-	if err != nil {
-		client.lastSubmitErr = err
-	}
+	// Track only the latest submission, so a stale refusal from an earlier
+	// retry cannot classify a later terminal failure as retryable.
+	client.lastSubmitErr = err
 	if err == nil {
 		applied := result.State.Status.Applied
 		if result.Outcome.AppliedIndex > applied {
@@ -815,7 +815,9 @@ func initializeRF3CatalogGenesisSession(
 	if err = session.RetireReleaseAndDestroy(ctx); err != nil {
 		statusAfterRetireRelease := session.Status()
 		if client.lastSubmitErr != nil {
-			return fmt.Errorf("rf3 catalog genesis session %s: client=%x retry=%x epoch=%d next=%d ack=%d pending=%t active=%t retired=%t released=%t local owner: %v: %w",
+			// Wrap the local owner's refusal: a lost election surfaces here as
+			// NotLeader and must reach the retry classifier, not kill the node.
+			return fmt.Errorf("rf3 catalog genesis session %s: client=%x retry=%x epoch=%d next=%d ack=%d pending=%t active=%t retired=%t released=%t local owner: %w: %w",
 				phase, client.clientID, client.retryHome, statusAfterRetireRelease.Epoch,
 				statusAfterRetireRelease.NextSequence, statusAfterRetireRelease.AckThrough,
 				statusAfterRetireRelease.Pending, statusAfterRetireRelease.Active,

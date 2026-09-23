@@ -933,19 +933,18 @@ func seamlessScaleQueryRetry(ctx context.Context, connection net.Conn, query str
 // Only complete responses proving safe replay may retry. An unknown write or
 // a transport failure must never resubmit SQL under a new durable identity.
 func retrySeamlessScaleSQL(ctx context.Context, readOnly bool, call func(context.Context) (fusedPGResult, error)) (fusedPGResult, uint64, error) {
-	var cancel context.CancelFunc
-	defer func() {
-		if cancel != nil {
-			cancel()
-		}
-	}()
+	// The recovery deadline is armed only once a retryable response proves a
+	// replay is safe; the first attempt runs under the caller's context.
+	armed := false
 	for attempt := uint64(0); ; attempt++ {
 		result, err := call(ctx)
 		if err != nil || !seamlessScaleSQLRetryable(result, readOnly) {
 			return result, attempt, err
 		}
-		if cancel == nil {
-			ctx, cancel = context.WithTimeout(ctx, seamlessScaleRecoveryBudget)
+		if !armed {
+			recovery, cancel := context.WithTimeout(ctx, seamlessScaleRecoveryBudget)
+			defer cancel()
+			ctx, armed = recovery, true
 		}
 		last := fmt.Errorf("transient PostgreSQL response %s: %s", result.code, result.message)
 		if err := fusedWaitRetry(ctx, seamlessScaleRetryDelay(attempt)); err != nil {
@@ -993,12 +992,9 @@ func (workload *seamlessScaleWorkload) gatewayRead(ctx context.Context, connecti
 	if err != nil {
 		return fusedPGResult{}, 0, err
 	}
-	var cancel context.CancelFunc
-	defer func() {
-		if cancel != nil {
-			cancel()
-		}
-	}()
+	// The recovery deadline is armed only once a retryable response proves a
+	// replay is safe; the first attempt runs under the caller's context.
+	armed := false
 	for attempt := uint64(0); ; attempt++ {
 		startedIO = true
 		if err := connection.gate.SetDeadline(minFusedDeadline(ctx, time.Now().Add(seamlessScaleRecoveryBudget))); err != nil {
@@ -1018,8 +1014,10 @@ func (workload *seamlessScaleWorkload) gatewayRead(ctx context.Context, connecti
 		if !durableRF3ExternalRetryableResponse(response) {
 			return fusedPGResult{}, attempt, last
 		}
-		if cancel == nil {
-			ctx, cancel = context.WithTimeout(ctx, seamlessScaleRecoveryBudget)
+		if !armed {
+			recovery, cancel := context.WithTimeout(ctx, seamlessScaleRecoveryBudget)
+			defer cancel()
+			ctx, armed = recovery, true
 		}
 		if err := fusedWaitRetry(ctx, seamlessScaleRetryDelay(attempt)); err != nil {
 			return fusedPGResult{}, attempt + 1, errors.Join(last, err)

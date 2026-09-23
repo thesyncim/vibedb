@@ -69,6 +69,9 @@ type postgresDirectPool struct {
 	service  postgresDurableService
 	prepared postgresPreparedDirectService
 	slots    chan *postgresDirectSlot
+	// admissionWindow bounds waiting for catalog convergence after
+	// pre-admission refusals; zero uses preAdmissionWriteRecoveryWindow.
+	admissionWindow time.Duration
 }
 
 func openPostgresDirectPool(path string, authority serviceauthz.Authority, service postgresDurableService) (_ *postgresDirectPool, err error) {
@@ -441,8 +444,11 @@ func (p *postgresDirectPool) Write(ctx context.Context, q gateway.Query) (*gatew
 	}
 	queries := []gateway.Query{owned}
 	const maxAbortedWrites = 8
-	const maxAdmissionRefusals = 12
 	var abortedWrites, admissionRefusals int
+	// Pre-admission refusals persist until the catalog publication for an
+	// applied membership or ownership transition reaches this gateway; wait for
+	// that convergence within a time budget, not a fixed number of probes.
+	var admissionDeadline time.Time
 	for {
 		if err = ctx.Err(); err != nil {
 			return nil, true, err
@@ -478,11 +484,17 @@ func (p *postgresDirectPool) Write(ctx context.Context, q gateway.Query) (*gatew
 			}
 			continue
 		}
-		admissionRefusals++
-		if admissionRefusals == maxAdmissionRefusals {
+		if admissionRefusals == 0 {
+			window := p.admissionWindow
+			if window <= 0 {
+				window = preAdmissionWriteRecoveryWindow
+			}
+			admissionDeadline = time.Now().Add(window)
+		} else if !time.Now().Before(admissionDeadline) {
 			return nil, true, err
 		}
-		timer := time.NewTimer(time.Duration(min(admissionRefusals, 8)) * 25 * time.Millisecond)
+		timer := time.NewTimer(preAdmissionWriteRetryDelay(admissionRefusals))
+		admissionRefusals++
 		select {
 		case <-ctx.Done():
 			timer.Stop()

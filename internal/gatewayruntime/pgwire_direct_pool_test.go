@@ -490,17 +490,23 @@ func TestPostgreSQLDirectRetryBudgetsAndTerminalErrorStayTyped(t *testing.T) {
 	t.Run("admission exhaustion", func(t *testing.T) {
 		s := &directPoolService{}
 		p := testDirectPool(t, s)
+		const window = 300 * time.Millisecond
+		p.admissionWindow = window
 		calls := 0
 		s.execute = func(context.Context, durableExecBatchIdentity, []gateway.Query, *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
 			calls++
 			return durableExecBatchExecuteResult{}, errors.Join(gateway.ErrDurableSQLNotAdmitted, raftservice.ErrServingFence)
 		}
+		started := time.Now()
 		_, _, err := p.Write(t.Context(), gateway.Query{SQL: "UPDATE docs SET n=n+1 WHERE id='a'"})
+		elapsed := time.Since(started)
 		if !errors.Is(err, gateway.ErrDurableSQLNotAdmitted) || errors.Is(err, gateway.ErrDurableSQLAborted) {
 			t.Fatalf("terminal admission refusal error=%v", err)
 		}
-		if calls != 12 {
-			t.Fatalf("execute calls=%d, want 12 admission attempts", calls)
+		// Refusals persist until the catalog converges, so they are retried for
+		// the whole window with capped backoff, then surface typed.
+		if elapsed < window || elapsed > window+time.Second || calls < 3 {
+			t.Fatalf("admission retry elapsed=%s calls=%d, want the %s convergence window", elapsed, calls, window)
 		}
 	})
 

@@ -462,11 +462,17 @@ func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauth
 		errors.Is(err, gateway.ErrDurableSQLNotAdmitted) && w.record.Query == nil && w.poison == nil {
 		return w.writeFresh(ctx, authority, q, gateway.DurableSQLCoordinated)
 	}
-	// A membership publication refuses the prepared fence before Raft admits
-	// the command. The sequence was not consumed. Replan against the refreshed
-	// catalog instead of returning that refusal to the caller.
-	for attempt := 0; attempt < 8 && preAdmissionWriteRetry(err) && w.record.Query == nil && w.poison == nil && ctx.Err() == nil; attempt++ {
-		timer := time.NewTimer(time.Duration(attempt+1) * 20 * time.Millisecond)
+	// A membership or ownership transition refuses the prepared fence before
+	// Raft admits the command, so the sequence was not consumed. Replicas fence
+	// the old route as soon as the transition applies, which precedes the
+	// catalog publication that carries the new route; the refusal persists until
+	// that publication reaches this gateway. Replan against the refreshed
+	// catalog until it converges, bounded by time rather than attempt count so
+	// a slower publication under load is still absorbed.
+	deadline := time.Now().Add(preAdmissionWriteRecoveryWindow)
+	for attempt := 0; preAdmissionWriteRetry(err) && w.record.Query == nil && w.poison == nil &&
+		ctx.Err() == nil && time.Now().Before(deadline); attempt++ {
+		timer := time.NewTimer(preAdmissionWriteRetryDelay(attempt))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -476,6 +482,14 @@ func (w *postgresDurableWriter) Write(ctx context.Context, authority serviceauth
 		result, err = w.writeFresh(ctx, authority, q, mode)
 	}
 	return result, err
+}
+
+const preAdmissionWriteRecoveryWindow = 10 * time.Second
+
+func preAdmissionWriteRetryDelay(attempt int) time.Duration {
+	const initial, ceiling = 20 * time.Millisecond, 250 * time.Millisecond
+	delay := initial << min(attempt, 4)
+	return min(delay, ceiling)
 }
 
 func preAdmissionWriteRetry(err error) bool {
