@@ -63,15 +63,19 @@ const (
 	// When set, a failed qualification moves its temporary state directory to
 	// this path after all process cleanup has run. It is intentionally opt-in
 	// because the directory contains private test credentials and catalogs.
-	seamlessScaleFailureEnvironment  = "VIBEDB_SEAMLESS_SCALE_FAILURE"
-	seamlessScaleWindowDuration      = 10 * time.Second
-	seamlessScaleWatchdogInterval    = 100 * time.Millisecond
-	seamlessScaleWatchdogThreshold   = 2 * time.Second
-	seamlessScaleMinimumSamples      = 10_000
-	seamlessScaleOfferedRate         = 1_200
-	seamlessScaleWorkloadConnections = 16
-	seamlessScaleOperationWait       = 750 * time.Millisecond
-	seamlessScaleRecoveryBudget      = 10 * time.Second
+	seamlessScaleFailureEnvironment = "VIBEDB_SEAMLESS_SCALE_FAILURE"
+	seamlessScaleWindowDuration     = 10 * time.Second
+	seamlessScaleWatchdogInterval   = 100 * time.Millisecond
+	seamlessScaleWatchdogThreshold  = 2 * time.Second
+	seamlessScaleMinimumSamples     = 10_000
+	seamlessScaleOfferedRate        = 1_200
+	// A calibration candidate must complete at least 99% of its offered load
+	// with a bounded arrival queue to count as sustained.
+	seamlessScaleSustainedThroughputPPM = 990_000
+	seamlessScaleSustainedQueueLag      = 500 * time.Millisecond
+	seamlessScaleWorkloadConnections    = 16
+	seamlessScaleOperationWait          = 750 * time.Millisecond
+	seamlessScaleRecoveryBudget         = 10 * time.Second
 	// cluster dev gives node zero the only autonomous topology controller.
 	// Keep the controller and the long-lived survivor gateway running while
 	// this qualification retires each physical node in turn.
@@ -569,10 +573,11 @@ func (workload *seamlessScaleWorkload) WindowSet(ctx context.Context, phase stri
 		return seamlessScalePhaseEvidence{Phase: phase}
 	}
 	var start, end time.Time
-	var scheduled, missed uint64
+	var scheduled, missed, gap uint64
 	var samples []seamlessScaleSample
 	for index := 0; index < count; index++ {
 		window := workload.Window(ctx, phase, duration, rate)
+		gap = max(gap, window.CompletionGapNS)
 		if start.IsZero() || window.StartNS < uint64(start.UnixNano()) {
 			start = time.Unix(0, int64(window.StartNS))
 		}
@@ -592,7 +597,20 @@ func (workload *seamlessScaleWorkload) WindowSet(ctx context.Context, phase stri
 	if start.IsZero() || end.IsZero() {
 		return seamlessScalePhaseEvidence{Phase: phase}
 	}
-	return workload.phaseEvidence(phase, start, end, scheduled, missed, samples)
+	return withinWindowContinuity(workload.phaseEvidence(phase, start, end, scheduled, missed, samples), gap)
+}
+
+// withinWindowContinuity replaces a merged phase's completion gap with the
+// largest gap observed inside any one window. Each window stops arrivals at
+// its deadline and drains in-flight work before the next window schedules,
+// so the gap across a window boundary is roughly one request latency created
+// by the harness itself, not a pause of the system under test.
+func withinWindowContinuity(evidence seamlessScalePhaseEvidence, gap uint64) seamlessScalePhaseEvidence {
+	if gap == 0 && evidence.Completed > 1 {
+		gap = 1
+	}
+	evidence.MaxPauseNS, evidence.CompletionGapNS = gap, gap
+	return evidence
 }
 
 // WindowUntil keeps the same open-loop actor active across an operation wave.
@@ -615,9 +633,18 @@ func (workload *seamlessScaleWorkload) WindowUntil(ctx context.Context, phase st
 // calibrateSeamlessScaleRate selects a sustained rate using the complete five
 // baseline windows. The chosen candidate's entire measurement is the baseline;
 // rejected candidates remain in history and no windows are discarded from it.
+//
+// A candidate is sustained only when the cluster completes essentially all of
+// the offered load without a growing arrival queue. An open-loop actor that
+// offers more than capacity accepts every request yet queues them, so every
+// later latency and continuity measurement would describe the backlog rather
+// than the system (coordinated omission). Candidates descend until one holds.
+// Every candidate keeps each phase above seamlessScaleMinimumSamples.
+var seamlessScaleCalibrationRates = []int{seamlessScaleOfferedRate, 1_000, 800, 600}
+
 func calibrateSeamlessScaleRate(t *testing.T, workload *seamlessScaleWorkload, ctx context.Context) (int, seamlessScalePhaseEvidence) {
 	t.Helper()
-	for _, candidate := range []int{seamlessScaleOfferedRate, 1_000} {
+	for _, candidate := range seamlessScaleCalibrationRates {
 		phase := fmt.Sprintf("calibration-%d", candidate)
 		probe := workload.WindowSet(ctx, phase, 5, seamlessScaleWindowDuration, candidate)
 		t.Logf("scale sustained calibration rate=%d windows=5 scheduled=%d completed=%d errors=%d missed=%d writes=%d reads=%d p99=%s", candidate, probe.Scheduled, probe.Completed, probe.Errors, probe.Missed, probe.AcknowledgedWrites, probe.VerifiedReads, time.Duration(probe.P99NS))
@@ -625,8 +652,13 @@ func calibrateSeamlessScaleRate(t *testing.T, workload *seamlessScaleWorkload, c
 			// Capacity selection must never conceal an operation/data failure.
 			t.Fatalf("scale calibration operation failure: errors=%d timeouts=%d", probe.Errors, probe.Timeouts)
 		}
+		sustained := probe.ThroughputMilli*1_000_000 >= probe.OfferedRateMilli*seamlessScaleSustainedThroughputPPM &&
+			probe.QueueLagP99NS <= uint64(seamlessScaleSustainedQueueLag)
+		t.Logf("scale calibration rate=%d sustained=%t throughput_milli=%d offered_milli=%d queue_lag_p99=%s max_window_gap=%s",
+			candidate, sustained, probe.ThroughputMilli, probe.OfferedRateMilli,
+			time.Duration(probe.QueueLagP99NS), time.Duration(probe.CompletionGapNS))
 		if probe.Scheduled >= uint64(candidate)*uint64(5*seamlessScaleWindowDuration/time.Second) && probe.Started == probe.Scheduled &&
-			probe.Completed == probe.Started && probe.Missed == 0 {
+			probe.Completed == probe.Started && probe.Missed == 0 && sustained {
 			workload.historyMu.Lock()
 			workload.history[seamlessScalePhaseBaseline] = workload.history[phase]
 			for index := range workload.history[seamlessScalePhaseBaseline] {
@@ -638,7 +670,7 @@ func calibrateSeamlessScaleRate(t *testing.T, workload *seamlessScaleWorkload, c
 			return candidate, probe
 		}
 	}
-	t.Fatal("scale workload calibration could not sustain the minimum strict offered rate without misses")
+	t.Fatal("scale workload calibration found no sustained offered rate")
 	return 0, seamlessScalePhaseEvidence{}
 }
 
@@ -674,7 +706,7 @@ func (workload *seamlessScaleWorkload) FaultTimingEvidence() (seamlessScalePhase
 		var samples []seamlessScaleSample
 		var start, end time.Time
 		var duration, scheduled, missed, gap uint64
-		var previousEnd, previousCompletion time.Time
+		var previousEnd time.Time
 		previousSelected := false
 		for _, window := range windows {
 			selected := seamlessScaleRecoveryWindow(window.evidence, faults) == (class == 1)
@@ -692,23 +724,10 @@ func (workload *seamlessScaleWorkload) FaultTimingEvidence() (seamlessScalePhase
 			if previousSelected && wstart.After(previousEnd) {
 				duration += uint64(wstart.Sub(previousEnd))
 			}
-			var first, last time.Time
-			for _, sample := range window.samples {
-				if sample.Completed.IsZero() {
-					continue
-				}
-				if first.IsZero() || sample.Completed.Before(first) {
-					first = sample.Completed
-				}
-				if sample.Completed.After(last) {
-					last = sample.Completed
-				}
-			}
+			// Continuity is measured inside each window; see
+			// withinWindowContinuity for why boundary gaps are excluded.
 			gap = max(gap, window.evidence.CompletionGapNS)
-			if previousSelected && !first.IsZero() && first.After(previousCompletion) {
-				gap = max(gap, uint64(first.Sub(previousCompletion)))
-			}
-			previousEnd, previousCompletion, previousSelected = wend, last, true
+			previousEnd, previousSelected = wend, true
 			scheduled += window.evidence.Scheduled
 			missed += window.evidence.Missed
 			samples = append(samples, window.samples...)
@@ -744,9 +763,10 @@ func (workload *seamlessScaleWorkload) HistoryEvidence(phase string) seamlessSca
 	}
 	start := time.Unix(0, int64(entries[0].evidence.StartNS))
 	end := time.Unix(0, int64(entries[0].evidence.EndNS))
-	var scheduled, missed uint64
+	var scheduled, missed, gap uint64
 	var samples []seamlessScaleSample
 	for _, entry := range entries {
+		gap = max(gap, entry.evidence.CompletionGapNS)
 		entryStart := time.Unix(0, int64(entry.evidence.StartNS))
 		entryEnd := time.Unix(0, int64(entry.evidence.EndNS))
 		if entryStart.Before(start) {
@@ -759,7 +779,7 @@ func (workload *seamlessScaleWorkload) HistoryEvidence(phase string) seamlessSca
 		missed += entry.evidence.Missed
 		samples = append(samples, entry.samples...)
 	}
-	return workload.phaseEvidence(phase, start, end, scheduled, missed, samples)
+	return withinWindowContinuity(workload.phaseEvidence(phase, start, end, scheduled, missed, samples), gap)
 }
 
 func (workload *seamlessScaleWorkload) doJob(ctx context.Context, worker int, connection *seamlessScaleConnection, scheduled time.Time) seamlessScaleSample {

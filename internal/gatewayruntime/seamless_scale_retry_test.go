@@ -359,9 +359,26 @@ func TestSeamlessScaleFaultWindowsPreserveEverySampleAndSteadyContinuity(t *test
 	}
 	workload.MarkFault(start.Add(11 * time.Second))
 	steady, recovery, normalWindows, faultWindows, injections := workload.FaultTimingEvidence()
+	// Continuity is the largest gap inside any one window (1s here). The 9s
+	// between adjacent windows is the harness draining one window before
+	// scheduling the next, and the gap across the excluded recovery windows
+	// belongs to no steady window; neither may be reported as a pause.
 	if normalWindows != 3 || faultWindows != 2 || injections != 1 || steady.Scheduled != 6 || recovery.Scheduled != 4 ||
 		steady.DurationNS != uint64(30*time.Second) || recovery.DurationNS != uint64(20*time.Second) ||
-		steady.CompletionGapNS != uint64(9*time.Second) {
+		steady.CompletionGapNS != uint64(time.Second) || steady.MaxPauseNS != uint64(time.Second) ||
+		recovery.CompletionGapNS != uint64(time.Second) {
 		t.Fatalf("lost sample or fabricated gap: steady=%+v recovery=%+v windows=%d/%d injections=%d", steady, recovery, normalWindows, faultWindows, injections)
+	}
+	// A real stall inside a steady window is still reported in full.
+	stalled := workload.history[seamlessScalePhaseDuring][4]
+	stalled.samples = append(stalled.samples, seamlessScaleSample{
+		Scheduled: time.Unix(141, 0), Started: time.Unix(141, 0), Completed: time.Unix(147, 0),
+		Latency: 6 * time.Second,
+	})
+	stalled.evidence = workload.phaseEvidence(seamlessScalePhaseDuring, time.Unix(140, 0), time.Unix(150, 0), 3, 0, stalled.samples)
+	workload.history[seamlessScalePhaseDuring][4] = stalled
+	steady, _, _, _, _ = workload.FaultTimingEvidence()
+	if steady.MaxPauseNS < uint64(5*time.Second) {
+		t.Fatalf("intra-window stall hidden: steady=%+v", steady)
 	}
 }
