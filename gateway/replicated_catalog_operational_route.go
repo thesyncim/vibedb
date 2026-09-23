@@ -249,6 +249,16 @@ func clearPromotedCatalogDiscoveryHint(route *ReplicatedRoute) bool {
 	}
 	for _, serving := range route.Replicas {
 		if serving.Member != route.discoveryReplica.Member {
+			if serving.Node == route.discoveryReplica.Node || serving.StoreID == route.discoveryReplica.StoreID {
+				// A node hosts at most one member of a group. A different,
+				// freshly authenticated member on the hint's node or store proves
+				// the hint names a retired placement: the member moved away and
+				// the node was later reused for this group. It can no longer help
+				// discovery, and keeping it would invalidate every route.
+				route.discoveryReplica = ReplicatedEndpoint{}
+				route.hasDiscoveryReplica = false
+				break
+			}
 			continue
 		}
 		if serving.Node != route.discoveryReplica.Node || serving.StoreID != route.discoveryReplica.StoreID {

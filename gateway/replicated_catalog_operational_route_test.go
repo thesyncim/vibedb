@@ -409,6 +409,20 @@ func TestClearPromotedCatalogDiscoveryHintUsesTheWholeEphemeralRoster(t *testing
 		}
 	})
 
+	t.Run("retired member on a reused node is cleared", func(t *testing.T) {
+		// The group's member left this node and a new member was later placed
+		// on it: the hint names a retired placement on a now-serving node.
+		candidate := route
+		candidate.discoveryReplica = route.Replicas[1]
+		candidate.discoveryReplica.Member = 77
+		candidate.discoveryReplica.NodeIncarnation++
+		candidate.hasDiscoveryReplica = true
+		if !clearPromotedCatalogDiscoveryHint(&candidate) || candidate.hasDiscoveryReplica ||
+			!validReplicatedRoute(candidate) {
+			t.Fatalf("retired hint on a reused node invalidated the route: %+v", candidate)
+		}
+	})
+
 	t.Run("same member with changed node identity fails closed", func(t *testing.T) {
 		candidate := route
 		candidate.discoveryReplica = route.Replicas[1]
