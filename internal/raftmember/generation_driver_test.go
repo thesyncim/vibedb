@@ -189,7 +189,7 @@ func TestRuntimeWALGenerationBuildDoesNotBlockRaftProgress(t *testing.T) {
 	fixture.runtime.tickWALGeneration()
 	select {
 	case <-started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testAsyncDeadline):
 		t.Fatal("background generation build did not start")
 	}
 	if err := fixture.runtime.Tick(); err != nil {
@@ -223,7 +223,7 @@ func TestRuntimeWALGenerationBuildDoesNotBlockRaftProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testAsyncDeadline)
 	for fixture.runtime.walGeneration.building && time.Now().Before(deadline) {
 		fixture.runtime.tickWALGeneration()
 		runtime.Gosched()
