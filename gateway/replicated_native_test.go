@@ -1008,6 +1008,7 @@ func TestReplicatedExecutorObservesTransferAfterUnknownWithoutResend(t *testing.
 	route, _, states := testReplicatedRouteCommand(t)
 	membershipRoute, states := testReplicatedMembershipRoute(route, states)
 	target := uint64(4)
+	source := states["m2"].LeaderID
 	afterTerm := states["m2"].Fence.Term
 	for address, state := range states {
 		state.LeaderID = target
@@ -1020,10 +1021,61 @@ func TestReplicatedExecutorObservesTransferAfterUnknownWithoutResend(t *testing.
 		t.Fatal(err)
 	}
 	result, err := executor.ObserveMembershipTransfer(context.Background(), membershipRoute,
-		target, afterTerm)
+		source, target, afterTerm)
 	if err != nil || client.moved || result.TransferWitness.TargetMember != target ||
 		result.TransferWitness.Term != afterTerm+1 || result.State.Fence.MemberID != target {
 		t.Fatalf("observation result=%+v moved=%t err=%v", result, client.moved, err)
+	}
+}
+
+// The retiring source hands leadership to a continuing voter that both the
+// source and destination routes contain. That is a settled transfer; the
+// source itself in a later term is not.
+func TestReplicatedExecutorObservesTransferToContinuingVoter(t *testing.T) {
+	route, _, states := testReplicatedRouteCommand(t)
+	membershipRoute, states := testReplicatedMembershipRoute(route, states)
+	target := uint64(4)
+	source := states["m2"].LeaderID
+	afterTerm := states["m2"].Fence.Term
+	continuing := uint64(0)
+	for _, replica := range membershipRoute.Serving.Replicas {
+		if replica.Member != source {
+			continuing = replica.Member
+			break
+		}
+	}
+	if continuing == 0 || continuing == target {
+		t.Fatalf("fixture has no continuing voter: source=%d route=%+v", source, membershipRoute.Serving.Replicas)
+	}
+	lead := func(leader uint64) map[string]shardservice.ReplicatedMemberState {
+		next := make(map[string]shardservice.ReplicatedMemberState, len(states))
+		for address, state := range states {
+			state.LeaderID = leader
+			state.Fence.Term = afterTerm + 1
+			next[address] = state
+		}
+		return next
+	}
+	client := &transferReplicatedClient{states: lead(continuing)}
+	executor, err := NewReplicatedExecutor(client, 3, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := executor.ObserveMembershipTransfer(context.Background(), membershipRoute,
+		source, target, afterTerm)
+	if err != nil || result.TransferWitness.TargetMember != continuing ||
+		result.State.Fence.MemberID != continuing || result.State.LeaderID != continuing {
+		t.Fatalf("continuing-voter transfer result=%+v err=%v", result, err)
+	}
+
+	client = &transferReplicatedClient{states: lead(source)}
+	executor, err = NewReplicatedExecutor(client, 3, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := executor.ObserveMembershipTransfer(context.Background(), membershipRoute,
+		source, target, afterTerm); !errors.Is(err, raftservice.ErrOutcomeUnknown) {
+		t.Fatalf("re-elected source witnessed as transfer: result=%+v err=%v", result, err)
 	}
 }
 

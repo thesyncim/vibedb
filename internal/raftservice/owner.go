@@ -2875,10 +2875,60 @@ func (owner *Owner) prepareMembershipLeaderTransfer(
 	if request.Kind != MembershipTransferLeader {
 		return raftmember.LeaderTransferGuard{}, ErrMembershipMalformed
 	}
-	if _, err := owner.validateMembershipAdmission(request); err != nil {
+	admission, err := owner.validateMembershipAdmission(request)
+	if err != nil {
 		return raftmember.LeaderTransferGuard{}, err
 	}
-	return owner.host.PrepareLeaderTransfer(request.Fence.Group, request.TargetMember)
+	transferee, err := owner.membershipTransferee(request, admission.authority)
+	if err != nil {
+		return raftmember.LeaderTransferGuard{}, err
+	}
+	return owner.host.PrepareLeaderTransfer(request.Fence.Group, transferee)
+}
+
+// membershipTransferee chooses where the retiring source hands leadership.
+// Clients reach a group only through its published route, and a move's source
+// route lacks the enrolled target while its destination route lacks the
+// source. Only the grant's continuing voters are in every route of the move,
+// so the most caught-up of them is preferred; transferring to the target
+// would leave the group leaderless to routed clients until the catalog
+// publishes. Admission has already proven the target caught up, so it remains
+// the fallback when no continuing voter is ready. The choice is recomputed on
+// each preparation attempt: before the guard is prepared no Runtime authority
+// has been revoked, so following the freshest progress is safe.
+func (owner *Owner) membershipTransferee(
+	request MembershipRequest, authority membershipgrant.Grant,
+) (uint64, error) {
+	publication, err := owner.host.Publication(request.Fence.Group)
+	if err != nil {
+		return 0, err
+	}
+	status, err := owner.host.Status(request.Fence.Group)
+	if err != nil {
+		return 0, err
+	}
+	voters := publication.ConfState.GetVoters()
+	best, bestMatch := uint64(0), uint64(0)
+	for _, member := range authority.InitialVoters {
+		if member == 0 || member == request.SourceMember || member == request.TargetMember ||
+			!containsSorted(voters, member) {
+			continue
+		}
+		progress, found, err := owner.host.Progress(request.Fence.Group, member)
+		if err != nil {
+			return 0, err
+		}
+		if !caughtUp(progress, found, status.Commit, false) {
+			continue
+		}
+		if best == 0 || progress.Match > bestMatch || progress.Match == bestMatch && member < best {
+			best, bestMatch = member, progress.Match
+		}
+	}
+	if best == 0 {
+		return request.TargetMember, nil
+	}
+	return best, nil
 }
 
 func (owner *Owner) applyMembership(request MembershipRequest) error {

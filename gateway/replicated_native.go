@@ -998,18 +998,18 @@ func (executor *ReplicatedExecutor) ObserveMembershipLeader(ctx context.Context,
 func (executor *ReplicatedExecutor) ObserveMembershipTransfer(
 	ctx context.Context,
 	route ReplicatedMembershipRoute,
-	target, afterTerm uint64,
+	source, target, afterTerm uint64,
 ) (ReplicatedMembershipResult, error) {
 	if executor == nil || executor.client == nil || ctx == nil ||
-		!validReplicatedMembershipRoute(route) || target == 0 || afterTerm == 0 ||
-		!membershipTransferTarget(route, target) {
+		!validReplicatedMembershipRoute(route) || source == 0 || target == 0 ||
+		source == target || afterTerm == 0 || !membershipTransferTarget(route, target) {
 		return ReplicatedMembershipResult{}, ErrReplicatedRoute
 	}
-	result, witnessed := executor.observeMembershipTransfer(ctx, route, target, afterTerm)
+	result, witnessed := executor.observeMembershipTransfer(ctx, route, source, target, afterTerm)
 	if !witnessed {
 		return ReplicatedMembershipResult{}, raftservice.ErrOutcomeUnknown
 	}
-	result.TransferWitness = MembershipTransferWitness{TargetMember: target,
+	result.TransferWitness = MembershipTransferWitness{TargetMember: result.State.LeaderID,
 		Term: result.State.Fence.Term}
 	return result, nil
 }
@@ -1053,7 +1053,7 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 			executor.leaderHints.invalidate(route.Serving, endpoint, state)
 			if membership.Kind == raftservice.MembershipTransferLeader {
 				if witness, observeErr := executor.ObserveMembershipTransfer(
-					ctx, route, membership.TargetMember, state.Fence.Term,
+					ctx, route, membership.SourceMember, membership.TargetMember, state.Fence.Term,
 				); observeErr == nil {
 					witness.Retries += attempt
 					return witness, nil
@@ -1087,7 +1087,7 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 			result := ReplicatedMembershipResult{State: response.State, Retries: attempt}
 			if membership.Kind == raftservice.MembershipTransferLeader {
 				witness, observeErr := executor.ObserveMembershipTransfer(
-					ctx, route, membership.TargetMember, state.Fence.Term,
+					ctx, route, membership.SourceMember, membership.TargetMember, state.Fence.Term,
 				)
 				if observeErr != nil {
 					return ReplicatedMembershipResult{}, raftservice.ErrOutcomeUnknown
@@ -1108,7 +1108,7 @@ func (executor *ReplicatedExecutor) ApplyMembership(
 			executor.leaderHints.invalidate(route.Serving, endpoint, state)
 			if membership.Kind == raftservice.MembershipTransferLeader {
 				if witness, observeErr := executor.ObserveMembershipTransfer(
-					ctx, route, membership.TargetMember, state.Fence.Term,
+					ctx, route, membership.SourceMember, membership.TargetMember, state.Fence.Term,
 				); observeErr == nil {
 					witness.Retries += attempt
 					return witness, nil
@@ -1157,22 +1157,36 @@ func membershipTransferTarget(route ReplicatedMembershipRoute, target uint64) bo
 	return route.RetiringSource.Member != 0 && replicatedRouteContainsMember(route.Serving, target)
 }
 
+// observeMembershipTransfer witnesses leadership leaving the retiring source
+// in a later term. The source leader hands off to its most caught-up
+// continuing voter, which every published route of the move contains, and
+// uses the enrolled target only when no continuing voter is ready. Either is
+// a settled transfer; the retiring source never is.
 func (executor *ReplicatedExecutor) observeMembershipTransfer(
 	ctx context.Context,
 	route ReplicatedMembershipRoute,
-	target, afterTerm uint64,
+	source, target, afterTerm uint64,
 ) (ReplicatedMembershipResult, bool) {
-	preferred := target
+	preferred := uint64(0)
 	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
 		endpoint, state, err := executor.discoverMembershipLeaderFresh(ctx, route, preferred,
 			serviceauthz.CapabilityMembership)
-		if err == nil && endpoint.Member == target && state.LeaderID == target &&
-			state.Fence.MemberID == target && state.Fence.Term > afterTerm {
+		leader := endpoint.Member
+		if err == nil && membershipTransferee(route, source, target, leader) &&
+			state.LeaderID == leader && state.Fence.MemberID == leader && state.Fence.Term > afterTerm {
 			return ReplicatedMembershipResult{State: state, Retries: attempt}, true
 		}
-		preferred = target
+		preferred = 0
+		if err == nil && membershipTransferee(route, source, target, state.LeaderID) {
+			preferred = state.LeaderID
+		}
 	}
 	return ReplicatedMembershipResult{}, false
+}
+
+func membershipTransferee(route ReplicatedMembershipRoute, source, target, member uint64) bool {
+	return member != 0 && member != source &&
+		(member == target || replicatedRouteContainsMember(route.Serving, member))
 }
 
 // Propose discovers the live leader, submits the canonical command, and uses
