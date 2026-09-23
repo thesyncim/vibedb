@@ -391,7 +391,8 @@ func (runtime *Runtime) startOptionalServices() error {
 		runtime.metricsDone = done
 		go func() {
 			defer close(done)
-			if err := runtime.distributedMetrics.RunRefresh(runtime.ctx, runtime.config.ControllerInterval,
+			if err := runtime.distributedMetrics.RunRefresh(runtime.ctx,
+				distributedMetricsRefreshInterval(runtime.config.ControllerInterval),
 				runtime.distributedMetricsConcurrency); err != nil && runtime.ctx.Err() == nil {
 				runtime.config.Logf("gatewayruntime: distributed metrics refresh: %v", err)
 				runtime.setServeError(err)
@@ -424,4 +425,15 @@ func (runtime *Runtime) startOptionalServices() error {
 	}
 	runtime.servingContext = servingContext
 	return nil
+}
+
+// distributedMetricsMinimumRefresh bounds observational metrics polling. Each
+// refresh reads every (group, member) slot and node aggregate over its own
+// authenticated shard-control exchange, so tying it to a fast controller
+// cadence multiplied control traffic without informing any control decision:
+// its only readers are cluster status and the metrics endpoint.
+const distributedMetricsMinimumRefresh = time.Second
+
+func distributedMetricsRefreshInterval(controllerInterval time.Duration) time.Duration {
+	return max(controllerInterval, distributedMetricsMinimumRefresh)
 }
