@@ -1641,6 +1641,27 @@ func TestReplicatedExecutorTreatsChangedStaleFenceAsDefinite(t *testing.T) {
 	}
 }
 
+func TestReplicatedExecutorPreservesStaleFenceCauseDuringUnknownRecovery(t *testing.T) {
+	route, command, states := testReplicatedRouteCommand(t)
+	oldState := states["m2"]
+	newState := oldState
+	newState.Fence.Command.OwnershipEpoch++
+	newState.Fence.Command.RoutingVersion++
+	newState.Fence.Command.RouteGeneration++
+	client := &staleFenceReplicatedClient{oldState: oldState, newState: newState}
+	executor, err := NewReplicatedExecutor(client, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = executor.propose(context.Background(), route, command, nil, true,
+		serviceauthz.CapabilityDataWrite, replicatedUnknownCommandClone)
+	var unknown *raftservice.UnknownOutcomeError
+	if !errors.As(err, &unknown) || !errors.Is(err, raftservice.ErrServingFence) ||
+		client.proposals != 1 || !bytes.Equal(unknown.Command, command) {
+		t.Fatalf("unknown stale-fence recovery=%T %v proposals=%d", err, err, client.proposals)
+	}
+}
+
 func TestReplicatedExecutorRetriesSameCommandFenceIncarnationRace(t *testing.T) {
 	route, command, states := testReplicatedRouteCommand(t)
 	state := states["m2"]

@@ -575,6 +575,19 @@ func (runtime *Runtime) Listener() net.Listener {
 	return runtime.listener
 }
 
+// MoveControllerDiagnostics returns the latest detached move-controller pass
+// and, when available, refreshes its highest-revision move from the catalog.
+// It performs catalog reads only for callers explicitly collecting
+// diagnostics; normal reconciliation and request paths are unchanged.
+func (runtime *Runtime) MoveControllerDiagnostics(ctx context.Context) rebalanceexec.MoveControllerDiagnosticSnapshot {
+	if runtime == nil || runtime.moveController == nil {
+		return rebalanceexec.MoveControllerDiagnosticSnapshot{
+			CapturedAt: time.Now().UTC(), JournalError: "replica move controller is unavailable",
+		}
+	}
+	return runtime.moveController.DiagnosticSnapshot(ctx)
+}
+
 // Ready closes after every configured optional service and PostgreSQL writer
 // and listener has started successfully. Open only binds the public listener;
 // supervisors must select Ready alongside Serve completion and cancellation

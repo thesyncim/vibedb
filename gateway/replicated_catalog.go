@@ -15,8 +15,8 @@ import (
 )
 
 // ServingReplicaCount is the only public data topology served by this native
-// vertical. A single enrolled membership target is retained separately and
-// never widens the serving route.
+// vertical. One authenticated transition endpoint may be retained separately
+// and never widens the serving route.
 const ServingReplicaCount = 3
 
 // ReplicatedReplicaDescriptor binds one Raft member ID to the endpoint whose
@@ -60,6 +60,10 @@ type ReplicatedShardDescriptor struct {
 	// participate in membership control. It is never included in the public
 	// data route until a later catalog cut makes it one of Replicas.
 	EnrolledTarget *ReplicatedReplicaDescriptor
+	// RetiringSource is the exact displaced voter retained by the certified
+	// G+1 replacement cut. It remains discoverable while Raft may still elect
+	// it, but is never part of the public RF3 serving roster. G+2 clears it.
+	RetiringSource *ReplicatedReplicaDescriptor
 	SplitOrigin    *ReplicatedSplitOrigin
 }
 
@@ -76,6 +80,7 @@ type replicatedCatalogShard struct {
 	shard             uint32
 	replicaCount      uint8
 	hasEnrolledTarget bool
+	hasRetiringSource bool
 	splitOrigin       *ReplicatedSplitOrigin
 }
 
@@ -250,6 +255,31 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 				}
 			}
 		}
+		if source := descriptor.RetiringSource; source != nil {
+			if descriptor.EnrolledTarget != nil {
+				return &CatalogError{Reason: "replicated shard cannot retain both an enrolled target and retiring source"}
+			}
+			address, endpointExists := snapshot.endpoints[source.Endpoint]
+			nativeAddress, nativeExists := snapshot.endpoints[source.NativeEndpoint]
+			controlAddress, controlExists := snapshot.endpoints[source.ControlEndpoint]
+			if source.Member == 0 || source.Node == (rafttransport.NodeID{}) ||
+				source.StoreID == ([16]byte{}) || source.NodeIncarnation == 0 ||
+				source.Endpoint == "" || source.NativeEndpoint == "" || source.ControlEndpoint == "" ||
+				source.NativeEndpoint == source.Endpoint || source.ControlEndpoint == source.Endpoint ||
+				source.ControlEndpoint == source.NativeEndpoint || !endpointExists || !nativeExists ||
+				!controlExists || address == "" || nativeAddress == "" || controlAddress == "" ||
+				address == nativeAddress || address == controlAddress || nativeAddress == controlAddress {
+				return &CatalogError{Reason: "replicated shard has an invalid retiring source"}
+			}
+			for _, replica := range descriptor.Replicas {
+				if replica.Member == source.Member || replica.Node == source.Node ||
+					replica.StoreID == source.StoreID || replica.Endpoint == source.Endpoint ||
+					replica.NativeEndpoint == source.NativeEndpoint ||
+					replica.ControlEndpoint == source.ControlEndpoint {
+					return &CatalogError{Reason: "retiring source repeats a serving identity or endpoint"}
+				}
+			}
+		}
 		unresolved[ordinal] = unresolvedReplicatedCatalogShard{
 			descriptor: descriptor, manifest: uint32(manifestOrdinal), shard: uint32(shardOrdinal),
 		}
@@ -288,6 +318,17 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 				ControlEndpoint: string(target.ControlEndpoint),
 				ControlAddress:  snapshot.endpoints[target.ControlEndpoint],
 			})
+		} else if source := entry.descriptor.RetiringSource; source != nil {
+			replicas = append(replicas, ReplicatedEndpoint{
+				Member: source.Member, Node: source.Node, StoreID: source.StoreID,
+				NodeIncarnation: source.NodeIncarnation,
+				Endpoint:        string(source.Endpoint),
+				DataAddress:     snapshot.endpoints[source.Endpoint],
+				NativeEndpoint:  string(source.NativeEndpoint),
+				Address:         snapshot.endpoints[source.NativeEndpoint],
+				ControlEndpoint: string(source.ControlEndpoint),
+				ControlAddress:  snapshot.endpoints[source.ControlEndpoint],
+			})
 		}
 		shards[ordinal] = replicatedCatalogShard{
 			group: entry.descriptor.Group, allocation: entry.descriptor.AllocationGeneration,
@@ -299,6 +340,7 @@ func (snapshot *Snapshot) attachReplicatedMetadata(
 			replicaBase:      uint32(base), manifest: entry.manifest, shard: entry.shard,
 			replicaCount:      uint8(len(entry.descriptor.Replicas)),
 			hasEnrolledTarget: entry.descriptor.EnrolledTarget != nil,
+			hasRetiringSource: entry.descriptor.RetiringSource != nil,
 			splitOrigin:       cloneReplicatedSplitOrigin(entry.descriptor.SplitOrigin),
 		}
 	}
@@ -395,15 +437,15 @@ func (snapshot *Snapshot) ResolveReplicatedRoute(
 		LineageDigest: entry.lineageDigest, ForwardingRuleDigest: entry.forwardingDigest,
 		Replicas: dst,
 	}
-	route = snapshot.withEnrolledDiscovery(route, entry)
+	route = snapshot.withTransitionDiscovery(route, entry)
 	return route, true
 }
 
-// withEnrolledDiscovery keeps a promoted replacement reachable for leader
-// discovery without adding it to the serving replica set. Ordinary reads and
-// writes still cannot select it.
-func (snapshot *Snapshot) withEnrolledDiscovery(route ReplicatedRoute, entry replicatedCatalogShard) ReplicatedRoute {
-	if snapshot == nil || !entry.hasEnrolledTarget {
+// withTransitionDiscovery keeps the one catalog-certified transition member
+// reachable for leader discovery without adding it to the serving RF3.
+func (snapshot *Snapshot) withTransitionDiscovery(route ReplicatedRoute, entry replicatedCatalogShard) ReplicatedRoute {
+	if snapshot == nil || (!entry.hasEnrolledTarget && !entry.hasRetiringSource) ||
+		entry.hasEnrolledTarget && entry.hasRetiringSource {
 		return route
 	}
 	index := int(entry.replicaBase) + int(entry.replicaCount)
@@ -444,17 +486,18 @@ func (snapshot *Snapshot) ReplicatedRouteAt(index int, dst []ReplicatedEndpoint)
 	}
 	dst = append(dst[:0], snapshot.replicatedReplicas[int(entry.replicaBase):int(entry.replicaBase)+int(entry.replicaCount)]...)
 	dst = dst[:len(dst):len(dst)]
-	return ReplicatedRoute{Distribution: manifest.Distribution(), Shard: metadata.ID, Group: entry.group,
+	route := ReplicatedRoute{Distribution: manifest.Distribution(), Shard: metadata.ID, Group: entry.group,
 		AllocationGeneration: uint64(entry.allocation), Command: entry.command, LogicalSchemaDigest: entry.logicalSchema,
 		RangeIdentity: entry.rangeIdentity, LineageDigest: entry.lineageDigest,
-		ForwardingRuleDigest: entry.forwardingDigest, Replicas: dst}, true
+		ForwardingRuleDigest: entry.forwardingDigest, Replicas: dst}
+	return snapshot.withTransitionDiscovery(route, entry), true
 }
 
 // ResolveReplicatedMembershipRoute resolves the active serving RF3 together
-// with its optional enrolled replacement. The replacement is kept outside the
-// serving slice, so ordinary reads, writes, and transactions cannot select it.
-// Supplying capacity for ServingReplicaCount keeps a route without a target
-// allocation-free; the target itself is returned by value.
+// with its optional control-only transition replica. An enrolled replacement
+// or retiring source stays outside the serving slice, so data operations
+// cannot select it. Supplying capacity for ServingReplicaCount keeps the
+// lookup allocation-free; the optional endpoint is returned by value.
 func (snapshot *Snapshot) ResolveReplicatedMembershipRoute(
 	distributionName distribution.DistributionName,
 	shardID distribution.ShardID,
@@ -465,11 +508,10 @@ func (snapshot *Snapshot) ResolveReplicatedMembershipRoute(
 		return ReplicatedMembershipRoute{}, false
 	}
 	end := int(entry.replicaBase) + int(entry.replicaCount)
-	targets := 0
-	if entry.hasEnrolledTarget {
-		targets = 1
+	if entry.hasEnrolledTarget && entry.hasRetiringSource {
+		return ReplicatedMembershipRoute{}, false
 	}
-	if end+targets > len(snapshot.replicatedReplicas) {
+	if (entry.hasEnrolledTarget || entry.hasRetiringSource) && end >= len(snapshot.replicatedReplicas) {
 		return ReplicatedMembershipRoute{}, false
 	}
 	dst = append(dst[:0], snapshot.replicatedReplicas[int(entry.replicaBase):end]...)
@@ -481,9 +523,11 @@ func (snapshot *Snapshot) ResolveReplicatedMembershipRoute(
 		LineageDigest: entry.lineageDigest, ForwardingRuleDigest: entry.forwardingDigest,
 		Replicas: dst,
 	}}
-	if targets != 0 {
+	if entry.hasEnrolledTarget {
 		result.EnrolledTarget = snapshot.replicatedReplicas[end]
 		result.HasEnrolledTarget = true
+	} else if entry.hasRetiringSource {
+		result.RetiringSource = snapshot.replicatedReplicas[end]
 	}
 	if !validReplicatedMembershipRoute(result) {
 		return ReplicatedMembershipRoute{}, false
@@ -548,6 +592,19 @@ func (snapshot *Snapshot) replicatedDescriptors() []ReplicatedShardDescriptor {
 				Endpoint:        distribution.EndpointID(target.Endpoint),
 				NativeEndpoint:  distribution.EndpointID(target.NativeEndpoint),
 				ControlEndpoint: distribution.EndpointID(target.ControlEndpoint),
+			}
+		} else if entry.hasRetiringSource {
+			sourceOrdinal := int(entry.replicaBase) + int(entry.replicaCount)
+			if sourceOrdinal >= len(snapshot.replicatedReplicas) {
+				return nil
+			}
+			source := snapshot.replicatedReplicas[sourceOrdinal]
+			descriptor.RetiringSource = &ReplicatedReplicaDescriptor{
+				Member: source.Member, Node: source.Node, StoreID: source.StoreID,
+				NodeIncarnation: source.NodeIncarnation,
+				Endpoint:        distribution.EndpointID(source.Endpoint),
+				NativeEndpoint:  distribution.EndpointID(source.NativeEndpoint),
+				ControlEndpoint: distribution.EndpointID(source.ControlEndpoint),
 			}
 		}
 		descriptors[ordinal] = descriptor
@@ -636,7 +693,8 @@ func validateReplicatedCatalogTransition(current, next *Snapshot) error {
 		// change. Do not let a catalog reload imply that membership completed:
 		// an installed ReplicaSetVersion transition must certify that cut.
 		if candidate.command.ReplicaSetVersion != old.command.ReplicaSetVersion ||
-			!sameReplicatedCatalogRoster(current, old, next, candidate) {
+			!sameReplicatedCatalogRoster(current, old, next, candidate) ||
+			!sameCatalogRetiringSource(current, old, next, candidate) {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"replicated shard %q/%q changed its roster without a membership transition",
 				oldManifest.Distribution(), oldMetadata.ID,
@@ -644,6 +702,19 @@ func validateReplicatedCatalogTransition(current, next *Snapshot) error {
 		}
 	}
 	return nil
+}
+
+func sameCatalogRetiringSource(current *Snapshot, old replicatedCatalogShard, next *Snapshot, candidate replicatedCatalogShard) bool {
+	if old.hasRetiringSource != candidate.hasRetiringSource {
+		return false
+	}
+	if !old.hasRetiringSource {
+		return true
+	}
+	oldIndex := int(old.replicaBase) + int(old.replicaCount)
+	newIndex := int(candidate.replicaBase) + int(candidate.replicaCount)
+	return oldIndex < len(current.replicatedReplicas) && newIndex < len(next.replicatedReplicas) &&
+		current.replicatedReplicas[oldIndex] == next.replicatedReplicas[newIndex]
 }
 
 func advanceCatalogStateReplicaReplacement(
@@ -692,13 +763,17 @@ func validateCertifiedReplicaReplacement(
 		}
 		if old.group != grant.Group {
 			if candidate.command != old.command ||
-				!sameReplicatedCatalogRoster(current, old, next, candidate) {
+				!sameReplicatedCatalogRoster(current, old, next, candidate) ||
+				!sameCatalogRetiringSource(current, old, next, candidate) {
 				return &CatalogError{Reason: "replica replacement changed an unrelated RF3 group"}
 			}
 			continue
 		}
-		if replaced || !exactCertifiedReplicaReplacement(current, old, next, candidate, grant) {
-			return &CatalogError{Reason: "replica replacement final roster is not exact"}
+		if replaced {
+			return &CatalogError{Reason: "replica replacement contains more than one certified group"}
+		}
+		if err := exactCertifiedReplicaReplacement(current, old, next, candidate, grant); err != nil {
+			return err
 		}
 		replaced = true
 	}
@@ -714,9 +789,12 @@ func exactCertifiedReplicaReplacement(
 	next *Snapshot,
 	candidate replicatedCatalogShard,
 	grant membershipgrant.Grant,
-) bool {
+) error {
 	if old.replicaCount != ServingReplicaCount || candidate.replicaCount != ServingReplicaCount ||
-		old.command.ReplicaSetVersion != grant.InitialReplicaSetVersion ||
+		old.hasRetiringSource || candidate.hasEnrolledTarget || !candidate.hasRetiringSource {
+		return &CatalogError{Reason: "replica replacement transition slots are invalid"}
+	}
+	if old.command.ReplicaSetVersion != grant.InitialReplicaSetVersion ||
 		candidate.command.ReplicaSetVersion <= old.command.ReplicaSetVersion ||
 		candidate.command.ActivePolicyGeneration != old.command.ActivePolicyGeneration ||
 		candidate.command.ProtectionEpoch != old.command.ProtectionEpoch ||
@@ -724,10 +802,12 @@ func exactCertifiedReplicaReplacement(
 		candidate.command.SchemaGeneration != old.command.SchemaGeneration ||
 		candidate.command.RelationManifestDigest != old.command.RelationManifestDigest ||
 		candidate.command.RoutingVersion != old.command.RoutingVersion+1 ||
-		candidate.command.RouteGeneration != old.command.RouteGeneration+1 ||
-		int(old.replicaBase)+ServingReplicaCount > len(current.replicatedReplicas) ||
+		candidate.command.RouteGeneration != old.command.RouteGeneration+1 {
+		return &CatalogError{Reason: "replica replacement command is not the exact certified successor"}
+	}
+	if int(old.replicaBase)+ServingReplicaCount > len(current.replicatedReplicas) ||
 		int(candidate.replicaBase)+ServingReplicaCount > len(next.replicatedReplicas) {
-		return false
+		return &CatalogError{Reason: "replica replacement roster is outside its certified catalog cut"}
 	}
 	changes := 0
 	changedOrdinal := -1
@@ -739,30 +819,41 @@ func exactCertifiedReplicaReplacement(
 		}
 		if before.Member != grant.SourceMember || after.Member != grant.TargetMember ||
 			[16]byte(after.Node) != grant.TargetNode {
-			return false
+			return &CatalogError{Reason: "replica replacement changes an uncertified roster ordinal"}
 		}
 		changes++
 		changedOrdinal = ordinal
 	}
 	if changes != 1 {
-		return false
+		return &CatalogError{Reason: "replica replacement does not change exactly one source ordinal"}
+	}
+	retiringIndex := int(candidate.replicaBase) + int(candidate.replicaCount)
+	if retiringIndex >= len(next.replicatedReplicas) {
+		return &CatalogError{Reason: "replica replacement retiring-source identity is absent"}
+	}
+	retiring := next.replicatedReplicas[retiringIndex]
+	if retiring != current.replicatedReplicas[int(old.replicaBase)+changedOrdinal] {
+		return &CatalogError{Reason: "replica replacement retiring-source identity does not match the displaced voter"}
 	}
 	oldManifest := current.config.Manifests[old.manifest]
 	nextManifest := next.config.Manifests[candidate.manifest]
 	oldMetadata, ok := oldManifest.ShardMetadataAt(int(old.shard))
 	if !ok || oldMetadata.Epoch == ^distribution.OwnershipEpoch(0) ||
 		oldManifest.Version() == ^distribution.RoutingVersion(0) {
-		return false
+		return &CatalogError{Reason: "replica replacement source manifest cannot advance"}
 	}
 	targetEndpoint, ok := nextManifest.ShardLeaderAt(int(candidate.shard), changedOrdinal)
 	if !ok {
-		return false
+		return &CatalogError{Reason: "replica replacement target manifest has no certified leader ordinal"}
 	}
 	expectedManifest, err := oldManifest.ReplaceShardLeader(
 		int(old.shard), oldManifest.Version()+1, changedOrdinal,
 		targetEndpoint, oldMetadata.Epoch+1,
 	)
-	return err == nil && nextManifest.Equal(expectedManifest)
+	if err != nil || !nextManifest.Equal(expectedManifest) {
+		return &CatalogError{Reason: "replica replacement target manifest is not the exact source-to-target successor"}
+	}
+	return nil
 }
 
 func replicatedCommandFenceRegresses(old, next raftservice.CommandFence) bool {
@@ -828,6 +919,7 @@ type persistedReplicatedShard struct {
 	RouteGeneration        uint64                          `json:"route_generation"`
 	Replicas               []persistedReplicatedReplica    `json:"replicas"`
 	EnrolledTarget         *persistedReplicatedReplica     `json:"enrolled_target,omitempty"`
+	RetiringSource         *persistedReplicatedReplica     `json:"retiring_source,omitempty"`
 	SplitOrigin            *persistedReplicatedSplitOrigin `json:"split_origin,omitempty"`
 }
 
@@ -880,6 +972,10 @@ func persistedReplicatedDescriptors(
 		if descriptor.EnrolledTarget != nil {
 			target := persistReplicatedReplica(*descriptor.EnrolledTarget)
 			entry.EnrolledTarget = &target
+		}
+		if descriptor.RetiringSource != nil {
+			source := persistReplicatedReplica(*descriptor.RetiringSource)
+			entry.RetiringSource = &source
 		}
 		persisted[ordinal] = entry
 	}
@@ -972,6 +1068,13 @@ func (pc persistedCatalog) replicatedDescriptors() ([]ReplicatedShardDescriptor,
 				return nil, err
 			}
 			descriptor.EnrolledTarget = &target
+		}
+		if persisted.RetiringSource != nil {
+			source, err := openPersistedReplicatedReplica(*persisted.RetiringSource)
+			if err != nil {
+				return nil, err
+			}
+			descriptor.RetiringSource = &source
 		}
 		descriptors[ordinal] = descriptor
 	}

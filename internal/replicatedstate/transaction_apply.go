@@ -1059,7 +1059,9 @@ func (m *Machine) planSingleTargetApply(
 	}
 	resultCode := uint32(ResultIndexConflict)
 	var affectedRows int64
-	if !blocked {
+	if blocked {
+		resultCode = ResultIntentBusy
+	} else {
 		changes, spans, digest, rows, code, planErr := m.planStoredTransactionMutations(
 			command, payloads, plan.command.dataChainDigest, relationSnapshots, scratch,
 		)

@@ -42,8 +42,23 @@ func TestReplicaMoveColdDiscoveryRetainsSourceUntilRemovalReceipt(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, phase := range []gateway.TransitionPhase{gateway.TransitionPhasePreRemove, gateway.TransitionPhasePostRemove} {
-		cut, err := resolveGatewayReplicaMoveRoute(published, intent.Request, intent.Transition, phase)
+	postCommand := command
+	postCommand.ReplicaSetVersion++
+	postPublished, err := gateway.BuildGroupOwnedShardTransition(
+		published, intent.Transition, gateway.TransitionPhasePostRemove,
+		intent.Transition.Replacement, postCommand,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []struct {
+		catalog *gateway.Snapshot
+		phase   gateway.TransitionPhase
+	}{
+		{published, gateway.TransitionPhasePreRemove},
+		{postPublished, gateway.TransitionPhasePostRemove},
+	} {
+		cut, err := resolveGatewayReplicaMoveRoute(state.catalog, intent.Request, intent.Transition, state.phase)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -52,10 +67,10 @@ func TestReplicaMoveColdDiscoveryRetainsSourceUntilRemovalReceipt(t *testing.T) 
 		}
 		candidates := cut.Membership.AppendControlEndpoints(nil)
 		hasSource := slices.ContainsFunc(candidates, func(e gateway.ReplicatedEndpoint) bool { return e.Member == 1 })
-		if hasSource != (phase == gateway.TransitionPhasePreRemove) || len(candidates) > 4 {
-			t.Fatalf("phase=%d has source=%t candidates=%d", phase, hasSource, len(candidates))
+		if hasSource != (state.phase == gateway.TransitionPhasePreRemove) || len(candidates) > 4 {
+			t.Fatalf("phase=%d has source=%t candidates=%d", state.phase, hasSource, len(candidates))
 		}
-		if phase == gateway.TransitionPhasePreRemove && (cut.Membership.RetiringSource.NativeEndpoint != "one-native" ||
+		if state.phase == gateway.TransitionPhasePreRemove && (cut.Membership.RetiringSource.NativeEndpoint != "one-native" ||
 			cut.Membership.RetiringSource.Address != "127.0.0.1:11" || cut.Membership.RetiringSource.ControlEndpoint != "one-control") {
 			t.Fatalf("durable source endpoint was not restored: %+v", cut.Membership.RetiringSource)
 		}

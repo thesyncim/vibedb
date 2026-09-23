@@ -1256,7 +1256,7 @@ func TestLeaderTransferRequiresConfiguredVoterAndExposesProgress(t *testing.T) {
 	}
 	driveCampaignWithPeer(t, node, 2)
 	progress, found := node.Progress(2)
-	if !found || progress.Learner || progress.Next == 0 {
+	if !found || progress.Learner || progress.Next == 0 || progress.State == "" || progress.InflightCount < 0 {
 		t.Fatalf("peer progress = %+v, %t", progress, found)
 	}
 	if _, found := node.Progress(99); found {

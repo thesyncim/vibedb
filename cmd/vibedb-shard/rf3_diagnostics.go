@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -165,6 +168,115 @@ type rf3DiagnosticTransportFailure struct {
 	Term        uint64                              `json:"term"`
 }
 
+type rf3DiagnosticPeerTransport struct {
+	NodeID         string `json:"node_id"`
+	QueuedFrames   int    `json:"queued_frames"`
+	QueuedBytes    int64  `json:"queued_bytes"`
+	ReservedFrames int    `json:"reserved_frames"`
+	ReservedBytes  int64  `json:"reserved_bytes"`
+	DialAttempts   uint64 `json:"dial_attempts"`
+	DialFailures   uint64 `json:"dial_failures"`
+	WriteFailures  uint64 `json:"write_failures"`
+	Connections    uint64 `json:"connections"`
+	SentFrames     uint64 `json:"sent_frames"`
+	SentBytes      uint64 `json:"sent_bytes"`
+}
+
+type rf3DiagnosticMemberProgress struct {
+	MemberID        uint64 `json:"member_id"`
+	Found           bool   `json:"found"`
+	Match           uint64 `json:"match"`
+	Next            uint64 `json:"next"`
+	PendingSnapshot uint64 `json:"pending_snapshot"`
+	State           string `json:"state,omitempty"`
+	InflightCount   int    `json:"inflight_count,omitempty"`
+	InflightFull    bool   `json:"inflight_full,omitempty"`
+	Learner         bool   `json:"learner"`
+	RecentActive    bool   `json:"recent_active"`
+	FlowPaused      bool   `json:"flow_paused"`
+}
+
+type rf3DiagnosticRaftGroup struct {
+	Identity             rf3DiagnosticAuthorityRuntimeIdentity `json:"identity"`
+	StatusAvailable      bool                                  `json:"status_available"`
+	MemberID             uint64                                `json:"member_id"`
+	LeaderID             uint64                                `json:"leader_id"`
+	Term                 uint64                                `json:"term"`
+	Commit               uint64                                `json:"commit"`
+	Applied              uint64                                `json:"applied"`
+	CheckpointApplied    uint64                                `json:"checkpoint_applied"`
+	RaftState            uint64                                `json:"raft_state"`
+	PublicationAvailable bool                                  `json:"publication_available"`
+	ReplicaSetVersion    uint64                                `json:"replica_set_version"`
+	Voters               []uint64                              `json:"voters,omitempty"`
+	VotersOutgoing       []uint64                              `json:"voters_outgoing,omitempty"`
+	Learners             []uint64                              `json:"learners,omitempty"`
+	LearnersNext         []uint64                              `json:"learners_next,omitempty"`
+	AutoLeave            bool                                  `json:"auto_leave"`
+	Progress             []rf3DiagnosticMemberProgress         `json:"progress,omitempty"`
+}
+
+func rf3DiagnosticRaftGroups(runtimes []*raftmember.Runtime) []rf3DiagnosticRaftGroup {
+	groups := make([]rf3DiagnosticRaftGroup, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		if runtime == nil {
+			continue
+		}
+		identity := runtime.Identity()
+		group := rf3DiagnosticRaftGroup{Identity: rf3DiagnosticAuthorityRuntimeIdentityJSON(identity)}
+		if status, err := runtime.Status(); err == nil {
+			group.StatusAvailable = true
+			group.MemberID = status.MemberID
+			group.LeaderID = status.LeaderID
+			group.Term = status.Term
+			group.Commit = status.Commit
+			group.Applied = status.Applied
+			group.CheckpointApplied = status.CheckpointApplied
+			group.RaftState = uint64(status.RaftState)
+		}
+		if publication, err := runtime.Publication(); err == nil {
+			group.PublicationAvailable = true
+			group.ReplicaSetVersion = publication.ReplicaSetVersion
+			if conf := publication.ConfState; conf != nil {
+				group.Voters = append([]uint64(nil), conf.GetVoters()...)
+				group.VotersOutgoing = append([]uint64(nil), conf.GetVotersOutgoing()...)
+				group.Learners = append([]uint64(nil), conf.GetLearners()...)
+				group.LearnersNext = append([]uint64(nil), conf.GetLearnersNext()...)
+				group.AutoLeave = conf.GetAutoLeave()
+				members := make([]uint64, 0, len(group.Voters)+len(group.VotersOutgoing)+len(group.Learners)+len(group.LearnersNext))
+				members = append(members, group.Voters...)
+				members = append(members, group.VotersOutgoing...)
+				members = append(members, group.Learners...)
+				members = append(members, group.LearnersNext...)
+				slices.Sort(members)
+				progress := make([]rf3DiagnosticMemberProgress, 0, len(members))
+				for index, member := range members {
+					if member == 0 || index > 0 && member == members[index-1] {
+						continue
+					}
+					observed, found, progressErr := runtime.Progress(member)
+					entry := rf3DiagnosticMemberProgress{MemberID: member, Found: found && progressErr == nil}
+					if entry.Found {
+						entry.Match = observed.Match
+						entry.Next = observed.Next
+						entry.PendingSnapshot = observed.PendingSnapshot
+						entry.State = observed.State
+						entry.InflightCount = observed.InflightCount
+						entry.InflightFull = observed.InflightFull
+						entry.Learner = observed.Learner
+						entry.RecentActive = observed.RecentActive
+						entry.FlowPaused = observed.FlowPaused
+					}
+					progress = append(progress, entry)
+				}
+				group.Progress = progress
+			}
+		}
+		groups = append(groups, group)
+	}
+	return groups
+}
+
 func bindRF3TransportFailureDiagnostics(
 	owner *rf3NodeOwner,
 	provider rf3TransportStatsProvider,
@@ -199,6 +311,36 @@ func bindRF3TransportFailureDiagnostics(
 			})
 		}
 		return failures
+	}
+	owner.transportPeerStats = func() []rf3DiagnosticPeerTransport {
+		peers := registry.PeerDirectory()
+		statsByPeer := make([]rf3DiagnosticPeerTransport, 0, len(peers))
+		for _, physical := range peers {
+			node := physical.NodeID
+			if node == (rafttransport.NodeID{}) {
+				node = physical.Node
+			}
+			if node == (rafttransport.NodeID{}) {
+				continue
+			}
+			stats, err := provider.TransportStats(node)
+			if err != nil {
+				continue
+			}
+			statsByPeer = append(statsByPeer, rf3DiagnosticPeerTransport{
+				NodeID: hex.EncodeToString(node[:]), QueuedFrames: stats.QueuedFrames,
+				QueuedBytes: stats.QueuedBytes, ReservedFrames: stats.ReservedFrames,
+				ReservedBytes: stats.ReservedBytes, DialAttempts: stats.DialAttempts,
+				DialFailures: stats.DialFailures, WriteFailures: stats.WriteFailures,
+				Connections: stats.Connections, SentFrames: stats.SentFrames, SentBytes: stats.SentBytes,
+			})
+		}
+		return statsByPeer
+	}
+	if inbound, ok := provider.(interface {
+		InboundStats() raftservice.PeerServerStats
+	}); ok {
+		owner.peerInboundStats = inbound.InboundStats
 	}
 	owner.controlMu.Unlock()
 }
@@ -429,6 +571,9 @@ type rf3DiagnosticSnapshot struct {
 	NodeID string `json:"node_id"`
 	Groups int    `json:"groups"`
 
+	GoroutineStacks          string `json:"goroutine_stacks,omitempty"`
+	GoroutineStacksTruncated bool   `json:"goroutine_stacks_truncated,omitempty"`
+
 	ReadyWaves             uint64   `json:"ready_waves"`
 	ReadyDurableWaves      uint64   `json:"ready_durable_waves"`
 	ObservedAppendBarriers uint64   `json:"observed_append_barriers"`
@@ -476,15 +621,24 @@ type rf3DiagnosticSnapshot struct {
 	GatewaySQLRequestCount uint64 `json:"gateway_sql_request_encodings"`
 	GatewaySQLRequestBytes uint64 `json:"gateway_sql_request_encoded_bytes"`
 
-	RemoteDials             uint64                          `json:"remote_dials"`
-	RemoteReuses            uint64                          `json:"remote_reuses"`
-	RemotePoisoned          uint64                          `json:"remote_poisoned"`
-	RemoteRejected          uint64                          `json:"remote_rejected"`
-	RemoteHandshakeFailures uint64                          `json:"remote_handshake_failures"`
-	RemoteConnections       int                             `json:"remote_connections"`
-	RemoteIdle              int                             `json:"remote_idle"`
-	RemoteWaiters           int                             `json:"remote_waiters"`
-	RaftTransportFailures   []rf3DiagnosticTransportFailure `json:"raft_transport_failures,omitempty"`
+	RemoteDials              uint64                          `json:"remote_dials"`
+	RemoteReuses             uint64                          `json:"remote_reuses"`
+	RemotePoisoned           uint64                          `json:"remote_poisoned"`
+	RemoteRejected           uint64                          `json:"remote_rejected"`
+	RemoteHandshakeFailures  uint64                          `json:"remote_handshake_failures"`
+	RemoteConnections        int                             `json:"remote_connections"`
+	RemoteIdle               int                             `json:"remote_idle"`
+	RemoteWaiters            int                             `json:"remote_waiters"`
+	RaftTransportFailures    []rf3DiagnosticTransportFailure `json:"raft_transport_failures,omitempty"`
+	RaftPeerTransport        []rf3DiagnosticPeerTransport    `json:"raft_peer_transport,omitempty"`
+	RaftPeerInboundAvailable bool                            `json:"raft_peer_inbound_available"`
+	RaftPeerInboundAccepted  uint64                          `json:"raft_peer_inbound_accepted"`
+	RaftPeerInboundRejected  uint64                          `json:"raft_peer_inbound_rejected"`
+	RaftPeerInboundFailed    uint64                          `json:"raft_peer_inbound_failed"`
+	RaftPeerInboundActive    uint64                          `json:"raft_peer_inbound_active"`
+	RaftGroups               []rf3DiagnosticRaftGroup        `json:"raft_groups,omitempty"`
+	MoveControllerAvailable  bool                            `json:"move_controller_available"`
+	MoveController           any                             `json:"move_controller,omitempty"`
 
 	RaftProposalBatches             uint64   `json:"raft_proposal_batches"`
 	RaftProposalCommands            uint64   `json:"raft_proposal_commands"`
@@ -845,7 +999,7 @@ func emitRF3DiagnosticSnapshot(
 	serial *atomic.Uint64,
 	inventory *rf3AdoptedGroupInventory,
 ) {
-	emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embedded, serial, inventory, nil, nil, nil, rf3AuthorityDiagnostics{})
+	emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embedded, serial, inventory, nil, nil, nil, nil, rf3AuthorityDiagnostics{})
 }
 
 func emitRF3DiagnosticSnapshotWithResources(
@@ -859,6 +1013,7 @@ func emitRF3DiagnosticSnapshotWithResources(
 	prepared []preparedRF3Group,
 	schemas *rf3SchemaActivator,
 	progressMetrics *raftservice.ProgressMetrics,
+	runtimes []*raftmember.Runtime,
 	authorityDiagnostics rf3AuthorityDiagnostics,
 ) {
 	snapshot := rf3DiagnosticSnapshot{
@@ -901,6 +1056,13 @@ func emitRF3DiagnosticSnapshotWithResources(
 	if serial != nil {
 		snapshot.Serial = serial.Add(1)
 	}
+	if os.Getenv("VIBEDB_RF3_DIAGNOSTIC_STACKS") == "1" {
+		const maxStackBytes = 2 << 20
+		stack := make([]byte, maxStackBytes)
+		written := runtime.Stack(stack, true)
+		snapshot.GoroutineStacks = string(stack[:written])
+		snapshot.GoroutineStacksTruncated = written == len(stack)
+	}
 	if profile != nil {
 		node := profile.LocalIdentity().Node
 		snapshot.NodeID = fmt.Sprintf("%x", node[:])
@@ -911,14 +1073,45 @@ func emitRF3DiagnosticSnapshotWithResources(
 	if nodeOwner != nil {
 		nodeOwner.controlMu.Lock()
 		transportFailures := nodeOwner.transportFailures
+		transportPeerStats := nodeOwner.transportPeerStats
+		peerInboundStats := nodeOwner.peerInboundStats
 		nodeOwner.controlMu.Unlock()
 		if transportFailures != nil {
 			snapshot.RaftTransportFailures = transportFailures()
+		}
+		if transportPeerStats != nil {
+			snapshot.RaftPeerTransport = transportPeerStats()
+		}
+		if peerInboundStats != nil {
+			stats := peerInboundStats()
+			snapshot.RaftPeerInboundAvailable = true
+			snapshot.RaftPeerInboundAccepted = stats.Accepted
+			snapshot.RaftPeerInboundRejected = stats.Rejected
+			snapshot.RaftPeerInboundFailed = stats.Failed
+			snapshot.RaftPeerInboundActive = stats.Active
 		}
 	}
 	if progressMetrics != nil {
 		applyRF3DiagnosticProgress(&snapshot, progressMetrics.Snapshot())
 	}
+	if embedded != nil && embedded.runtime != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		snapshot.MoveController = embedded.runtime.MoveControllerDiagnostics(ctx)
+		cancel()
+		snapshot.MoveControllerAvailable = true
+	}
+	// The startup slice excludes groups adopted later by an empty physical
+	// node. Snapshot the node-control runtime's shared dynamic inventory at
+	// diagnostic time so an adopted target's leader, term, ConfState, and peer
+	// progress are visible with the original groups in the same signal cut.
+	diagnosticRuntimes := make([]*raftmember.Runtime, 0, len(runtimes)+1)
+	diagnosticRuntimes = append(diagnosticRuntimes, runtimes...)
+	if nodeOwner != nil {
+		if empty := nodeOwner.emptyRuntimeHandle(); empty != nil {
+			diagnosticRuntimes = append(diagnosticRuntimes, empty.diagnosticRuntimes()...)
+		}
+	}
+	snapshot.RaftGroups = rf3DiagnosticRaftGroups(diagnosticRuntimes)
 	if authorityDiagnostics.RoundMetrics != nil {
 		metrics := authorityDiagnostics.RoundMetrics()
 		snapshot.ReadAuthorityRoundsStarted = metrics.RoundsStarted

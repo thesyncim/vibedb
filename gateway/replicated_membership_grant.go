@@ -501,10 +501,18 @@ func buildReplicaReplacementPostRemoveTransition(
 		if descriptor.Group != grant.Group {
 			continue
 		}
-		if changed || observedReplicaSetVersion <= descriptor.Command.ReplicaSetVersion {
+		targetFound := false
+		for _, replica := range descriptor.Replicas {
+			targetFound = targetFound || replica.Member == grant.TargetMember &&
+				[16]byte(replica.Node) == grant.TargetNode
+		}
+		if changed || observedReplicaSetVersion <= descriptor.Command.ReplicaSetVersion ||
+			descriptor.RetiringSource == nil || descriptor.RetiringSource.Member != grant.SourceMember ||
+			descriptor.EnrolledTarget != nil || !targetFound {
 			return nil, &CatalogError{Reason: "invalid post-remove replica-set fence"}
 		}
 		descriptor.Command.ReplicaSetVersion = observedReplicaSetVersion
+		descriptor.RetiringSource = nil
 		changed = true
 	}
 	if !changed {

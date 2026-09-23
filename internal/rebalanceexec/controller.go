@@ -2,9 +2,12 @@ package rebalanceexec
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rebalance"
@@ -32,7 +35,9 @@ type Controller struct {
 	abandonmentCursor AbandonmentSchedulerCursor
 	// Diagnostic only: replaced after each complete directory pass and never
 	// consulted by the reconciler or any authorization/completion decision.
-	failures atomic.Pointer[map[[32]byte]string]
+	failures    atomic.Pointer[map[[32]byte]string]
+	lastPass    atomic.Pointer[MoveControllerPassDiagnostic]
+	lastAttempt atomic.Pointer[MoveControllerAttemptDiagnostic]
 }
 
 func (controller *Controller) LastFailure(operation [32]byte) string {
@@ -215,11 +220,107 @@ type ControllerPass struct {
 	AbandonmentBytes     uint64
 }
 
+// MoveControllerAttemptDiagnostic is the most recent durable move action
+// attempted by RunPass. It is detached from controller state and exists only
+// for on-demand diagnostics; callers must not use it as execution authority.
+type MoveControllerAttemptDiagnostic struct {
+	StartedAt   time.Time                        `json:"started_at"`
+	FinishedAt  time.Time                        `json:"finished_at"`
+	OperationID string                           `json:"operation_id"`
+	Revision    uint64                           `json:"revision"`
+	State       gateway.ReplicatedOperationState `json:"state"`
+	Cursor      [8]uint64                        `json:"cursor"`
+	Action      string                           `json:"action"`
+	Error       string                           `json:"error,omitempty"`
+}
+
+// MoveControllerRecordDiagnostic is the highest-revision active move seen in
+// the most recent directory pass, refreshed from the durable journal only
+// when a diagnostic snapshot is requested.
+type MoveControllerRecordDiagnostic struct {
+	OperationID string                           `json:"operation_id"`
+	GroupID     string                           `json:"group_id"`
+	Revision    uint64                           `json:"revision"`
+	State       gateway.ReplicatedOperationState `json:"state"`
+	Cursor      [8]uint64                        `json:"cursor"`
+	LastFailure string                           `json:"last_failure,omitempty"`
+}
+
+// MoveControllerPassDiagnostic records one bounded controller pass and the
+// active record with the highest revision that the pass observed.
+type MoveControllerPassDiagnostic struct {
+	StartedAt       time.Time                      `json:"started_at"`
+	FinishedAt      time.Time                      `json:"finished_at"`
+	Pass            ControllerPass                 `json:"pass"`
+	Error           string                         `json:"error,omitempty"`
+	HighestRevision MoveControllerRecordDiagnostic `json:"highest_revision_move"`
+	MoveRecordFound bool                           `json:"move_record_found"`
+}
+
+// MoveControllerDiagnosticSnapshot is collected on demand. The current
+// durable record is reread only for the highest-revision move from the last
+// pass, avoiding extra catalog reads on the controller or data paths.
+type MoveControllerDiagnosticSnapshot struct {
+	CapturedAt           time.Time                       `json:"captured_at"`
+	LastPass             MoveControllerPassDiagnostic    `json:"last_pass"`
+	LastPassAvailable    bool                            `json:"last_pass_available"`
+	LastAttempt          MoveControllerAttemptDiagnostic `json:"last_attempt"`
+	LastAttemptAvailable bool                            `json:"last_attempt_available"`
+	CurrentMove          MoveControllerRecordDiagnostic  `json:"current_move"`
+	CurrentMoveAvailable bool                            `json:"current_move_available"`
+	JournalError         string                          `json:"journal_error,omitempty"`
+}
+
+// DiagnosticSnapshot returns a bounded detached view of the latest move
+// controller pass. It is intended for explicit diagnostic signals only.
+func (controller *Controller) DiagnosticSnapshot(ctx context.Context) MoveControllerDiagnosticSnapshot {
+	snapshot := MoveControllerDiagnosticSnapshot{CapturedAt: time.Now().UTC()}
+	if controller == nil || ctx == nil || controller.directory == nil {
+		snapshot.JournalError = ErrControllerConfig.Error()
+		return snapshot
+	}
+	if pass := controller.lastPass.Load(); pass != nil {
+		snapshot.LastPass = *pass
+		snapshot.LastPassAvailable = true
+	}
+	if attempt := controller.lastAttempt.Load(); attempt != nil {
+		snapshot.LastAttempt = *attempt
+		snapshot.LastAttemptAvailable = true
+	}
+	if !snapshot.LastPassAvailable || !snapshot.LastPass.MoveRecordFound {
+		return snapshot
+	}
+	rawID, err := hex.DecodeString(snapshot.LastPass.HighestRevision.OperationID)
+	if err != nil || len(rawID) != len([32]byte{}) {
+		snapshot.JournalError = "invalid operation identity in move diagnostics"
+		return snapshot
+	}
+	var operation [32]byte
+	copy(operation[:], rawID)
+	record, err := controller.directory.ReadOperation(ctx, operation)
+	if err != nil {
+		snapshot.JournalError = err.Error()
+		return snapshot
+	}
+	if record.Kind != gateway.ReplicatedOperationMove {
+		snapshot.JournalError = "highest-revision operation is no longer a move"
+		return snapshot
+	}
+	detail := snapshot.LastPass.HighestRevision
+	detail.Revision = record.Revision
+	detail.State = record.State
+	detail.Cursor = record.Cursor
+	detail.LastFailure = controller.LastFailure(record.ID)
+	snapshot.CurrentMove = detail
+	snapshot.CurrentMoveAvailable = true
+	return snapshot
+}
+
 // RunPass discovers the complete catalog-bounded work directory and advances
 // every move by at most one durable step. A failed move does not starve an
 // unrelated shard: errors are joined after all discoverable records have had
 // their turn. Catalog CAS fences still serialize conflicting topology changes.
-func (controller *Controller) RunPass(ctx context.Context) (ControllerPass, error) {
+func (controller *Controller) RunPass(ctx context.Context) (result ControllerPass, resultErr error) {
 	if controller == nil || ctx == nil {
 		return ControllerPass{}, ErrControllerConfig
 	}
@@ -228,6 +329,17 @@ func (controller *Controller) RunPass(ctx context.Context) (ControllerPass, erro
 	// same pending step concurrently from this process.
 	controller.passMu.Lock()
 	defer controller.passMu.Unlock()
+	passStartedAt := time.Now().UTC()
+	var highestRevision MoveControllerRecordDiagnostic
+	var moveRecordFound bool
+	defer func() {
+		diagnostic := &MoveControllerPassDiagnostic{
+			StartedAt: passStartedAt, FinishedAt: time.Now().UTC(), Pass: result,
+			Error: errorString(resultErr), HighestRevision: highestRevision,
+			MoveRecordFound: moveRecordFound,
+		}
+		controller.lastPass.Store(diagnostic)
+	}()
 	ids, err := controller.directory.ReadOperationIDs(ctx)
 	if err != nil {
 		return ControllerPass{}, err
@@ -272,23 +384,51 @@ func (controller *Controller) RunPass(ctx context.Context) (ControllerPass, erro
 			continue
 		}
 		pass.Moves++
+		if record.State != gateway.ReplicatedOperationComplete &&
+			(!moveRecordFound || record.Revision > highestRevision.Revision) {
+			identity, inspectErr := rebalance.InspectReplicaMoveIntent(record.Intent)
+			if inspectErr == nil {
+				highestRevision = MoveControllerRecordDiagnostic{
+					OperationID: fmt.Sprintf("%x", record.ID),
+					GroupID:     fmt.Sprintf("%x", identity.Request.Group.GroupID),
+					Revision:    record.Revision, State: record.State, Cursor: record.Cursor,
+				}
+				moveRecordFound = true
+			}
+		}
+		attempt := &MoveControllerAttemptDiagnostic{
+			StartedAt: time.Now().UTC(), OperationID: fmt.Sprintf("%x", record.ID),
+			Revision: record.Revision, State: record.State, Cursor: record.Cursor,
+		}
 		action, stepErr := controller.Resume(ctx, rebalance.OperationID(record.ID))
+		attempt.FinishedAt = time.Now().UTC()
+		attempt.Action = action.Kind.String()
 		if stepErr != nil {
+			attempt.Error = stepErr.Error()
 			failures = errors.Join(failures, stepErr)
 			if reported == nil {
 				reported = make(map[[32]byte]string)
 			}
-			detail := stepErr.Error()
+			detail := fmt.Sprintf("move operation=%x revision=%d state=%d cursor=%x failure_at=%s: %v",
+				record.ID, record.Revision, record.State, record.Cursor, time.Now().UTC().Format(time.RFC3339Nano), stepErr)
 			if len(detail) > 2048 {
 				detail = detail[:2048]
 			}
 			reported[record.ID] = detail
-			continue
+		} else {
+			pass.Advanced++
+			if action.Kind == rebalance.ActionComplete {
+				pass.Completed++
+			}
 		}
-		pass.Advanced++
-		if action.Kind == rebalance.ActionComplete {
-			pass.Completed++
-		}
+		controller.lastAttempt.Store(attempt)
 	}
 	return pass, failures
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

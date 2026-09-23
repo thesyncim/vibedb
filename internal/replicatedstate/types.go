@@ -45,9 +45,9 @@ const (
 	ResultSessionRevoked  uint32 = 10
 	ResultIndexConflict   uint32 = 11
 	// ResultIntentBusy is the deterministic ordinary-mutation refusal emitted
-	// while an active distributed transaction owns the exact relation key.
-	// Result codes are local to their ResultFormat: transaction format code 12
-	// independently denotes a transaction-control CAS loss.
+	// while an active distributed transaction owns the exact relation key. In
+	// the transaction result format it is also the retained direct-write intent
+	// refusal; ResultTransactionConflict is the transaction-control CAS loss.
 	ResultIntentBusy uint32 = 12
 	// ResultRequestLedgerConflict is a deterministic request identity,
 	// revision, or byte-CAS conflict. The retained state remains authoritative.

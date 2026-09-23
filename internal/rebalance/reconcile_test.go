@@ -528,6 +528,115 @@ func TestTargetManifestForMoveReplacesNonFirstSourceLeader(t *testing.T) {
 	}
 }
 
+func TestCertifiedReplicaReplacementMatchesSourceOrdinalOnePlan(t *testing.T) {
+	group := moveTestGroup()
+	manifest, err := distribution.NewManifest("data", 7, []distribution.Shard{{
+		ID: "all", AllocationGeneration: 11,
+		Range: distribution.KeyRange{
+			Start: moveTestPoint(0), End: distribution.KeyspaceEnd{Max: true},
+		},
+		Leaders: []distribution.EndpointID{"ep-a", "ep-c", "ep-d"}, Epoch: 13,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := distribution.ClusterConfig{
+		Distributions: []distribution.DistributionSpec{{Name: "data", Arity: 1, MapperVersion: 1}},
+		Placements:    []distribution.TablePlacement{{Table: "docs", Distribution: "data", Columns: []string{"/id"}}},
+		Manifests:     []*distribution.Manifest{manifest},
+	}
+	endpoints := map[distribution.EndpointID]string{
+		"ep-a": "127.0.0.1:7001", "ep-a-native": "127.0.0.1:7101", "ep-a-control": "127.0.0.1:7201",
+		"ep-b": "127.0.0.1:7002", "ep-b-native": "127.0.0.1:7102", "ep-b-control": "127.0.0.1:7202",
+		"ep-c": "127.0.0.1:7003", "ep-c-native": "127.0.0.1:7103", "ep-c-control": "127.0.0.1:7203",
+		"ep-d": "127.0.0.1:7004", "ep-d-native": "127.0.0.1:7104", "ep-d-control": "127.0.0.1:7204",
+	}
+	command := raftservice.CommandFence{
+		ReplicaSetVersion: 253, ActivePolicyGeneration: 5, ProtectionEpoch: 6,
+		OwnershipEpoch: 13, SchemaGeneration: 8, RelationManifestDigest: [32]byte{1},
+		RoutingVersion: 7, RouteGeneration: 1,
+	}
+	descriptor := gateway.ReplicatedShardDescriptor{
+		Distribution: "data", Shard: "all", Group: group, AllocationGeneration: 11,
+		Command: command, LogicalSchemaDigest: [32]byte{2},
+		RangeIdentity: [32]byte{3}, LineageDigest: [32]byte{4}, ForwardingRuleDigest: [32]byte{5},
+		Replicas: []gateway.ReplicatedReplicaDescriptor{
+			{Member: 1, Node: [16]byte{1}, StoreID: [16]byte{11}, NodeIncarnation: 21,
+				Endpoint: "ep-a", NativeEndpoint: "ep-a-native", ControlEndpoint: "ep-a-control"},
+			{Member: 2, Node: [16]byte{2}, StoreID: [16]byte{12}, NodeIncarnation: 22,
+				Endpoint: "ep-c", NativeEndpoint: "ep-c-native", ControlEndpoint: "ep-c-control"},
+			{Member: 3, Node: [16]byte{3}, StoreID: [16]byte{13}, NodeIncarnation: 23,
+				Endpoint: "ep-d", NativeEndpoint: "ep-d-native", ControlEndpoint: "ep-d-control"},
+		},
+		EnrolledTarget: &gateway.ReplicatedReplicaDescriptor{
+			Member: 4, Node: [16]byte{4}, StoreID: [16]byte{14}, NodeIncarnation: 24,
+			Endpoint: "ep-b", NativeEndpoint: "ep-b-native", ControlEndpoint: "ep-b-control",
+		},
+	}
+	base, err := gateway.NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 5, nil, nil, []gateway.ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var routeWorkspace [gateway.ServingReplicaCount]gateway.ReplicatedEndpoint
+	route, ok := base.ResolveReplicatedRoute("data", "all", routeWorkspace[:0])
+	if !ok {
+		t.Fatal("resolve exact request-ledger route")
+	}
+	current, err := gateway.NewSnapshotWithReplicatedRequestLedgerMetadata(
+		config, endpoints, 5, nil, nil, []gateway.ReplicatedShardDescriptor{descriptor}, nil,
+		gateway.DurableRequestLedgerTopology{Generation: 5, Ranges: []gateway.DurableRequestLedgerRange{{
+			Identity: [32]byte{0x92}, Route: route,
+		}}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	materialized := current.ReplicatedShardDescriptors()[0]
+	if materialized.EnrolledTarget == nil || *materialized.EnrolledTarget != *descriptor.EnrolledTarget {
+		t.Fatalf("catalog enrolled target=%+v, want %+v", materialized.EnrolledTarget, descriptor.EnrolledTarget)
+	}
+	if _, err := gateway.CatalogSnapshotDigest(current); err != nil {
+		t.Fatalf("digest exact source catalog: %v", err)
+	}
+	grant, err := gateway.BuildReplicaReplacementMembershipGrant(
+		current, group, [16]byte{0x91}, 7, 2, 4,
+	)
+	if err != nil {
+		t.Fatalf("build certified membership grant: %v", err)
+	}
+	plan, err := PlanReplicaMove(current, raftmodel.Publication{
+		Applied: 265, ReplicaSetVersion: 253,
+		ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}},
+	}, MoveRequest{
+		Distribution: "data", Shard: "all", Group: group,
+		RetiringMember: 2, SnapshotSourceMember: 3, TargetMember: 4,
+		Source: "ep-c", Target: "ep-b",
+	})
+	if err != nil {
+		t.Fatalf("plan exact ordinal-one replacement: %v", err)
+	}
+	if got := plan.TargetManifest(); got == nil || got.Version() != 8 {
+		t.Fatalf("target manifest = %v, want version 8", got)
+	}
+	nextCommand := command
+	nextCommand.ReplicaSetVersion = 254
+	nextCommand.OwnershipEpoch = 14
+	nextCommand.RoutingVersion = 8
+	nextCommand.RouteGeneration = 2
+	next, err := gateway.BuildReplicaReplacementTransition(
+		current, plan.TargetManifest(), plan.NextCatalogGeneration(), grant,
+		*descriptor.EnrolledTarget, nextCommand,
+	)
+	if err != nil {
+		t.Fatalf("build exact certified ordinal-one replacement: %v", err)
+	}
+	if next.Generation() != 6 || next.ReplicatedShardDescriptors()[0].Command != nextCommand {
+		t.Fatalf("replacement catalog generation/command = %d/%+v", next.Generation(), next.ReplicatedShardDescriptors()[0].Command)
+	}
+}
+
 func BenchmarkTargetManifestForMove1024Shards(b *testing.B) {
 	const shardCount = 1024
 	shards := make([]distribution.Shard, shardCount)

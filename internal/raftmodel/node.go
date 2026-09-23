@@ -126,6 +126,9 @@ type MemberProgress struct {
 	Match           uint64
 	Next            uint64
 	PendingSnapshot uint64
+	State           string
+	InflightCount   int
+	InflightFull    bool
 	Learner         bool
 	RecentActive    bool
 	FlowPaused      bool
@@ -570,7 +573,12 @@ func (n *Node) Progress(memberID uint64) (MemberProgress, bool) {
 		result = MemberProgress{
 			Match: progress.Match, Next: progress.Next,
 			PendingSnapshot: progress.PendingSnapshot, Learner: progress.IsLearner,
-			RecentActive: progress.RecentActive, FlowPaused: progress.IsPaused(),
+			State: progress.State.String(), RecentActive: progress.RecentActive,
+			FlowPaused: progress.IsPaused(),
+		}
+		if progress.Inflights != nil {
+			result.InflightCount = progress.Inflights.Count()
+			result.InflightFull = progress.Inflights.Full()
 		}
 		found = true
 	})

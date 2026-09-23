@@ -43,8 +43,12 @@ type SourceExportPlan struct {
 	ArtifactWorkspace []byte
 	TransferWorkspace []byte
 	// Release returns caller-owned workspace or other bounded plan resources.
-	// Snapshot ownership remains separate and is always closed by the exporter.
+	// The provider owns Snapshot for the plan's full lifetime.
 	Release func()
+	// Finalize releases the provider's pin after publication, or records a
+	// permanent failure while keeping the exact request from minting a new cut.
+	// Transient failures leave the immutable cut available to an exact retry.
+	Finalize func(error) error
 }
 
 // ExportPinnedSnapshot publishes one deterministic artifact from the same
@@ -110,7 +114,7 @@ func ExportPinnedSnapshot(plan SourceExportPlan) (
 
 	offset, complete, err := plan.Repository.OffsetContextWithLease(ctx, lease, descriptor)
 	if err != nil {
-		return Descriptor{}, replicatedstate.SnapshotArtifactManifest{}, err
+		return descriptor, manifest, err
 	}
 	if complete {
 		return descriptor, manifest, nil

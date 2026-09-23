@@ -53,7 +53,7 @@ type postgresModeDurableService interface {
 
 type postgresPreparedDirectService interface {
 	PrepareDirectBatch(context.Context, serviceauthz.Authority, durableExecBatchIdentity, []gateway.Query) (*gateway.DurableSQLDirectPlan, error)
-	ExecutePreparedDirectBatch(context.Context, serviceauthz.Authority, durableExecBatchIdentity, []gateway.Query, *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error)
+	ExecutePreparedDirectBatch(context.Context, serviceauthz.Authority, durableExecBatchIdentity, []gateway.Query, *gateway.DurableSQLDirectPlan, bool) (durableExecBatchExecuteResult, error)
 }
 
 type postgresCoordinatedIssuer struct {
@@ -344,7 +344,9 @@ func (w *postgresDurableWriter) resolve(ctx context.Context, fresh bool) (*gatew
 			return nil, errInvalidDurableRequestAdapter
 		}
 		region := trace.StartRegion(ctx, "pg.direct.execute")
-		result, err = service.ExecutePreparedDirectBatch(ctx, w.record.Authority, w.record.Identity, queries, w.record.DirectPlan)
+		result, err = service.ExecutePreparedDirectBatch(
+			ctx, w.record.Authority, w.record.Identity, queries, w.record.DirectPlan, !fresh,
+		)
 		region.End()
 		found = true
 	} else if !fresh {

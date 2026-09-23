@@ -398,7 +398,7 @@ func (executor *Executor) executeCatalog(
 		grant, target, cut.Command,
 	)
 	if err != nil {
-		return err
+		return replicaReplacementTransitionError(plan, cut, grant, err)
 	}
 	err = executor.options.Catalog.PublishReplicaReplacement(
 		ctx, plan.CatalogGeneration(), next, grant,
@@ -414,6 +414,57 @@ func (executor *Executor) executeCatalog(
 		return errors.Join(err, ErrExecutionFence)
 	}
 	return nil
+}
+
+// replicaReplacementTransitionError adds the exact catalog and Raft fence
+// evidence needed to diagnose a rejected certified cut. This formatting is
+// deliberately confined to the error path; the successful publication path
+// does not enumerate descriptors or allocate diagnostic strings.
+func replicaReplacementTransitionError(
+	plan *rebalance.Plan,
+	cut MoveRoute,
+	grant membershipgrant.Grant,
+	cause error,
+) error {
+	var old raftservice.CommandFence
+	request := plan.Request()
+	if cut.Catalog != nil && plan != nil {
+		for _, descriptor := range cut.Catalog.ReplicatedShardDescriptors() {
+			if descriptor.Group == plan.Group() && descriptor.Distribution == request.Distribution &&
+				descriptor.Shard == request.Shard {
+				old = descriptor.Command
+				break
+			}
+		}
+	}
+	targetManifest := plan.TargetManifest()
+	version := distribution.RoutingVersion(0)
+	var leaders []distribution.EndpointID
+	if targetManifest != nil {
+		version = targetManifest.Version()
+		for shardOrdinal := 0; shardOrdinal < targetManifest.ShardCount(); shardOrdinal++ {
+			metadata, ok := targetManifest.ShardMetadataAt(shardOrdinal)
+			if !ok || metadata.ID != request.Shard {
+				continue
+			}
+			leaders = make([]distribution.EndpointID, 0, metadata.LeaderCount)
+			for leaderOrdinal := 0; leaderOrdinal < metadata.LeaderCount; leaderOrdinal++ {
+				if leader, found := targetManifest.ShardLeaderAt(shardOrdinal, leaderOrdinal); found {
+					leaders = append(leaders, leader)
+				}
+			}
+			break
+		}
+	}
+	return fmt.Errorf(
+		"build certified replica replacement: %w (group=%x grant-initial-rs=%d old-command=[rs=%d policy=%d protection=%d owner=%d schema=%d route=%d route-generation=%d] observed-command=[rs=%d policy=%d protection=%d owner=%d schema=%d route=%d route-generation=%d] target-manifest-version=%d leaders=%q)",
+		cause, grant.Group.GroupID, grant.InitialReplicaSetVersion,
+		old.ReplicaSetVersion, old.ActivePolicyGeneration, old.ProtectionEpoch,
+		old.OwnershipEpoch, old.SchemaGeneration, old.RoutingVersion, old.RouteGeneration,
+		cut.Command.ReplicaSetVersion, cut.Command.ActivePolicyGeneration, cut.Command.ProtectionEpoch,
+		cut.Command.OwnershipEpoch, cut.Command.SchemaGeneration, cut.Command.RoutingVersion, cut.Command.RouteGeneration,
+		version, leaders,
+	)
 }
 
 func (executor *Executor) executeCatalogRefresh(

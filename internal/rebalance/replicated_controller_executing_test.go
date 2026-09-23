@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"go.etcd.io/raft/v3"
 )
 
@@ -46,6 +48,92 @@ type rejectingExecutingJournal struct {
 	rejectKind ActionKind
 	rejectNext bool
 	rejectErr  error
+}
+
+func TestReplicatedMoveOwnershipResponseLossReconcilesTargetBinding(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		partial    bool
+		wantAction ActionKind
+		wantErr    error
+	}{
+		{name: "exact target binding resumes catalog publication", wantAction: ActionPublishCatalog},
+		{name: "partial target binding remains blocked", partial: true, wantErr: ErrTopologyConflict},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			initial, catalog := moveTestPlan(t)
+			plan := bindMoveTestPlan(initial)
+			state := plan.baseState
+			state.Applied, state.ReplicaSetVersion, state.ConfState = 9, 9, plan.voterConf
+			observer := &fixedMoveObserver{cut: ReplicatedMoveCut{Observation: Observation{
+				Catalog: catalog,
+				Publication: raftmodel.Publication{
+					Applied: 9, ReplicaSetVersion: 9, ConfState: plan.voterConf,
+				},
+				LeaderStatus: leaderStatus(plan.TargetMember(), 9),
+				TargetStatus: raftmember.RuntimeStatus{MemberID: plan.TargetMember(), Applied: 9},
+				TargetState:  state,
+				TargetProgress: raftmodel.MemberProgress{
+					Match: 9, Next: 10, RecentActive: true,
+				},
+				ProgressFound: true,
+			}, SnapshotBase: &replicatedstate.SnapshotBaseCertificate{
+				Manifest: replicatedstate.SnapshotArtifactManifest{State: plan.baseState},
+				Digest:   plan.baseDigest,
+			}}}
+			journal := &memoryMoveJournal{}
+			lostReply := errors.New("ownership action committed but reply was lost")
+			executor := &moveActionExecutor{journal: journal, fail: lostReply}
+			action, err := ExecuteReplicatedMoveStep(
+				t.Context(), plan.OperationID(), plan, journal, observer, executor,
+			)
+			if !errors.Is(err, lostReply) || action.Kind != ActionAdvanceOwnership || len(executor.executions) != 1 ||
+				journal.record.State != gateway.ReplicatedOperationRunning ||
+				journal.record.Cursor[3] != replicaMoveCursorExecuting {
+				t.Fatalf("uncertain ownership action=%+v executions=%d record=%+v err=%v",
+					action, len(executor.executions), journal.record, err)
+			}
+			witness := executor.executions[0]
+			prior := journal.record
+
+			// The target durably applied the exact ownership command after the
+			// reply was lost. Its Raft watermark advanced, while the catalog still
+			// names the old route. Resume must derive PublishCatalog from this
+			// certified target state instead of replaying ownership blindly.
+			state = observer.cut.TargetState
+			state.Binding.OwnershipEpoch++
+			state.Binding.RoutingVersion++
+			state.Binding.RouteGeneration++
+			if testCase.partial {
+				state.Binding.RouteGeneration--
+			}
+			state.Applied = 10
+			observer.cut.TargetState = state
+			observer.cut.Publication.Applied = 10
+			observer.cut.LeaderStatus.Applied = 10
+			observer.cut.LeaderStatus.Commit = 10
+			observer.cut.TargetStatus.Applied = 10
+			observer.cut.TargetProgress.Match = 10
+			observer.cut.TargetProgress.Next = 11
+			action, err = ExecuteReplicatedMoveStep(
+				t.Context(), plan.OperationID(), nil, journal, observer, executor,
+			)
+			if testCase.wantErr != nil {
+				if !errors.Is(err, testCase.wantErr) || len(executor.executions) != 1 || !journal.record.Equal(prior) {
+					t.Fatalf("partial target binding advanced: action=%+v executions=%d record=%+v err=%v",
+						action, len(executor.executions), journal.record, err)
+				}
+				return
+			}
+			if err != nil || action.Kind != testCase.wantAction || len(executor.executions) != 2 ||
+				executor.executions[0] != witness || executor.executions[1].Action.Kind != ActionPublishCatalog ||
+				journal.record.Cursor[3] != replicaMoveCursorApplied ||
+				ActionKind(journal.record.Cursor[0]) != ActionPublishCatalog {
+				t.Fatalf("target ownership recovery action=%+v executions=%+v record=%+v err=%v",
+					action, executor.executions, journal.record, err)
+			}
+		})
+	}
 }
 
 func (journal *rejectingExecutingJournal) PublishOperation(
@@ -213,7 +301,7 @@ func TestOpenReplicatedMoveExecutionRestoresTransitionReceiptDigest(t *testing.T
 			Group: plan.Group(), SourceAllocationGeneration: 1,
 			SourceDescriptorDigest: [32]byte{1}, SourceCommandFenceDigest: [32]byte{2},
 		},
-		Phase: gateway.TransitionPhasePreRemove,
+		Phase:                  gateway.TransitionPhasePreRemove,
 		PredecessorGroupDigest: [32]byte{3}, PredecessorHeadGeneration: 1, PredecessorHeadDigest: [32]byte{4},
 		PredecessorGroupGeneration: 1, PredecessorGroupHeadDigest: [32]byte{5},
 		PredecessorRosterDigest: [32]byte{6}, PredecessorRouteDigest: [32]byte{7},

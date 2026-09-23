@@ -3,8 +3,10 @@ package rebalanceexec
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -189,11 +191,29 @@ func TestControllerDiscoversOnlyMovesAndResumesFromJournal(t *testing.T) {
 		controller.LastFailure([32]byte(plan.OperationID())) == "" || controller.LastFailure([32]byte{0xff}) != "" {
 		t.Fatalf("missing or misattributed active move diagnostic: %v", err)
 	}
+	failedDiagnostic := controller.DiagnosticSnapshot(context.Background())
+	if !failedDiagnostic.LastPassAvailable || !failedDiagnostic.LastAttemptAvailable ||
+		failedDiagnostic.LastAttempt.Action != "create-snapshot-base" ||
+		!strings.Contains(failedDiagnostic.LastAttempt.Error, ErrExecutionFence.Error()) ||
+		!failedDiagnostic.CurrentMoveAvailable ||
+		!strings.Contains(failedDiagnostic.CurrentMove.LastFailure, "failure_at=") {
+		t.Fatalf("failed move diagnostic omitted action, cursor, or timestamp: %+v", failedDiagnostic)
+	}
 	fixture.bootstrapErr = nil
 	pass, err := controller.RunPass(context.Background())
 	if err != nil || pass.Discovered != 2 || pass.Moves != 1 || pass.Advanced != 1 ||
 		pass.Completed != 0 || len(fixture.snapshotRequests) != 2 || controller.LastFailure([32]byte(plan.OperationID())) != "" {
 		t.Fatalf("pass=%+v snapshots=%d err=%v", pass, len(fixture.snapshotRequests), err)
+	}
+	diagnostic := controller.DiagnosticSnapshot(context.Background())
+	record := journal.records[[32]byte(plan.OperationID())]
+	if !diagnostic.LastPassAvailable || diagnostic.LastPass.Pass.Moves != 1 ||
+		diagnostic.LastPass.FinishedAt.IsZero() || !diagnostic.LastAttemptAvailable ||
+		diagnostic.LastAttempt.Action != "create-snapshot-base" || diagnostic.LastAttempt.Error != "" ||
+		!diagnostic.CurrentMoveAvailable || diagnostic.CurrentMove.OperationID != fmt.Sprintf("%x", record.ID) ||
+		diagnostic.CurrentMove.Revision != record.Revision || diagnostic.CurrentMove.Cursor != record.Cursor ||
+		diagnostic.CurrentMove.LastFailure != "" {
+		t.Fatalf("successful move diagnostic=%+v durable=%+v", diagnostic, record)
 	}
 }
 

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/asn1"
 	"errors"
+	"fmt"
 	"net"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,6 +27,9 @@ import (
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/shardservice"
+	"go.etcd.io/raft/v3"
+	pb "go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 type gatewayTestGrantSource struct{ grant membershipgrant.Grant }
@@ -187,6 +192,485 @@ func TestGatewayGrantedMembershipInstallsPublishedTargetBeforeSourceRemoval(t *t
 type gatewayTestObservationClient struct {
 	observation replicacontrol.Observation
 	request     *replicacontrol.Request
+}
+
+type gatewayReplicaMoveObserverAuthority struct {
+	catalog *gateway.Snapshot
+	grant   membershipgrant.Grant
+}
+
+func (authority gatewayReplicaMoveObserverAuthority) Read(context.Context) (*gateway.Snapshot, error) {
+	return authority.catalog, nil
+}
+
+func (authority gatewayReplicaMoveObserverAuthority) ReadMembershipGrant(
+	_ context.Context, group raftmember.GroupKey,
+) (membershipgrant.Grant, bool, error) {
+	return authority.grant, authority.grant.Group == group, nil
+}
+
+func (gatewayReplicaMoveObserverAuthority) ReadGroupPublicationReceipt(
+	context.Context, gateway.GroupTransitionKey,
+) (gateway.GroupPublicationReceipt, bool, error) {
+	return gateway.GroupPublicationReceipt{}, false, nil
+}
+
+type gatewayReplicaMoveTargetErrorObservation struct {
+	target      rafttransport.NodeID
+	err         error
+	observation replicacontrol.Observation
+}
+
+func (client gatewayReplicaMoveTargetErrorObservation) Observe(
+	_ context.Context, node rafttransport.NodeID, request replicacontrol.Request,
+) (replicacontrol.Observation, error) {
+	if node == client.target {
+		return replicacontrol.Observation{}, client.err
+	}
+	if node != (rafttransport.NodeID{2}) {
+		return replicacontrol.Observation{}, errors.New("not leader")
+	}
+	result := client.observation
+	result.Request = request
+	return result, nil
+}
+
+type gatewayReplicaMoveTestDrainer struct{}
+
+func (gatewayReplicaMoveTestDrainer) CertifyClusterCatalogDrain(
+	context.Context, gateway.ClusterCatalogDrainRequest,
+) (gateway.ClusterCatalogDrainCertificate, error) {
+	return gateway.ClusterCatalogDrainCertificate{}, nil
+}
+
+func TestGatewayReplicaMoveObserverPropagatesTargetObservationFailure(t *testing.T) {
+	catalog, _, observed := gatewayHotShardMoveFixture(t)
+	plan, err := rebalance.PlanReplicaMove(catalog, observed.publication, rebalance.MoveRequest{
+		Distribution: "data", Shard: "all", Group: observed.grant.Group,
+		RetiringMember: 1, SnapshotSourceMember: 2, TargetMember: 4,
+		Source: "one", Target: "target",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed.publication.ConfState.Voters = append(observed.publication.ConfState.Voters, 4)
+	targetErr := errors.New("target observation deadline")
+	observer := gatewayReplicaMoveObserver{
+		authority: gatewayReplicaMoveObserverAuthority{catalog: catalog, grant: observed.grant},
+		remote: gatewayReplicaMoveTargetErrorObservation{
+			target: rafttransport.NodeID{4}, err: targetErr,
+			observation: replicacontrol.Observation{
+				Publication: observed.publication,
+				Status:      raftmember.RuntimeStatus{MemberID: 2, LeaderID: 2, Term: 4},
+			},
+		},
+		drainer: gatewayReplicaMoveTestDrainer{},
+	}
+	record := gateway.ReplicatedOperationRecord{State: gateway.ReplicatedOperationRunning,
+		Revision: 4, Cursor: [8]uint64{uint64(rebalance.ActionAdvanceOwnership), 4, 0, 1, 7, 10, 8, 0}}
+	_, err = observer.ObserveReplicaMove(t.Context(), plan.OperationID(), record, plan)
+	if !errors.Is(err, targetErr) {
+		t.Fatalf("target observation failure was hidden: %v", err)
+	}
+	for _, evidence := range []string{
+		"operation=" + fmt.Sprintf("%x", plan.OperationID()),
+		"group=" + fmt.Sprintf("%x", observed.grant.Group.GroupID),
+		"member=4", "journal_state=2", "journal_revision=4", "journal_cursor=",
+		"catalog_route_command=", "leader_command=", "target_binding=unavailable",
+	} {
+		if !strings.Contains(err.Error(), evidence) {
+			t.Fatalf("target diagnostic lacks %q: %v", evidence, err)
+		}
+	}
+}
+
+func TestGatewayReplicaMoveObserverAllowsUnhostedTargetBeforeAddLearner(t *testing.T) {
+	catalog, _, observed := gatewayHotShardMoveFixture(t)
+	plan, err := rebalance.PlanReplicaMove(catalog, observed.publication, rebalance.MoveRequest{
+		Distribution: "data", Shard: "all", Group: observed.grant.Group,
+		RetiringMember: 1, SnapshotSourceMember: 2, TargetMember: 4,
+		Source: "one", Target: "target",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := gatewayReplicaMoveObserver{
+		authority: gatewayReplicaMoveObserverAuthority{catalog: catalog, grant: observed.grant},
+		remote: gatewayReplicaMoveTargetErrorObservation{
+			target: rafttransport.NodeID{4}, err: errors.New("empty target has no runtime yet"),
+			observation: replicacontrol.Observation{
+				Publication: observed.publication,
+				Status: raftmember.RuntimeStatus{MemberID: 2, LeaderID: 2, Term: 4,
+					Commit: observed.publication.Applied, Applied: observed.publication.Applied,
+					RaftState: raft.StateLeader},
+			},
+		},
+		drainer: gatewayReplicaMoveTestDrainer{},
+	}
+	cut, err := observer.ObserveReplicaMove(t.Context(), plan.OperationID(), gateway.ReplicatedOperationRecord{}, plan)
+	if err != nil {
+		t.Fatalf("unhosted target prevented leader-side learner admission: %v", err)
+	}
+	if cut.Observation.TargetState != (replicatedstate.State{}) || cut.Observation.TargetStatus != (raftmember.RuntimeStatus{}) {
+		t.Fatalf("failed target observation invented target state: %+v", cut.Observation)
+	}
+	action, err := rebalance.Reconcile(plan, cut.Observation)
+	if err != nil || action.Kind != rebalance.ActionAddLearner || action.Member != plan.TargetMember() {
+		t.Fatalf("unhosted target action=%+v err=%v", action, err)
+	}
+}
+
+type gatewayReplicaMoveMutableObservation struct {
+	target      rafttransport.NodeID
+	targetErr   error
+	targetCut   replicacontrol.Observation
+	targetFound bool
+	leader      replicacontrol.Observation
+}
+
+func (client *gatewayReplicaMoveMutableObservation) Observe(
+	_ context.Context, node rafttransport.NodeID, request replicacontrol.Request,
+) (replicacontrol.Observation, error) {
+	if node == client.target {
+		if client.targetErr != nil {
+			return replicacontrol.Observation{}, client.targetErr
+		}
+		if client.targetFound {
+			result := client.targetCut
+			result.Request = request
+			return result, nil
+		}
+		return replicacontrol.Observation{}, errors.New("target observation not configured")
+	}
+	if node != (rafttransport.NodeID{2}) {
+		return replicacontrol.Observation{}, errors.New("not leader")
+	}
+	result := client.leader
+	result.Request = request
+	return result, nil
+}
+
+type gatewayReplicaMoveMemoryJournal struct {
+	record gateway.ReplicatedOperationRecord
+	found  bool
+}
+
+func (journal *gatewayReplicaMoveMemoryJournal) ReadOperation(
+	_ context.Context, id [32]byte,
+) (gateway.ReplicatedOperationRecord, error) {
+	if !journal.found || journal.record.ID != id {
+		return gateway.ReplicatedOperationRecord{}, gateway.ErrReplicatedOperationMissing
+	}
+	return journal.record, nil
+}
+
+func (journal *gatewayReplicaMoveMemoryJournal) SubmitOperation(
+	_ context.Context, record gateway.ReplicatedOperationRecord,
+) error {
+	journal.record, journal.found = record, true
+	return nil
+}
+
+func (journal *gatewayReplicaMoveMemoryJournal) PublishOperation(
+	_ context.Context, expected uint64, record gateway.ReplicatedOperationRecord,
+) error {
+	if !journal.found || journal.record.Revision != expected {
+		return errors.New("move journal revision mismatch")
+	}
+	journal.record = record
+	return nil
+}
+
+func (journal *gatewayReplicaMoveMemoryJournal) DeleteOperation(
+	_ context.Context, id [32]byte, expected uint64,
+) error {
+	if !journal.found || journal.record.ID != id || journal.record.Revision != expected {
+		return errors.New("move journal delete mismatch")
+	}
+	journal.found = false
+	return nil
+}
+
+func (*gatewayReplicaMoveMemoryJournal) RetryPending(context.Context) error { return nil }
+
+type gatewayReplicaMoveStepExecutor struct {
+	observation *replicacontrol.Observation
+	actions     []rebalance.ActionKind
+}
+
+func (executor *gatewayReplicaMoveStepExecutor) ExecuteReplicaMove(
+	_ context.Context, _ rebalance.OperationID, _ *rebalance.Plan,
+	execution rebalance.ReplicatedMoveExecution,
+) error {
+	executor.actions = append(executor.actions, execution.Action.Kind)
+	if execution.Action.Kind == rebalance.ActionAddLearner {
+		executor.observation.Publication.ConfState = &pb.ConfState{
+			Voters: []uint64{1, 2, 3}, Learners: []uint64{4},
+		}
+		executor.observation.Publication.Applied++
+		executor.observation.Publication.ReplicaSetVersion++
+		executor.observation.Status.Applied++
+		executor.observation.Status.Commit++
+		executor.observation.SnapshotBase = &replicatedstate.SnapshotBaseCertificate{
+			Digest: [32]byte{1},
+		}
+	}
+	return nil
+}
+
+func gatewayReplicaMoveTestSnapshotCertificate(
+	plan *rebalance.Plan, catalog *gateway.Snapshot, publication raftmodel.Publication,
+) *replicatedstate.SnapshotBaseCertificate {
+	descriptor := catalog.ReplicatedShardDescriptors()[0]
+	digest := [32]byte{0x5a}
+	state := replicatedstate.State{
+		Binding: replicatedstate.Binding{
+			ClusterID: plan.Group().ClusterID, ClusterIncarnation: plan.Group().ClusterIncarnation,
+			TopologyRecoveryEpoch: plan.Group().TopologyRecoveryEpoch,
+			Distribution:          "data", Shard: "all", AllocationGeneration: uint64(descriptor.AllocationGeneration),
+			ShardIncarnation: plan.Group().ShardIncarnation, GroupID: plan.Group().GroupID,
+			ActivePolicyGeneration: descriptor.Command.ActivePolicyGeneration,
+			ProtectionEpoch:        descriptor.Command.ProtectionEpoch,
+			OwnershipEpoch:         descriptor.Command.OwnershipEpoch,
+			SchemaGeneration:       descriptor.Command.SchemaGeneration,
+			RoutingVersion:         uint64(descriptor.Command.RoutingVersion),
+			RouteGeneration:        descriptor.Command.RouteGeneration,
+			OwnedRange:             distribution.KeyRange{End: distribution.KeyspaceEnd{Max: true}},
+		},
+		ConfState: proto.Clone(publication.ConfState).(*pb.ConfState),
+		Applied:   publication.Applied, ReplicaSetVersion: publication.ReplicaSetVersion,
+		LastTerm: 4, SnapshotBaseDigest: digest,
+	}
+	return &replicatedstate.SnapshotBaseCertificate{
+		Manifest: replicatedstate.SnapshotArtifactManifest{State: state}, Digest: digest,
+	}
+}
+
+func TestGatewayReplicaMoveObserverAdvancesAppliedLearnerToSnapshotBeforeBootstrap(t *testing.T) {
+	catalog, _, observed := gatewayHotShardMoveFixture(t)
+	plan, err := rebalance.PlanReplicaMove(catalog, observed.publication, rebalance.MoveRequest{
+		Distribution: "data", Shard: "all", Group: observed.grant.Group,
+		RetiringMember: 1, SnapshotSourceMember: 2, TargetMember: 4,
+		Source: "one", Target: "target",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaderObservation := replicacontrol.Observation{
+		Publication: observed.publication,
+		Status: raftmember.RuntimeStatus{MemberID: 2, LeaderID: 2, Term: 4,
+			Commit: observed.publication.Applied, Applied: observed.publication.Applied,
+			RaftState: raft.StateLeader},
+	}
+	remote := &gatewayReplicaMoveMutableObservation{
+		target: rafttransport.NodeID{4}, targetErr: errors.New("pre-bootstrap target EOF"),
+		leader: leaderObservation,
+	}
+	observer := gatewayReplicaMoveObserver{
+		authority: gatewayReplicaMoveObserverAuthority{catalog: catalog, grant: observed.grant},
+		remote:    remote, drainer: gatewayReplicaMoveTestDrainer{},
+	}
+	initial, err := rebalance.PrepareReplicatedMoveRecord(t.Context(), plan, observer)
+	if err != nil || rebalance.ActionKind(initial.Cursor[0]) != rebalance.ActionAddLearner {
+		t.Fatalf("prepared record action=%d err=%v", initial.Cursor[0], err)
+	}
+	journal := &gatewayReplicaMoveMemoryJournal{record: initial, found: true}
+	executor := &gatewayReplicaMoveStepExecutor{observation: &remote.leader}
+
+	first, err := rebalance.ExecuteReplicatedMoveStep(
+		t.Context(), plan.OperationID(), nil, journal, observer, executor,
+	)
+	if err != nil || first.Kind != rebalance.ActionAddLearner ||
+		journal.record.Cursor[3] != 3 {
+		t.Fatalf("AddLearner action=%+v record=%+v err=%v", first, journal.record, err)
+	}
+	if remote.leader.Publication.ConfState.GetLearners()[0] != plan.TargetMember() {
+		t.Fatalf("test executor did not apply learner: %+v", remote.leader.Publication.ConfState)
+	}
+
+	cut, err := observer.ObserveReplicaMove(t.Context(), plan.OperationID(), journal.record, nil)
+	if err != nil || cut.SnapshotBase != nil ||
+		cut.Observation.TargetStatus != (raftmember.RuntimeStatus{}) ||
+		cut.Observation.TargetState != (replicatedstate.State{}) {
+		t.Fatalf("pre-bootstrap learner cut=%+v err=%v", cut, err)
+	}
+	action, err := rebalance.Reconcile(plan, cut.Observation)
+	if err != nil || action.Kind != rebalance.ActionCreateSnapshotBase {
+		t.Fatalf("pre-bootstrap learner reconcile=%+v err=%v", action, err)
+	}
+
+	second, err := rebalance.ExecuteReplicatedMoveStep(
+		t.Context(), plan.OperationID(), nil, journal, observer, executor,
+	)
+	if err != nil || second.Kind != rebalance.ActionCreateSnapshotBase ||
+		len(executor.actions) != 2 || executor.actions[1] != rebalance.ActionCreateSnapshotBase ||
+		rebalance.ActionKind(journal.record.Cursor[0]) != rebalance.ActionCreateSnapshotBase ||
+		journal.record.Cursor[3] != 3 {
+		t.Fatalf("snapshot action=%+v actions=%v record=%+v err=%v", second, executor.actions, journal.record, err)
+	}
+}
+
+func TestGatewayReplicaMoveObserverRejectsMissingCertificateForBoundWitness(t *testing.T) {
+	catalog, _, observed := gatewayHotShardMoveFixture(t)
+	plan, err := rebalance.PlanReplicaMove(catalog, observed.publication, rebalance.MoveRequest{
+		Distribution: "data", Shard: "all", Group: observed.grant.Group,
+		RetiringMember: 1, SnapshotSourceMember: 2, TargetMember: 4,
+		Source: "one", Target: "target",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	learnerPublication := observed.publication
+	learnerPublication.Applied++
+	learnerPublication.ReplicaSetVersion++
+	learnerPublication.ConfState = &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4}}
+	certificate := gatewayReplicaMoveTestSnapshotCertificate(plan, catalog, learnerPublication)
+	intent, err := rebalance.AppendReplicaMoveIntent(nil, catalog, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundPlan, err := rebalance.OpenReplicaMoveIntent(intent, catalog, learnerPublication, certificate)
+	if err != nil || !boundPlan.SnapshotBaseBound() {
+		t.Fatalf("bound plan=%t err=%v", boundPlan != nil && boundPlan.SnapshotBaseBound(), err)
+	}
+	leaderObservation := replicacontrol.Observation{
+		Publication: learnerPublication,
+		Status: raftmember.RuntimeStatus{MemberID: 2, LeaderID: 2, Term: 4,
+			Commit: learnerPublication.Applied, Applied: learnerPublication.Applied,
+			RaftState: raft.StateLeader},
+		SnapshotBase: certificate,
+	}
+	remote := &gatewayReplicaMoveMutableObservation{
+		target: rafttransport.NodeID{4}, targetFound: true,
+		leader:    leaderObservation,
+		targetCut: replicacontrol.Observation{SnapshotBase: certificate},
+	}
+	observer := gatewayReplicaMoveObserver{
+		authority: gatewayReplicaMoveObserverAuthority{catalog: catalog, grant: observed.grant},
+		remote:    remote, drainer: gatewayReplicaMoveTestDrainer{},
+	}
+	boundRecord, err := rebalance.PrepareReplicatedMoveRecord(t.Context(), boundPlan, observer)
+	if err != nil || rebalance.ActionKind(boundRecord.Cursor[0]) != rebalance.ActionAwaitSnapshotInstall {
+		t.Fatalf("bound action=%d err=%v", boundRecord.Cursor[0], err)
+	}
+	journal := &gatewayReplicaMoveMemoryJournal{record: boundRecord, found: true}
+	executor := new(gatewayReplicaMoveStepExecutor)
+	remote.targetFound = false
+	remote.targetErr = errors.New("pre-bootstrap target EOF")
+	cut, err := observer.ObserveReplicaMove(t.Context(), plan.OperationID(), journal.record, nil)
+	if err != nil || cut.SnapshotBase != nil {
+		t.Fatalf("unobserved target certificate was reused: certificate=%v err=%v", cut.SnapshotBase, err)
+	}
+	_, err = rebalance.ExecuteReplicatedMoveStep(
+		t.Context(), plan.OperationID(), nil, journal, observer, executor,
+	)
+	if !errors.Is(err, rebalance.ErrReplicatedMove) || len(executor.actions) != 0 ||
+		!journal.record.Equal(boundRecord) {
+		t.Fatalf("missing bound certificate was not fail-closed: actions=%v record_changed=%t err=%v",
+			executor.actions, !journal.record.Equal(boundRecord), err)
+	}
+}
+
+func TestGatewayReplicaMoveObserverFailsClosedOutsideSourceLearnerStage(t *testing.T) {
+	for _, name := range []string{"voter", "voter-outgoing", "learner-next", "target-published"} {
+		t.Run(name, func(t *testing.T) {
+			catalog, _, observed := gatewayHotShardMoveFixture(t)
+			plan, err := rebalance.PlanReplicaMove(catalog, observed.publication, rebalance.MoveRequest{
+				Distribution: "data", Shard: "all", Group: observed.grant.Group,
+				RetiringMember: 1, SnapshotSourceMember: 2, TargetMember: 4,
+				Source: "one", Target: "target",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			leaderPublication := observed.publication
+			switch name {
+			case "voter":
+				leaderPublication.ConfState = &pb.ConfState{Voters: []uint64{1, 2, 3, 4}}
+			case "voter-outgoing":
+				leaderPublication.ConfState = &pb.ConfState{
+					Voters: []uint64{1, 2, 3}, VotersOutgoing: []uint64{4}, Learners: []uint64{4},
+				}
+			case "learner-next":
+				leaderPublication.ConfState = &pb.ConfState{
+					Voters: []uint64{1, 2, 3}, Learners: []uint64{4}, LearnersNext: []uint64{4},
+				}
+			case "target-published":
+				descriptor := catalog.ReplicatedShardDescriptors()[0]
+				target := *descriptor.EnrolledTarget
+				command := descriptor.Command
+				command.ReplicaSetVersion += 3
+				command.OwnershipEpoch++
+				command.RoutingVersion++
+				command.RouteGeneration++
+				catalog, err = gateway.BuildReplicaReplacementTransition(
+					catalog, plan.TargetManifest(), catalog.Generation()+1,
+					observed.grant, target, command,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				leaderPublication.Applied = command.ReplicaSetVersion
+				leaderPublication.ReplicaSetVersion = command.ReplicaSetVersion
+				leaderPublication.ConfState = &pb.ConfState{
+					Voters: []uint64{1, 2, 3}, Learners: []uint64{4},
+				}
+			}
+			targetErr := errors.New("target observation unavailable")
+			remote := gatewayReplicaMoveTargetErrorObservation{
+				target: rafttransport.NodeID{4}, err: targetErr,
+				observation: replicacontrol.Observation{
+					Publication: leaderPublication,
+					Status: raftmember.RuntimeStatus{MemberID: 2, LeaderID: 2, Term: 4,
+						Commit: leaderPublication.Applied, Applied: leaderPublication.Applied,
+						RaftState: raft.StateLeader},
+				},
+			}
+			observer := gatewayReplicaMoveObserver{
+				authority: gatewayReplicaMoveObserverAuthority{catalog: catalog, grant: observed.grant},
+				remote:    remote, drainer: gatewayReplicaMoveTestDrainer{},
+			}
+			_, err = observer.ObserveReplicaMove(t.Context(), plan.OperationID(), gateway.ReplicatedOperationRecord{}, plan)
+			if !errors.Is(err, targetErr) {
+				t.Fatalf("target failure was hidden outside source learner stage: %v", err)
+			}
+		})
+	}
+}
+
+func TestGatewayReplicaMoveObserverRejectsInvalidLearnerRoster(t *testing.T) {
+	catalog, _, observed := gatewayHotShardMoveFixture(t)
+	plan, err := rebalance.PlanReplicaMove(catalog, observed.publication, rebalance.MoveRequest{
+		Distribution: "data", Shard: "all", Group: observed.grant.Group,
+		RetiringMember: 1, SnapshotSourceMember: 2, TargetMember: 4,
+		Source: "one", Target: "target",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publication := observed.publication
+	publication.Applied++
+	publication.ReplicaSetVersion++
+	publication.ConfState = &pb.ConfState{Voters: []uint64{1, 2, 3}, Learners: []uint64{4, 5}}
+	remote := gatewayReplicaMoveTargetErrorObservation{
+		target: rafttransport.NodeID{4}, err: errors.New("target not hosted"),
+		observation: replicacontrol.Observation{
+			Publication: publication,
+			Status: raftmember.RuntimeStatus{MemberID: 2, LeaderID: 2, Term: 4,
+				Commit: publication.Applied, Applied: publication.Applied, RaftState: raft.StateLeader},
+		},
+	}
+	observer := gatewayReplicaMoveObserver{
+		authority: gatewayReplicaMoveObserverAuthority{catalog: catalog, grant: observed.grant},
+		remote:    remote, drainer: gatewayReplicaMoveTestDrainer{},
+	}
+	cut, err := observer.ObserveReplicaMove(t.Context(), plan.OperationID(), gateway.ReplicatedOperationRecord{}, plan)
+	if err != nil {
+		t.Fatalf("leader-side learner cut failed before roster validation: %v", err)
+	}
+	if _, err = rebalance.Reconcile(plan, cut.Observation); !errors.Is(err, rebalance.ErrTopologyConflict) {
+		t.Fatalf("invalid learner roster reconcile error=%v", err)
+	}
 }
 
 func (client gatewayTestObservationClient) Observe(

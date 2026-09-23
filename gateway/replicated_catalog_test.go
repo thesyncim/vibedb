@@ -196,6 +196,58 @@ func TestReplicatedCatalogSeparatesEnrolledTargetFromServingRF3(t *testing.T) {
 	); err == nil {
 		t.Fatal("catalog accepted an enrolled target that repeats a serving member")
 	}
+	both := descriptor
+	endpoints["ep-retiring"] = "127.0.0.1:7006"
+	endpoints["ep-retiring-native"] = "127.0.0.1:7106"
+	endpoints["ep-retiring-control"] = "127.0.0.1:7206"
+	both.RetiringSource = &ReplicatedReplicaDescriptor{
+		Member: 5, Node: [16]byte{5}, StoreID: [16]byte{15}, NodeIncarnation: 25,
+		Endpoint: "ep-retiring", NativeEndpoint: "ep-retiring-native",
+		ControlEndpoint: "ep-retiring-control",
+	}
+	if _, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 6, nil, nil, []ReplicatedShardDescriptor{both},
+	); err == nil {
+		t.Fatal("catalog accepted both transition endpoints in the single bounded slot")
+	}
+}
+
+func TestReplicatedMembershipRouteRetainsCertifiedRetiringSource(t *testing.T) {
+	config, endpoints, descriptor := testReplicatedCatalogInput(t)
+	descriptor.RetiringSource = &ReplicatedReplicaDescriptor{
+		Member: 4, Node: [16]byte{4}, StoreID: [16]byte{14}, NodeIncarnation: 24,
+		Endpoint: "ep-b", NativeEndpoint: "ep-b-native", ControlEndpoint: "ep-b-control",
+	}
+	snapshot, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 5, nil, nil, []ReplicatedShardDescriptor{descriptor},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace [ServingReplicaCount]ReplicatedEndpoint
+	membership, ok := snapshot.ResolveReplicatedMembershipRoute(
+		descriptor.Distribution, descriptor.Shard, workspace[:0],
+	)
+	if !ok || membership.HasEnrolledTarget || membership.RetiringSource.Member != 4 ||
+		membership.RetiringSource.Address != endpoints[descriptor.RetiringSource.NativeEndpoint] {
+		t.Fatalf("retiring membership route=%+v ok=%v", membership, ok)
+	}
+	for _, serving := range membership.Serving.Replicas {
+		if serving.Member == membership.RetiringSource.Member {
+			t.Fatalf("retiring source leaked into serving RF3: %+v", membership)
+		}
+	}
+
+	invalid := descriptor
+	invalid.EnrolledTarget = &ReplicatedReplicaDescriptor{
+		Member: 5, Node: [16]byte{5}, StoreID: [16]byte{15}, NodeIncarnation: 25,
+		Endpoint: "ep-b", NativeEndpoint: "ep-b-native", ControlEndpoint: "ep-b-control",
+	}
+	if _, err := NewSnapshotWithReplicatedMetadata(
+		config, endpoints, 6, nil, nil, []ReplicatedShardDescriptor{invalid},
+	); err == nil {
+		t.Fatal("catalog accepted an unbound fourth endpoint alongside the retiring source")
+	}
 }
 
 func TestBuildReplicaReplacementMembershipGrantBindsCompleteEnrolledIdentity(t *testing.T) {
@@ -423,14 +475,82 @@ func TestBuildReplicaReplacementTransitionRequiresExactCertifiedRF3Successor(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	var workspace [ServingReplicaCount]ReplicatedEndpoint
+	var workspace [ServingReplicaCount + 1]ReplicatedEndpoint
 	route, ok := next.ResolveReplicatedRoute(
 		descriptor.Distribution, descriptor.Shard, workspace[:0],
 	)
 	if !ok || route.Command != command || route.Replicas[0].Member != grant.TargetMember ||
 		route.Replicas[0].Node != target.Node || route.Replicas[1].Member != 2 ||
-		route.Replicas[2].Member != 3 {
+		route.Replicas[2].Member != 3 || len(route.Replicas) != ServingReplicaCount ||
+		!route.hasDiscoveryReplica || route.discoveryReplica.Member != grant.SourceMember ||
+		route.discoveryReplica.NativeEndpoint != string(descriptor.Replicas[0].NativeEndpoint) {
 		t.Fatalf("replacement route=%+v ok=%v", route, ok)
+	}
+	if got := next.ReplicatedShardDescriptors()[0].RetiringSource; got == nil || *got != descriptor.Replicas[0] {
+		t.Fatalf("G+1 retiring source=%+v, want exact displaced voter %+v", got, descriptor.Replicas[0])
+	}
+
+	path := filepath.Join(t.TempDir(), "retiring-source-catalog.json")
+	if err := SaveSnapshot(path, next); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloadedDescriptor := reloaded.ReplicatedShardDescriptors()[0]
+	if reloadedDescriptor.RetiringSource == nil || *reloadedDescriptor.RetiringSource != descriptor.Replicas[0] {
+		t.Fatalf("persisted retiring source=%+v", reloadedDescriptor.RetiringSource)
+	}
+	var loadedWorkspace [ServingReplicaCount + 1]ReplicatedEndpoint
+	loadedRoute, ok := reloaded.ResolveReplicatedRoute(descriptor.Distribution, descriptor.Shard, loadedWorkspace[:0])
+	if !ok || !loadedRoute.hasDiscoveryReplica || loadedRoute.discoveryReplica.Member != grant.SourceMember {
+		t.Fatalf("reloaded source discovery route=%+v ok=%v", loadedRoute, ok)
+	}
+	var zeroAllocWorkspace [ServingReplicaCount + 1]ReplicatedEndpoint
+	var candidateWorkspace [ServingReplicaCount + 1]ReplicatedEndpoint
+	var resolved ReplicatedRoute
+	var resolvedOK bool
+	if allocations := testing.AllocsPerRun(1000, func() {
+		resolved, resolvedOK = reloaded.ResolveReplicatedRoute(
+			descriptor.Distribution, descriptor.Shard, zeroAllocWorkspace[:0],
+		)
+		_ = routeDiscoveryCandidates(resolved, candidateWorkspace[:0])
+	}); allocations != 0 || !resolvedOK {
+		t.Fatalf("G+1 route discovery allocations=%f route=%+v ok=%v", allocations, resolved, resolvedOK)
+	}
+
+	postRemove, err := BuildReplicaReplacementPostRemoveTransition(
+		next, next.Generation()+1, grant, command.ReplicaSetVersion+1,
+	)
+	if err != nil {
+		t.Fatalf("build G+2 post-remove cut: %v", err)
+	}
+	postRemoveDescriptor := postRemove.ReplicatedShardDescriptors()[0]
+	if postRemoveDescriptor.RetiringSource != nil {
+		t.Fatalf("G+2 retained retiring source %+v", postRemoveDescriptor.RetiringSource)
+	}
+	var postRemoveWorkspace [ServingReplicaCount + 1]ReplicatedEndpoint
+	postRemoveRoute, ok := postRemove.ResolveReplicatedRoute(
+		descriptor.Distribution, descriptor.Shard, postRemoveWorkspace[:0],
+	)
+	if !ok || postRemoveRoute.hasDiscoveryReplica || len(routeDiscoveryCandidates(postRemoveRoute, postRemoveWorkspace[:0])) != ServingReplicaCount {
+		t.Fatalf("G+2 route retained transition discovery: %+v ok=%v", postRemoveRoute, ok)
+	}
+
+	forgedDescriptors := next.ReplicatedShardDescriptors()
+	forgedSource := *forgedDescriptors[0].RetiringSource
+	forgedSource.Member = 9 // structurally distinct, but not the exact grant source.
+	forgedDescriptors[0].RetiringSource = &forgedSource
+	forged, err := NewSnapshotWithReplicatedTableMetadata(
+		cloneConfig(next.config), next.endpoints, next.Generation(), next.indexDescriptors(),
+		next.statistics.Descriptors(), forgedDescriptors, next.replicatedTableProfiles(), next.ReplicatedTableDeclarations(),
+	)
+	if err != nil {
+		t.Fatalf("construct forged retiring-source fixture: %v", err)
+	}
+	if err = validateCertifiedReplicaReplacement(current, forged, grant); err == nil {
+		t.Fatal("certified replacement accepted a retiring source that did not match the displaced voter")
 	}
 	if _, err = advanceCatalogState(current, next); err == nil {
 		t.Fatal("ordinary catalog transition accepted a certified roster change without its grant")

@@ -37,7 +37,7 @@ func (s *preparedWriteService) PrepareDirectBatch(_ context.Context, _ serviceau
 	s.prepared++
 	return &gateway.DurableSQLDirectPlan{Key: requestledger.RequestKey{Request: requestledger.RequestID(id.RequestID), IssuerSequence: id.IssuerSequence}, RequestDigest: replication.Digest{7}, CatalogGeneration: 1, Target: gateway.ReplicatedTransactionTarget{Batches: []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{Kind: replication.MutationPutDigestEqual, Key: []byte("a"), Value: []byte(`{"id":"a","n":42}`), ExpectedValueLength: 17, ExpectedValueDigest: replication.Digest{9}}}}}}}, nil
 }
-func (s *preparedWriteService) ExecutePreparedDirectBatch(_ context.Context, _ serviceauthz.Authority, id durableExecBatchIdentity, _ []gateway.Query, plan *gateway.DurableSQLDirectPlan) (durableExecBatchExecuteResult, error) {
+func (s *preparedWriteService) ExecutePreparedDirectBatch(_ context.Context, _ serviceauthz.Authority, id durableExecBatchIdentity, _ []gateway.Query, plan *gateway.DurableSQLDirectPlan, _ bool) (durableExecBatchExecuteResult, error) {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		s.t.Fatal(err)

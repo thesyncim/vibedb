@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/migrationbudget"
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -33,7 +34,9 @@ type rf3NodeOwner struct {
 	// after the authenticated peer runtime and physical directory are ready.
 	// It is kept as a callback so the node owner remains independent of the
 	// runtime's transport lifecycle during startup and teardown.
-	transportFailures func() []rf3DiagnosticTransportFailure
+	transportFailures  func() []rf3DiagnosticTransportFailure
+	transportPeerStats func() []rf3DiagnosticPeerTransport
+	peerInboundStats   func() raftservice.PeerServerStats
 }
 
 // bindEmptyRuntime is the process-local handoff used by a bootstrap-directory

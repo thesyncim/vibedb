@@ -408,6 +408,8 @@ func BuildGroupOwnedShardTransition(
 			}
 			descriptor.Replicas[changedOrdinal] = replacement
 			descriptor.EnrolledTarget = nil
+			retiringSource := source
+			descriptor.RetiringSource = &retiringSource
 			// Route leaders can deliberately use NativeEndpoint. Preserve the
 			// chosen alias while replacing the same ordered source position.
 			if source.Endpoint == sourceRouteEndpoint {
@@ -428,6 +430,17 @@ func BuildGroupOwnedShardTransition(
 			continue
 		}
 		if phase == TransitionPhasePostRemove {
+			var expectedRetiringSource ReplicatedReplicaDescriptor
+			for _, source := range intent.SourceDescriptor.Replicas {
+				if source.Member == intent.SourceMember {
+					expectedRetiringSource = source
+					break
+				}
+			}
+			if descriptor.EnrolledTarget != nil || expectedRetiringSource == (ReplicatedReplicaDescriptor{}) ||
+				descriptor.RetiringSource == nil || *descriptor.RetiringSource != expectedRetiringSource {
+				return nil, ErrGroupTransition
+			}
 			foundTarget := false
 			for _, replica := range descriptor.Replicas {
 				if replica.Member == replacement.Member {
@@ -438,6 +451,8 @@ func BuildGroupOwnedShardTransition(
 			if !foundTarget {
 				return nil, ErrGroupTransition
 			}
+			descriptor.RetiringSource = nil
+			descriptor.EnrolledTarget = nil
 			descriptor.Command = command
 			changed = true
 		}
@@ -581,6 +596,13 @@ func DigestReplicatedShardDescriptor(descriptor ReplicatedShardDescriptor) [32]b
 		hash.u64(1)
 		targetDigest := DigestReplicatedReplicaDescriptor(*descriptor.EnrolledTarget)
 		hash.bytes(targetDigest[:])
+	}
+	if descriptor.RetiringSource == nil {
+		hash.u64(0)
+	} else {
+		hash.u64(1)
+		sourceDigest := DigestReplicatedReplicaDescriptor(*descriptor.RetiringSource)
+		hash.bytes(sourceDigest[:])
 	}
 	return hash.sum()
 }
@@ -726,6 +748,10 @@ func cloneTransitionDescriptor(descriptor ReplicatedShardDescriptor) ReplicatedS
 	if descriptor.EnrolledTarget != nil {
 		target := *descriptor.EnrolledTarget
 		descriptor.EnrolledTarget = &target
+	}
+	if descriptor.RetiringSource != nil {
+		source := *descriptor.RetiringSource
+		descriptor.RetiringSource = &source
 	}
 	if descriptor.SplitOrigin != nil {
 		origin := *descriptor.SplitOrigin

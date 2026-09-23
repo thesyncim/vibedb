@@ -36,6 +36,8 @@ type rf3NodeRuntime struct {
 	native        *rf3NativeAuthorities
 	actionJournal *replicaaction.FileJournal
 	controlMu     sync.Mutex
+	groupsMu      sync.RWMutex
+	groups        map[raftmember.GroupKey]*raftmember.Runtime
 	// servingGroups is separate from transport membership. A group becomes
 	// native-serving only after the certified snapshot installer calls
 	// RegisterExecutionGroup; an empty process therefore remains fail-closed.
@@ -73,10 +75,34 @@ func (runtime *rf3NodeRuntime) RegisterExecutionGroupWithGrant(
 			group.Identity.Group.GroupID, group.Identity.MemberID, group.Identity.NodeIncarnation,
 			len(roster), servingBefore, err)
 	}
+	// Keep the same shared inventory used to register dynamic learners so an
+	// on-demand SIGUSR1 snapshot can include their Raft state. This map is only
+	// touched during group lifecycle transitions; data requests do not read it.
+	runtime.groupsMu.Lock()
+	if runtime.groups == nil {
+		runtime.groups = make(map[raftmember.GroupKey]*raftmember.Runtime)
+	}
+	runtime.groups[group.Identity.Group] = group.Runtime
+	runtime.groupsMu.Unlock()
 	if runtime.servingGroups != nil {
 		runtime.servingGroups.Add(1)
 	}
 	return nil
+}
+
+func (runtime *rf3NodeRuntime) diagnosticRuntimes() []*raftmember.Runtime {
+	if runtime == nil {
+		return nil
+	}
+	runtime.groupsMu.RLock()
+	groups := make([]*raftmember.Runtime, 0, len(runtime.groups))
+	for _, group := range runtime.groups {
+		if group != nil {
+			groups = append(groups, group)
+		}
+	}
+	runtime.groupsMu.RUnlock()
+	return groups
 }
 
 // UnregisterExecutionGroup withdraws a quiescent group from the shared peer
@@ -89,6 +115,9 @@ func (runtime *rf3NodeRuntime) UnregisterExecutionGroup(identity raftmember.Runt
 	if err := runtime.peer.UnregisterExecutionGroup(identity); err != nil {
 		return err
 	}
+	runtime.groupsMu.Lock()
+	delete(runtime.groups, identity.Group)
+	runtime.groupsMu.Unlock()
 	var cleanup error
 	cleanup = errors.Join(cleanup, runtime.native.unregisterDynamic(identity))
 	if runtime.donors != nil {

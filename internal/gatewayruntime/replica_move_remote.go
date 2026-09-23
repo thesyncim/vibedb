@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/membershipgrant"
+	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalance"
@@ -21,6 +23,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/snapshottransfer"
 	"github.com/thesyncim/vibedb/shardservice"
+	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 var errGatewayReplicaControl = errors.New("vibedb-gateway: invalid replica control configuration")
@@ -188,6 +191,8 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 	var observeErrors error
 	candidates := route.Membership.AppendControlEndpoints(nil)
 	for _, endpoint := range candidates {
+		startedAt := time.Now().UTC()
+		started := time.Now()
 		candidate, observeErr := observer.remote.Observe(ctx, endpoint.Node, observeRequest)
 		if observeErr == nil && candidate.Publication.ReplicaSetVersion >= minimumReplicaSet &&
 			candidate.Status.MemberID == endpoint.Member && candidate.Status.MemberID == candidate.Status.LeaderID &&
@@ -196,10 +201,12 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 			break
 		}
 		if observeErr != nil {
-			observeErrors = errors.Join(observeErrors, fmt.Errorf("observe move member %d: %w", endpoint.Member, observeErr))
+			observeErrors = errors.Join(observeErrors, fmt.Errorf("observe move candidate member=%d node=%x control=%s started_at=%s elapsed=%s: %w",
+				endpoint.Member, endpoint.Node, endpoint.ControlAddress, startedAt.Format(time.RFC3339Nano), time.Since(started), observeErr))
 		} else {
-			observeErrors = errors.Join(observeErrors, fmt.Errorf("observe move member %d: group=%x member=%d leader=%d term=%d replica-set=%d minimum=%d voters=%v learners=%v: %w",
-				endpoint.Member, request.Group.GroupID, candidate.Status.MemberID, candidate.Status.LeaderID, candidate.Status.Term,
+			observeErrors = errors.Join(observeErrors, fmt.Errorf("observe move candidate member=%d node=%x control=%s started_at=%s elapsed=%s group=%x member=%d leader=%d term=%d replica-set=%d minimum=%d voters=%v learners=%v: %w",
+				endpoint.Member, endpoint.Node, endpoint.ControlAddress, startedAt.Format(time.RFC3339Nano), time.Since(started),
+				request.Group.GroupID, candidate.Status.MemberID, candidate.Status.LeaderID, candidate.Status.Term,
 				candidate.Publication.ReplicaSetVersion, minimumReplicaSet, candidate.Publication.ConfState.GetVoters(), candidate.Publication.ConfState.GetLearners(), errGatewayReplicaControl))
 		}
 	}
@@ -207,8 +214,50 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 		return rebalance.ReplicatedMoveCut{}, errors.Join(observeErrors, errGatewayReplicaControl)
 	}
 	target, targetErr := observer.remote.Observe(ctx, route.Target.Node, observeRequest)
+	targetUnavailableBeforeBootstrap := false
 	if targetErr != nil {
-		target = replicacontrol.Observation{}
+		conf := leader.Publication.ConfState
+		targetInGroup := slices.Contains(conf.GetVoters(), route.Target.Member) ||
+			slices.Contains(conf.GetVotersOutgoing(), route.Target.Member) ||
+			slices.Contains(conf.GetLearners(), route.Target.Member) ||
+			slices.Contains(conf.GetLearnersNext(), route.Target.Member)
+		if !targetInGroup {
+			// A newly enrolled physical node has no hosted Raft runtime until
+			// the leader adds its member as a learner. Its observation is
+			// therefore expected to fail before this membership change; let
+			// Reconcile produce the authenticated AddLearner action from the
+			// serving leader cut. Once the member enters ConfState, keep the
+			// detailed error path below fail-closed.
+			target = replicacontrol.Observation{}
+		} else if targetIsSoleLearner(conf, route.Target.Member) &&
+			replicaMoveCatalogStillEnrollsTarget(catalog, sourceGeneration, transitionKey,
+				transition, receipt, receiptFound, request.Group, route) {
+			// AddLearner is committed before the target hosts its Raft group. A
+			// source-placement cut with this exact learner is sufficient for
+			// Reconcile to authorize only snapshot creation (or a passive install
+			// wait when a certificate is available). Do not borrow the leader's
+			// possibly historical snapshot certificate for this unobserved target;
+			// the journaled proof will reject a cut that already requires one.
+			target = replicacontrol.Observation{}
+			targetUnavailableBeforeBootstrap = true
+		} else {
+			binding := leader.State.Binding
+			leaderFence := raftservice.CommandFence{
+				ReplicaSetVersion:      leader.Publication.ReplicaSetVersion,
+				ActivePolicyGeneration: binding.ActivePolicyGeneration,
+				ProtectionEpoch:        binding.ProtectionEpoch,
+				OwnershipEpoch:         binding.OwnershipEpoch,
+				SchemaGeneration:       binding.SchemaGeneration,
+				RelationManifestDigest: route.Command.RelationManifestDigest,
+				RoutingVersion:         binding.RoutingVersion,
+				RouteGeneration:        binding.RouteGeneration,
+			}
+			return rebalance.ReplicatedMoveCut{}, fmt.Errorf(
+				"observe replica move target operation=%x group=%x member=%d node=%x journal_state=%d journal_revision=%d journal_cursor=%x catalog_route_command=%+v leader_command=%+v target_binding=unavailable: %w",
+				operation, request.Group.GroupID, route.Target.Member, route.Target.Node,
+				record.State, record.Revision, record.Cursor, route.Command, leaderFence, targetErr,
+			)
+		}
 	}
 	cut := rebalance.ReplicatedMoveCut{Observation: rebalance.Observation{
 		Catalog: catalog, Publication: leader.Publication, LeaderStatus: leader.Status,
@@ -216,7 +265,9 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 		TargetProgress: leader.Progress, ProgressFound: leader.ProgressFound,
 	}}
 	cut.TransitionReceipt, cut.TransitionReceiptFound = receipt, receiptFound
-	if target.SnapshotBase != nil {
+	if targetUnavailableBeforeBootstrap {
+		cut.SnapshotBase = nil
+	} else if target.SnapshotBase != nil {
 		cut.SnapshotBase = target.SnapshotBase
 	} else {
 		cut.SnapshotBase = leader.SnapshotBase
@@ -253,6 +304,37 @@ func (observer gatewayReplicaMoveObserver) ObserveReplicaMove(
 		}
 	}
 	return cut, nil
+}
+
+func targetIsSoleLearner(conf *pb.ConfState, member uint64) bool {
+	return conf != nil && member != 0 &&
+		slices.Contains(conf.GetLearners(), member) &&
+		!slices.Contains(conf.GetVoters(), member) &&
+		!slices.Contains(conf.GetVotersOutgoing(), member) &&
+		!slices.Contains(conf.GetLearnersNext(), member)
+}
+
+func replicaMoveCatalogStillEnrollsTarget(
+	catalog *gateway.Snapshot,
+	sourceGeneration uint64,
+	transitionKey gateway.GroupTransitionKey,
+	transition gateway.GroupTransitionIntent,
+	receipt gateway.GroupPublicationReceipt,
+	receiptFound bool,
+	group raftmember.GroupKey,
+	route rebalanceexec.MoveRoute,
+) bool {
+	if catalog == nil || !route.Membership.HasEnrolledTarget ||
+		route.Membership.Serving.Group != group || route.Target.Member == 0 ||
+		route.Membership.EnrolledTarget != route.Target {
+		return false
+	}
+	if !transitionKey.Valid() {
+		return !receiptFound && catalog.Generation() == sourceGeneration
+	}
+	return transition.Valid() && transition.Key == transitionKey && transition.Key.Group == group &&
+		(!receiptFound || receipt.Valid() && receipt.Key == transitionKey &&
+			receipt.CommittedHeadGeneration <= catalog.Generation())
 }
 
 func gatewayReplicaObservationStep(operation rebalance.OperationID, generation uint64) [32]byte {

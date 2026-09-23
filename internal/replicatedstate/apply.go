@@ -871,7 +871,8 @@ func (m *Machine) AdmitCommand(data []byte) error {
 		}
 		if transactionPlan.command.resultCode != ResultApplied &&
 			transactionPlan.command.resultCode != ResultTransactionConflict &&
-			transactionPlan.command.resultCode != ResultIndexConflict {
+			transactionPlan.command.resultCode != ResultIndexConflict &&
+			transactionPlan.command.resultCode != ResultIntentBusy {
 			return ErrAdmissionBound
 		}
 		next, stateErr := m.hypotheticalTransactionState(command, transactionPlan)

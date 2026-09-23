@@ -1470,7 +1470,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		case <-serviceCutReady:
 			serviceCutReady = nil
 		case <-diagnostics:
-			emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, nil, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator, progressMetrics, rf3AuthorityDiagnostics{
+			emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, nil, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator, progressMetrics, runtimes, rf3AuthorityDiagnostics{
 				RoundMetrics: peer.Owners().ReadAuthorityRoundMetrics,
 				Evidence:     peer.Owners().ReadAuthorityEvidence,
 			})
@@ -1522,7 +1522,7 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		for {
 			select {
 			case <-diagnostics:
-				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embeddedGatewayState, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator, progressMetrics, rf3AuthorityDiagnostics{
+				emitRF3DiagnosticSnapshotWithResources(manifest, profile, nodeOwner, server, embeddedGatewayState, &diagnosticSerial, adoptedInventory, preparedSet.groups, schemaActivator, progressMetrics, runtimes, rf3AuthorityDiagnostics{
 					RoundMetrics: peer.Owners().ReadAuthorityRoundMetrics,
 					Evidence:     peer.Owners().ReadAuthorityEvidence,
 				})

@@ -75,9 +75,9 @@ type ReplicatedRoute struct {
 	// live membership fence for ReadIndex. Stable commands use the same
 	// discovery rule without changing their retained command bytes.
 	membershipStable bool
-	// discoveryReplica is the enrolled replacement. Leader discovery may probe
-	// it while it leads, before catalog publication moves it into Replicas.
-	// Reads and serving selection never use it.
+	// discoveryReplica is the catalog-certified transition endpoint: either an
+	// enrolled replacement or the displaced source retained through removal.
+	// Leader discovery may probe it while it leads; serving selection does not.
 	discoveryReplica    ReplicatedEndpoint
 	hasDiscoveryReplica bool
 }
@@ -1483,10 +1483,18 @@ func (executor *ReplicatedExecutor) proposeAttempts(
 			// other mismatched post-proposal response remains outcome-unknown.
 			if validReplicatedWritePreAdmissionRefusal(
 				response, shardservice.ReplicatedRefusalStaleFence, false,
-			) && lastUnknown == nil {
-				return ReplicatedResult{}, &ReplicatedRefusalError{
-					Code: response.Refusal, Outcome: response.Outcome,
+			) {
+				if lastUnknown == nil {
+					return ReplicatedResult{}, &ReplicatedRefusalError{
+						Code: response.Refusal, Outcome: response.Outcome,
+					}
 				}
+				// An earlier proposal may have committed, but this authenticated
+				// refusal proves the recovery attempt itself was not admitted. Keep
+				// the same command outcome unknown while making the transient fence
+				// cause available to the durable direct-recovery boundary.
+				lastUnknown = errors.Join(lastUnknown, raftservice.ErrServingFence)
+				continue
 			}
 			if lastUnknown == nil {
 				lastUnknown = ErrReplicatedRoute
@@ -2069,6 +2077,20 @@ func validReplicatedRoute(route ReplicatedRoute) bool {
 				route.Replicas[prior].Address == endpoint.Address {
 				return false
 			}
+		}
+	}
+	if !route.hasDiscoveryReplica {
+		return route.discoveryReplica == (ReplicatedEndpoint{})
+	}
+	if !validReplicatedEndpoint(route.discoveryReplica) {
+		return false
+	}
+	for _, serving := range route.Replicas {
+		if serving.Member == route.discoveryReplica.Member || serving.Node == route.discoveryReplica.Node ||
+			serving.StoreID == route.discoveryReplica.StoreID ||
+			serving.NativeEndpoint == route.discoveryReplica.NativeEndpoint ||
+			serving.Address == route.discoveryReplica.Address {
+			return false
 		}
 	}
 	return true

@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/requestledger"
+	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -59,11 +60,40 @@ func (executor *ReplicatedExecutor) DirectMutate(
 	ctx context.Context,
 	request ReplicatedDirectMutation,
 ) (ReplicatedDirectMutationResult, error) {
+	return executor.directMutate(ctx, request, false)
+}
+
+// DirectMutateRecovering retries a retained direct request after the caller
+// has rebound only its serving route to a certified newer fence. The request
+// identity and canonical mutation remain unchanged; the replicated target's
+// TransactionControl decides whether to return the stored outcome or apply it
+// once if the prior command never reached the Raft order.
+func (executor *ReplicatedExecutor) DirectMutateRecovering(
+	ctx context.Context,
+	request ReplicatedDirectMutation,
+) (ReplicatedDirectMutationResult, error) {
+	return executor.directMutate(ctx, request, true)
+}
+
+func (executor *ReplicatedExecutor) directMutate(
+	ctx context.Context,
+	request ReplicatedDirectMutation,
+	priorUnknown bool,
+) (ReplicatedDirectMutationResult, error) {
 	command, control, err := appendReplicatedDirectMutationCommand(nil, request)
 	if err != nil {
 		return ReplicatedDirectMutationResult{}, err
 	}
-	proposal, err := executor.Propose(ctx, request.Target.Route, command)
+	var proposal ReplicatedResult
+	if priorUnknown {
+		// This is intentionally not RetryUnknown: the certified route fence may
+		// have advanced, so the newly encoded envelope is not byte-identical. The
+		// durable logical command and request identity are unchanged.
+		proposal, err = executor.propose(ctx, request.Target.Route, command, nil, true,
+			serviceauthz.CapabilityDataWrite, replicatedUnknownCommandClone)
+	} else {
+		proposal, err = executor.Propose(ctx, request.Target.Route, command)
+	}
 	if err != nil {
 		return ReplicatedDirectMutationResult{}, err
 	}
@@ -90,7 +120,7 @@ func (executor *ReplicatedExecutor) DirectMutate(
 		return result, nil
 	}
 	if code != replicatedstate.ResultIndexConflict && code != replicatedstate.ResultWrongShard &&
-		code != replicatedstate.ResultTransactionConflict {
+		code != replicatedstate.ResultIntentBusy && code != replicatedstate.ResultTransactionConflict {
 		return ReplicatedDirectMutationResult{}, ErrReplicatedTransaction
 	}
 	return result, ErrReplicatedTransactionConflict

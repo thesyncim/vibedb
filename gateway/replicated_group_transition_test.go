@@ -69,6 +69,40 @@ func TestBuildGroupOwnedShardTransitionReplacesNonFirstRouteLeader(t *testing.T)
 	if descriptor.Replicas[1] != target || descriptor.Replicas[0] != source.Replicas[0] || descriptor.Replicas[2] != source.Replicas[2] {
 		t.Fatalf("transition roster = %+v", descriptor.Replicas)
 	}
+	if descriptor.RetiringSource == nil || *descriptor.RetiringSource != source.Replicas[1] {
+		t.Fatalf("pre-remove retiring source=%+v, want exact displaced source %+v", descriptor.RetiringSource, source.Replicas[1])
+	}
+
+	postCommand := command
+	postCommand.ReplicaSetVersion++
+	post, err := BuildGroupOwnedShardTransition(next, intent, TransitionPhasePostRemove, target, postCommand)
+	if err != nil {
+		t.Fatalf("build post-remove transition: %v", err)
+	}
+	postDescriptor := post.ReplicatedShardDescriptors()[0]
+	if postDescriptor.RetiringSource != nil {
+		t.Fatalf("post-remove retained retiring source %+v", postDescriptor.RetiringSource)
+	}
+
+	for name, mutate := range map[string]func(*Snapshot){
+		"missing source witness": func(candidate *Snapshot) {
+			candidate.replicatedShards[0].hasRetiringSource = false
+		},
+		"forged source witness": func(candidate *Snapshot) {
+			index := int(candidate.replicatedShards[0].replicaBase) + int(candidate.replicatedShards[0].replicaCount)
+			candidate.replicatedReplicas[index].Node[0]++
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := *next
+			candidate.replicatedShards = append([]replicatedCatalogShard(nil), next.replicatedShards...)
+			candidate.replicatedReplicas = append([]ReplicatedEndpoint(nil), next.replicatedReplicas...)
+			mutate(&candidate)
+			if _, err := BuildGroupOwnedShardTransition(&candidate, intent, TransitionPhasePostRemove, target, postCommand); err == nil {
+				t.Fatal("post-remove accepted an absent or forged retiring-source witness")
+			}
+		})
+	}
 }
 
 func TestGroupTransitionReceiptAtomicRecoveryAndOwnerFence(t *testing.T) {

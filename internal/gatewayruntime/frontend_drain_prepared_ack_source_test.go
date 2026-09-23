@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -228,6 +229,81 @@ func TestFrontendDrainPreparedAckCutReadDispatchAndAuthorityProjection(t *testin
 	dispatchRuntime := &Runtime{controlReadDeadline: deadline}
 	if err := dispatchRuntime.serveGatewayControlConnection(t.Context(), dispatchConnection); !errors.Is(err, errFrontendDrainPreparedAckSourceAuth) {
 		t.Fatalf("source-cut discriminator did not dispatch to endpoint: %v", err)
+	}
+}
+
+func TestFrontendDrainPreparedAckCutReadDeadlineCancelsAuthorityAndReleasesSlot(t *testing.T) {
+	profile, node, source, _, request := frontendDrainSourceTestFixture(t)
+	serviceCtx, cancelService := context.WithCancel(context.Background())
+	defer cancelService()
+	var deadlineCalls atomic.Int32
+	deadline := func() time.Time {
+		call := deadlineCalls.Add(1)
+		if call == 1 {
+			return time.Now().Add(35 * time.Millisecond)
+		}
+		return time.Now().Add(time.Second)
+	}
+	authorize := func(connection rafttransport.PeerConnection) bool {
+		return connection.TrafficClass() == rafttransport.TrafficGatewayControl &&
+			connection.PeerIdentity().TrustDomain == profile.LocalIdentity().TrustDomain &&
+			connection.PeerIdentity().Node == node.NodeID && connection.PeerKeyDigest() == [32]byte{10}
+	}
+	readNode := func(_ context.Context, got rafttransport.NodeID, incarnation uint64) (gateway.NodeRecord, error) {
+		if got != node.NodeID || incarnation != node.Incarnation {
+			return gateway.NodeRecord{}, gateway.ErrScalingIdentity
+		}
+		return node, nil
+	}
+	readSlot := make(chan struct{}, 1)
+	started := make(chan struct{})
+	var reads atomic.Int32
+	readCut := func(ctx context.Context) (gateway.FrontendDrainRuntimeCut, error) {
+		if reads.Add(1) == 1 {
+			readSlot <- struct{}{}
+			close(started)
+			<-ctx.Done()
+			<-readSlot
+			return gateway.FrontendDrainRuntimeCut{}, context.Cause(ctx)
+		}
+		readSlot <- struct{}{}
+		defer func() { <-readSlot }()
+		return source, nil
+	}
+	serve := func() error {
+		connection := &frontendDrainSourceTestConnection{
+			input: bytes.NewReader(request.Marshal()),
+			peer:  rafttransport.PeerIdentity{TrustDomain: profile.LocalIdentity().TrustDomain, Node: node.NodeID},
+			key:   [32]byte{10}, class: rafttransport.TrafficGatewayControl,
+		}
+		return serveFrontendDrainPreparedAckCutReadConnectionWith(serviceCtx, connection,
+			authorize, readNode, readCut, profile, 1, deadline, deadline)
+	}
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- serve() }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first authority read did not start")
+	}
+	select {
+	case err := <-firstDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("first request error=%v, want deadline cancellation", err)
+		}
+	case <-time.After(time.Second):
+		cancelService()
+		<-firstDone
+		t.Fatal("authority read outlived its socket deadline")
+	}
+	if got := len(readSlot); got != 0 {
+		t.Fatalf("timed-out authority request retained its read slot: %d", got)
+	}
+	if err := serve(); err != nil {
+		t.Fatalf("next request after deadline did not acquire the released read slot: %v", err)
+	}
+	if got := reads.Load(); got != 2 {
+		t.Fatalf("authority reads=%d, want timed-out read and successful retry", got)
 	}
 }
 

@@ -129,8 +129,9 @@ func (executor *ReplicatedExecutor) catalogOperationalRouteOnce(ctx context.Cont
 		if ok {
 			count = copy(candidates[:], membership.Serving.Replicas)
 		}
-		if ok && membership.HasEnrolledTarget && !replicatedRouteContainsMember(membership.Serving, membership.EnrolledTarget.Member) {
-			candidates[count] = membership.EnrolledTarget
+		transitionReplica := membership.extraControlEndpoint()
+		if ok && transitionReplica.Member != 0 && !replicatedRouteContainsMember(membership.Serving, transitionReplica.Member) {
+			candidates[count] = transitionReplica
 			count++
 		}
 	}
@@ -154,6 +155,9 @@ func (executor *ReplicatedExecutor) catalogOperationalRouteOnce(ctx context.Cont
 			}
 		}
 		route.Replicas[index] = endpoint
+		if !clearPromotedCatalogDiscoveryHint(&route) {
+			return ReplicatedRoute{}, ErrReplicatedRoute
+		}
 		executor.leaderHints.publish(route, endpoint, state)
 		return route, nil
 	}
@@ -227,6 +231,9 @@ func (executor *ReplicatedExecutor) catalogOperationalRouteOnce(ctx context.Cont
 		} else {
 			route.Replicas[index] = observed
 		}
+		if !clearPromotedCatalogDiscoveryHint(&route) {
+			return ReplicatedRoute{}, ErrReplicatedRoute
+		}
 		executor.leaderHints.publish(route, observed, response.State)
 		return route, nil
 	}
@@ -234,4 +241,25 @@ func (executor *ReplicatedExecutor) catalogOperationalRouteOnce(ctx context.Cont
 		joined = errReplicatedLeaderUnobserved
 	}
 	return ReplicatedRoute{}, errors.Join(ErrReplicatedLeader, joined)
+}
+
+func clearPromotedCatalogDiscoveryHint(route *ReplicatedRoute) bool {
+	if route == nil || !route.hasDiscoveryReplica {
+		return true
+	}
+	for _, serving := range route.Replicas {
+		if serving.Member != route.discoveryReplica.Member {
+			continue
+		}
+		if serving.Node != route.discoveryReplica.Node || serving.StoreID != route.discoveryReplica.StoreID {
+			return false
+		}
+		// The hint has become one of the freshly authenticated serving
+		// candidates. Its runtime incarnation may have advanced since the
+		// bootstrap image, but member/node/store identity is stable.
+		route.discoveryReplica = ReplicatedEndpoint{}
+		route.hasDiscoveryReplica = false
+		break
+	}
+	return validReplicatedRoute(*route)
 }

@@ -88,9 +88,14 @@ func OpenTransactionCompletionResult(
 			return TransactionCompletionResult{}, ErrCompletionCorrupt
 		}
 	} else if (resultCode != ResultApplied && resultCode != ResultIndexConflict &&
-		resultCode != ResultWrongShard &&
+		resultCode != ResultWrongShard && resultCode != ResultIntentBusy &&
 		resultCode != ResultTransactionConflict) ||
 		!result.RevisionValid {
+		return TransactionCompletionResult{}, ErrCompletionCorrupt
+	}
+	if resultCode == ResultIntentBusy &&
+		(result.Role != distributedtxn.ReplicatedRoleTarget ||
+			result.Operation != distributedtxn.ReplicatedApplySingleTarget) {
 		return TransactionCompletionResult{}, ErrCompletionCorrupt
 	}
 	if (resultCode == ResultIndexConflict || resultCode == ResultWrongShard) &&
@@ -107,6 +112,7 @@ func OpenTransactionCompletionResult(
 			!apply && result.Operation != distributedtxn.ReplicatedRetireCoordinator &&
 				result.AffectedRowsValid) ||
 		(resultCode == ResultIndexConflict || resultCode == ResultWrongShard ||
+			resultCode == ResultIntentBusy ||
 			resultCode == ResultTransactionConflict) &&
 			result.AffectedRowsValid {
 		return TransactionCompletionResult{}, ErrCompletionCorrupt
@@ -230,6 +236,13 @@ func transactionCompletionDisposition(
 				return transactionRetryUnknown, 0, ErrTransactionStateCorrupt
 			}
 			return transactionRetryExact, ResultWrongShard, nil
+		case ResultIntentBusy:
+			if command.Role != distributedtxn.ReplicatedRoleTarget ||
+				command.Operation != distributedtxn.ReplicatedApplySingleTarget ||
+				!control.FusedPath || control.PrepareResultCode != ResultIntentBusy {
+				return transactionRetryUnknown, 0, ErrTransactionStateCorrupt
+			}
+			return transactionRetryExact, ResultIntentBusy, nil
 		default:
 			return transactionRetryUnknown, 0, ErrTransactionStateCorrupt
 		}
@@ -316,7 +329,8 @@ func transactionHistoricalRetryExact(
 			control.Revision == command.ExpectedRevision &&
 			(control.PrepareResultCode == ResultApplied ||
 				control.PrepareResultCode == ResultIndexConflict ||
-				control.PrepareResultCode == ResultWrongShard), control.PrepareResultCode, nil
+				control.PrepareResultCode == ResultWrongShard ||
+				control.PrepareResultCode == ResultIntentBusy), control.PrepareResultCode, nil
 	case distributedtxn.ReplicatedCommitCoordinator:
 		return control.CoordinatorDecision == distributedtxn.CoordinatorCommitted &&
 			transactionCoordinatorDecisionExpected(control) == command.ExpectedRevision, ResultApplied, nil
@@ -577,7 +591,7 @@ func (m *Machine) appendTransactionCompletion(
 	exact bool,
 ) ([]byte, error) {
 	if resultCode != ResultApplied && resultCode != ResultIndexConflict &&
-		resultCode != ResultWrongShard &&
+		resultCode != ResultWrongShard && resultCode != ResultIntentBusy &&
 		resultCode != ResultTransactionConflict &&
 		resultCode != ResultStaleFence {
 		return dst, ErrCompletionCorrupt

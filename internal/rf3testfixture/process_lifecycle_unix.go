@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const MaxProcessDiagnosticBytes = 1 << 20
+const MaxProcessDiagnosticBytes = 3 << 20
 
 type ProcessDiagnostic struct {
 	mu        sync.Mutex

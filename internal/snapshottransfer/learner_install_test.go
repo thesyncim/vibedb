@@ -11,6 +11,7 @@ import (
 
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
+	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/multiraft"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
@@ -214,14 +215,9 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 		t.Fatal("encode document key")
 	}
 	document := []byte(`{"id":"doc-1","value":"replicated"}`)
-	command.Kind = replication.CommandMutationBatch
-	command.ClientEpoch, command.ClientSequence = completion.ClientEpoch, 2
-	command.Fingerprint = sha256.Sum256([]byte("learner-document"))
-	command.NextDeadlineUnixNano = 0
-	command.Batches = []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{
-		Kind: replication.MutationPut, Key: keyBytes, Value: document,
-	}}}}
-	documentCommand, err := replication.AppendCommand(nil, command)
+	documentCommand, err := learnerInstallDirectMutationCommand(
+		sourceIdentity, authority, 1, keyBytes, document,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,6 +404,114 @@ func TestInstallPublishedLearnerRetriesExactIncarnationAfterHostBoundary(t *test
 	if status, err := host.Status(descriptor.Group); err != nil || status.MemberID != 2 {
 		t.Fatalf("installed learner status=%+v err=%v", status, err)
 	}
+	if err := host.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, _, err = sqldriver.OpenReplicatedShardStoreWithApplyForSettlement(
+		targetPath, targetIdentity, options,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayedApply, _, err := reopened.OpenReplicatedApply(targetIdentity, bootstrap, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A committed membership change advances the physical serving fence after
+	// the artifact cut. The same direct request identity must still resolve its
+	// retained Applied result at the successor membership version.
+	publication, err := replayedApply.ApplyConfiguration(raftmodel.ApplyMeta{
+		Index: manifest.State.Applied + 1, Term: manifest.State.LastTerm,
+		Type: pb.EntryConfChange,
+	}, &pb.ConfState{Voters: []uint64{1, 2}})
+	if err != nil || publication.ReplicaSetVersion != manifest.State.Applied+1 {
+		t.Fatalf("promoted learner publication=%+v err=%v", publication, err)
+	}
+	replayCommand, err := learnerInstallDirectMutationCommand(
+		targetIdentity, authority, publication.ReplicaSetVersion, keyBytes, document,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = replayedApply.ApplyNormal(raftmodel.ApplyMeta{
+		Index: publication.Applied + 1, Term: manifest.State.LastTerm, Type: pb.EntryNormal,
+	}, replayCommand); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := replayedApply.LookupCompletion(replayCommand)
+	originalCompletion, originalErr := replication.OpenCompletion(sourceCompletion)
+	replayedCompletion, replayErr := replication.OpenCompletion(replayed.Bytes)
+	if closeErr := errors.Join(replayedApply.Close(), reopened.Close()); err != nil || closeErr != nil ||
+		originalErr != nil || replayErr != nil ||
+		replayedCompletion.ResultCode != replicatedstate.ResultApplied ||
+		replayedCompletion.ResultCode != originalCompletion.ResultCode ||
+		replayedCompletion.AppliedSequence != originalCompletion.AppliedSequence ||
+		!bytes.Equal(replayedCompletion.InlineResult, originalCompletion.InlineResult) {
+		t.Fatalf("same direct request after physical install returned %+v (original %+v), lookup err=%v decode=%v/%v close err=%v",
+			replayedCompletion, originalCompletion, err, originalErr, replayErr, closeErr)
+	}
+}
+
+func learnerInstallDirectMutationCommand(
+	identity sqldriver.ReplicatedShardStoreIdentity,
+	authority sqldriver.ReplicatedAuthorityProfile,
+	replicaSetVersion uint64,
+	key, document []byte,
+) ([]byte, error) {
+	binding := identity.Binding
+	batches := []replication.RelationMutationBatch{{Relation: 1, Mutations: []replication.Mutation{{
+		Kind: replication.MutationPutAbsent, Key: key, Value: document,
+	}}}}
+	mutationDigest, err := replication.TransactionMutationDigest(batches)
+	if err != nil {
+		return nil, err
+	}
+	control := distributedtxn.ReplicatedCommand{
+		Role:      distributedtxn.ReplicatedRoleTarget,
+		Operation: distributedtxn.ReplicatedApplySingleTarget,
+		ID:        distributedtxn.ID{0x41}, ExpectedRevision: 1,
+		PayloadKind:     distributedtxn.ReplicatedPayloadTargetStage,
+		ControllerEpoch: 1, ExecutionPinDigest: distributedtxn.Digest{0x51},
+		Target: distributedtxn.TransactionTargetStage{
+			CoordinatorGroup:            distributedtxn.ID(binding.GroupID),
+			CoordinatorShardIncarnation: distributedtxn.ID(binding.ShardIncarnation),
+			CoordinatorAllocation:       binding.AllocationGeneration,
+			BucketBits:                  8,
+			IntentScopes:                []distributedtxn.IntentScope{{Start: 0, End: 256}},
+			MutationDigest:              mutationDigest,
+		},
+	}
+	controlBytes, err := distributedtxn.AppendReplicatedCommand(nil, control)
+	if err != nil {
+		return nil, err
+	}
+	command := replication.Command{
+		AuthorityClass:         replication.CommandAuthorityMembershipStableData,
+		Kind:                   replication.CommandTransaction,
+		ClusterID:              binding.ClusterID,
+		ClusterIncarnation:     binding.ClusterIncarnation,
+		TopologyRecoveryEpoch:  binding.TopologyRecoveryEpoch,
+		Distribution:           binding.Distribution,
+		Shard:                  binding.Shard,
+		AllocationGeneration:   binding.AllocationGeneration,
+		ShardIncarnation:       binding.ShardIncarnation,
+		GroupID:                binding.GroupID,
+		ReplicaSetVersion:      replicaSetVersion,
+		ActivePolicyGeneration: authority.ActivePolicyGeneration,
+		ProtectionEpoch:        authority.ProtectionEpoch,
+		OwnershipEpoch:         authority.OwnershipEpoch,
+		SchemaGeneration:       authority.SchemaGeneration,
+		RoutingVersion:         authority.RoutingVersion,
+		RouteGeneration:        authority.RouteGeneration,
+		Tenant:                 []byte("tenant"),
+		ClientID:               replication.ID128(control.ID),
+		ClientEpoch:            2,
+		ClientSequence:         control.ExpectedRevision,
+		Fingerprint:            sha256.Sum256([]byte("physical direct mutation replay")),
+		Transaction:            controlBytes,
+		Batches:                batches,
+	}
+	return replication.AppendCommand(nil, command)
 }
 
 func learnerInstallCapturePartitioner(

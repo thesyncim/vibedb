@@ -178,9 +178,10 @@ func serveFrontendDrainPreparedAckCutReadConnectionWithOptions(
 	if options.readDeadline != nil {
 		configuredReadDeadline = options.readDeadline()
 	}
-	if deadline := frontendParticipantDeadline(ctx, configuredReadDeadline); deadline.IsZero() {
+	requestDeadline := frontendParticipantDeadline(ctx, configuredReadDeadline)
+	if requestDeadline.IsZero() {
 		return errFrontendDrainPreparedAckSourceWire
-	} else if err := connection.SetReadDeadline(deadline); err != nil {
+	} else if err := connection.SetReadDeadline(requestDeadline); err != nil {
 		return err
 	}
 	requestBytes := make([]byte, frontenddrain.PreparedAckCutReadRequestBytes)
@@ -197,16 +198,18 @@ func serveFrontendDrainPreparedAckCutReadConnectionWithOptions(
 		request.ReceiverIncarnation == 0 {
 		return errFrontendDrainPreparedAckSourceAuth
 	}
+	requestCtx, cancelRequest := context.WithDeadline(ctx, requestDeadline)
+	defer cancelRequest()
 	operation := request.Operation
 	var node gateway.NodeRecord
 	if options.readNode != nil {
 		var err error
-		node, err = options.readNode(ctx, request.ReceiverNode, request.ReceiverIncarnation)
+		node, err = options.readNode(requestCtx, request.ReceiverNode, request.ReceiverIncarnation)
 		if err != nil {
 			return fmt.Errorf("%w: read receiver: %w", errFrontendDrainPreparedAckSourceState, err)
 		}
 	}
-	source, err := options.readCut(ctx)
+	source, err := options.readCut(requestCtx)
 	if err != nil {
 		return fmt.Errorf("%w: read canonical source: %w", errFrontendDrainPreparedAckSourceState, err)
 	}
@@ -249,7 +252,7 @@ func serveFrontendDrainPreparedAckCutReadConnectionWithOptions(
 		return errFrontendDrainPreparedAckSourceAuth
 	}
 	serviceCut, err := runtimeServiceDirectoryCutFromFrontendDrainRuntimeCut(
-		ctx, source, options.profile, options.policyGeneration)
+		requestCtx, source, options.profile, options.policyGeneration)
 	if err != nil {
 		return fmt.Errorf("%w: project canonical service directory: %w", errFrontendDrainPreparedAckSourceState, err)
 	}
@@ -282,7 +285,7 @@ func serveFrontendDrainPreparedAckCutReadConnectionWithOptions(
 			cut.ServiceDirectoryRevision, request.SourceFloor.ServiceDirectoryRevision)
 	}
 	if operation == frontenddrain.CutOperationInstallExact && cut.Digest() != request.SourceCutDigest {
-		return writeFrontendDrainPreparedAckCutReadMovedResponse(ctx, connection, request, cut, options.writeDeadline)
+		return writeFrontendDrainPreparedAckCutReadMovedResponse(requestCtx, connection, request, cut, options.writeDeadline)
 	}
 	response := frontenddrain.PreparedAckCutReadResponse{
 		Operation: operation, RequirePrepared: request.RequirePrepared,
@@ -302,7 +305,7 @@ func serveFrontendDrainPreparedAckCutReadConnectionWithOptions(
 	if options.writeDeadline != nil {
 		configuredWriteDeadline = options.writeDeadline()
 	}
-	if deadline := frontendParticipantDeadline(ctx, configuredWriteDeadline); deadline.IsZero() {
+	if deadline := frontendParticipantDeadline(requestCtx, configuredWriteDeadline); deadline.IsZero() {
 		return errFrontendDrainPreparedAckSourceWire
 	} else if err := connection.SetWriteDeadline(deadline); err != nil {
 		return err
