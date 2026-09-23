@@ -870,7 +870,17 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 			}
 			candidateCount += bits.OnesCount64(mask.Bits)
 		}
-		compact = masks != nil && candidateCount <= snapshot.Len()/2
+		// A lone ==> over an exact mask compacts at any selectivity:
+		// the row list costs nanoseconds per row while the recheck it
+		// replaces costs a retokenize, so enumerating the verdict set
+		// wins even when it names nearly every row. Downstream paths
+		// keep their selective tuning, which stays correct (only
+		// cheaper than the scan it replaces), and the identity
+		// selection below stays valid because storeRows still
+		// enumerates exactly the verdict set.
+		loneMatch := p.where != nil && p.where.kind == predMatch && len(p.where.kids) == 0
+		compact = masks != nil && (candidateCount <= snapshot.Len()/2 ||
+			(loneMatch && maskExact))
 		scanRows = snapshot.Len()
 		if compact {
 			scanRows = candidateCount

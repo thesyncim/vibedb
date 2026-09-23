@@ -299,3 +299,55 @@ func TestSQLMatchExactSkipCoversMutations(t *testing.T) {
 		})
 	}
 }
+
+// TestSQLMatchParseReuseAcrossSnapshots pins the bound-parse cache: one
+// statement executed repeatedly over one Exec reuses the parsed query
+// while its snapshot's index stands, and re-parses the moment a new
+// snapshot (with a new matching document) arrives. Same rows either way;
+// the second snapshot must see the new document, the first must not.
+func TestSQLMatchParseReuseAcrossSnapshots(t *testing.T) {
+	db := tinMatchDatabase(t, true)
+	coll, ok := db.Collection("docs")
+	if !ok {
+		t.Fatal("docs collection missing")
+	}
+	statement, err := PrepareStatement(
+		`SELECT o.id FROM docs AS o WHERE o.body ==> 'luxury' ORDER BY o.id`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statement.Release()
+	exec := Exec{}
+	defer exec.Release()
+	run := func(catalog store.DatabaseSnapshot) []string {
+		t.Helper()
+		return tinMatchStatementIDs(t, statement, FromDatabase(catalog, "docs"), &exec)
+	}
+	snap1 := db.Snapshot()
+	first := run(snap1)
+	second := run(snap1)
+	if !slices.Equal(first, second) {
+		t.Fatalf("reuse changed rows: %v vs %v", first, second)
+	}
+	// The repeat execution reuses the bound parse and all warmed
+	// staging, so the only allocation is the test's own ids slice:
+	// steady-state production work is allocation-free.
+	if n := testing.AllocsPerRun(20, func() { run(snap1) }); n > 1 {
+		t.Fatalf("repeat execution allocates %.1f times, want <= 1", n)
+	}
+	if _, err := coll.Put("d009", []byte(`{"id":"d009","body":"luxury yachts"}`)); err != nil {
+		t.Fatal(err)
+	}
+	snap2 := db.Snapshot()
+	third := run(snap2)
+	want := append(slices.Clone(first), "d009")
+	slices.Sort(want)
+	if !slices.Equal(third, want) {
+		t.Fatalf("new snapshot rows=%v want=%v", third, want)
+	}
+	fourth := run(snap1)
+	if !slices.Equal(fourth, first) {
+		t.Fatalf("old snapshot rows=%v want=%v", fourth, first)
+	}
+}

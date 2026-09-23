@@ -220,12 +220,20 @@ func bindPredMatches(pd *compiledPredicate, owner *plan, snapshot store.Snapshot
 			return fmt.Errorf("query: ==> node names an uncompiled path or slot")
 		}
 		path := owner.valuePaths[pd.col].indexPath()
+		// A bound parse stays valid while its index and pattern do: a
+		// parsed query holds only syntax and term hashes (never layout
+		// or postings state), and one index pointer means one immutable
+		// dictionary, so expansions agree. Same-snapshot executions
+		// then skip the re-parse outright.
+		prevPattern := patterns[pd.slot]
 		patterns[pd.slot] = pd.pattern
 		if segs, ok := bindTinSegments(snapshot, path); ok {
 			// Segmented heap path: the single index stays unbuilt.
 			// Shard buffers persist across executions; only the
 			// index pointers rebind to this snapshot's segments.
-			sh := shards[pd.slot]
+			prev := shards[pd.slot]
+			sameSeg := len(prev) == len(segs) && prev[0].Ix == segs[0]
+			sh := prev
 			if len(sh) != len(segs) {
 				sh = make([]tin.Shard, len(segs))
 			}
@@ -236,11 +244,13 @@ func bindPredMatches(pd *compiledPredicate, owner *plan, snapshot store.Snapshot
 			// The shared parse runs against the first segment.
 			// Masks re-parse per shard when it reports Expanded,
 			// and top-K serves only unexpanded shapes from it.
-			q, err := segs[0].ParseTINQL(pd.pattern)
-			if err != nil {
-				return fmt.Errorf("query: ==> over %s: invalid TINQL query: %v", path, err)
+			if !(sameSeg && prevPattern == pd.pattern) {
+				q, err := segs[0].ParseTINQL(pd.pattern)
+				if err != nil {
+					return fmt.Errorf("query: ==> over %s: invalid TINQL query: %v", path, err)
+				}
+				queries[pd.slot] = q
 			}
-			queries[pd.slot] = q
 			indexes[pd.slot] = nil
 		} else {
 			shards[pd.slot] = nil
@@ -251,11 +261,13 @@ func bindPredMatches(pd *compiledPredicate, owner *plan, snapshot store.Snapshot
 					path,
 				)
 			}
-			q, err := ix.ParseTINQL(pd.pattern)
-			if err != nil {
-				return fmt.Errorf("query: ==> over %s: invalid TINQL query: %v", path, err)
+			if !(indexes[pd.slot] == ix && prevPattern == pd.pattern) {
+				q, err := ix.ParseTINQL(pd.pattern)
+				if err != nil {
+					return fmt.Errorf("query: ==> over %s: invalid TINQL query: %v", path, err)
+				}
+				queries[pd.slot] = q
 			}
-			queries[pd.slot] = q
 			indexes[pd.slot] = ix
 		}
 	}
