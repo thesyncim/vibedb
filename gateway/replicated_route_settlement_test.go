@@ -320,3 +320,68 @@ func TestDurableRequestLifecycleRunnerRecordsReleasedFromExactReceipt(t *testing
 		t.Fatalf("receipt release cut=%+v head=%+v pending=%+v calls=%d auth=%v proposals=%v", ledger.route, ledger.head, ledger.pending, proposer.receiptCalls, proposer.receiptContext, base.attempts[replication.CommandRouteGate])
 	}
 }
+
+// retiredReleaseProposer answers the exact release re-proposal with the
+// durable session-window refusal a shard returns once an earlier attempt of
+// that release has applied and its sequence has been retired.
+type retiredReleaseProposer struct {
+	*lifecycleReceiptProposer
+	retired bool
+}
+
+func (proposer *retiredReleaseProposer) Propose(
+	ctx context.Context, route ReplicatedRoute, exact []byte,
+) (ReplicatedResult, error) {
+	if proposer.retired && bytes.Equal(exact, proposer.exact) {
+		proposer.events.add("propose:retry-retired")
+		return ReplicatedResult{}, &ReplicatedRefusalError{
+			Code:    shardservice.ReplicatedRefusalRetryRetired,
+			Outcome: raftserve.Outcome{Code: raftserve.OutcomeRetryRetired},
+		}
+	}
+	return proposer.lifecycleReceiptProposer.Propose(ctx, route, exact)
+}
+
+func TestDurableRequestLifecycleRunnerSettlesRetiredReleaseFromReceipt(t *testing.T) {
+	wave, initial, route := lifecycleRunnerFixture(t)
+	service := serviceauthz.Authority{Node: [16]byte{0xa6}, Generation: 9}
+	resolver := &lifecycleReceiptResolver{route: route}
+	base := &lifecycleRunnerProposer{
+		t: t, events: new(lifecycleRunnerEvents),
+		faultKind: int(replication.CommandRouteGate), faultGate: routegate.OperationReleaseShared,
+		attempts: make(map[replication.CommandKind][][]byte),
+	}
+	runner, err := NewDurableRequestLifecycleRunner(&lifecycleRunnerLedger{head: initial, events: base.events}, resolver, &ReplicatedExecutor{}, service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposer := &retiredReleaseProposer{lifecycleReceiptProposer: &lifecycleReceiptProposer{
+		lifecycleRunnerProposer: base, route: route,
+	}}
+	runner.proposer, runner.pinFencer, runner.gateSessions = proposer, proposer, proposer
+	ledger := runner.ledger.(*lifecycleRunnerLedger)
+	if _, err := runner.RunWave(t.Context(), wave); !errors.Is(err, errLifecycleRunnerFault) {
+		t.Fatalf("lost release response error=%v", err)
+	}
+	if ledger.route.Phase != requestledger.RoutePinReleasing {
+		t.Fatalf("lost release response did not leave Releasing: %+v", ledger.route)
+	}
+	proposer.exact = bytes.Clone(ledger.route.Command)
+	view, err := replication.OpenCommand(proposer.exact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposer.completion = lifecycleRunnerCompletion(t, view)
+	base.faultKind = -1
+	proposer.retired = true
+	// The route still resolves; only the retired session window refuses the
+	// exact re-proposal.
+	if _, err := runner.RunWave(t.Context(), wave); err != nil {
+		t.Fatalf("retired release was not settled from its receipt: %v", err)
+	}
+	if proposer.receiptCalls != 1 || proposer.receiptContext[0] != service ||
+		ledger.route.Phase != requestledger.RoutePinReleased ||
+		ledger.head.OutstandingRoutePinDigest != (requestledger.Digest{}) || ledger.pending.Revision != 0 {
+		t.Fatalf("retired release cut=%+v head=%+v pending=%+v receipts=%d", ledger.route, ledger.head, ledger.pending, proposer.receiptCalls)
+	}
+}

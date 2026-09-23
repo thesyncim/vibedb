@@ -919,6 +919,14 @@ func (e *ReplicatedRefusalError) Error() string {
 	return fmt.Sprintf("gateway: replicated shard refusal %d", e.Code)
 }
 
+// replicatedRetryRetired reports the typed durable session-window refusal:
+// the exact command's sequence was retired after an earlier settlement.
+func replicatedRetryRetired(err error) bool {
+	var refusal *ReplicatedRefusalError
+	return err != nil && errors.As(err, &refusal) &&
+		refusal.Code == shardservice.ReplicatedRefusalRetryRetired
+}
+
 func (e *ReplicatedRefusalError) Unwrap() error {
 	if e.Code == shardservice.ReplicatedRefusalDeterministic ||
 		e.Code == shardservice.ReplicatedRefusalRetryRetired {

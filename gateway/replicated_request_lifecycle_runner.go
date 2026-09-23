@@ -534,14 +534,24 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 		route, resolveErr := runner.resolvePersistedRoute(ctx, wave, routePin.Command)
 		var settled ReplicatedResult
 		receiptRecovered := false
+		useReceipt := resolveErr != nil
+		var retiredErr error
 		if resolveErr == nil {
 			settled, err = runner.proposer.Propose(ctx, route, routePin.Command)
-		} else {
+			// An earlier attempt of this exact release applied and the session
+			// window has since retired its sequence. The refusal proves that
+			// settlement without returning its completion; read the durable
+			// receipt instead of reporting the request unresolved.
+			if replicatedRetryRetired(err) {
+				useReceipt, retiredErr, err = true, err, nil
+			}
+		}
+		if useReceipt {
 			stage = "release receipt"
 			receiptResolver, resolverOK := runner.resolver.(durableRequestReleaseReceiptResolver)
 			receiptReader, readerOK := runner.proposer.(durableRequestReleaseReceiptReader)
 			if !resolverOK || !readerOK {
-				return DurableRequestWaveResult{}, resolveErr
+				return DurableRequestWaveResult{}, errors.Join(resolveErr, retiredErr, ErrDurableRequestUnresolved)
 			}
 			route, err = receiptResolver.resolveDurableReleaseReceiptRoute(
 				ctx, wave.LogicalTarget, routePin.Command,
@@ -575,7 +585,7 @@ func (runner *DurableRequestLifecycleRunner) runAdmittedWave(ctx context.Context
 					receiptRecovered = true
 					err = nil
 				} else {
-					return DurableRequestWaveResult{}, errors.Join(resolveErr, err, refreshErr, ErrDurableRequestUnresolved)
+					return DurableRequestWaveResult{}, errors.Join(resolveErr, retiredErr, err, refreshErr, ErrDurableRequestUnresolved)
 				}
 			}
 		}
