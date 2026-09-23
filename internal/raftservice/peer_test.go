@@ -41,7 +41,7 @@ func TestPeerServerAuthenticatesDeliversAndRejectsAboveExactStreamBound(t *testi
 		{Group: group, ReplicaSetVersion: 1, MemberID: 1, Node: clientNode, Role: rafttransport.MemberVoter},
 		{Group: group, ReplicaSetVersion: 1, MemberID: 2, Node: serverNode, Role: rafttransport.MemberVoter},
 	}
-	clientRegistry, err := rafttransport.NewStaticRegistry(
+	_, err := rafttransport.NewStaticRegistry(
 		clientNode, members, rafttransport.Limits{MaxGroups: 1, MaxMembers: 2},
 	)
 	if err != nil {
@@ -63,7 +63,7 @@ func TestPeerServerAuthenticatesDeliversAndRejectsAboveExactStreamBound(t *testi
 	})
 
 	profiles := []*rafttransport.PeerTLS{clientTLS, serverTLS}
-	clientRegistry = pinnedPeerTestRegistry(t, clientNode, members, rafttransport.Limits{MaxGroups: 1, MaxMembers: 2}, profiles)
+	clientRegistry := pinnedPeerTestRegistry(t, clientNode, members, rafttransport.Limits{MaxGroups: 1, MaxMembers: 2}, profiles)
 	serverRegistry = pinnedPeerTestRegistry(t, serverNode, members, rafttransport.Limits{MaxGroups: 1, MaxMembers: 2}, profiles)
 
 	delivered := make(chan rafttransport.Inbound, 1)

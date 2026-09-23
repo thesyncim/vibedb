@@ -2994,6 +2994,9 @@ func TestReplicatedApplyCaptureTargetCommitsAndRecoversWithCheckpointGroup(t *te
 	options.TxnLimits.MaxBytes, err = ReplicatedApplyTransactionByteFloor(
 		base, options.RetryWindow,
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	bootstrap := testReplicatedApplyBootstrap()
 	claim, identity, err := database.OpenReplicatedApply(base, bootstrap, options)
 	if err != nil {

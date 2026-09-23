@@ -31,16 +31,15 @@ import (
 )
 
 type preparedColdRF3Group struct {
-	group        raftmember.GroupKey
-	service      *snapshottransfer.BootstrapControlService
-	authority    coldRF3GrantAuthority
-	repository   *snapshottransfer.Repository
-	cursor       *replicatedstate.SnapshotCursorStore
-	journal      *snapshottransfer.BootstrapFileJournal
-	database     *sqldriver.Database
-	key          raftstore.Key
-	installer    *coldRF3Installer
-	installedWAL bool
+	group      raftmember.GroupKey
+	service    *snapshottransfer.BootstrapControlService
+	authority  coldRF3GrantAuthority
+	repository *snapshottransfer.Repository
+	cursor     *replicatedstate.SnapshotCursorStore
+	journal    *snapshottransfer.BootstrapFileJournal
+	database   *sqldriver.Database
+	key        raftstore.Key
+	installer  *coldRF3Installer
 }
 
 func (group *preparedColdRF3Group) close() error {
@@ -298,7 +297,7 @@ func bootstrapPreparedRF3Groups(
 		return err
 	case <-complete:
 		stopControl(context.Canceled)
-		_ = <-done
+		<-done
 	}
 	if err = host.Close(); err != nil {
 		return err

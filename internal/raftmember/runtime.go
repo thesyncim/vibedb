@@ -1691,7 +1691,7 @@ func (runtime *Runtime) DriveReady(
 			return DriveResult{}, runtime.fail(err)
 		}
 		if !sent {
-			return DriveResult{}, runtime.fail(errors.New("Ready message position made no progress"))
+			return DriveResult{}, runtime.fail(errors.New("ready message position made no progress"))
 		}
 		return DriveResult{Kind: DriveMessage, ReadyID: progress.ReadyID}, nil
 
@@ -1742,7 +1742,7 @@ func (runtime *Runtime) DriveReady(
 				return DriveResult{}, runtime.fail(err)
 			}
 			if !recorded {
-				return DriveResult{}, runtime.fail(errors.New("Ready read-state position made no progress"))
+				return DriveResult{}, runtime.fail(errors.New("ready read-state position made no progress"))
 			}
 			return DriveResult{Kind: DriveReadState, ReadyID: progress.ReadyID}, nil
 		}

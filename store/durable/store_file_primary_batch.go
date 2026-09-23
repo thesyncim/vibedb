@@ -1998,7 +1998,6 @@ func (c *Collection) mergePrimaryBatchLeafRows(
 	for baseAt < len(baseRows) || mutationAt < leaf.mutationEnd {
 		if mutationAt >= leaf.mutationEnd {
 			final = append(final, baseRows[baseAt:]...)
-			baseAt = len(baseRows)
 			break
 		}
 		mutation := &c.batchPrimaryMutations[mutationAt]

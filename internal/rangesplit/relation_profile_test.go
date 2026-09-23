@@ -220,7 +220,7 @@ func TestRelationProfileGlobalMapperIgnoresValueAndLocatorPlacement(t *testing.T
 }
 
 func TestPortableRelationProfileMaximumShapeAndBounds(t *testing.T) {
-	p, profile := testRelationPartitioner(t)
+	_, profile := testRelationPartitioner(t)
 	profile.SchemaGeneration = math.MaxUint64
 	profile.Relations = make([]RelationProfile, replication.MaxRelationsPerBundle)
 	for i := range profile.Relations {

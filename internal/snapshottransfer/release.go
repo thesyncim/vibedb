@@ -19,9 +19,7 @@ func (r *Repository) ReleaseInstalledArtifact(
 		!runtimeMatchesDescriptor(identity, request.Descriptor) {
 		return ErrBootstrapConflict
 	}
-	return r.ReleasePublished(ArtifactReleaseRequest{
-		Operation: request.Operation, Step: request.Step, Descriptor: request.Descriptor,
-	})
+	return r.ReleasePublished(ArtifactReleaseRequest(request))
 }
 
 // ArtifactReleaseRequest binds reclamation to the exact orchestrated replica

@@ -163,7 +163,7 @@ func TestPreparedDirectMultiIntegerUpdateUsesApplyTimeDeltasAndFallbackKeepsCAS(
 }
 
 func TestPreparedDirectIntegerUpdatePublishesJID1ThroughDirectExecutor(t *testing.T) {
-	snapshot, planner := replicatedSQLTransactionFixture(t, true)
+	snapshot, _ := replicatedSQLTransactionFixture(t, true)
 	if err := snapshot.attachReplicatedTableDeclarations([]ReplicatedTableDeclaration{{
 		Table:       "messages",
 		CreateTable: `CREATE TABLE messages (id TEXT PRIMARY KEY, score INTEGER NOT NULL, keep TEXT)`,
@@ -172,7 +172,7 @@ func TestPreparedDirectIntegerUpdatePublishesJID1ThroughDirectExecutor(t *testin
 	}
 	// CatalogHolder snapshots are immutable and clone their initial state; the
 	// declaration must be attached before constructing the production planner.
-	planner = NewExecutor(nil, NewCatalogHolder(snapshot), Options{})
+	planner := NewExecutor(nil, NewCatalogHolder(snapshot), Options{})
 	old := []byte(`{"id":"message-1","score":41,"keep":"x"}`)
 	reader, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
 	executor := &DurableSQLRequestExecutor{planner: planner, data: data, singleFast: true}
@@ -211,14 +211,14 @@ func TestPreparedDirectIntegerUpdatePublishesJID1ThroughDirectExecutor(t *testin
 }
 
 func TestPreparedDirectMultiIntegerUpdatePublishesJID2ThroughDirectExecutor(t *testing.T) {
-	snapshot, planner := replicatedSQLTransactionFixture(t, true)
+	snapshot, _ := replicatedSQLTransactionFixture(t, true)
 	if err := snapshot.attachReplicatedTableDeclarations([]ReplicatedTableDeclaration{{
 		Table:       "messages",
 		CreateTable: `CREATE TABLE messages (id TEXT PRIMARY KEY, count INTEGER NOT NULL, total INTEGER NOT NULL, keep TEXT)`,
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	planner = NewExecutor(nil, NewCatalogHolder(snapshot), Options{})
+	planner := NewExecutor(nil, NewCatalogHolder(snapshot), Options{})
 	old := []byte(`{"id":"message-1","count":41,"total":100,"keep":"x"}`)
 	reader, data := attachReplicatedSQLIndexedReadClient(t, snapshot, old)
 	executor := &DurableSQLRequestExecutor{planner: planner, data: data, singleFast: true}
@@ -277,14 +277,14 @@ func TestPreparedDirectMultiIntegerUpdatePublishesJID2ThroughDirectExecutor(t *t
 }
 
 func TestPreparedDirectIntegerUpdateReplaysSameJID1AfterGatewayReplan(t *testing.T) {
-	snapshot, planner := replicatedSQLTransactionFixture(t, true)
+	snapshot, _ := replicatedSQLTransactionFixture(t, true)
 	if err := snapshot.attachReplicatedTableDeclarations([]ReplicatedTableDeclaration{{
 		Table:       "messages",
 		CreateTable: `CREATE TABLE messages (id TEXT PRIMARY KEY, score INTEGER NOT NULL)`,
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	planner = NewExecutor(nil, NewCatalogHolder(snapshot), Options{})
+	planner := NewExecutor(nil, NewCatalogHolder(snapshot), Options{})
 	var replicas [ServingReplicaCount]ReplicatedEndpoint
 	route, ok := snapshot.ResolveReplicatedRoute("data", "all", replicas[:0])
 	if !ok {

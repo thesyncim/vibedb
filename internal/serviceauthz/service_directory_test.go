@@ -160,7 +160,7 @@ func TestServiceDirectoryInternalBootstrapIsClosedAndSelfOnly(t *testing.T) {
 func TestServiceDirectoryGatewaySessionAndDrainingFence(t *testing.T) {
 	peer := serviceDirectoryPeer(10, 11)
 	binding := serviceDirectoryBinding(peer, ServiceRoleGateway, ServiceDraining)
-	gate, err := NewServiceDirectoryGate(serviceDirectoryCut(3, binding))
+	_, err := NewServiceDirectoryGate(serviceDirectoryCut(3, binding))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestServiceDirectoryGatewaySessionAndDrainingFence(t *testing.T) {
 		IntentID: [32]byte{18}, FenceDigest: binding.DrainFenceDigest}
 	binding.DrainFence = fence
 	binding.InternalFences = []ServiceFence{fence}
-	gate, err = NewServiceDirectoryGate(serviceDirectoryCut(3, binding))
+	gate, err := NewServiceDirectoryGate(serviceDirectoryCut(3, binding))
 	if err != nil {
 		t.Fatal(err)
 	}

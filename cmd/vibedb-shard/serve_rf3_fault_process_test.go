@@ -82,8 +82,8 @@ func runRF3ShippedFaultHarness(t *testing.T, nodeLog bool) {
 	}
 
 	leader, states := fixture.waitLeader(t, []int{0, 1, 2}, 30*time.Second)
-	epoch, openApplied := fixture.openSession(t, leader, states[leader])
-	lastApplied := openApplied
+	epoch, _ := fixture.openSession(t, leader, states[leader])
+	var lastApplied uint64
 
 	// Isolate the elected process without closing its established peer sockets.
 	// The remaining quorum must elect, and the resumed former leader must reject

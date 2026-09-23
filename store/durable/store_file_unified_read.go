@@ -261,20 +261,18 @@ func (s *Snapshot) FilterIntegerOrderCount(
 	defer cursor.Close()
 	var progress storeio.UnifiedFilterProgress
 	allowPrefix := !s.hasDataSkippingPath(f.path)
-	for {
-		supported, err := cursor.FilterCountIntegerOrdered(
-			f.inner, &progress, allowPrefix,
-		)
-		if err != nil {
-			return FilterIntegerOrderResult{}, err
-		}
-		if !supported {
-			return FilterIntegerOrderResult{}, nil
-		}
-		return FilterIntegerOrderResult{
-			Matched: progress.Matched, Scanned: progress.Scanned, Supported: true,
-		}, nil
+	supported, err := cursor.FilterCountIntegerOrdered(
+		f.inner, &progress, allowPrefix,
+	)
+	if err != nil {
+		return FilterIntegerOrderResult{}, err
 	}
+	if !supported {
+		return FilterIntegerOrderResult{}, nil
+	}
+	return FilterIntegerOrderResult{
+		Matched: progress.Matched, Scanned: progress.Scanned, Supported: true,
+	}, nil
 }
 
 // FilterIntegerIntervalCount scans a snapshot using the strict compact
@@ -312,20 +310,18 @@ func (s *Snapshot) FilterIntegerIntervalCount(
 	defer cursor.Close()
 	var progress storeio.UnifiedFilterProgress
 	allowPrefix := !s.hasDataSkippingPath(f.path)
-	for {
-		supported, err := cursor.FilterCountIntegerInterval(
-			f.inner, &progress, allowPrefix,
-		)
-		if err != nil {
-			return FilterIntegerIntervalResult{}, err
-		}
-		if !supported {
-			return FilterIntegerIntervalResult{}, nil
-		}
-		return FilterIntegerIntervalResult{
-			Matched: progress.Matched, Scanned: progress.Scanned, Supported: true,
-		}, nil
+	supported, err := cursor.FilterCountIntegerInterval(
+		f.inner, &progress, allowPrefix,
+	)
+	if err != nil {
+		return FilterIntegerIntervalResult{}, err
 	}
+	if !supported {
+		return FilterIntegerIntervalResult{}, nil
+	}
+	return FilterIntegerIntervalResult{
+		Matched: progress.Matched, Scanned: progress.Scanned, Supported: true,
+	}, nil
 }
 
 // FilterIntegerExtrema scans a snapshot using the strict compact integer

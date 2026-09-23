@@ -465,13 +465,14 @@ func BenchmarkStatementRootIntermediateAdmission(b *testing.B) {
 	})
 
 	b.Run("shared_root_RunIntermediateInto", func(b *testing.B) {
-		cursor, retained, err := statement.RunIntermediateInto(&exec, source, nil)
+		cursor, _, err := statement.RunIntermediateInto(&exec, source, nil)
 		if err != nil {
 			b.Fatal(err)
 		}
 		consumeIntermediateCursor(&cursor)
 		b.ReportAllocs()
 		b.ResetTimer()
+		var retained int64
 		for range b.N {
 			cursor, retained, err = statement.RunIntermediateInto(&exec, source, nil)
 			if err != nil {

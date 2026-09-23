@@ -2165,8 +2165,7 @@ func writeDevCredentialsWithCA(root string, domain rafttransport.TrustDomain, no
 			}
 		}
 		caPublic, ok := caCert.PublicKey.(*ecdsa.PublicKey)
-		if !ok || caKey.PublicKey.X == nil || caKey.PublicKey.Y == nil || caPublic.X == nil || caPublic.Y == nil ||
-			caKey.PublicKey.X.Cmp(caPublic.X) != 0 || caKey.PublicKey.Y.Cmp(caPublic.Y) != 0 {
+		if !ok || !caKey.PublicKey.Equal(caPublic) {
 			return nil, "", errDevCluster
 		}
 	}
@@ -2479,9 +2478,7 @@ func validDevManifest(m devClusterManifest, root string) bool {
 			if node.GatewayNode == m.GatewayNode && index != 0 {
 				return false
 			}
-			for _, path := range []string{node.Certificate, node.Key, node.ServeManifest, node.CatalogSessionJournal, node.DirectIssuerJournal, node.FallbackJournal, node.ExecutionPinJournal} {
-				paths = append(paths, path)
-			}
+			paths = append(paths, []string{node.Certificate, node.Key, node.ServeManifest, node.CatalogSessionJournal, node.DirectIssuerJournal, node.FallbackJournal, node.ExecutionPinJournal}...)
 			// The cluster-level gateway credential names the designated
 			// controller's frontend credential; the other frontend credentials
 			// remain node-local. Node manifests are shared by the role groups

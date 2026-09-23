@@ -12,9 +12,11 @@ func TestRF3SplitStreamInventoryRejectsNodeAndSnapshotAliasing(t *testing.T) {
 		snapshot: make(map[rafttransport.NodeID]string),
 	}
 	one, two := rafttransport.NodeID{1}, rafttransport.NodeID{2}
-	if !opener.install(one, "127.0.0.1:7001", "127.0.0.1:8001") ||
-		!opener.install(one, "127.0.0.1:7001", "127.0.0.1:8001") {
-		t.Fatal("exact inventory replay rejected")
+	// Installing the exact inventory twice must succeed: replay is idempotent.
+	for range 2 {
+		if !opener.install(one, "127.0.0.1:7001", "127.0.0.1:8001") {
+			t.Fatal("exact inventory replay rejected")
+		}
 	}
 	if opener.install(one, "127.0.0.1:7002", "127.0.0.1:8001") {
 		t.Fatal("same node accepted conflicting control address")

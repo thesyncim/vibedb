@@ -577,10 +577,10 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 	if err := cluster.owners[(leader+1)%len(cluster.owners)].Campaign(ctx, cluster.group); err != nil {
 		t.Fatal(err)
 	}
-	newLeader := waitRF3Leader(t, ctx, cluster.owners[:], removed, cluster.group)
+	waitRF3Leader(t, ctx, cluster.owners[:], removed, cluster.group)
 	var commitRetry Result
 	var commitRetryEnvelope replication.CompletionView
-	newLeader, commitRetry, commitRetryEnvelope, _ = submitRF3TransactionAtCurrentLeader(
+	newLeader, commitRetry, commitRetryEnvelope, _ := submitRF3TransactionAtCurrentLeader(
 		t, ctx, cluster, removed, cluster.group, commit,
 	)
 	if !bytes.Equal(commitRetry.Completion, committed.Completion) ||
@@ -592,13 +592,13 @@ func TestRF3TransactionSurvivesLeaderLossAndPublishesRelationBundleAtomically(t 
 		Role: distributedtxn.ReplicatedRoleTarget, Operation: distributedtxn.ReplicatedApplyTarget,
 		ID: id, ExpectedRevision: 2, PayloadKind: distributedtxn.ReplicatedPayloadNone,
 	}, nil)
-	newLeader, applied, _, appliedResult := submitRF3TransactionAtCurrentLeader(
+	_, applied, _, appliedResult := submitRF3TransactionAtCurrentLeader(
 		t, ctx, cluster, removed, cluster.group, apply,
 	)
 	if !appliedResult.AffectedRowsValid || appliedResult.AffectedRows != 1 {
 		t.Fatalf("apply result=%+v", appliedResult)
 	}
-	newLeader, appliedRetry, _, retryResult := submitRF3TransactionAtCurrentLeader(
+	_, appliedRetry, _, retryResult := submitRF3TransactionAtCurrentLeader(
 		t, ctx, cluster, removed, cluster.group, apply,
 	)
 	if !bytes.Equal(appliedRetry.Completion, applied.Completion) || retryResult != appliedResult {

@@ -102,12 +102,19 @@ func (service *Service) Serve(ctx context.Context, connection rafttransport.Peer
 	default:
 		return clusterbackup.ErrBound
 	}
-	workspace, _ := service.pool.Get().([]byte)
+	// The pool holds *[]byte so retrieved headers never box on Put: the
+	// pointer cycles pool-to-pool while only the header bytes copy.
+	pooled, _ := service.pool.Get().(*[]byte)
+	if pooled == nil {
+		pooled = new([]byte)
+	}
+	workspace := *pooled
 	if cap(workspace) < service.options.ChunkBytes {
 		workspace = make([]byte, 0, service.options.ChunkBytes)
 	}
 	workspace = workspace[:0]
-	defer service.pool.Put(workspace)
+	*pooled = workspace
+	defer service.pool.Put(pooled)
 	state, err := service.options.Owner.Probe(ctx, request.Group)
 	if err != nil || state.Identity.MemberID != request.SourceMember {
 		return errors.Join(clusterbackup.ErrLiveBackup, err)

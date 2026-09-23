@@ -6,8 +6,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmember"
 )
 
-const durableRequestGroupBytes = 72
-
 func appendDurableRequestGroup(dst []byte, group raftmember.GroupKey) {
 	copy(dst[:16], group.ClusterID[:])
 	copy(dst[16:32], group.ClusterIncarnation[:])

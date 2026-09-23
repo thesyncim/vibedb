@@ -35,7 +35,6 @@ type rf3NodeRuntime struct {
 	donors        *rf3DynamicDonorServices
 	native        *rf3NativeAuthorities
 	actionJournal *replicaaction.FileJournal
-	controlMu     sync.Mutex
 	groupsMu      sync.RWMutex
 	groups        map[raftmember.GroupKey]*raftmember.Runtime
 	// servingGroups is separate from transport membership. A group becomes

@@ -200,7 +200,7 @@ func testRF3AdmissionPlan(t testing.TB) (*Plan, *gateway.Snapshot) {
 			ControlEndpoint: sourceLeaders[index] + "-control",
 		}
 	}
-	catalog, err := gateway.NewSnapshotWithReplicatedMetadata(
+	_, err = gateway.NewSnapshotWithReplicatedMetadata(
 		config, endpoints, 19, nil, nil, []gateway.ReplicatedShardDescriptor{descriptor},
 	)
 	if err != nil {
@@ -241,7 +241,7 @@ func testRF3AdmissionPlan(t testing.TB) (*Plan, *gateway.Snapshot) {
 		replica.ControlAddress = endpoints[replica.ControlEndpoint]
 	}
 	schema := bindProjectionSourceAndChildSchemas(t, &descriptor, &target)
-	catalog, err = gateway.NewSnapshotWithReplicatedMetadata(config, endpoints, 19, nil, nil, []gateway.ReplicatedShardDescriptor{descriptor})
+	catalog, err := gateway.NewSnapshotWithReplicatedMetadata(config, endpoints, 19, nil, nil, []gateway.ReplicatedShardDescriptor{descriptor})
 	if err != nil {
 		t.Fatal(err)
 	}

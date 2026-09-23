@@ -211,7 +211,6 @@ type ownerRequest struct {
 	ownershipDrainExpired bool
 	install               ExecutionGroup
 	pointReadSlot         *pointReadViewSlot
-	publish               func()
 	registryChange        func(func(func()) error) error
 	database              *sqldriver.Database
 	apply                 *sqldriver.ReplicatedApply

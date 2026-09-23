@@ -151,7 +151,7 @@ func TestSchemaRolloutAbortIsSafeOnlyBeforeActivationBoundary(t *testing.T) {
 	authority, _, current := newCatalogAuthorityFixture(t)
 	target, receipts := testSchemaRolloutTarget(t, current)
 	id := sha256.Sum256([]byte{0x31})
-	planned, err := authority.PrepareSchemaRollout(
+	_, err := authority.PrepareSchemaRollout(
 		context.Background(), id, target, receipts,
 	)
 	if err != nil {
@@ -173,7 +173,7 @@ func TestSchemaRolloutAbortIsSafeOnlyBeforeActivationBoundary(t *testing.T) {
 	}
 
 	runningID := sha256.Sum256([]byte{0x32})
-	planned, err = authority.PrepareSchemaRollout(
+	planned, err := authority.PrepareSchemaRollout(
 		context.Background(), runningID, target, receipts,
 	)
 	if err != nil {

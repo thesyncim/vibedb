@@ -13,10 +13,9 @@ import (
 const replicatedProjectedFieldRows = 8192
 
 type replicatedProjectedFieldRow struct {
-	id      string
-	doc     []byte
-	values  []string
-	deleted bool
+	id     string
+	doc    []byte
+	values []string
 }
 
 // replicatedProjectedFieldDocument retains the RF3 benchmark shape while

@@ -870,7 +870,7 @@ func buildPreparedRF3Manifest(input prepareRF3Manifest, nodes [3]rafttransport.N
 		Members:         make([]persistedRF3Member, len(input.Members)),
 	}
 	for index, grant := range input.SplitControl.Grants {
-		m.SplitControl.Grants[index] = persistedRF3ActionGrant{NodeID: grant.NodeID, Actions: grant.Actions}
+		m.SplitControl.Grants[index] = persistedRF3ActionGrant(grant)
 	}
 	for i, member := range input.Members {
 		storeID := member.StoreID

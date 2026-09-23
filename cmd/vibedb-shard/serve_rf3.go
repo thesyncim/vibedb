@@ -729,7 +729,6 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 	commands := make([]raftservice.CommandFence, 0, len(preparedSet.groups))
 	readSources := make([]raftservice.ReadSource, 0, len(preparedSet.groups))
 	recoverySources := make([]raftservice.TransactionRecoverySource, 0, len(preparedSet.groups))
-	publications := make([]raftmodel.Publication, 0, len(preparedSet.groups))
 	closeAdopted := func(cause error) error {
 		for _, runtime := range runtimes {
 			cause = errors.Join(cause, runtime.Close())
@@ -754,7 +753,6 @@ func servePreparedRF3WithExecutionLanesAndGateway(
 		}
 		identity := runtime.Identity()
 		identities = append(identities, identity)
-		publications = append(publications, runtimePublication)
 		command, commandErr := currentRF3CommandFence(item.apply, identity, runtimePublication)
 		if commandErr != nil {
 			return errors.Join(closeAdopted(fmt.Errorf("%w: group %d current command fence: %v", errRF3Serving, index, commandErr)), closePreparedRF3Groups(preparedSet.groups[index+1:], nil))

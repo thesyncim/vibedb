@@ -144,7 +144,7 @@ func TestControllerPassSkipsValidNonSplitWitnessesInRemoteLoop(t *testing.T) {
 }
 
 func TestControllerPassRejectsMalformedDirectoryEntriesAndSkipsMissing(t *testing.T) {
-	snapshot, base, observer, router, _ := newDirectControllerLoopFixture(t)
+	snapshot, _, observer, router, _ := newDirectControllerLoopFixture(t)
 	missingID := [32]byte{0x21}
 	missing := &mixedControllerDirectory{
 		testControllerCatalog: &testControllerCatalog{
@@ -191,7 +191,7 @@ func TestControllerPassRejectsMalformedDirectoryEntriesAndSkipsMissing(t *testin
 	}
 
 	readErr := errors.New("directory read failed")
-	_, base, observer, router, _ = newDirectControllerLoopFixture(t)
+	_, base, observer, router, _ := newDirectControllerLoopFixture(t)
 	directory := &mixedControllerDirectory{
 		testControllerCatalog: base,
 		ids:                   [][32]byte{{0x31}}, errors: map[[32]byte]error{{0x31}: readErr},

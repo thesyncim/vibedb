@@ -440,8 +440,7 @@ func (cache *replicatedIssuerGrantCache) get(reference ReplicatedIssuerReference
 	if cache == nil || !validReplicatedIssuerReference(reference) {
 		return ReplicatedIssuerLaneGrant{}, false
 	}
-	key := replicatedIssuerGrantCacheKey{Installation: reference.Installation, Epoch: reference.Epoch,
-		LaneOrdinal: reference.LaneOrdinal, GrantDigest: reference.GrantDigest}
+	key := replicatedIssuerGrantCacheKey(reference)
 	shard := cache.shard(key.GrantDigest)
 	shard.mu.RLock()
 	grant, found := shard.entries[key]

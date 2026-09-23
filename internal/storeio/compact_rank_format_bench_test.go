@@ -59,7 +59,7 @@ func BenchmarkCompactRankFormat(b *testing.B) {
 				b.ReportAllocs()
 				b.ResetTimer()
 				for b.Loop() {
-					payload, err = BuildCompactPrimaryStripePayload(records, builder)
+					_, err = BuildCompactPrimaryStripePayload(records, builder)
 					if err != nil {
 						b.Fatal(err)
 					}

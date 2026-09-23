@@ -254,7 +254,7 @@ func matchDiscovery(tokens, pattern []string) (discoveryFilter, bool) {
 			// JetBrains renders an empty fragment selection as IN (NULL).
 			// It matches no relation, not every relation.
 			if tokens[i] == "null" {
-				if f.names != nil && len(f.names) != 0 {
+				if len(f.names) != 0 {
 					return f, false
 				}
 				f.names = []string{}

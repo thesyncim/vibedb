@@ -38,12 +38,6 @@ type tinDefinition struct {
 	pointer vibejson.CompiledPointer
 }
 
-// tinCacheEntry pins one State's built tin indexes.
-type tinCacheEntry struct {
-	state   *State
-	indexes map[string]*tin.Index
-}
-
 // CompileTinDefinition validates a tin index definition: exactly one path,
 // no uniqueness, and a compilable RFC 6901 pointer.
 func CompileTinDefinition(def IndexDefinition) (tinDefinition, error) {

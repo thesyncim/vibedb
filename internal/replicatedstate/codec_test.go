@@ -16,23 +16,6 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const (
-	_resultAppliedAtLeastExact         = ResultApplied - 1
-	_resultAppliedAtMostExact          = uint32(1) - ResultApplied
-	_resultStaleFenceAtLeastExact      = ResultStaleFence - 2
-	_resultStaleFenceAtMostExact       = uint32(2) - ResultStaleFence
-	_resultUnknownRelationAtLeastExact = ResultUnknownRelation - 3
-	_resultUnknownRelationAtMostExact  = uint32(3) - ResultUnknownRelation
-	_resultInvalidDocumentAtLeastExact = ResultInvalidDocument - 4
-	_resultInvalidDocumentAtMostExact  = uint32(4) - ResultInvalidDocument
-	_resultTargetBoundAtLeastExact     = ResultTargetBound - 5
-	_resultTargetBoundAtMostExact      = uint32(5) - ResultTargetBound
-	_resultWrongShardAtLeastExact      = ResultWrongShard - 6
-	_resultWrongShardAtMostExact       = uint32(6) - ResultWrongShard
-	_resultSessionRetiredAtLeastExact  = ResultSessionRetired - 7
-	_resultSessionRetiredAtMostExact   = uint32(7) - ResultSessionRetired
-)
-
 func codecState() State {
 	dataChain := sha256.Sum256([]byte("data-chain"))
 	contract := sha256.Sum256([]byte("apply-contract"))
@@ -517,7 +500,7 @@ func TestCodecWritableAliasesAreRejectedAndRelocationAliasesAreAllowed(t *testin
 	})
 	t.Run("relocation", func(t *testing.T) {
 		state := codecState()
-		statePrefix := make([]byte, 4, 4)
+		statePrefix := make([]byte, 4)
 		copy(statePrefix, "dist")
 		state.Binding.Distribution = unsafe.String(unsafe.SliceData(statePrefix), len(statePrefix))
 		encoded, err := AppendState(statePrefix, state)
@@ -529,7 +512,7 @@ func TestCodecWritableAliasesAreRejectedAndRelocationAliasesAreAllowed(t *testin
 		}
 
 		record := sessionCodecRecord()
-		tenantPrefix := make([]byte, len(record.Tenant), len(record.Tenant))
+		tenantPrefix := make([]byte, len(record.Tenant))
 		copy(tenantPrefix, record.Tenant)
 		record.Tenant = tenantPrefix
 		encoded, err = AppendSessionRecord(tenantPrefix, record)

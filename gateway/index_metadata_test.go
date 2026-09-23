@@ -32,7 +32,8 @@ func TestIndexMetadataRoundTripAndDefensiveCopy(t *testing.T) {
 	descriptors[0].Name = "mutated"
 	descriptors[0].Paths[0] = "/mutated"
 	descriptors[0].Paths = append(descriptors[0].Paths, "/extra")
-	descriptors = append(descriptors, IndexDescriptor{})
+	// The append itself must not disturb the published snapshot; only the call matters.
+	_ = append(descriptors, IndexDescriptor{})
 
 	metadata, ok := snapshot.Index("messages", "by_tenant_created")
 	if !ok {

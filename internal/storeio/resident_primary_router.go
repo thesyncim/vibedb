@@ -481,21 +481,20 @@ func (r *ResidentPrimaryRouter) SplitLeafPartition(
 		return nil, fmt.Errorf("%w: resident partition source", ErrInvalidWrite)
 	}
 	residentSourceFence := r.fence(sourceRank)
-	// Build one tablet-local identity set for the existing router. Checking the
-	// whole resident slice once keeps the K-way validation bounded by O(N+K),
-	// rather than rescanning every resident leaf for each replacement.
+	// Borrow the tablet-local identity set instead of rescanning every
+	// resident leaf for each replacement. Same-tablet leaves occupy one
+	// contiguous rank range (tablet-major build order, enforced by
+	// ReplaceTablets), so a prior leaf exists exactly when the immediate
+	// predecessor belongs to this tablet.
 	var used [TabletLocalIdentityLocalCount / 64]uint64
 	selectedTabletHasPriorLeaf := false
 	if locals, found := r.buckets.tabletLocals(tabletID); found {
 		used = locals.words
 		used[sourceLocalID>>6] &^= uint64(1) << (sourceLocalID & 63)
-		for rank := sourceRank - 1; rank >= 0; rank-- {
-			old, _ := r.RouteAtRank(rank)
+		if sourceRank > 0 {
+			old, _ := r.RouteAtRank(sourceRank - 1)
 			oldTablet, _, valid := SplitTabletLocalIdentityBucket(uint32(old.Bucket))
-			if valid && oldTablet == tabletID {
-				selectedTabletHasPriorLeaf = true
-			}
-			break
+			selectedTabletHasPriorLeaf = valid && oldTablet == tabletID
 		}
 	}
 	// A tablet's first persistent leaf has an empty local floor, while the

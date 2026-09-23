@@ -32,6 +32,8 @@ func punchFileStoreHole(
 		offset: int64(offset), length: int64(length),
 	}
 	for attempt := 0; attempt < fileStoreHolePunchMaxAttempts; attempt++ {
+		// x/sys offers no pointer-argument fcntl wrapper on darwin, so
+		// F_PUNCHHOLE keeps its direct trap while the constant exists.
 		_, _, errno := unix.Syscall(
 			unix.SYS_FCNTL, file.Fd(), uintptr(unix.F_PUNCHHOLE),
 			uintptr(unsafe.Pointer(&request)),

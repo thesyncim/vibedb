@@ -885,7 +885,7 @@ func BenchmarkReplicatedApplyCaptureWALBase(b *testing.B) {
 	b.ReportMetric(1, "scan/op")
 	b.ResetTimer()
 	for b.Loop() {
-		preparation, err = claim.CaptureWALBase(WALBaseCaptureOptions{Workspace: workspace})
+		_, err = claim.CaptureWALBase(WALBaseCaptureOptions{Workspace: workspace})
 		if err != nil {
 			b.Fatal(err)
 		}
