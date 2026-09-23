@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/loopbackport"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 )
 
@@ -34,12 +35,9 @@ func TestPostgreSQLDevOnlineCreateTableAndRestart(t *testing.T) {
 	for _, command := range []string{"vibedb", "vibedb-shard", "vibedb-gateway"} {
 		replicaProcessBuild(t, ctx, filepath.Join(bin, command), "./cmd/"+command)
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	// The PostgreSQL endpoint is rebound after the restart below.
+	address, err := loopbackport.Reserve()
 	if err != nil {
-		t.Fatal(err)
-	}
-	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
 		t.Fatal(err)
 	}
 	args := []string{"cluster", "dev", "--root", filepath.Join(root, "state"), "--pg-listen", address, "--diagnostics-on-exit"}
