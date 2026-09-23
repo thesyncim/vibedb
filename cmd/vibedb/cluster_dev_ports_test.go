@@ -54,9 +54,18 @@ func TestReserveDevPortsHoldsRequestedPGEndpointsDuringEveryAllocation(t *testin
 			}
 			initial = nil
 			allocations := 0
+			injectedCollision := false
 			ports, err := reserveDevPortsUsing(1+tc.physical*6, requested, func(network, address string) (net.Listener, error) {
 				if !slices.Contains(requested, address) {
 					allocations++
+					// Force one legitimate retry per subtest: a random pick
+					// may collide with a live listener held by a
+					// concurrently running package, and the reservation must
+					// absorb it without changing the produced ports.
+					if !injectedCollision {
+						injectedCollision = true
+						return nil, syscall.EADDRINUSE
+					}
 					// Deliberately try every requested binding before each
 					// internal allocation; a missing reservation fails on every
 					// run instead of depending on an ephemeral-port coincidence.
@@ -76,7 +85,10 @@ func TestReserveDevPortsHoldsRequestedPGEndpointsDuringEveryAllocation(t *testin
 				}
 				return net.Listen(network, address)
 			})
-			if err != nil || len(ports) != 1+tc.physical*6 || allocations != len(ports) {
+			// A random pick may collide with a live listener held by a
+			// concurrently running package and legitimately retry, so
+			// attempts only lower-bound the produced ports.
+			if err != nil || len(ports) != 1+tc.physical*6 || allocations < len(ports) {
 				t.Fatalf("ports=%v allocations=%d err=%v", ports, allocations, err)
 			}
 			assertDevPortsCanBindTogether(t, append(requested, ports...))
