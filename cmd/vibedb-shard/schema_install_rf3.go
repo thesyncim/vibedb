@@ -685,7 +685,7 @@ func (a *rf3SchemaActivator) activate(
 		}
 		if err = settleRF3SchemaCommitWithAlias(ctx, a.owners, request.Group, command, func() (bool, error) {
 			applied := state.apply.Applied()
-			committed, aliasErr := rf3SchemaCommittedTransitionAlias(state.wal, applied)
+			committed, aliasErr := rf3SchemaLiveTransitionAlias(state.wal, applied)
 			if aliasErr != nil {
 				return false, aliasErr
 			}

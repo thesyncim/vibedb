@@ -136,6 +136,45 @@ func TestRF3SchemaCommittedTransitionAlias(t *testing.T) {
 	}
 }
 
+// While a live schema commit settles, an apply tip that is not yet the
+// transition (nothing applied, a membership change, or a new leader's empty
+// entry) means "keep waiting", not a conflict. Malformed reads still fail.
+func TestRF3SchemaLiveTransitionAliasWaitsOnNonTransitionTip(t *testing.T) {
+	index, term := uint64(11), uint64(3)
+	normal, confChange := pb.EntryNormal, pb.EntryConfChange
+	command := []byte("committed schema command")
+	alias, err := rf3SchemaLiveTransitionAlias(schemaRecoveryWAL{entries: []*pb.Entry{
+		{Index: &index, Term: &term, Type: &normal, Data: command}}}, index)
+	if err != nil || !bytes.Equal(alias, command) {
+		t.Fatalf("committed tip = %q, %v", alias, err)
+	}
+	for name, test := range map[string]struct {
+		wal     schemaRecoveryWAL
+		applied uint64
+	}{
+		"nothing applied":    {wal: schemaRecoveryWAL{}, applied: 0},
+		"leader empty entry": {wal: schemaRecoveryWAL{entries: []*pb.Entry{{Index: &index, Term: &term, Type: &normal}}}, applied: index},
+		"membership change":  {wal: schemaRecoveryWAL{entries: []*pb.Entry{{Index: &index, Term: &term, Type: &confChange, Data: []byte{1}}}}, applied: index},
+		"compacted":          {wal: schemaRecoveryWAL{err: raft.ErrCompacted}, applied: index},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if alias, err := rf3SchemaLiveTransitionAlias(test.wal, test.applied); err != nil || alias != nil {
+				t.Fatalf("alias=%q err=%v, want keep waiting", alias, err)
+			}
+		})
+	}
+	for name, wal := range map[string]schemaRecoveryWAL{
+		"unavailable": {err: raft.ErrUnavailable},
+		"missing":     {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := rf3SchemaLiveTransitionAlias(wal, index); !errors.Is(err, schemainstall.ErrConflict) {
+				t.Fatalf("malformed read accepted: %v", err)
+			}
+		})
+	}
+}
+
 func testRF3SchemaRecoveryCommand(t *testing.T) (schemainstall.Request, schemainstall.Authorization, replicatedstate.SchemaTransitionView) {
 	t.Helper()
 	from := replicatedstate.Binding{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2},

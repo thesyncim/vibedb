@@ -198,6 +198,32 @@ func rf3SchemaCommittedTransitionAlias(wal rf3SchemaWALReader, committedApplied 
 	return append([]byte(nil), entries[0].GetData()...), nil
 }
 
+// rf3SchemaLiveTransitionAlias reads the entry at the live apply tip while a
+// schema commit is still settling. Unlike startup recovery, the tip may
+// legitimately be something other than the transition yet: nothing applied,
+// a membership change, or a new leader's empty entry. Those mean "not
+// committed here yet", not a conflict, and return no alias so the caller keeps
+// waiting. A malformed or mismatched read still fails closed.
+func rf3SchemaLiveTransitionAlias(wal rf3SchemaWALReader, applied uint64) ([]byte, error) {
+	if wal == nil {
+		return nil, schemainstall.ErrConflict
+	}
+	if applied == 0 {
+		return nil, nil
+	}
+	entries, err := wal.Entries(applied, applied+1, 1<<20)
+	if errors.Is(err, raft.ErrCompacted) {
+		return nil, nil
+	}
+	if err != nil || len(entries) != 1 || entries[0].GetIndex() != applied {
+		return nil, errors.Join(err, schemainstall.ErrConflict)
+	}
+	if entries[0].GetType() != raftpb.EntryNormal || len(entries[0].GetData()) == 0 {
+		return nil, nil
+	}
+	return append([]byte(nil), entries[0].GetData()...), nil
+}
+
 type rf3SchemaSourceRecovery interface {
 	ObserveReplicatedSchemaTransition([]byte) (uint64, bool, error)
 	PublishReplicatedSchemaCatalog() (bool, error)
