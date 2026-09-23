@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"github.com/thesyncim/vibedb/internal/raftservice"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -520,5 +521,49 @@ func TestPostgreSQLWriteJournalRejectsConcurrentOwnerAndCorruption(t *testing.T)
 	if other, err := openPostgresDurableWriter(path, authority, s); err == nil {
 		other.Close()
 		t.Fatal("corrupt authority replaced")
+	}
+}
+
+// fenceRefusedButAdmittedStub answers the first execution with a transient
+// serving-fence refusal although the request was in fact admitted, as a race
+// during a topology change can. Replay of the exact identity finds it.
+type fenceRefusedButAdmittedStub struct {
+	postgresWriteServiceStub
+	fenceRefusals int
+}
+
+func (s *fenceRefusedButAdmittedStub) ExecBatch(ctx context.Context, authority serviceauthz.Authority, id durableExecBatchIdentity, q []gateway.Query) (durableExecBatchExecuteResult, error) {
+	if s.fenceRefusals > 0 {
+		s.fenceRefusals--
+		s.writes++
+		s.identity, s.queries = id, q
+		return durableExecBatchExecuteResult{}, errors.Join(gateway.ErrDurableSQLNotAdmitted, raftservice.ErrServingFence)
+	}
+	return s.postgresWriteServiceStub.ExecBatch(ctx, authority, id, q)
+}
+
+// A transient fence refusal must be retried under the same request identity
+// so the ledger settles it exactly once; a new identity could apply the
+// statement a second time.
+func TestPostgreSQLWriteFenceRefusalRetriesSameIdentity(t *testing.T) {
+	authority := serviceauthz.Authority{Generation: 1}
+	authority.Node[0] = 9
+	s := &fenceRefusedButAdmittedStub{fenceRefusals: 1}
+	w, err := openPostgresDurableWriter(filepath.Join(t.TempDir(), "writes"), authority, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	first := durableExecBatchIdentity{}
+	if _, err = w.Write(t.Context(), authority, gateway.Query{SQL: "INSERT INTO docs VALUES ('a')"}); err != nil {
+		t.Fatalf("fence-refused write was not settled: %v", err)
+	}
+	first = s.identity
+	if s.writes != 1 || s.replays != 1 {
+		t.Fatalf("writes=%d replays=%d, want one execution settled by replay of the same identity",
+			s.writes, s.replays)
+	}
+	if w.record.Query != nil || w.record.Sequence != first.IssuerSequence+1 {
+		t.Fatalf("settled write left record=%+v", w.record)
 	}
 }
