@@ -9,6 +9,8 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/frontenddrain"
+	"github.com/thesyncim/vibedb/internal/rafttransport"
+	"github.com/thesyncim/vibedb/internal/replication"
 )
 
 // publishCanonicalFrontendDrainCut distributes a complete catalog/service cut
@@ -110,7 +112,22 @@ func (runtime *Runtime) publishCanonicalFrontendDrainCutOnce(
 		}
 		acked := 0
 		var lastUnreachable error
+		// A failed round is retried every tick until it completes. Receivers
+		// that already installed this exact cut need no second exchange, so a
+		// retry costs only the outstanding receivers rather than the roster.
+		cutDigest := replication.Digest(sourceCut.Digest())
+		if runtime.frontendDrainAckedCut != cutDigest || runtime.frontendDrainAckedReceivers == nil {
+			runtime.frontendDrainAckedCut = cutDigest
+			runtime.frontendDrainAckedReceivers = make(map[frontendDrainAckedReceiver]struct{}, len(receivers))
+		}
 		for _, receiver := range receivers {
+			ackedKey := frontendDrainAckedReceiver{node: receiver.node.NodeID,
+				incarnation: receiver.node.Incarnation, revision: receiver.node.Revision,
+				serviceKey: receiver.node.ServiceKeyDigest}
+			if _, done := runtime.frontendDrainAckedReceivers[ackedKey]; done {
+				acked++
+				continue
+			}
 			var nonce [16]byte
 			if _, err := cryptorand.Read(nonce[:]); err != nil {
 				return err
@@ -139,6 +156,7 @@ func (runtime *Runtime) publishCanonicalFrontendDrainCutOnce(
 				return fmt.Errorf("prepared-ack receiver %s incarnation %d: %w", receiver.node.NodeID,
 					receiver.node.Incarnation, err)
 			}
+			runtime.frontendDrainAckedReceivers[ackedKey] = struct{}{}
 			acked++
 		}
 		if acked == 0 {
@@ -165,4 +183,14 @@ func (runtime *Runtime) publishCanonicalFrontendDrainCutOnce(
 			latest.cut.CatalogGeneration, latest.fullCut.Digest())
 	}
 	return nil
+}
+
+// frontendDrainAckedReceiver identifies one receiver incarnation that has
+// durably installed the current canonical cut. A restart, re-enrollment, or
+// key rotation changes the key and forces a fresh exchange.
+type frontendDrainAckedReceiver struct {
+	node        rafttransport.NodeID
+	incarnation uint64
+	revision    uint64
+	serviceKey  replication.Digest
 }

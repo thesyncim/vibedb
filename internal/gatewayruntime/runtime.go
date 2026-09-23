@@ -227,10 +227,14 @@ type Runtime struct {
 	// controller's physical prepared-ACK exchange without replacing the
 	// production shard-control opener. Production wiring leaves it nil and
 	// uses controlOpener below.
-	preparedAckPhysicalOpener       frontendDrainPreparedAckPhysicalOpener
-	clusterControlOpener            *gatewayClusterControlOpener
-	drainCoordinator                *gateway.ClusterCatalogDrainCoordinator
-	controlDirectoryRefresh         controlRefreshGate
+	preparedAckPhysicalOpener frontendDrainPreparedAckPhysicalOpener
+	clusterControlOpener      *gatewayClusterControlOpener
+	drainCoordinator          *gateway.ClusterCatalogDrainCoordinator
+	controlDirectoryRefresh   controlRefreshGate
+	// Receivers that acknowledged frontendDrainAckedCut; owned by the refresh
+	// gate holder like the published digest below.
+	frontendDrainAckedCut           replication.Digest
+	frontendDrainAckedReceivers     map[frontendDrainAckedReceiver]struct{}
 	publishedFrontendDrainCutDigest replication.Digest
 	publishedFrontendDrainCutValid  bool
 	controlRosterMu                 sync.RWMutex

@@ -72,6 +72,7 @@ type refreshDedupPreparedAckOpener struct {
 	receiverKey  [32]byte
 	receiverNode rafttransport.NodeID
 	refuseNode   rafttransport.NodeID
+	failNode     rafttransport.NodeID
 	fail         bool
 	calls        int
 }
@@ -93,7 +94,7 @@ func (opener *refreshDedupPreparedAckOpener) OpenShardControlEndpoint(
 	if refuseNode != (rafttransport.NodeID{}) && endpoint.Node == refuseNode {
 		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
 	}
-	if fail {
+	if fail || opener.failNode != (rafttransport.NodeID{}) && endpoint.Node == opener.failNode {
 		return nil, errors.New("injected prepared-ack receiver failure")
 	}
 	clientRaw, serverRaw := net.Pipe()
@@ -340,5 +341,44 @@ func TestRefreshLiveControlDirectorySkipsUnreachableRecoveryReceiver(t *testing.
 	}
 	if got := opener.callsObserved(); got != 4 {
 		t.Fatalf("fanout=%d, want one four-receiver round including the refused peer", got)
+	}
+}
+
+// A round that fails on one receiver is retried on the next tick. Receivers
+// that already installed the same cut must not be contacted again, so retry
+// traffic scales with the outstanding receivers, not the whole roster.
+func TestRefreshLiveControlDirectoryRetriesOnlyOutstandingReceivers(t *testing.T) {
+	source, profile, policy, node := refreshDedupExpandedSource(t)
+	reader := &refreshDedupRuntimeCutReader{cut: source}
+	opener := &refreshDedupPreparedAckOpener{
+		profile: profile, receiverNode: node.NodeID, receiverKey: [32]byte(node.ServiceKeyDigest),
+		failNode: rafttransport.NodeID{3},
+	}
+	runtime := newRefreshDedupRuntime(t, source, reader, opener, profile, policy)
+	if err := runtime.refreshLiveControlDirectory(t.Context()); err == nil {
+		t.Fatal("round with a failing receiver succeeded")
+	}
+	first := opener.callsObserved()
+	ackedFirst := first - 1
+	opener.mu.Lock()
+	opener.failNode = rafttransport.NodeID{}
+	opener.mu.Unlock()
+	if err := runtime.refreshLiveControlDirectory(t.Context()); err != nil {
+		t.Fatalf("retry after receiver recovered: %v", err)
+	}
+	if retry := opener.callsObserved() - first; retry != 4-ackedFirst {
+		t.Fatalf("retry contacted %d receivers, want only the %d outstanding (first round acked %d)",
+			retry, 4-ackedFirst, ackedFirst)
+	}
+	// A new cut resets the acknowledgement set: every receiver installs it.
+	changed := source
+	changed.CatalogHeadDigest[0]++
+	reader.set(changed)
+	before := opener.callsObserved()
+	if err := runtime.refreshLiveControlDirectory(t.Context()); err != nil {
+		t.Fatalf("new cut publication: %v", err)
+	}
+	if got := opener.callsObserved() - before; got != 4 {
+		t.Fatalf("new cut contacted %d receivers, want all 4", got)
 	}
 }
