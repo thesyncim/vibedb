@@ -417,20 +417,42 @@ func (runtime *Runtime) openControlDirectory() error {
 	if reader == nil || runtime.config.TLSProfile == nil || runtime.config.Authorization == nil {
 		return errGatewayControlDirectory
 	}
-	// Catalog leaders already own a linearizable row reader. Install that cut
-	// before dialing a remote source or the semantic catalog authority; both
-	// of those routes wait on a gateway that has not opened yet.
-	if rows := runtime.config.CanonicalFrontendDrainRuntimeRows; rows != nil {
-		if source, readErr := gateway.ReadFrontendDrainRuntimeCutFromRows(runtime.ctx, rows); readErr == nil {
-			if err := runtime.installControlDirectoryFromRuntimeCut(source); err == nil {
-				return nil
+	for attempt := 0; ; attempt++ {
+		// Catalog leaders already own a linearizable row reader. Install that
+		// cut before dialing a remote source or the semantic catalog authority;
+		// both of those routes wait on a gateway that has not opened yet.
+		if rows := runtime.config.CanonicalFrontendDrainRuntimeRows; rows != nil {
+			if source, readErr := gateway.ReadFrontendDrainRuntimeCutFromRows(runtime.ctx, rows); readErr == nil {
+				if err := runtime.installControlDirectoryFromRuntimeCut(source); err == nil {
+					return nil
+				}
 			}
 		}
-	}
-	if source := runtime.config.CanonicalFrontendDrainRuntimeSource; source != nil {
+		source := runtime.config.CanonicalFrontendDrainRuntimeSource
+		if source == nil {
+			break
+		}
 		proof, sourceErr := source.ReadLatestFrontendDrainCut(runtime.ctx)
 		if sourceErr != nil {
-			return fmt.Errorf("read initial canonical frontend drain source proof: %w", sourceErr)
+			// A restarting or not-yet-listening source is a transient startup
+			// condition, not a node failure: keep converging until it answers,
+			// this node's own catalog replica can serve the rows, or the
+			// runtime stops. Any other error is still fatal.
+			if !frontendDrainPreparedAckReceiverUnreachable(sourceErr) || runtime.ctx.Err() != nil {
+				return fmt.Errorf("read initial canonical frontend drain source proof: %w", sourceErr)
+			}
+			if attempt%20 == 0 && runtime.config.Logf != nil {
+				runtime.config.Logf("gatewayruntime: waiting for canonical frontend drain source: %v", sourceErr)
+			}
+			timer := time.NewTimer(preAdmissionWriteRetryDelay(attempt))
+			select {
+			case <-runtime.ctx.Done():
+				timer.Stop()
+				return fmt.Errorf("read initial canonical frontend drain source proof: %w",
+					errors.Join(sourceErr, context.Cause(runtime.ctx)))
+			case <-timer.C:
+			}
+			continue
 		}
 		if !proof.Valid() {
 			return fmt.Errorf("%w: initial canonical frontend drain source proof is invalid", errGatewayControlDirectory)
