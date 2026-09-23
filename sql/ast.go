@@ -698,6 +698,10 @@ const (
 	// or a placeholder; the query lowerer executes SQL's '%' and '_' pattern
 	// operators and the optional backslash escape.
 	ExprLike
+	// ExprMatch is Path [NOT] ==> Value, full-text match. Value must be a
+	// string literal or a placeholder holding TINQL; the query lowerer
+	// resolves it against the collection's tin index for the path.
+	ExprMatch
 	// ExprAnd is the conjunction of Kids.
 	ExprAnd
 	// ExprOr is the disjunction of Kids.

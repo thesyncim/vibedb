@@ -237,34 +237,57 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 	leafPos := p.tok.pos
 	agg := AggNone
 	var path *PathExpr
-	switch kind, head, state := p.tryAggregate(); state {
-	case aggCall:
-		if ctx != ctxHaving {
-			if p.inCaseTruth() {
-				return nil, newFeatureNotSupportedError(
-					p.lx.src, leafPos,
-					"aggregate predicates inside searched CASE require a combined grouped CASE stage",
-				)
+	// SCORE() enters scalar parsing only with its parentheses: a bare score
+	// is an ordinary path leaf because a field can be named score, exactly
+	// like count and sum stay paths without '('. The head is consumed either
+	// way, so a head-only SCORE continues through the shared leaf tail below.
+	scoreHead := false
+	if p.tok.kind == tokIdent && p.tok.kw == kwScore {
+		node, head, state, err := p.tryScore(scalarContextForPredicate(ctx))
+		if err != nil {
+			return nil, err
+		}
+		if state == scoreCall {
+			return p.parseScalarCondition(ctx, node, head.pos)
+		}
+		if state == scoreHeadOnly {
+			p2, err := p.continuePath(head, false)
+			if err != nil {
+				return nil, err
 			}
-			return nil, p.errfHere("an aggregate is not allowed in %s: rows are filtered before they are reduced; use HAVING", ctx)
+			path, scoreHead = p2, true
 		}
-		arg, err := p.parseAggregateArgs(kind)
-		if err != nil {
-			return nil, err
+	}
+	if !scoreHead {
+		switch kind, head, state := p.tryAggregate(); state {
+		case aggCall:
+			if ctx != ctxHaving {
+				if p.inCaseTruth() {
+					return nil, newFeatureNotSupportedError(
+						p.lx.src, leafPos,
+						"aggregate predicates inside searched CASE require a combined grouped CASE stage",
+					)
+				}
+				return nil, p.errfHere("an aggregate is not allowed in %s: rows are filtered before they are reduced; use HAVING", ctx)
+			}
+			arg, err := p.parseAggregateArgs(kind)
+			if err != nil {
+				return nil, err
+			}
+			agg, path = kind, arg
+		case aggHeadOnly:
+			p2, err := p.continuePath(head, false)
+			if err != nil {
+				return nil, err
+			}
+			path = p2
+		default:
+			p2, err := p.parsePath(false)
+			if err != nil {
+				return nil, err
+			}
+			path = p2
 		}
-		agg, path = kind, arg
-	case aggHeadOnly:
-		p2, err := p.continuePath(head, false)
-		if err != nil {
-			return nil, err
-		}
-		path = p2
-	default:
-		p2, err := p.parsePath(false)
-		if err != nil {
-			return nil, err
-		}
-		path = p2
 	}
 	if scalarContinues(p.tok) {
 		column := ResultColumn{Agg: agg, Path: path, Pos: leafPos}
@@ -559,10 +582,17 @@ func (p *Parser) parseLeafTail(
 	case p.atKeyword(kwSimilar):
 		return nil, p.errHere("SIMILAR TO is not supported: the engine has no pattern operator")
 	case negated:
-		return nil, p.errHere("expected IN, BETWEEN, or LIKE after NOT")
+		// NOT ==> parses below beside @>; anything else after NOT is
+		// refused with the keyword list.
+		if p.tok.kind != tokMatch {
+			return nil, p.errHere("expected IN, BETWEEN, LIKE, or ==> after NOT")
+		}
 	}
 	if p.tok.kind == tokContains {
 		return p.parseContainsTail(agg, path, pos)
+	}
+	if p.tok.kind == tokMatch {
+		return p.parseMatchTail(agg, path, pos, negated)
 	}
 	op, ok := comparisonOp(p.tok.kind)
 	if !ok {
@@ -661,9 +691,13 @@ func (p *Parser) parseLeafTail(
 		}
 		return e, nil
 	}
+	// kwScore rides the nameable-word lane: SCORE is a relevance function
+	// only with '(', so a bare score is a field reference exactly like an
+	// unkeyworded identifier. Without this, WHERE id=score misparses as a
+	// constant-operand violation instead of reaching schema analysis.
 	if pathComparison &&
 		(p.tok.kind == tokQuotedIdent ||
-			p.tok.kind == tokIdent && p.tok.kw == kwNone) {
+			p.tok.kind == tokIdent && (p.tok.kw == kwNone || p.tok.kw == kwScore)) {
 		right, err := p.parsePath(false)
 		if err != nil {
 			return nil, err
@@ -729,6 +763,33 @@ func (p *Parser) parseLikeTail(
 	e := p.exprs.one()
 	*e = Expr{
 		Kind: ExprLike, Negated: negated, Insensitive: insensitive,
+		Column: -1, Path: path, Value: value, Pos: pos,
+	}
+	return e, nil
+}
+
+// parseMatchTail parses Path [NOT] ==> TINQL. The right side is a string
+// literal or placeholder holding a TINQL query; the lowerer resolves it
+// against the collection's tin index for the path, exactly like LIKE resolves
+// its pattern, so prepare-time shape checks and placeholder binding behave
+// the same way.
+func (p *Parser) parseMatchTail(
+	agg AggKind, path *PathExpr, pos int, negated bool,
+) (*Expr, error) {
+	if agg != AggNone {
+		return nil, p.errHere("==> does not apply to an aggregate result")
+	}
+	p.advance() // ==>
+	value, err := p.parseOperand()
+	if err != nil {
+		return nil, err
+	}
+	if value.Kind != OperandString && value.Kind != OperandParam {
+		return nil, p.errAt(value.Pos, "==> query must be a string literal or a placeholder")
+	}
+	e := p.exprs.one()
+	*e = Expr{
+		Kind: ExprMatch, Negated: negated,
 		Column: -1, Path: path, Value: value, Pos: pos,
 	}
 	return e, nil

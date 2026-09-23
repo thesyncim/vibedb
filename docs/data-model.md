@@ -125,6 +125,20 @@ Indexes change access paths, not query results. A building low-level heap index
 uses exact scan fallback for uncovered chunks. Later writes maintain every
 published index before their new generation becomes visible.
 
+## Full-text (tin) indexes
+
+`Collection.CreateTinIndex(name, path)` and SQL `CREATE INDEX ... USING tin`
+declare a positional full-text index over exactly one JSON Pointer path. Only
+string values are indexed; other values, null, and absent paths are omitted
+and never match. Text is tokenized into words and folded for case and
+accents. Index contents are derived per generation from that generation's
+own documents, so a reader never sees postings from another generation. The
+durable catalog stores the declaration, not the postings: each durable
+generation builds its postings on first use. A durable catalog admits at most
+64 tin declarations. Full-text predicates rank with BM25; see the
+[native search API](api/native.md#search-text-with-a-tin-index) and the
+[SQL reference](reference/sql.md).
+
 ## Reads and immutable generations
 
 Every successful state-changing mutation publishes an immutable collection state.

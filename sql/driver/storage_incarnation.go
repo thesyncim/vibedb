@@ -489,6 +489,7 @@ func cloneIndexMeta(source []indexMeta) []indexMeta {
 			Name:   source[i].Name,
 			Paths:  append([]string(nil), source[i].Paths...),
 			Unique: source[i].Unique,
+			Method: source[i].Method,
 		}
 	}
 	return clone

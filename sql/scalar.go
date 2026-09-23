@@ -15,6 +15,13 @@ const (
 	ScalarAggregate
 	ScalarCast
 	ScalarCase
+	// ScalarScore is SQL's SCORE() full-text relevance function: the BM25
+	// score of the row against the statement's single ==> query, or zero
+	// when the row does not match. It is appended last so existing kind
+	// numbering never shifts. The query package binds it after ==> slots
+	// are numbered; a statement with no (or more than one) ==> predicate
+	// fails at prepare with a positioned error, never a silent zero.
+	ScalarScore
 )
 
 // ScalarOp is an arithmetic, sign, concatenation, or conditional operation.

@@ -31,6 +31,10 @@ var (
 	// grow to MaxPageSize); variable base page sizes are no longer supported, so
 	// Create refuses a non-4096 PageSize and Open refuses a store that recorded one.
 	ErrUnsupportedPageSize = errors.New("vibedb: collection page size must be 4096")
+	// Tin index declarations (USING tin) enter the durable page catalog
+	// through the declare-only online path: createTinIndexContext publishes
+	// the declaration in a catalog-only generation, and postings build
+	// lazily per generation on first query use.
 	// ErrPrimaryLeafSplitRequired reports that an insert landed on a leaf with
 	// no room for it. It is an internal retry signal: the mutation path catches
 	// it, commits an atomic leaf split as its own structural transaction, and
@@ -426,6 +430,40 @@ func defaultTxnLimits() TxnLimits {
 func ValidateOptions(options Options) error {
 	_, err := options.normalized()
 	return err
+}
+
+// compileFileTinDefinition validates one USING tin definition for the
+// durable catalog: a name, exactly one compilable path, no uniqueness.
+// It mirrors store.CompileTinDefinition's contract without adopting its
+// in-memory build; durable postings are a later slice.
+func compileFileTinDefinition(
+	definition store.IndexDefinition,
+) (storeio.PageCatalogTinIndex, error) {
+	if definition.Name == "" {
+		return storeio.PageCatalogTinIndex{}, fmt.Errorf(
+			"%w: name is empty", store.ErrIndexDefinition,
+		)
+	}
+	if len(definition.Paths) != 1 {
+		return storeio.PageCatalogTinIndex{}, fmt.Errorf(
+			"%w: tin indexes exactly one path, got %d",
+			store.ErrIndexDefinition, len(definition.Paths),
+		)
+	}
+	if definition.Unique {
+		return storeio.PageCatalogTinIndex{}, fmt.Errorf(
+			"%w: tin indexes do not support UNIQUE", store.ErrIndexDefinition,
+		)
+	}
+	path := strings.Clone(definition.Paths[0])
+	if _, err := vibejson.CompilePointer(path); err != nil {
+		return storeio.PageCatalogTinIndex{}, fmt.Errorf(
+			"%w: path: %v", store.ErrIndexDefinition, err,
+		)
+	}
+	return storeio.PageCatalogTinIndex{
+		Name: strings.Clone(definition.Name), Path: path,
+	}, nil
 }
 
 func fileStoreCheckedAdd(left, right int) (int, bool) {
@@ -897,8 +935,15 @@ type normalizedFileStoreOptions struct {
 	freeFoldLimit                          int
 	pageCatalog                            *storeio.CanonicalPageCatalog
 	indexes                                []*store.ExactIndex
-	skipIndexes                            []vibejson.CompiledPointer
-	indexNameIDs                           map[string]uint32
+	// tinIndexes carries the declared full-text definitions in canonical
+	// catalog order. Tin postings build lazily per generation on first
+	// query use: nothing in the write, enforcement, or exact-probe paths
+	// consults this list. Snapshots advertise it so readers observe the
+	// published catalog exactly, and the online index path preserves it
+	// across re-normalization.
+	tinIndexes   []store.IndexDefinition
+	skipIndexes  []vibejson.CompiledPointer
+	indexNameIDs map[string]uint32
 	// uniqueIndexIDs is the normalized OR of alias-local Unique policy onto
 	// physical path-vector identities. Keeping it beside the compiled catalog
 	// makes the overwhelmingly common non-unique Put path a constant-time nil
@@ -1142,22 +1187,31 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		}
 		inputSkipPaths[i] = owned
 	}
-	inputIndexes := make([]storeio.PageCatalogIndex, len(o.Indexes))
+	inputIndexes := make([]storeio.PageCatalogIndex, 0, len(o.Indexes))
+	inputTin := make([]storeio.PageCatalogTinIndex, 0, len(o.Indexes))
 	seenIndexes := make(map[string]struct{}, len(o.Indexes))
-	for i, definition := range o.Indexes {
+	for _, definition := range o.Indexes {
 		if _, exists := seenIndexes[definition.Name]; exists {
 			return normalizedFileStoreOptions{}, store.ErrIndexExists
+		}
+		seenIndexes[definition.Name] = struct{}{}
+		if definition.Kind == store.IndexTin {
+			tin, tinErr := compileFileTinDefinition(definition)
+			if tinErr != nil {
+				return normalizedFileStoreOptions{}, tinErr
+			}
+			inputTin = append(inputTin, tin)
+			continue
 		}
 		exact, compileErr := store.CompileExactIndex(definition)
 		if compileErr != nil {
 			return normalizedFileStoreOptions{}, compileErr
 		}
-		seenIndexes[definition.Name] = struct{}{}
-		inputIndexes[i] = storeio.PageCatalogIndex{
+		inputIndexes = append(inputIndexes, storeio.PageCatalogIndex{
 			Name:   strings.Clone(definition.Name),
 			Paths:  slices.Clone(exact.Specs[:exact.N]),
 			Unique: definition.Unique,
-		}
+		})
 	}
 	var catalogSchema *storeio.PageCatalogSchema
 	if o.Collection.Schema != nil {
@@ -1180,7 +1234,8 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 	}
 	pageCatalog, catalogErr := storeio.BuildCanonicalPageCatalog(
 		storeio.PageCatalogDefinition{
-			Indexes: inputIndexes, SkipPaths: inputSkipPaths, Schema: catalogSchema,
+			Indexes: inputIndexes, TinIndexes: inputTin,
+			SkipPaths: inputSkipPaths, Schema: catalogSchema,
 		},
 	)
 	if catalogErr != nil {
@@ -1272,6 +1327,22 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		}
 	}
 	o.Indexes = definitions
+	// Tin definitions persist in canonical catalog order beside the exact
+	// aliases. The 0x54,0x49,0x4e marker keeps their hash domain disjoint
+	// from exact aliases, schema, and skip paths.
+	tinDefinitions := make([]store.IndexDefinition, len(canonical.TinIndexes))
+	for i, tin := range canonical.TinIndexes {
+		tinDefinitions[i] = store.IndexDefinition{
+			Name: tin.Name, Paths: []string{tin.Path}, Kind: store.IndexTin,
+		}
+		catalogHash = fileIndexHashBytes(
+			catalogHash, []byte{0x54, 0x49, 0x4e},
+		)
+		catalogHash = fileIndexHashBytes(catalogHash, []byte(tin.Name))
+		catalogHash = fileIndexHashBytes(catalogHash, []byte{0})
+		catalogHash = fileIndexHashBytes(catalogHash, []byte(tin.Path))
+		catalogHash = fileIndexHashBytes(catalogHash, []byte{0})
+	}
 	if o.Collection.Schema != nil {
 		catalogHash = fileIndexHashBytes(
 			catalogHash, []byte{0x53, 0x43, 0x48},
@@ -1290,7 +1361,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		catalogHash = fileIndexHashBytes(catalogHash, []byte{0})
 	}
 	if len(compiled) == 0 && len(compiledSkipIndexes) == 0 &&
-		o.Collection.Schema == nil {
+		len(tinDefinitions) == 0 && o.Collection.Schema == nil {
 		catalogHash = 0
 	} else if catalogHash == 0 {
 		// StateRoot reserves zero to mean that no exact catalog exists. FNV is
@@ -1624,6 +1695,7 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		freeFoldLimit:                          freeFoldLimit,
 		pageCatalog:                            pageCatalog,
 		indexes:                                compiled,
+		tinIndexes:                             tinDefinitions,
 		indexNameIDs:                           indexNameIDs,
 		uniqueIndexIDs:                         uniqueIndexIDs,
 		skipIndexes:                            compiledSkipIndexes,

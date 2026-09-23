@@ -1406,7 +1406,10 @@ func (p *Parser) parseMutationTargetAlias(allowBare bool) (string, int, error) {
 // separate step: CREATE TABLE ... AS has its own answer, and reaching this one
 // first would give it the wrong message.
 func (p *Parser) rejectAlias() error {
-	if p.tok.kind == tokQuotedIdent || (p.tok.kind == tokIdent && p.tok.kw == kwNone) || p.atKeyword(kwAs) {
+	// kwScore counts as a nameable word here for the same reason it does in
+	// predicate comparison operands: a bare score is a field or alias name,
+	// SCORE() only with '('.
+	if p.tok.kind == tokQuotedIdent || (p.tok.kind == tokIdent && (p.tok.kw == kwNone || p.tok.kw == kwScore)) || p.atKeyword(kwAs) {
 		return p.errHere("a table alias has nothing to qualify in a single-collection statement; write the paths unqualified")
 	}
 	return nil

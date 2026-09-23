@@ -501,6 +501,59 @@ func (d *database) createIndexLocked(statement *query.DMLStatement) (sqldriver.R
 	return d.createIndexLockedContext(backgroundContext, statement)
 }
 
+// validateIndexDefinition checks a lowered CREATE INDEX against the index
+// family it declares: exact definitions compile as exact, USING tin
+// definitions compile as tin. Routing by Kind keeps a tin definition from
+// reaching the exact compiler, which rejects it as corruption-shaped, and
+// keeps an exact definition from entering the tin catalog section.
+func validateIndexDefinition(definition query.IndexDefinition) error {
+	if definition.Definition.Kind == store.IndexTin {
+		if _, err := store.CompileTinDefinition(definition.Definition); err != nil {
+			return fmt.Errorf("vibedb: CREATE INDEX: %w", err)
+		}
+		return nil
+	}
+	if _, err := store.CompileExactIndex(definition.Definition); err != nil {
+		return fmt.Errorf("vibedb: CREATE INDEX: %w", err)
+	}
+	return nil
+}
+
+// indexDefinitionMethod reports the catalog access-method spelling for a
+// lowered CREATE INDEX: "tin" for full-text declarations, "" for exact.
+func indexDefinitionMethod(definition query.IndexDefinition) string {
+	if definition.Definition.Kind == store.IndexTin {
+		return indexMethodTin
+	}
+	return ""
+}
+
+// compileReplicatedLocalIndex validates one local index definition for a
+// replicated schema image, preserving its access method: exact definitions
+// compile as exact, USING tin definitions compile as tin. Every replicated
+// path must route through here; compiling by family keeps a tin declaration
+// from failing closed as "not an exact index" or, worse, materializing as
+// exact on a replica while the primary answers full text.
+func compileReplicatedLocalIndex(definition store.IndexDefinition) (indexMeta, error) {
+	if definition.Kind == store.IndexTin {
+		if _, err := store.CompileTinDefinition(definition); err != nil {
+			return indexMeta{}, err
+		}
+		return indexMeta{
+			Name:   definition.Name,
+			Paths:  append([]string(nil), definition.Paths...),
+			Method: indexMethodTin,
+		}, nil
+	}
+	compiled, err := store.CompileExactIndex(definition)
+	if err != nil {
+		return indexMeta{}, err
+	}
+	return indexMeta{
+		Name: definition.Name, Paths: compiled.Specs[:compiled.N],
+	}, nil
+}
+
 // createIndexContext keeps the catalog mutex only around validation and the
 // final metadata publication. A materialized table delegates the expensive
 // scan to durable.Collection.CreateIndexContext, whose optimistic leaf
@@ -533,9 +586,9 @@ func (d *database) createIndexContext(
 		d.mu.Unlock()
 		return nil, err
 	}
-	if _, err := store.CompileExactIndex(definition.Definition); err != nil {
+	if err := validateIndexDefinition(definition); err != nil {
 		d.mu.Unlock()
-		return nil, fmt.Errorf("vibedb: CREATE INDEX: %w", err)
+		return nil, err
 	}
 	t, exists := d.tables[definition.Table]
 	if !exists {
@@ -787,8 +840,8 @@ func (d *database) createIndexLockedContext(
 	if err != nil {
 		return nil, err
 	}
-	if _, err := store.CompileExactIndex(definition.Definition); err != nil {
-		return nil, fmt.Errorf("vibedb: CREATE INDEX: %w", err)
+	if err := validateIndexDefinition(definition); err != nil {
+		return nil, err
 	}
 	t, exists := d.tables[definition.Table]
 	if !exists {
@@ -820,6 +873,7 @@ func (d *database) createIndexLockedContext(
 		Name:   definition.Definition.Name,
 		Paths:  append([]string(nil), definition.Definition.Paths...),
 		Unique: definition.Unique,
+		Method: indexDefinitionMethod(definition),
 	})
 	candidateMeta := *t.meta
 	candidateMeta.Indexes = proposed

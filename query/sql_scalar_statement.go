@@ -7,6 +7,7 @@ import (
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/pginput"
+	"github.com/thesyncim/vibedb/internal/tin"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
@@ -65,6 +66,12 @@ const (
 	statementScalarCaseNode
 	statementScalarConditionalNode
 	statementScalarBooleanNode
+	// statementScalarScore is SQL's SCORE(): the BM25 relevance of the row
+	// against the statement's single ==> query. dependency names the hidden
+	// result column carrying the match path's text; the slot lives once on
+	// the program (scoreSlot), since SCORE() binds exactly one ==> node.
+	// Appended last so existing node numbering never shifts.
+	statementScalarScore
 )
 
 type statementScalarNode struct {
@@ -134,9 +141,18 @@ type statementScalarOrdered struct {
 	having        *havingProgram
 	rows          []statementScalarOrderRow
 	scratch       []statementScalarOrderRow
+	heap          []scalarOrderEntry
 	values        []scalar
 	arena         []byte
 	cells         []Cell
+}
+
+// scalarOrderEntry pairs a sort row with its pre-sort sequence so a
+// bounded heap reproduces the stable sort's order exactly: keys first,
+// original position on ties.
+type scalarOrderEntry struct {
+	row statementScalarOrderRow
+	seq int
 }
 
 // statementScalar is the cold prepared sidecar. It owns both the postorder
@@ -164,6 +180,27 @@ type statementScalar struct {
 	cardinality        bool
 	groupedCardinality bool
 	hasAggregate       bool
+	// scoreSlot is the ==> slot every SCORE() node evaluates against, or -1
+	// when the statement uses no SCORE(). The query package's post-compile
+	// score pass sets it once SCORE()'s exactly-one-==> rule is proven;
+	// like the plan, it names where per-execution values live but never
+	// holds them, so the prepared program stays shareable.
+	scoreSlot int
+	// scoreQuery and scoreStats are the execution's bound ==> query and its
+	// BM25 statistics, borrowed read-only from the executing Workspace for
+	// the synchronous execution (the same aliasing discipline as
+	// evalScratch.matchQueries: no appends happen between bindScore and the
+	// last row, so the backing array cannot move). scoreScratch is this
+	// execution's serial transient scratch, reused across rows so warm
+	// scoring allocates nothing.
+	scoreQuery   *tin.Query
+	scoreStats   *tin.ScoreStats
+	scoreScratch tin.TextScratch
+	// tinTopKPlan is the plan an index-driven top-K restriction was
+	// decided for, or nil. executeOrdered skips key evaluation and the
+	// sort only when the executing Workspace names this same plan,
+	// so a restriction can never skip work for a foreign plan.
+	tinTopKPlan *plan
 }
 
 func (s *Statement) scalarStatement() *statementScalar {
@@ -268,6 +305,9 @@ func (s *Statement) prepareScalar(preserveUnknownOutput bool) error {
 			"computed scalar WHERE expressions must run before grouping and cannot yet share a grouped statement")
 	}
 	runtime := new(statementScalar)
+	// Slot zero is a bound ==> node, so SCORE()'s slot starts unbound; the
+	// post-compile score pass resolves it or fails the prepare.
+	runtime.scoreSlot = -1
 	if err := runtime.compileWhere(s, s.tree.Where); err != nil {
 		return err
 	}
@@ -640,6 +680,13 @@ func (r *statementScalar) compileExpr(s *Statement, expr *sqlast.ScalarExpr) (in
 		})
 	case sqlast.ScalarCase:
 		return r.compileCase(s, expr)
+	case sqlast.ScalarScore:
+		// The ==> slot and the hidden text column resolve after ==> slots
+		// are numbered; until the score pass runs, dependency stays -1 so
+		// any evaluation before binding fails closed in evalNodes.
+		r.nodes = append(r.nodes, statementScalarNode{
+			kind: statementScalarScore, dependency: -1, left: -1, right: -1, pos: expr.Pos,
+		})
 	default:
 		return 0, fmt.Errorf("query: invalid scalar expression kind %d", expr.Kind)
 	}
@@ -976,6 +1023,8 @@ func (r *statementScalar) nodeType(root int32) ValueType {
 			return TypeBool
 		}
 		return r.conditionals[node.conditionalIndex].domain.schemaType()
+	case statementScalarScore:
+		return TypeNumber
 	default:
 		return TypeAny
 	}
@@ -1024,6 +1073,8 @@ func (r *statementScalar) nodeRepresentation(root int32) OutputRepresentation {
 			return OutputSQLBool
 		}
 		return r.conditionals[node.conditionalIndex].domain.representation()
+	case statementScalarScore:
+		return OutputSQLNumber
 	default:
 		return OutputJSON
 	}
@@ -1056,6 +1107,12 @@ func (r *statementScalar) evalNodes(
 			cell := result.Columns[node.dependency].Cells[row]
 			value = statementScalarValue{cell: cell, direct: true}
 			value.value = scalarFromResultCell(cell, arena)
+		case statementScalarScore:
+			var err error
+			value, err = r.evalScore(result, row, node, arena)
+			if err != nil {
+				return err
+			}
 		case statementScalarLiteral:
 			value.value = node.bound
 		case statementScalarNull:
@@ -1458,6 +1515,13 @@ func (r *statementScalar) execute(
 	if shapeErr := r.validateResult(result); shapeErr != nil {
 		return Cursor{}, shapeErr
 	}
+	// Borrow this execution's ==> query and statistics for SCORE(). The core
+	// scan bound its match slots before the scalar stage runs; statements
+	// without SCORE() skip the refresh entirely.
+	if err := r.bindScore(&exec.Workspace); err != nil {
+		result.abortResult()
+		return Cursor{}, err
+	}
 	inputBytes := result.resultBytesUsed
 	scratchBytes := scalarExecutionScratchBytes(len(r.nodes), len(r.outputs))
 	if err := frame.intermediate.reserve("scalar dependency result", inputBytes); err != nil {
@@ -1651,6 +1715,14 @@ func (r *statementScalar) executeOrdered(
 	ordered.arena = ordered.arena[:0]
 	orderCharge := int64(0)
 	defer func() { frame.intermediate.release(orderCharge) }()
+	// Ranked input arrives in exactly the sort's order (score direction
+	// with scan-order ties, the full sort's prefix contract), so key
+	// evaluation and the sort itself are skipped: rows keep input order
+	// into the unchanged OFFSET/LIMIT slice. The plan-pointer match
+	// proves this execution's scan was restricted for this statement's
+	// own plan; any foreign or unrestricted scan sorts normally.
+	ranked := r.tinTopKPlan != nil && exec.Workspace.tinTopKUsed &&
+		exec.Workspace.tinTopKPlan == r.tinTopKPlan
 
 	perRow := saturatedBytes(
 		int64(unsafe.Sizeof(statementScalarOrderRow{})),
@@ -1704,27 +1776,29 @@ func (r *statementScalar) executeOrdered(
 		}
 		orderCharge = saturatedBytes(orderCharge, perRow)
 		keyBase := len(ordered.values)
-		for key := range ordered.order {
-			term := &ordered.order[key]
-			r.evalArena = r.evalArena[:0]
-			temporaryCharge := int64(0)
-			if err := r.evalNodes(
-				result, row, int(term.start), int(term.end), &r.evalArena,
-				&exec.Workspace.aggregateBudget, &frame.intermediate, &temporaryCharge,
-				options.Cancel,
-			); err != nil {
+		if !ranked {
+			for key := range ordered.order {
+				term := &ordered.order[key]
+				r.evalArena = r.evalArena[:0]
+				temporaryCharge := int64(0)
+				if err := r.evalNodes(
+					result, row, int(term.start), int(term.end), &r.evalArena,
+					&exec.Workspace.aggregateBudget, &frame.intermediate, &temporaryCharge,
+					options.Cancel,
+				); err != nil {
+					frame.intermediate.release(temporaryCharge)
+					return Cursor{}, err
+				}
+				value := r.values[term.root].value
+				ownedBytes := scalarOwnedBytes(value)
+				if err := frame.intermediate.reserve("scalar ORDER BY values", ownedBytes); err != nil {
+					frame.intermediate.release(temporaryCharge)
+					return Cursor{}, err
+				}
+				orderCharge = saturatedBytes(orderCharge, ownedBytes)
+				ordered.values = append(ordered.values, ownScalar(value, &ordered.arena))
 				frame.intermediate.release(temporaryCharge)
-				return Cursor{}, err
 			}
-			value := r.values[term.root].value
-			ownedBytes := scalarOwnedBytes(value)
-			if err := frame.intermediate.reserve("scalar ORDER BY values", ownedBytes); err != nil {
-				frame.intermediate.release(temporaryCharge)
-				return Cursor{}, err
-			}
-			orderCharge = saturatedBytes(orderCharge, ownedBytes)
-			ordered.values = append(ordered.values, ownScalar(value, &ordered.arena))
-			frame.intermediate.release(temporaryCharge)
 		}
 		ordered.rows = append(ordered.rows, statementScalarOrderRow{
 			input: row, keyBase: keyBase,
@@ -1734,18 +1808,39 @@ func (r *statementScalar) executeOrdered(
 	if err := cancellationCheckpoint(options.Cancel, len(ordered.rows)); err != nil {
 		return Cursor{}, err
 	}
-	if len(ordered.order) != 0 {
-		sortScratchBytes := saturatedProduct(
-			int64(len(ordered.rows)), int64(unsafe.Sizeof(statementScalarOrderRow{})),
-		)
-		if err := frame.intermediate.reserve("scalar ORDER BY sort workspace", sortScratchBytes); err != nil {
-			return Cursor{}, err
+	if len(ordered.order) != 0 && !ranked {
+		// OFFSET+LIMIT bounds the survivors the output reads, so a
+		// bounded selection replaces the full sort whenever it covers
+		// fewer rows. Stability carries over exactly (sequence
+		// tiebreak), and downstream slices rows[first:last] unchanged.
+		k := 0
+		if s.hasLimit {
+			if k = s.offset + s.limit; k < 0 || k >= len(ordered.rows) {
+				k = 0
+			}
 		}
-		if err := ordered.sort(options.Cancel); err != nil {
+		if k > 0 {
+			heapBytes := saturatedProduct(int64(k), int64(unsafe.Sizeof(scalarOrderEntry{})))
+			if err := frame.intermediate.reserve("scalar ORDER BY top-K heap", heapBytes); err != nil {
+				return Cursor{}, err
+			}
+			orderCharge = saturatedBytes(orderCharge, heapBytes)
+			if err := ordered.topK(options.Cancel, k); err != nil {
+				return Cursor{}, err
+			}
+		} else {
+			sortScratchBytes := saturatedProduct(
+				int64(len(ordered.rows)), int64(unsafe.Sizeof(statementScalarOrderRow{})),
+			)
+			if err := frame.intermediate.reserve("scalar ORDER BY sort workspace", sortScratchBytes); err != nil {
+				return Cursor{}, err
+			}
+			if err := ordered.sort(options.Cancel); err != nil {
+				frame.intermediate.release(sortScratchBytes)
+				return Cursor{}, err
+			}
 			frame.intermediate.release(sortScratchBytes)
-			return Cursor{}, err
 		}
-		frame.intermediate.release(sortScratchBytes)
 	}
 	if err := cancellationCheckpoint(options.Cancel, len(ordered.rows)+1); err != nil {
 		return Cursor{}, err
@@ -1995,6 +2090,78 @@ func (o *statementScalarOrdered) sort(cancel *CancelFlag) error {
 		}
 	}
 	return nil
+}
+
+// orderLess is the stable sort's total order: keys first, original
+// position on ties (positions are unique, so the order is total).
+func (o *statementScalarOrdered) orderLess(a, b scalarOrderEntry) bool {
+	if c := o.compare(a.row, b.row); c != 0 {
+		return c < 0
+	}
+	return a.seq < b.seq
+}
+
+// topK leaves the k best rows ordered in o.rows[:k]: a worst-first heap
+// over (keys, sequence) selects them at O(n log k) comparisons, then
+// heapsort orders the winners. The result equals the stable sort's
+// length-k prefix exactly. Requires 0 < k < len(o.rows); the heap
+// staging persists for reuse like the sort scratch.
+func (o *statementScalarOrdered) topK(cancel *CancelFlag, k int) error {
+	h := o.heap[:0]
+	for i, row := range o.rows {
+		if err := cancellationCheckpoint(cancel, i); err != nil {
+			return err
+		}
+		e := scalarOrderEntry{row: row, seq: i}
+		if len(h) < k {
+			h = append(h, e)
+			up := len(h) - 1
+			for up > 0 {
+				parent := (up - 1) / 2
+				if !o.orderLess(h[parent], h[up]) {
+					break
+				}
+				h[up], h[parent] = h[parent], h[up]
+				up = parent
+			}
+			continue
+		}
+		if o.orderLess(e, h[0]) {
+			h[0] = e
+			o.siftDown(h, 0)
+		}
+	}
+	o.heap = h
+	for end := len(h) - 1; end > 0; end-- {
+		if err := cancellationCheckpoint(cancel, end); err != nil {
+			return err
+		}
+		h[0], h[end] = h[end], h[0]
+		o.siftDown(h[:end], 0)
+	}
+	for i, e := range h {
+		o.rows[i] = e.row
+	}
+	return nil
+}
+
+// siftDown restores the worst-first heap below down.
+func (o *statementScalarOrdered) siftDown(h []scalarOrderEntry, down int) {
+	for {
+		left := 2*down + 1
+		if left >= len(h) {
+			break
+		}
+		worst := left
+		if right := left + 1; right < len(h) && o.orderLess(h[left], h[right]) {
+			worst = right
+		}
+		if !o.orderLess(h[down], h[worst]) {
+			break
+		}
+		h[down], h[worst] = h[worst], h[down]
+		down = worst
+	}
 }
 
 func scalarOwnedBytes(value scalar) int64 {

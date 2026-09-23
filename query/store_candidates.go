@@ -19,7 +19,9 @@ func (p *plan) storeCandidateMasksMode(snapshot store.Snapshot, w *Workspace, re
 	// A heap Snapshot can materialize its live-row universe, so it is its own
 	// live-mask source. The capability is stated here, where the type is concrete
 	// and the compiler checks it, rather than discovered by assertion inside the
-	// generic planner; see sourceCaps.
+	// generic planner; see sourceCaps. The Snapshot travels by value: it is
+	// two words, and copying it into the concrete caps field allocates
+	// nothing, unlike boxing it into an interface.
 	return snapshotCandidateMasks(
-		p, snapshot, sourceCaps{live: snapshot}, w, requireExact)
+		p, snapshot, sourceCaps{live: snapshot, hasLive: true}, w, requireExact)
 }

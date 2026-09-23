@@ -151,3 +151,47 @@ func TestReplicatedChildBundleAllocatorRejectsAliasingAndSchemaDrift(t *testing.
 		t.Fatal("schema generation drift accepted")
 	}
 }
+
+// A USING tin declaration replays through the child-schema path with its
+// method intact: the digest binds name, paths, AND method, so a replica
+// that rematerialized the declaration as exact would fail authentication
+// instead of answering different results from the primary.
+func TestReplicatedChildSchemaReplaysTinIndex(t *testing.T) {
+	newTinIdentity := func(t *testing.T, digest [32]byte) ReplicatedShardStoreIdentity {
+		t.Helper()
+		binding := testReplicatedBinding(61)
+		identity, err := NewReplicatedChildShardStoreIdentity(ShardStoreIdentity{
+			Distribution: distribution.DistributionName(binding.Distribution), Shard: distribution.ShardID(binding.Shard),
+			AllocationGeneration: distribution.ShardAllocationGeneration(binding.AllocationGeneration), LogID: [16]byte{71},
+		}, binding, "docs", strings.Repeat("a1", 32), "/id", ReplicatedShardStoreLimits{
+			MaxKeyBytes: 256, MaxDocumentBytes: 4 << 20, MaxBatchDocuments: 64, MaxBatchBytes: replicatedMaxBatchBytes,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		identity.Relations[0].LocalIndexDigest = digest
+		identity.RelationManifestDigest = replicatedRelationManifestDigest(identity)
+		if err := validateReplicatedShardStoreIdentity(identity); err != nil {
+			t.Fatal(err)
+		}
+		return identity
+	}
+	tinMeta := indexMeta{Name: "body_tin", Paths: []string{"/body"}, Method: indexMethodTin}
+	source := newTinIdentity(t, replicatedLocalIndexDigest([]indexMeta{tinMeta}))
+	statements := []string{"CREATE INDEX body_tin ON docs (body) USING tin"}
+	if err := ValidateReplicatedChildSchema(source, "CREATE TABLE docs (PRIMARY KEY (id))", statements, nil); err != nil {
+		t.Fatalf("tin replay rejected: %v", err)
+	}
+	// The same SQL against an exact-method digest fails: the method bit
+	// participates in authentication, so method confusion cannot slip
+	// through as a matching image.
+	exact := newTinIdentity(t, replicatedLocalIndexDigest([]indexMeta{{Name: "body_tin", Paths: []string{"/body"}}}))
+	if err := ValidateReplicatedChildSchema(exact, "CREATE TABLE docs (PRIMARY KEY (id))", statements, nil); err == nil {
+		t.Fatal("tin SQL accepted against an exact-method digest")
+	}
+	// Malformed tin (two paths) fails closed instead of truncating to one.
+	twoPaths := []string{"CREATE INDEX bad_tin ON docs (a, b) USING tin"}
+	if err := ValidateReplicatedChildSchema(source, "CREATE TABLE docs (PRIMARY KEY (id))", twoPaths, nil); err == nil {
+		t.Fatal("two-path USING tin replay accepted")
+	}
+}

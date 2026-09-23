@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/storekey"
+	"github.com/thesyncim/vibedb/internal/tin"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
 )
@@ -145,6 +146,13 @@ type Collection struct {
 	indexes      map[string]*storeIndexBuild
 	indexVisit   uint32
 	exactAliases uint32
+	// tinDefs records full-text index definitions by name; tinCache pins
+	// built tin indexes per snapshot State (see store_index_tin.go).
+	tinDefs  map[string]tinDefinition
+	tinCache map[*State]map[string]*tin.Index
+	// tinSegCache pins segmented tin builds per State, keyed by index
+	// name and segment count.
+	tinSegCache map[*State]map[tinSegKey][]*tin.Index
 }
 
 // WithBulkSnapshot runs fn with c's current State (materializing an
@@ -935,7 +943,7 @@ func (c *Collection) noteChunkPostingsLocked(id uint32, old, next *Chunk) {
 // Collection satisfies the same [Mutable] shape as durable.Collection, whose
 // Snapshot can fail on I/O.
 func (c *Collection) Snapshot() (Snapshot, error) {
-	return Snapshot{state: c.state.Load()}, nil
+	return Snapshot{state: c.state.Load(), coll: c}, nil
 }
 
 // Len returns the number of keys in the current snapshot.
@@ -985,6 +993,12 @@ func (c *Collection) StateMetrics() StateMetrics {
 // allocation; Get may populate an equivalent memoized shape-tape widening.
 type Snapshot struct {
 	state *State
+	// coll is the collection the snapshot was taken from, retained so
+	// execution can resolve that collection's index catalog (tin definitions
+	// live on the collection, not the state). It is never dereferenced for
+	// document data: the pinned state stays the only read path, so a snapshot
+	// remains valid while later writes publish new views.
+	coll *Collection
 }
 
 // Chunks reports the snapshot's live chunk count, the unit the query work

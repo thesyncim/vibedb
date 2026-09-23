@@ -32,6 +32,9 @@ type IndexDefinition struct {
 	// Durable collections validate existing rows before publication, persist
 	// this bit, and enforce it on later point, batch, bulk, and replay writes.
 	Unique bool
+	// Kind selects the index family: zero (IndexExact) or IndexTin. Tin
+	// requires exactly one path and refuses Unique.
+	Kind IndexKind
 }
 
 var (
@@ -96,6 +99,18 @@ type Mask struct {
 func CompileExactIndex(def IndexDefinition) (*ExactIndex, error) {
 	if def.Name == "" {
 		return nil, fmt.Errorf("%w: name is empty", ErrIndexDefinition)
+	}
+	// A tin definition must never compile as exact: the posting families
+	// are unrelated, and an exact probe over tin content (or a tin query
+	// over exact postings) is silent corruption, not a fallback. Heap
+	// collections route Kind==IndexTin to the tin sidecar before reaching
+	// here; durable collections refuse tin definitions outright, so this
+	// choke rejects any path that dropped or ignored the Kind.
+	if def.Kind == IndexTin {
+		return nil, fmt.Errorf(
+			"%w: %q names USING tin, which is not an exact index",
+			ErrIndexDefinition, def.Name,
+		)
 	}
 	if len(def.Paths) == 0 || len(def.Paths) > MaxIndexColumns {
 		return nil, fmt.Errorf("%w: path count must be in [1,%d]", ErrIndexDefinition, MaxIndexColumns)

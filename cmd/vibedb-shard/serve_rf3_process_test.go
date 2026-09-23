@@ -717,38 +717,50 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		}
 		// The target has reopened since its preplanned bootstrap incarnation.
 		// An authenticated fenced probe reports its current identity without
-		// granting data service to this still-RF4 member.
-		targetProbe := rf3CommandRoundTrip(t, target.NativeAddress, targetNode, clientProfile,
-			&shardservice.ReplicatedRequest{
-				Operation: shardservice.ReplicatedProbe, Authority: authorityIdentity,
-				Capability: serviceauthz.CapabilityTopology,
-				Fence: shardservice.ReplicatedFence{Group: group,
-					AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration,
-					Command:              leaderState.Fence.Command},
-			})
-		if targetProbe.Kind != shardservice.ReplicatedHandshake || !targetProbe.HasState ||
-			targetProbe.State.Fence.Group != group || targetProbe.State.Fence.MemberID != target.MemberID ||
-			targetProbe.State.Fence.StoreID != targetStore || targetProbe.State.Fence.NodeIncarnation <= targetIncarnation ||
-			targetProbe.State.Fence.Command != leaderState.Fence.Command ||
-			targetProbe.State.LeaderID != leaderState.LeaderID || targetProbe.State.Fence.Term != leaderState.Fence.Term {
-			t.Fatalf("target identity observation: %+v", targetProbe)
+		// granting data service to this still-RF4 member. The transfer
+		// converges asynchronously: a loaded runner can serve the probe
+		// before the new leader's identity settles (stale LeaderID or
+		// Term), so each exact observation is awaited like every other
+		// convergence in this file instead of asserted on the first
+		// response.
+		probeRequest := &shardservice.ReplicatedRequest{
+			Operation: shardservice.ReplicatedProbe, Authority: authorityIdentity,
+			Capability: serviceauthz.CapabilityTopology,
+			Fence: shardservice.ReplicatedFence{Group: group,
+				AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration,
+				Command:              leaderState.Fence.Command},
 		}
-		identityProbe := targetProbe
-		if leaderNode != targetNode {
-			identityProbe = rf3CommandRoundTrip(t, leaderAddress, leaderNode, clientProfile,
-				&shardservice.ReplicatedRequest{
-					Operation: shardservice.ReplicatedProbe, Authority: authorityIdentity,
-					Capability: serviceauthz.CapabilityTopology,
-					Fence: shardservice.ReplicatedFence{Group: group,
-						AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration,
-						Command:              leaderState.Fence.Command},
-				})
-			if identityProbe.Kind != shardservice.ReplicatedHandshake || !identityProbe.HasState ||
-				identityProbe.State.Fence.MemberID != leaderState.LeaderID ||
-				identityProbe.State.LeaderID != leaderState.LeaderID ||
-				identityProbe.State.Fence.Term != leaderState.Fence.Term {
-				t.Fatalf("new-leader identity observation: %+v", identityProbe)
+		awaitProbe := func(name, address string, node rafttransport.NodeID,
+			matches func(*shardservice.ReplicatedResponse) bool,
+		) *shardservice.ReplicatedResponse {
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				probe := rf3CommandRoundTrip(t, address, node, clientProfile, probeRequest)
+				if matches(probe) {
+					return probe
+				}
+				if !time.Now().Before(deadline) {
+					t.Fatalf("%s identity observation: %+v", name, probe)
+				}
+				time.Sleep(10 * time.Millisecond)
 			}
+		}
+		identityProbe := awaitProbe("target", target.NativeAddress, targetNode,
+			func(probe *shardservice.ReplicatedResponse) bool {
+				return probe.Kind == shardservice.ReplicatedHandshake && probe.HasState &&
+					probe.State.Fence.Group == group && probe.State.Fence.MemberID == target.MemberID &&
+					probe.State.Fence.StoreID == targetStore && probe.State.Fence.NodeIncarnation > targetIncarnation &&
+					probe.State.Fence.Command == leaderState.Fence.Command &&
+					probe.State.LeaderID == leaderState.LeaderID && probe.State.Fence.Term == leaderState.Fence.Term
+			})
+		if leaderNode != targetNode {
+			identityProbe = awaitProbe("new-leader", leaderAddress, leaderNode,
+				func(probe *shardservice.ReplicatedResponse) bool {
+					return probe.Kind == shardservice.ReplicatedHandshake && probe.HasState &&
+						probe.State.Fence.Group == group && probe.State.Fence.MemberID == leaderState.LeaderID &&
+						probe.State.Fence.Command == leaderState.Fence.Command &&
+						probe.State.LeaderID == leaderState.LeaderID && probe.State.Fence.Term == leaderState.Fence.Term
+				})
 		}
 		response := rf3CommandRoundTrip(t, leaderAddress, leaderNode, clientProfile,
 			&shardservice.ReplicatedRequest{

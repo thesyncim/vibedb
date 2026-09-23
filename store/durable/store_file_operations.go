@@ -338,6 +338,23 @@ func (c *Collection) pinSnapshot() (*Snapshot, error) {
 	return snapshot, nil
 }
 
+// snapshotIndexDefinitions returns the exact aliases plus the declared tin
+// definitions in canonical order. The caller must hold snapshotGate: the
+// online index path replaces both lists under it. Without tin the shared
+// exact slice is returned directly; with tin a fresh concatenation is
+// built so the exact prefix keeps its identity for exact-only readers.
+func (c *Collection) snapshotIndexDefinitions() []store.IndexDefinition {
+	if len(c.options.tinIndexes) == 0 {
+		return c.options.Indexes
+	}
+	out := make(
+		[]store.IndexDefinition,
+		0, len(c.options.Indexes)+len(c.options.tinIndexes),
+	)
+	out = append(out, c.options.Indexes...)
+	return append(out, c.options.tinIndexes...)
+}
+
 func (c *Collection) pinSnapshotInto(snapshot *Snapshot) error {
 	c.snapshotGate.RLock()
 	state, stateErr := c.readerFileState()
@@ -352,7 +369,7 @@ func (c *Collection) pinSnapshotInto(snapshot *Snapshot) error {
 	primaryRouter := c.primaryRouter.Load()
 	indexes := c.options.indexes
 	indexNameIDs := c.options.indexNameIDs
-	indexDefinitions := c.options.Indexes
+	indexDefinitions := c.snapshotIndexDefinitions()
 	lease, err := c.leases.Acquire(state.root.Generation)
 	c.snapshotGate.RUnlock()
 	if err != nil {

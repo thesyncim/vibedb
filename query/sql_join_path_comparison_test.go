@@ -287,8 +287,32 @@ func TestLegacySQLJoinLayoutAndWarmAllocationGates(t *testing.T) {
 		// (perf/commit-garbage): joinBinding.file.docs is a batch Segment,
 		// so the binding shrinks with it. Layout of query-owned fields is
 		// unchanged — lits offset below still pins that.
-		if got := unsafe.Sizeof(joinBinding{}); got != 3520 {
-			t.Fatalf("joinBinding size = %d, want unchanged 3520", got)
+		// 3520 before ==> bindings: the binding's inner scan Workspace
+		// carries one parsed-query slice and its evaluator one parsed-query
+		// alias plus one scratch slice (24 + 48 bytes incl. alignment).
+		// 3600 before ==> pruning: the Workspace gains the parallel
+		// build-pointer slice plus the DocID enumeration scratch (48
+		// bytes), both nil until an ==> node binds.
+		// 3648 before durable ==> pruning: the Workspace gains the
+		// durable build-pointer slice, the live primary router, and the
+		// ordinal-to-slot hit scratch (24 + 8 + 24 bytes), all nil until
+		// an ==> node binds against a durable database.
+		// 3704 before SCORE(): the Workspace gains the per-execution BM25
+		// statistics slice (24 bytes), refreshed only when the statement
+		// scores, so statements without SCORE() pay nothing per row.
+		// 3728 before index-driven top-K: the Workspace gains the Score
+		// ranking scratch slice plus the restriction-engaged flag (24 + 8
+		// bytes incl. alignment), both nil/false until an ORDER BY
+		// SCORE() ... LIMIT statement restricts its scan.
+		// 3760 before verdict/sort skipping: the Workspace gains the
+		// restricting plan pointer (8 bytes), matched by the sort-skip
+		// reader so foreign plans never skip.
+		// 3768 before segmented ==> search: the Workspace gains the
+		// per-slot segment shard slice plus the raw pattern slice
+		// (24 + 24 bytes), both nil until an ==> node binds a
+		// fan-out-sized heap snapshot.
+		if got := unsafe.Sizeof(joinBinding{}); got != 3816 {
+			t.Fatalf("joinBinding size = %d, want unchanged 3816", got)
 		}
 		if got := unsafe.Offsetof(joinBinding{}.lits); got != 8 {
 			t.Fatalf("joinBinding.lits offset = %d, want unchanged 8", got)
@@ -314,8 +338,14 @@ func TestLegacySQLJoinLayoutAndWarmAllocationGates(t *testing.T) {
 		// (no 32-bit runner here; the 64-bit pin above is measured and CI
 		// covers 386). All fields after docs are 4-aligned slices and ints
 		// on 32-bit, so the tail only shifts by the delta, never repacks.
-		if got := unsafe.Sizeof(joinBinding{}); got != 1876 {
-			t.Fatalf("joinBinding size = %d, want unchanged 1876", got)
+		// 1876 before index-driven top-K: the Workspace gains a 12-byte
+		// Score ranking scratch slice plus a bool flag padded to 4 (16
+		// bytes), shifting the tail by the delta exactly like the 64-bit
+		// pin above.
+		// 1892 before verdict/sort skipping: the Workspace gains a 4-byte
+		// restricting plan pointer.
+		if got := unsafe.Sizeof(joinBinding{}); got != 1896 {
+			t.Fatalf("joinBinding size = %d, want unchanged 1896", got)
 		}
 		if got := unsafe.Offsetof(joinBinding{}.lits); got != 4 {
 			t.Fatalf("joinBinding.lits offset = %d, want unchanged 4", got)

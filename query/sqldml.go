@@ -1714,5 +1714,11 @@ func (d *DMLStatement) LowerIndex() (IndexDefinition, error) {
 		name = prefix + hex.EncodeToString(hash.Sum(nil))
 	}
 	out.Definition = store.IndexDefinition{Name: name, Paths: paths, Unique: stmt.Unique}
+	if stmt.Method == "tin" {
+		if stmt.Unique {
+			return IndexDefinition{}, fmt.Errorf("query: USING tin does not support UNIQUE")
+		}
+		out.Definition.Kind = store.IndexTin
+	}
 	return out, nil
 }

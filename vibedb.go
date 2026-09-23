@@ -925,6 +925,98 @@ func (c *Collection) CreateIndex(name string, paths ...string) error {
 	return facadeError(err)
 }
 
+// TinHit is one ranked full-text hit: the document key and its BM25 score.
+// Hits arrive in index order: descending score, ties by document identity.
+type TinHit struct {
+	Key   string
+	Score float64
+}
+
+// CreateTinIndex builds and publishes one full-text index over exactly one
+// text path, for use with TinSearch. It mirrors CreateIndex across both
+// backends: the heap sidecar and the durable declaration both build content
+// lazily, and the facade warms the heap build so the first search never
+// pays for it.
+func (c *Collection) CreateTinIndex(name, path string) error {
+	if err := c.admissionError(); err != nil {
+		return err
+	}
+	definition := store.IndexDefinition{
+		Name: name, Paths: []string{path}, Kind: store.IndexTin,
+	}
+	if _, err := store.CompileTinDefinition(definition); err != nil {
+		return err
+	}
+	c.indexMu.Lock()
+	defer c.indexMu.Unlock()
+	memory, disk, err := c.backend(true)
+	if err != nil {
+		return err
+	}
+	if memory != nil {
+		if _, err := memory.CreateIndex(definition); err != nil {
+			return facadeError(err)
+		}
+		if _, err := memory.BackfillIndex(name, 0); err != nil {
+			// Same one-shot contract as CreateIndex: roll the unpublished
+			// facade operation back so the name stays reusable.
+			return facadeError(errors.Join(err, memory.DropIndex(name)))
+		}
+		return nil
+	}
+	_, err = disk.CreateIndex(definition)
+	return facadeError(err)
+}
+
+// TinSearch resolves the tin index covering path in the collection's
+// current generation, parses tinql against it, and returns up to topK hits
+// by BM25 score. A missing index reports store.ErrIndexNotFound and an
+// invalid query reports its TINQL parse error; topK <= 0 returns no hits.
+func (c *Collection) TinSearch(path, tinql string, topK int) ([]TinHit, error) {
+	if err := c.admissionError(); err != nil {
+		return nil, err
+	}
+	if topK <= 0 {
+		return nil, nil
+	}
+	memory, disk, err := c.backend(false)
+	if err != nil {
+		return nil, err
+	}
+	if memory != nil {
+		snapshot, err := memory.Snapshot()
+		if err != nil {
+			return nil, facadeError(err)
+		}
+		hits, err := memory.TinSearch(snapshot, path, tinql, topK)
+		if err != nil {
+			return nil, facadeError(err)
+		}
+		out := make([]TinHit, 0, len(hits))
+		for _, hit := range hits {
+			out = append(out, TinHit{Key: hit.Key, Score: hit.Score})
+		}
+		return out, nil
+	}
+	if disk == nil {
+		return nil, store.ErrIndexNotFound
+	}
+	snapshot, err := disk.Snapshot()
+	if err != nil {
+		return nil, facadeError(err)
+	}
+	defer func() { _ = snapshot.Close() }()
+	hits, err := disk.TinSearch(snapshot, path, tinql, topK)
+	if err != nil {
+		return nil, facadeError(err)
+	}
+	out := make([]TinHit, 0, len(hits))
+	for _, hit := range hits {
+		out = append(out, TinHit{Key: hit.Key, Score: hit.Score})
+	}
+	return out, nil
+}
+
 // Flush makes this collection's current visible generation crash-safe. It is
 // a no-op for Memory and for a lazy collection that has not been created.
 func (c *Collection) Flush() error {

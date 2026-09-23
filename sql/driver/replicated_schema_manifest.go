@@ -53,11 +53,11 @@ func replicatedSchemaManifestValidated(identity ReplicatedShardStoreIdentity,
 	}
 	meta := make([]indexMeta, len(indexes))
 	for i, index := range indexes {
-		compiled, err := store.CompileExactIndex(index)
+		compiled, err := compileReplicatedLocalIndex(index)
 		if err != nil {
 			return [32]byte{}, err
 		}
-		meta[i] = indexMeta{Name: index.Name, Paths: compiled.Specs[:compiled.N]}
+		meta[i] = compiled
 	}
 	if replicatedLocalIndexDigest(meta) != identity.Relations[0].LocalIndexDigest {
 		return [32]byte{}, ErrReplicatedShardStoreIdentityMismatch

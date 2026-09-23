@@ -13,7 +13,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/schemachange"
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
-	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
@@ -306,18 +305,19 @@ func lowerReplicatedSchemaDDL(target *catalogFile, statement *query.DMLStatement
 		if definition.Table != name {
 			return false, false, ErrTableNotFound
 		}
-		if _, err := store.CompileExactIndex(definition.Definition); err != nil {
+		index, err := compileReplicatedLocalIndex(definition.Definition)
+		if err != nil {
 			return false, false, err
 		}
 		for _, existing := range meta.Indexes {
-			if existing.Name == definition.Definition.Name {
+			if existing.Name == index.Name {
 				if definition.IfNotExists {
 					return false, true, nil
 				}
 				return false, false, ErrIndexExists
 			}
 		}
-		meta.Indexes = append(meta.Indexes, indexMeta{Name: definition.Definition.Name, Paths: definition.Definition.Paths})
+		meta.Indexes = append(meta.Indexes, index)
 	case sqlast.KindDropIndex:
 		if tree.DropIndex.HasTable && tree.DropIndex.Table != name {
 			return false, false, ErrTableNotFound

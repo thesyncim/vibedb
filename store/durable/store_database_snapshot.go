@@ -785,7 +785,7 @@ func (c *Collection) snapshotGateHeldFreshInto(snapshot *Snapshot) error {
 	// snapshotGate, so a database-wide capture cannot read either later.
 	indexes := c.options.indexes
 	indexNameIDs := c.options.indexNameIDs
-	indexDefinitions := c.options.Indexes
+	indexDefinitions := c.snapshotIndexDefinitions()
 	epoch := c.primaryEpoch
 	primaryRouter := c.primaryRouter.Load()
 	lease, err := c.leases.Acquire(state.root.Generation)

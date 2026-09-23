@@ -21,10 +21,15 @@ const (
 	// indexes or residual scans.
 	PageCatalogMaxSkipIndexes  = 8
 	PageCatalogMaxSchemaFields = 4096
+	// PageCatalogMaxTinIndexes bounds the versioned full-text definitions
+	// carried beside the exact family. Tin records hold no postings yet;
+	// they persist the declared name and path so a reopen advertises the
+	// same catalog the writer published.
+	PageCatalogMaxTinIndexes = 64
 	// PageCatalogMaxUniqueStrings is the exact sum of every independently
-	// addressable maximum: 4096 aliases, 64*4 physical paths, 8 skip paths, and
-	// 4096 schema fields.
-	PageCatalogMaxUniqueStrings  = 8456
+	// addressable maximum: 4096 exact aliases, 64*4 physical paths, 8 skip
+	// paths, 4096 schema fields, and 64 tin names plus 64 tin paths.
+	PageCatalogMaxUniqueStrings  = 8584
 	PageCatalogMaxStringBytes    = 1<<16 - 1
 	PageCatalogMaxCanonicalBytes = 32 << 20
 	PageCatalogDigestSize        = 16
@@ -67,8 +72,22 @@ const (
 const (
 	pageCatalogCanonicalSchema    = uint16(1)
 	pageCatalogCanonicalSkipPaths = uint16(1 << 1)
-	pageCatalogIndexUnique        = byte(1)
+	// pageCatalogCanonicalTinIndexes marks a trailing versioned tin
+	// section. Binaries that predate the section reject the flag rather
+	// than misreading the tail as a corrupt exact catalog.
+	pageCatalogCanonicalTinIndexes = uint16(1 << 2)
+	pageCatalogIndexUnique         = byte(1)
 )
+
+// pageCatalogTinEncodingVersion versions the tin record spelling itself:
+// one name string, one path string, and the tokenizer contract that
+// version implies. The decoder accepts exactly this version; a newer
+// writer must bump it and older readers then refuse loudly.
+const pageCatalogTinEncodingVersion = uint16(1)
+
+// pageCatalogTinRecordSize is the fixed record width: name and path string
+// IDs, the record encoding version, and a reserved zero.
+const pageCatalogTinRecordSize = 8
 
 var (
 	pageCatalogCanonicalMagic = [8]byte{'S', 'J', 'C', 'A', 'T', 'C', '0', '0'}
@@ -104,12 +123,22 @@ type PageCatalogSchema struct {
 	Fields []PageCatalogSchemaField
 }
 
+// PageCatalogTinIndex is one declared full-text definition: its catalog
+// name and the single text path it covers. Tin records carry no postings;
+// the section exists so the catalog round-trips the declaration with a
+// version stamp the future postings format can key off.
+type PageCatalogTinIndex struct {
+	Name string
+	Path string
+}
+
 // PageCatalogDefinition is the complete configuration needed to reopen a
 // Store without caller-supplied index or schema options.
 type PageCatalogDefinition struct {
-	Indexes   []PageCatalogIndex
-	SkipPaths []string
-	Schema    *PageCatalogSchema
+	Indexes    []PageCatalogIndex
+	TinIndexes []PageCatalogTinIndex
+	SkipPaths  []string
+	Schema     *PageCatalogSchema
 }
 
 type pageCatalogPhysicalDefinition struct {
@@ -122,6 +151,7 @@ type CanonicalPageCatalog struct {
 	canonical []byte
 	digest    [PageCatalogDigestSize]byte
 	indexes   []PageCatalogIndex
+	tin       []PageCatalogTinIndex
 	physical  []pageCatalogPhysicalDefinition
 	skipPaths []string
 	schema    *PageCatalogSchema
@@ -168,8 +198,9 @@ func (c *CanonicalPageCatalog) Definition() PageCatalogDefinition {
 		return PageCatalogDefinition{}
 	}
 	out := PageCatalogDefinition{
-		Indexes:   clonePageCatalogIndexes(c.indexes),
-		SkipPaths: slices.Clone(c.skipPaths),
+		Indexes:    clonePageCatalogIndexes(c.indexes),
+		TinIndexes: clonePageCatalogTinIndexes(c.tin),
+		SkipPaths:  slices.Clone(c.skipPaths),
 	}
 	if c.schema != nil {
 		out.Schema = &PageCatalogSchema{
@@ -230,12 +261,12 @@ func (c *CanonicalPageCatalog) SegmentCountFor(pageSize uint32) (int, bool) {
 func BuildCanonicalPageCatalog(
 	definition PageCatalogDefinition,
 ) (*CanonicalPageCatalog, error) {
-	normalized, physical, err := normalizePageCatalogDefinition(definition)
+	normalized, physical, normalizedTin, err := normalizePageCatalogDefinition(definition)
 	if err != nil {
 		return nil, err
 	}
-	if len(normalized.Indexes) == 0 && len(normalized.SkipPaths) == 0 &&
-		normalized.Schema == nil {
+	if len(normalized.Indexes) == 0 && len(normalizedTin) == 0 &&
+		len(normalized.SkipPaths) == 0 && normalized.Schema == nil {
 		return &CanonicalPageCatalog{}, nil
 	}
 	stringsTable, stringIDs, err := pageCatalogStrings(normalized, physical)
@@ -256,7 +287,8 @@ func BuildCanonicalPageCatalog(
 	total64 := uint64(PageCatalogCanonicalHeaderSize) +
 		uint64(stringBytes) + uint64(physicalBytes) +
 		uint64(len(normalized.Indexes))*4 +
-		uint64(len(normalized.SkipPaths))*2
+		uint64(len(normalized.SkipPaths))*2 +
+		uint64(len(normalizedTin))*pageCatalogTinRecordSize
 	if normalized.Schema != nil {
 		total64 += uint64(len(normalized.Schema.Fields)) * 6
 	}
@@ -281,6 +313,9 @@ func BuildCanonicalPageCatalog(
 	if len(normalized.SkipPaths) != 0 {
 		flags |= pageCatalogCanonicalSkipPaths
 	}
+	if len(normalizedTin) != 0 {
+		flags |= pageCatalogCanonicalTinIndexes
+	}
 	binary.LittleEndian.PutUint16(canonical[14:16], flags)
 	binary.LittleEndian.PutUint32(canonical[16:20], uint32(len(canonical)))
 	binary.LittleEndian.PutUint32(canonical[20:24], uint32(len(stringsTable)))
@@ -291,6 +326,16 @@ func BuildCanonicalPageCatalog(
 	binary.LittleEndian.PutUint32(canonical[40:44], uint32(physicalBytes))
 	binary.LittleEndian.PutUint16(canonical[44:46], schemaRoot)
 	binary.LittleEndian.PutUint32(canonical[46:50], uint32(len(normalized.SkipPaths)))
+	// The tin count and record version occupy formerly reserved header
+	// bytes. Images written before the section exist read back as zero
+	// here; images carrying a section fail a pre-section decoder on its
+	// nonzero reserved bytes before any section math runs.
+	binary.LittleEndian.PutUint32(canonical[50:54], uint32(len(normalizedTin)))
+	if len(normalizedTin) != 0 {
+		binary.LittleEndian.PutUint16(
+			canonical[54:56], pageCatalogTinEncodingVersion,
+		)
+	}
 
 	cursor := PageCatalogCanonicalHeaderSize
 	previous = ""
@@ -334,6 +379,14 @@ func BuildCanonicalPageCatalog(
 			cursor += 6
 		}
 	}
+	for _, tin := range normalizedTin {
+		binary.LittleEndian.PutUint16(canonical[cursor:cursor+2], stringIDs[tin.Name])
+		binary.LittleEndian.PutUint16(canonical[cursor+2:cursor+4], stringIDs[tin.Path])
+		binary.LittleEndian.PutUint16(
+			canonical[cursor+4:cursor+6], pageCatalogTinEncodingVersion,
+		)
+		cursor += pageCatalogTinRecordSize
+	}
 	if cursor != len(canonical) {
 		panic("page catalog size calculation disagrees with encoder")
 	}
@@ -341,6 +394,7 @@ func BuildCanonicalPageCatalog(
 		canonical: canonical,
 		digest:    pageCatalogDigest(canonical),
 		indexes:   clonePageCatalogIndexes(normalized.Indexes),
+		tin:       clonePageCatalogTinIndexes(normalizedTin),
 		physical:  clonePageCatalogPhysical(physical),
 		skipPaths: slices.Clone(normalized.SkipPaths),
 		schema:    clonePageCatalogSchema(normalized.Schema),
@@ -375,6 +429,7 @@ func openOwnedCanonicalPageCatalog(
 		canonical: canonical,
 		digest:    pageCatalogDigest(canonical),
 		indexes:   definition.Indexes,
+		tin:       definition.TinIndexes,
 		physical:  physical,
 		skipPaths: definition.SkipPaths,
 		schema:    definition.Schema,
@@ -406,21 +461,28 @@ func decodeCanonicalPageCatalog(
 
 func normalizePageCatalogDefinition(
 	definition PageCatalogDefinition,
-) (PageCatalogDefinition, []pageCatalogPhysicalDefinition, error) {
+) (PageCatalogDefinition, []pageCatalogPhysicalDefinition, []PageCatalogTinIndex, error) {
 	if len(definition.Indexes) > PageCatalogMaxLogicalIndexes {
-		return PageCatalogDefinition{}, nil, fmt.Errorf(
+		return PageCatalogDefinition{}, nil, nil, fmt.Errorf(
 			"%w: catalog count exceeds format limit", ErrPageCatalogDefinition,
+		)
+	}
+	if len(definition.TinIndexes) > PageCatalogMaxTinIndexes {
+		return PageCatalogDefinition{}, nil, nil, fmt.Errorf(
+			"%w: %d tin indexes, maximum is %d",
+			ErrPageCatalogDefinition,
+			len(definition.TinIndexes), PageCatalogMaxTinIndexes,
 		)
 	}
 	indexes := make([]PageCatalogIndex, len(definition.Indexes))
 	for i, index := range definition.Indexes {
 		if err := pageCatalogString(index.Name, false); err != nil {
-			return PageCatalogDefinition{}, nil, fmt.Errorf(
+			return PageCatalogDefinition{}, nil, nil, fmt.Errorf(
 				"%w: index %d name: %v", ErrPageCatalogDefinition, i, err,
 			)
 		}
 		if len(index.Paths) == 0 || len(index.Paths) > PageCatalogMaxIndexColumns {
-			return PageCatalogDefinition{}, nil, fmt.Errorf(
+			return PageCatalogDefinition{}, nil, nil, fmt.Errorf(
 				"%w: index %q path count", ErrPageCatalogDefinition, index.Name,
 			)
 		}
@@ -431,7 +493,7 @@ func normalizePageCatalogDefinition(
 		}
 		for pathIndex, path := range index.Paths {
 			if err := pageCatalogPointer(path, true); err != nil {
-				return PageCatalogDefinition{}, nil, fmt.Errorf(
+				return PageCatalogDefinition{}, nil, nil, fmt.Errorf(
 					"%w: index %q path %d: %v",
 					ErrPageCatalogDefinition, index.Name, pathIndex, err,
 				)
@@ -444,7 +506,7 @@ func normalizePageCatalogDefinition(
 	})
 	for i := 1; i < len(indexes); i++ {
 		if indexes[i-1].Name == indexes[i].Name {
-			return PageCatalogDefinition{}, nil, fmt.Errorf(
+			return PageCatalogDefinition{}, nil, nil, fmt.Errorf(
 				"%w: duplicate index alias %q",
 				ErrPageCatalogDefinition, indexes[i].Name,
 			)
@@ -461,10 +523,10 @@ func normalizePageCatalogDefinition(
 	})
 	skipPaths, err := normalizePageCatalogSkipPaths(definition.SkipPaths)
 	if err != nil {
-		return PageCatalogDefinition{}, nil, err
+		return PageCatalogDefinition{}, nil, nil, err
 	}
 	if len(physical) > PageCatalogMaxPhysicalIndexes {
-		return PageCatalogDefinition{}, nil, fmt.Errorf(
+		return PageCatalogDefinition{}, nil, nil, fmt.Errorf(
 			"%w: %d physical indexes, maximum is %d",
 			ErrPageCatalogDefinition, len(physical), PageCatalogMaxPhysicalIndexes,
 		)
@@ -472,11 +534,67 @@ func normalizePageCatalogDefinition(
 
 	schema, err := normalizePageCatalogSchema(definition.Schema)
 	if err != nil {
-		return PageCatalogDefinition{}, nil, err
+		return PageCatalogDefinition{}, nil, nil, err
+	}
+	tin, err := normalizePageCatalogTinIndexes(definition.TinIndexes, indexes)
+	if err != nil {
+		return PageCatalogDefinition{}, nil, nil, err
 	}
 	return PageCatalogDefinition{
-		Indexes: indexes, SkipPaths: skipPaths, Schema: schema,
-	}, physical, nil
+		Indexes: indexes, TinIndexes: tin, SkipPaths: skipPaths, Schema: schema,
+	}, physical, tin, nil
+}
+
+// normalizePageCatalogTinIndexes validates the tin family against the
+// already-normalized exact aliases. Tin and exact share one catalog
+// namespace — a tin name must not shadow an exact alias — while paths may
+// overlap freely: the families answer different predicates over the same
+// document. Each family keeps its own count budget, so maximum exact
+// catalogs and maximum tin declarations compose.
+func normalizePageCatalogTinIndexes(
+	tin []PageCatalogTinIndex,
+	indexes []PageCatalogIndex,
+) ([]PageCatalogTinIndex, error) {
+
+	out := make([]PageCatalogTinIndex, len(tin))
+	for i, entry := range tin {
+		if err := pageCatalogString(entry.Name, false); err != nil {
+			return nil, fmt.Errorf(
+				"%w: tin index %d name: %v", ErrPageCatalogDefinition, i, err,
+			)
+		}
+		if err := pageCatalogPointer(entry.Path, true); err != nil {
+			return nil, fmt.Errorf(
+				"%w: tin index %q path: %v",
+				ErrPageCatalogDefinition, entry.Name, err,
+			)
+		}
+		out[i] = PageCatalogTinIndex{
+			Name: strings.Clone(entry.Name), Path: strings.Clone(entry.Path),
+		}
+	}
+	slices.SortFunc(out, func(a, b PageCatalogTinIndex) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	for i := 1; i < len(out); i++ {
+		if out[i-1].Name == out[i].Name {
+			return nil, fmt.Errorf(
+				"%w: duplicate tin index %q",
+				ErrPageCatalogDefinition, out[i].Name,
+			)
+		}
+	}
+	for _, entry := range out {
+		if slices.ContainsFunc(indexes, func(index PageCatalogIndex) bool {
+			return index.Name == entry.Name
+		}) {
+			return nil, fmt.Errorf(
+				"%w: tin index %q shadows an exact alias",
+				ErrPageCatalogDefinition, entry.Name,
+			)
+		}
+	}
+	return out, nil
 }
 
 func normalizePageCatalogSkipPaths(paths []string) ([]string, error) {
@@ -566,6 +684,10 @@ func pageCatalogStrings(
 	for _, index := range definition.Indexes {
 		unique[index.Name] = struct{}{}
 	}
+	for _, tin := range definition.TinIndexes {
+		unique[tin.Name] = struct{}{}
+		unique[tin.Path] = struct{}{}
+	}
 	for _, definition := range physical {
 		for _, path := range definition.paths {
 			unique[path] = struct{}{}
@@ -604,7 +726,7 @@ func decodeCanonicalPageCatalogDefinition(
 		!bytes.Equal(src[0:8], pageCatalogCanonicalMagic[:]) ||
 		binary.LittleEndian.Uint32(src[8:12]) != pageCatalogCanonicalVersion ||
 		binary.LittleEndian.Uint16(src[12:14]) != PageCatalogCanonicalHeaderSize ||
-		!allZero(src[50:PageCatalogCanonicalHeaderSize]) {
+		!allZero(src[56:PageCatalogCanonicalHeaderSize]) {
 		return PageCatalogDefinition{}, fmt.Errorf(
 			"%w: canonical header", ErrPageCatalogCorrupt,
 		)
@@ -619,14 +741,21 @@ func decodeCanonicalPageCatalogDefinition(
 	physicalBytes := binary.LittleEndian.Uint32(src[40:44])
 	root := binary.LittleEndian.Uint16(src[44:46])
 	skipCount := binary.LittleEndian.Uint32(src[46:50])
-	if flags&^(pageCatalogCanonicalSchema|pageCatalogCanonicalSkipPaths) != 0 ||
+	tinCount := binary.LittleEndian.Uint32(src[50:54])
+	tinVersion := binary.LittleEndian.Uint16(src[54:56])
+	if flags&^(pageCatalogCanonicalSchema|pageCatalogCanonicalSkipPaths|pageCatalogCanonicalTinIndexes) != 0 ||
 		total != uint32(len(src)) || len(src) > PageCatalogMaxCanonicalBytes ||
 		stringCount > PageCatalogMaxUniqueStrings ||
 		aliasCount > PageCatalogMaxLogicalIndexes ||
 		physicalCount > PageCatalogMaxPhysicalIndexes ||
 		fieldCount > PageCatalogMaxSchemaFields ||
 		skipCount > PageCatalogMaxSkipIndexes ||
+		tinCount > PageCatalogMaxTinIndexes ||
 		(flags&pageCatalogCanonicalSkipPaths == 0) != (skipCount == 0) ||
+		(flags&pageCatalogCanonicalTinIndexes == 0) != (tinCount == 0) ||
+		(flags&pageCatalogCanonicalTinIndexes == 0) !=
+			(tinVersion == 0) ||
+		tinVersion != 0 && tinVersion != pageCatalogTinEncodingVersion ||
 		flags&pageCatalogCanonicalSchema == 0 && (root != 0 || fieldCount != 0) ||
 		flags&pageCatalogCanonicalSchema != 0 &&
 			(!validPageCatalogSchemaTypes(root) ||
@@ -638,7 +767,8 @@ func decodeCanonicalPageCatalogDefinition(
 	}
 	sections64 := uint64(PageCatalogCanonicalHeaderSize) +
 		uint64(stringBytes) + uint64(physicalBytes) +
-		uint64(aliasCount)*4 + uint64(skipCount)*2 + uint64(fieldCount)*6
+		uint64(aliasCount)*4 + uint64(skipCount)*2 + uint64(fieldCount)*6 +
+		uint64(tinCount)*pageCatalogTinRecordSize
 	if sections64 != uint64(len(src)) {
 		return PageCatalogDefinition{}, fmt.Errorf(
 			"%w: canonical section bounds", ErrPageCatalogCorrupt,
@@ -808,6 +938,37 @@ func decodeCanonicalPageCatalogDefinition(
 			usedStrings[id] = true
 		}
 	}
+	tin := make([]PageCatalogTinIndex, int(tinCount))
+	previousTin := ""
+	for i := range tin {
+		nameID := binary.LittleEndian.Uint16(src[cursor : cursor+2])
+		pathID := binary.LittleEndian.Uint16(src[cursor+2 : cursor+4])
+		version := binary.LittleEndian.Uint16(src[cursor+4 : cursor+6])
+		reserved := binary.LittleEndian.Uint16(src[cursor+6 : cursor+8])
+		cursor += pageCatalogTinRecordSize
+		if int(nameID) >= len(values) || int(pathID) >= len(values) ||
+			version != pageCatalogTinEncodingVersion || reserved != 0 ||
+			values[nameID] == "" ||
+			pageCatalogPointer(values[pathID], true) != nil ||
+			i != 0 && values[nameID] <= previousTin {
+			return PageCatalogDefinition{}, fmt.Errorf(
+				"%w: tin index", ErrPageCatalogCorrupt,
+			)
+		}
+		tin[i] = PageCatalogTinIndex{Name: values[nameID], Path: values[pathID]}
+		previousTin = values[nameID]
+		usedStrings[nameID] = true
+		usedStrings[pathID] = true
+	}
+	for _, entry := range tin {
+		if slices.ContainsFunc(indexes, func(index PageCatalogIndex) bool {
+			return index.Name == entry.Name
+		}) {
+			return PageCatalogDefinition{}, fmt.Errorf(
+				"%w: tin index shadows an exact alias", ErrPageCatalogCorrupt,
+			)
+		}
+	}
 	if cursor != len(src) {
 		return PageCatalogDefinition{}, fmt.Errorf(
 			"%w: canonical tail", ErrPageCatalogCorrupt,
@@ -821,7 +982,7 @@ func decodeCanonicalPageCatalogDefinition(
 		}
 	}
 	return PageCatalogDefinition{
-		Indexes: indexes, SkipPaths: skipPaths, Schema: schema,
+		Indexes: indexes, TinIndexes: tin, SkipPaths: skipPaths, Schema: schema,
 	}, nil
 }
 
@@ -918,6 +1079,14 @@ func clonePageCatalogIndexes(indexes []PageCatalogIndex) []PageCatalogIndex {
 		out[i] = PageCatalogIndex{
 			Name: index.Name, Paths: slices.Clone(index.Paths), Unique: index.Unique,
 		}
+	}
+	return out
+}
+
+func clonePageCatalogTinIndexes(tin []PageCatalogTinIndex) []PageCatalogTinIndex {
+	out := make([]PageCatalogTinIndex, len(tin))
+	for i, entry := range tin {
+		out[i] = PageCatalogTinIndex{Name: entry.Name, Path: entry.Path}
 	}
 	return out
 }

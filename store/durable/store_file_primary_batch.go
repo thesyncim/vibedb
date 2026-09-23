@@ -31,6 +31,17 @@ var errPrimaryBatchExactCheckpointRequired = errors.New(
 // fill would rewrite compact primary leaves for the rest of a write burst.
 const primaryOrdinaryOverlayPressureRetries = 3
 
+// primarySlotGeometryMaintained reports whether the collection keeps the
+// 256-slot leaf geometry mask probes address. Exact indexes have always
+// required it; tin indexes need the same stable slots for pruned candidate
+// masks, and declare it through the tin flag rather than the physical
+// index count. Scan-oriented collections without either keep unindexed
+// stripes of any width.
+func primarySlotGeometryMaintained(root storeio.StateRoot) bool {
+	return root.IndexCount != 0 ||
+		root.Options&storeio.StateOptionTinIndexes != 0
+}
+
 func primaryUnifiedOverlayFoldExtent(
 	payloadBytes int, quantum, maxLeafBytes uint32,
 ) (uint32, bool) {
@@ -420,13 +431,13 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 			return stagedPrimaryBatch{}, true, false, storeio.ErrCommonPrimaryLeafCorrupt
 		}
 		if stripe.Len() > storeio.CommonPrimaryLeafWideSlots &&
-			state.root.IndexCount != 0 {
+			primarySlotGeometryMaintained(state.root) {
 			lease.Release()
 			return stagedPrimaryBatch{}, false, false, nil
 		}
 		pendingRaw, pendingRows := overlay.pendingBucketDeltas(leaf.resident.Bucket)
 		if stripe.Len()+pendingRows > storeio.CommonPrimaryLeafWideSlots &&
-			state.root.IndexCount != 0 {
+			primarySlotGeometryMaintained(state.root) {
 			lease.Release()
 			return stagedPrimaryBatch{}, false, false, nil
 		}
