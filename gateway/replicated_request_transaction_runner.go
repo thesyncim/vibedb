@@ -997,33 +997,17 @@ func (runner *DurableRequestDistributedRunner) openProgress(
 	ctx context.Context,
 	execution DurableRequestTypedExecutionContext,
 ) (requestledger.HeadRecord, requestledger.ContinuationRecord, error) {
-	if reader, ok := runner.ledger.(durableRequestProgressCutReader); ok {
-		cut, err := reader.ReadProgressCut(ctx, execution.Home, execution.Key.RequestKey)
-		if err != nil {
-			return requestledger.HeadRecord{}, requestledger.ContinuationRecord{}, err
-		}
-		return cut.Head, cut.Continuation, nil
+	// The shipped RF3 ledger always serves the coherent progress cut. There
+	// is no row-by-row fallback, and production never wires another ledger.
+	reader, ok := runner.ledger.(durableRequestProgressCutReader)
+	if !ok {
+		return requestledger.HeadRecord{}, requestledger.ContinuationRecord{}, ErrDurableRequestConflict
 	}
-	headRow, err := runner.ledger.ReadRow(ctx, execution.Home, DurableRequestLifecycleRead{
-		Key: execution.Key.RequestKey, Kind: replicatedstate.RequestLedgerReadHead, MinimumApplied: 1,
-	})
-	if err != nil || !headRow.Found || headRow.Kind != replicatedstate.RequestLedgerReadHead {
-		return requestledger.HeadRecord{}, requestledger.ContinuationRecord{}, errors.Join(err, ErrDurableRequestConflict)
-	}
-	row, err := runner.ledger.ReadRow(ctx, execution.Home, DurableRequestLifecycleRead{
-		Key: execution.Key.RequestKey, Kind: replicatedstate.RequestLedgerReadContinuation,
-		MinimumApplied: headRow.Applied,
-	})
+	cut, err := reader.ReadProgressCut(ctx, execution.Home, execution.Key.RequestKey)
 	if err != nil {
 		return requestledger.HeadRecord{}, requestledger.ContinuationRecord{}, err
 	}
-	if !row.Found {
-		return headRow.Head, requestledger.ContinuationRecord{}, nil
-	}
-	if row.Kind != replicatedstate.RequestLedgerReadContinuation {
-		return requestledger.HeadRecord{}, requestledger.ContinuationRecord{}, ErrDurableRequestConflict
-	}
-	return headRow.Head, row.Continuation, nil
+	return cut.Head, cut.Continuation, nil
 }
 
 func durableDistributedCompletion(

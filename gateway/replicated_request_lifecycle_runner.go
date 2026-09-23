@@ -629,61 +629,27 @@ func (runner *DurableRequestLifecycleRunner) openWaveRows(
 	wave DurableRequestWave,
 	keyDigest requestledger.Digest,
 ) (requestledger.HeadRecord, requestledger.RoutePinRecord, requestledger.PendingWaveRecord, uint64, error) {
-	if reader, ok := runner.ledger.(durableRequestWaveCutReader); ok {
-		var scratch [requestledger.MaxPendingWaveSteps]requestledger.StepRef
-		cut, err := reader.ReadWaveCut(ctx, wave.Home, wave.Key, scratch[:])
-		if err != nil || cut.Head.KeyDigest != keyDigest ||
-			(cut.Route.Revision != 0 && cut.Route.KeyDigest != keyDigest) ||
-			(cut.Pending.Revision != 0 && (cut.Pending.KeyDigest != keyDigest ||
-				len(cut.Pending.Steps) != 1 || cut.Pending.Steps[0] != wave.Step)) {
-			return requestledger.HeadRecord{}, requestledger.RoutePinRecord{},
-				requestledger.PendingWaveRecord{}, 0, errors.Join(err, ErrDurableRequestConflict)
-		}
-		if cut.Pending.Revision != 0 {
-			cut.Pending.Steps = append([]requestledger.StepRef(nil), cut.Pending.Steps...)
-		}
-		return cut.Head, cut.Route, cut.Pending, cut.Applied, nil
-	}
-	headRow, err := runner.ledger.ReadRow(ctx, wave.Home, DurableRequestLifecycleRead{
-		Key: wave.Key, Kind: replicatedstate.RequestLedgerReadHead, MinimumApplied: 1,
-	})
-	if err != nil || !headRow.Found || headRow.Kind != replicatedstate.RequestLedgerReadHead ||
-		headRow.Head.KeyDigest != keyDigest {
-		return requestledger.HeadRecord{}, requestledger.RoutePinRecord{}, requestledger.PendingWaveRecord{}, 0,
-			errors.Join(err, ErrDurableRequestConflict)
-	}
-	routeRow, err := runner.ledger.ReadRow(ctx, wave.Home, DurableRequestLifecycleRead{
-		Key: wave.Key, Kind: replicatedstate.RequestLedgerReadRoutePin,
-		MinimumApplied: headRow.Applied,
-	})
-	if err != nil {
-		return requestledger.HeadRecord{}, requestledger.RoutePinRecord{}, requestledger.PendingWaveRecord{}, 0, err
-	}
-	var route requestledger.RoutePinRecord
-	if routeRow.Found {
-		if routeRow.Kind != replicatedstate.RequestLedgerReadRoutePin {
-			return requestledger.HeadRecord{}, requestledger.RoutePinRecord{}, requestledger.PendingWaveRecord{}, 0, ErrDurableRequestConflict
-		}
-		route = routeRow.RoutePin
+	// The shipped RF3 ledger always serves the coherent wave cut. There is
+	// no row-by-row fallback: a superseded wave is only recoverable from one
+	// atomic read, and production never wires another ledger.
+	reader, ok := runner.ledger.(durableRequestWaveCutReader)
+	if !ok {
+		return requestledger.HeadRecord{}, requestledger.RoutePinRecord{},
+			requestledger.PendingWaveRecord{}, 0, ErrDurableRequestConflict
 	}
 	var scratch [requestledger.MaxPendingWaveSteps]requestledger.StepRef
-	pendingRow, err := runner.ledger.ReadRow(ctx, wave.Home, DurableRequestLifecycleRead{
-		Key: wave.Key, Kind: replicatedstate.RequestLedgerReadPending,
-		MinimumApplied: headRow.Applied, PendingSteps: scratch[:],
-	})
-	if err != nil {
-		return requestledger.HeadRecord{}, requestledger.RoutePinRecord{}, requestledger.PendingWaveRecord{}, 0, err
+	cut, err := reader.ReadWaveCut(ctx, wave.Home, wave.Key, scratch[:])
+	if err != nil || cut.Head.KeyDigest != keyDigest ||
+		(cut.Route.Revision != 0 && cut.Route.KeyDigest != keyDigest) ||
+		(cut.Pending.Revision != 0 && (cut.Pending.KeyDigest != keyDigest ||
+			len(cut.Pending.Steps) != 1 || cut.Pending.Steps[0] != wave.Step)) {
+		return requestledger.HeadRecord{}, requestledger.RoutePinRecord{},
+			requestledger.PendingWaveRecord{}, 0, errors.Join(err, ErrDurableRequestConflict)
 	}
-	var pending requestledger.PendingWaveRecord
-	if pendingRow.Found {
-		if pendingRow.Kind != replicatedstate.RequestLedgerReadPending || len(pendingRow.Pending.Steps) != 1 ||
-			pendingRow.Pending.Steps[0] != wave.Step {
-			return requestledger.HeadRecord{}, requestledger.RoutePinRecord{}, requestledger.PendingWaveRecord{}, 0, ErrDurableRequestConflict
-		}
-		pending = pendingRow.Pending
-		pending.Steps = append([]requestledger.StepRef(nil), pending.Steps...)
+	if cut.Pending.Revision != 0 {
+		cut.Pending.Steps = append([]requestledger.StepRef(nil), cut.Pending.Steps...)
 	}
-	return headRow.Head, route, pending, headRow.Applied, nil
+	return cut.Head, cut.Route, cut.Pending, cut.Applied, nil
 }
 
 // durableRequestRetiredOpenCut is the one coherent lifecycle read permitted
