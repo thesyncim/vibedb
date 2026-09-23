@@ -241,8 +241,14 @@ func rf3AwaitMembershipSettlement(ctx context.Context, before replicacontrol.Obs
 			state.Fence.Group == before.Request.Group && state.Fence.MemberID == before.Status.MemberID &&
 			state.Applied >= observed.State.ReplicaSetVersion {
 			if request.Kind == raftservice.MembershipTransferLeader {
-				if observed.State.ReplicaSetVersion == version && observed.Status.LeaderID == request.TargetMember && observed.Status.Term > before.Status.Term &&
-					state.LeaderID == request.TargetMember && state.Fence.Term >= observed.Status.Term {
+				// The retiring source hands off to its most caught-up continuing
+				// voter (every route of the move contains one), or to the target
+				// when none is ready. Either settles the transfer; the source does
+				// not.
+				leader := observed.Status.LeaderID
+				if observed.State.ReplicaSetVersion == version && leader != request.SourceMember &&
+					slices.Contains(expected.GetVoters(), leader) && observed.Status.Term > before.Status.Term &&
+					state.LeaderID == leader && state.Fence.Term >= observed.Status.Term {
 					return state, nil
 				}
 			} else if observed.State.ReplicaSetVersion > version && observed.State.Applied > before.State.Applied {

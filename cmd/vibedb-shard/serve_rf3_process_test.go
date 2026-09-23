@@ -695,21 +695,30 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		leaderState = rf3CommandWaitLeaderWitnessWithProbeCommand(
 			t, servingAddresses, servingNodes, clientProfile, authorityIdentity.Node,
 			group, rf3CommandStoreIdentity(1).AllocationGeneration,
-			authorityIdentity.Generation, grant.TargetMember, beforeTerm, leaderState.Fence.Command,
+			authorityIdentity.Generation, grant.SourceMember, beforeTerm, leaderState.Fence.Command,
 		)
 		removeRequest.ExpectedReplicaSetVersion = leaderState.Fence.Command.ReplicaSetVersion
 		removeObservationRequest := replicacontrol.Request{
 			Operation: sha256.Sum256(removeRequest.TransitionID[:]), Step: [32]byte{0x6d, byte(removeRequest.Kind)},
 			Group: group, TargetMember: removeRequest.TargetMember, ExpectedReplicaSetVersion: removeRequest.ExpectedReplicaSetVersion,
 		}
-		beforeRemoval, err := observationClient.Observe(t.Context(), targetNode, removeObservationRequest)
+		// The retiring source hands leadership to a continuing voter when one is
+		// caught up, otherwise to the target. Remove through whichever leads.
+		leaderAddress, leaderNode := target.NativeAddress, targetNode
+		if leaderState.LeaderID != target.MemberID {
+			if leaderState.LeaderID < 2 || leaderState.LeaderID > 3 {
+				t.Fatalf("transfer settled on unexpected leader %d", leaderState.LeaderID)
+			}
+			leaderAddress, leaderNode = nativeAddresses[leaderState.LeaderID-1], nodes[leaderState.LeaderID-1]
+		}
+		beforeRemoval, err := observationClient.Observe(t.Context(), leaderNode, removeObservationRequest)
 		if err != nil {
-			t.Fatalf("observe target leader before removal: %v", err)
+			t.Fatalf("observe new leader before removal: %v", err)
 		}
 		// The target has reopened since its preplanned bootstrap incarnation.
 		// An authenticated fenced probe reports its current identity without
 		// granting data service to this still-RF4 member.
-		identityProbe := rf3CommandRoundTrip(t, target.NativeAddress, targetNode, clientProfile,
+		targetProbe := rf3CommandRoundTrip(t, target.NativeAddress, targetNode, clientProfile,
 			&shardservice.ReplicatedRequest{
 				Operation: shardservice.ReplicatedProbe, Authority: authorityIdentity,
 				Capability: serviceauthz.CapabilityTopology,
@@ -717,14 +726,31 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 					AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration,
 					Command:              leaderState.Fence.Command},
 			})
-		if identityProbe.Kind != shardservice.ReplicatedHandshake || !identityProbe.HasState ||
-			identityProbe.State.Fence.Group != group || identityProbe.State.Fence.MemberID != target.MemberID ||
-			identityProbe.State.Fence.StoreID != targetStore || identityProbe.State.Fence.NodeIncarnation <= targetIncarnation ||
-			identityProbe.State.Fence.Command != leaderState.Fence.Command ||
-			identityProbe.State.LeaderID != target.MemberID || identityProbe.State.Fence.Term != leaderState.Fence.Term {
-			t.Fatalf("target-leader identity observation: %+v", identityProbe)
+		if targetProbe.Kind != shardservice.ReplicatedHandshake || !targetProbe.HasState ||
+			targetProbe.State.Fence.Group != group || targetProbe.State.Fence.MemberID != target.MemberID ||
+			targetProbe.State.Fence.StoreID != targetStore || targetProbe.State.Fence.NodeIncarnation <= targetIncarnation ||
+			targetProbe.State.Fence.Command != leaderState.Fence.Command ||
+			targetProbe.State.LeaderID != leaderState.LeaderID || targetProbe.State.Fence.Term != leaderState.Fence.Term {
+			t.Fatalf("target identity observation: %+v", targetProbe)
 		}
-		response := rf3CommandRoundTrip(t, target.NativeAddress, targetNode, clientProfile,
+		identityProbe := targetProbe
+		if leaderNode != targetNode {
+			identityProbe = rf3CommandRoundTrip(t, leaderAddress, leaderNode, clientProfile,
+				&shardservice.ReplicatedRequest{
+					Operation: shardservice.ReplicatedProbe, Authority: authorityIdentity,
+					Capability: serviceauthz.CapabilityTopology,
+					Fence: shardservice.ReplicatedFence{Group: group,
+						AllocationGeneration: rf3CommandStoreIdentity(1).AllocationGeneration,
+						Command:              leaderState.Fence.Command},
+				})
+			if identityProbe.Kind != shardservice.ReplicatedHandshake || !identityProbe.HasState ||
+				identityProbe.State.Fence.MemberID != leaderState.LeaderID ||
+				identityProbe.State.LeaderID != leaderState.LeaderID ||
+				identityProbe.State.Fence.Term != leaderState.Fence.Term {
+				t.Fatalf("new-leader identity observation: %+v", identityProbe)
+			}
+		}
+		response := rf3CommandRoundTrip(t, leaderAddress, leaderNode, clientProfile,
 			&shardservice.ReplicatedRequest{
 				Operation: shardservice.ReplicatedMembership, Authority: authorityIdentity,
 				Capability: serviceauthz.CapabilityMembership,
@@ -732,16 +758,16 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 				Membership: removeRequest,
 			})
 		if response.Kind != shardservice.ReplicatedMembershipAccepted {
-			t.Fatalf("target-leader removal response: %+v", response)
+			t.Fatalf("new-leader removal response: %+v", response)
 		}
 		settlementContext, cancelSettlement := context.WithTimeout(t.Context(), 30*time.Second)
 		_, settleErr := rf3AwaitMembershipSettlement(settlementContext, beforeRemoval, removeRequest,
-			rf3MembershipNetworkObserverWithProbeCommand(observationClient, target.NativeAddress, targetNode, clientProfile,
+			rf3MembershipNetworkObserverWithProbeCommand(observationClient, leaderAddress, leaderNode, clientProfile,
 				authorityIdentity, rf3CommandStoreIdentity(1).AllocationGeneration, removeObservationRequest,
 				identityProbe.State.Fence.Command))
 		cancelSettlement()
 		if settleErr != nil {
-			t.Fatalf("accepted target-leader removal did not settle: %v", settleErr)
+			t.Fatalf("accepted new-leader removal did not settle: %v", settleErr)
 		}
 	} else {
 		_ = rf3CommandApplyMembershipWithProbeCommand(
@@ -1145,13 +1171,14 @@ func rf3CommandWaitLeaderWitnessWithProbeCommand(
 	profile *rafttransport.PeerTLS,
 	authorityNode rafttransport.NodeID,
 	group raftmember.GroupKey,
-	allocation, generation, leaderMember, afterTerm uint64,
+	allocation, generation, retiringMember, afterTerm uint64,
 	probeCommand raftservice.CommandFence,
 ) shardservice.ReplicatedMemberState {
 	t.Helper()
 	if !probeCommand.Valid() {
 		t.Fatal("RF3 leader witness requires a valid command fence")
 	}
+	// Any elected leader other than the retiring source settles the transfer.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for ctx.Err() == nil {
@@ -1162,13 +1189,14 @@ func rf3CommandWaitLeaderWitnessWithProbeCommand(
 				ctx, addresses[index], nodes[index], profile, authorityNode,
 				group, allocation, generation, probeCommand,
 			)
-			if err == nil && state.LeaderID == leaderMember && state.Fence.Term > afterTerm {
+			if err == nil && state.LeaderID != 0 && state.LeaderID != retiringMember &&
+				state.Fence.Term > afterTerm {
 				return state
 			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("leader %d witness unavailable after term %d", leaderMember, afterTerm)
+	t.Fatalf("no leader other than retiring member %d after term %d", retiringMember, afterTerm)
 	return shardservice.ReplicatedMemberState{}
 }
 
