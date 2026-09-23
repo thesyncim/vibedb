@@ -19,6 +19,9 @@ var (
 	ErrSourceMissing        = errors.New("snapshottransfer: source export operation is missing")
 	ErrSourceConflict       = errors.New("snapshottransfer: source export operation conflicts")
 	ErrSourceOutcomeUnknown = errors.New("snapshottransfer: source export outcome is unknown")
+	// ErrSourceNotCaughtUp is a transient refusal: the donor replica has not
+	// yet applied the membership named by the request.
+	ErrSourceNotCaughtUp = errors.New("snapshottransfer: source replica has not applied the requested membership")
 )
 
 // SourceControlRequestDiscriminator identifies this fixed grammar on the

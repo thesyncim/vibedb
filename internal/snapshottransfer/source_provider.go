@@ -361,6 +361,21 @@ func (provider *RetainedSourceExportProvider) PinSourceExport(
 			}
 			fence := cut.Fence()
 			publication := cut.Publication()
+			if fence.ReplicaSetVersion < request.ReplicaSetVersion ||
+				publication.ReplicaSetVersion < request.ReplicaSetVersion {
+				// This replica has not applied the requested membership yet; a
+				// follower donor routinely trails the leader's AddLearner. That is
+				// not a verdict on the request: release the pin rather than
+				// terminalizing it, so the exact retry takes a fresh cut once the
+				// local apply catches up.
+				behindErr := fmt.Errorf("%w: source cut membership requested=%d fence=%d publication=%d",
+					ErrSourceNotCaughtUp, request.ReplicaSetVersion, fence.ReplicaSetVersion,
+					publication.ReplicaSetVersion)
+				behindErr = errors.Join(behindErr, cut.Close())
+				provider.dropExportPin(request, pin)
+				returnWorkspace()
+				return SourceExportPlan{}, behindErr
+			}
 			if fence.ReplicaSetVersion != request.ReplicaSetVersion ||
 				publication.ReplicaSetVersion != request.ReplicaSetVersion ||
 				publication.ConfState == nil ||

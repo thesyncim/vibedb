@@ -439,13 +439,22 @@ func TestRetainedSourceProviderRejectsWrongIdentityAndStaleMembership(t *testing
 	if _, err = provider.PinSourceExport(context.Background(), wrong); !errors.Is(err, ErrSourceConflict) {
 		t.Fatalf("wrong source node err=%v", err)
 	}
+	// A request for membership this replica has not applied yet is transient:
+	// the donor is behind, not wrong. Each exact retry takes a fresh cut, and a
+	// behind cut returns its sole workspace instead of wedging later work.
 	request.ReplicaSetVersion++
-	if _, err = provider.PinSourceExport(context.Background(), request); !errors.Is(err, ErrStaleFence) {
-		t.Fatalf("stale replica-set version err=%v", err)
-	}
-	// A stale cut must return its sole workspace instead of wedging later work.
-	if _, err = provider.PinSourceExport(context.Background(), request); !errors.Is(err, ErrStaleFence) {
-		t.Fatalf("workspace was not returned after stale cut: %v", err)
+	source := provider.options.Cut.(*retainedTestCut)
+	for attempt := 1; attempt <= 2; attempt++ {
+		_, err = provider.PinSourceExport(context.Background(), request)
+		if !errors.Is(err, ErrSourceNotCaughtUp) || errors.Is(err, ErrStaleFence) {
+			t.Fatalf("behind replica-set version attempt %d err=%v", attempt, err)
+		}
+		if pin := provider.pins[request]; pin != nil {
+			t.Fatalf("behind cut was retained as a pin: %+v", pin)
+		}
+		if source.calls != attempt {
+			t.Fatalf("attempt %d did not take a fresh cut: calls=%d", attempt, source.calls)
+		}
 	}
 }
 
