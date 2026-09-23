@@ -256,81 +256,25 @@ func (coordinator *DurableRequestTerminalCoordinator) openTerminalRows(
 		}
 		return cut.Head, cut.Continuation, cut.Prepared, cut.SchemaPin, cut.Terminal, cut.Applied, nil
 	}
-	if reader, ok := coordinator.ledger.(durableRequestTerminalCutReader); ok {
-		cut, err := reader.ReadTerminalCut(ctx, plan.Home, plan.Key)
-		if err != nil {
-			return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
-				requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
-				requestledger.TerminalRecord{}, 0, err
-		}
-		if cut.Terminal.Revision == 0 && cut.Continuation.Revision == 0 {
-			return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
-				requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
-				requestledger.TerminalRecord{}, 0, ErrDurableRequestConflict
-		}
-		return cut.Head, cut.Continuation, cut.Prepared, cut.SchemaPin,
-			cut.Terminal, cut.Applied, nil
-	}
-	headRow, err := coordinator.ledger.ReadRow(ctx, plan.Home, DurableRequestLifecycleRead{
-		Key: plan.Key, Kind: replicatedstate.RequestLedgerReadHead, MinimumApplied: 1,
-	})
-	if err != nil || !headRow.Found || headRow.Kind != replicatedstate.RequestLedgerReadHead {
-		return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
-			requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
-			requestledger.TerminalRecord{}, 0, errors.Join(err, ErrDurableRequestConflict)
-	}
-	read := func(kind replicatedstate.RequestLedgerReadKind) (DurableRequestLifecycleRow, error) {
-		return coordinator.ledger.ReadRow(ctx, plan.Home, DurableRequestLifecycleRead{
-			Key: plan.Key, Kind: kind, MinimumApplied: headRow.Applied,
-		})
-	}
-	terminalRow, err := read(replicatedstate.RequestLedgerReadTerminal)
-	if err != nil {
-		return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
-			requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
-			requestledger.TerminalRecord{}, 0, err
-	}
-	if terminalRow.Found {
-		if terminalRow.Kind == replicatedstate.RequestLedgerReadAck {
-			return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
-				requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
-				requestledger.TerminalRecord{}, 0, ErrDurableRequestAcknowledged
-		}
-		if terminalRow.Kind != replicatedstate.RequestLedgerReadTerminal {
-			return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
-				requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
-				requestledger.TerminalRecord{}, 0, ErrDurableRequestConflict
-		}
-		return headRow.Head, requestledger.ContinuationRecord{},
-			requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
-			terminalRow.Terminal, terminalRow.Applied, nil
-	}
-	continuationRow, err := read(replicatedstate.RequestLedgerReadContinuation)
-	if err != nil || !continuationRow.Found ||
-		continuationRow.Kind != replicatedstate.RequestLedgerReadContinuation {
-		return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
-			requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
-			requestledger.TerminalRecord{}, 0, errors.Join(err, ErrDurableRequestConflict)
-	}
-	preparedRow, err := read(replicatedstate.RequestLedgerReadPrepared)
-	if err != nil {
-		return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
-			requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
-			requestledger.TerminalRecord{}, 0, err
-	}
-	schemaRow, err := read(replicatedstate.RequestLedgerReadSchemaPin)
-	if err != nil {
-		return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
-			requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
-			requestledger.TerminalRecord{}, 0, err
-	}
-	if preparedRow.Found && preparedRow.Kind != replicatedstate.RequestLedgerReadPrepared ||
-		schemaRow.Found && schemaRow.Kind != replicatedstate.RequestLedgerReadSchemaPin {
+	// The shipped RF3 ledger always serves the coherent terminal cut. There
+	// is no row-by-row fallback, and production never wires another ledger.
+	reader, ok := coordinator.ledger.(durableRequestTerminalCutReader)
+	if !ok {
 		return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
 			requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
 			requestledger.TerminalRecord{}, 0, ErrDurableRequestConflict
 	}
-	return headRow.Head, continuationRow.Continuation,
-		preparedRow.Prepared, schemaRow.SchemaPin, requestledger.TerminalRecord{},
-		headRow.Applied, nil
+	cut, err := reader.ReadTerminalCut(ctx, plan.Home, plan.Key)
+	if err != nil {
+		return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
+			requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
+			requestledger.TerminalRecord{}, 0, err
+	}
+	if cut.Terminal.Revision == 0 && cut.Continuation.Revision == 0 {
+		return requestledger.HeadRecord{}, requestledger.ContinuationRecord{},
+			requestledger.PreparedTerminalRecord{}, requestledger.SchemaPinReleaseRecord{},
+			requestledger.TerminalRecord{}, 0, ErrDurableRequestConflict
+	}
+	return cut.Head, cut.Continuation, cut.Prepared, cut.SchemaPin,
+		cut.Terminal, cut.Applied, nil
 }

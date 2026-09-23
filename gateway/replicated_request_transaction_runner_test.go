@@ -79,6 +79,17 @@ func (ledger *distributedRunnerLedger) ReadRow(_ context.Context, _ DurableReque
 	}
 }
 
+func (ledger *distributedRunnerLedger) ReadProgressCut(
+	_ context.Context,
+	_ DurableRequestLedgerHome,
+	_ requestledger.RequestKey,
+) (durableRequestProgressReadCut, error) {
+	return durableRequestProgressReadCut{
+		Head: ledger.head, Continuation: ledger.continuation,
+		Applied: max(uint64(1), ledger.head.Revision),
+	}, nil
+}
+
 type distributedRunnerPayloads struct{}
 
 type advancedRecoveryOrderWaves struct {

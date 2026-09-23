@@ -167,6 +167,29 @@ func (ledger *lifecycleRunnerLedger) ReadRow(
 	}
 }
 
+func (ledger *lifecycleRunnerLedger) ReadWaveCut(
+	_ context.Context,
+	_ DurableRequestLedgerHome,
+	_ requestledger.RequestKey,
+	steps []requestledger.StepRef,
+) (durableRequestWaveReadCut, error) {
+	pending := ledger.pending
+	pending.Steps = append(steps[:0], pending.Steps...)
+	return durableRequestWaveReadCut{
+		Head: ledger.head, Route: ledger.route, Pending: pending, Applied: ledger.head.Revision,
+	}, nil
+}
+
+func (ledger *lifecycleRunnerLedger) ReadProgressCut(
+	_ context.Context,
+	_ DurableRequestLedgerHome,
+	_ requestledger.RequestKey,
+) (durableRequestProgressReadCut, error) {
+	return durableRequestProgressReadCut{
+		Head: ledger.head, Continuation: ledger.continuation, Applied: ledger.head.Revision,
+	}, nil
+}
+
 type lifecycleRunnerResolver struct {
 	route  ReplicatedRoute
 	calls  int

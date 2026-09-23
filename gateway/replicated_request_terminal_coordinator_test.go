@@ -93,6 +93,17 @@ func (ledger *terminalCoordinatorLedger) ReadRow(
 	return row, nil
 }
 
+func (ledger *terminalCoordinatorLedger) ReadTerminalCut(
+	_ context.Context,
+	_ DurableRequestLedgerHome,
+	_ requestledger.RequestKey,
+) (durableRequestTerminalReadCut, error) {
+	return durableRequestTerminalReadCut{
+		Head: ledger.head, Continuation: ledger.continuation, Prepared: ledger.prepared,
+		SchemaPin: ledger.release, Terminal: ledger.terminal, Applied: ledger.head.Revision + 100,
+	}, nil
+}
+
 type terminalCoordinatorPin struct {
 	record       executionpin.Record
 	attempts     [][]byte
