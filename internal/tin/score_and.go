@@ -132,6 +132,65 @@ func (ix *Index) scoreAndTopKCore(kids []Query, boost float64, topK int, out []S
 	return append(out, h...), true
 }
 
+// scoreAndFull appends the full all-term AND ranking in rank order: the
+// top-K core's intersect, deterministic shortest-first accumulation, and
+// kernel lanes, but with no gates and no heap — every keep document
+// scores, so the full path never declines. df is the shared view's
+// document frequency (global for one index, pinned for segments), which
+// keeps kid order identical wherever the same corpus is scored: merged
+// per-shard full rankings then carry the same sums the single index
+// would, up to the last-ulp ordering the AND contract already allows.
+// Lanes ride the same index-owned staging as the top-K core.
+func (ix *Index) scoreAndFull(kids []Query, boost float64, out []Scored,
+	nDocs int, avg float64, df func(term uint64) int) ([]Scored, bool) {
+	lists := ix.termLists[:0]
+	for _, k := range kids {
+		p := ix.post[k.Term]
+		if p == nil {
+			ix.termLists = lists
+			return out, true
+		}
+		lists = append(lists, p)
+	}
+	ix.termLists = lists
+	// Shortest-first by the shared df view, exactly like the top-K core:
+	// the same corpus accumulates kids in the same order on one index
+	// and on every segment.
+	short := 0
+	for i := range lists {
+		if df(kids[i].Term) < df(kids[short].Term) {
+			short = i
+		}
+	}
+	lists[0], lists[short] = lists[short], lists[0]
+	if short != 0 {
+		kids = append(ix.andKids[:0], kids...)
+		kids[0], kids[short] = kids[short], kids[0]
+		ix.andKids = kids
+	}
+	keep, poss := ix.andIntersect(lists)
+	if len(keep) == 0 || nDocs == 0 {
+		return out, true
+	}
+	dl := extendN(ix.andDL[:0], len(keep))
+	for i, d := range keep {
+		dl[i] = float64(ix.docLength(d))
+	}
+	sums := extendN(ix.andSums[:0], len(keep))
+	clear(sums)
+	for ki, k := range kids {
+		p := lists[ki]
+		ix.andKidScores(p, idf(nDocs, df(k.Term)), avg, k.boostOf(), poss[ki], dl, sums)
+	}
+	base := len(out)
+	for i, d := range keep {
+		out = append(out, Scored{Doc: d, Score: sums[i] * boost})
+	}
+	ix.andDL, ix.andSums = dl[:0], sums[:0]
+	sortScored(out[base:])
+	return out, true
+}
+
 // andIntersect intersects shortest-first lists, tracking every keep
 // doc's position per list. It returns the keep set with one position
 // lane per list; lanes share andPos in stride of the driver length.

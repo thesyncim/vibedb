@@ -1322,6 +1322,10 @@ func (ix *Index) Score(q Query, topK int, out []Scored) []Scored {
 			if s, ok := ix.scoreAndTopK(q, topK, out); ok {
 				return s
 			}
+		case OpOr:
+			if s, ok := ix.scoreOrTopK(q, topK, out); ok {
+				return s
+			}
 		}
 	}
 	ix.scratchS = ix.scratchS[:0]

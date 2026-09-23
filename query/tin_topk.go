@@ -1,11 +1,19 @@
 package query
 
 import (
+	"runtime"
 	"sort"
 
 	"github.com/thesyncim/vibedb/internal/tin"
 	"github.com/thesyncim/vibedb/store"
 )
+
+// tinSegPool is the process-wide worker set for segmented tin search:
+// one pool sized to the machine's threads serves every execution, so
+// segmented queries never spawn per-shard goroutines per call. Workers
+// stride over shards deterministically, so rankings never depend on
+// pool size; the pool lives for the process and is never closed.
+var tinSegPool = tin.NewGatherPool(runtime.NumCPU())
 
 // Index-driven top-K restriction for ORDER BY SCORE() ... LIMIT.
 //
@@ -126,7 +134,7 @@ func applyTinTopK(w *Workspace, spec tinTopKSpec) bool {
 		// to the single index.
 		segServed := false
 		if haveSeg {
-			if hits, ok := tin.ScoreSegmented(w.matchShards[spec.slot], q, need, w.matchScored[:0]); ok {
+			if hits, ok := tin.ScoreSegmentedPool(tinSegPool, w.matchShards[spec.slot], q, need, w.matchScored[:0]); ok {
 				w.matchScored = hits
 				if need > 0 && len(hits) > need {
 					hits = hits[:need]
@@ -153,13 +161,15 @@ func applyTinTopK(w *Workspace, spec tinTopKSpec) bool {
 		// ranking's DocID order — the scan order the full sort breaks ties
 		// with. Scoring the full match set still skips every per-row
 		// retokenization, which is where the time used to go. Segmented
-		// snapshots serve lone terms, whose shared-view full ranking
-		// merges bit-identically (see tin.ScoreSegmentedFull); anything
-		// else declines to the single index, and to the ordinary scan
+		// snapshots serve lone terms (bit-identical merge) and
+		// all-term conjunctions (shared-df shortest-first order,
+		// agreeing to 1 ulp with identical order outside pathological
+		// near-ties; see tin.ScoreSegmentedFull); anything else
+		// declines to the single index, and to the ordinary scan
 		// when it is unbuilt.
 		segServed := false
-		if haveSeg && q.Op == tin.OpTerm {
-			if hits, ok := tin.ScoreSegmentedFull(w.matchShards[spec.slot], q, w.matchScored[:0]); ok {
+		if haveSeg {
+			if hits, ok := tin.ScoreSegmentedFullPool(tinSegPool, w.matchShards[spec.slot], q, w.matchScored[:0]); ok {
 				w.matchScored = hits
 				segServed = true
 			}

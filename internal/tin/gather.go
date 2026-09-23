@@ -116,43 +116,68 @@ func (ix *Index) ScorePinned(q Query, topK int, out []Scored, gs *SegGlobals) ([
 	return out, false
 }
 
-// ScorePinnedFull scores q's whole matching set under gs, reporting
-// false outside OpTerm: a lone term sums once per document, so the
-// shared-view scores match the single index bit for bit and the merge
-// order equals its ranking. AND sums in shard/task-dependent orders
-// that agree only to 1 ulp (see score_and.go), which can reorder
-// near-ties, so conjunctions stay on the top-K path whose single-index
-// twin uses the same core. A missing list contributes nothing.
+// ScorePinnedFull scores q's whole matching set under gs: OpTerm, plus
+// all-term ANDs through the gateless full core. A lone term sums once
+// per document, so the shared-view scores match the single index bit
+// for bit. Conjunctions accumulate shortest-first by the shared df on
+// every shard, the same order the top-K core uses everywhere —
+// deterministic, unlike the single index's mergeScores order, so the
+// two agree to 1 ulp and order identically outside pathological
+// near-ties (see score_and.go). Anything else reports false; a missing
+// list contributes nothing.
 func (ix *Index) ScorePinnedFull(q Query, out []Scored, gs *SegGlobals) ([]Scored, bool) {
-	if gs == nil || q.Op != OpTerm {
+	if gs == nil {
 		return out, false
 	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	ix.ensureSorted()
-	p := ix.post[q.Term]
-	if p == nil || gs.nDocs == 0 {
-		return out, true
+	switch q.Op {
+	case OpTerm:
+		p := ix.post[q.Term]
+		if p == nil || gs.nDocs == 0 {
+			return out, true
+		}
+		n := p.docCount()
+		if n == 0 {
+			return out, true
+		}
+		// topK covers the shard's whole list, so the heap never fills and
+		// no sealed block is ever skipped: the run is the full ranking.
+		return ix.scoreSingleTopKCore(p, gs.nDocs, gs.avg, gs.df[q.Term], q.boostOf(), n, out)
+	case OpAnd:
+		kids := q.Kids
+		if len(kids) == 0 || !allTerms(kids) {
+			return out, false
+		}
+		return ix.scoreAndFull(kids, q.boostOf(), out, gs.nDocs, gs.avg,
+			func(term uint64) int { return gs.df[term] })
 	}
-	n := p.docCount()
-	if n == 0 {
-		return out, true
-	}
-	// topK covers the shard's whole list, so the heap never fills and
-	// no sealed block is ever skipped: the run is the full ranking.
-	return ix.scoreSingleTopKCore(p, gs.nDocs, gs.avg, gs.df[q.Term], q.boostOf(), n, out)
+	return out, false
 }
 
 // ScoreSegmentedFull scores q on every shard in parallel under one shared
 // statistics view and merges the exact full ranking. See ScorePinnedFull
-// for the OpTerm-only contract; anything else reports false and the
-// caller serves it another way. Nil shards contribute nothing. Buffer
-// rules match ScoreGathered.
+// for the OpTerm plus all-term AND contract; anything else reports false
+// and the caller serves it another way. Nil shards contribute nothing.
+// Buffer rules match ScoreGathered.
 func ScoreSegmentedFull(shards []Shard, q Query, out []Scored) ([]Scored, bool) {
-	if q.Op != OpTerm {
+	var terms []uint64
+	switch q.Op {
+	case OpTerm:
+		terms = []uint64{q.Term}
+	case OpAnd:
+		if len(q.Kids) == 0 || !allTerms(q.Kids) {
+			return out, false
+		}
+		terms = make([]uint64, len(q.Kids))
+		for i, k := range q.Kids {
+			terms[i] = k.Term
+		}
+	default:
 		return out, false
 	}
-	gs := gatherSegGlobals(shards, []uint64{q.Term})
+	gs := gatherSegGlobals(shards, terms)
 	if gs.nDocs == 0 {
 		return out, true
 	}
@@ -236,6 +261,59 @@ func ScoreSegmented(shards []Shard, q Query, topK int, out []Scored) ([]Scored, 
 	return mergeScored(runs, topK, out), true
 }
 
+// segmentedTerms extracts the bound term set for the pinned paths: lone
+// terms and all-term conjunctions, the shapes whose shared-view sums the
+// merge proves exact. Anything else declines.
+func segmentedTerms(q Query) ([]uint64, bool) {
+	switch q.Op {
+	case OpTerm:
+		return []uint64{q.Term}, true
+	case OpAnd:
+		if len(q.Kids) == 0 || !allTerms(q.Kids) {
+			return nil, false
+		}
+		terms := make([]uint64, len(q.Kids))
+		for i, k := range q.Kids {
+			terms[i] = k.Term
+		}
+		return terms, true
+	}
+	return nil, false
+}
+
+// ScoreSegmentedPool scores through p instead of spawning per call:
+// the same shape gate, shared view, per-shard ScorePinned calls, and
+// merge as ScoreSegmented, verdict-identical, with the pool's warmed
+// allocation budget. See GatherPool for lifecycle.
+func ScoreSegmentedPool(p *GatherPool, shards []Shard, q Query, topK int, out []Scored) ([]Scored, bool) {
+	if topK <= 0 {
+		return out, false
+	}
+	terms, ok := segmentedTerms(q)
+	if !ok {
+		return out, false
+	}
+	gs := gatherSegGlobals(shards, terms)
+	if gs.nDocs == 0 {
+		return out, true
+	}
+	return p.ScorePinned(shards, q, topK, &gs, out)
+}
+
+// ScoreSegmentedFullPool merges the exact full ranking through p:
+// the ScoreSegmentedFull contract on the pool's budget.
+func ScoreSegmentedFullPool(p *GatherPool, shards []Shard, q Query, out []Scored) ([]Scored, bool) {
+	terms, ok := segmentedTerms(q)
+	if !ok {
+		return out, false
+	}
+	gs := gatherSegGlobals(shards, terms)
+	if gs.nDocs == 0 {
+		return out, true
+	}
+	return p.ScorePinnedFull(shards, q, &gs, out)
+}
+
 // MatchGathered matches q on every shard in parallel and merges the union
 // of matching DocIDs, deduplicated, into out. Each per-shard run arrives
 // DocID-sorted, so the union merge is linear. A nil shard index
@@ -281,17 +359,30 @@ type GatherPool struct {
 	wg   sync.WaitGroup
 }
 
+// gatherOp selects the per-shard call a pooled worker runs: plain Score,
+// pinned top-K, or pinned full ranking.
+type gatherOp uint8
+
+const (
+	gatherOpScore gatherOp = iota
+	gatherOpPinned
+	gatherOpPinnedFull
+)
+
 // gatherJob is one worker's share of one query: every worker receives the
 // same job value and serves the shards its stride owns. All fields are
-// read-only except the worker's own runs slots and Out buffers, which are
-// disjoint by stride, and the shared WaitGroup.
+// read-only except the worker's own runs/oks slots and Out buffers, which
+// are disjoint by stride, and the shared WaitGroup.
 type gatherJob struct {
 	shards []Shard
 	runs   [][]Scored
+	oks    []bool
+	gs     *SegGlobals
 	q      Query
 	topK   int
 	worker int
 	of     int
+	op     gatherOp
 	wg     *sync.WaitGroup
 }
 
@@ -316,12 +407,37 @@ func (p *GatherPool) serve(w int) {
 		case <-p.done:
 			return
 		case job := <-p.work[w]:
-			for i := job.worker; i < len(job.shards); i += job.of {
-				if job.shards[i].Ix == nil {
-					continue
+			switch job.op {
+			case gatherOpPinned:
+				for i := job.worker; i < len(job.shards); i += job.of {
+					if job.shards[i].Ix == nil {
+						job.oks[i] = true
+						continue
+					}
+					s, ok := job.shards[i].Ix.ScorePinned(job.q, job.topK, job.shards[i].Out[:0], job.gs)
+					job.shards[i].Out = s
+					job.runs[i] = s
+					job.oks[i] = ok
 				}
-				job.shards[i].Out = job.shards[i].Ix.Score(job.q, job.topK, job.shards[i].Out[:0])
-				job.runs[i] = job.shards[i].Out
+			case gatherOpPinnedFull:
+				for i := job.worker; i < len(job.shards); i += job.of {
+					if job.shards[i].Ix == nil {
+						job.oks[i] = true
+						continue
+					}
+					s, ok := job.shards[i].Ix.ScorePinnedFull(job.q, job.shards[i].Out[:0], job.gs)
+					job.shards[i].Out = s
+					job.runs[i] = s
+					job.oks[i] = ok
+				}
+			default:
+				for i := job.worker; i < len(job.shards); i += job.of {
+					if job.shards[i].Ix == nil {
+						continue
+					}
+					job.shards[i].Out = job.shards[i].Ix.Score(job.q, job.topK, job.shards[i].Out[:0])
+					job.runs[i] = job.shards[i].Out
+				}
 			}
 			job.wg.Done()
 		}
@@ -339,19 +455,57 @@ func (p *GatherPool) serve(w int) {
 // exactly like sharing it across ScoreGathered calls.
 func (p *GatherPool) Score(shards []Shard, q Query, topK int, out []Scored) []Scored {
 	runs := make([][]Scored, len(shards))
+	p.dispatch(gatherJob{shards: shards, q: q, topK: topK, runs: runs})
+	return mergeScored(runs, topK, out)
+}
+
+// ScorePinned runs ScoreSegmented's per-shard work through the pool — the
+// same ScorePinned calls over the same buffers — and reports the merge
+// only when every shard serves (no declines). Verdict-identical to
+// ScoreSegmented; a warmed call adds one allocation for the oks slice.
+func (p *GatherPool) ScorePinned(shards []Shard, q Query, topK int, gs *SegGlobals, out []Scored) ([]Scored, bool) {
+	runs := make([][]Scored, len(shards))
+	oks := make([]bool, len(shards))
+	p.dispatch(gatherJob{shards: shards, q: q, topK: topK, runs: runs, oks: oks, gs: gs, op: gatherOpPinned})
+	for _, ok := range oks {
+		if !ok {
+			return out, false
+		}
+	}
+	return mergeScored(runs, topK, out), true
+}
+
+// ScorePinnedFull runs ScoreSegmentedFull's per-shard work through the
+// pool and merges the exact full ranking, verdict-identical to
+// ScoreSegmentedFull. Warmed allocations match ScorePinned.
+func (p *GatherPool) ScorePinnedFull(shards []Shard, q Query, gs *SegGlobals, out []Scored) ([]Scored, bool) {
+	runs := make([][]Scored, len(shards))
+	oks := make([]bool, len(shards))
+	p.dispatch(gatherJob{shards: shards, q: q, runs: runs, oks: oks, gs: gs, op: gatherOpPinnedFull})
+	for _, ok := range oks {
+		if !ok {
+			return out, false
+		}
+	}
+	return mergeScored(runs, 0, out), true
+}
+
+// dispatch fans one job value out to the workers covering shards: at most
+// one worker per shard, idle workers never woken.
+func (p *GatherPool) dispatch(job gatherJob) {
 	var wg sync.WaitGroup
 	n := len(p.work)
-	if len(shards) < n {
-		n = len(shards)
+	if len(job.shards) < n {
+		n = len(job.shards)
 	}
 	wg.Add(n)
-	job := gatherJob{shards: shards, q: q, topK: topK, runs: runs, of: n, wg: &wg}
+	job.of = n
+	job.wg = &wg
 	for w := 0; w < n; w++ {
 		job.worker = w
 		p.work[w] <- job
 	}
 	wg.Wait()
-	return mergeScored(runs, topK, out)
 }
 
 // Close parks the workers. Call it only once no Score call is in flight:

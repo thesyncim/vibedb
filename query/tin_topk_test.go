@@ -293,6 +293,7 @@ func TestTinSegmentedSQLIdentity(t *testing.T) {
 		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'alpha' ORDER BY SCORE() DESC LIMIT 10`,
 		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'alpha AND beta' ORDER BY SCORE() DESC LIMIT 10`,
 		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'alpha' ORDER BY SCORE() ASC LIMIT 10`,
+		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'alpha AND beta' ORDER BY SCORE() ASC LIMIT 10`,
 		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'alph*' ORDER BY SCORE() DESC LIMIT 10`,
 		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> '"alpha beta"' ORDER BY SCORE() DESC LIMIT 10`,
 		`SELECT o.id, SCORE() FROM docs AS o WHERE o.body ==> 'alpha' LIMIT 10`,

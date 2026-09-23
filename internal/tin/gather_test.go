@@ -102,6 +102,71 @@ func TestGatherPoolMatchesSpawnGather(t *testing.T) {
 	}
 }
 
+// TestGatherPoolPinnedMatchesSpawn proves the pinned pool twins change
+// nothing: top-K and full rankings over terms and conjunctions equal the
+// spawn-per-call segmented paths bit for bit (terms) and Doc order plus
+// 1e-12 (conjunctions), including declines.
+func TestGatherPoolPinnedMatchesSpawn(t *testing.T) {
+	p := NewGatherPool(3)
+	defer p.Close()
+	shards := gatherShardCorpus(4, 2000)
+	for _, pattern := range []string{
+		"common", "zipf", "tied", "missing",
+		`zipf AND common`, `tied AND common`, `common AND missing`,
+		`zipf OR common`, `"tied tie"`, `*`,
+	} {
+		q := gatherQuery(t, shards, pattern)
+		terms, shaped := segmentedTerms(q)
+		var gs SegGlobals
+		if shaped {
+			gs = gatherSegGlobals(shards, terms)
+		}
+		for _, topK := range []int{1, 10, 100} {
+			want, wantOK := ScoreSegmented(shards, q, topK, nil)
+			for i := range shards {
+				shards[i].Out = nil
+			}
+			got, gotOK := p.ScorePinned(shards, q, topK, &gs, nil)
+			if gotOK != wantOK {
+				t.Fatalf("%s topK=%d: pool ok=%v, spawn ok=%v", pattern, topK, gotOK, wantOK)
+			}
+			if !wantOK {
+				continue
+			}
+			if len(got) != len(want) {
+				t.Fatalf("%s topK=%d: %d hits, want %d", pattern, topK, len(got), len(want))
+			}
+			for i := range got {
+				if got[i] != want[i] {
+					t.Fatalf("%s topK=%d hit %d = %+v, want %+v", pattern, topK, i, got[i], want[i])
+				}
+			}
+		}
+		wantF, wantFOK := ScoreSegmentedFull(shards, q, nil)
+		for i := range shards {
+			shards[i].Out = nil
+		}
+		gotF, gotFOK := p.ScorePinnedFull(shards, q, &gs, nil)
+		if gotFOK != wantFOK {
+			t.Fatalf("%s full: pool ok=%v, spawn ok=%v", pattern, gotFOK, wantFOK)
+		}
+		if !wantFOK {
+			continue
+		}
+		if len(gotF) != len(wantF) {
+			t.Fatalf("%s full: %d hits, want %d", pattern, len(gotF), len(wantF))
+		}
+		for i := range gotF {
+			if gotF[i].Doc != wantF[i].Doc {
+				t.Fatalf("%s full hit %d doc = %v, want %v", pattern, i, gotF[i].Doc, wantF[i].Doc)
+			}
+			if !scoresClose(gotF[i].Score, wantF[i].Score) {
+				t.Fatalf("%s full hit %d score = %v, want %v", pattern, i, gotF[i].Score, wantF[i].Score)
+			}
+		}
+	}
+}
+
 // TestGatherPoolEdges covers degenerate inputs: no shards, all-nil
 // shards, and a pool larger than the shard set on a single worker.
 func TestGatherPoolEdges(t *testing.T) {
@@ -311,10 +376,12 @@ func TestScoreSegmentedExact(t *testing.T) {
 }
 
 // TestScoreSegmentedFullExact proves ScoreSegmentedFull merges the exact
-// full ranking — every (Doc, Score) bit-identical to the single index —
-// over open and sealed shards, empty and nil shards, and missing terms.
-// Only lone terms serve: conjunctions sum in task-dependent orders that
-// agree to 1 ulp, which can reorder near-ties, so they decline.
+// full ranking over open and sealed shards, empty and nil shards, and
+// missing terms. Lone terms merge bit-identically; all-term conjunctions
+// accumulate shortest-first by the shared df on every shard, so the
+// merged ranking carries the same Doc order with scores agreeing to
+// 1e-12 (the AND contract in score_and.go) — the corpus below exhibits
+// no near-tie reorder, and any future one fails loudly here.
 func TestScoreSegmentedFullExact(t *testing.T) {
 	for _, sealed := range []bool{false, true} {
 		shards := gatherShardCorpus(4, 2000)
@@ -346,7 +413,29 @@ func TestScoreSegmentedFullExact(t *testing.T) {
 			}
 		}
 		for _, pattern := range []string{
-			`zipf AND common`, `"tied tie"`, `zipf OR common`, `*`,
+			`zipf AND common`, `tied AND common`, `common AND missing`,
+			`zipf^0.5 AND common`,
+		} {
+			q := gatherQuery(t, shards, pattern)
+			got, ok := ScoreSegmentedFull(shards, q, nil)
+			if !ok {
+				t.Fatalf("sealed=%v %s declined, want full AND", sealed, pattern)
+			}
+			want := single.Score(q, 0, nil)
+			if len(got) != len(want) {
+				t.Fatalf("sealed=%v %s: %d hits, want %d", sealed, pattern, len(got), len(want))
+			}
+			for i := range got {
+				if got[i].Doc != want[i].Doc {
+					t.Fatalf("sealed=%v %s hit %d doc = %v, want %v", sealed, pattern, i, got[i].Doc, want[i].Doc)
+				}
+				if !scoresClose(got[i].Score, want[i].Score) {
+					t.Fatalf("sealed=%v %s hit %d score = %v, want %v", sealed, pattern, i, got[i].Score, want[i].Score)
+				}
+			}
+		}
+		for _, pattern := range []string{
+			`"tied tie"`, `zipf OR common`, `*`,
 		} {
 			q := gatherQuery(t, shards, pattern)
 			if _, ok := ScoreSegmentedFull(shards, q, nil); ok {
@@ -408,6 +497,27 @@ func TestScoreSegmentedShippedExact(t *testing.T) {
 		}
 		if want := single.Score(q, 0, nil); !reflect.DeepEqual(got, want) {
 			t.Fatalf("%s full ranking differs", pattern)
+		}
+	}
+	// Full conjunctions over shipped bundles: same Doc order, 1e-12
+	// scores (the AND contract), exercising the sealed import paths.
+	for _, pattern := range []string{`zipf AND common`, `tied AND common`} {
+		q := gatherQuery(t, shards, pattern)
+		got, ok := ScoreSegmentedFull(shards, q, nil)
+		if !ok {
+			t.Fatalf("%s full declined, want full AND", pattern)
+		}
+		want := single.Score(q, 0, nil)
+		if len(got) != len(want) {
+			t.Fatalf("%s: %d hits, want %d", pattern, len(got), len(want))
+		}
+		for i := range got {
+			if got[i].Doc != want[i].Doc {
+				t.Fatalf("%s hit %d doc = %v, want %v", pattern, i, got[i].Doc, want[i].Doc)
+			}
+			if !scoresClose(got[i].Score, want[i].Score) {
+				t.Fatalf("%s hit %d score = %v, want %v", pattern, i, got[i].Score, want[i].Score)
+			}
 		}
 	}
 }

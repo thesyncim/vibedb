@@ -101,6 +101,9 @@ type Index struct {
 	// termLists stages resolved postings for layout-aware conjunctions,
 	// reused across calls under the same lock.
 	termLists []*postings
+	// wandCurs stages WAND traversal cursors, reused across calls under
+	// the same lock; cursor state never escapes the call.
+	wandCurs []wandCursor
 	// matchKeep stages scoreInto's all-term keep set under the same
 	// lock; filterScored consumes it before any nested use.
 	matchKeep []DocID
