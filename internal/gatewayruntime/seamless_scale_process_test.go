@@ -1551,7 +1551,21 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 	if err := workload.Seed(t, ctx); err != nil {
 		t.Fatalf("seed acknowledged workload rows: %v", err)
 	}
-	calibratedRate, baseline := calibrateSeamlessScaleRate(t, workload, ctx)
+	// Resolve the profile before any load: an unknown profile must fail before
+	// the qualification spends minutes of runner time.
+	profileBounds, err := loadSeamlessScalePerformanceBounds(os.Getenv)
+	if err != nil {
+		t.Fatalf("performance bounds: %v", err)
+	}
+	var calibratedRate int
+	var baseline seamlessScalePhaseEvidence
+	if profileBounds.FixedRate != 0 {
+		calibratedRate = profileBounds.FixedRate
+		baseline = workload.WindowSet(ctx, seamlessScalePhaseBaseline, 5, seamlessScaleWindowDuration, calibratedRate)
+	} else {
+		calibratedRate, baseline = calibrateSeamlessScaleRate(t, workload, ctx)
+	}
+	t.Logf("scale baseline complete: profile=%s rate=%d", profileBounds.Profile, calibratedRate)
 	t.Logf("scale baseline complete: rate=%d scheduled=%d completed=%d errors=%d missed=%d p99=%s", calibratedRate,
 		baseline.Scheduled, baseline.Completed, baseline.Errors, baseline.Missed, time.Duration(baseline.P99NS))
 	// These are already mandatory final evidence gates. An invalid baseline

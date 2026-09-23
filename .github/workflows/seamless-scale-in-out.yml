@@ -83,6 +83,9 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}/seamless-scale-in-out-tmp
           VIBEDB_SEAMLESS_SCALE_E2E: '1'
+          # Hosted runners are shared: gate correctness strictly and judge
+          # latency as bounded degradation at a fixed, moderate load.
+          VIBEDB_SEAMLESS_SCALE_PROFILE: shared-runner
           VIBEDB_SEAMLESS_SCALE_EVIDENCE: ${{ runner.temp }}/seamless-scale-in-out/qualification.tsv
         run: |
           set -euo pipefail
