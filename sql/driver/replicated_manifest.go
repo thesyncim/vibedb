@@ -89,11 +89,11 @@ func initialReplicatedSchemaIdentity(binding ReplicatedShardStoreBinding,
 	}
 	indexes := make([]indexMeta, len(schema.LocalIndexes))
 	for i, index := range schema.LocalIndexes {
-		compiled, err := store.CompileExactIndex(index)
+		meta, err := compileReplicatedLocalIndex(index)
 		if err != nil {
 			return ReplicatedShardStoreIdentity{}, err
 		}
-		indexes[i] = indexMeta{Name: index.Name, Paths: compiled.Specs[:compiled.N]}
+		indexes[i] = meta
 	}
 	// This value is only a hashing input. It deliberately has no fabricated
 	// log/storage IDs and is never passed off as a bound durable identity.

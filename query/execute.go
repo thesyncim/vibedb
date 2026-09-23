@@ -6,7 +6,10 @@ import (
 	"math/bits"
 	"slices"
 
+	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibedb/internal/tin"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
 )
@@ -130,6 +133,70 @@ type Workspace struct {
 	// marks is the immutable-after-bind grouped state for correlated predicate
 	// subqueries. Each evaluator aliases it read-only during the outer scan.
 	marks []markBinding
+	// matchQueries is one parsed TINQL query per ==> slot, in the order
+	// assignMatchSlots numbered. It lives here rather than in the plan
+	// because expansions resolve against the executing snapshot's index
+	// dictionary: a compiled Query is shared by every concurrent execution
+	// while the parse belongs to exactly one of them.
+	matchQueries []tin.Query
+	// matchIndexes parallels matchQueries: the generation-pinned tin index
+	// each ==> slot parsed against, for index-pruned candidate masks. It
+	// lives here rather than in the plan because the build belongs to the
+	// executing snapshot's generation; nil entries decline to the full
+	// scan. Like matchQueries it is rebound every execution and cleared
+	// when the plan carries no ==> node, so a reused Workspace never
+	// retains a build past its snapshot.
+	matchIndexes []*tin.Index
+	// matchShards parallels matchQueries on the segmented heap path: one
+	// tin.Shard per segment index of the executing snapshot, searched in
+	// parallel and merged exactly (ScoreSegmented for unexpanded term/AND
+	// top-K, MatchGathered for masks). Empty entries decline to the
+	// single index or the full scan. Result buffers persist across
+	// executions for warm reuse; only the index pointers rebind.
+	matchShards [][]tin.Shard
+	// matchPatterns parallels matchQueries: the raw TINQL pattern each
+	// slot parsed, for per-shard expansion when the shared parse reports
+	// Expanded. Set alongside every binding; empty when unbound.
+	matchPatterns []string
+	// matchTinBuilds parallels matchQueries on the durable path: the
+	// generation-pinned build each ==> slot parsed against, carrying the
+	// ordinal-to-stable-slot map for pruned candidate masks. Nil entries
+	// decline to the full scan. It lives here rather than in the plan
+	// because the build belongs to the executing snapshot's generation;
+	// like matchQueries it is rebound every execution and cleared when the
+	// plan carries no ==> node, so a reused Workspace never retains a
+	// build past its snapshot.
+	matchTinBuilds []*durable.TinBuild
+	// matchTinRouter is the live primary router the durable probe
+	// validates candidate buckets against at plan time. It is set before
+	// planning and read-only after, like matchQueries; a stale resolution
+	// only ever declines a probe, never misroutes one.
+	matchTinRouter *storeio.ResidentPrimaryRouter
+	// matchTinHits is scratch for ordinal-to-slot resolution during ==>
+	// pruning on the durable path.
+	matchTinHits []durable.TinSlotHit
+	// matchDocIDs is scratch for tin Match enumeration during ==> pruning.
+	matchDocIDs []tin.DocID
+	// matchScored is scratch for tin Score rankings during index-driven
+	// top-K restriction. It lives on the Workspace so warm executions
+	// reuse its capacity; entries are valid only for the execution that
+	// filled them.
+	matchScored []tin.Scored
+	// tinTopKUsed reports whether the last execution restricted its scan
+	// through the index-driven top-K path. Tests assert engagement;
+	// production ignores it.
+	tinTopKUsed bool
+	// tinTopKPlan is the plan whose restriction engaged, set alongside
+	// tinTopKUsed. Sort-skip readers match it against their own
+	// statement's plan pointer, so a restriction decided for one plan
+	// can never skip work for another sharing this Workspace.
+	tinTopKPlan *plan
+	// matchScoreStats parallels matchQueries: the BM25 statistics for the
+	// SCORE() slot, refreshed per execution by the scalar stage (not by
+	// bindMatches) so statements without SCORE() pay nothing. Like
+	// matchQueries it is rebound every execution; entries beyond the live
+	// slots keep warm idf buffers for the next execution.
+	matchScoreStats []tin.ScoreStats
 	// correlations is the execution-local scalar tuple supplied by a containing
 	// APPLY. Compiled plans carry only slot ordinals; values are copied here at
 	// the synchronous child boundary and cleared before the Workspace is reused.
@@ -233,12 +300,14 @@ func (w *Workspace) clearBorrowedViews() {
 	w.ctx.rows = 0
 	w.eval.bindTo(nil)
 	w.eval.bindMarks(nil)
+	w.eval.bindMatches(nil)
 	w.resetCorrelationBindings()
 	w.eval.setWork(nil)
 	if w.pool != nil {
 		for i := range w.pool.workers {
 			w.pool.workers[i].eval.bindTo(nil)
 			w.pool.workers[i].eval.bindMarks(nil)
+			w.pool.workers[i].eval.bindMatches(nil)
 			w.pool.workers[i].eval.bindCorrelations(nil)
 			w.pool.workers[i].eval.setWork(nil)
 			w.pool.workers[i].release()
@@ -318,11 +387,17 @@ type evalScratch struct {
 	// text is the decoded-string arena a nested evaluation classifies through.
 	// Only a join probe uses it; a top-level scan classifies into the phase
 	// arenas the extraction owns.
-	text              []byte
-	binds             []joinBinding
-	probes            []joinProbe
-	marks             []markBinding
-	correlations      []scalar
+	text         []byte
+	binds        []joinBinding
+	probes       []joinProbe
+	marks        []markBinding
+	correlations []scalar
+	// matchQueries aliases the executing Workspace's parsed TINQL queries,
+	// shared read-only across evaluators; matchScratch is this evaluator's
+	// own transient per-slot scratch. bindMatches installs both together so
+	// a worker can never see queries without scratch for them.
+	matchQueries      []tin.Query
+	matchScratch      []tin.TextScratch
 	markLeftEntries   []vibejson.IndexEntry
 	markRightEntries  []vibejson.IndexEntry
 	markLeftReserved  int64
@@ -523,6 +598,11 @@ func (p *plan) runInto(dst *Result, s *store.Segment, w *Workspace, workers int)
 	if err := w.checkCanceled(); err != nil {
 		return err
 	}
+	// A bare segment carries no index catalog, so ==> has nothing to parse
+	// against here; the snapshot sources bind before reaching this path.
+	if err := rejectTinMatch(p, "a bare segment"); err != nil {
+		return err
+	}
 	if p.hasLimit && p.limit == 0 && !p.requiresSQLDomainScan() {
 		return prepareResult(dst, p, 0)
 	}
@@ -680,6 +760,9 @@ func (p *plan) runSnapshotInto(e *Exec, snapshot store.Snapshot, catalog store.D
 		e.Stats = ExecStats{}
 		return prepareResult(&e.Result, p, 0)
 	}
+	if err := p.bindMatches(&e.Workspace, snapshot, catalog); err != nil {
+		return err
+	}
 	if err := p.bindJoins(
 		&e.Workspace, snapshot, catalog,
 		e.Options.JoinMembershipMax, e.Options.JoinFilterScanRatio,
@@ -708,6 +791,8 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 	}
 	w.candidateUsed = 0
 	w.storeMaskUsed = 0
+	w.tinTopKUsed = false
+	w.tinTopKPlan = nil
 	w.text = w.text[:0]
 	w.lateText = w.lateText[:0]
 	w.groupKey = w.groupKey[:0]
@@ -757,41 +842,68 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 			return nil
 		}
 	}
-	masks, err := p.storeCandidateMasks(snapshot, w)
-	if err != nil {
-		return err
+	// An index-driven top-K restriction replaces the mask probe outright:
+	// the ranked survivors arrive in score order, so no candidate
+	// enumeration runs at all. Any decline falls through to the ordinary
+	// mask scan below, which resets the row list first.
+	topK := p.tinTopK.set && applyTinTopK(w, p.tinTopK)
+	if topK {
+		w.tinTopKPlan = p
 	}
-	if err := w.checkCanceled(); err != nil {
-		return err
-	}
-	candidateCount := 0
-	for i, mask := range masks {
-		if err := cancellationCheckpoint(w.cancel, i); err != nil {
+	compact := topK
+	scanRows := len(w.storeRows)
+	var masks []store.Mask
+	var maskExact bool
+	if !topK {
+		var err error
+		masks, maskExact, err = p.storeCandidateMasksMode(snapshot, w, false)
+		if err != nil {
 			return err
 		}
-		candidateCount += bits.OnesCount64(mask.Bits)
-	}
-	compact := masks != nil && candidateCount <= snapshot.Len()/2
-	scanRows := snapshot.Len()
-	if compact {
-		scanRows = candidateCount
+		if err := w.checkCanceled(); err != nil {
+			return err
+		}
+		candidateCount := 0
+		for i, mask := range masks {
+			if err := cancellationCheckpoint(w.cancel, i); err != nil {
+				return err
+			}
+			candidateCount += bits.OnesCount64(mask.Bits)
+		}
+		// A lone ==> over an exact mask compacts at any selectivity:
+		// the row list costs nanoseconds per row while the recheck it
+		// replaces costs a retokenize, so enumerating the verdict set
+		// wins even when it names nearly every row. Downstream paths
+		// keep their selective tuning, which stays correct (only
+		// cheaper than the scan it replaces), and the identity
+		// selection below stays valid because storeRows still
+		// enumerates exactly the verdict set.
+		loneMatch := p.where != nil && p.where.kind == predMatch && len(p.where.kids) == 0
+		compact = masks != nil && (candidateCount <= snapshot.Len()/2 ||
+			(loneMatch && maskExact))
+		scanRows = snapshot.Len()
+		if compact {
+			scanRows = candidateCount
+		}
 	}
 	if err := w.activeHeapWorkBudget().admitRows(
 		p, scanRows, heapWorkSnapshot, workers,
 	); err != nil {
 		return err
 	}
-	w.storeRows = w.storeRows[:0]
-	if compact {
-		for i, mask := range masks {
-			if err := cancellationCheckpoint(w.cancel, i); err != nil {
-				return err
-			}
-			for word := mask.Bits; word != 0; word &= word - 1 {
-				w.storeRows = append(w.storeRows, store.Location{
-					Chunk: mask.Chunk,
-					Slot:  uint8(bits.TrailingZeros64(word)),
-				})
+	if !topK {
+		w.storeRows = w.storeRows[:0]
+		if compact {
+			for i, mask := range masks {
+				if err := cancellationCheckpoint(w.cancel, i); err != nil {
+					return err
+				}
+				for word := mask.Bits; word != 0; word &= word - 1 {
+					w.storeRows = append(w.storeRows, store.Location{
+						Chunk: mask.Chunk,
+						Slot:  uint8(bits.TrailingZeros64(word)),
+					})
+				}
 			}
 		}
 	}
@@ -832,9 +944,44 @@ func (p *plan) runSnapshotRows(dst *Result, snapshot store.Snapshot, catalog sto
 		}
 		return p.emit(dst, ctx, selected, w)
 	}
-	selected, err := p.filterSnapshotRows(ctx, w, snapshot, compact, workers)
-	if err != nil {
-		return err
+	var selected []int
+	var err error
+	// A lone ==> over an exact mask is verdict-proven twice: the top-K
+	// restriction ranked exactly the admitted rows, and an exact
+	// candidate mask enumerates exactly them (state-keyed index,
+	// injective slot addresses, Match/transient differential). Either
+	// way every scanned row keeps, so the identity selection skips the
+	// per-row re-tokenize. Compact is load-bearing for the mask half:
+	// only compact mode enumerates the verdict set in storeRows; a
+	// non-compact scan leaves storeRows empty and filters by mask probe
+	// plus recheck, so it stays on the rechecked path.
+	proven := w.tinTopKUsed || (compact && maskExact && masks != nil)
+	if proven && !p.hasSQLJoinComparison() && !p.runtimeSQLPaths && len(p.joins) == 0 &&
+		p.where != nil && p.where.kind == predMatch && len(p.where.kids) == 0 {
+		// Extract the filter columns the later stages still read and
+		// take the identity selection. The shape guards re-prove the
+		// pushdown contract locally (no joins, no runtime path domains,
+		// a bare match predicate), so a plan that ever diverges from
+		// its spec falls back to the rechecked scan.
+		if err := ctx.extractSnapshotValues(p, snapshot, p.filterCols, w.storeRows, compact, &w.text, w); err != nil {
+			return err
+		}
+		if err := cancellationCheckpoint(w.cancel, ctx.rows); err != nil {
+			return err
+		}
+		selected = w.selected[:0]
+		for row := 0; row < ctx.rows; row++ {
+			selected = append(selected, row)
+		}
+		w.selected = selected
+		if err := w.eval.firstError(); err != nil {
+			return err
+		}
+	} else {
+		selected, err = p.filterSnapshotRows(ctx, w, snapshot, compact, workers)
+		if err != nil {
+			return err
+		}
 	}
 	if p.fanOutJoin >= 0 {
 		selected, err = ctx.materializeFanOut(p, snapshot, catalog, selected, compact, w)

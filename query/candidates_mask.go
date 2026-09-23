@@ -1,6 +1,7 @@
 package query
 
 import (
+	"github.com/thesyncim/vibedb/internal/tin"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibejson"
 )
@@ -54,8 +55,16 @@ import (
 // at compile time, so each concrete entry point states its own and the compiler
 // checks the claim.
 type sourceCaps struct {
-	live   store.LiveMaskSource
-	ranges store.RangeIndexSource
+	// live is the heap snapshot's own live-row universe, held concrete
+	// rather than as a LiveMaskSource interface: boxing the Snapshot value
+	// into the interface costs a heap allocation on every warmed execution,
+	// and only heap snapshots ever provide the capability (durable
+	// deliberately declines it — materializing that universe needs real
+	// page I/O). hasLive distinguishes a provided universe from the zero
+	// caps a durable source passes.
+	live    store.Snapshot
+	hasLive bool
+	ranges  store.RangeIndexSource
 }
 
 func snapshotCandidateMasks[S store.IndexSource](p *plan, snapshot S, caps sourceCaps, w *Workspace, requireExact bool) ([]store.Mask, bool, error) {
@@ -208,7 +217,7 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 		// Durable deliberately offers no live universe because obtaining one
 		// would require a full document-page scan, so it declines here before
 		// paying for any positive probes.
-		if caps.live == nil {
+		if !caps.hasLive {
 			return nil, false, false, nil
 		}
 		positive := *p
@@ -240,6 +249,8 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 			return nil, false, false, nil
 		}
 		return candidatesFor(p.containPlan, snapshot, caps, paths, indexes, w, requireExact)
+	case predMatch:
+		return matchCandidateMasks(p, w)
 	case predAnd:
 		return andCandidatesFor(p, snapshot, caps, paths, indexes, w, requireExact)
 	case predOr:
@@ -264,7 +275,7 @@ func candidatesFor[S store.IndexSource](p *compiledPredicate, snapshot S, caps s
 		// backend that can never complete a NOT should decline it at zero cost,
 		// not after paying for a child probe it can't use.
 		live := caps.live
-		if live == nil {
+		if !caps.hasLive {
 			return nil, false, false, nil
 		}
 		// Complementing a candidate superset is unsafe: a hash collision in the
@@ -467,6 +478,153 @@ func singleColumnIndex(path string, indexes []store.IndexInfo) (store.IndexInfo,
 	return store.IndexInfo{}, false
 }
 
+// singleColumnTinIndex reports the Ready full-text declaration covering one
+// path, the only catalog shape ==> pruning accepts. Building indexes stay
+// out: their postings do not exist yet.
+func singleColumnTinIndex(path string, indexes []store.IndexInfo) bool {
+	for _, index := range indexes {
+		if index.Kind == store.IndexTin && index.State == store.IndexReady &&
+			index.ColumnCount == 1 && index.Columns[0] == path {
+			return true
+		}
+	}
+	return false
+}
+
+// matchCandidateMasks prunes ==> with the slot's generation-pinned tin
+// postings. Match enumerates every document the bound query accepts as DocIDs
+// packing (chunk, slot); folding them into ascending chunk masks feeds the
+// compact scan directly. The heap and segmented-heap probes report exact:
+// the index builds from the reading snapshot's own state (state-keyed,
+// immutable), DocIDs are injective (chunk, slot) addresses, and
+// TestMatchSingleAgreesWithIndex proves the Match set is exactly the
+// per-row verdict set — so a lone-==> compact scan over an exact mask
+// skips the evalMatch recheck outright. Compound shapes still recheck through the
+// shared combinators, which AND child exactness down. A missing or
+// out-of-range slot (an execution that never bound, such as a join inner
+// scan's private workspace) declines to the full scan rather than
+// erroring: an index is an optimization, and the rechecked scan remains
+// exact.
+func matchCandidateMasks(
+	p *compiledPredicate, w *Workspace,
+) ([]store.Mask, bool, bool, error) {
+	if p.slot < 0 || p.slot >= len(w.matchQueries) {
+		return nil, false, false, nil
+	}
+	// Segmented heap path: gathered matches union exactly, with global
+	// document identities the mask folding below already speaks. A shared
+	// parse serves only unexpanded queries; expanding patterns re-parse
+	// per shard so every shard's expansions contribute.
+	if p.slot < len(w.matchShards) && len(w.matchShards[p.slot]) > 0 {
+		shards := w.matchShards[p.slot]
+		q := w.matchQueries[p.slot]
+		var ids []tin.DocID
+		if q.Expanded && p.slot < len(w.matchPatterns) {
+			// Expansion needs syntax, so a shared Expanded parse
+			// always has a pattern to re-parse per shard.
+			pattern := w.matchPatterns[p.slot]
+			queries := make([]tin.Query, len(shards))
+			for i := range shards {
+				if shards[i].Ix == nil {
+					continue
+				}
+				qi, err := shards[i].Ix.ParseTINQL(pattern)
+				if err != nil {
+					return nil, false, false, nil
+				}
+				queries[i] = qi
+			}
+			ids = tinSegPool.MatchQueries(shards, queries, w.matchDocIDs[:0])
+		} else {
+			ids = tinSegPool.Match(shards, q, w.matchDocIDs[:0])
+		}
+		w.matchDocIDs = ids
+		if len(ids) == 0 {
+			return nil, true, false, nil
+		}
+		out := w.nextStoreMasks()
+		out = appendMatchMasks(out, ids)
+		if out == nil {
+			// A slot width beyond the 64-bit mask universe cannot be pruned
+			// exactly: decline rather than drop a document.
+			return nil, false, false, nil
+		}
+		w.keepStoreMasks(out)
+		return out, true, true, nil
+	}
+	if p.slot < len(w.matchIndexes) && w.matchIndexes[p.slot] != nil {
+		ix := w.matchIndexes[p.slot]
+		ids := ix.Match(w.matchQueries[p.slot], w.matchDocIDs[:0])
+		w.matchDocIDs = ids
+		if len(ids) == 0 {
+			return nil, true, false, nil
+		}
+		out := w.nextStoreMasks()
+		out = appendMatchMasks(out, ids)
+		if out == nil {
+			// A slot width beyond the 64-bit mask universe cannot be pruned
+			// exactly: decline rather than drop a document.
+			return nil, false, false, nil
+		}
+		w.keepStoreMasks(out)
+		return out, true, true, nil
+	}
+	// Durable twin: the generation-pinned build maps the same Match
+	// ordinals to stable-slot masks through its live table. Every decline
+	// below — no build, no router, skew, dense hits, dropped buckets —
+	// falls back to the exact full scan plus the per-row recheck.
+	if p.slot < len(w.matchTinBuilds) && w.matchTinBuilds[p.slot] != nil {
+		build := w.matchTinBuilds[p.slot]
+		if build.Index() == nil {
+			return nil, false, false, nil
+		}
+		ids := build.Index().Match(w.matchQueries[p.slot], w.matchDocIDs[:0])
+		w.matchDocIDs = ids
+		if len(ids) == 0 {
+			return nil, true, false, nil
+		}
+		out := w.nextStoreMasks()
+		var ok bool
+		out, w.matchTinHits, ok = build.AppendCandidateMasks(
+			w.matchTinRouter, ids, out, w.matchTinHits[:0],
+		)
+		if !ok {
+			return nil, false, false, nil
+		}
+		w.keepStoreMasks(out)
+		return out, true, false, nil
+	}
+	return nil, false, false, nil
+}
+
+// appendMatchMasks folds ascending match DocIDs into ascending chunk masks.
+// It returns nil if any slot escapes the mask universe; the caller must
+// decline rather than emit a partial set.
+func appendMatchMasks(out []store.Mask, ids []tin.DocID) []store.Mask {
+	var cur uint32
+	var bits uint64
+	started := false
+	flush := func() {
+		if started {
+			out = append(out, store.Mask{Chunk: cur, Bits: bits})
+		}
+	}
+	for _, id := range ids {
+		chunk := uint32(id >> 32)
+		slot := uint(id & 0xffffffff)
+		if slot >= 64 {
+			return nil
+		}
+		if !started || chunk != cur {
+			flush()
+			cur, bits, started = chunk, 0, true
+		}
+		bits |= uint64(1) << slot
+	}
+	flush()
+	return out
+}
+
 // membership returns the alternatives and needles a membership leaf tests
 // against, resolving a late-bound one through its slot in the executing
 // Workspace. bindable is false for a binding that chose the lookup strategy:
@@ -609,6 +767,12 @@ func (p *compiledPredicate) canBoundWithRanges(
 		return p.containPlan != nil && p.containPlan.canBoundWithRanges(
 			paths, indexes, w, ranges,
 		)
+	case predMatch:
+		// OR-side pruning needs every disjunct bounded; a Ready tin
+		// declaration over the path bounds this leaf. The bound query
+		// itself is only consulted at probe time, post-bind, so this
+		// stays accurate on the EXPLAIN path too.
+		return singleColumnTinIndex(p.indexPath(paths), indexes)
 	case predAnd:
 		if _, _, ok := p.bestCompoundIndex(paths, indexes, w); ok {
 			return true

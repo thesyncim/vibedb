@@ -89,7 +89,7 @@ func TestRejectsNonPredicateExpressions(t *testing.T) {
 		{"NULL is not a membership alternative", `SELECT a FROM t WHERE b IN (1, NULL)`, 31, "IS NULL"},
 		{"an empty membership", `SELECT a FROM t WHERE b IN ()`, 28, "no alternatives"},
 		{"IS wants a supported test", `SELECT a FROM t WHERE b IS 1`, 27, "NULL, MISSING, TRUE, or FALSE"},
-		{"NOT wants a leaf operator", `SELECT a FROM t WHERE b NOT 1`, 28, "IN, BETWEEN, or LIKE"},
+		{"NOT wants a leaf operator", `SELECT a FROM t WHERE b NOT 1`, 28, "IN, BETWEEN, LIKE, or ==>"},
 		{"BETWEEN wants AND", `SELECT a FROM t WHERE b BETWEEN 1, 2`, 33, "AND between the bounds"},
 	})
 }

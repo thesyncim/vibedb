@@ -4,7 +4,7 @@
 
 Use `github.com/thesyncim/vibedb` when an application wants VibeDB to own an
 embedded database lifecycle. It provides named JSON collections, exact indexes,
-typed queries, and serializable transactions without exposing storage pages or
+full-text search, typed queries, and serializable transactions without exposing storage pages or
 snapshot leases.
 
 This guide describes the root `vibedb` package only. The `store` and
@@ -195,6 +195,36 @@ The facade has no `DropIndex` or unique-index method. Applications that need
 lower-level index DDL must accept the direct engine's separate ownership and
 stability contract.
 
+## Search text with a tin index
+
+`CreateTinIndex` declares a full-text index over exactly one text path, and
+`TinSearch` returns up to `topK` hits ranked by BM25 score from the
+collection's current generation.
+
+```go
+if err := docs.CreateTinIndex("body_tin", "/body"); err != nil {
+	return err
+}
+
+hits, err := docs.TinSearch("/body", `luxury AND "vintage watches"`, 10)
+if err != nil {
+	return err
+}
+for _, hit := range hits {
+	fmt.Println(hit.Key, hit.Score)
+}
+```
+
+Hits arrive by descending score, ties by document identity. The query is
+TINQL, parsed against the searched generation's index; see the
+[SQL reference](../reference/sql.md) for the language. A path without a tin
+index reports `store.ErrIndexNotFound`, an invalid query reports its parse
+error, and `topK <= 0` returns no hits. `CreateTinIndex` follows the same
+one-shot contract as `CreateIndex` on both profiles. On `Memory` it warms the
+index before returning; on durable profiles the declaration publishes
+immediately and each generation's postings build on first use. Only string
+values are indexed.
+
 ## Run typed queries
 
 Compile a reusable `*query.Query`, then choose one-off execution or a reusable
@@ -290,6 +320,7 @@ limits, and crash-atomic multi-collection commit.
 | Point operation | Key bytes | 256 |
 | Point operation | JSON document bytes | 4 MiB |
 | Exact index | Ordered paths | 1–4 |
+| Tin index | Text paths | 1 |
 | One dirty collection in a transaction | Distinct staged keys | 64 |
 | One dirty collection in a transaction | Staged key and document bytes | 16,793,600 |
 | Whole transaction | Dirty collections | 16 |

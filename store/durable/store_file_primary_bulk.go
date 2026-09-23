@@ -404,7 +404,7 @@ func createFromPrimaryGraphRecords(
 	}
 	root.Options = fileStoreCollectionOptionFlags(
 		normalized.Collection, len(normalized.SkipIndexes) != 0,
-		normalized.OpaqueValues,
+		len(normalized.tinIndexes) != 0, normalized.OpaqueValues,
 	)
 	if normalized.MaterializationDamageGranule != 0 {
 		root.Options |= storeio.StateOptionCanonicalMaterialization
@@ -662,7 +662,7 @@ func primaryBulkStoreID(
 	writeUint64(uint64(options.MaxDocumentBytes))
 	writeUint64(uint64(fileStoreCollectionOptionFlags(
 		options.Collection, len(options.SkipIndexes) != 0,
-		options.OpaqueValues,
+		len(options.tinIndexes) != 0, options.OpaqueValues,
 	)))
 	// The canonical index catalog is part of the immutable file image: a build
 	// with different indexes must produce a different identity. indexCatalogHash

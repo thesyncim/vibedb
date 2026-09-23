@@ -91,7 +91,16 @@ type indexMeta struct {
 	Name   string   `json:"name"`
 	Paths  []string `json:"paths"`
 	Unique bool     `json:"unique,omitempty"`
+	// Method names the index access method: "" is the engine's exact
+	// scalar index, "tin" is a full-text index over one text path
+	// (CREATE INDEX ... USING tin). It rides the SQL catalog so a
+	// catalog-only declaration still materializes with its Kind.
+	Method string `json:"method,omitempty"`
 }
+
+// indexMethodTin is the indexMeta.Method spelling of a full-text index,
+// matching the SQL parser's lowered method name.
+const indexMethodTin = "tin"
 
 type table struct {
 	meta       *tableMeta
@@ -1103,9 +1112,16 @@ func durableOptions(t *table) durable.Options {
 		PortableSealedCapacity:     t.meta.SealedRecoveryJournalBytes != 0,
 	}
 	for _, index := range t.meta.Indexes {
-		options.Indexes = append(options.Indexes, store.IndexDefinition{
+		definition := store.IndexDefinition{
 			Name: index.Name, Paths: append([]string(nil), index.Paths...), Unique: index.Unique,
-		})
+		}
+		// The SQL catalog is the only record of a catalog-only USING tin
+		// declaration; dropping the method here would materialize it as an
+		// exact index — silent corruption, not a fallback.
+		if index.Method == indexMethodTin {
+			definition.Kind = store.IndexTin
+		}
+		options.Indexes = append(options.Indexes, definition)
 	}
 	return options
 }
@@ -1141,13 +1157,17 @@ func syncTableIndexMeta(t *table) (bool, error) {
 			[]string(nil), infos[i].Columns[:infos[i].ColumnCount]...,
 		)
 		next[i].Unique = infos[i].Unique
+		if infos[i].Kind == store.IndexTin {
+			next[i].Method = indexMethodTin
+		}
 	}
 	if len(next) == len(t.meta.Indexes) {
 		equal := true
 		for i := range next {
 			if next[i].Name != t.meta.Indexes[i].Name ||
 				!slices.Equal(next[i].Paths, t.meta.Indexes[i].Paths) ||
-				next[i].Unique != t.meta.Indexes[i].Unique {
+				next[i].Unique != t.meta.Indexes[i].Unique ||
+				next[i].Method != t.meta.Indexes[i].Method {
 				equal = false
 				break
 			}
@@ -1767,6 +1787,9 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 			part := encodedJSONStringBytes(index.Name) + 256
 			if index.Unique {
 				part += len(`,"unique":true`)
+			}
+			if index.Method != "" {
+				part += len(`,"method":""`) + len(index.Method)
 			}
 			if !add(part) {
 				return size, catalogSizeError(size)

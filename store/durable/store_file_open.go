@@ -478,7 +478,7 @@ func (c *Collection) createInitialState() error {
 	}
 	root.Options = fileStoreCollectionOptionFlags(
 		c.options.Collection, len(c.options.SkipIndexes) != 0,
-		c.options.OpaqueValues,
+		len(c.options.tinIndexes) != 0, c.options.OpaqueValues,
 	)
 	if c.options.MaterializationDamageGranule != 0 {
 		root.Options |= storeio.StateOptionCanonicalMaterialization

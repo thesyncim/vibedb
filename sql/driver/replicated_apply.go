@@ -761,6 +761,11 @@ func replicatedApplyLocalIndexes(t *table) []store.IndexDefinition {
 			Paths:  append([]string(nil), t.meta.Indexes[i].Paths...),
 			Unique: t.meta.Indexes[i].Unique,
 		}
+		// A replicated USING tin declaration must stay tin when applied:
+		// an exact index over the same path answers a different question.
+		if t.meta.Indexes[i].Method == indexMethodTin {
+			result[i].Kind = store.IndexTin
+		}
 	}
 	return result
 }

@@ -111,8 +111,13 @@ not accepted inside a transaction.
 
 The typed query engine compiles immutable plans. Heap execution reads a pinned
 snapshot. Durable execution late-binds persistent exact indexes, admits bounded
-workspace, and falls back to a full scan when an optimization cannot fit. A
-candidate posting is always rechecked against the document.
+workspace, and falls back to a full scan when an optimization cannot fit. An
+exact-index candidate posting is always rechecked against the document.
+Full-text (`==>`) predicates bind a generation-pinned tin index per
+execution and use its postings to restrict candidates. A heap tin index is
+built from the same state being scanned, so a lone `==>` over its compact
+candidate mask is answered by the mask without a per-row recheck; every
+other full-text shape rechecks each candidate.
 
 Result memory is a separate budget from intermediate work. One-off results and
 session-owned results have different lifetimes; both must follow their API's

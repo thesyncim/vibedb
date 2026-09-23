@@ -79,6 +79,10 @@ func (p *plan) runFileSmall(e *Exec, snapshot *durable.Snapshot, span *FileRange
 	s.work.eval.setWork(&e.Workspace.heapWorkBudget)
 	s.work.eval.bindTo(nil)
 	s.work.eval.bindMarks(nil)
+	// ==> rechecks read the bound queries: without this every predMatch
+	// evaluates false on the small lane, which is exactly where pruned
+	// candidate sets land.
+	s.work.eval.bindMatches(e.Workspace.matchQueries)
 	s.work.eval.bindCorrelations(e.Workspace.correlations)
 	s.batch = takeFileBatch(s.slots[:], 0, 0)
 	defer func() {
@@ -137,6 +141,9 @@ func (p *plan) runFileSmall(e *Exec, snapshot *durable.Snapshot, span *FileRange
 // durable ranges keeps the complete predicate authoritative; its Segment
 // fallback covers complex paths and uncommon JSON roots.
 func (p *plan) runValidatedRawInto(e *Exec, raw []byte) error {
+	if err := rejectTinMatch(p, "a validated raw source"); err != nil {
+		return err
+	}
 	if e.file.small == nil {
 		e.file.small = &fileSmallScan{}
 		e.file.small.row = e.file.small.appendRow
@@ -159,6 +166,10 @@ func (p *plan) runValidatedRawInto(e *Exec, raw []byte) error {
 	s.work.eval.setWork(&e.Workspace.heapWorkBudget)
 	s.work.eval.bindTo(nil)
 	s.work.eval.bindMarks(nil)
+	// ==> rechecks read the bound queries: without this every predMatch
+	// evaluates false on the small lane, which is exactly where pruned
+	// candidate sets land.
+	s.work.eval.bindMatches(e.Workspace.matchQueries)
 	s.work.eval.bindCorrelations(e.Workspace.correlations)
 	s.batch = takeFileBatch(s.slots[:], 0, 0)
 	defer func() {

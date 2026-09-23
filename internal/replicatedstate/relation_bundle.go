@@ -304,11 +304,25 @@ func canonicalLocalIndexes(input []store.IndexDefinition) ([]store.IndexDefiniti
 				store.ErrIndexDefinition,
 			)
 		}
+		if input[i].Kind == store.IndexTin {
+			// A full-text declaration canonicalizes by family: compiling
+			// it as exact would reject it, and dropping the Kind would
+			// let a tin and an exact index over the same name and paths
+			// digest identically on different replicas.
+			if _, err := store.CompileTinDefinition(input[i]); err != nil {
+				return nil, err
+			}
+			result[i].Name = strings.Clone(input[i].Name)
+			result[i].Paths = append([]string(nil), input[i].Paths...)
+			result[i].Kind = store.IndexTin
+			continue
+		}
 		compiled, err := store.CompileExactIndex(input[i])
 		if err != nil {
 			return nil, err
 		}
 		result[i].Name = strings.Clone(input[i].Name)
+		result[i].Kind = store.IndexExact
 		result[i].Paths = make([]string, int(compiled.N))
 		for column := 0; column < int(compiled.N); column++ {
 			result[i].Paths[column] = strings.Clone(compiled.Specs[column])
@@ -557,6 +571,13 @@ func relationManifestDigest(
 		_, _ = h.Write(limits[:])
 		binary.LittleEndian.PutUint64(fixed[0:8], uint64(len(relation.localIndexes)))
 		_, _ = h.Write(fixed[:8])
+		hasMethod := false
+		for j := range relation.localIndexes {
+			if relation.localIndexes[j].Kind != store.IndexExact {
+				hasMethod = true
+				break
+			}
+		}
 		for j := range relation.localIndexes {
 			index := &relation.localIndexes[j]
 			writeHashFrame(h, []byte(index.Name))
@@ -564,6 +585,13 @@ func relationManifestDigest(
 			_, _ = h.Write(fixed[:8])
 			for _, path := range index.Paths {
 				writeHashFrame(h, []byte(path))
+			}
+			if hasMethod {
+				// Keep every all-exact relation byte-stable: the kind
+				// byte extends only images that declare an access
+				// method, so a tin and an exact index over the same
+				// name and paths never share a digest.
+				_, _ = h.Write([]byte{byte(index.Kind)})
 			}
 		}
 	}

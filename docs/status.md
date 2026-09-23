@@ -11,7 +11,8 @@ state together.
 
 | Interface | Available for evaluation | Main boundary |
 | --- | --- | --- |
-| Native embedded Go | JSON collections, exact indexes, typed queries, serializable transactions. | API and data formats can change. |
+| Native embedded Go | JSON collections, exact indexes, tin full-text indexes, typed queries, serializable transactions. | API and data formats can change. |
+| Full-text search | TINQL `==>` matching and BM25 `SCORE()` over in-memory and durable collections, in SQL, pgwire, and the Go API. | Durable transactions refuse `==>` over pending writes; the RF3 schema carries tin declarations, but distributed `==>` execution is not qualified. |
 | Typed query engine | Plans over heap and durable sources with explicit work budgets. | Source capabilities and result lifetimes differ. |
 | `database/sql` | Embedded VibeDB SQL and transactions. | A bounded dialect; check the SQL reference. |
 | PostgreSQL wire | Selected v3 protocol flows and client discovery behavior. | Protocol access does not establish PostgreSQL SQL, catalog, extension, or ORM compatibility. |

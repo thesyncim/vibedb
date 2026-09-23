@@ -281,6 +281,10 @@ type plan struct {
 	// they require one coherent catalog snapshot and bind into the executing
 	// Workspace before the driving scan starts.
 	marks []planMark
+	// matchCount is the number of ==> nodes assignMatchSlots numbered, in
+	// slot order across the driving plan and every join and mark inner plan.
+	// It sizes the Workspace's per-execution parsed-query binding.
+	matchCount int
 
 	grouped bool
 	// runtimeSQLPaths marks a SQL-only path-to-path comparison whose live
@@ -297,6 +301,11 @@ type plan struct {
 	order    []planOrder
 	limit    int
 	hasLimit bool
+	// tinTopK carries an index-driven top-K row restriction for ORDER BY
+	// SCORE() ... LIMIT scalar statements, decided in bindScorePlan where
+	// the finished plan and the scalar program are both visible. The zero
+	// value keeps the ordinary scan.
+	tinTopK tinTopKSpec
 }
 
 // A planColumn is one compiled SELECT column.
@@ -423,6 +432,7 @@ func (c *compiler) compilePlan(q *Query) (*plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	p.matchCount = assignMatchSlots(p)
 	return p, nil
 }
 

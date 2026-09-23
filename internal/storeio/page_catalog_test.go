@@ -297,6 +297,9 @@ func TestPageCatalogCompactAccountingAtOrdinaryAndMaximumCounts(t *testing.T) {
 		Indexes: make(
 			[]PageCatalogIndex, PageCatalogMaxLogicalIndexes,
 		),
+		TinIndexes: make(
+			[]PageCatalogTinIndex, PageCatalogMaxTinIndexes,
+		),
 		Schema: &PageCatalogSchema{
 			Root: PageCatalogSchemaObject,
 			Fields: make(
@@ -334,6 +337,12 @@ func TestPageCatalogCompactAccountingAtOrdinaryAndMaximumCounts(t *testing.T) {
 			Path:     fmt.Sprintf("/schema/%04d", i),
 			Types:    PageCatalogSchemaString,
 			Required: i&1 != 0,
+		}
+	}
+	for i := range maximum.TinIndexes {
+		maximum.TinIndexes[i] = PageCatalogTinIndex{
+			Name: fmt.Sprintf("tin_%02d", i),
+			Path: fmt.Sprintf("/tin/%02d", i),
 		}
 	}
 	maxCatalog, err := BuildCanonicalPageCatalog(maximum)
@@ -411,7 +420,8 @@ func assertPageCatalogCompactAccounting(
 		stringBytes + physicalBytes +
 		len(definition.Indexes)*4 +
 		len(definition.SkipPaths)*2 +
-		fieldCount*6
+		fieldCount*6 +
+		len(definition.TinIndexes)*pageCatalogTinRecordSize
 	if catalog.CanonicalSize() != wantTotal ||
 		int(binary.LittleEndian.Uint32(catalog.canonical[16:20])) != wantTotal ||
 		int(binary.LittleEndian.Uint32(catalog.canonical[36:40])) != stringBytes ||

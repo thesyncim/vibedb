@@ -150,6 +150,14 @@ func (lx *lexer) next() token {
 	case '?':
 		return token{kind: tokParam, pos: start}
 	case '=':
+		// `==>` is the full-text match operator; a bare `=` stays equality
+		// and `==` without `>` is refused rather than guessed at.
+		if lx.accept('=') {
+			if lx.accept('>') {
+				return token{kind: tokMatch, pos: start}
+			}
+			return errorToken(start, "expected '>' after '=='; full-text match is spelled '==>'")
+		}
 		return token{kind: tokEq, pos: start}
 	case '!':
 		if lx.accept('=') {

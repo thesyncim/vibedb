@@ -6,6 +6,7 @@ import (
 	"math/bits"
 	"slices"
 
+	"github.com/thesyncim/vibedb/internal/tin"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
@@ -738,7 +739,7 @@ func (p *plan) bindJoins(
 		b := &w.joins[j.slot]
 		if err := j.bind(
 			b, catalog, limit, outer.Len(), ratio,
-			pairBudget, workBudget, w.cancel, stats,
+			pairBudget, workBudget, w.cancel, stats, w.matchQueries,
 		); err != nil {
 			return err
 		}
@@ -771,9 +772,14 @@ func (j *planJoin) bind(
 	workBudget *heapWorkBudget,
 	cancel *CancelFlag,
 	stats *ExecStats,
+	matches []tin.Query,
 ) error {
 	b.reset()
 	b.scan.cancel = cancel
+	// Slots are statement-global, so the clause's inner scan aliases the
+	// outer binding: bindMatches already parsed its ==> nodes against this
+	// same inner snapshot. Installed after reset, which clears the scan.
+	b.scan.eval.bindMatches(matches)
 	if err := b.scan.checkCanceled(); err != nil {
 		return err
 	}

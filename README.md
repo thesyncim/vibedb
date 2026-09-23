@@ -1,8 +1,9 @@
 # VibeDB
 
-An embedded JSON database for Go, with exact indexes, typed queries, and
-serializable transactions. VibeDB also provides a SQL dialect through
-`database/sql`, a PostgreSQL wire adapter, and an RF3 distributed runtime.
+An embedded JSON database for Go, with exact indexes, full-text search, typed
+queries, and serializable transactions. VibeDB also provides a SQL dialect
+through `database/sql`, a PostgreSQL wire adapter, and an RF3 distributed
+runtime.
 
 [Get started](docs/getting-started.md) · [API guides](docs/api/README.md) ·
 [Design](docs/design/README.md) · [Operations](docs/operations/README.md) ·
@@ -63,6 +64,33 @@ it. Collections are created on the first valid write; stored JSON is
 canonicalized. The [tutorial](docs/getting-started.md) walks through reopening
 the database, and the [native API guide](docs/api/native.md) covers indexes,
 queries, and resource lifetimes.
+
+## Search text
+
+A tin index adds positional full-text search with BM25 ranking over one text
+path. Queries use TINQL: terms, phrases, boolean operators, wildcards, fuzzy
+matching, proximity, and positional filters.
+
+```go
+if err := users.CreateTinIndex("bio_tin", "/bio"); err != nil {
+	return err
+}
+hits, err := users.TinSearch("/bio", `compiler AND "type systems"`, 10)
+```
+
+The same index serves SQL:
+
+```sql
+CREATE INDEX users_bio_tin ON users(bio) USING tin;
+
+SELECT id, SCORE() FROM users
+WHERE bio ==> 'compiler AND "type systems"'
+ORDER BY SCORE() DESC
+LIMIT 10;
+```
+
+Both in-memory and durable collections support tin indexes. See the
+[SQL reference](docs/reference/sql.md) for TINQL and `SCORE()`.
 
 ## Choose an interface
 

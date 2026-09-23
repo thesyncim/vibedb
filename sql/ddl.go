@@ -225,6 +225,9 @@ type CreateIndexStmt struct {
 	HasName bool
 	// Table is the collection indexed.
 	Table string
+	// Method names the index access method: "" is the engine's exact scalar
+	// posting index, "tin" is full-text search over one text path.
+	Method string
 	// Paths are the indexed paths in declared order. One path is a column
 	// index; several form an order-sensitive compound key.
 	Paths []*PathExpr

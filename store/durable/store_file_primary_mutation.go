@@ -1378,7 +1378,7 @@ func (c *Collection) cowBufferedPrimaryMutation(
 
 	leafImage, leafBytes, _, prepareErr := c.preparePrimaryLeafMutation(
 		&preparePath, generation, key, value, deleting, found, slot, leafBounds,
-		state.root.IndexCount == 0,
+		!primarySlotGeometryMaintained(state.root),
 	)
 	if prepareErr != nil {
 		c.unadmitPrimaryMutationFrames()
@@ -1676,7 +1676,7 @@ func (c *Collection) cowPrimaryMutation(
 	}
 	leafImage, leafBytes, _, prepareErr := c.preparePrimaryLeafMutation(
 		path, generation, key, value, deleting, found, slot, leafBounds,
-		state.root.IndexCount == 0,
+		!primarySlotGeometryMaintained(state.root),
 	)
 	if prepareErr != nil {
 		return storeio.PageRef{}, false, false, prepareErr

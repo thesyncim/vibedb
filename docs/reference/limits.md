@@ -171,6 +171,7 @@ exact whole-process memory bound.
 | retired extents | 65,536 default; 16,777,216 hard | default / hard | durable collection, `store/durable/store_file_options.go` |
 | exact index tuple | 4 components; 4,096 encoded bytes | hard | storage codec, `internal/storeio/index_term_key.go` |
 | logical / physical exact indexes | 4,096 aliases / 64 physical | hard | page catalog, `internal/storeio/page_catalog.go` |
+| tin (full-text) index declarations | 64; one path each | hard | page catalog, `internal/storeio/page_catalog.go` |
 | page catalog canonical image | 32 MiB | hard | page catalog, `internal/storeio/page_catalog.go` |
 | transaction decision log | 1 MiB default; 16 MiB hard; 64 participants/record | default / hard | `internal/storeio/txn_marker.go` |
 | Raft WAL file / record / live bytes | 256 MiB / 80 MiB / 128 MiB | zero-value defaults | RF3 WAL, `internal/raftstore/types.go` |

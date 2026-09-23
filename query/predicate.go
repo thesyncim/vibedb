@@ -109,6 +109,13 @@ const (
 	// a live undefined equality operator aborts the statement before existential
 	// negation can turn an ordinary non-match into TRUE.
 	predSQLAntiBound
+	// predMatch is SQL's Path ==> TINQL full-text predicate. The left column
+	// holds the row's text and the right side is one TINQL query, parsed per
+	// execution against the tin index covering the path: expansions resolve
+	// against that index's dictionary, so parsing cannot happen at compile
+	// time. It stays a separate kind rather than a flag on predLike so the
+	// LIKE fast paths keep exactly the code they have today.
+	predMatch
 )
 
 func comparePaths(left string, op Op, right string, operatorPos int) Predicate {
@@ -178,6 +185,15 @@ func Like(path, pattern string) Predicate {
 // characters. Wildcards and escapes retain the same meaning as Like.
 func ILike(path, pattern string) Predicate {
 	return Predicate{kind: predLike, path: path, pattern: pattern, insensitive: true}
+}
+
+// Match tests whether the string at path satisfies a TINQL full-text query,
+// the builder form of SQL's Path ==> 'query'. Non-string, null, and absent
+// values do not match. Execution requires a tin index over path and parses
+// the query against it once per execution, so a prepared Match works against
+// every snapshot while expansions stay pinned to the snapshot being scanned.
+func Match(path, tinql string) Predicate {
+	return Predicate{kind: predMatch, path: path, pattern: tinql}
 }
 
 func isString(path string) Predicate {
@@ -420,8 +436,9 @@ type compiledPredicate struct {
 	needles []vibejson.Index
 
 	// slot addresses this node's late binding in the executing [Workspace] for
-	// predInBound and predAntiBound, or the right extracted column for
-	// predCmpPath. It is an index rather than a pointer because a compiled plan
+	// predInBound and predAntiBound, the right extracted column for
+	// predCmpPath, or the parsed-query slot bindMatches fills for predMatch.
+	// It is an index rather than a pointer because a compiled plan
 	// is immutable and shared by every concurrent execution: the values a join
 	// collects belong to one Exec, so the plan may name where to find them but
 	// must never hold them.
@@ -571,6 +588,21 @@ func (c *compiler) compilePredicate(p Predicate, reg *pathRegistry) (*compiledPr
 		*cp = compiledPredicate{
 			kind: predLike, col: col,
 			pattern: c.internString(p.pattern), insensitive: p.insensitive,
+		}
+		return cp, nil
+	case predMatch:
+		col, err := c.addPath(reg, p.path)
+		if err != nil {
+			return nil, err
+		}
+		// The TINQL text is interned but not parsed: expansions resolve
+		// against the executing snapshot's index dictionary, which compile
+		// time cannot see. bindMatches parses it once per execution. Slot
+		// numbering is a post-compile pass over the finished plan.
+		cp := c.nodes.one()
+		*cp = compiledPredicate{
+			kind: predMatch, col: col, slot: -1,
+			pattern: c.internString(p.pattern),
 		}
 		return cp, nil
 	case predContains:
@@ -1046,6 +1078,8 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int, s *evalScratch) bool 
 	case predLike:
 		cell := cols[p.col][row]
 		return cell.kind == kindString && likeMatch(p.pattern, cell.sval, p.insensitive)
+	case predMatch:
+		return evalMatch(s, p, cols, row)
 	case predInBound:
 		return s.binds[p.slot].matches(cols[p.col][row], &s.probes[p.slot])
 	case predSQLInBound:

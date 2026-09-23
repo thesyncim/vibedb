@@ -635,6 +635,11 @@ func (p *plan) runFileInto(
 	if snapshot == nil {
 		return fmt.Errorf("query: FromFile was given a nil snapshot")
 	}
+	// ==> binds against the driving snapshot's generation-pinned tin
+	// catalog before any scan starts, exactly like the heap sources.
+	if err := p.bindFileMatches(&e.Workspace, snapshot, catalog); err != nil {
+		return err
+	}
 	stats := ExecStats{Workers: n.workers, RowsTotal: snapshot.Len()}
 	if rangeSource != nil && p.requiresSQLDomainScan() {
 		// A native primary range is an optimization hint over the complete
@@ -784,6 +789,12 @@ func (p *plan) runFileOverlayInto(e *Exec, snapshot *durable.Snapshot, overlay F
 	}
 	if snapshot == nil {
 		return fmt.Errorf("query: FromFileOverlay was given a nil snapshot")
+	}
+	// ==> binds against the driving snapshot only: the overlay path
+	// carries no database cut, and staged writes hide terms from
+	// parse-time expansions, so a pending overlay refuses loudly.
+	if err := p.bindFileOverlayMatches(&e.Workspace, snapshot, overlay); err != nil {
+		return err
 	}
 	if overlay == nil {
 		return fmt.Errorf("query: FromFileOverlay was given a nil overlay")
@@ -988,6 +999,10 @@ func (p *plan) runFileSnapshotBatched(
 		e.file.workers[worker].eval.setWork(work)
 		e.file.workers[worker].eval.bindTo(binds)
 		e.file.workers[worker].eval.bindMarks(marks)
+		// Statement-global ==> queries, parsed against the driving and
+		// inner generations before any worker woke. A plan without ==>
+		// binds nil, so a reused Exec never leaks a previous execution.
+		e.file.workers[worker].eval.bindMatches(e.Workspace.matchQueries)
 		e.file.workers[worker].eval.bindCorrelations(e.Workspace.correlations)
 	}
 	pool.start(fileJob{

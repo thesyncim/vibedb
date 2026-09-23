@@ -19,6 +19,7 @@ same revision; [stability and compatibility](status.md) explains the boundaries.
 | --- | --- |
 | Store documents and maintain indexes | [Native API](api/native.md) |
 | Understand keys, JSON values, and index definitions | [Data model](data-model.md) |
+| Search and rank text with tin indexes | [Native search](api/native.md#search-text-with-a-tin-index), [SQL `==>` and `SCORE()`](reference/sql.md#predicates-and-three-valued-logic) |
 | Execute reusable typed plans | [Query API](api/query.md) |
 | Use Go's SQL connection pool | [SQL API](api/sql.md) |
 | Track application SQL compatibility gaps | [SQL workload tracker](compatibility/sql-workload.md) |

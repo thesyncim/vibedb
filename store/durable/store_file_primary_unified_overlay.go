@@ -2051,8 +2051,8 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 	baseRank, baseFound := stripe.FindKey(key)
 	largeUnindexed := stripe.Len() > storeio.CommonPrimaryLeafWideSlots ||
 		!baseFound && stripe.Len() == storeio.CommonPrimaryLeafWideSlots &&
-			state.root.IndexCount == 0
-	if largeUnindexed && state.root.IndexCount != 0 {
+			!primarySlotGeometryMaintained(state.root)
+	if largeUnindexed && primarySlotGeometryMaintained(state.root) {
 		return false, false, false, nil
 	}
 	baseSlot, slotOK := uint8(0), largeUnindexed
@@ -2246,7 +2246,7 @@ func (c *Collection) tryPrimaryUnifiedOverlayDelete(
 		return false, false, false, storeio.ErrCommonPrimaryLeafCorrupt
 	}
 	largeUnindexed := stripe.Len() > storeio.CommonPrimaryLeafWideSlots
-	if largeUnindexed && state.root.IndexCount != 0 {
+	if largeUnindexed && primarySlotGeometryMaintained(state.root) {
 		return false, false, false, nil
 	}
 	baseRank, baseFound := stripe.FindKey(key)

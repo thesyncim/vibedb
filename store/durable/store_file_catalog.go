@@ -41,6 +41,7 @@ func planFilePageCatalog(
 	size := catalog.CanonicalSize()
 	definition := catalog.Definition()
 	semanticEmpty := len(definition.Indexes) == 0 &&
+		len(definition.TinIndexes) == 0 &&
 		len(definition.SkipPaths) == 0 &&
 		definition.Schema == nil
 	if size == 0 {
@@ -162,6 +163,7 @@ func (p filePageCatalogPlan) ref(ordinal uint16) storeio.PageRef {
 func fileStoreCollectionOptionFlags(
 	options store.Options,
 	hasSkipIndexes bool,
+	hasTinIndexes bool,
 	hasOpaqueValues bool,
 ) uint32 {
 	var flags uint32
@@ -171,10 +173,23 @@ func fileStoreCollectionOptionFlags(
 	if hasSkipIndexes {
 		flags |= storeio.StateOptionSkipIndexes
 	}
+	if hasTinIndexes {
+		flags |= storeio.StateOptionTinIndexes
+	}
 	if hasOpaqueValues {
 		flags |= storeio.StateOptionOpaqueValues
 	}
 	return flags
+}
+
+// hasTinIndexDefinitions reports whether any definition declares full text.
+func hasTinIndexDefinitions(definitions []store.IndexDefinition) bool {
+	for _, definition := range definitions {
+		if definition.Kind == store.IndexTin {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeOpenedFileStoreOptions reconstructs every frozen collection option
@@ -192,7 +207,8 @@ func normalizeOpenedFileStoreOptions(
 		)
 	}
 	definition := catalog.Definition()
-	hasIndexes := len(definition.Indexes) != 0
+	hasIndexes := len(definition.Indexes) != 0 || len(definition.TinIndexes) != 0
+	hasTinIndexes := len(definition.TinIndexes) != 0
 	hasSkipIndexes := len(definition.SkipPaths) != 0
 	hasSchema := definition.Schema != nil
 	hasOpaqueValues := root.Options&storeio.StateOptionOpaqueValues != 0
@@ -204,6 +220,7 @@ func normalizeOpenedFileStoreOptions(
 	if root.IndexCount != uint32(catalog.PhysicalIndexCount()) ||
 		(root.Options&storeio.StateOptionSchema != 0) != hasSchema ||
 		(root.Options&storeio.StateOptionSkipIndexes != 0) != hasSkipIndexes ||
+		(root.Options&storeio.StateOptionTinIndexes != 0) != hasTinIndexes ||
 		opaqueCatalogConflict ||
 		(root.PageCatalogBytes != 0) !=
 			(hasIndexes || hasSkipIndexes || hasSchema) {
@@ -249,10 +266,10 @@ func normalizeOpenedFileStoreOptions(
 	}
 	persistedFlags := root.Options &
 		(storeio.StateOptionSchema | storeio.StateOptionSkipIndexes |
-			storeio.StateOptionOpaqueValues)
+			storeio.StateOptionTinIndexes | storeio.StateOptionOpaqueValues)
 	assertedFlags := fileStoreCollectionOptionFlags(
 		supplied.Collection, len(supplied.SkipIndexes) != 0,
-		supplied.OpaqueValues,
+		hasTinIndexDefinitions(supplied.Indexes), supplied.OpaqueValues,
 	)
 	if assertedFlags&^persistedFlags != 0 {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
@@ -271,12 +288,23 @@ func normalizeOpenedFileStoreOptions(
 	options.Collection.IndexOptions.MaxDepth = int(root.IndexMaxDepth)
 	if options.Indexes == nil {
 		options.Indexes = make(
-			[]store.IndexDefinition, len(definition.Indexes),
+			[]store.IndexDefinition,
+			len(definition.Indexes)+len(definition.TinIndexes),
 		)
 		for i, index := range definition.Indexes {
 			options.Indexes[i] = store.IndexDefinition{
 				Name: index.Name, Paths: slices.Clone(index.Paths),
 				Unique: index.Unique,
+			}
+		}
+		// Tin declarations round-trip with their Kind so the re-derived
+		// canonical catalog below reproduces the persisted tin section
+		// byte-for-byte. Postings build lazily per generation on first
+		// query use, so snapshots advertise these as IndexReady.
+		for i, tin := range definition.TinIndexes {
+			options.Indexes[len(definition.Indexes)+i] = store.IndexDefinition{
+				Name: tin.Name, Paths: []string{tin.Path},
+				Kind: store.IndexTin,
 			}
 		}
 	}
@@ -328,7 +356,7 @@ func normalizeOpenedFileStoreOptions(
 		persistedFlags !=
 			fileStoreCollectionOptionFlags(
 				normalized.Collection, len(normalized.SkipIndexes) != 0,
-				normalized.OpaqueValues,
+				len(normalized.tinIndexes) != 0, normalized.OpaqueValues,
 			) {
 		return normalizedFileStoreOptions{}, fmt.Errorf(
 			"%w: state summaries disagree with canonical catalog",
