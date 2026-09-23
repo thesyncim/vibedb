@@ -640,7 +640,7 @@ func (workload *seamlessScaleWorkload) WindowUntil(ctx context.Context, phase st
 // later latency and continuity measurement would describe the backlog rather
 // than the system (coordinated omission). Candidates descend until one holds.
 // Every candidate keeps each phase above seamlessScaleMinimumSamples.
-var seamlessScaleCalibrationRates = []int{seamlessScaleOfferedRate, 1_000, 800, 600}
+var seamlessScaleCalibrationRates = []int{seamlessScaleOfferedRate, 1_000, 800, 600, 400}
 
 func calibrateSeamlessScaleRate(t *testing.T, workload *seamlessScaleWorkload, ctx context.Context) (int, seamlessScalePhaseEvidence) {
 	t.Helper()
@@ -652,10 +652,12 @@ func calibrateSeamlessScaleRate(t *testing.T, workload *seamlessScaleWorkload, c
 			// Capacity selection must never conceal an operation/data failure.
 			t.Fatalf("scale calibration operation failure: errors=%d timeouts=%d", probe.Errors, probe.Timeouts)
 		}
-		sustained := probe.ThroughputMilli*1_000_000 >= probe.OfferedRateMilli*seamlessScaleSustainedThroughputPPM &&
+		// Throughput is measured over the whole span including the final
+		// drain, so a queue that outgrows the offered rate lowers it.
+		sustained := probe.ThroughputMilli*1_000_000 >= uint64(candidate)*1_000*seamlessScaleSustainedThroughputPPM &&
 			probe.QueueLagP99NS <= uint64(seamlessScaleSustainedQueueLag)
-		t.Logf("scale calibration rate=%d sustained=%t throughput_milli=%d offered_milli=%d queue_lag_p99=%s max_window_gap=%s",
-			candidate, sustained, probe.ThroughputMilli, probe.OfferedRateMilli,
+		t.Logf("scale calibration rate=%d sustained=%t throughput_milli=%d queue_lag_p99=%s max_window_gap=%s",
+			candidate, sustained, probe.ThroughputMilli,
 			time.Duration(probe.QueueLagP99NS), time.Duration(probe.CompletionGapNS))
 		if probe.Scheduled >= uint64(candidate)*uint64(5*seamlessScaleWindowDuration/time.Second) && probe.Started == probe.Scheduled &&
 			probe.Completed == probe.Started && probe.Missed == 0 && sustained {
