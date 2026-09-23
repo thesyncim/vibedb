@@ -1646,6 +1646,7 @@ func (authority *ReplicatedCatalogAuthority) PutScalingIntent(ctx context.Contex
 	}
 	var drainNodeResult ReplicatedPointResult
 	var drainNodeKey []byte
+	var gatewayDrainAdmission bool
 	if intent.Request.Kind == ScalingScaleIn || intent.Request.Kind == ScalingDecommission {
 		if !intent.Request.Drain.Valid() {
 			return ErrScalingIdentity
@@ -1665,28 +1666,30 @@ func (authority *ReplicatedCatalogAuthority) PutScalingIntent(ctx context.Contex
 		if current.Found && drainNode.Lifecycle != NodeActive && drainNode.Lifecycle != NodeDraining && drainNode.Lifecycle != NodeDecommissioned {
 			return ErrScalingState
 		}
-		// A gateway frontend has one irreversible admission fence.  Refuse a
-		// second distinct decommission while the first gateway intent is still
-		// live, before this intent can be published and before its frontend can
-		// reserve a drain slot or close admission.  The scaling-intent directory
-		// mutation below is a digest CAS, so two authorities racing from the
-		// same cut cannot both pass this check.
-		if !current.Found && intent.Request.Kind == ScalingDecommission &&
-			drainNode.Roles&NodeRoleGateway != 0 {
-			activeGatewayDrains, readErr := authority.activeGatewayFrontendDrainIDs(ctx)
-			if readErr != nil {
-				return readErr
-			}
-			for activeID := range activeGatewayDrains {
-				if activeID != intent.ID {
-					return errors.Join(ErrScalingState, ErrConcurrentFrontendDrain)
-				}
-			}
-		}
+		gatewayDrainAdmission = !current.Found && intent.Request.Kind == ScalingDecommission &&
+			drainNode.Roles&NodeRoleGateway != 0
 	}
 	directoryResult, err := authority.readRaw(ctx, scalingIntentDirectoryKey, maxScalingIntentDirectoryBytes)
 	if err != nil {
 		return err
+	}
+	// A gateway frontend has one irreversible admission fence.  Refuse a
+	// second distinct decommission while the first gateway intent is still
+	// live, before this intent can be published and before its frontend can
+	// reserve a drain slot or close admission.  The guard is evaluated against
+	// exactly the directory bytes the digest CAS below expects, so two
+	// authorities racing from one cut cannot both pass it: a guard read at an
+	// earlier cut than the CAS would admit both.
+	if gatewayDrainAdmission {
+		activeGatewayDrains, readErr := authority.activeGatewayFrontendDrainIDsAt(ctx, directoryResult)
+		if readErr != nil {
+			return readErr
+		}
+		for activeID := range activeGatewayDrains {
+			if activeID != intent.ID {
+				return errors.Join(ErrScalingState, ErrConcurrentFrontendDrain)
+			}
+		}
 	}
 	var completionFences []NativeMutation
 	if intent.State == ScalingComplete &&
@@ -1814,6 +1817,42 @@ func (authority *ReplicatedCatalogAuthority) activeGatewayFrontendDrainIDs(
 	if err != nil {
 		return nil, err
 	}
+	return authority.gatewayFrontendDrainIDs(ctx, intents)
+}
+
+// activeGatewayFrontendDrainIDsAt derives the active gateway drains from one
+// exact scaling-intent directory cut. Each record must match its directory
+// digest, so a caller that CASes on the same directory bytes admits against
+// precisely the intents it evaluated.
+func (authority *ReplicatedCatalogAuthority) activeGatewayFrontendDrainIDsAt(
+	ctx context.Context, directoryResult ReplicatedPointResult,
+) (map[[32]byte]struct{}, error) {
+	if authority == nil || ctx == nil {
+		return nil, ErrInvalidScalingMetadata
+	}
+	if !directoryResult.Found {
+		return map[[32]byte]struct{}{}, nil
+	}
+	entries, err := openScalingIDDirectory(directoryResult.Value, scalingIntentDirectoryDocumentID[:], maxScalingIntentDirectoryBytes, MaxScalingIntents)
+	if err != nil {
+		return nil, err
+	}
+	intents := make([]ScalingIntent, len(entries))
+	for index, entry := range entries {
+		var id [32]byte
+		copy(id[:], entry.ID)
+		// A digest mismatch means the directory moved past this cut; the CAS
+		// would fail anyway, so surface the conflict for the caller to retry.
+		if intents[index], err = authority.readScalingIntentDirectoryEntry(ctx, id, entry); err != nil {
+			return nil, err
+		}
+	}
+	return authority.gatewayFrontendDrainIDs(ctx, intents)
+}
+
+func (authority *ReplicatedCatalogAuthority) gatewayFrontendDrainIDs(
+	ctx context.Context, intents []ScalingIntent,
+) (map[[32]byte]struct{}, error) {
 	active := make(map[[32]byte]struct{})
 	for _, intent := range intents {
 		if intent.State >= ScalingComplete || intent.Request.Kind != ScalingDecommission ||

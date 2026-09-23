@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore/seglog"
@@ -822,7 +823,27 @@ func (s *NodeStore) publishGroupCheckpointSequenced(group uint64, snapshot *pb.S
 	return nil
 }
 
-func (s *NodeStore) PersistWave(ready []NodeReady) error { return s.persistWave(ready, false) }
+func (s *NodeStore) PersistWave(ready []NodeReady) error { return s.persistUnsequencedWave(ready) }
+
+// persistUnsequencedWave is the synchronous (no device sequencer) persist
+// path. Seal backpressure is transient engine maintenance, not a refusal of
+// the Ready: like the device sequencer, wait for the pending seal and retry
+// the exact wave so direct callers observe only durable success or a real
+// failure.
+func (s *NodeStore) persistUnsequencedWave(ready []NodeReady) error {
+	for {
+		err := s.persistWave(ready, false)
+		if !errors.Is(err, ErrDurabilityBackpressure) {
+			return err
+		}
+		if waitErr := s.engine.WaitSeal(); waitErr != nil {
+			return errors.Join(ErrPersistenceUnknown, err, waitErr)
+		}
+		// Backpressure without a pending seal means the metadata lane is
+		// replenishing reserves or checkpointing; yield so it can publish.
+		time.Sleep(50 * time.Microsecond)
+	}
+}
 
 // PersistReadySeries persists one bounded same-group series as one logical
 // node wave batch. The caller's descriptors and every value reachable through
@@ -838,12 +859,12 @@ func (s *NodeStore) PersistReadySeries(group uint64, batches []raftmodel.Persist
 		if s == nil {
 			return ErrBounds
 		}
-		return s.persistWave([]NodeReady{{GroupID: group, seriesCount: uint8(MaxReadySeries + 1)}}, false)
+		return s.persistUnsequencedWave([]NodeReady{{GroupID: group, seriesCount: uint8(MaxReadySeries + 1)}})
 	}
 	var item NodeReady
 	item.GroupID, item.seriesCount = group, uint8(len(batches))
 	copy(item.series[:], batches)
-	return s.persistWave([]NodeReady{item}, false)
+	return s.persistUnsequencedWave([]NodeReady{item})
 }
 
 func (s *NodeStore) persistSequencedWave(ready []NodeReady) error { return s.persistWave(ready, true) }
