@@ -129,6 +129,33 @@ func FuzzParseStatement(f *testing.F) {
 	})
 }
 
+// isSourceIndependentSelect reports whether s is a FROM-less SELECT over
+// literals and parameters, mirroring validateSourceIndependentColumns. It
+// fails the test on any column the parser should have refused, so the
+// carve-out cannot hide a grammar hole.
+func isSourceIndependentSelect(t *testing.T, s *Statement) bool {
+	t.Helper()
+	if s.Kind != KindSelect || s.Select == nil || len(s.Select.From) != 0 {
+		return false
+	}
+	for i := range s.Select.Columns {
+		column := &s.Select.Columns[i]
+		switch {
+		case column.Window != nil:
+			t.Fatalf("FROM-less SELECT accepted a window expression")
+		case column.Agg != AggNone:
+			t.Fatalf("FROM-less SELECT accepted an aggregate")
+		case column.Scalar != nil:
+			if hasPath, hasAggregate := scalarDependencyKinds(column.Scalar); hasPath || hasAggregate {
+				t.Fatalf("FROM-less SELECT accepted a path or aggregate scalar")
+			}
+		default:
+			t.Fatalf("FROM-less SELECT accepted a non-scalar output")
+		}
+	}
+	return true
+}
+
 // checkAnyStatement asserts what an accepted statement of any kind promises.
 func checkAnyStatement(t *testing.T, s *Statement) {
 	t.Helper()
@@ -147,7 +174,8 @@ func checkAnyStatement(t *testing.T, s *Statement) {
 		t.Fatalf("an accepted statement carries %d bodies, want exactly 1", bodies)
 	}
 	if s.Table() == "" && s.Kind != KindDropIndex &&
-		!(s.Kind == KindSelect && s.Select != nil && s.Select.Set != nil) {
+		!(s.Kind == KindSelect && s.Select != nil && s.Select.Set != nil) &&
+		!isSourceIndependentSelect(t, s) {
 		t.Fatal("an accepted statement names no collection")
 	}
 	switch s.Kind {
