@@ -916,6 +916,12 @@ type ReplicatedRefusalError struct {
 }
 
 func (e *ReplicatedRefusalError) Error() string {
+	if e.Outcome.Code != 0 {
+		// Deterministic and retry-retired refusals carry the state machine's
+		// exact outcome; without it the refusal class alone is ambiguous.
+		return fmt.Sprintf("gateway: replicated shard refusal %d (outcome %d applied=%d)",
+			e.Code, e.Outcome.Code, e.Outcome.AppliedIndex)
+	}
 	return fmt.Sprintf("gateway: replicated shard refusal %d", e.Code)
 }
 

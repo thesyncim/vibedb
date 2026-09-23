@@ -178,3 +178,27 @@ func mustOpenCommand(t testing.TB, raw []byte) replication.CommandView {
 	}
 	return command
 }
+
+// An Open superseded by another attempt of the same wave is recoverable from
+// the refreshed ledger cut whether the session retired it or still holds the
+// later command unacknowledged. Any other refusal fails the wave closed.
+func TestDurableRequestSupersededOpenRefusalClassification(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"retry retired", &ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalRetryRetired,
+			Outcome: raftserve.Outcome{Code: raftserve.OutcomeRetryRetired}}, true},
+		{"active session superseded", &ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalDeterministic,
+			Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionActive, AppliedIndex: 41}}, true},
+		{"other deterministic outcome", &ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalDeterministic,
+			Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionSequence, AppliedIndex: 41}}, false},
+		{"stale fence", &ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalStaleFence}, false},
+		{"plain error", ErrDurableRequestConflict, false},
+	} {
+		if got := durableRequestRetiredOpenRefusal(test.err); got != test.want {
+			t.Errorf("%s: recoverable=%t, want %t", test.name, got, test.want)
+		}
+	}
+}
