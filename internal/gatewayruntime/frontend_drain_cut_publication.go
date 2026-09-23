@@ -65,7 +65,7 @@ func (runtime *Runtime) publishCanonicalFrontendDrainCut(
 		}
 		// Keep the local semantic receiver at the same complete cut that the
 		// next physical round will install. This call is intentionally below
-		// refreshLiveControlDirectory's mutex; the caller already owns it.
+		// refreshLiveControlDirectory's gate; the caller already owns it.
 		if applyErr := runtime.applyLiveControlDirectoryProjection(ctx, projection); applyErr != nil {
 			return applyErr
 		}

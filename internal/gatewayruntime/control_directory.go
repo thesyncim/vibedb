@@ -647,14 +647,15 @@ func (runtime *Runtime) applyLiveControlDirectoryProjection(
 // service-directory projections. Online table provisioning uses this fence
 // before reporting CREATE success so an immediately following topology DDL
 // cannot race the periodic directory refresh.
-func (runtime *Runtime) refreshLiveControlDirectory(ctx context.Context) error {
+func (runtime *Runtime) refreshLiveControlDirectory(ctx context.Context) (err error) {
 	if runtime == nil || ctx == nil {
 		return errGatewayControlDirectory
 	}
-	if err := runtime.lockControlDirectoryRefresh(ctx); err != nil {
+	ticket, run, err := runtime.controlDirectoryRefresh.acquire(ctx)
+	if err != nil || !run {
 		return err
 	}
-	defer runtime.controlDirectoryRefreshMu.Unlock()
+	defer func() { ticket.release(err) }()
 	projection, err := runtime.readLiveControlDirectoryProjection(ctx)
 	if err != nil {
 		return fmt.Errorf("read live control directory: %w", err)
@@ -688,37 +689,6 @@ func (runtime *Runtime) refreshLiveControlDirectory(ctx context.Context) error {
 		runtime.publishedFrontendDrainCutValid = false
 	}
 	return nil
-}
-
-// lockControlDirectoryRefresh keeps cancellation effective while another
-// refresh is still waiting on a slow receiver. A plain Mutex.Lock here would
-// let a dead peer strand DDL callers until the previous round's transport
-// deadline expires.
-func (runtime *Runtime) lockControlDirectoryRefresh(ctx context.Context) error {
-	if runtime == nil || ctx == nil {
-		return errGatewayControlDirectory
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	const poll = 5 * time.Millisecond
-	for {
-		if runtime.controlDirectoryRefreshMu.TryLock() {
-			return nil
-		}
-		timer := time.NewTimer(poll)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			return context.Cause(ctx)
-		case <-timer.C:
-		}
-	}
 }
 
 func (runtime *Runtime) runControlDirectory() {

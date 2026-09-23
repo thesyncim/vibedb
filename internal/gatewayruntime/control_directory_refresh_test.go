@@ -20,13 +20,16 @@ import (
 
 func TestRefreshLiveControlDirectoryCancellationWhileWaitingForRound(t *testing.T) {
 	runtime := new(Runtime)
-	runtime.controlDirectoryRefreshMu.Lock()
-	defer runtime.controlDirectoryRefreshMu.Unlock()
+	held, run, err := runtime.controlDirectoryRefresh.acquire(t.Context())
+	if err != nil || !run {
+		t.Fatalf("hold prior round: run=%t err=%v", run, err)
+	}
+	defer held.release(errors.New("prior round still running"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	err := runtime.refreshLiveControlDirectory(ctx)
+	err = runtime.refreshLiveControlDirectory(ctx)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("refresh waiting on prior round err=%v, want deadline exceeded", err)
 	}

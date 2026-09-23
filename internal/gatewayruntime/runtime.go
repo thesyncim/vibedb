@@ -230,7 +230,7 @@ type Runtime struct {
 	preparedAckPhysicalOpener       frontendDrainPreparedAckPhysicalOpener
 	clusterControlOpener            *gatewayClusterControlOpener
 	drainCoordinator                *gateway.ClusterCatalogDrainCoordinator
-	controlDirectoryRefreshMu       sync.Mutex
+	controlDirectoryRefresh         controlRefreshGate
 	publishedFrontendDrainCutDigest replication.Digest
 	publishedFrontendDrainCutValid  bool
 	controlRosterMu                 sync.RWMutex
