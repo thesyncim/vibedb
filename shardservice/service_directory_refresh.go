@@ -89,7 +89,12 @@ func (server *ReplicatedServer) authorizeReplicatedPeerWithDirectoryRefresh(
 		return false
 	}
 	if !directory.ServiceCutRefreshNeeded(peer, request.Authority, request.Continuation, scope) {
-		return false
+		// The gate's state is replaced in place when a cut is installed, so a
+		// concurrent refresh can land between the failed authorization above
+		// and this check, which then sees the resource and reports no refresh
+		// needed. Authorize once more against the current state before denying;
+		// this reads no source and so exposes nothing beyond a normal check.
+		return server.authorizeReplicatedPeerWithDirectory(server.directory.Load(), peer, request)
 	}
 	if err := server.refreshServiceDirectoryCut(ctx); err != nil {
 		return false
