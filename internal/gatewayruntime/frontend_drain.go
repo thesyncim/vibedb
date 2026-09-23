@@ -362,8 +362,8 @@ func (runtime *Runtime) scanLocalGatewayParticipant(
 		authenticatedGatewayKey != record.Gateway.ServiceKeyDigest {
 		return gateway.GatewayParticipantEvidence{}, fmt.Errorf(
 			"%w: gateway TLS identity node=%s key=%x; directory gateway node=%s key=%x",
-			gateway.ErrScalingRevision, authenticatedGatewayNode, authenticatedGatewayKey,
-			record.Gateway.NodeID, record.Gateway.ServiceKeyDigest,
+			gateway.ErrScalingRevision, nodeIDHex(authenticatedGatewayNode), authenticatedGatewayKey,
+			nodeIDHex(record.Gateway.NodeID), record.Gateway.ServiceKeyDigest,
 		)
 	}
 	ack := runtime.FrontendDrainStatus()
@@ -379,10 +379,10 @@ func (runtime *Runtime) scanLocalGatewayParticipant(
 		return gateway.GatewayParticipantEvidence{}, fmt.Errorf(
 			"%w: frontend identity node=%s/%d gateway=%s/%d key=%x session=%x/%d revision=%d generation=%d; directory node=%s/%d gateway=%s/%d key=%x session=%x/%d revision=%d generation=%d",
 			gateway.ErrScalingRevision,
-			identity.NodeID, identity.Incarnation, identity.GatewayNodeID, identity.GatewayIncarnation,
+			nodeIDHex(identity.NodeID), identity.Incarnation, nodeIDHex(identity.GatewayNodeID), identity.GatewayIncarnation,
 			identity.GatewayServiceKeyDigest, identity.SessionID, identity.SessionRevision,
 			identity.NodeRevision, identity.CatalogGeneration,
-			record.NodeID, record.Incarnation, record.Gateway.NodeID, record.Gateway.Incarnation,
+			nodeIDHex(record.NodeID), record.Incarnation, nodeIDHex(record.Gateway.NodeID), record.Gateway.Incarnation,
 			record.Gateway.ServiceKeyDigest, record.Gateway.SessionID, record.Gateway.SessionRevision,
 			record.Revision, record.CatalogGeneration,
 		)
@@ -390,7 +390,7 @@ func (runtime *Runtime) scanLocalGatewayParticipant(
 	if identity.DirectoryRevision == 0 {
 		return gateway.GatewayParticipantEvidence{}, fmt.Errorf(
 			"%w: frontend identity has no directory revision (node=%s/%d)",
-			gateway.ErrScalingRevision, identity.NodeID, identity.Incarnation,
+			gateway.ErrScalingRevision, nodeIDHex(identity.NodeID), identity.Incarnation,
 		)
 	}
 	active := !ack.AdmissionDrained || ack.ActiveNativeConnections != 0 ||

@@ -148,12 +148,12 @@ func (runtime *Runtime) publishCanonicalFrontendDrainCutOnce(
 				if request.DrainID == ([32]byte{}) && frontendDrainPreparedAckReceiverUnreachable(err) {
 					if runtime.config.Logf != nil {
 						runtime.config.Logf("gatewayruntime: skip unreachable prepared-ack receiver %s incarnation %d: %v",
-							receiver.node.NodeID, receiver.node.Incarnation, err)
+							nodeIDHex(receiver.node.NodeID), receiver.node.Incarnation, err)
 					}
 					lastUnreachable = err
 					continue
 				}
-				return fmt.Errorf("prepared-ack receiver %s incarnation %d: %w", receiver.node.NodeID,
+				return fmt.Errorf("prepared-ack receiver %s incarnation %d: %w", nodeIDHex(receiver.node.NodeID),
 					receiver.node.Incarnation, err)
 			}
 			runtime.frontendDrainAckedReceivers[ackedKey] = struct{}{}
