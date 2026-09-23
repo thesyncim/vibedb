@@ -64,9 +64,3 @@ func (c *Collection) effectiveRecoveryFloor(current uint64) uint64 {
 
 // exactRootRecoveryFloorForTest exposes the installed floor to package tests
 // without making it a detached public authority.
-func (c *Collection) exactRootRecoveryFloorForTest() uint64 {
-	if c == nil {
-		return 0
-	}
-	return c.exactRootRecoveryFloor.Load()
-}

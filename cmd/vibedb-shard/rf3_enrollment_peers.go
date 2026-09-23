@@ -300,26 +300,6 @@ func sameRF3PhysicalPeerIdentity(left, right rafttransport.PhysicalPeer) bool {
 		left.Address == right.Address && left.State == right.State
 }
 
-func rf3MembershipGrantForGroup(manifest rf3Manifest, group raftmember.GroupKey) (membershipgrant.Grant, bool, error) {
-	if group == (raftmember.GroupKey{}) {
-		return membershipgrant.Grant{}, false, errRF3EnrollmentPeerReceipt
-	}
-	var path string
-	for _, bundle := range manifest.groupBundles() {
-		if bundle.Route.Group != group {
-			continue
-		}
-		if path != "" && path != bundle.Route.MembershipGrantPath {
-			return membershipgrant.Grant{}, false, errRF3EnrollmentPeerReceipt
-		}
-		path = bundle.Route.MembershipGrantPath
-	}
-	if path == "" {
-		return membershipgrant.Grant{}, false, errRF3EnrollmentPeerReceipt
-	}
-	return readRF3MembershipGrant(path)
-}
-
 // rf3RecoveredEnrollmentRoster reconstructs endpoints from the authenticated
 // enrollment chain, and roles only from durable Raft membership. Historical
 // receipts prove identities; they do not accumulate live member mappings.

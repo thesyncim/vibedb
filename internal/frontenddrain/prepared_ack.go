@@ -14,7 +14,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"math"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -285,12 +284,6 @@ func serviceDirectoryDigest(directory serviceauthz.ServiceDirectoryCut) [32]byte
 
 // ServiceDirectoryCutDigest computes the canonical digest carried by a full
 // source cut. Callers must pass a validated, canonical directory cut.
-func ServiceDirectoryCutDigest(directory serviceauthz.ServiceDirectoryCut) [32]byte {
-	if !directory.Valid() {
-		return [32]byte{}
-	}
-	return serviceDirectoryDigest(directory)
-}
 
 func canonicalPreparedAckCut(cut PreparedAckCut) (PreparedAckCut, error) {
 	if !cut.valid() {
@@ -522,9 +515,3 @@ func OpenPreparedAckResponse(raw []byte, request PreparedAckRequest) (PreparedAc
 }
 
 // MaxFrameBytes is exported for listener-side accounting and tests.
-func MaxFrameBytes() int {
-	if MaxPreparedAckCutBytes > math.MaxInt-preparedAckHeaderBytes-preparedAckDigestBytes {
-		return math.MaxInt
-	}
-	return preparedAckHeaderBytes + int(MaxPreparedAckCutBytes) + preparedAckDigestBytes
-}

@@ -346,10 +346,6 @@ func (s *Service) Stats() Stats {
 		Chunks:           s.chunks.Load(), Bytes: s.bytes.Load(), Budget: s.budget.Metrics()}
 }
 
-func expectedChunkBytes(d Descriptor, offset uint64) uint64 {
-	return expectedChunkBytesLimited(d, offset, d.ChunkBytes)
-}
-
 func expectedChunkBytesLimited(d Descriptor, offset uint64, limit uint32) uint64 {
 	if offset >= d.ArtifactBytes {
 		return 0

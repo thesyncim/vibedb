@@ -69,9 +69,6 @@ type PlanView struct {
 	recipe []byte
 }
 
-func (view PlanView) Bytes() []byte  { return view.raw[:len(view.raw):len(view.raw)] }
-func (view PlanView) Recipe() []byte { return view.recipe[:len(view.recipe):len(view.recipe)] }
-
 // AppendPlan wraps one already-canonical protocol recipe. Large callers stream
 // the same bytes through page records without creating a second aggregate copy.
 func AppendPlan(dst, recipe []byte) ([]byte, error) {

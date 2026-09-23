@@ -251,27 +251,6 @@ func assertPublicationEqual(
 	}
 }
 
-func normalBatchRetryCommands(
-	t testing.TB,
-	binding Binding,
-	firstSequence uint64,
-	count int,
-) [][]byte {
-	t.Helper()
-	commands := make([][]byte, count)
-	for index := range commands {
-		sequence := firstSequence + uint64(index)
-		command := commandValue(binding, sequence)
-		command.Batches[0].Mutations = []replication.Mutation{{
-			Kind:  replication.MutationPut,
-			Key:   []byte{0, byte(sequence % 4), 0xff},
-			Value: []byte{'{', '"', 'n', '"', ':', byte('0' + sequence%10), '}'},
-		}}
-		commands[index] = encodeCommand(t, command)
-	}
-	return commands
-}
-
 func openDistinctBatchSessions(
 	t testing.TB,
 	machine *Machine,

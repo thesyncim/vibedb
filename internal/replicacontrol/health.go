@@ -16,7 +16,6 @@ var healthObservationMagic = [8]byte{'V', 'B', 'R', 'H', 'E', 'A', 'L', 0}
 
 // HealthObservationDiscriminator identifies the fixed health response
 // grammar. It is deliberately distinct from the complete-cut response magic.
-func HealthObservationDiscriminator() [8]byte { return healthObservationMagic }
 
 // HealthObservation is the bounded liveness result used by revision control.
 // It has no State, Publication, progress map, or snapshot certificate.

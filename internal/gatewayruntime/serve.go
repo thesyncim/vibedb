@@ -1134,23 +1134,6 @@ func startGatewayRecovery(
 	return done
 }
 
-func serveAuthenticatedGateway(ctx context.Context, listener net.Listener, exec *gateway.Executor,
-	capability *gateway.ClientTLS, limits gateway.ClientTLSLimits, logf func(string, ...any)) error {
-	return serveAuthenticatedGatewayData(ctx, listener, exec, nil, capability, limits, logf)
-}
-
-func serveAuthenticatedGatewayData(
-	ctx context.Context,
-	listener net.Listener,
-	exec *gateway.Executor,
-	data nativeDataReader,
-	capability *gateway.ClientTLS,
-	limits gateway.ClientTLSLimits,
-	logf func(string, ...any),
-) error {
-	return serveAuthenticatedGatewayDurableData(ctx, listener, exec, data, nil, capability, limits, logf)
-}
-
 func serveAuthenticatedGatewayDurableData(
 	ctx context.Context,
 	listener net.Listener,
@@ -1208,29 +1191,9 @@ func (listener *gatewayCancellationListener) Accept() (net.Conn, error) {
 	return conn, err
 }
 
-func handleConnAuthorized(ctx context.Context, conn net.Conn, exec *gateway.Executor,
-	capability *gateway.ClientTLS, logf func(string, ...any)) {
-	handleConnAuthorizedData(ctx, conn, exec, nil, capability, logf)
-}
-
-func handleConnAuthorizedData(ctx context.Context, conn net.Conn, exec *gateway.Executor,
-	data nativeDataReader, capability *gateway.ClientTLS, logf func(string, ...any)) {
-	handleConnPolicy(ctx, conn, exec, data, logf, func(required serviceauthz.Capability) bool {
-		return capability.Authorize(ctx, required, nil) == serviceauthz.DecisionAllow
-	})
-}
-
 // handleConn serves newline-delimited JSON requests on one connection until the
 // peer disconnects or the server shuts down. Closing the connection when ctx is
 // done unblocks a blocked decode so a signaled shutdown drains promptly.
-func handleConn(ctx context.Context, conn net.Conn, exec *gateway.Executor, logf func(string, ...any)) {
-	handleConnData(ctx, conn, exec, nil, logf)
-}
-
-func handleConnData(ctx context.Context, conn net.Conn, exec *gateway.Executor,
-	data nativeDataReader, logf func(string, ...any)) {
-	handleConnPolicy(ctx, conn, exec, data, logf, nil)
-}
 
 func handleConnPolicy(ctx context.Context, conn net.Conn, exec *gateway.Executor,
 	data nativeDataReader, logf func(string, ...any), authorize func(serviceauthz.Capability) bool) {

@@ -21,7 +21,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/store/durable"
-	"github.com/thesyncim/vibejson"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
@@ -718,32 +717,6 @@ func checkedTxnBytes(userBatchBytes, systemBatchBytes int) (int64, bool) {
 		return 0, false
 	}
 	return userBytes + systemBytes, true
-}
-
-func validateExistingRows(snapshot *durable.Snapshot, target CollectionTarget) error {
-	if target.Validation != ValidationDeterministicMutation {
-		return nil
-	}
-	return snapshot.RangeRaw(func(key, value []byte) error {
-		if err := vibejson.Validate(value); err != nil {
-			return fmt.Errorf("%w: malformed JSON in existing row", ErrSchemaProfile)
-		}
-		switch validation := target.Validator.ValidatePut(key, value); validation {
-		case MutationValidationAccept:
-			return nil
-		case MutationValidationInvalid:
-			return fmt.Errorf("%w: mutation validator rejected an existing row", ErrSchemaProfile)
-		case MutationValidationTargetBound:
-			return fmt.Errorf("%w: existing row exceeds the mutation validator target", ErrSchemaProfile)
-		case MutationValidationWrongShard:
-			return fmt.Errorf("%w: existing row belongs to another shard", ErrSchemaProfile)
-		default:
-			return fmt.Errorf(
-				"%w: mutation validator returned %d for an existing row",
-				ErrInvalidCollection, validation,
-			)
-		}
-	})
 }
 
 func validateBootstrap(snapshot *pb.Snapshot) ([]byte, [32]byte, error) {
@@ -2086,10 +2059,6 @@ func (m *Machine) immutableBindingMatches(command replication.CommandView) bool 
 		bytes.Equal(command.Shard, m.shard) &&
 		command.AllocationGeneration == b.AllocationGeneration &&
 		command.ShardIncarnation == b.ShardIncarnation && command.GroupID == b.GroupID
-}
-
-func (m *Machine) mutableBindingMatches(command replication.CommandView) bool {
-	return m.mutableBindingMatchesState(command, m.state)
 }
 
 func (m *Machine) mutableBindingMatchesState(command replication.CommandView, state State) bool {

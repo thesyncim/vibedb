@@ -169,13 +169,6 @@ func OpenRecord(raw []byte) (Record, error) {
 	return record, nil
 }
 
-func RecordDigest(encoded []byte) (Digest, error) {
-	if _, err := OpenRecord(encoded); err != nil {
-		return Digest{}, err
-	}
-	return Digest(sha256.Sum256(encoded)), nil
-}
-
 func sealSHA(frame []byte, domain []byte) {
 	hash := sha256.New()
 	_, _ = hash.Write(domain)

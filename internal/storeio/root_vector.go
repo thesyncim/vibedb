@@ -102,13 +102,6 @@ func RootVectorBankBytes(memberCount int) (int, error) {
 }
 
 // RootVectorFileBytes returns the two-bank file size for memberCount.
-func RootVectorFileBytes(memberCount int) (int, error) {
-	bank, err := RootVectorBankBytes(memberCount)
-	if err != nil {
-		return 0, err
-	}
-	return 2 * bank, nil
-}
 
 // EncodeRootVectorBank writes the canonical complete bank into dst.  The
 // caller may provide a larger scratch buffer; only the exact bank size is

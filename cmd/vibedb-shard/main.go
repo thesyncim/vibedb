@@ -45,7 +45,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -102,17 +101,6 @@ func run(args []string) int {
 		usage()
 		return 2
 	}
-}
-
-type repeatedFlag []string
-
-func (values *repeatedFlag) String() string { return strings.Join(*values, ",") }
-func (values *repeatedFlag) Set(value string) error {
-	if value == "" || len(*values) >= servicetls.AbsoluteMaxIdentities {
-		return servicetls.ErrInvalidProfile
-	}
-	*values = append(*values, value)
-	return nil
 }
 
 func usage() {

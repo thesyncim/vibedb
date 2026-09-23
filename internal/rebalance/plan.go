@@ -291,19 +291,6 @@ func (p *Plan) installTransitionIntent(current *gateway.Snapshot) {
 // BindSnapshotBase returns a new plan bound to one strictly verified learner
 // certificate. The certificate must describe the same shard/group/catalog
 // fence and the exact expected learner membership.
-func BindSnapshotBase(plan *Plan, snapshot *pb.Snapshot) (*Plan, error) {
-	if plan == nil || snapshot == nil {
-		return nil, ErrInvalidPlan
-	}
-	if plan.baseBound {
-		return nil, ErrSnapshotBaseBound
-	}
-	certificate, err := replicatedstate.OpenSnapshotBase(snapshot)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidPlan, err)
-	}
-	return bindCertificate(plan, certificate)
-}
 
 func bindCertificate(
 	plan *Plan,
@@ -350,30 +337,6 @@ func bindCertificate(
 // The verified certificate supplies the pre-promotion learner configuration
 // and source serving fence. Current may be either the source catalog or the
 // exact already-published target catalog; any other topology fails closed.
-func RecoverReplicaMove(
-	current *gateway.Snapshot,
-	publication raftmodel.Publication,
-	request MoveRequest,
-	snapshot *pb.Snapshot,
-) (*Plan, error) {
-	if current == nil || snapshot == nil || invalidMoveRequest(request) ||
-		publication.ConfState == nil || publication.Applied == 0 ||
-		publication.ReplicaSetVersion == 0 ||
-		publication.ReplicaSetVersion > publication.Applied {
-		return nil, ErrInvalidPlan
-	}
-	if _, err := current.Address(request.Source); err != nil {
-		return nil, ErrInvalidPlan
-	}
-	if _, err := current.Address(request.Target); err != nil {
-		return nil, ErrInvalidPlan
-	}
-	certificate, err := replicatedstate.OpenSnapshotBase(snapshot)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidPlan, err)
-	}
-	return recoverReplicaMoveCertificate(current, publication, request, certificate)
-}
 
 func recoverReplicaMoveCertificate(
 	current *gateway.Snapshot,

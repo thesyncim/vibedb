@@ -49,12 +49,6 @@ func (t *WriteTransaction) MaxBuildPageBytes() int {
 // NewTransactionPrimaryGraphSink exposes the same allocation sink used by the
 // primary builder to sibling schema/index/overflow builders. The adapter owns
 // nothing and remains valid only while tx is active.
-func NewTransactionPrimaryGraphSink(tx *WriteTransaction) (PrimaryGraphBuildSink, error) {
-	if tx == nil || !tx.active || tx.batch == nil {
-		return nil, ErrBatchState
-	}
-	return transactionPrimaryGraphSink{tx: tx}, nil
-}
 
 func (s transactionPrimaryGraphSink) AllocatePage(kind PageKind, length uint32, logicalID uint64) (PrimaryGraphBuildPage, error) {
 	p, err := s.tx.Allocate(kind, length, logicalID)

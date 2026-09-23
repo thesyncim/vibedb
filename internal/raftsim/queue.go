@@ -40,12 +40,6 @@ func NewQueue(limit int) (*Queue, error) {
 }
 
 // Len reports the number of retained events.
-func (q *Queue) Len() int {
-	if q == nil {
-		return 0
-	}
-	return len(q.items)
-}
 
 // Now reports the logical time of the last popped event.
 func (q *Queue) Now() uint64 {

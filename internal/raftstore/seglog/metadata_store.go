@@ -513,14 +513,3 @@ func writeFullAt(file *os.File, data []byte, offset int64) error {
 	}
 	return nil
 }
-
-func closeMetadataAndFile(store *metadataStore, file *os.File) error {
-	var first, second error
-	if store != nil {
-		first = store.Close()
-	}
-	if file != nil {
-		second = file.Close()
-	}
-	return errors.Join(first, second)
-}

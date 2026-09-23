@@ -142,9 +142,6 @@ func NewHead(key RequestKey, plan []byte) (HeadRecord, error) {
 
 // NewHeadWithRequestDigest binds retries to the original canonical client
 // request independently of the derived outbound execution plan.
-func NewHeadWithRequestDigest(key RequestKey, requestDigest Digest, plan []byte) (HeadRecord, error) {
-	return NewHeadWithContract(key, requestDigest, requestDigest, plan)
-}
 
 // NewHeadWithContract binds terminal settlement to the exact catalog,
 // target, and result-shape contract selected before any outbound step.
@@ -585,16 +582,6 @@ type PlanPageRecord struct {
 	PreviousChain Digest
 	Chain         Digest
 	Data          []byte
-}
-
-func NewPlanPage(head HeadRecord, plan []byte, ordinal uint64, previous Digest) (PlanPageRecord, error) {
-	if err := validateHead(head); err != nil || len(head.InlinePlan) != 0 ||
-		uint64(len(plan)) != head.TotalPlanBytes || ordinal >= head.PlanPageCount {
-		return PlanPageRecord{}, ErrCorrupt
-	}
-	offset := ordinal * MaxPlanPageBytes
-	end := min(offset+MaxPlanPageBytes, uint64(len(plan)))
-	return NewPlanPageData(head, ordinal, previous, plan[offset:end:end])
 }
 
 // NewPlanPageData is the allocation-free second-pass page emitter.

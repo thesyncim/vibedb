@@ -228,16 +228,6 @@ func BuildPrimaryGraph(
 // output: placements must have exactly one element per input record, and each
 // receives the posting-stable location the builder assigned that row. It is the
 // entry the ordered-primary exact-index build uses to key posting tiles.
-func BuildPrimaryGraphPlaced(
-	tx *WriteTransaction,
-	records []PrimaryGraphRecord,
-	placements []PrimaryGraphPlacement,
-) (PageRef, error) {
-	if len(placements) != len(records) {
-		return PageRef{}, fmt.Errorf("%w: primary placement output", ErrInvalidWrite)
-	}
-	return buildPrimaryGraphPlaced(tx, records, placements)
-}
 
 // EmptyPrimaryGraphPageCount is the exact number of transaction pages
 // BuildEmptyPrimaryGraph stages: one leaf, one tablet (anchor + locator +
@@ -255,9 +245,6 @@ const EmptyPrimaryGraphPageCount = 1 + 3 + 1 + 1
 // build produces one leaf/tablet/catalog; a delete of the last row produces an
 // empty leaf), so this only composes them. The returned reference is suitable
 // for StateRoot.PrimaryRoot.
-func BuildEmptyPrimaryGraph(tx *WriteTransaction) (PageRef, error) {
-	return BuildEmptyPrimaryGraphSummarized(tx, nil)
-}
 
 // BuildEmptyPrimaryGraphSummarized is BuildEmptyPrimaryGraph with the compact
 // summary catalog already embedded in the empty leaf, so its first mutation
@@ -391,23 +378,9 @@ func BuildPlannedPrimaryGraphToSink(
 // BuildPrimaryGraph will stage for records. Bulk callers use it to
 // reserve one bounded commit without guessing from document count or average
 // value width.
-func PrimaryGraphPageCount(
-	storeID [16]byte,
-	records []PrimaryGraphRecord,
-) (int, error) {
-	plan, err := PlanPrimaryGraph(storeID, records, false)
-	return plan.PageCount(), err
-}
 
 // PrimaryGraphPlacedPageCount is the exact graph-page count for a build that
 // also emits uint8 ordinal placements for exact-index posting tiles.
-func PrimaryGraphPlacedPageCount(
-	storeID [16]byte,
-	records []PrimaryGraphRecord,
-) (int, error) {
-	plan, err := PlanPrimaryGraph(storeID, records, true)
-	return plan.PageCount(), err
-}
 
 func validatePrimaryGraphRecords(
 	storeID [16]byte,
@@ -477,16 +450,6 @@ type PrimaryGraphLeafSpan struct {
 
 // PrimaryGraphLeafSpans plans the leaves BuildPrimaryGraph will stage for
 // records — identical planning, no staging.
-func PrimaryGraphLeafSpans(
-	storeID [16]byte,
-	records []PrimaryGraphRecord,
-) ([]PrimaryGraphLeafSpan, error) {
-	plan, err := PlanPrimaryGraph(storeID, records, true)
-	if err != nil {
-		return nil, err
-	}
-	return plan.LeafSpans()
-}
 
 // planCompactPrimaryLeaves packs records into the largest compact stripe that
 // fits the configured row and extent bounds. There is no fallback format.

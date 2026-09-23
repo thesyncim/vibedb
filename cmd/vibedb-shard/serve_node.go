@@ -591,13 +591,3 @@ func rf3GatewayDuration(millis uint64, fallback time.Duration) time.Duration {
 	}
 	return time.Duration(millis) * time.Millisecond
 }
-
-func stringsCompare(left, right string) int {
-	if left < right {
-		return -1
-	}
-	if left > right {
-		return 1
-	}
-	return 0
-}

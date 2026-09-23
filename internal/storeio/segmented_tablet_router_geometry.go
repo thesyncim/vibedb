@@ -15,12 +15,6 @@ import (
 // preflight before the replacement leaves and anchors have physical handles.
 // EncodeSegmentedTabletRouter performs the complete identity validation once
 // those handles exist.
-func ValidateSegmentedTabletRouterLeafGeometry(
-	leaves []SegmentedTabletRouterLeaf,
-) error {
-	_, _, err := PlanSegmentedTabletRouterAnchors(leaves)
-	return err
-}
 
 func validateSegmentedTabletRouterLeafIdentities(leaves []SegmentedTabletRouterLeaf) error {
 	if len(leaves) == 0 ||

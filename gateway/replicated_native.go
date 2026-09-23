@@ -2247,15 +2247,3 @@ func nextReplicatedMember(route ReplicatedRoute, member uint64) uint64 {
 	}
 	return route.Replicas[(ordinal+1)%len(route.Replicas)].Member
 }
-
-func firstUnvisitedReplicatedEndpoint(
-	route ReplicatedRoute,
-	visited uint64,
-) (ReplicatedEndpoint, int, bool) {
-	for index, endpoint := range route.Replicas {
-		if visited&(uint64(1)<<index) == 0 {
-			return endpoint, index, true
-		}
-	}
-	return ReplicatedEndpoint{}, 0, false
-}

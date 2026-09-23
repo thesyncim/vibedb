@@ -162,9 +162,6 @@ func NewNodeWithOptions(
 // MsgStorageAppend/MsgStorageApply protocol. The caller must service each
 // local target reliably and in order and must never call the synchronous Ready
 // lifecycle methods.
-func NewPipelinedNode(id, incarnation uint64, stable StableStore, machine StateMachine) (*Node, error) {
-	return NewPipelinedNodeWithOptions(id, incarnation, stable, machine, NodeOptions{})
-}
 
 // NewPipelinedNodeWithOptions constructs an asynchronous Node with its owner
 // hooks bound before RawNode recovery. The caller still owns the same ordered

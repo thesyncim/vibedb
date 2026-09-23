@@ -646,39 +646,6 @@ func (e *Engine) finishRetiredFiles(ticket *reclaimTicket) error {
 	return e.finishCheckpointRetirements()
 }
 
-func addCheckpointRetirements(next *metadataSlot, old [2]metadataSlot) error {
-	kept := [2][16]byte{next.CheckpointID, next.PreviousCheckpointID}
-	for i := range old {
-		for _, previous := range []bool{false, true} {
-			slot := old[i]
-			if previous {
-				slot.CheckpointID, slot.CheckpointTail, slot.CheckpointHash = slot.PreviousCheckpointID, slot.PreviousCheckpointTail, slot.PreviousCheckpointHash
-			}
-			if slot.CheckpointID == ([16]byte{}) || slot.CheckpointID == kept[0] || slot.CheckpointID == kept[1] {
-				continue
-			}
-			id := fileID(slot.CheckpointID)
-			found := false
-			for j := 0; j < int(next.RetiredCheckpointCount); j++ {
-				if next.RetiredCheckpoints[j].ID == id {
-					if next.RetiredCheckpoints[j].Hash != slot.CheckpointHash {
-						return ErrCorrupt
-					}
-					found = true
-				}
-			}
-			if !found {
-				if next.RetiredCheckpointCount >= maxRetiredCheckpoints {
-					return ErrBounds
-				}
-				next.RetiredCheckpoints[next.RetiredCheckpointCount] = retiredCheckpointDescriptor{ID: id, Hash: slot.CheckpointHash}
-				next.RetiredCheckpointCount++
-			}
-		}
-	}
-	return nil
-}
-
 // checkpointRetirementBankState reports whether a queued checkpoint is still
 // named by either metadata bank. An invalid bank is a healing obligation: its
 // bytes are not trusted for deletion, but the queued file must remain until an

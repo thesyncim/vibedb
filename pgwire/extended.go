@@ -531,10 +531,6 @@ func (s *session) handleBind() error {
 // Both returned strings view that one immutable backing block. The prepared
 // object and its map key retain them together, so separate allocations would
 // buy no lifetime advantage.
-func ownPreparedText(name, sql string) (string, string) {
-	ownedName, ownedSQL, _ := ownPreparedTextCancelable(name, sql, nil)
-	return ownedName, ownedSQL
-}
 
 func ownPreparedTextCancelable(
 	name string,

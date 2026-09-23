@@ -338,14 +338,6 @@ func writeU64(hash interface{ Write([]byte) (int, error) }, value uint64) {
 	_, _ = hash.Write(raw[:])
 }
 
-func writeGroup(hash interface{ Write([]byte) (int, error) }, group raftmember.GroupKey) {
-	_, _ = hash.Write(group.ClusterID[:])
-	_, _ = hash.Write(group.ClusterIncarnation[:])
-	writeU64(hash, group.TopologyRecoveryEpoch)
-	_, _ = hash.Write(group.ShardIncarnation[:])
-	_, _ = hash.Write(group.GroupID[:])
-}
-
 func cloneContinuationGrant(grant CommittedFrontendContinuationGrant) CommittedFrontendContinuationGrant {
 	grant.AcceptedConnectionTokens = slices.Clone(grant.AcceptedConnectionTokens)
 	grant.AcceptedConnectionProtocols = slices.Clone(grant.AcceptedConnectionProtocols)
@@ -361,11 +353,6 @@ func sameContinuationGrant(left, right CommittedFrontendContinuationGrant) bool 
 		left.AdmissionClosedProofDigest == right.AdmissionClosedProofDigest && left.Revision == right.Revision &&
 		left.State == right.State && slices.Equal(left.AcceptedConnectionTokens, right.AcceptedConnectionTokens) &&
 		slices.Equal(left.AcceptedConnectionProtocols, right.AcceptedConnectionProtocols)
-}
-
-func containsContinuationToken(tokens []FrontendConnToken, want FrontendConnToken) bool {
-	_, found := continuationTokenIndex(tokens, want)
-	return found
 }
 
 func continuationTokenIndex(tokens []FrontendConnToken, want FrontendConnToken) (int, bool) {

@@ -215,24 +215,6 @@ func OpenBoundSQLForSettlement(
 // OpenBoundNodeSQLForSettlement is the node-log counterpart of
 // OpenBoundSQLForSettlement. The authenticated GroupView supplies the exact
 // immutable Raft binding; no per-group WAL handle or generation exists.
-func OpenBoundNodeSQLForSettlement(
-	path string,
-	group *raftstore.GroupView,
-	authority sqldriver.ReplicatedAuthorityProfile,
-	expectedLogID [16]byte,
-	userTable string,
-) (*sqldriver.Database, sqldriver.ReplicatedShardStoreIdentity, error) {
-	binding, err := BindingFromNodeGroup(group, authority)
-	if err != nil {
-		return nil, sqldriver.ReplicatedShardStoreIdentity{}, err
-	}
-	if expectedLogID == ([16]byte{}) {
-		return nil, sqldriver.ReplicatedShardStoreIdentity{}, ErrExpectedSQLLogID
-	}
-	return sqldriver.OpenReplicatedShardStoreForSettlement(
-		path, binding, expectedLogID, userTable,
-	)
-}
 
 // OpenBoundSQL opens a previously bound SQL root only when expected is the
 // complete identity returned by BindPreparedSQL and its embedded WAL/profile
@@ -265,21 +247,3 @@ func OpenBoundSQL(
 // OpenBoundNodeSQL opens a previously bound root against one authenticated
 // group in the node-wide log. The complete retained SQL identity is compared
 // before the driver may recover or mutate the local namespace.
-func OpenBoundNodeSQL(
-	path string,
-	group *raftstore.GroupView,
-	authority sqldriver.ReplicatedAuthorityProfile,
-	expected sqldriver.ReplicatedShardStoreIdentity,
-) (*sqldriver.Database, error) {
-	binding, err := BindingFromNodeGroup(group, authority)
-	if err != nil {
-		return nil, err
-	}
-	if expected.LogID == ([16]byte{}) {
-		return nil, ErrExpectedSQLLogID
-	}
-	if expected.Binding != binding {
-		return nil, ErrBindingMismatch
-	}
-	return sqldriver.OpenReplicatedShardStore(path, expected)
-}

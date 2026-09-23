@@ -142,14 +142,6 @@ func OpenClusterCatalogDrainEnvelope(raw []byte) (ClusterCatalogDrainEnvelope, e
 	return envelope, nil
 }
 
-func WriteClusterCatalogDrainEnvelope(writer io.Writer, envelope ClusterCatalogDrainEnvelope) error {
-	raw, err := AppendClusterCatalogDrainEnvelope(nil, envelope)
-	if err != nil {
-		return err
-	}
-	return writeCatalogDrainFull(writer, raw)
-}
-
 func ReadClusterCatalogDrainEnvelope(reader io.Reader) (ClusterCatalogDrainEnvelope, error) {
 	var header [clusterCatalogDrainRequestHeaderBytes]byte
 	if _, err := io.ReadFull(reader, header[:]); err != nil {

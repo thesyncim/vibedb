@@ -62,18 +62,3 @@ func openRF3SchemaSourceLog(path string, log rf3RecoveryLog,
 		return nil, nil, raftmember.ErrWALUnavailable
 	}
 }
-
-func rf3DurableLogCommit(log rf3RecoveryLog) (uint64, error) {
-	switch value := log.(type) {
-	case *raftstore.Store:
-		return value.DurableCommit()
-	case *raftstore.GroupView:
-		hard, _, err := value.InitialState()
-		if err != nil {
-			return 0, err
-		}
-		return hard.GetCommit(), nil
-	default:
-		return 0, raftmember.ErrWALUnavailable
-	}
-}

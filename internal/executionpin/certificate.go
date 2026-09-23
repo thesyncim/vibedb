@@ -248,15 +248,6 @@ func LeaseCertificateDigest(certificate LeaseCertificate) (Digest, error) {
 	return Digest(sha256.Sum256(encoded)), nil
 }
 
-func TerminalCertificateDigest(certificate TerminalCertificate) (Digest, error) {
-	var storage [TerminalCertificateBytes]byte
-	encoded, err := AppendTerminalCertificate(storage[:0], certificate)
-	if err != nil {
-		return Digest{}, err
-	}
-	return Digest(sha256.Sum256(encoded)), nil
-}
-
 func (record Record) AcquireCertificate() (AcquireCertificate, bool) {
 	if !record.Valid() || record.AcquireApplied == 0 {
 		return AcquireCertificate{}, false

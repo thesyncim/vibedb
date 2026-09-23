@@ -56,19 +56,6 @@ func (owner *rf3NodeOwner) bindEmptyRuntime(runtime *rf3NodeRuntime) error {
 	return nil
 }
 
-func (owner *rf3NodeOwner) emptyIntentReader() *nodecontrol.IntentReaderSlot {
-	if owner == nil {
-		return nil
-	}
-	owner.controlMu.Lock()
-	runtime := owner.emptyRuntime
-	owner.controlMu.Unlock()
-	if runtime == nil {
-		return nil
-	}
-	return runtime.IntentReaderSlot()
-}
-
 // emptyRuntimeHandle returns the live physical-node runtime while it is
 // owned by this process. Callers use it only to complete a certified learner
 // install; the runtime itself still performs the serialized publication.

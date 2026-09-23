@@ -230,13 +230,6 @@ func appendLeafRecords(
 	return dst
 }
 
-func (c *Collection) extractLeafRecords(
-	leaf *storeio.CommonPrimaryLeafView,
-) []storeio.CommonPrimaryLeafRecord {
-	c.structuralRows = appendLeafRecords(c.structuralRows[:0], leaf)
-	return c.structuralRows
-}
-
 // fitStructuralLeaf places and encodes rows into the sole VCS1 grammar and
 // returns the planner-selected extent. Splits may assign fresh
 // stable slots because their exact-index contribution is rebuilt in the same

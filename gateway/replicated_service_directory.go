@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"slices"
 
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -183,19 +182,6 @@ func frontendDrainEntryID(entry replicatedFrontendDrainEntry) ([32]byte, bool) {
 	return id, id != ([32]byte{})
 }
 
-func sameServiceContinuationGrantImmutable(
-	left, right serviceauthz.CommittedFrontendContinuationGrant,
-) bool {
-	return left.GrantDigest == right.GrantDigest && left.TrustDomain == right.TrustDomain &&
-		left.PhysicalNode == right.PhysicalNode && left.PhysicalIncarnation == right.PhysicalIncarnation &&
-		left.PeerKeyDigest == right.PeerKeyDigest && left.GatewayServiceID == right.GatewayServiceID &&
-		left.GatewaySessionID == right.GatewaySessionID && left.GatewaySessionRevision == right.GatewaySessionRevision &&
-		left.DrainID == right.DrainID && left.AdmissionEpoch == right.AdmissionEpoch &&
-		left.AdmissionClosedProofDigest == right.AdmissionClosedProofDigest && left.Revision == right.Revision &&
-		slices.Equal(left.AcceptedConnectionTokens, right.AcceptedConnectionTokens) &&
-		slices.Equal(left.AcceptedConnectionProtocols, right.AcceptedConnectionProtocols)
-}
-
 func (authority *ReplicatedCatalogAuthority) ReadServiceDirectoryContinuationGrantCut(
 	ctx context.Context,
 ) (uint64, []serviceauthz.CommittedFrontendContinuationGrant, error) {
@@ -234,15 +220,6 @@ func sameServiceDrainFenceImmutable(
 // fence while allowing the node-bound revision to advance with the atomic
 // Active -> Draining -> Decommissioned lifecycle. The revision is checked
 // separately by each transition and is never allowed to move backwards.
-func sameServiceDrainFenceProof(
-	left, right serviceauthz.CommittedFrontendDrainFence,
-) bool {
-	return left.TrustDomain == right.TrustDomain && left.PhysicalNode == right.PhysicalNode &&
-		left.PhysicalIncarnation == right.PhysicalIncarnation && left.PeerKeyDigest == right.PeerKeyDigest &&
-		left.GatewayServiceID == right.GatewayServiceID && left.GatewaySessionID == right.GatewaySessionID &&
-		left.GatewaySessionRevision == right.GatewaySessionRevision && left.DrainID == right.DrainID &&
-		left.Fence == right.Fence
-}
 
 var _ ServiceDirectoryContinuationGrantReader = (*ReplicatedCatalogAuthority)(nil)
 var _ ServiceDirectoryDrainFenceReader = (*ReplicatedCatalogAuthority)(nil)

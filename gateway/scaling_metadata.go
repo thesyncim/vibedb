@@ -12,7 +12,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"slices"
 
 	"github.com/thesyncim/vibedb/autosplit"
@@ -1201,15 +1200,4 @@ func sameNodeReplacement(left, right *NodeReplacementProof) bool {
 		return left == nil && right == nil
 	}
 	return *left == *right
-}
-
-func cloneScalingIntent(intent ScalingIntent) ScalingIntent {
-	intent.Request.Targets = slices.Clone(intent.Request.Targets)
-	intent.OutstandingMoves = slices.Clone(intent.OutstandingMoves)
-	intent.Blockers = slices.Clone(intent.Blockers)
-	return intent
-}
-
-func metadataError(format string, args ...any) error {
-	return fmt.Errorf("%w: %s", ErrInvalidScalingMetadata, fmt.Sprintf(format, args...))
 }

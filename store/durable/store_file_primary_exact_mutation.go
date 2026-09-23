@@ -344,17 +344,6 @@ func (c *Collection) emitPrimaryExactTileRecord(
 // lands directly on the stripe piece owning the tile — then seeks that
 // leaf's ascending mask iterator, so its cost is O(one leaf's postings
 // before the touched tile), corpus-size-independent by construction.
-func (c *Collection) resolvePrimaryExactTermTileBits(
-	epoch *primaryExactEpoch,
-	indexID uint32,
-	keyRecord storeio.IndexTermKeyRecord,
-	chainHash uint64,
-	tileID uint32,
-) (uint64, error) {
-	return c.resolvePrimaryExactTermTileBitsPrepared(
-		epoch, nil, indexID, keyRecord, chainHash, tileID,
-	)
-}
 
 // resolvePrimaryExactTermTileBitsPrepared extends the writer's normal exact
 // probe to records staged by the current, not-yet-published mutation. A batch

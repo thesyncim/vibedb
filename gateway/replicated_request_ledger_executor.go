@@ -591,42 +591,6 @@ func (journal *durableRequestJournal) Settle(
 	return nil
 }
 
-func durableRequestPlanDescriptor(
-	key DurableRequestLedgerKey,
-	raw []byte,
-) (DurableRequestPlanDescriptor, error) {
-	keyDigest, err := requestledger.KeyDigest(key.RequestKey)
-	if err != nil {
-		return DurableRequestPlanDescriptor{}, errors.Join(err, ErrDurableRequest)
-	}
-	root, err := requestledger.PlanRoot(keyDigest, raw)
-	if err != nil {
-		return DurableRequestPlanDescriptor{}, errors.Join(err, ErrDurableRequest)
-	}
-	descriptor := DurableRequestPlanDescriptor{
-		TotalBytes: uint64(len(raw)), Root: replication.Digest(root),
-	}
-	if len(raw) <= DurableRequestInlineBytes {
-		descriptor.Inline = bytes.Clone(raw)
-		return descriptor, nil
-	}
-	descriptor.PageCount = uint32((len(raw) + DurableRequestPlanPageBytes - 1) / DurableRequestPlanPageBytes)
-	return descriptor, nil
-}
-
-func durableRequestPlanRootMatches(
-	key DurableRequestLedgerKey,
-	raw []byte,
-	want replication.Digest,
-) bool {
-	keyDigest, err := requestledger.KeyDigest(key.RequestKey)
-	if err != nil {
-		return false
-	}
-	root, err := requestledger.PlanRoot(keyDigest, raw)
-	return err == nil && replication.Digest(root) == want
-}
-
 func durableRequestOutcome(entry DurableRequestLedgerEntry) (DurableRequestOutcome, error) {
 	if entry.State == DurableRequestLedgerAcked {
 		return DurableRequestOutcome{Acknowledged: true}, ErrDurableRequestAcknowledged

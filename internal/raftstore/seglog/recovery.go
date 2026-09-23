@@ -18,13 +18,6 @@ func (l *Log) reconcileRotation() error {
 	return nil
 }
 
-func (l *Log) expectedPreviousID() uint64 {
-	if n := len(l.state.Segments); n != 0 {
-		return l.state.Segments[n-1].ID
-	}
-	return l.state.AnchorID
-}
-
 func (l *Log) expectedPreviousHash() [32]byte {
 	if n := len(l.state.Segments); n != 0 {
 		return l.state.Segments[n-1].Hash

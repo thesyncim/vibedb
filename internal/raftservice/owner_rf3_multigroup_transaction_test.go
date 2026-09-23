@@ -467,17 +467,6 @@ func (client *multiGroupRF3RoundTripper) DoReplicated(
 	return response, nil
 }
 
-func (client *multiGroupRF3RoundTripper) gatewayTrace() []multiGroupRF3GatewayTrace {
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	trace := make([]multiGroupRF3GatewayTrace, len(client.trace))
-	copy(trace, client.trace)
-	for index := range trace {
-		trace[index].command = bytes.Clone(trace[index].command)
-	}
-	return trace
-}
-
 func newMultiGroupTransactionRF3Cluster(t testing.TB) *multiGroupTransactionRF3Cluster {
 	return newMultiGroupRF3Cluster(t, multiGroupRF3Groups)
 }

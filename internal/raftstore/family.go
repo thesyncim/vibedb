@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 
@@ -479,11 +478,4 @@ func (manifest *familyManifest) close() error {
 	manifest.key = Key{}
 	clear(manifest.manifestKey[:])
 	return err
-}
-
-func (manifest *familyManifest) path(parent string) string {
-	if manifest == nil {
-		return ""
-	}
-	return filepath.Join(parent, manifest.base)
 }

@@ -1511,11 +1511,6 @@ func windowSelectedNonNullPosition(
 	return positions[suffixLo+ordinal], true
 }
 
-func resolveWindowFrame(frame windowRowsFrame, position, rows int) (int, int) {
-	group := 0
-	return resolveWindowFrameAt(frame, position, rows, nil, &group)
-}
-
 func (e *windowExecutor) resolveWindowFrameSelection(
 	input *relationSpool,
 	order []windowOrderKey,

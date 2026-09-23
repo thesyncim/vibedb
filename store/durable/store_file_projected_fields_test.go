@@ -187,19 +187,6 @@ func primaryProjectionTestContainerDocument(row int) []byte {
 	)
 }
 
-func primaryProjectionTestExpectedRows(
-	rows []primaryProjectionTestRow,
-	paths []string,
-) [][]byte {
-	values := make([][]byte, 0, len(rows)*len(paths))
-	for _, row := range rows {
-		for _, path := range paths {
-			values = append(values, row.values[path])
-		}
-	}
-	return values
-}
-
 func primaryProjectionTestRowFromDocument(
 	t testing.TB,
 	key string,

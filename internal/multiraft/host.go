@@ -434,12 +434,6 @@ func (queue *proposalQueue) compact() {
 	queue.head = 0
 }
 
-func (queue *proposalQueue) clear() {
-	clear(queue.items)
-	queue.items = nil
-	queue.head = 0
-}
-
 type inputClass uint8
 
 const (

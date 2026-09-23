@@ -11,10 +11,6 @@ import (
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
-func startGatewayPostgreSQL(ctx context.Context, address string, executor *gateway.Executor, authority serviceauthz.Authority, write func(context.Context, serviceauthz.Authority, gateway.Query) (*gateway.Result, error), logf func(string, ...any), ddl ...func(context.Context, serviceauthz.Authority, string) error) (*pgwire.Server, error) {
-	return startGatewayPostgreSQLWithFrontend(ctx, address, executor, authority, write, logf, nil, ddl...)
-}
-
 // startGatewayPostgreSQLWithFrontend keeps the public PostgreSQL listener
 // behind the same admission fence as the native frontend. The wrapper owns
 // only token admission; pgwire remains the authority for exact connection and

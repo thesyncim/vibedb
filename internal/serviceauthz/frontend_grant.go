@@ -99,13 +99,6 @@ func WithFrontendContinuationCredential(ctx context.Context, credential Frontend
 // FrontendConnectionFromContext returns the socket token and scope without
 // consulting the provider. It is useful to bind the envelope at a transport
 // boundary while keeping validation at the receiver.
-func FrontendConnectionFromContext(ctx context.Context) (FrontendConnToken, FrontendContinuationScope, bool) {
-	if ctx == nil {
-		return FrontendConnToken{}, 0, false
-	}
-	connection, ok := ctx.Value(frontendConnectionContextKey{}).(frontendConnectionContext)
-	return connection.Token, connection.Scope, ok && connection.Token != (FrontendConnToken{}) && connection.Scope.Valid()
-}
 
 // FrontendContinuationFromContext resolves the current committed credential. A
 // missing grant is a normal Active/legacy state; callers must preserve legacy
