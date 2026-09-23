@@ -413,6 +413,22 @@ func (connection *seamlessScaleConnection) refreshSQLAfterIncompleteResponse(ctx
 	return connection.openSQLConnection(openCtx)
 }
 
+func (connection *seamlessScaleConnection) openGatewayConnection(ctx context.Context) error {
+	if connection == nil || connection.openGate == nil || ctx == nil {
+		return errors.New("scale workload gateway reconnect is not configured")
+	}
+	if connection.gate != nil {
+		return nil
+	}
+	gate, err := connection.openGate(ctx)
+	if err != nil {
+		return err
+	}
+	connection.gate = gate
+	connection.reader = bufio.NewReaderSize(gate, 64<<10)
+	return nil
+}
+
 func (connection *seamlessScaleConnection) refreshGatewayAfterIncompleteResponse(ctx context.Context) error {
 	if connection == nil || ctx == nil || connection.openGate == nil {
 		return errors.New("scale workload gateway reconnect is not configured")
@@ -424,13 +440,7 @@ func (connection *seamlessScaleConnection) refreshGatewayAfterIncompleteResponse
 	}
 	openCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
-	gate, err := connection.openGate(openCtx)
-	if err != nil {
-		return err
-	}
-	connection.gate = gate
-	connection.reader = bufio.NewReaderSize(gate, 64<<10)
-	return nil
+	return connection.openGatewayConnection(openCtx)
 }
 
 func (workload *seamlessScaleWorkload) refreshSQLAfterIncompleteResponse(
@@ -1019,6 +1029,12 @@ func (workload *seamlessScaleWorkload) gatewayRead(ctx context.Context, connecti
 	request := rf3FixturePointRequest(row.Table, row.ID)
 	raw, err := vibejson.Marshal(&request)
 	if err != nil {
+		return fusedPGResult{}, 0, err
+	}
+	// A failed refresh leaves the gate unopened while the gateway restarts.
+	// Reopen it lazily like the SQL stream: report the dial failure as a
+	// sample error instead of dereferencing a nil connection below.
+	if err := connection.openGatewayConnection(ctx); err != nil {
 		return fusedPGResult{}, 0, err
 	}
 	// The recovery deadline is armed only once a retryable response proves a
@@ -2971,6 +2987,46 @@ func TestHasSeamlessScaleSessionBlockerUsesCanonicalCode(t *testing.T) {
 				t.Fatal("invalid gateway session blocker was accepted")
 			}
 		})
+	}
+}
+
+// A refresh that fails while the gateway restarts must leave the worker's
+// gate unopened without panicking the next read: the read reports the dial
+// failure as a sample error and reopens lazily once the gateway returns.
+func TestSeamlessScaleGatewayReadSurvivesFailedReconnect(t *testing.T) {
+	dialErr := errors.New("dial gateway: connection refused")
+	opens := 0
+	pipe, peer := net.Pipe()
+	defer pipe.Close()
+	defer peer.Close()
+	connection := &seamlessScaleConnection{openGate: func(context.Context) (net.Conn, error) {
+		opens++
+		return nil, dialErr
+	}}
+	workload := &seamlessScaleWorkload{}
+	row := seamlessScaleAck{Table: "scale_a", ID: "seed-scale_a-0000"}
+	if _, _, err := workload.gatewayRead(t.Context(), connection, row); !errors.Is(err, dialErr) {
+		t.Fatalf("gateway read with refused dial err=%v", err)
+	}
+	if connection.gate != nil || connection.reader != nil {
+		t.Fatal("failed gateway reopen must leave the connection unopened")
+	}
+	if err := connection.refreshGatewayAfterIncompleteResponse(t.Context()); !errors.Is(err, dialErr) {
+		t.Fatalf("gateway refresh with refused dial err=%v", err)
+	}
+	connection.openGate = func(context.Context) (net.Conn, error) {
+		opens++
+		return pipe, nil
+	}
+	if err := connection.openGatewayConnection(t.Context()); err != nil {
+		t.Fatalf("gateway reopen after refused dial err=%v", err)
+	}
+	if connection.gate == nil || connection.reader == nil {
+		t.Fatal("successful gateway reopen left the connection unopened")
+	}
+	before := opens
+	if err := connection.openGatewayConnection(t.Context()); err != nil || opens != before {
+		t.Fatalf("open gateway connection reopened a live gate err=%v opens=%d", err, opens)
 	}
 }
 
