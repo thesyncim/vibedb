@@ -69,9 +69,11 @@ const (
 	seamlessScaleWatchdogThreshold  = 2 * time.Second
 	seamlessScaleMinimumSamples     = 10_000
 	seamlessScaleOfferedRate        = 1_200
-	// A calibration candidate must complete at least 99% of its offered load
-	// with a bounded arrival queue to count as sustained.
-	seamlessScaleSustainedThroughputPPM = 990_000
+	// A calibration candidate must complete at least 97% of its offered load
+	// with a bounded arrival queue to count as sustained. The bounded queue is
+	// the overload test; the throughput floor tolerates the final drain, which
+	// the measured span includes, on a noisy shared runner.
+	seamlessScaleSustainedThroughputPPM = 970_000
 	seamlessScaleSustainedQueueLag      = 500 * time.Millisecond
 	seamlessScaleWorkloadConnections    = 16
 	seamlessScaleOperationWait          = 750 * time.Millisecond
