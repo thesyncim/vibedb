@@ -266,7 +266,11 @@ func UnmarshalSegment(b []byte) (*Segment, error) {
 	if r.err != nil {
 		return nil, r.err
 	}
-	if seg.NDocs < 0 || seg.NDocs > len(r.b)/9 {
+	// Every document costs at least one lens byte (its uvarint length),
+	// so a count above the remaining bytes is impossible. A tighter
+	// per-doc floor would false-reject tightly packed small-doc shards,
+	// whose whole wire runs near five bytes per document.
+	if seg.NDocs < 0 || seg.NDocs > len(r.b) {
 		return nil, fmt.Errorf("tin segment: bad doc count %d", seg.NDocs)
 	}
 	n := int(r.u32())

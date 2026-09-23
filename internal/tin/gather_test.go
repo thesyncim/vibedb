@@ -1,6 +1,7 @@
 package tin
 
 import (
+	"reflect"
 	"testing"
 )
 
@@ -270,6 +271,62 @@ func TestScoreSegmentedFullExact(t *testing.T) {
 			if _, ok := ScoreSegmentedFull(shards, q, nil); ok {
 				t.Fatalf("sealed=%v %s segmented without full support, want decline", sealed, pattern)
 			}
+		}
+	}
+}
+
+// TestScoreSegmentedShippedExact proves the distributed query path: shards
+// shipped as wire bundles and reopened on the receiving side serve
+// ScoreSegmented, ScoreSegmentedFull, and MatchGathered bit-identically to
+// the single index. Shipped indexes arrive fully sealed with cold caches,
+// which live-built shards never exercise. The small-doc shards also pin
+// the segment doc-count floor: their wire runs near five bytes per
+// document, which the old nine-byte floor false-rejected.
+func TestScoreSegmentedShippedExact(t *testing.T) {
+	live := gatherShardCorpus(4, 2000)
+	var shards []Shard
+	for _, sh := range live {
+		sh.Ix.Seal()
+		wire, err := MarshalSegment(sh.Ix.ExportSegment())
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		seg, err := UnmarshalSegment(wire)
+		if err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		rx, err := OpenSegment(seg)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		shards = append(shards, Shard{Ix: rx})
+	}
+	shards = append(shards, Shard{Ix: NewIndex()}, Shard{})
+	single := gatherSingleCorpus(4, 2000)
+	for _, pattern := range []string{"common", "zipf", "tied", "missing", "zipf AND common"} {
+		q := gatherQuery(t, shards, pattern)
+		got, ok := ScoreSegmented(shards, q, 10, nil)
+		if !ok {
+			t.Fatalf("%s declined, want exact", pattern)
+		}
+		if want := single.Score(q, 10, nil); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s top-10 differs", pattern)
+		}
+	}
+	for _, pattern := range []string{"common", "zipf AND common", `"tied tie"`, `zipf OR common`} {
+		q := gatherQuery(t, shards, pattern)
+		if got := MatchGathered(shards, q, nil); !reflect.DeepEqual(got, single.Match(q, nil)) {
+			t.Fatalf("%s match differs", pattern)
+		}
+	}
+	for _, pattern := range []string{"common", "zipf", "tied", "missing"} {
+		q := gatherQuery(t, shards, pattern)
+		got, ok := ScoreSegmentedFull(shards, q, nil)
+		if !ok {
+			t.Fatalf("%s full declined, want exact", pattern)
+		}
+		if want := single.Score(q, 0, nil); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s full ranking differs", pattern)
 		}
 	}
 }
