@@ -478,9 +478,14 @@ func (workload *seamlessScaleWorkload) Seed(t *testing.T, ctx context.Context) e
 	return nil
 }
 
+// seamlessScalePayload is a 1 KiB deterministic marker. It keeps the seeded
+// image (3 tables x 512 rows) well above the migration burst, so every move is
+// paced, while bounding growth from ~20% inserts to ~200 KiB/s at 1000/s. An
+// 8 KiB marker grew the dataset by gigabytes over a run, making each later
+// cycle migrate far more than the first on shared CI hardware.
 func seamlessScalePayload(table string, index int) string {
 	digest := sha256.Sum256([]byte(fmt.Sprintf("vibedb-scale/%s/%d", table, index)))
-	return strings.Repeat(hex.EncodeToString(digest[:]), 128)
+	return strings.Repeat(hex.EncodeToString(digest[:]), 16)
 }
 
 // Window drives fixed open-loop arrivals.  A bounded queue turns scheduler
