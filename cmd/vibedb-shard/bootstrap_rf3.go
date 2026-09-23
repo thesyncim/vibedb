@@ -412,7 +412,7 @@ func bootstrapPreparedRF3(
 		return err
 	case <-complete:
 		stopControl(context.Canceled)
-		_ = <-done
+		<-done
 	}
 	if err = host.Close(); err != nil {
 		return err

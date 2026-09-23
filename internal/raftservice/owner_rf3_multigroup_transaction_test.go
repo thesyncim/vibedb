@@ -1088,12 +1088,12 @@ func TestTwoRealRF3GroupsExecuteFusedTwoTargetTransactionAcrossLeaderIsolation(t
 	if err := cluster.owners[0].Campaign(ctx, cluster.groups[0].key); err != nil {
 		t.Fatal(err)
 	}
-	leader0 := waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[0].key)
+	waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[0].key)
 	if err := cluster.owners[1].Campaign(ctx, cluster.groups[1].key); err != nil {
 		t.Fatal(err)
 	}
 	leader1 := waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[1].key)
-	leader0 = waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[0].key)
+	leader0 := waitRF3Leader(t, ctx, cluster.owners[:], nil, cluster.groups[0].key)
 	if leader0 == leader1 {
 		t.Fatalf("two groups elected the same deliberately separated leader %d", leader0)
 	}

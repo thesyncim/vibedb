@@ -73,7 +73,7 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	ctx = processAuthorizedContext(t, ctx)
-	leader := cluster.elect(t, ctx, 1)
+	cluster.elect(t, ctx, 1)
 	route := cluster.route()
 	if fence, ok := cluster.probeFence(); !ok || fence.Group != route.Group ||
 		fence.AllocationGeneration != route.AllocationGeneration || route.Group == processGroup() ||
@@ -88,7 +88,7 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 	// Session creation is itself a replicated proposal and may overlap the one
 	// startup term transition. Establish a fresh serving witness so this test
 	// measures catalog publication, not cluster boot readiness.
-	leader = cluster.waitStableLeader(t, ctx)
+	cluster.waitStableLeader(t, ctx)
 	first := processControlPlaneSnapshot(t, cluster, 1)
 	var dataReplicas [processVoters]gateway.ReplicatedEndpoint
 	dataRoute, ok := first.ResolveReplicatedRoute("orders", "0000-ffff", dataReplicas[:0])
@@ -275,7 +275,7 @@ func TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart(t *testin
 	}
 	record.Intent = []byte(`{}`)
 	record.IntentDigest = sha256.Sum256(record.Intent)
-	leader = cluster.waitLeader(t, ctx)
+	leader := cluster.waitLeader(t, ctx)
 	client.arm(leader, faultAfterDecodedResponseBeforeClientDelivery)
 	err = journal.SubmitOperation(ctx, record)
 	if !errors.Is(err, gateway.ErrReplicatedCatalogPending) {

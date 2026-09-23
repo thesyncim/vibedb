@@ -458,14 +458,16 @@ func TestOpenCrashCutsRecoverAuthenticatedReadyTailIndependentlyOfCurrentSlot(t 
 	}
 	corrupt := []byte{0}
 	corruptOffset := recordOffset + recordPrefixBytes + int64(len(store.header.keyID))
-	if _, err := file.ReadAt(corrupt, corruptOffset); err == nil {
-		corrupt[0] ^= 0x80
-		_, err = file.WriteAt(corrupt, corruptOffset)
+	if _, err := file.ReadAt(corrupt, corruptOffset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
 	}
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
+	corrupt[0] ^= 0x80
+	if _, err := file.WriteAt(corrupt, corruptOffset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
 	}
-	if err != nil {
+	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Open(path, testIdentity(), testBootstrap().TopologyRecoveryEpoch, testKey(), options); !errors.Is(err, ErrCorrupt) {

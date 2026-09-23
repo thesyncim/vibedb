@@ -366,13 +366,13 @@ func (store *DurableRequestDynamicPayloadStore) Cleanup(
 		if result.Ledger.ResultCode != replicatedstate.ResultApplied {
 			return 0, ErrDurableRequestConflict
 		}
-		next, advanceErr := requestledger.AdvancePayloadCleanup(
+		// AdvancePayloadCleanup re-derives the post-batch head and validates
+		// it; the loop re-reads the canonical head, so only the error matters.
+		if _, advanceErr := requestledger.AdvancePayloadCleanup(
 			head, request, chunk, head.Revision+1,
-		)
-		if advanceErr != nil {
+		); advanceErr != nil {
 			return 0, errors.Join(advanceErr, ErrDurableRequestConflict)
 		}
-		revision = next.Revision
 	}
 }
 

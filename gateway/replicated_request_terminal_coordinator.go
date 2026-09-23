@@ -138,7 +138,6 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 		if cas.Ledger.ResultCode != replicatedstate.ResultApplied {
 			return DurableRequestTerminalResult{}, ErrDurableRequestConflict
 		}
-		applied = cas.Applied
 		head, err = requestledger.MarkTerminalPrepared(head, continuation, prepared)
 		if err != nil {
 			return DurableRequestTerminalResult{}, errors.Join(err, ErrDurableRequestConflict)
@@ -179,7 +178,7 @@ func (coordinator *DurableRequestTerminalCoordinator) Complete(
 		// is not release evidence, and no old gateway identity is replayed.
 		refreshPlan := plan
 		refreshPlan.Execution.terminalCut = nil
-		head, continuation, prepared, release, terminal, applied, err = coordinator.openTerminalRows(ctx, refreshPlan)
+		head, _, prepared, release, terminal, applied, err = coordinator.openTerminalRows(ctx, refreshPlan)
 		if err != nil {
 			return DurableRequestTerminalResult{}, err
 		}

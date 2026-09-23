@@ -294,14 +294,14 @@ func TestVerifiedSchemaTargetPublishesCapturedShadowAndReopens(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer verified.Close()
-	proof, err := verified.Prepare(t.Context(), op)
+	_, err = verified.Prepare(t.Context(), op)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := verified.Close(); err != nil {
 		t.Fatal(err)
 	}
-	proof, err = verified.ResumePrepared(t.Context(), claim, shadow.Catalog, op)
+	proof, err := verified.ResumePrepared(t.Context(), claim, shadow.Catalog, op)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -365,7 +365,7 @@ func (p *Parser) parseInsertConflictUpdate() error {
 		assignments := append(p.conflictAssignments[:0], assignment)
 		for p.tok.kind == tokComma {
 			p.advance()
-			doc, wholeDocument, assignment, err = p.parseConflictAssignment()
+			_, wholeDocument, assignment, err = p.parseConflictAssignment()
 			if err != nil {
 				return err
 			}
@@ -1116,7 +1116,7 @@ func (p *Parser) parseUpdate() error {
 		p.updateAssignments = append(p.updateAssignments, assignment)
 		for p.tok.kind == tokComma {
 			p.advance()
-			whole, wholeDocument, assignment, err = p.parseAssignment()
+			_, wholeDocument, assignment, err = p.parseAssignment()
 			if err != nil {
 				return err
 			}

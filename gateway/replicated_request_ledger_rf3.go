@@ -108,7 +108,7 @@ func (client *ReplicatedRequestLedgerRF3) Read(
 	read ReplicatedRequestLedgerRead,
 ) (ReplicatedRequestLedgerReadResult, error) {
 	if client == nil || client.executor == nil || ctx == nil ||
-		home.Identity == (replication.Digest{}) || read.Key.Valid() == false ||
+		home.Identity == (replication.Digest{}) || !read.Key.Valid() ||
 		read.ExpectedRangeIdentity != requestledger.Digest(home.Identity) {
 		return ReplicatedRequestLedgerReadResult{}, ErrDurableRequest
 	}

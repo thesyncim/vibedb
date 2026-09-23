@@ -904,7 +904,7 @@ func newCheckpointGroup(
 	if checkpointGroupAfterDirectoryMembershipHook != nil {
 		checkpointGroupAfterDirectoryMembershipHook()
 	}
-	file, certificate, openErr := openCheckpointGroupCertificate(log)
+	file, _, openErr := openCheckpointGroupCertificate(log)
 	if openErr == nil {
 		cause := ErrCheckpointGroupRecoveryRequired
 		terminalFenceCheckpointGroupActivationLocked(log, order, cause)
@@ -953,7 +953,7 @@ func newCheckpointGroup(
 			ErrCheckpointGroupCorrupt,
 		)
 	}
-	certificate = checkpointGroupCertificate{
+	certificate := checkpointGroupCertificate{
 		sequence: 1, markerID: log.marker.Header().MarkerID,
 		markerEpoch: log.marker.Header().Epoch, members: ordered,
 		seedApplied: seedApplied, seedState: seedState, seedMember: seedMember,

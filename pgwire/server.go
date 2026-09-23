@@ -382,7 +382,6 @@ func (s *Server) BeginDrain() AdmissionDrainState {
 	for listener := range s.listeners {
 		listeners = append(listeners, listener)
 	}
-	state := s.admissionStateLocked()
 	s.mu.Unlock()
 	for _, listener := range listeners {
 		_ = listener.Close()
@@ -394,7 +393,7 @@ func (s *Server) BeginDrain() AdmissionDrainState {
 	if s.draining {
 		s.admissionDrained = true
 	}
-	state = s.admissionStateLocked()
+	state := s.admissionStateLocked()
 	s.mu.Unlock()
 	return state
 }

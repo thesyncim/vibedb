@@ -344,14 +344,16 @@ func TestRecoveredTornCurrentSlotQuarantinesBeforeSQLMutation(t *testing.T) {
 	}
 	offset := int64(raftstore.StaticHeaderBytes + raftstore.CurrentSlotBytes + 128)
 	one := []byte{0}
-	if _, err := file.ReadAt(one, offset); err == nil {
-		one[0] ^= 0xff
-		_, err = file.WriteAt(one, offset)
+	if _, err := file.ReadAt(one, offset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
 	}
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
+	one[0] ^= 0xff
+	if _, err := file.WriteAt(one, offset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
 	}
-	if err != nil {
+	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
 

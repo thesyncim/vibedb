@@ -80,7 +80,7 @@ func (snapshot *Snapshot) attachReplicatedTableProfiles(
 	for ordinal := range profiles {
 		profile := profiles[ordinal]
 		plannerOrdinal, found := snapshot.plannerTableOrdinal(profile.Table)
-		if !found || plannerOrdinal < 0 || uint64(plannerOrdinal) > uint64(^uint32(0)) {
+		if !found {
 			return &CatalogError{Reason: fmt.Sprintf(
 				"replicated table %q has no placement", profile.Table,
 			)}

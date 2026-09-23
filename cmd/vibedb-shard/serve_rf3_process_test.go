@@ -657,7 +657,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		Fence: rf3CommandServingFence(leaderState.Fence), SourceMember: 1, TargetMember: 4,
 		Command: ownership,
 	})
-	leader, leaderState = rf3CommandFindLeaderWithProbeCommand(
+	_, leaderState = rf3CommandFindLeaderWithProbeCommand(
 		t, servingAddresses, servingNodes, clientProfile, authorityIdentity.Node, group,
 		rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
 		leaderState.Fence.Command,

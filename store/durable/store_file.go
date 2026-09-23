@@ -527,8 +527,7 @@ type Collection struct {
 	// structuralRows is reused row scratch for leaf re-encoding. Its
 	// records borrow the source leaf page and are valid only while that page is
 	// leased inside the structural transaction.
-	structuralRows  []storeio.CommonPrimaryLeafRecord
-	pointKeyScratch []byte
+	structuralRows []storeio.CommonPrimaryLeafRecord
 	// schemaIndexScratch is the writer-only IndexEntry arena reused to build the
 	// per-document index that schema enforcement validates. It is only touched
 	// when the collection carries a declared schema, so the common (schemaless)

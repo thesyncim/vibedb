@@ -165,15 +165,15 @@ func TestCombineProcessManifestsWithNodeMetadataPreservesPhysicalGenesis(t *test
 		}
 	}
 	if position := bytes.Index(raw, []byte(`"authorization_policy"`)); position < 0 ||
-		bytes.Index(raw[position:], []byte(`"canonical_source_seeds"`)) < 0 ||
-		bytes.Index(raw[position:], []byte(`"replica_control"`)) < 0 {
+		!bytes.Contains(raw[position:], []byte(`"canonical_source_seeds"`)) ||
+		!bytes.Contains(raw[position:], []byte(`"replica_control"`)) {
 		t.Fatal("source seeds were not placed after authorization policy")
 	}
 	if policy := bytes.Index(raw, []byte(`"authorization_policy"`)); bytes.Index(raw[policy:], []byte(`"canonical_source_seeds"`)) >
 		bytes.Index(raw[policy:], []byte(`"replica_control"`)) {
 		t.Fatal("source seeds were placed after replica control")
 	}
-	if position := bytes.Index(raw, []byte(`"split_control"`)); position < 0 || bytes.Index(raw[position:], []byte(`"catalog_genesis"`)) < 0 {
+	if position := bytes.Index(raw, []byte(`"split_control"`)); position < 0 || !bytes.Contains(raw[position:], []byte(`"catalog_genesis"`)) {
 		t.Fatal("catalog genesis was not placed after split control")
 	}
 }

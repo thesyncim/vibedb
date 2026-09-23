@@ -49,6 +49,9 @@ func provePinnedNamedFile(
 	return nil
 }
 
+// rawFstatat and rawOpenDirectory keep direct traps deliberately: the
+// libSystem wrappers convert Go strings and allocate, while these pass the
+// caller's pre-terminated path with zero allocations on the persist path.
 func rawFstatat(directory int, pathNUL string, stat *unix.Stat_t, flags int) error {
 	_, _, errno := unix.Syscall6(unix.SYS_FSTATAT64, uintptr(directory), uintptr(unsafe.Pointer(unsafe.StringData(pathNUL))), uintptr(unsafe.Pointer(stat)), uintptr(flags), 0, 0)
 	runtime.KeepAlive(pathNUL)

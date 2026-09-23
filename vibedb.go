@@ -761,7 +761,7 @@ func (c *Collection) Put(key string, document []byte) (created bool, err error) 
 
 // Delete atomically removes key. deleted is false when key was absent.
 func (c *Collection) Delete(key string) (deleted bool, err error) {
-	memory, disk, err := c.backend(false)
+	_, disk, err := c.backend(false)
 	if err != nil {
 		return false, err
 	}
@@ -771,7 +771,7 @@ func (c *Collection) Delete(key string) (deleted bool, err error) {
 	}
 	c.lockDirectMutation()
 	defer c.unlockDirectMutation()
-	memory, disk, err = c.backend(false)
+	memory, disk, err := c.backend(false)
 	if err != nil {
 		return false, err
 	}

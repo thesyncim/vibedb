@@ -259,13 +259,11 @@ func newNode(
 	if err != nil {
 		return nil, fmt.Errorf("raftmodel: read durable last term at %d: %w", last, err)
 	}
-	committed := base
 	if !raft.IsEmptyHardState(hs) {
 		if hs.GetCommit() < base || hs.GetCommit() > last || hs.GetTerm() < lastTerm ||
 			(hs.GetTerm() == 0 && hs.GetVote() != 0) {
 			return nil, fmt.Errorf("raftmodel: durable commit %d outside log range [%d,%d]", hs.GetCommit(), base, last)
 		}
-		committed = hs.GetCommit()
 	}
 	if pub.Applied <= base {
 		reconciled := &Node{machine: machine, published: pub}
@@ -291,13 +289,6 @@ func newNode(
 	}
 	if pub.Applied < base || pub.Applied > last {
 		return nil, fmt.Errorf("raftmodel: published index %d outside durable log range [%d,%d]", pub.Applied, base, last)
-	}
-	if pub.Applied > committed {
-		// A successful state-machine publication is itself durable by contract
-		// and could only have been produced from a committed, already-durable log
-		// entry. It is therefore the recovery certificate for a final commit-only
-		// HardState notification that the WAL deliberately did not rewrite.
-		committed = pub.Applied
 	}
 	if pub.Applied == base {
 		if equivalentErr := pub.ConfState.Equivalent(metadata.GetConfState()); equivalentErr != nil {

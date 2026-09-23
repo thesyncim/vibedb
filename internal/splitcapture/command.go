@@ -61,7 +61,6 @@ func AppendCommand(dst []byte, c Command) ([]byte, error) {
 	binary.LittleEndian.PutUint64(f[o:o+8], c.SourceGeneration)
 	o += 8
 	binary.LittleEndian.PutUint64(f[o:o+8], c.SchemaGeneration)
-	o += 8
 	copy(f[headerBytes:headerBytes+len(c.Spec)], c.Spec)
 	h := sha256.New()
 	_, _ = h.Write(domain)

@@ -265,7 +265,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	go pulseRF3(stopPulses, pulses)
 	waitRF3Applied(t, ctx, owners, nil, group, acknowledged.Outcome.AppliedIndex)
 	follower := (leader + 1) % voters
-	followerRead, followerLease, followerState, err := readRF3PointAtFreshFence(
+	followerRead, followerLease, _, err := readRF3PointAtFreshFence(
 		t, ctx, owners[follower], readSources[follower], group, PointReadRequest{Relation: 1, Key: key,
 			MinimumApplied: acknowledged.Outcome.AppliedIndex,
 			MaxValueBytes:  replication.MaxMutationValueBytes,
@@ -285,6 +285,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	} else if lease != nil {
 		t.Fatal("response-bound refusal returned a lease")
 	}
+	var followerState ServingState
 	if _, lease, followerState, err = readRF3PointAtFreshFence(t, ctx, owners[follower], readSources[follower], group, PointReadRequest{
 		Relation: 1, Key: key,
 		MinimumApplied: followerRead.Applied + 1,
@@ -352,7 +353,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	} else if lease != nil {
 		t.Fatal("stale read term returned a lease")
 	}
-	if _, lease, leaderState, err = readRF3PointAtFreshFence(t, ctx, owners[leader], readSources[leader], group, PointReadRequest{
+	if _, lease, _, err = readRF3PointAtFreshFence(t, ctx, owners[leader], readSources[leader], group, PointReadRequest{
 		Relation: 1, Key: key,
 		MinimumApplied: linearRead.Applied + 1,
 		MaxValueBytes:  replication.MaxMutationValueBytes, Linearizable: true,

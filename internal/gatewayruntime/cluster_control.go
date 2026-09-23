@@ -388,7 +388,6 @@ type clusterControlProgress struct {
 	phase                  string
 	applicationGroupsMoved uint32
 	internalGroupsMoved    uint32
-	retiringReferences     uint32
 	inventoryDigest        string
 	moveFailure            string
 }

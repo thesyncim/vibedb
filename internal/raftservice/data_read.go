@@ -364,10 +364,7 @@ func (owner *Owner) readLinearizablePointInto(
 			reply.read.generation.release()
 		}
 	}()
-	source, ok := reply.read.source.(ReadSource)
-	if !ok {
-		return ErrServingFence
-	}
+	source := reply.read.source
 	if err := context.Cause(ctx); err != nil {
 		return err
 	}

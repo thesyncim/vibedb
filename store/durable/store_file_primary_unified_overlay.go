@@ -1189,11 +1189,12 @@ func (o *primaryUnifiedOverlay) prepareBatch(
 			}
 		}
 
-		previousWide, foundKey := false, false
+		var previousWide bool
+		foundKey := false
 		for keyIndex := range keys {
 			candidate := &keys[keyIndex]
 			if bytes.Equal(candidate.key, mutation.key) {
-				previousWide, foundKey = candidate.wide, true
+				foundKey = true
 				break
 			}
 		}

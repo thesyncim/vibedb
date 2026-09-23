@@ -345,21 +345,19 @@ func appendPreparedAckHeader(dst []byte, request PreparedAckRequest, cutDigest [
 // Marshal returns one canonical request frame, including the route
 // discriminator consumed by shardcontrol.Mux.
 func (request PreparedAckRequest) Marshal() ([]byte, error) {
-	cut, err := marshalPreparedAckCut(request.SourceCut)
-	if err != nil || !request.valid() {
+	if _, err := marshalPreparedAckCut(request.SourceCut); err != nil || !request.valid() {
 		return nil, ErrPreparedAckWire
 	}
-	cutDigest := sha256.Sum256(cut)
 	canonicalCut, err := canonicalPreparedAckCut(request.SourceCut)
 	if err != nil {
 		return nil, ErrPreparedAckWire
 	}
 	request.SourceCut = canonicalCut
-	cut, err = marshalPreparedAckCut(request.SourceCut)
+	cut, err := marshalPreparedAckCut(request.SourceCut)
 	if err != nil {
 		return nil, err
 	}
-	cutDigest = sha256.Sum256(cut)
+	cutDigest := sha256.Sum256(cut)
 	frame, err := appendPreparedAckHeader(nil, request, cutDigest, uint32(len(cut)))
 	if err != nil {
 		return nil, err

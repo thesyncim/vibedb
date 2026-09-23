@@ -325,8 +325,7 @@ func (s *relationSpool) ownCell(cell Cell, cancel *CancelFlag) (scalar, error) {
 		raw = nil
 	} else if len(cell.raw) != 0 {
 		start := len(s.data)
-		var err error
-		err = s.appendOwnedBytes(cell.raw, cancel)
+		err := s.appendOwnedBytes(cell.raw, cancel)
 		if err != nil {
 			return scalar{}, err
 		}
