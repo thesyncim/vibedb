@@ -1360,7 +1360,19 @@ func (executor *ReplicatedExecutor) propose(
 	}
 }
 
+// replicatedDefiniteUnavailable reports an invocation that provably admitted
+// nothing and failed only because the group could not serve it yet: a typed
+// Unavailable refusal, or an attempt budget spent entirely on pre-admission
+// NotLeader/stale-fence refusals (the bare ErrReplicatedLeader result). A
+// leadership handoff is wall-clock bounded, not attempt bounded: members that
+// still name a stale leader redirect without a wait, so a fixed attempt count
+// can be exhausted in microseconds mid-election. Retry such cuts within the
+// executor's time budget. Discovery failures are not included; discovery owns
+// its own election wait, and an unreachable replica set stays terminal.
 func replicatedDefiniteUnavailable(err error) bool {
+	if err == ErrReplicatedLeader {
+		return true
+	}
 	var refusal *ReplicatedRefusalError
 	return !errors.Is(err, raftservice.ErrOutcomeUnknown) && !terminalReplicatedDiscoveryError(err) && errors.As(err, &refusal) &&
 		refusal.Code == shardservice.ReplicatedRefusalUnavailable

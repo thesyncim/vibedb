@@ -36,6 +36,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/hotshard"
+	"github.com/thesyncim/vibedb/internal/loopbackport"
 	"github.com/thesyncim/vibedb/internal/orderedkey"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -2060,7 +2061,7 @@ func reserveDevPortsUsing(count int, pgAddresses []string, listen func(string, s
 	}
 	addresses = make([]string, count)
 	for index := range addresses {
-		listener, listenErr := listen("tcp", "127.0.0.1:0")
+		listener, listenErr := loopbackport.Listen(listen)
 		if listenErr != nil {
 			return nil, listenErr
 		}
@@ -2069,6 +2070,7 @@ func reserveDevPortsUsing(count int, pgAddresses []string, listen func(string, s
 	}
 	return addresses, nil
 }
+
 func writeDevCredentials(root string, domain rafttransport.TrustDomain, nodes []rafttransport.NodeID) ([][2]string, string, error) {
 	return writeDevCredentialsWithCA(root, domain, nodes, "", "")
 }

@@ -304,7 +304,7 @@ func (evidence seamlessScaleEvidence) valid(bounds seamlessScalePerformanceBound
 	// Every during sample belongs to exactly one explicitly classified window.
 	// These two summaries may span disjoint windows: DurationNS is their actual
 	// active duration, never the wall-clock gap occupied by the other class.
-	if evidence.FaultInjections != 4 || evidence.SteadyWindows < 3 || evidence.RecoveryWindows == 0 ||
+	if evidence.FaultInjections != 4 || evidence.SteadyWindows < seamlessScaleMinimumSteadyWindows || evidence.RecoveryWindows == 0 ||
 		evidence.RecoveryWindows > 2*evidence.FaultInjections ||
 		evidence.SteadyWindows+evidence.RecoveryWindows != evidence.DuringWindows ||
 		evidence.SteadyDuring.Scheduled+evidence.RecoveryDuring.Scheduled != evidence.During.Scheduled ||

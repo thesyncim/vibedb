@@ -133,6 +133,44 @@ func TestReplicatedExecutorWaitsForDefiniteUnavailableWithoutChangingCommand(t *
 	}
 }
 
+type handoffProposalClient struct {
+	*startupElectionClient
+	readyAt   time.Time
+	redirects int
+}
+
+func (client *handoffProposalClient) DoReplicated(ctx context.Context, endpoint ReplicatedEndpoint,
+	request *shardservice.ReplicatedRequest,
+) (*shardservice.ReplicatedResponse, error) {
+	if request.Operation == shardservice.ReplicatedPropose && time.Now().Before(client.readyAt) {
+		client.redirects++
+		state := client.states[endpoint.Address]
+		state.LeaderID = 0
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedNotLeader,
+			HasState: true, State: state}, nil
+	}
+	return client.startupElectionClient.DoReplicated(ctx, endpoint, request)
+}
+
+// A leadership handoff can refuse every proposal attempt before admission
+// faster than the election completes. The executor must wait out the handoff
+// within its time budget, not fail after a fixed count of NotLeader replies.
+func TestReplicatedExecutorWaitsOutLeaderHandoffWithoutChangingCommand(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		route, command, states := testReplicatedRouteCommand(t)
+		client := &handoffProposalClient{startupElectionClient: &startupElectionClient{states: states},
+			readyAt: time.Now().Add(1500 * time.Millisecond)}
+		executor, err := NewReplicatedExecutor(client, 1, 3*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = executor.Propose(t.Context(), route, command)
+		if err != nil || len(client.commands) != 1 || client.redirects < 2 || !bytes.Equal(client.commands[0], command) {
+			t.Fatalf("handoff: admitted=%d redirects=%d err=%v", len(client.commands), client.redirects, err)
+		}
+	})
+}
+
 func TestReplicatedExecutorUnavailableDeadlineIsDefinite(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		route, command, states := testReplicatedRouteCommand(t)

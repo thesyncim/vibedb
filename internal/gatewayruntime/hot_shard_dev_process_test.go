@@ -23,6 +23,7 @@ import (
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/loopbackport"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rf3testfixture"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -116,12 +117,8 @@ func TestGatewayZeroConfigDevPressureCompletesReplicatedSplit(t *testing.T) {
 		"--shard-binary", shardBinary, "--gateway-binary", gatewayBinary,
 	}
 	if customTable {
-		pgListener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		pgListen = pgListener.Addr().String()
-		if err := pgListener.Close(); err != nil {
+		var err error
+		if pgListen, err = loopbackport.Reserve(); err != nil {
 			t.Fatal(err)
 		}
 		schemaPath := filepath.Join(root, "dev-hot-messages.sql")

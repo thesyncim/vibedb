@@ -5,8 +5,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"syscall"
 	"testing"
+
+	"github.com/thesyncim/vibedb/internal/loopbackport"
 )
 
 func TestReserveDevPortsHoldsRequestedPGEndpointsDuringEveryAllocation(t *testing.T) {
@@ -51,7 +55,7 @@ func TestReserveDevPortsHoldsRequestedPGEndpointsDuringEveryAllocation(t *testin
 			initial = nil
 			allocations := 0
 			ports, err := reserveDevPortsUsing(1+tc.physical*6, requested, func(network, address string) (net.Listener, error) {
-				if address == "127.0.0.1:0" {
+				if !slices.Contains(requested, address) {
 					allocations++
 					// Deliberately try every requested binding before each
 					// internal allocation; a missing reservation fails on every
@@ -78,6 +82,27 @@ func TestReserveDevPortsHoldsRequestedPGEndpointsDuringEveryAllocation(t *testin
 			assertDevPortsCanBindTogether(t, append(requested, ports...))
 		})
 	}
+}
+
+// Persisted development ports must never come from the kernel's ephemeral
+// range: an outbound connection may take such a port as its source while the
+// node that owns it restarts.
+func TestReserveDevPortsAvoidEphemeralRange(t *testing.T) {
+	ports, err := reserveDevPorts(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, address := range ports {
+		_, rawPort, err := net.SplitHostPort(address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		port, err := strconv.Atoi(rawPort)
+		if err != nil || port < loopbackport.Low || port >= loopbackport.High {
+			t.Fatalf("persistent port %q outside [%d,%d): %v", address, loopbackport.Low, loopbackport.High, err)
+		}
+	}
+	assertDevPortsCanBindTogether(t, ports)
 }
 
 func TestReserveDevPortsClosesAllReservationsOnFailure(t *testing.T) {
