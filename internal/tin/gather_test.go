@@ -71,6 +71,87 @@ func TestScoreGatheredMatchesSequentialMerge(t *testing.T) {
 	}
 }
 
+// TestGatherPoolMatchesSpawnGather proves the pool changes nothing:
+// every pool size (fewer, equal, and more workers than shards) returns
+// bit-identical rankings to the spawn-per-call gather over terms, ANDs,
+// phrases, ties, and full rankings, with nil and empty shard sets
+// covered. Shard buffers are fresh per size so no run aliases another.
+func TestGatherPoolMatchesSpawnGather(t *testing.T) {
+	for _, workers := range []int{1, 2, 6, 7, 32} {
+		shards := gatherShardCorpus(6, 500)
+		p := NewGatherPool(workers)
+		for _, pattern := range []string{"common", "zipf AND common", `"tied tie"`, "zipf"} {
+			q := gatherQuery(t, shards, pattern)
+			for _, topK := range []int{1, 10, 0} {
+				want := ScoreGathered(shards, q, topK, nil)
+				for i := range shards {
+					shards[i].Out = nil
+				}
+				got := p.Score(shards, q, topK, nil)
+				if len(got) != len(want) {
+					t.Fatalf("workers=%d %s topK=%d: %d hits, want %d", workers, pattern, topK, len(got), len(want))
+				}
+				for i := range got {
+					if got[i] != want[i] {
+						t.Fatalf("workers=%d %s topK=%d hit %d: %+v != %+v", workers, pattern, topK, i, got[i], want[i])
+					}
+				}
+			}
+		}
+		p.Close()
+	}
+}
+
+// TestGatherPoolEdges covers degenerate inputs: no shards, all-nil
+// shards, and a pool larger than the shard set on a single worker.
+func TestGatherPoolEdges(t *testing.T) {
+	p := NewGatherPool(4)
+	defer p.Close()
+	if got := p.Score(nil, Query{Op: OpTerm, Term: 1}, 10, nil); len(got) != 0 {
+		t.Fatalf("empty shards: %v", got)
+	}
+	nils := []Shard{{}, {}, {}}
+	if got := p.Score(nils, Query{Op: OpTerm, Term: 1}, 10, nil); len(got) != 0 {
+		t.Fatalf("all-nil shards: %v", got)
+	}
+	one := NewGatherPool(1)
+	defer one.Close()
+	shards := gatherShardCorpus(1, 100)
+	q := gatherQuery(t, shards, "common")
+	want := ScoreGathered(shards, q, 5, nil)
+	shards[0].Out = nil
+	if got := one.Score(shards, q, 5, nil); len(got) != len(want) {
+		t.Fatalf("single: %d hits, want %d", len(got), len(want))
+	} else {
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("single hit %d: %+v != %+v", i, got[i], want[i])
+			}
+		}
+	}
+}
+
+// TestGatherPoolSteadyAllocs pins the pool's warm budget at exactly three,
+// independent of shard count: the runs slice, the pre-sized merge heap,
+// and the shared WaitGroup (its address crosses goroutines, so it escapes
+// by construction). The spawn-per-call path spends ~2 per shard on top.
+func TestGatherPoolSteadyAllocs(t *testing.T) {
+	shards := gatherShardCorpus(16, 500)
+	p := NewGatherPool(8)
+	defer p.Close()
+	q := gatherQuery(t, shards, "common")
+	var out []Scored
+	for i := 0; i < 10; i++ {
+		out = p.Score(shards, q, 10, out[:0])
+	}
+	if n := testing.AllocsPerRun(20, func() {
+		out = p.Score(shards, q, 10, out[:0])
+	}); n != 3 {
+		t.Fatalf("pool Score allocated %v per run, want 3 (runs, heap, WaitGroup)", n)
+	}
+	_ = out
+}
+
 // TestScoreGatheredTopKSufficiency proves per-shard top-K suffices: the
 // merged top-K over full per-shard rankings is identical, even with ties
 // spanning every shard.

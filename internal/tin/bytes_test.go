@@ -383,6 +383,152 @@ func TestBytesLanesZeroAlloc(t *testing.T) {
 
 var scratchPairs []tokPos
 
+// FuzzByteLanesAgree fuzzes the lane lockstep: arbitrary bytes (the
+// fuzzer lives for multibyte boundaries and malformed sequences) must
+// tokenize, spell, pair, fold, and early-exit identically on both lanes.
+// The seed corpus runs under plain `go test`; extended exploration is a
+// `go test -fuzz` away. Inputs are capped so one worker stays quick.
+func FuzzByteLanesAgree(f *testing.F) {
+	for _, s := range bytesCorpus {
+		f.Add([]byte(s))
+	}
+	f.Add([]byte{0xff, 0xfe, 0x80, 0xc3})
+	f.Add([]byte("a"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 2048 {
+			t.Skip()
+		}
+		text := string(data)
+		var wantPairs []tokPos
+		scanBytes(data, func(h uint64, p uint32) {
+			wantPairs = append(wantPairs, tokPos{hash: h, pos: p})
+		})
+		var havePairs []tokPos
+		scanString(text, func(h uint64, p uint32) {
+			havePairs = append(havePairs, tokPos{hash: h, pos: p})
+		})
+		if len(wantPairs) != len(havePairs) {
+			t.Fatalf("%d bytes: byte tokens %d, string %d", len(data), len(wantPairs), len(havePairs))
+		}
+		for i := range havePairs {
+			if wantPairs[i] != havePairs[i] {
+				t.Fatalf("%d bytes token %d: byte %+v, string %+v", len(data), i, wantPairs[i], havePairs[i])
+			}
+		}
+		if got, want := scanPairsBytes(data, nil), scanPairs(text, nil); len(got) != len(want) {
+			t.Fatalf("%d bytes: byte pairs %d, string %d", len(data), len(got), len(want))
+		} else {
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("%d bytes pair %d: byte %+v, string %+v", len(data), i, got[i], want[i])
+				}
+			}
+		}
+		foldWant := make([]byte, len(data))
+		foldASCII(foldWant, text)
+		foldGot := make([]byte, len(data))
+		foldASCIIBytes(foldGot, data)
+		if string(foldGot) != string(foldWant) {
+			t.Fatalf("%d bytes: fold lanes disagree", len(data))
+		}
+		// Early-exit lockstep on queries derived from the input's own
+		// tokens, so exits, fall-throughs, and misses all occur.
+		var queries []Query
+		if len(wantPairs) > 0 {
+			queries = append(queries, Query{Op: OpTerm, Term: wantPairs[0].hash})
+			if len(wantPairs) > 1 {
+				queries = append(queries, Query{Op: OpOr, Kids: []Query{
+					{Op: OpTerm, Term: wantPairs[0].hash},
+					{Op: OpTerm, Term: wantPairs[1].hash},
+				}})
+				queries = append(queries, Query{Op: OpAnd, Kids: []Query{
+					{Op: OpTerm, Term: wantPairs[0].hash},
+					{Op: OpTerm, Term: wantPairs[1].hash},
+				}})
+			}
+		}
+		queries = append(queries, Query{Op: OpTerm, Term: 0x9E3779B97F4A7C15})
+		for _, q := range queries {
+			var neededBuf [stopCap]uint64
+			needed, ok := collectTerms(&q, neededBuf[:0])
+			if !ok || len(needed) == 0 {
+				continue
+			}
+			var f1, f2 [stopCap]tokPos
+			wOut, wFound, wStop, wVerdict := scanPairsUntil(text, nil, q, needed, f1[:0])
+			gOut, gFound, gStop, gVerdict := scanPairsUntilBytes(data, nil, q, needed, f2[:0])
+			if wStop != gStop || wVerdict != gVerdict || len(wOut) != len(gOut) || len(wFound) != len(gFound) {
+				t.Fatalf("%d bytes op %d: string (%d,%d,%v,%v) byte (%d,%d,%v,%v)",
+					len(data), q.Op, len(wOut), len(wFound), wStop, wVerdict,
+					len(gOut), len(gFound), gStop, gVerdict)
+			}
+			for i := range wOut {
+				if wOut[i] != gOut[i] {
+					t.Fatalf("%d bytes op %d pair %d: string %+v, byte %+v", len(data), q.Op, i, wOut[i], gOut[i])
+				}
+			}
+		}
+	})
+}
+
+// buildBenchTexts mixes short, fold-lane long, multibyte, and empty
+// documents for the ingest A/B.
+var buildBenchTexts = []string{
+	"fuji apple juicy red pie",
+	"Hello WORLD café \u4e2d\u6587",
+	"",
+	strings.Repeat("Alpha Beta GAMMA delta café ", 20),
+	strings.Repeat("the quick brown fox jumps over the lazy dog ", 12),
+	"punctuation ...,,, and $19.99 (sale!)",
+}
+
+// BenchmarkAddBuildLane is the ingest A/B: full index builds over the same
+// documents through Add, through AddBytes from per-document buffers, and
+// through AddBytes from one reused buffer (copy included, so the reuse
+// story pays its honest price).
+func BenchmarkAddBuildLane(b *testing.B) {
+	bufs := make([][]byte, len(buildBenchTexts))
+	for i, s := range buildBenchTexts {
+		bufs[i] = []byte(s)
+	}
+	b.Run("string", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			ix := NewIndex()
+			for id, s := range buildBenchTexts {
+				ix.Add(DocID(id+1), s)
+			}
+		}
+	})
+	b.Run("bytes", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			ix := NewIndex()
+			for id, buf := range bufs {
+				ix.AddBytes(DocID(id+1), buf)
+			}
+		}
+	})
+	b.Run("bytes-reuse", func(b *testing.B) {
+		var scratch []byte
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			ix := NewIndex()
+			for id, buf := range bufs {
+				if cap(scratch) < len(buf) {
+					scratch = make([]byte, len(buf))
+				}
+				scratch = scratch[:len(buf)]
+				copy(scratch, buf)
+				ix.AddBytes(DocID(id+1), scratch)
+			}
+		}
+	})
+}
+
 // BenchmarkScanPairsBytes mirrors BenchmarkScanPairs for the A/B: same
 // documents, same metric, byte lane.
 func BenchmarkScanPairsBytes(b *testing.B) {

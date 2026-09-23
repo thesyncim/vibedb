@@ -266,6 +266,103 @@ func gatherScores(shards []Shard, q Query, topK int) [][]Scored {
 	return runs
 }
 
+// GatherPool is a persistent worker set for distributed search. Spawning
+// one goroutine per shard per query costs a stack plus scheduling per
+// shard on every call (~2 allocs each, measured); parked workers pay
+// that once and then serve every query. Size the pool to the search
+// threads (usually GOMAXPROCS), not the shard count: workers stride
+// over shards, so any shard count runs on any pool size, and shards
+// beyond the thread count still queue in waves — oversubscription is a
+// deployment property no gather API can remove. Close the pool when the
+// deployment stops serving.
+type GatherPool struct {
+	work []chan gatherJob
+	done chan struct{}
+	wg   sync.WaitGroup
+}
+
+// gatherJob is one worker's share of one query: every worker receives the
+// same job value and serves the shards its stride owns. All fields are
+// read-only except the worker's own runs slots and Out buffers, which are
+// disjoint by stride, and the shared WaitGroup.
+type gatherJob struct {
+	shards []Shard
+	runs   [][]Scored
+	q      Query
+	topK   int
+	worker int
+	of     int
+	wg     *sync.WaitGroup
+}
+
+// NewGatherPool starts n parked search workers.
+func NewGatherPool(n int) *GatherPool {
+	if n < 1 {
+		n = 1
+	}
+	p := &GatherPool{work: make([]chan gatherJob, n), done: make(chan struct{})}
+	for w := range p.work {
+		p.work[w] = make(chan gatherJob, 1)
+		p.wg.Add(1)
+		go p.serve(w)
+	}
+	return p
+}
+
+func (p *GatherPool) serve(w int) {
+	defer p.wg.Done()
+	for {
+		select {
+		case <-p.done:
+			return
+		case job := <-p.work[w]:
+			for i := job.worker; i < len(job.shards); i += job.of {
+				if job.shards[i].Ix == nil {
+					continue
+				}
+				job.shards[i].Out = job.shards[i].Ix.Score(job.q, job.topK, job.shards[i].Out[:0])
+				job.runs[i] = job.shards[i].Out
+			}
+			job.wg.Done()
+		}
+	}
+}
+
+// Score searches every shard through the pool and merges the exact global
+// top-K, verdict-identical to ScoreGathered: the same per-shard Score
+// calls over the same buffers into the same merge. A warmed call spends
+// exactly three allocations — the runs slice, the pre-sized merge heap,
+// and the shared WaitGroup — independent of shard count. Shard buffers
+// must not alias out or each
+// other, as with ScoreGathered, and concurrent Score calls must use
+// disjoint shard sets: sharing one Shard's Out across callers races,
+// exactly like sharing it across ScoreGathered calls.
+func (p *GatherPool) Score(shards []Shard, q Query, topK int, out []Scored) []Scored {
+	runs := make([][]Scored, len(shards))
+	var wg sync.WaitGroup
+	n := len(p.work)
+	if len(shards) < n {
+		n = len(shards)
+	}
+	wg.Add(n)
+	job := gatherJob{shards: shards, q: q, topK: topK, runs: runs, of: n, wg: &wg}
+	for w := 0; w < n; w++ {
+		job.worker = w
+		p.work[w] <- job
+	}
+	wg.Wait()
+	return mergeScored(runs, topK, out)
+}
+
+// Close parks the workers. Call it only once no Score call is in flight:
+// a worker may observe done with a submitted job still queued, hanging
+// that call's wait. The deployment owns the lifecycle — construct with
+// the server, close on shutdown.
+func (p *GatherPool) Close() {
+	close(p.done)
+	p.wg.Wait()
+}
+
 // MatchGatheredQueries matches one query per shard in parallel and merges
 // the deduplicated union. It serves patterns whose dictionary expansion
 // differs per shard: each shard matches the pattern parsed against its
@@ -313,7 +410,9 @@ func gatherMatches(shards []Shard, q Query) [][]DocID {
 // global order and truncates to topK (topK <= 0 keeps everything). Equal
 // DocIDs dedupe to their first — hence highest-scoring — occurrence.
 func mergeScored(runs [][]Scored, topK int, out []Scored) []Scored {
-	var heap mergeHeap
+	// Pre-sized: one allocation covers every run's head instead of
+	// regrowing through the capacity ladder per call.
+	heap := make(mergeHeap, 0, len(runs))
 	for _, run := range runs {
 		if len(run) > 0 {
 			heap = append(heap, mergeHead{run: run})
