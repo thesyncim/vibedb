@@ -125,7 +125,7 @@ func TestTopKScoredPartition(t *testing.T) {
 		"shuffled": func(n int) []Scored {
 			s := make([]Scored, n)
 			for i := range s {
-				s[i] = Scored{Doc: DocID((i*2654435761)%(n+1) + 1), Score: 1.5}
+				s[i] = Scored{Doc: DocID(int(uint64(i)*2654435761%uint64(n+1)) + 1), Score: 1.5}
 			}
 			return s
 		},

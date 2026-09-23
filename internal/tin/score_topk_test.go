@@ -17,7 +17,7 @@ func topKExactIndex(t *testing.T, seal bool, n int) *Index {
 		var sb strings.Builder
 		sb.WriteString("common filler")
 		if i%5 != 0 {
-			tf := 1 + (i*2654435761)%512
+			tf := 1 + int(uint64(i)*2654435761%512)
 			for k := 0; k < tf; k++ {
 				sb.WriteString(" zipf")
 			}
@@ -104,7 +104,7 @@ func skewTopKIndex(t testing.TB, seal bool) *Index {
 		var sb strings.Builder
 		sb.WriteString("fill")
 		if i%5 != 0 {
-			tf := 1 + (i*2654435761)%1024
+			tf := 1 + int(uint64(i)*2654435761%1024)
 			for k := 0; k < tf; k++ {
 				sb.WriteString(" zipf")
 			}

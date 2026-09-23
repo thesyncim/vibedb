@@ -21,7 +21,7 @@ func scoreBenchDatabase(b testing.TB) *store.Database {
 	}
 	for i := range 8192 {
 		body := "common"
-		for k := 0; k < (i*2654435761)%64; k++ {
+		for k := 0; k < int(uint64(i)*2654435761%64); k++ {
 			body += " common"
 		}
 		for k := 0; k < (i*97)%240; k++ {

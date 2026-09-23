@@ -691,9 +691,13 @@ func (p *Parser) parseLeafTail(
 		}
 		return e, nil
 	}
+	// kwScore rides the nameable-word lane: SCORE is a relevance function
+	// only with '(', so a bare score is a field reference exactly like an
+	// unkeyworded identifier. Without this, WHERE id=score misparses as a
+	// constant-operand violation instead of reaching schema analysis.
 	if pathComparison &&
 		(p.tok.kind == tokQuotedIdent ||
-			p.tok.kind == tokIdent && p.tok.kw == kwNone) {
+			p.tok.kind == tokIdent && (p.tok.kw == kwNone || p.tok.kw == kwScore)) {
 		right, err := p.parsePath(false)
 		if err != nil {
 			return nil, err
