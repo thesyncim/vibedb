@@ -979,3 +979,63 @@ func TestPostgreSQLDirectPreparationCancellationAndRetryBound(t *testing.T) {
 		})
 	}
 }
+
+// A write refused before admission may still have been admitted by a racing
+// path. While the logical route is unchanged the pool must re-drive the same
+// request identity through recovery, never mint a new one: a new identity
+// would turn an admitted attempt into a duplicate insert.
+func TestPostgreSQLDirectAdmissionRetryKeepsIdentityOnSameRoute(t *testing.T) {
+	route := catalogRouteSeedRoute(t, catalogRouteSeedSnapshot(t, 1, "127.0.0.1:7101"))
+	advanced := route
+	advanced.Command.OwnershipEpoch++
+	advanced.Command.RoutingVersion++
+	advanced.Command.RouteGeneration++
+	split := advanced
+	split.Group.GroupID[0] ^= 0xff
+	for _, test := range []struct {
+		name         string
+		next         gateway.ReplicatedRoute
+		sameIdentity bool
+	}{
+		{name: "ownership advance keeps identity", next: advanced, sameIdentity: true},
+		{name: "group change mints identity", next: split, sameIdentity: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := &directPoolService{}
+			prepares := 0
+			s.prepare = func(_ context.Context, id durableExecBatchIdentity, _ []gateway.Query) (*gateway.DurableSQLDirectPlan, error) {
+				prepares++
+				plan := &gateway.DurableSQLDirectPlan{Key: requestledger.RequestKey{
+					Request: requestledger.RequestID(id.RequestID), IssuerSequence: id.IssuerSequence}}
+				plan.Target.Route = route
+				if prepares > 1 {
+					plan.Target.Route = test.next
+				}
+				return plan, nil
+			}
+			type call struct {
+				id           durableExecBatchIdentity
+				priorUnknown bool
+			}
+			var calls []call
+			s.executeUnknown = func(_ context.Context, id durableExecBatchIdentity, _ []gateway.Query, _ *gateway.DurableSQLDirectPlan, priorUnknown bool) (durableExecBatchExecuteResult, error) {
+				calls = append(calls, call{id: id, priorUnknown: priorUnknown})
+				if len(calls) == 1 {
+					return durableExecBatchExecuteResult{}, errors.Join(gateway.ErrDurableSQLNotAdmitted, raftservice.ErrServingFence)
+				}
+				return durableExecBatchExecuteResult{Direct: true, Result: &gateway.Result{RowsAffected: 1}}, nil
+			}
+			p := testDirectPool(t, s)
+			p.admissionWindow = time.Second
+			result, _, err := p.Write(t.Context(), gateway.Query{SQL: "INSERT INTO docs VALUES ('a')"})
+			if err != nil || result == nil || result.RowsAffected != 1 || len(calls) != 2 {
+				t.Fatalf("result=%+v calls=%+v err=%v", result, calls, err)
+			}
+			same := calls[1].id.RequestID == calls[0].id.RequestID &&
+				calls[1].id.IssuerSequence == calls[0].id.IssuerSequence
+			if same != test.sameIdentity || calls[1].priorUnknown != test.sameIdentity {
+				t.Fatalf("retry identity same=%t priorUnknown=%t, want %t", same, calls[1].priorUnknown, test.sameIdentity)
+			}
+		})
+	}
+}

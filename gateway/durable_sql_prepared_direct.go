@@ -326,6 +326,15 @@ func diagnoseDirectRecoveryRoute(
 		current.Group, current.AllocationGeneration, current.Command, err)
 }
 
+// DirectMutationRecoverableRoute reports whether a retained direct recipe
+// planned against old may be re-driven under its original request identity
+// on current: the same logical shard, group and allocation with a fence that
+// only advanced. This is exactly the rebinding ExecutePreparedDirect performs
+// when called with priorUnknown.
+func DirectMutationRecoverableRoute(old, current ReplicatedRoute) bool {
+	return directMutationRouteAdvanceAllowed(old, current)
+}
+
 func directMutationRouteAdvanceAllowed(old, current ReplicatedRoute) bool {
 	return validReplicatedRoute(old) && validReplicatedRoute(current) &&
 		directMutationRouteIdentityMatches(old, current) && directMutationFenceAdvanceAllowed(old, current)

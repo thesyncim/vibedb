@@ -501,7 +501,55 @@ func (p *postgresDirectPool) Write(ctx context.Context, q gateway.Query) (*gatew
 			return nil, true, errors.Join(err, ctx.Err())
 		case <-timer.C:
 		}
+		// Never mint a new identity for a write the cluster may already hold
+		// when the original one can still settle it. While the logical route
+		// is unchanged (a replica move or ownership advance, not a split),
+		// re-drive this exact identity through direct recovery: the target's
+		// durable transaction control returns the retained outcome if the
+		// refused-looking attempt was in fact admitted, or applies it once.
+		// A new identity on the same route would turn such an attempt into a
+		// duplicate write (an IndexConflict on the client's own row).
+		if current, prepareErr := p.prepare(ctx, id, queries); prepareErr == nil && current != nil &&
+			gateway.DirectMutationRecoverableRoute(plan.Target.Route, current.Target.Route) {
+			slot.pending = &postgresDirectPending{identity: id, queries: queries, plan: plan, unknown: true}
+			for {
+				result, err = p.resolve(ctx, slot)
+				if err == nil || !postgresDirectRecoveryRefused(err) || !time.Now().Before(admissionDeadline) {
+					break
+				}
+				// Every retry reuses this identity, so waiting for the route to
+				// converge cannot duplicate the write.
+				timer := time.NewTimer(preAdmissionWriteRetryDelay(admissionRefusals))
+				admissionRefusals++
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return nil, true, errors.Join(err, ctx.Err())
+				case <-timer.C:
+				}
+			}
+			if !errors.Is(err, gateway.ErrDurableSQLAborted) {
+				return result, true, err
+			}
+			if !postgresDirectAbortRetry(err) {
+				return nil, true, err
+			}
+			abortedWrites++
+			if abortedWrites == maxAbortedWrites {
+				return nil, true, err
+			}
+		}
 	}
+}
+
+// postgresDirectRecoveryRefused reports that a retained-identity recovery
+// attempt was itself refused before admission because the route has not yet
+// converged. The earlier attempt's outcome is still unknown, but retrying the
+// same identity is safe.
+func postgresDirectRecoveryRefused(err error) bool {
+	return err != nil && !errors.Is(err, gateway.ErrDurableSQLAborted) &&
+		(errors.Is(err, raftservice.ErrServingFence) || errors.Is(err, raftserve.ErrProposalRefused)) &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 func postgresDirectAbortRetry(err error) bool {
