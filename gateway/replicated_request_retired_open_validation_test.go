@@ -131,9 +131,18 @@ func TestDurableRequestRetiredOpenRefusalRequiresExactTypedOutcome(t *testing.T)
 			Code:    shardservice.ReplicatedRefusalRetryRetired,
 			Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionActive},
 		}},
+		// The same retirement arrives as a deterministic applied refusal when
+		// the Open entered Raft before the state machine observed the floor,
+		// as after a leader change replays it onto the new leader. Resume
+		// still fails closed unless the refreshed cut proves this session's
+		// later command.
+		{name: "deterministic applied retry retired", err: &ReplicatedRefusalError{
+			Code:    shardservice.ReplicatedRefusalDeterministic,
+			Outcome: raftserve.Outcome{Code: raftserve.OutcomeRetryRetired, AppliedIndex: 19},
+		}, want: true},
 		{name: "different refusal", err: &ReplicatedRefusalError{
 			Code:    shardservice.ReplicatedRefusalDeterministic,
-			Outcome: raftserve.Outcome{Code: raftserve.OutcomeRetryRetired},
+			Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionSequence, AppliedIndex: 19},
 		}},
 		{name: "nil", err: nil},
 	} {
@@ -190,6 +199,8 @@ func TestDurableRequestSupersededOpenRefusalClassification(t *testing.T) {
 	}{
 		{"retry retired", &ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalRetryRetired,
 			Outcome: raftserve.Outcome{Code: raftserve.OutcomeRetryRetired}}, true},
+		{"retry retired applied", &ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalDeterministic,
+			Outcome: raftserve.Outcome{Code: raftserve.OutcomeRetryRetired, AppliedIndex: 19}}, true},
 		{"active session superseded", &ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalDeterministic,
 			Outcome: raftserve.Outcome{Code: raftserve.OutcomeSessionActive, AppliedIndex: 41}}, true},
 		{"other deterministic outcome", &ReplicatedRefusalError{Code: shardservice.ReplicatedRefusalDeterministic,

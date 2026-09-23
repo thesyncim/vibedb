@@ -85,9 +85,12 @@ func durableRequestSessionOpenCommand(command replication.Command, maxCommand in
 // route-session Open was already superseded by a later command of the same
 // session: another attempt of the wave opened it, recorded the route pin and
 // proposed its acquire. RetryRetired covers a session whose retry floor passed
-// the Open; SessionActive covers the window before that acquire is
-// acknowledged. Either way the caller must resume from the refreshed ledger
-// cut, which then carries the other attempt's pin, rather than fail the wave.
+// the Open, in both refusal shapes: pre-admission (no Raft entry, zero
+// outcome) and deterministic applied (the state machine refused at an apply
+// witness, as after a leader change replays the Open onto the new leader).
+// SessionActive covers the window before that acquire is acknowledged. Either
+// way the caller must resume from the refreshed ledger cut, which then
+// carries the other attempt's pin, rather than fail the wave.
 func durableRequestRetiredOpenRefusal(err error) bool {
 	refusal, ok := err.(*ReplicatedRefusalError)
 	if !ok {
@@ -97,7 +100,8 @@ func durableRequestRetiredOpenRefusal(err error) bool {
 	case shardservice.ReplicatedRefusalRetryRetired:
 		return refusal.Outcome == (raftserve.Outcome{Code: raftserve.OutcomeRetryRetired})
 	case shardservice.ReplicatedRefusalDeterministic:
-		return refusal.Outcome.Code == raftserve.OutcomeSessionActive
+		return refusal.Outcome.Code == raftserve.OutcomeSessionActive ||
+			refusal.Outcome.Code == raftserve.OutcomeRetryRetired
 	default:
 		return false
 	}
