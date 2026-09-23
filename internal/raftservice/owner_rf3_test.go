@@ -28,6 +28,12 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
+// futureReadFloorGap keeps deliberately unreached MinimumApplied floors
+// beyond any background pulse application between a baseline read and its
+// behind-check. Pulses keep the cluster live for leader-loss recovery, so a
+// +1 floor races them; this gap cannot be crossed during a test.
+const futureReadFloorGap = uint64(1) << 32
+
 func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *testing.T) {
 	const voters = 3
 	runtimes := make([]*raftmember.Runtime, voters)
@@ -288,7 +294,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	var followerState ServingState
 	if _, lease, followerState, err = readRF3PointAtFreshFence(t, ctx, owners[follower], readSources[follower], group, PointReadRequest{
 		Relation: 1, Key: key,
-		MinimumApplied: followerRead.Applied + 1,
+		MinimumApplied: followerRead.Applied + futureReadFloorGap,
 		MaxValueBytes:  replication.MaxMutationValueBytes,
 	}); !errors.Is(err, replicatedstate.ErrReadBehind) {
 		t.Fatalf("future follower floor error=%v", err)
@@ -355,7 +361,7 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	}
 	if _, lease, _, err = readRF3PointAtFreshFence(t, ctx, owners[leader], readSources[leader], group, PointReadRequest{
 		Relation: 1, Key: key,
-		MinimumApplied: linearRead.Applied + 1,
+		MinimumApplied: linearRead.Applied + futureReadFloorGap,
 		MaxValueBytes:  replication.MaxMutationValueBytes, Linearizable: true,
 	}); !errors.Is(err, replicatedstate.ErrReadBehind) {
 		t.Fatalf("future ReadIndex floor error=%v", err)
