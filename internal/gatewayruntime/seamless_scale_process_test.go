@@ -78,6 +78,14 @@ const (
 	seamlessScaleWorkloadConnections    = 16
 	seamlessScaleOperationWait          = 750 * time.Millisecond
 	seamlessScaleRecoveryBudget         = 10 * time.Second
+	// The evidence split requires at least this many during windows fully
+	// outside every fault shadow. The actor drains to it before stopping so
+	// a fast run cannot cover all windows with recovery intervals.
+	seamlessScaleMinimumSteadyWindows = 3
+	// Worst case the last fault shadow plus three windows must still clear
+	// after the cycles finish. The drain gives up well inside the job
+	// timeout and lets the evidence validation fail loudly instead.
+	seamlessScaleSteadyDrainTimeout = 90 * time.Second
 	// cluster dev gives node zero the only autonomous topology controller.
 	// Keep the controller and the long-lived survivor gateway running while
 	// this qualification retires each physical node in turn.
@@ -766,6 +774,110 @@ func (workload *seamlessScaleWorkload) FaultTimingEvidence() (seamlessScalePhase
 		partitions[class] = value
 	}
 	return partitions[0], partitions[1], counts[0], counts[1], uint64(len(faults))
+}
+
+// drainSteadyDuringCoverage keeps the during actor running until its history
+// holds the required steady windows. Fault shadows extend a fixed budget
+// past each restart while the during span follows the cycle speed, so a fast
+// run can otherwise cover every window with recovery intervals and fail the
+// evidence split without any workload failure. Windows starting after the
+// last shadow are disjoint from every fault by construction, so the drain
+// converges as soon as three of them complete; the timeout only bounds a
+// wedged actor and lets validation fail loudly.
+func drainSteadyDuringCoverage(t *testing.T, workload *seamlessScaleWorkload, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		_, _, steady, _, _ := workload.FaultTimingEvidence()
+		if steady >= seamlessScaleMinimumSteadyWindows {
+			t.Logf("scale steady during coverage drained: steady_windows=%d", steady)
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Logf("scale steady during coverage incomplete after drain: steady_windows=%d", steady)
+			return
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func TestSeamlessScaleRecoveryWindowBoundsShadow(t *testing.T) {
+	fault := time.Unix(1_790_192_100, 0)
+	shadow := seamlessScaleRecoveryBudget
+	window := func(start, end time.Time) seamlessScalePhaseEvidence {
+		return seamlessScalePhaseEvidence{StartNS: uint64(start.UnixNano()), EndNS: uint64(end.UnixNano())}
+	}
+	for _, test := range []struct {
+		name       string
+		start, end time.Time
+		recovery   bool
+	}{
+		{"before shadow", fault.Add(-20 * time.Second), fault.Add(-10 * time.Second), false},
+		{"ending at fault start", fault.Add(-10 * time.Second), fault, false},
+		{"starting at shadow end", fault.Add(shadow), fault.Add(shadow + seamlessScaleWindowDuration), false},
+		{"after shadow", fault.Add(shadow + time.Second), fault.Add(shadow + 11*time.Second), false},
+		{"straddling fault start", fault.Add(-time.Second), fault.Add(time.Second), true},
+		{"straddling shadow end", fault.Add(shadow - time.Second), fault.Add(shadow + time.Second), true},
+		{"inside shadow", fault.Add(time.Second), fault.Add(2 * time.Second), true},
+		{"covering shadow", fault.Add(-time.Second), fault.Add(shadow + time.Second), true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := seamlessScaleRecoveryWindow(window(test.start, test.end), []time.Time{fault}); got != test.recovery {
+				t.Fatalf("recovery=%t want=%t", got, test.recovery)
+			}
+		})
+	}
+}
+
+func TestDrainSteadyDuringCoverageWaitsForSteadyWindows(t *testing.T) {
+	base := time.Now()
+	fault := base.Add(5 * time.Second)
+	window := func(start time.Time) seamlessScaleWindow {
+		return seamlessScaleWindow{evidence: seamlessScalePhaseEvidence{
+			StartNS: uint64(start.UnixNano()),
+			EndNS:   uint64(start.Add(seamlessScaleWindowDuration).UnixNano())}}
+	}
+	workload := &seamlessScaleWorkload{
+		history:     map[string][]seamlessScaleWindow{seamlessScalePhaseDuring: {window(base)}},
+		faultStarts: []time.Time{fault},
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(50 * time.Millisecond)
+		steady := fault.Add(seamlessScaleRecoveryBudget)
+		workload.historyMu.Lock()
+		for index := range seamlessScaleMinimumSteadyWindows {
+			start := steady.Add(time.Duration(index) * seamlessScaleWindowDuration)
+			workload.history[seamlessScalePhaseDuring] = append(
+				workload.history[seamlessScalePhaseDuring], window(start))
+		}
+		workload.historyMu.Unlock()
+	}()
+	drainSteadyDuringCoverage(t, workload, 30*time.Second)
+	<-done
+	if _, _, steady, _, _ := workload.FaultTimingEvidence(); steady != seamlessScaleMinimumSteadyWindows {
+		t.Fatalf("steady_windows=%d want=%d", steady, seamlessScaleMinimumSteadyWindows)
+	}
+}
+
+func TestDrainSteadyDuringCoverageTimeoutIsBounded(t *testing.T) {
+	base := time.Now()
+	workload := &seamlessScaleWorkload{
+		history: map[string][]seamlessScaleWindow{seamlessScalePhaseDuring: {{
+			evidence: seamlessScalePhaseEvidence{
+				StartNS: uint64(base.UnixNano()),
+				EndNS:   uint64(base.Add(seamlessScaleWindowDuration).UnixNano())}}}},
+		faultStarts: []time.Time{base.Add(time.Second)},
+	}
+	started := time.Now()
+	drainSteadyDuringCoverage(t, workload, 20*time.Millisecond)
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Fatalf("drain took %s", elapsed)
+	}
+	if _, _, steady, _, _ := workload.FaultTimingEvidence(); steady != 0 {
+		t.Fatalf("steady_windows=%d want=0", steady)
+	}
 }
 
 // HistoryEvidence returns the complete measured span for a phase. It is used
@@ -2166,6 +2278,7 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 		t.Logf("scale cycle %d decommission complete: node=%s operation=%s", cycle+1, retireIDText, retire.OperationID)
 	}
 
+	drainSteadyDuringCoverage(t, workload, seamlessScaleSteadyDrainTimeout)
 	close(duringStop)
 	during := <-duringDone
 	after := workload.WindowSet(ctx, seamlessScalePhaseAfter, 3, seamlessScaleWindowDuration, calibratedRate)
