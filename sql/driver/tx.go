@@ -1140,19 +1140,6 @@ func (t *tx) execMutationContext(
 	return t.execMutationCore(ctx, statement, args, nil, nil, nil)
 }
 
-func (t *tx) execMutationReturningContext(
-	ctx context.Context,
-	statement *query.DMLStatement,
-	args []any,
-	returning *query.Statement,
-) (query.Cursor, error) {
-	var cursor query.Cursor
-	_, err := t.execMutationCore(
-		ctx, statement, args, returning, &cursor, nil,
-	)
-	return cursor, err
-}
-
 func (t *tx) execPreparedMutationContext(
 	ctx context.Context,
 	prepared *stmt,

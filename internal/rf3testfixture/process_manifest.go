@@ -236,24 +236,6 @@ func emptyNodeMigrationFromConfig(config migrationbudget.Config) emptyNodeMigrat
 // PrepareEmptyNode writes the exact canonical input and its local key source.
 // It does not invoke a binary; callers then run the real prepare-node-rf3 CLI
 // against PreparationPath and can start the resulting serve-rf3.vibejson.
-func PrepareEmptyNode(options EmptyNodeOptions) (PreparedEmptyNode, error) {
-	if err := validateEmptyNodeOptions(options, options.Root+".node-key"); err != nil {
-		return PreparedEmptyNode{}, err
-	}
-	keyMaterialPath := options.Root + ".node-key"
-	if err := writeFixtureOnce(keyMaterialPath, options.Key.Material[:], 0o600); err != nil {
-		return PreparedEmptyNode{}, err
-	}
-	raw, err := EmptyNodePreparationManifest(options, keyMaterialPath)
-	if err != nil {
-		return PreparedEmptyNode{}, err
-	}
-	preparationPath := options.Root + ".prepare-node.vibejson"
-	if err := writeFixtureOnce(preparationPath, raw, 0o600); err != nil {
-		return PreparedEmptyNode{}, err
-	}
-	return PreparedEmptyNode{PreparationPath: preparationPath, KeyMaterialPath: keyMaterialPath}, nil
-}
 
 func validateEmptyNodeOptions(options EmptyNodeOptions, keyMaterialPath string) error {
 	if options.Root == "" || !filepath.IsAbs(options.Root) || filepath.Clean(options.Root) != options.Root || options.Root == string(filepath.Separator) ||
@@ -299,18 +281,6 @@ func validateEmptyNodeOptions(options EmptyNodeOptions, keyMaterialPath string) 
 		}
 	}
 	return nil
-}
-
-func writeFixtureOnce(path string, raw []byte, mode os.FileMode) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	if _, err := file.Write(raw); err != nil {
-		return err
-	}
-	return file.Sync()
 }
 
 func PrepareProcessMember(options ProcessMemberOptions) (PreparedProcessMember, error) {

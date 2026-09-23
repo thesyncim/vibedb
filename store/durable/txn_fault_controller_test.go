@@ -2,7 +2,6 @@ package durable
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -112,16 +111,6 @@ func (c *txnFaultController) AttachOpenJournals(named map[string]*Collection) {
 }
 
 // AttachMarker wraps an already-minted decision log.
-func (c *txnFaultController) AttachMarker(log *TxnLog) {
-	c.t.Helper()
-	if log == nil || log.marker == nil {
-		c.t.Fatal("AttachMarker: nil log or marker")
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.log = log
-	c.marker = storeio.NewFaultTxnMarker(log.marker)
-}
 
 // Journal returns the fault wrapper for name, or nil if not yet attached.
 func (c *txnFaultController) Journal(name string) *storeio.FaultJournal {
@@ -138,11 +127,6 @@ func (c *txnFaultController) Marker() *storeio.FaultTxnMarker {
 }
 
 // PrepareSyncs reports how many journal sync barriers the post-sync hook saw.
-func (c *txnFaultController) PrepareSyncs() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.prepareSyncs
-}
 
 // ProgramJournal sets a journal fault plan on one target.
 func (c *txnFaultController) ProgramJournal(name string, plan storeio.JournalFaultPlan) {
@@ -177,29 +161,10 @@ func (c *txnFaultController) Capture(label, src string) txnCrashImage {
 }
 
 // Images returns the crash images captured so far.
-func (c *txnFaultController) Images() []txnCrashImage {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := make([]txnCrashImage, len(c.images))
-	copy(out, c.images)
-	return out
-}
 
 // capturePrepareSyncImages installs a post-sync hook that clones the database
 // directory after each prepare sync ordinal. The previous post-sync hook from
 // newTxnFaultController is replaced for the duration of the commit.
-func (c *txnFaultController) capturePrepareSyncImages(dir string) (restore func()) {
-	c.t.Helper()
-	prev := recoveryJournalPostSyncHook
-	recoveryJournalPostSyncHook = func() {
-		c.mu.Lock()
-		c.prepareSyncs++
-		n := c.prepareSyncs
-		c.mu.Unlock()
-		c.Capture(fmt.Sprintf("after-prepare-sync-%d", n), dir)
-	}
-	return func() { recoveryJournalPostSyncHook = prev }
-}
 
 // assertReopenOutcome opens img via OpenDatabase and checks every named
 // collection either holds wantDoc at key "k" (committed) or lacks "k"

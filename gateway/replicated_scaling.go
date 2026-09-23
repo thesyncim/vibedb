@@ -218,19 +218,6 @@ func appendScalingNodeDirectoryAt(dst []byte, entries []scalingNodeDirectoryEntr
 	return appendControlPlaneDocument(dst, scalingNodeDirectoryDocumentID[:], payload, maxScalingNodeDirectoryBytes)
 }
 
-func appendScalingNodeDirectory(dst []byte, entries []scalingNodeDirectoryEntry) ([]byte, error) {
-	var revision uint64
-	for _, entry := range entries {
-		if entry.Revision > revision {
-			revision = entry.Revision
-		}
-	}
-	if revision == 0 {
-		revision = 1
-	}
-	return appendScalingNodeDirectoryAt(dst, entries, revision)
-}
-
 func compareNodeDirectoryEntry(left, right scalingNodeDirectoryEntry) int {
 	if result := bytes.Compare(left.NodeID, right.NodeID); result != 0 {
 		return result
@@ -2471,11 +2458,6 @@ func enrollmentCatalogWithTarget(current *Snapshot, intent GroupEnrollmentIntent
 		return nil, -1, err
 	}
 	return certified, matched, nil
-}
-
-func ptrPersistedReplica(replica ReplicatedReplicaDescriptor) *persistedReplicatedReplica {
-	persisted := persistReplicatedReplica(replica)
-	return &persisted
 }
 
 func enrollmentReceiptMatchesCatalog(intent GroupEnrollmentIntent, cut replicatedCatalogCut) bool {

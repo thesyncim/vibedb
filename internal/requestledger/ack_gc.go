@@ -252,5 +252,3 @@ func ackGCTransitionDigest(record AckRecord) Digest {
 	}
 	return Digest(sha256.Sum256(framed[:at]))
 }
-
-func SameAck(left, right AckRecord) bool { return left == right }

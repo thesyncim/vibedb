@@ -393,18 +393,6 @@ func validateCompactPlannerCount(kind string, count uint64) error {
 	return nil
 }
 
-func (s *Snapshot) forEachIndex(visit func(IndexMetadata)) {
-	if s == nil || visit == nil {
-		return
-	}
-	for tableOrdinal, span := range s.plannerIndexSpans {
-		table := s.config.Placements[s.planner[tableOrdinal].placement].Table
-		for i := uint32(0); i < span.count; i++ {
-			visit(s.indexMetadata(table, span.first+i))
-		}
-	}
-}
-
 func buildPlannerIndexes(config distribution.ClusterConfig, planner []plannerTable, descriptors []IndexDescriptor) (plannerIndexBuild, error) {
 	if len(descriptors) == 0 {
 		return plannerIndexBuild{}, nil

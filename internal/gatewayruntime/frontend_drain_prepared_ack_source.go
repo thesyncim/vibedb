@@ -550,27 +550,3 @@ func frontendDrainPreparedAckCutAtLeastFloor(
 ) bool {
 	return cut.AtLeastFloor(floor)
 }
-
-func preparedAckSourceGrant(
-	source gateway.FrontendDrainRuntimeCut, drainID, grantDigest [32]byte,
-) bool {
-	for _, grant := range source.ContinuationGrants {
-		if grant.GrantDigest == grantDigest {
-			return grant.Valid() && grant.DrainID == drainID &&
-				grant.State == serviceauthz.ContinuationGrantPrepared
-		}
-	}
-	return false
-}
-
-func preparedAckServiceCutGrant(
-	cut serviceauthz.ServiceDirectoryCut, drainID, grantDigest [32]byte,
-) bool {
-	for _, grant := range cut.ContinuationGrants {
-		if grant.GrantDigest == grantDigest {
-			return grant.Valid() && grant.DrainID == drainID &&
-				grant.State == serviceauthz.ContinuationGrantPrepared
-		}
-	}
-	return false
-}

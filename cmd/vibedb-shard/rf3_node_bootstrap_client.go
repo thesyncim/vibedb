@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"net"
-	"time"
 
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -104,8 +103,4 @@ func bindRF3NodeBootstrapIntentReader(
 		return nil, err
 	}
 	return transport, nil
-}
-
-func rf3BootstrapReadDeadline() rafttransport.DeadlineFunc {
-	return func() time.Time { return time.Now().Add(rf3NetworkTimeout) }
 }

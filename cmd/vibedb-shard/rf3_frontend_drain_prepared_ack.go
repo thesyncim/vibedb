@@ -72,17 +72,6 @@ type rf3FrontendDrainPreparedAckCutReader struct {
 	writeDeadline            rafttransport.DeadlineFunc
 }
 
-func newRF3FrontendDrainPreparedAckCutReader(
-	profile *rafttransport.PeerTLS,
-	seeds []nodecontrol.BootstrapGatewaySeed,
-	localIncarnation uint64,
-	readDeadline, writeDeadline rafttransport.DeadlineFunc,
-) (*rf3FrontendDrainPreparedAckCutReader, *servicetls.Client, error) {
-	return newRF3FrontendDrainPreparedAckCutReaderWithSources(
-		profile, seeds, nil, localIncarnation, readDeadline, writeDeadline,
-	)
-}
-
 // newRF3FrontendDrainPreparedAckCutReaderWithSources keeps gateway-control
 // drain requests and the pre-open physical source route on separate pinned
 // transports. A storage certificate must never be used as a gateway source
@@ -728,15 +717,6 @@ func (reader *rf3FrontendDrainPreparedAckCutReader) readFromConnectionClass(
 	return reader.readQueryFromConnectionClass(ctx, connection, seed, query, trafficClass, physicalSource)
 }
 
-func (reader *rf3FrontendDrainPreparedAckCutReader) readQueryFromConnection(
-	ctx context.Context, connection rafttransport.PeerConnection,
-	seed nodecontrol.BootstrapGatewaySeed,
-	query frontenddrain.PreparedAckCutReadRequest,
-) (frontenddrain.PreparedAckCut, error) {
-	return reader.readQueryFromConnectionClass(ctx, connection, seed, query,
-		rafttransport.TrafficGatewayControl, false)
-}
-
 func (reader *rf3FrontendDrainPreparedAckCutReader) readQueryFromConnectionClass(
 	ctx context.Context, connection rafttransport.PeerConnection,
 	seed nodecontrol.BootstrapGatewaySeed,
@@ -849,26 +829,6 @@ func writeRF3FrontendDrainPreparedAckFrame(writer io.Writer, frame []byte) error
 		}
 	}
 	return nil
-}
-
-func rf3FrontendDrainPreparedAckSourceCutMatches(
-	cut frontenddrain.PreparedAckCut,
-	request frontenddrain.PreparedAckRequest,
-	seed nodecontrol.BootstrapGatewaySeed,
-) bool {
-	if !request.Valid() || request.SourcePrincipal != seed.NodeID ||
-		request.SourcePrincipalKeyDigest != [sha256.Size]byte(seed.SPKIPinDigest) {
-		return false
-	}
-	query := frontenddrain.PreparedAckCutReadRequest{
-		Operation: frontenddrain.CutOperationInstallExact, RequirePrepared: request.RequirePrepared,
-		Nonce: request.Nonce, DrainID: request.DrainID, GrantDigest: request.GrantDigest,
-		ReceiverNode: request.ReceiverNode, ReceiverIncarnation: request.ReceiverIncarnation,
-		ReceiverServiceKeyDigest: request.ReceiverServiceKeyDigest,
-		ReceiverNodeRevision:     request.ReceiverNodeRevision, SourceFloor: request.SourceCut.ReadFloor(),
-		SourceCutDigest: request.SourceCutDigest(),
-	}
-	return rf3FrontendDrainPreparedAckSourceCutMatchesQuery(cut, query, seed)
 }
 
 func rf3FrontendDrainPreparedAckSourceCutMatchesQuery(

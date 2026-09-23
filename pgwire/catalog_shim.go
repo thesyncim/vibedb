@@ -179,10 +179,6 @@ func recognizeCatalogQueryCancelable(
 // harvesting and validating the capture between each adjacent pair. Every
 // capture in one query must be identical — psql always copies the same oid —
 // and the final segment must end the text exactly.
-func matchCatalogShape(text string, shape *catalogShape) (string, bool) {
-	capture, ok, _ := matchCatalogShapeCancelable(text, shape, nil)
-	return capture, ok
-}
 
 func matchCatalogShapeCancelable(
 	text string,

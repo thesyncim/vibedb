@@ -547,15 +547,6 @@ func RecoveryBatchRecordPaddedSize(sectorSize uint32, entries []RecoveryBatchEnt
 
 // RecoveryDeltaBatchRecordPaddedSize returns the on-disk byte cost of one
 // consecutive-generation put/delete delta batch.
-func RecoveryDeltaBatchRecordPaddedSize(
-	sectorSize uint32, entries []RecoveryBatchEntry,
-) int {
-	plan, ok := prepareRecoveryDeltaBatch(sectorSize, entries)
-	if !ok {
-		return maxIntValue
-	}
-	return plan.padded
-}
 
 // RecoveryBatchRecordPaddedSizeForPayload returns the exact padded record size
 // for a batch with entryCount fixed entry headers and totalPayloadBytes bytes

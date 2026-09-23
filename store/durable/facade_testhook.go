@@ -66,16 +66,6 @@ func InstallTxnMarkerSyncFaultForFacadeTest() (restore func()) {
 // zero-Sync CheckpointGroup counterpart of InstallTxnMarkerSyncFaultForFacadeTest:
 // ordinary group transitions append their implementation decision without a
 // marker Sync, so the append itself is the only per-transition marker I/O.
-func InstallTxnMarkerAppendFaultForFacadeTest(appendIndex int) (restore func()) {
-	previous := databaseTxnAfterMintHook
-	databaseTxnAfterMintHook = func(l *TxnLog) {
-		fm := storeio.NewFaultTxnMarker(l.marker)
-		fm.Program(storeio.TxnMarkerFaultPlan{
-			Phase: storeio.TxnMarkerFaultAppendError, AppendIndex: appendIndex,
-		})
-	}
-	return func() { databaseTxnAfterMintHook = previous }
-}
 
 // InstallCheckpointGroupDecisionAppendFaultForFacadeTest makes the next group
 // transition report an unknown outcome after its decision append completes.

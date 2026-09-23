@@ -349,20 +349,6 @@ func mergeGatewayControlEndpoints(
 	return result
 }
 
-func controlDirectoryNodes(
-	directory *gateway.ReplicatedControlDirectory,
-) []rafttransport.NodeID {
-	if directory == nil {
-		return nil
-	}
-	nodes := directory.Nodes()
-	result := make([]rafttransport.NodeID, 0, len(nodes))
-	for _, node := range nodes {
-		result = append(result, node.NodeID)
-	}
-	return result
-}
-
 // controlDirectoryMetricEndpoints projects only the current authenticated
 // physical-node records into the exact endpoint identity used by metrics.
 // Historical shard endpoints remain available for retirement fences, but

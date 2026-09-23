@@ -449,20 +449,6 @@ func assertTableCount(t *testing.T, db *stdsql.DB, table string, want int) {
 	}
 }
 
-func assertTableDoc(t *testing.T, db *stdsql.DB, table, id, want string) {
-	t.Helper()
-	var got string
-	err := db.QueryRow(
-		`SELECT * FROM `+table+` WHERE id = ?`, id,
-	).Scan(&got)
-	if err != nil {
-		t.Fatalf("table %s id %s: %v", table, id, err)
-	}
-	if got != want {
-		t.Fatalf("table %s id %s = %s, want %s", table, id, got, want)
-	}
-}
-
 func assertTableField(t *testing.T, db *stdsql.DB, table, id, field, want string) {
 	t.Helper()
 	var got string

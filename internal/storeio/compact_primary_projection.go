@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"math"
 	"strconv"
-	"unsafe"
 
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
@@ -99,32 +98,6 @@ type UnifiedProjectionStreamWorkspace struct {
 // UnifiedProjectionScratchBytes reports the fixed metadata bytes needed for a
 // projected scan. The value excludes page-backed stream data and the caller's
 // JSON value scratch, both of which are bounded independently by the caller.
-func UnifiedProjectionScratchBytes(shapeCount, fieldCount int) int64 {
-	if shapeCount <= 0 || fieldCount <= 0 {
-		return 0
-	}
-	shapeBytes := uint64(unsafe.Sizeof(UnifiedProjectionShapeWorkspace{})) +
-		uint64(unsafe.Sizeof(int(0)))
-	streamBytes := uint64(unsafe.Sizeof(UnifiedProjectionStreamWorkspace{}))
-	fieldBytes := uint64(unsafe.Sizeof(UnifiedProjectionField{}))
-	if uint64(shapeCount) > uint64(^uint64(0)>>1)/shapeBytes {
-		return int64(^uint64(0) >> 1)
-	}
-	shapes := uint64(shapeCount) * shapeBytes
-	if uint64(shapeCount) > uint64(^uint64(0)>>1)/uint64(fieldCount) {
-		return int64(^uint64(0) >> 1)
-	}
-	streamCount := uint64(shapeCount) * uint64(fieldCount)
-	if streamCount > (uint64(^uint64(0)>>1)-shapes)/streamBytes {
-		return int64(^uint64(0) >> 1)
-	}
-	metadata := shapes + streamCount*streamBytes
-	if uint64(fieldCount) > (uint64(^uint64(0)>>1)-metadata)/fieldBytes {
-		return int64(^uint64(0) >> 1)
-	}
-	metadata += uint64(fieldCount) * fieldBytes
-	return int64(metadata)
-}
 
 // compactProjectionValueLen computes the exact canonical spelling length
 // without appending to the caller's value scratch.  This is deliberately

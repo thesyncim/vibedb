@@ -131,10 +131,3 @@ type DurableRequestLedgerRF3Option func(*DurableRequestLedgerRF3)
 
 // WithDurableRequestLedgerReadCollector enables per-kind recovery-read
 // observations. Passing nil explicitly keeps collection disabled.
-func WithDurableRequestLedgerReadCollector(
-	collector DurableRequestLedgerReadCollector,
-) DurableRequestLedgerRF3Option {
-	return func(ledger *DurableRequestLedgerRF3) {
-		ledger.readCollector = collector
-	}
-}

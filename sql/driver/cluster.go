@@ -190,20 +190,6 @@ func (c *conn) clusterRouter() *distribution.Router {
 // routeInsertDocuments routes every post-coercion document of a placed insert to
 // its physical shard and rejects a cross-shard batch before any dispatch. It is
 // a no-op for an unplaced table or a non-cluster connection.
-func (c *conn) routeInsertDocuments(table string, documents [][]byte) error {
-	binding := c.clusterBinding(table)
-	if binding == nil {
-		return nil
-	}
-	state := insertPreflightState{text: c.pointRaw[:0]}
-	defer func() { c.pointRaw = state.text[:0] }()
-	for i := range documents {
-		if err := state.add(binding, documents[i], i); err != nil {
-			return err
-		}
-	}
-	return nil
-}
 
 // routeInsertSeeds routes the staged seeds of a non-transactional placed insert.
 func (c *conn) routeInsertSeeds(table string, seeds []seedDocument) error {

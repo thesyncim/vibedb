@@ -227,33 +227,6 @@ func (usage Usage) DurableBytes() (uint64, error) {
 	return total, nil
 }
 
-func addUsage(current *uint64, encoded []byte) error {
-	value := uint64(len(encoded))
-	if *current > ^uint64(0)-value {
-		return ErrTooLarge
-	}
-	*current += value
-	return nil
-}
-
-func (usage *Usage) AddHead(encoded []byte) error     { return addUsage(&usage.HeadBytes, encoded) }
-func (usage *Usage) AddPlanPage(encoded []byte) error { return addUsage(&usage.PlanPageBytes, encoded) }
-func (usage *Usage) AddPending(encoded []byte) error  { return addUsage(&usage.PendingBytes, encoded) }
-func (usage *Usage) AddContinuation(encoded []byte) error {
-	return addUsage(&usage.ContinuationBytes, encoded)
-}
-func (usage *Usage) AddPayload(encoded []byte) error  { return addUsage(&usage.PayloadBytes, encoded) }
-func (usage *Usage) AddRoutePin(encoded []byte) error { return addUsage(&usage.RoutePinBytes, encoded) }
-func (usage *Usage) AddPrepared(encoded []byte) error { return addUsage(&usage.PreparedBytes, encoded) }
-func (usage *Usage) AddSchemaPin(encoded []byte) error {
-	return addUsage(&usage.SchemaPinBytes, encoded)
-}
-func (usage *Usage) AddReady(encoded []byte) error    { return addUsage(&usage.ReadyBytes, encoded) }
-func (usage *Usage) AddExpiry(encoded []byte) error   { return addUsage(&usage.ExpiryBytes, encoded) }
-func (usage *Usage) AddTerminal(encoded []byte) error { return addUsage(&usage.TerminalBytes, encoded) }
-func (usage *Usage) AddAck(encoded []byte) error      { return addUsage(&usage.AckBytes, encoded) }
-func (usage *Usage) AddIssuer(encoded []byte) error   { return addUsage(&usage.IssuerBytes, encoded) }
-
 func nonzeroDigest(digest Digest) bool { return digest != (Digest{}) }
 
 func nextRevision(expected, next uint64) bool {

@@ -64,10 +64,6 @@ func (b *GenerationMigrationTabletBuilder) StageWindow(records []PrimaryGraphRec
 	return nil
 }
 
-func (b *GenerationMigrationTabletBuilder) Full() bool {
-	return b != nil && int(b.localID) == TabletLocalIdentityLocalCount
-}
-
 func (b *GenerationMigrationTabletBuilder) Finish(priorTabletMax []byte) (GenerationMigrationTabletEmission, error) {
 	if b == nil || b.finished || len(b.leaves) == 0 || len(priorTabletMax) > CommonPrimaryLeafMaxKeyBytes {
 		return GenerationMigrationTabletEmission{}, ErrInvalidWrite

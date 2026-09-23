@@ -474,18 +474,6 @@ func NewExecutionLanes(count int, limits Limits) (*ExecutionLanes, error) {
 // NewExecutionLanesWithResultSettlementSink constructs lanes sharing one
 // concurrency-safe result sink. The sink may be invoked concurrently by
 // different lanes and must not re-enter ExecutionLanes.
-func NewExecutionLanesWithResultSettlementSink(
-	count int,
-	limits Limits,
-	settle raftmember.ResultSettlementSink,
-) (*ExecutionLanes, error) {
-	if settle == nil {
-		return nil, ErrSettlementSinkRequired
-	}
-	return newExecutionLanes(count, func() (*Host, error) {
-		return NewHostWithResultSettlementSink(limits, settle)
-	})
-}
 
 // NewExecutionLanesWithServingSinks constructs serving lanes sharing one set
 // of concurrency-safe lifecycle sinks. Callbacks may run concurrently across

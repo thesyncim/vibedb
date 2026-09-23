@@ -2691,27 +2691,6 @@ func (registry *Registry) validateAttemptWaitersLocked(
 	return visited == attempt.waiterCount
 }
 
-func (registry *Registry) validAttemptLocked(
-	index uint32,
-	generation uint64,
-	state attemptState,
-) (*attemptRecord, *entryRecord, bool) {
-	if int(index) >= len(registry.attempts) {
-		return nil, nil, false
-	}
-	attempt := &registry.attempts[index]
-	if !attempt.hasFlag(attemptActive) || attempt.generation != generation ||
-		attempt.state != state ||
-		int(attempt.entry) >= len(registry.entries) {
-		return nil, nil, false
-	}
-	entry := &registry.entries[attempt.entry]
-	if !entry.active || entry.generation != attempt.entryGeneration {
-		return nil, nil, false
-	}
-	return attempt, entry, true
-}
-
 func unexpectedSettlementError(err error) error {
 	return fmt.Errorf("%w: %v", ErrSettlementResult, err)
 }

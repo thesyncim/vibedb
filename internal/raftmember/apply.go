@@ -252,39 +252,6 @@ func OpenBoundSQLWithApplyForSettlement(
 // OpenBoundNodeSQLWithApplyForSettlement resolves the same post-catalog crash
 // window as OpenBoundSQLWithApplyForSettlement without constructing a legacy
 // per-group WAL owner.
-func OpenBoundNodeSQLWithApplyForSettlement(
-	path string,
-	group *raftstore.GroupView,
-	authority sqldriver.ReplicatedAuthorityProfile,
-	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
-	options sqldriver.ReplicatedApplyOptions,
-) (*sqldriver.Database, *sqldriver.ReplicatedApply, sqldriver.ReplicatedApplyIdentity, error) {
-	binding, bootstrap, err := nodeApplyPrerequisites(group, authority)
-	if err != nil {
-		return nil, nil, sqldriver.ReplicatedApplyIdentity{}, err
-	}
-	if expectedSQL.Binding != binding {
-		return nil, nil, sqldriver.ReplicatedApplyIdentity{}, ErrBindingMismatch
-	}
-	database, identity, err := sqldriver.OpenReplicatedShardStoreWithApplyForSettlement(
-		path, expectedSQL, options,
-	)
-	if err != nil {
-		return nil, nil, sqldriver.ReplicatedApplyIdentity{}, err
-	}
-	claim, actual, err := database.OpenReplicatedApply(expectedSQL, bootstrap, options)
-	if err != nil || actual != identity {
-		if claim != nil {
-			_ = claim.Close()
-		}
-		closeErr := database.Close()
-		if err == nil {
-			err = sqldriver.ErrReplicatedApplyMismatch
-		}
-		return nil, nil, sqldriver.ReplicatedApplyIdentity{}, errors.Join(err, closeErr)
-	}
-	return database, claim, identity, nil
-}
 
 func applyPrerequisites(
 	wal *raftstore.Store,

@@ -1469,16 +1469,6 @@ func insertSourceDependencyPosition(plan *insertSelectPlan, name string) int {
 // projection before publication. A projection or result-budget failure leaves
 // storage untouched, and the successful path performs no storage reread for
 // INSERT/UPDATE; DELETE captures the old documents before removing them.
-func (c *conn) mutationReturningContext(
-	ctx context.Context,
-	statement *query.DMLStatement,
-	args []any,
-	returning *query.Statement,
-) (query.Cursor, error) {
-	return c.mutationReturningCoreContext(
-		ctx, statement, args, returning, nil,
-	)
-}
 
 func (c *conn) preparedMutationReturningContext(
 	ctx context.Context,

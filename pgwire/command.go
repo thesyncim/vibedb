@@ -197,9 +197,6 @@ type transactionMode struct {
 // parseTransactionCommand admits the transaction grammar implemented by the
 // typed runtime and returns every mode explicitly so none can be accepted and
 // then silently ignored.
-func parseTransactionCommand(src string, kind statementKind) (transactionMode, error) {
-	return parseTransactionCommandCancelable(src, kind, nil)
-}
 
 func parseTransactionCommandCancelable(
 	src string,
@@ -879,10 +876,6 @@ func (s *statementIterator) next() (string, bool, error) {
 // identifiers because this dialect escapes both the same way, and because
 // standard_conforming_strings is reported as on, so a backslash is an ordinary
 // byte.
-func skipQuoted(src string, i int, quote byte) int {
-	end, _ := skipQuotedChecked(src, i, quote)
-	return end
-}
 
 func skipQuotedChecked(src string, i int, quote byte) (int, bool) {
 	i++
@@ -1064,9 +1057,6 @@ type setCommand struct {
 // either spelling changes the session setting. SET and RESET are refused while
 // a transaction is active, so this adapter does not claim transaction-local
 // setting semantics.
-func parseSet(src string) (setCommand, error) {
-	return parseSetCancelable(src, nil)
-}
 
 func parseSetCancelable(
 	src string,
@@ -1141,9 +1131,6 @@ func parseSetCancelable(
 }
 
 // parseReset decodes "RESET name" and "RESET ALL".
-func parseReset(src string) (setCommand, error) {
-	return parseResetCancelable(src, nil)
-}
 
 func parseResetCancelable(
 	src string,
@@ -1178,9 +1165,6 @@ func parseResetCancelable(
 }
 
 // parseShow decodes "SHOW name", "SHOW ALL", and "SHOW TIME ZONE".
-func parseShow(src string) (string, error) {
-	return parseShowCancelable(src, nil)
-}
 
 func parseShowCancelable(
 	src string,
@@ -1214,10 +1198,6 @@ func parseShowCancelable(
 	return result, nil
 }
 
-func parseDiscard(src string) error {
-	return parseDiscardCancelable(src, nil)
-}
-
 func parseDiscardCancelable(src string, check func() error) (err error) {
 	s := newScanner(src, check)
 	defer func() {
@@ -1234,10 +1214,6 @@ func parseDiscardCancelable(src string, check func() error) (err error) {
 }
 
 // unquote strips one layer of single quotes from a SET value.
-func unquote(v string) string {
-	out, _ := unquoteCancelable(v, nil)
-	return out
-}
 
 func unquoteCancelable(v string, check func() error) (string, error) {
 	if len(v) >= 2 && v[0] == '\'' && v[len(v)-1] == '\'' {

@@ -399,12 +399,6 @@ func (r *ResidentPrimaryRouter) replacePersistent(rank int, repl []residentRoute
 	return next
 }
 
-func mustResidentCellRef(c *residentRouteCell) PageRef {
-	meta := c.meta.Load()
-	bucket := BucketID(uint32(meta >> 32))
-	id, _ := CommonPrimaryLeafLogicalID(bucket)
-	return PageRef{Offset: c.offset.Load(), LogicalID: id, Generation: c.generation.Load(), Length: uint32(meta), Kind: PagePrimaryLeaf}
-}
 func mustResidentCellBucket(c *residentRouteCell) BucketID {
 	return BucketID(uint32(c.meta.Load() >> 32))
 }

@@ -145,12 +145,6 @@ func OpenExactRootVectorCheckpoint(path string, memberCount int) (*ExactRootVect
 }
 
 // Path returns the sidecar path.
-func (c *ExactRootVectorCheckpoint) Path() string {
-	if c == nil {
-		return ""
-	}
-	return c.path
-}
 
 // Close releases the sidecar descriptor. It is safe to call repeatedly.
 func (c *ExactRootVectorCheckpoint) Close() error {
@@ -445,133 +439,12 @@ func exactRootImageLocked(collection *Collection) (storeio.InlineSuperblock, err
 // already selected complete vector image before ordinary collection bootstrap.
 // The caller must have authenticated the vector/member association; this
 // function deliberately performs no fallback or cross-member root selection.
-func openAtAuthenticatedRoot(
-	file *os.File,
-	options Options,
-	member RootVectorMember,
-	floor uint64,
-) (*Collection, error) {
-	if file == nil || member.StoreID == ([16]byte{}) || floor == 0 {
-		return nil, fmt.Errorf("%w: exact-root member", storeio.ErrRootVectorMember)
-	}
-	root := member.Root
-	if root.StoreID != member.StoreID || root.State.StoreID != member.StoreID ||
-		root.State.JournalID != member.JournalID || floor > root.Generation {
-		return nil, storeio.ErrRootVectorMember
-	}
-	return openCollection(file, options, collectionOpenConfig{
-		checkpointGroupRecovery: true,
-		deferJournalReplay:      true,
-		exactRoot:               &root,
-		exactRootStoreID:        member.StoreID,
-		exactRecoveryFloor:      floor,
-	})
-}
 
 // OpenCollectionsAtAuthenticatedRoot opens every fixed member from one
 // selected vector. It validates the complete member set before exposing any
 // collection and closes every partially opened handle on failure. Journals
 // must already be empty because this foundation selects a folded root while
 // leaving the production journal protocol authoritative.
-func OpenCollectionsAtAuthenticatedRoot(
-	vector RootVector,
-	floors []RootVectorMemberFloor,
-	requests []TransactionCollectionOpen,
-	names []string,
-) ([]*Collection, error) {
-	if len(requests) != len(names) || len(requests) != len(vector.Members) || len(requests) == 0 {
-		return nil, fmt.Errorf("%w: exact-root request membership", storeio.ErrRootVectorMember)
-	}
-	if len(floors) != len(vector.Members) {
-		return nil, fmt.Errorf("%w: exact-root floor membership", storeio.ErrRootVectorMember)
-	}
-	bankBytes, err := storeio.RootVectorBankBytes(len(vector.Members))
-	if err != nil {
-		return nil, err
-	}
-	if _, err := storeio.EncodeRootVectorBank(make([]byte, bankBytes), vector); err != nil {
-		return nil, err
-	}
-	byName := make(map[[32]byte]int, len(vector.Members))
-	byStore := make(map[[16]byte]int, len(vector.Members))
-	for i, member := range vector.Members {
-		if _, duplicate := byName[member.NameDigest]; duplicate {
-			return nil, storeio.ErrRootVectorMember
-		}
-		if _, duplicate := byStore[member.StoreID]; duplicate {
-			return nil, storeio.ErrRootVectorIdentity
-		}
-		byName[member.NameDigest] = i
-		byStore[member.StoreID] = i
-	}
-	collections := make([]*Collection, len(requests))
-	abort := func(cause error, count int) ([]*Collection, error) {
-		for i := count - 1; i >= 0; i-- {
-			if collections[i] != nil {
-				_ = collections[i].closeResources()
-			}
-		}
-		return nil, cause
-	}
-	seen := make(map[int]struct{}, len(requests))
-	for i := range requests {
-		if requests[i].File == nil || names[i] == "" {
-			return abort(storeio.ErrRootVectorMember, i)
-		}
-		memberIndex, ok := byName[sha256.Sum256([]byte(names[i]))]
-		if !ok || memberIndex < 0 {
-			return abort(fmt.Errorf("%w: member name %q", storeio.ErrRootVectorMember, names[i]), i)
-		}
-		if _, duplicate := seen[memberIndex]; duplicate {
-			return abort(storeio.ErrRootVectorMember, i)
-		}
-		seen[memberIndex] = struct{}{}
-		member := vector.Members[memberIndex]
-		floor := floors[memberIndex]
-		if floor.StoreID != member.StoreID || floor.NameDigest != member.NameDigest ||
-			floor.Generation == 0 || floor.Generation > member.Root.Generation {
-			return abort(storeio.ErrRootVectorMember, i)
-		}
-		collection, openErr := openAtAuthenticatedRoot(
-			requests[i].File, requests[i].Options, member, floor.Generation,
-		)
-		if openErr != nil {
-			return abort(openErr, i)
-		}
-		collections[i] = collection
-		if collection.storeID != member.StoreID {
-			return abort(storeio.ErrRootVectorMember, i+1)
-		}
-		state := collection.durableState.Load()
-		if state == nil {
-			return abort(storeio.ErrRootVectorCorrupt, i+1)
-		}
-		gotImage := storeio.InlineSuperblock{
-			StoreID: collection.storeID, Generation: state.root.Generation,
-			FileEnd: state.fileEnd, PageSize: state.root.PageSize,
-			State: state.root, FreeDelta: collection.inlineFree,
-		}
-		gotBytes := make([]byte, storeio.RootVectorRootBytes)
-		wantBytes := make([]byte, storeio.RootVectorRootBytes)
-		if _, encodeErr := storeio.EncodeInlineSuperblock(gotBytes, gotImage); encodeErr != nil {
-			return abort(encodeErr, i+1)
-		}
-		if _, encodeErr := storeio.EncodeInlineSuperblock(wantBytes, member.Root); encodeErr != nil ||
-			string(gotBytes) != string(wantBytes) {
-			if encodeErr == nil {
-				encodeErr = storeio.ErrRootVectorMember
-			}
-			return abort(encodeErr, i+1)
-		}
-		if collection.journal != nil && collection.journal.Cursor() != 0 {
-			return abort(fmt.Errorf("%w: member %q has an unfurled journal", storeio.ErrRootVectorCorrupt, names[i]), i+1)
-		}
-	}
-	if len(seen) != len(vector.Members) {
-		return abort(storeio.ErrRootVectorMember, len(collections))
-	}
-	return collections, nil
-}
 
 func (c *ExactRootVectorCheckpoint) readLocked() (RootVector, []RootVectorMemberFloor, error) {
 	vector, floors, _, _, err := c.readSelectedLocked()

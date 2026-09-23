@@ -1654,10 +1654,6 @@ func (s *NodeStore) RegisterGroupWithSnapshot(descriptor GroupDescriptor, snapsh
 	return s.registerGroupLocked(descriptor, snapshot)
 }
 
-func (s *NodeStore) registerGroupSequenced(descriptor GroupDescriptor, snapshot *pb.Snapshot) (GroupIncarnation, error) {
-	return s.registerGroupSequencedAt(descriptor, snapshot, 1, nil)
-}
-
 // registerGroupSequencedAt is the node-log publication primitive used by a
 // dynamic learner install. The requested incarnation is authenticated in the
 // same descriptor/checkpoint wave; it is never inferred from a local counter

@@ -85,11 +85,6 @@ func OpenReplicatedRouteSettlementValue(raw []byte) (ReplicatedRouteSettlementVa
 	return value, nil
 }
 
-func validReplicatedRouteSettlementValue(raw []byte) bool {
-	_, err := OpenReplicatedRouteSettlementValue(raw)
-	return err == nil
-}
-
 func validReplicatedRouteSettlementValueParts(value ReplicatedRouteSettlementValue) bool {
 	return value.Mode == ReplicatedRouteSettlementReadReleaseReceipt &&
 		value.CompletionAppliedSequence != 0 &&

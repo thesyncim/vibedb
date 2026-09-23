@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"reflect"
 	"slices"
 
 	"github.com/thesyncim/vibedb/gateway"
@@ -122,57 +121,11 @@ func PreparedAckCutFromFrontendDrainRuntimeCut(
 // the same view that selected the transport endpoints.  The full cut is kept
 // in the caller so the native receiver can advance its directory/catalog
 // floor together with the projected service gate.
-func readCanonicalFrontendDrainRuntimeCut(
-	ctx context.Context, reader gateway.DirectoryReader,
-	expected gateway.ReplicatedControlDirectorySnapshot,
-) (gateway.FrontendDrainRuntimeCut, error) {
-	if ctx == nil || reader == nil || !expected.Valid() {
-		return gateway.FrontendDrainRuntimeCut{}, errGatewayControlDirectory
-	}
-	coherent, ok := reader.(frontendDrainRuntimeCutReader)
-	if !ok {
-		return gateway.FrontendDrainRuntimeCut{}, fmt.Errorf("%w: canonical frontend drain runtime cut reader is required", errGatewayControlDirectory)
-	}
-	source, err := coherent.ReadFrontendDrainRuntimeCut(ctx)
-	if err != nil {
-		return gateway.FrontendDrainRuntimeCut{}, err
-	}
-	if !source.Nodes.Valid() || source.Catalog == nil ||
-		source.CatalogHeadDigest == (replication.Digest{}) ||
-		source.Catalog.Generation() != source.Nodes.CatalogGeneration ||
-		source.Nodes.Revision != expected.Revision ||
-		source.Nodes.CatalogGeneration != expected.CatalogGeneration ||
-		!reflect.DeepEqual(source.Nodes.CurrentNodes(), expected.Nodes) {
-		return gateway.FrontendDrainRuntimeCut{}, errGatewayControlDirectory
-	}
-	return source, nil
-}
 
 // readCanonicalFrontendDrainRuntimeCutFromRows performs the same endpoint
 // roster cross-check for a local catalog-owner row source. The local reader
 // owns the serving fence and canonical cut; this helper only verifies that the
 // resulting live node view is the one that selected the control endpoints.
-func readCanonicalFrontendDrainRuntimeCutFromRows(
-	ctx context.Context, reader gateway.FrontendDrainRuntimeCutRowReader,
-	expected gateway.ReplicatedControlDirectorySnapshot,
-) (gateway.FrontendDrainRuntimeCut, error) {
-	if ctx == nil || reader == nil || !expected.Valid() {
-		return gateway.FrontendDrainRuntimeCut{}, errGatewayControlDirectory
-	}
-	source, err := gateway.ReadFrontendDrainRuntimeCutFromRows(ctx, reader)
-	if err != nil {
-		return gateway.FrontendDrainRuntimeCut{}, err
-	}
-	if !source.Nodes.Valid() || source.Catalog == nil ||
-		source.CatalogHeadDigest == (replication.Digest{}) ||
-		source.Catalog.Generation() != source.Nodes.CatalogGeneration ||
-		source.Nodes.Revision != expected.Revision ||
-		source.Nodes.CatalogGeneration != expected.CatalogGeneration ||
-		!reflect.DeepEqual(source.Nodes.CurrentNodes(), expected.Nodes) {
-		return gateway.FrontendDrainRuntimeCut{}, errGatewayControlDirectory
-	}
-	return source, nil
-}
 
 // readCanonicalFrontendDrainRuntimeCutFromSourceProof verifies one physical
 // source response against a fresh complete authority cut. The source proof

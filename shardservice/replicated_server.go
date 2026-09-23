@@ -668,12 +668,6 @@ func (server *ReplicatedServer) authorizeReplicated(
 // committed service directory is installed. The dynamic gate replaces only
 // the authenticated service Delegate lookup; forwarded user authority still
 // goes through the unchanged static Policy gate below.
-func (server *ReplicatedServer) authorizeReplicatedPeer(
-	peer serviceauthz.AuthenticatedPeer,
-	request *ReplicatedRequest,
-) bool {
-	return server.authorizeReplicatedPeerWithDirectory(server.directory.Load(), peer, request)
-}
 
 func (server *ReplicatedServer) authorizeReplicatedPeerWithDirectory(
 	directory *serviceauthz.ServiceDirectoryGate,
@@ -751,15 +745,6 @@ func (server *ReplicatedServer) executeReplicatedAuthenticated(
 	authenticated bool,
 ) *ReplicatedResponse {
 	return server.executeReplicatedAuthenticatedCallValidated(ctx, request, authenticated, nil, false)
-}
-
-func (server *ReplicatedServer) executeReplicatedAuthenticatedCall(
-	ctx context.Context,
-	request *ReplicatedRequest,
-	authenticated bool,
-	sql *ShardRequest,
-) *ReplicatedResponse {
-	return server.executeReplicatedAuthenticatedCallValidated(ctx, request, authenticated, sql, false)
 }
 
 // executeReplicatedAuthenticatedCallValidated is the internal semantic

@@ -105,11 +105,6 @@ func (c *Collection) primaryExactActive() bool {
 // bucket<<2|(slot>>6) and the live bit is 1<<(slot&63) in chunk 0. It is the
 // authority the read-side posting recheck validates against, so it is recomputed
 // from the graph whenever the graph or the exact index is (re)opened.
-func (c *Collection) derivePrimaryLive(
-	state *fileStoreState,
-) (map[uint32]*[storeio.TermPostingTileChunks]uint64, error) {
-	return c.derivePrimaryLiveFromRouter(c.primaryRouter.Load(), state)
-}
 
 func (c *Collection) derivePrimaryLiveFromRouter(
 	router *storeio.ResidentPrimaryRouter, state *fileStoreState,
@@ -1554,36 +1549,6 @@ func buildPrimaryExactIndexes(
 // stagePrimaryExactLeafPage wraps one cutter-emitted canonical leaf in a
 // singleton leaf envelope. Production exact indexes stage packs instead;
 // this remains for tests and Open of unreleased singleton-leaf images.
-func stagePrimaryExactLeafPage(
-	sink storeio.PrimaryGraphBuildSink,
-	encoded []byte,
-	pageSize, maxPageSize uint32,
-) (storeio.PageRef, error) {
-	extent, ok := primaryExactExtent(
-		len(encoded)+storeio.PageHeaderSize+storeio.PageTrailerSize,
-		pageSize, maxPageSize,
-	)
-	if !ok {
-		return storeio.PageRef{}, fmt.Errorf(
-			"%w: cutter emitted an oversized exact term leaf",
-			storeio.ErrPrimaryExactIndexCorrupt,
-		)
-	}
-	page, err := sink.AllocatePage(storeio.PagePrimaryExactLeaf, extent, 0)
-	if err != nil {
-		return storeio.PageRef{}, err
-	}
-	if _, err := storeio.EncodePrimaryExactLeafPage(
-		page.Bytes(), sink.StoreIdentity(), sink.BuildGeneration(),
-		page.Ref().LogicalID, encoded,
-	); err != nil {
-		return storeio.PageRef{}, err
-	}
-	if err := page.Stage(); err != nil {
-		return storeio.PageRef{}, err
-	}
-	return page.Ref(), nil
-}
 
 // appendPrimaryExactDocumentTerm canonicalizes one document's compound exact
 // term. present is false when any component path is missing or non-scalar, in

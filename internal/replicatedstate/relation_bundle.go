@@ -1,7 +1,6 @@
 package replicatedstate
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -613,16 +612,4 @@ func relationContractDigest(
 	var result [sha256.Size]byte
 	_ = h.Sum(result[:0])
 	return result
-}
-
-func sameRelationNames(left, right []relationCollection) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i].id != right[i].id || !bytes.Equal([]byte(left[i].name), []byte(right[i].name)) {
-			return false
-		}
-	}
-	return true
 }

@@ -130,7 +130,7 @@ func prepareSchemaStartupTarget(t *testing.T, member *rf3testfixture.PreparedMem
 
 // Mandatory Linux real-storage composition: drop every WAL/SQL/apply handle
 // at the precommit and committed-before-publication cuts, then use the exact
-// opener called by prepareRF3GroupSet, not a mocked recovery interface.
+// opener called by the RF3 group preparation path, not a mocked recovery interface.
 func TestRF3SchemaStartupSettlesCommittedSourceBeforeRuntimeAdoption(t *testing.T) {
 	for _, committed := range []bool{false, true} {
 		name := "prepared-before-commit"

@@ -571,15 +571,6 @@ func NewStaticRegistryWithDirectory(
 
 // NewStaticRegistryFromAuthority is a descriptive alias for
 // NewStaticRegistryWithDirectory used by restart/replay adapters.
-func NewStaticRegistryFromAuthority(
-	local NodeID,
-	members []Member,
-	peers []PhysicalPeer,
-	directoryRevision uint64,
-	limits Limits,
-) (*StaticRegistry, error) {
-	return NewStaticRegistryWithDirectory(local, members, peers, directoryRevision, limits)
-}
 
 // NewNodeRegistryWithDirectory installs initial groups into the same mutable
 // inventory used for later adoption. Retiring an initial replica can therefore
@@ -671,15 +662,9 @@ func newEmptyRegistry(
 }
 
 // NewNodeRegistry is a descriptive alias for NewEmptyRegistry.
-func NewNodeRegistry(local NodeID, domain TrustDomain, limits Limits) (*StaticRegistry, error) {
-	return NewEmptyRegistry(local, domain, limits)
-}
 
 // NewNodeRegistryWithLocalPeer is the node-registry spelling of
 // NewEmptyRegistryWithLocalPeer.
-func NewNodeRegistryWithLocalPeer(local PhysicalPeer, limits Limits) (*StaticRegistry, error) {
-	return NewEmptyRegistryWithLocalPeer(local, limits)
-}
 
 func validTrustDomain(domain TrustDomain) bool {
 	return domain.ClusterID != ([16]byte{}) && domain.ClusterIncarnation != ([16]byte{})
@@ -2241,10 +2226,6 @@ func onlyRoleChange(current, next map[uint64]MemberRole, member uint64) bool {
 		}
 	}
 	return true
-}
-
-func equalRoles(left, right map[uint64]MemberRole) bool {
-	return len(left) == len(right) && onlyRoleChange(left, right, 0)
 }
 
 // LocalNode returns the registry's configured local node ID.

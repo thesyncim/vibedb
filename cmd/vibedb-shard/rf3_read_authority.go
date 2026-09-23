@@ -519,13 +519,6 @@ func (cache *rf3ReadAuthorityIncarnationCache) probeTargetResult(
 	return cache.probeResult(ctx, target)
 }
 
-func (cache *rf3ReadAuthorityIncarnationCache) probeTarget(
-	ctx context.Context,
-	target rf3ReadAuthorityProbeTarget,
-) bool {
-	return cache.probeTargetResult(ctx, target) == rf3ReadAuthorityProbeSuccess
-}
-
 func newRF3ReadAuthorityCache(
 	profile *rafttransport.PeerTLS,
 	authPolicy *serviceauthz.Policy,

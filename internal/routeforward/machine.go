@@ -69,13 +69,6 @@ func (machine *Machine) Status() Status {
 }
 
 // Entry returns one detached retained forwarding entry.
-func (machine *Machine) Entry(key Digest) (Entry, EntryState, bool) {
-	if machine == nil || key == (Digest{}) {
-		return Entry{}, EntryInvalid, false
-	}
-	entry, ok := machine.entries[key]
-	return entry.Entry, entry.State, ok
-}
 
 // Preview derives the exact transition without mutating maps and allocates no
 // memory. Catalog storage can durably commit the encoded delta before Apply.

@@ -35,11 +35,6 @@ const (
 		replicatedSQLWorkingReservationBudgets*replicatedSQLWorkingBytes
 )
 
-func replicatedSQLReservationBytes(maximum uint32) int64 {
-	return replicatedSQLResultReservationCopies*int64(maximum) +
-		replicatedSQLWorkingReservationBudgets*replicatedSQLWorkingBytes
-}
-
 type replicatedSQLLease struct {
 	budget *replicatedFrameByteBudget
 	bytes  int64
@@ -53,10 +48,6 @@ func (l *replicatedSQLLease) Release() {
 		l.budget.releaseSQL(l.bytes)
 		l.budget = nil
 	}
-}
-
-func (server *ReplicatedServer) executeReplicatedQuery(ctx context.Context, request *ReplicatedRequest, state raftservice.ServingState) *ReplicatedResponse {
-	return server.executeReplicatedQueryCall(ctx, request, state, nil, nil)
 }
 
 func (server *ReplicatedServer) executeReplicatedQueryCall(
@@ -304,11 +295,6 @@ func replicatedSQLPointReadEligible(req *ShardRequest) bool {
 		!req.Repartition.present() && !req.DocumentScan.present() &&
 		!req.GlobalIndexLookup.present() && !req.mutationCapturePresent() &&
 		!req.HasMinPosition && req.ReadFenceID.IsZero() && !req.RowBatch.present()
-}
-
-func (server *ReplicatedServer) executeReplicatedQueryTier(ctx context.Context, request *ReplicatedRequest, state raftservice.ServingState,
-	inner *ShardRequest, owner any, budget replicatedSQLBudget, maximum int) (*ReplicatedResponse, bool) {
-	return server.executeReplicatedQueryTierCall(ctx, request, state, inner, owner, budget, maximum, nil, false)
 }
 
 func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Context, request *ReplicatedRequest, state raftservice.ServingState,

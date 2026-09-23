@@ -105,7 +105,6 @@ type CapacityPlacementCut struct {
 }
 
 // CatalogGeneration reports the catalog cut all node evidence was fenced to.
-func (c CapacityPlacementCut) CatalogGeneration() uint64 { return c.catalogGeneration }
 
 // Count reports placed non-retained children.
 func (c CapacityPlacementCut) Count() int { return int(c.count) }

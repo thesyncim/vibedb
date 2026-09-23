@@ -2992,15 +2992,6 @@ func baseRelationChanges(
 	return nil
 }
 
-func (m *Machine) checkTransitionCapacityWithCapture(
-	next State,
-	changes []finalMutation,
-	plan commandPlan,
-	captureBytes int,
-) error {
-	return m.checkTransitionCapacityWithCaptureRows(next, changes, plan, captureBytes, nil)
-}
-
 func (m *Machine) checkTransitionCapacityWithCaptureRows(
 	next State,
 	changes []finalMutation,

@@ -65,47 +65,6 @@ func (grants *DynamicShardActionGrants) Install(input []ShardActionGrant) error 
 	return nil
 }
 
-func (grants *DynamicShardActionGrants) replace(
-	operation OperationID, digest [32]byte, input []ShardActionGrant,
-) error {
-	if grants == nil || operation == (OperationID{}) || digest == ([32]byte{}) ||
-		len(input) == 0 || len(input) > grants.limit {
-		return ErrRemoteExecution
-	}
-	keys := make([]shardActionGrantKey, len(input))
-	for index, grant := range input {
-		if !validShardActionGrant(grant) || grant.Operation != operation || grant.PlanDigest != digest {
-			return ErrRemoteExecution
-		}
-		keys[index] = shardActionGrantKey{grant.Operation, grant.PlanDigest, grant.Target}
-		for prior := 0; prior < index; prior++ {
-			if compareShardActionGrantKey(keys[prior], keys[index]) == 0 {
-				return ErrRemoteExecution
-			}
-		}
-	}
-	grants.mu.Lock()
-	defer grants.mu.Unlock()
-	remaining := len(grants.grants)
-	for key := range grants.grants {
-		if key.operation == operation && key.digest == digest {
-			remaining--
-		}
-	}
-	if len(keys) > grants.limit-remaining {
-		return ErrRemoteExecution
-	}
-	for key := range grants.grants {
-		if key.operation == operation && key.digest == digest {
-			delete(grants.grants, key)
-		}
-	}
-	for index, key := range keys {
-		grants.grants[key] = input[index]
-	}
-	return nil
-}
-
 // rebindCatalog advances only the authenticated catalog witness for an exact
 // live admission. Data-plane executors and their pinned stores remain the same
 // objects: rebuilding them after publication could attempt to reclaim an SQL

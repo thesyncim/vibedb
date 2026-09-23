@@ -402,24 +402,6 @@ func relationColumnPosition(text string, pos int) int {
 	return i
 }
 
-func (d *statementDerived) resolve(name, relation string) (int, error) {
-	found, matches := -1, 0
-	for i := range d.names {
-		if d.names[i] == name {
-			found = i
-			matches++
-		}
-	}
-	if matches != 1 {
-		return -1, &RelationColumnError{
-			Relation: relation,
-			Column:   name,
-			Matches:  matches,
-		}
-	}
-	return found, nil
-}
-
 func (s *Statement) renderDerived(path *sqlast.PathExpr, local bool) string {
 	if join := s.relationJoin(); join != nil {
 		for i := range s.specs {

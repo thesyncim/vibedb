@@ -57,14 +57,6 @@ type PrimaryExactInventoryView struct {
 	count   uint32
 }
 
-func PrimaryExactInventoryPageCapacity(pageBytes int) int {
-	usable := pageBytes - PageHeaderSize - PageTrailerSize - primaryExactInventoryHeaderBytes
-	if usable < primaryExactInventoryEntryBytes {
-		return 0
-	}
-	return usable / primaryExactInventoryEntryBytes
-}
-
 func EncodePrimaryExactInventoryPage(dst []byte, storeID [16]byte, generation, logicalID uint64, next PageRef, refs []PageRef) ([]byte, error) {
 	payloadBytes := primaryExactInventoryHeaderBytes + len(refs)*primaryExactInventoryEntryBytes
 	if len(refs) == 0 || payloadBytes > len(dst)-PageHeaderSize-PageTrailerSize || next != (PageRef{}) && next.Kind != PagePrimaryExactInventory {

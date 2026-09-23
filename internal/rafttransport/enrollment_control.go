@@ -805,16 +805,6 @@ func writeEnrollmentResponseFrame(writer io.Writer, kind byte, ack EnrollmentAck
 // OpenEnrollmentAck reads a committed receipt. A conflict hint (see
 // writeEnrollmentConflict) is rejected here; only EnrollMember's internal
 // retry path is expected to see one, via openEnrollmentConflict.
-func OpenEnrollmentAck(reader io.Reader) (EnrollmentAck, error) {
-	ack, kind, err := openEnrollmentResponseFrame(reader)
-	if err != nil {
-		return EnrollmentAck{}, err
-	}
-	if kind != enrollmentResponseKindAck || !ack.valid() {
-		return EnrollmentAck{}, ErrEnrollmentControl
-	}
-	return ack, nil
-}
 
 // openEnrollmentConflict reads either a committed receipt or a current-
 // revision hint. Exactly one of the two results is meaningful: a nonzero

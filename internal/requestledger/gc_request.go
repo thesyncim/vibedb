@@ -60,15 +60,6 @@ func GCRequestDigest(request GCRequest) Digest {
 	return Digest(sha256.Sum256(framed[:]))
 }
 
-func NewReleasePinRequest(expectedAck Digest, command, completion []byte) (GCRequest, error) {
-	r := GCRequest{Action: GCActionReleasePin, ExpectedAckDigest: expectedAck,
-		ReleaseCommand: command, ReleaseCompletion: completion}
-	if err := validateGCRequest(r); err != nil {
-		return GCRequest{}, err
-	}
-	return r, nil
-}
-
 func NewCollectRequest(expectedAck Digest, maxRows uint16, maxBytes uint32) (GCRequest, error) {
 	r := GCRequest{Action: GCActionCollect, ExpectedAckDigest: expectedAck,
 		MaxRows: maxRows, MaxBytes: maxBytes}

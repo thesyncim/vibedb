@@ -791,25 +791,6 @@ func OpenRequest(raw []byte) (Request, error) {
 	return request, nil
 }
 
-func ReadRequest(reader io.Reader) (Request, error) {
-	var header [requestHeaderBytes]byte
-	if _, err := io.ReadFull(reader, header[:]); err != nil {
-		return Request{}, err
-	}
-	request, payloadBytes, err := readRequestHeaderFromBytes(header[:])
-	if err != nil {
-		return Request{}, err
-	}
-	request.Payload = make([]byte, payloadBytes)
-	if _, err = io.ReadFull(reader, request.Payload); err != nil {
-		return Request{}, err
-	}
-	if !request.valid() {
-		return Request{}, ErrControl
-	}
-	return request, nil
-}
-
 // readRequestHeader reads and validates only the fixed portion. Service.Serve
 // uses this before allocating the request payload so the authenticated
 // endpoint's concurrency bound covers hostile large frames as well.

@@ -276,22 +276,6 @@ func AppendGroupPublicationReceipt(dst []byte, receipt GroupPublicationReceipt) 
 	return dst, nil
 }
 
-func OpenGroupPublicationReceipt(raw []byte) (GroupPublicationReceipt, error) {
-	var receipt GroupPublicationReceipt
-	if len(raw) == 0 || len(raw) > MaxGroupPublicationReceiptBytes || vibejson.Unmarshal(raw, &receipt) != nil {
-		return receipt, ErrGroupTransition
-	}
-	canonical, err := vibejson.Marshal(&receipt)
-	if err != nil {
-		return GroupPublicationReceipt{}, errors.Join(err, ErrGroupTransition)
-	}
-	canonical, err = vibejson.AppendCanonicalize(nil, canonical)
-	if err != nil || !bytes.Equal(raw, canonical) || !receipt.Valid() {
-		return GroupPublicationReceipt{}, errors.Join(err, ErrGroupTransition)
-	}
-	return receipt, nil
-}
-
 // ValidateSuccessor checks the receipt chain and the exact phase progression.
 // It does not compare the live catalog; the authority does that in its CAS.
 func (receipt GroupPublicationReceipt) ValidateSuccessor(intent GroupTransitionIntent, prior *GroupPublicationReceipt) error {
@@ -647,19 +631,6 @@ func DigestRoute(manifest *distribution.Manifest, shard distribution.ShardID) [3
 
 // DigestRouteFromLeaders is useful when the planner already has the bounded
 // ordered route and avoids a second manifest lookup.
-func DigestRouteFromLeaders(distributionName distribution.DistributionName, shard distribution.ShardID, version distribution.RoutingVersion, allocation uint64, epoch uint64, leaders []distribution.EndpointID) [32]byte {
-	var hash digestWriter
-	hash.string(string(distributionName))
-	hash.string(string(shard))
-	hash.u64(uint64(version))
-	hash.u64(allocation)
-	hash.u64(epoch)
-	hash.u64(uint64(len(leaders)))
-	for _, leader := range leaders {
-		hash.string(string(leader))
-	}
-	return hash.sum()
-}
 
 // DigestRouteFor computes the route digest directly from one immutable
 // catalog head.

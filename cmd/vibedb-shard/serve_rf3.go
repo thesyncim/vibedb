@@ -221,10 +221,6 @@ func closePreparedRF3Groups(groups []preparedRF3Group, cause error) error {
 	return cause
 }
 
-func prepareRF3GroupSet(manifest rf3Manifest, profile *rafttransport.PeerTLS, opening sqldriver.ReplicatedOpenOptions, inventory ...*rf3AdoptedGroupInventory) (preparedRF3Set, error) {
-	return prepareRF3GroupSetOnNode(manifest, profile, opening, nil, inventory...)
-}
-
 func prepareRF3GroupSetOnNode(manifest rf3Manifest, profile *rafttransport.PeerTLS, opening sqldriver.ReplicatedOpenOptions, nodeOwner *rf3NodeOwner, inventory ...*rf3AdoptedGroupInventory) (preparedRF3Set, error) {
 	return prepareRF3GroupSetOnNodeWithRetirements(manifest, profile, opening, nodeOwner, nil, inventory...)
 }
@@ -462,18 +458,6 @@ func rf3RouteMatchesBinding(
 		route.Distribution == binding.Distribution && route.Shard == binding.Shard &&
 		route.AllocationGeneration == binding.AllocationGeneration &&
 		route.MemberID == binding.MemberID && route.StoreID == binding.StoreID
-}
-
-func peerAddressForRF3Member(manifest rf3Manifest, memberID uint64) string {
-	for _, member := range manifest.memberRoster() {
-		if member.MemberID == memberID {
-			return member.PeerAddress
-		}
-	}
-	if manifest.EnrolledTarget != nil && manifest.EnrolledTarget.MemberID == memberID {
-		return manifest.EnrolledTarget.PeerAddress
-	}
-	return ""
 }
 
 func servePreparedRF3WithListen(
@@ -2175,13 +2159,6 @@ func buildRF3RosterWithEnrolledTarget(
 	return members, remote, dial, localNativeAuthorized, nil
 }
 
-func supportedRF3MembershipCut(
-	manifest rf3Manifest,
-	voters, learners []uint64,
-) bool {
-	return supportedRF3MembershipCutWithTarget(manifest, manifest.EnrolledTarget, voters, learners)
-}
-
 func supportedRF3MembershipCutWithTarget(
 	manifest rf3Manifest,
 	target *rf3ManifestEnrolledTarget,
@@ -2299,10 +2276,6 @@ func rf3CurrentFenceMatchesProfile(
 		current.ShardIncarnation == replication.ID128(expected.ShardIncarnation) &&
 		current.GroupID == replication.ID128(expected.GroupID) &&
 		identity.MemberID == expected.MemberID && identity.StoreID == expected.StoreID
-}
-
-func rf3RegistryLimits() raftserve.Limits {
-	return rf3RegistryLimitsForGroups(1)
 }
 
 func rf3RegistryLimitsForGroups(groups int) raftserve.Limits {

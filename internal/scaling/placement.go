@@ -546,7 +546,6 @@ func Plan(input PlacementInput) (PlacementPlan, error) {
 
 // PlanPlacements is a descriptive alias used by controllers that prefer an
 // operation-oriented name.
-func PlanPlacements(input PlacementInput) (PlacementPlan, error) { return Plan(input) }
 
 const (
 	BlockerStaleGeneration   = "stale-generation"

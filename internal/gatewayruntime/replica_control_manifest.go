@@ -465,14 +465,3 @@ func validateGatewayReplicaCatalogEndpoint(
 	}
 	return nil
 }
-
-func (manifest gatewayReplicaControlManifest) gatewayMembers() []gateway.ClusterCatalogDrainMember {
-	result := make([]gateway.ClusterCatalogDrainMember, len(manifest.Gateways))
-	for index := range manifest.Gateways {
-		result[index] = manifest.Gateways[index].Member
-	}
-	slices.SortFunc(result, func(left, right gateway.ClusterCatalogDrainMember) int {
-		return bytes.Compare(left.Node[:], right.Node[:])
-	})
-	return result
-}

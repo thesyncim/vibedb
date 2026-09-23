@@ -51,13 +51,6 @@ type frontendDrainPreparedAckReceiver struct {
 	endpoint gateway.ReplicatedEndpoint
 }
 
-func frontendDrainRecordGatewayKey(record gateway.FrontendDrainRecord) replication.Digest {
-	if record.PeerKeyDigest != (replication.Digest{}) {
-		return record.PeerKeyDigest
-	}
-	return record.GatewayServiceKeyDigest
-}
-
 func (request frontendDrainPreparedAckRequest) valid() bool {
 	// The same authenticated route is replayed after the atomic Enforcing and
 	// Retired commits. An empty-token drain has no bearer digest; its canonical
@@ -551,10 +544,6 @@ func (runtime *Runtime) frontendDrainPreparedAckReceiversFromServiceCut(
 type frontendDrainPreparedAckReceiverIdentity struct {
 	node        rafttransport.NodeID
 	incarnation uint64
-}
-
-func frontendDrainPreparedAckDirectoryDigest(cut serviceauthz.ServiceDirectoryCut) [32]byte {
-	return frontenddrain.ServiceDirectoryCutDigest(cut)
 }
 
 func (runtime *Runtime) frontendDrainPreparedAckRequest(

@@ -252,10 +252,6 @@ const (
 	TransactionRecordManifestSegment
 )
 
-func (kind TransactionRecordKind) valid() bool {
-	return kind <= TransactionRecordManifestSegment
-}
-
 // TransactionReply reports the durable state observed after a transaction
 // command. Exactly one typed state is populated according to Role.
 type TransactionReply struct {

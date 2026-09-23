@@ -496,7 +496,6 @@ func (r RecursiveCTEResult) Iterations() int    { return r.iterations }
 func (r RecursiveCTEResult) Evaluation() uint64 { return r.evaluation }
 
 // source is the lowering bridge used by ordinary CTE references.
-func (r RecursiveCTEResult) source() Source { return fromRelationSpool(r.relation) }
 
 // execute evaluates one descriptor inside an existing statement frame. The
 // caller consumes reference-local results before the next execute and calls

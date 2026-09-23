@@ -1,7 +1,6 @@
 package raftsim
 
 import (
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -196,13 +195,6 @@ func OpenTrace(src []byte) (*Trace, error) {
 }
 
 // Digest returns the SHA-256 digest of the canonical bytes.
-func (t *Trace) Digest() ([32]byte, error) {
-	b, err := t.AppendBinary(nil)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	return sha256.Sum256(b), nil
-}
 
 // Executor applies one recorded decision in a serialized model.
 type Executor interface {

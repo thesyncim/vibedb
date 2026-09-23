@@ -59,37 +59,6 @@ func (runtime *Runtime) publishFrontendContinuationGrant(
 	return nil
 }
 
-func (runtime *Runtime) readCatalogServiceFences(
-	ctx context.Context, reader gateway.DirectoryReader,
-) ([]serviceauthz.ServiceFence, error) {
-	if refresh, ok := reader.(interface {
-		RefreshCatalogServiceFences(context.Context) ([]serviceauthz.ServiceFence, uint64, error)
-	}); ok {
-		fences, _, err := refresh.RefreshCatalogServiceFences(ctx)
-		return fences, err
-	}
-	if read, ok := reader.(interface {
-		CatalogServiceFences(context.Context) ([]serviceauthz.ServiceFence, uint64, error)
-	}); ok {
-		fences, _, err := read.CatalogServiceFences(ctx)
-		return fences, err
-	}
-	return nil, nil
-}
-
-func (runtime *Runtime) continuationGrantMatchesRecord(
-	grant serviceauthz.CommittedFrontendContinuationGrant, record gateway.NodeRecord,
-) bool {
-	if runtime == nil || runtime.config.TLSProfile == nil || !grant.Valid() {
-		return false
-	}
-	return grant.TrustDomain == runtime.config.TLSProfile.LocalIdentity().TrustDomain &&
-		grant.PhysicalNode == record.NodeID && grant.PhysicalIncarnation == record.Incarnation &&
-		grant.PeerKeyDigest == [32]byte(record.Gateway.ServiceKeyDigest) &&
-		grant.GatewayServiceID == record.Gateway.NodeID && grant.GatewaySessionID == record.Gateway.SessionID &&
-		grant.GatewaySessionRevision == record.Gateway.SessionRevision
-}
-
 func (runtime *Runtime) buildFrontendDrainFence(
 	record gateway.NodeRecord, catalogFences []serviceauthz.ServiceFence,
 ) (serviceauthz.CommittedFrontendDrainFence, bool) {
@@ -120,16 +89,6 @@ func (runtime *Runtime) buildFrontendDrainFence(
 		}
 	}
 	return serviceauthz.CommittedFrontendDrainFence{}, false
-}
-
-func sameFrontendDrainFence(
-	left, right serviceauthz.CommittedFrontendDrainFence,
-) bool {
-	return left.Valid() && right.Valid() && left.TrustDomain == right.TrustDomain &&
-		left.PhysicalNode == right.PhysicalNode && left.PhysicalIncarnation == right.PhysicalIncarnation &&
-		left.PeerKeyDigest == right.PeerKeyDigest && left.GatewayServiceID == right.GatewayServiceID &&
-		left.GatewaySessionID == right.GatewaySessionID && left.GatewaySessionRevision == right.GatewaySessionRevision &&
-		left.DrainID == right.DrainID && left.Revision == right.Revision && left.Fence == right.Fence
 }
 
 func (runtime *Runtime) buildFrontendContinuationGrant(

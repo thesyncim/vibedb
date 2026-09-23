@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"slices"
 	"strings"
 	"unsafe"
@@ -681,9 +680,3 @@ func compareUint64(a, b uint64) int {
 }
 
 // Score reports a plan's objective score.
-func (o Objective) PlanScore(plan *Plan) float64 {
-	if plan == nil {
-		return math.Inf(1)
-	}
-	return o.withDefaults().Score(plan.Cost)
-}

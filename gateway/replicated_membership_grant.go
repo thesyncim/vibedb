@@ -1257,20 +1257,6 @@ func validReplicaReplacementReceipt(receipt replicaReplacementReceipt) bool {
 	return postEmpty || postComplete
 }
 
-func validateReplicaReplacementReceipt(raw, oldHead, newHead []byte,
-	oldGeneration, newGeneration uint64) (membershipgrant.Grant, error) {
-	receipt, err := openReplicaReplacementReceipt(raw)
-	if err != nil || receipt.OldGeneration != oldGeneration ||
-		receipt.NewGeneration != newGeneration ||
-		receipt.OldHeadBytes != uint64(len(oldHead)) ||
-		receipt.NewHeadBytes != uint64(len(newHead)) ||
-		receipt.OldHeadDigest != sha256.Sum256(oldHead) ||
-		receipt.NewHeadDigest != sha256.Sum256(newHead) {
-		return membershipgrant.Grant{}, errors.Join(err, ErrReplicatedCatalogConflict)
-	}
-	return receipt.Grant, nil
-}
-
 func appendReplicatedMembershipGrantPage(dst []byte, pageIndex byte,
 	groups []raftmember.GroupKey) ([]byte, error) {
 	if pageIndex >= replicatedMembershipGrantPages ||

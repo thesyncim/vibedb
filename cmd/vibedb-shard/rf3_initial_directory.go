@@ -36,10 +36,6 @@ func loadRF3InitialNodeDirectory(path string) ([]gateway.NodeRecord, error) {
 	return records, nil
 }
 
-func newRF3ProvisionedRegistry(manifest rf3Manifest, profile *rafttransport.PeerTLS, members []rafttransport.Member, endpoints map[rafttransport.NodeID]string, limits rafttransport.Limits) (*rafttransport.StaticRegistry, error) {
-	return newRF3ProvisionedRegistryWithPeers(manifest, profile, members, endpoints, limits, nil)
-}
-
 func newRF3ProvisionedRegistryWithPeers(manifest rf3Manifest, profile *rafttransport.PeerTLS, members []rafttransport.Member, endpoints map[rafttransport.NodeID]string, limits rafttransport.Limits, enrolledPeers []rafttransport.PhysicalPeer) (*rafttransport.StaticRegistry, error) {
 	if manifest.Gateway == nil || manifest.Gateway.InitialNodeDirectoryPath == "" {
 		return newRF3PinnedStaticRegistryWithPeers(manifest, profile, members, endpoints, limits, enrolledPeers)

@@ -738,11 +738,6 @@ func (p *compiledPredicate) comparisonScalar(w *Workspace) (
 // w is read only to resolve a late-bound membership's slot, which is already
 // filled by the time any planner pass runs; the catalog itself still comes from
 // indexes and no snapshot is touched.
-func (p *compiledPredicate) canBound(
-	paths []compiledPath, indexes []store.IndexInfo, w *Workspace,
-) bool {
-	return p.canBoundWithRanges(paths, indexes, w, false)
-}
 
 func (p *compiledPredicate) canBoundWithRanges(
 	paths []compiledPath,
