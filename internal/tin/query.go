@@ -1529,9 +1529,10 @@ func (ix *Index) scoreSpans(spans []spanHit, boost float64, acc *[]Scored) {
 	ix.scoreTF, ix.scoreDL, ix.scoreOut = tf[:0], dl[:0], sc[:0]
 }
 
-// idf is BM25's smoothed inverse document frequency.
+// idf is BM25's smoothed (Lucene) inverse document frequency,
+// ln(1 + (N - df + 0.5) / (df + 0.5)): always positive, and decreasing in df.
 func idf(nDocs, df int) float64 {
-	return math.Log1p(float64(nDocs-df) + 0.5/(float64(df)+0.5))
+	return math.Log1p((float64(nDocs-df) + 0.5) / (float64(df) + 0.5))
 }
 
 // mergeScores collapses duplicate docs (from OR/AND children) by summation,
