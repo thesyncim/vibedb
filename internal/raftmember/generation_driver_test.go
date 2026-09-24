@@ -137,7 +137,7 @@ func awaitWALGeneration(
 	t testing.TB, runtimeOwner *Runtime, wal *raftstore.Store, generation uint64,
 ) (raftstore.GenerationInfo, error) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(testAsyncDeadline)
 	for time.Now().Before(deadline) {
 		runtimeOwner.tickWALGeneration()
 		info, err := wal.GenerationInfo()
@@ -214,8 +214,9 @@ func TestRuntimeWALGenerationBuildDoesNotBlockRaftProgress(t *testing.T) {
 	releaseOnce.Do(func() { close(release) })
 	select {
 	case <-finished:
-	case <-time.After(10 * time.Second):
-		t.Fatal("background generation build did not finish")
+	case <-time.After(testAsyncDeadline):
+		t.Fatalf("background generation build did not finish: building=%v activationPending=%v",
+			fixture.runtime.walGeneration.building, fixture.runtime.walGeneration.activationPending)
 	}
 	// The intervening apply stales the candidate. Owner-lane revalidation must
 	// discard it without selecting or deleting the serving source.
