@@ -486,3 +486,41 @@ func TestRF3SchemaActivationResolvesCASAliasOnlyForPendingFence(t *testing.T) {
 		})
 	}
 }
+
+// A follower's machine can apply a peer member's transition for the same
+// operation before the follower persists its own command. Commit must adopt
+// that exact committed transition at its index instead of treating it as a
+// foreign suffix entry (the replayed suffix would fail to open it as a
+// command); a transition for any other operation remains a conflict.
+func TestRF3SchemaCommittedTransitionAdoptsPeerCommit(t *testing.T) {
+	request, authorization, transition := testRF3SchemaRecoveryCommand(t)
+	normal := func(index uint64, data []byte) *pb.Entry {
+		entryType, term := pb.EntryNormal, uint64(2)
+		return &pb.Entry{Index: &index, Term: &term, Type: &entryType, Data: data}
+	}
+	wal := schemaRecoveryWAL{entries: []*pb.Entry{
+		normal(8, nil), normal(9, transition.Bytes()), normal(10, []byte("later traffic")),
+	}}
+	index, command, found, err := rf3SchemaCommittedTransition(wal, 7, 10, request, authorization)
+	if err != nil || !found || index != 9 || !bytes.Equal(command, transition.Bytes()) {
+		t.Fatalf("committed peer transition = (%d, found=%t, %v)", index, found, err)
+	}
+	command[0] ^= 1
+	if bytes.Equal(command, wal.entries[1].GetData()) {
+		t.Fatal("adopted command aliases WAL storage")
+	}
+	if _, _, found, err = rf3SchemaCommittedTransition(
+		schemaRecoveryWAL{entries: wal.entries[:1]}, 7, 8, request, authorization); err != nil || found {
+		t.Fatalf("empty suffix reported a transition: found=%t err=%v", found, err)
+	}
+	foreign := request
+	foreign.Operation[0]++
+	foreignAuthorization := authorization
+	foreignAuthorization.Operation = foreign.Operation
+	if _, _, _, err = rf3SchemaCommittedTransition(wal, 7, 10, foreign, foreignAuthorization); !errors.Is(err, schemainstall.ErrConflict) {
+		t.Fatalf("foreign committed transition accepted: %v", err)
+	}
+	if _, _, _, err = rf3SchemaCommittedTransition(schemaRecoveryWAL{err: errors.New("wal unavailable")}, 7, 10, request, authorization); !errors.Is(err, schemainstall.ErrConflict) {
+		t.Fatalf("unreadable suffix accepted: %v", err)
+	}
+}

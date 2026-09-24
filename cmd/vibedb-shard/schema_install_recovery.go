@@ -96,6 +96,43 @@ func rf3SchemaReplayNeutralSuffix(wal rf3SchemaWALReader, sourceApplied, current
 	return nil
 }
 
+// rf3SchemaCommittedTransition finds this operation's schema transition among
+// the applied entries after the staged source cut. It returns the first
+// schema transition's index and exact bytes when that transition belongs to
+// request and authorization; a transition for anything else is a conflict.
+// Entries before it are left to the neutral-suffix proof.
+func rf3SchemaCommittedTransition(wal rf3SchemaWALReader, sourceApplied, currentApplied uint64,
+	request schemainstall.Request, authorization schemainstall.Authorization,
+) (uint64, []byte, bool, error) {
+	if wal == nil || sourceApplied == 0 || currentApplied < sourceApplied {
+		return 0, nil, false, schemainstall.ErrConflict
+	}
+	for next := sourceApplied + 1; next <= currentApplied; {
+		entries, err := wal.Entries(next, currentApplied+1, 1<<20)
+		if err != nil || len(entries) == 0 {
+			return 0, nil, false, errors.Join(err, schemainstall.ErrConflict)
+		}
+		for _, entry := range entries {
+			if entry.GetIndex() != next {
+				return 0, nil, false, schemainstall.ErrConflict
+			}
+			next++
+			if entry.GetType() != pb.EntryNormal || !replicatedstate.IsSchemaTransition(entry.GetData()) {
+				continue
+			}
+			transition, openErr := replicatedstate.OpenSchemaTransition(entry.GetData())
+			if openErr != nil {
+				return 0, nil, false, errors.Join(openErr, schemainstall.ErrConflict)
+			}
+			if err := validateRF3SchemaTransition(request, authorization, transition); err != nil {
+				return 0, nil, false, errors.Join(err, schemainstall.ErrConflict)
+			}
+			return entry.GetIndex(), bytes.Clone(transition.Bytes()), true, nil
+		}
+	}
+	return 0, nil, false, nil
+}
+
 // rf3SchemaEmptyNormalSuffix proves that every applied entry after a staged
 // source cut is a Raft leader no-op. It is deliberately stricter than merely
 // comparing applied indexes: any command or membership entry rejects recovery.

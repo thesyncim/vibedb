@@ -617,6 +617,7 @@ func (a *rf3SchemaActivator) activate(
 				return readErr
 			}
 		}
+		var adopted []byte
 		if !found {
 			var built bool
 			var sourceErr error
@@ -625,6 +626,19 @@ func (a *rf3SchemaActivator) activate(
 				return errors.Join(sourceErr, schemainstall.ErrConflict)
 			}
 			preCommandApplied = state.apply.Applied()
+			// Every member proposes its own transition, but Raft may apply a
+			// peer's before this member persists one. That committed
+			// transition is what this member's machine executed, so adopt it
+			// at its own index instead of rejecting it as foreign suffix.
+			committedIndex, committed, hasCommitted, scanErr := rf3SchemaCommittedTransition(
+				state.wal, preparedApplied, preCommandApplied, request, authorization)
+			if scanErr != nil {
+				return scanErr
+			}
+			if hasCommitted {
+				preCommandApplied = committedIndex - 1
+				adopted = committed
+			}
 			emptySuffix = preCommandApplied > preparedApplied
 			if emptySuffix {
 				if err := rf3SchemaReplayNeutralSuffix(state.wal, preparedApplied, preCommandApplied, request.Operation, request.Group); err != nil {
@@ -633,6 +647,9 @@ func (a *rf3SchemaActivator) activate(
 			}
 		}
 		command, err = rf3SchemaActivationCommand(request, authorization, persisted, found, func() ([]byte, error) {
+			if adopted != nil {
+				return adopted, nil
+			}
 			var proof sqldriver.ReplicatedSchemaTargetProof
 			var recoverErr error
 			if state.verified != nil && emptySuffix {
