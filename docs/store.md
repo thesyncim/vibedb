@@ -212,6 +212,21 @@ backup strategy.
 See the [durable ownership contract](../store/durable/OWNERSHIP.md) for handle,
 lease, and storage lifetime rules.
 
+## Limitations
+
+- Both engines are development APIs with detailed ownership rules; misuse
+  (copying handles, leaking snapshots) is not always detected.
+- Heap `Put` rebuilds a whole chunk (up to 64 documents) per mutation; use
+  `Builder` for bulk loads.
+- Heap tin indexes are rebuilt per generation under the collection writer
+  lock; durable tin postings are resident and never persisted. See
+  [full-text search](api/search.md#limitations).
+- Opening a durable collection with exact indexes rebuilds a resident index
+  epoch; open time and memory grow with the index set.
+- Long-lived durable snapshots pin retired extents and can make writers
+  refuse work until they close.
+- `Salvage` is partial by design: overflow values are skipped.
+
 ## Source map
 
 - Heap collection and snapshots: [store/engine.go](../store/engine.go), [store/store_builder.go](../store/store_builder.go)

@@ -130,6 +130,19 @@ abort. Resolve or replay the same identity, grant, statement order, SQL bytes,
 and parameter kinds and bytes; never replace an ambiguous mutation with a new
 ID. RF3 retries resend the original canonical command bytes.
 
+### Cluster control requests
+
+`vibedb cluster` commands use the same authenticated client listener, one request per connection. Each
+request is one canonical `vibejson` line with `format` 1, an `op` of
+`cluster_nodes`, `cluster_join`, `cluster_rebalance`, `cluster_decommission`,
+or `cluster_status`, and a required 64-hex `request_id`. Requests are bounded
+to 1 MiB and responses to 4 MiB; `wait_ms` is at most 24 hours. Unknown or
+misplaced fields are refused before capability dispatch. `cluster_nodes` and
+`cluster_status` need `topology`; the other three also need `membership`. A
+response always echoes the request ID and carries `ok`, `safe_to_stop`, and,
+when relevant, `operation_id`, `state`, nodes, blockers, evidence, and budget.
+See [scaling](../operations/scaling.md).
+
 ## Static shard SQL
 
 The static shard service uses big-endian frames: a one-byte tag, then an `int32`
@@ -288,10 +301,22 @@ Raft peer transport and service metrics have their own binary grammars. Neither
 is a client SQL/JSON surface, and a successful socket write is not a Raft ACK,
 commit acknowledgement, or apply acknowledgement.
 
+## Limitations
+
+- Every protocol on this page is an exact-build development surface. No wire
+  format is versioned for compatibility.
+- The build preface admits peers by declared grammar identity, which has
+  failed to change across at least two incompatible commits.
+- There is no HTTP, gRPC, or REST interface, and no published client library
+  for the native protocol.
+- The only SQL network interface to RF3 is the loopback development pgwire
+  listener.
+
 ## Source map
 
 | Area | Authoritative source |
 | --- | --- |
+| cluster control grammar | [internal/clustercontrol/control.go](../../internal/clustercontrol/control.go), [internal/gatewayruntime/cluster_control.go](../../internal/gatewayruntime/cluster_control.go) |
 | gateway stream and dispatch | [internal/gatewayruntime/serve.go](../../internal/gatewayruntime/serve.go), `serve_request_wire.go` |
 | native JSON grammar and errors | [internal/gatewayruntime/data_wire.go](../../internal/gatewayruntime/data_wire.go), `data_handler.go`, `data_response.go` |
 | durable request grammar | [internal/gatewayruntime/durable_exec_batch_wire.go](../../internal/gatewayruntime/durable_exec_batch_wire.go), `durable_exec_batch.go`, `exec_batch_ack_wire.go` |

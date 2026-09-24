@@ -42,7 +42,6 @@ Reproduction command:
 
 ```sh
 PATH=/private/tmp/vibedb-go-shim:$PATH \
-CODEX_AGENT_ID=write_validation \
 python3 scripts/bench/run-crdb-sql-comparison.py /new/evidence/path \
   --node-log --rows 8192 --operations 2000 --scans 2000 \
   --warmup 1000 --repetitions 3 --clients 1,8 \
@@ -53,15 +52,15 @@ The runner removed its temporary container and volume after each run.
 
 ## Validation
 
-All commands used `/Users/thesyncim/.codex/bin/project-env` and passed:
+All commands ran through a private environment wrapper that selects the Go toolchain, and passed:
 
 ```sh
-CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test ./gateway -run 'TestReplicatedDirectMutation|TestDurableSQLPrepared' -count=1 -timeout=10m
-CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test -race ./gateway -run 'TestReplicatedDirectMutation|TestDurableSQLPrepared' -count=1 -timeout=10m
-CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test ./internal/gatewayruntime -count=1 -timeout=20m
-CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test -race ./internal/gatewayruntime -run 'TestPostgreSQLDirectQueryOwnership|TestPostgreSQLDirectParallelIdentityUniqueness|TestPostgreSQLDirectUnknownRetainsExactCommand' -count=1 -timeout=10m
-CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test ./internal/raftservice -run '^TestProposalIngress' -count=1 -timeout=10m
-(cd integration/pgclient && CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test ./cmd/rf3-sqlbench -count=1 -timeout=10m)
+go test ./gateway -run 'TestReplicatedDirectMutation|TestDurableSQLPrepared' -count=1 -timeout=10m
+go test -race ./gateway -run 'TestReplicatedDirectMutation|TestDurableSQLPrepared' -count=1 -timeout=10m
+go test ./internal/gatewayruntime -count=1 -timeout=20m
+go test -race ./internal/gatewayruntime -run 'TestPostgreSQLDirectQueryOwnership|TestPostgreSQLDirectParallelIdentityUniqueness|TestPostgreSQLDirectUnknownRetainsExactCommand' -count=1 -timeout=10m
+go test ./internal/raftservice -run '^TestProposalIngress' -count=1 -timeout=10m
+(cd integration/pgclient && go test ./cmd/rf3-sqlbench -count=1 -timeout=10m)
 ```
 
 The ownership tests compare typed cloning with the legacy JSON result, mutate

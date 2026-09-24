@@ -1,6 +1,6 @@
 # Verify, salvage, and repack
 
-[Documentation](../README.md) / [Operations](README.md) · [Development status](../status.md)
+[Documentation](../README.md) / [Operations](README.md) / Verification
 
 This page covers offline inspection and repair of the `store/durable` file
 format. It does not turn the development format into a compatibility promise.
@@ -25,8 +25,19 @@ vibedb-verify salvage <store-file> <output-file>
 vibedb-verify repack  <store-file> <output-file>
 ```
 
-`salvage` and `repack` create the output with exclusive creation. Choose a path
-that does not exist. Never point either command at the source path.
+`salvage` and `repack` create the output with exclusive creation and also
+create its recovery journal, `<output-file>.rjournal`. Choose a path that does
+not exist; an existing output fails with `error create="<path>": ... file
+exists` and exit status 1. Never point either command at the source path.
+
+Build the verifier from the same checkout as the writer:
+
+```sh
+GOEXPERIMENT=simd go build -o ./bin/vibedb-verify ./cmd/vibedb-verify
+```
+
+Every command ends with `result ok` (exit 0) or `result fail findings=<n>`
+(exit 1). I/O errors print `error <operation>="<path>": <cause>` and exit 1.
 
 ## Prepare a stable input
 
@@ -47,7 +58,7 @@ supported backup cut.
 ## Verify a store file
 
 ```sh
-go run ./cmd/vibedb-verify verify ./data/collection-file
+./bin/vibedb-verify verify ./data/collection-file
 ```
 
 The verifier selects the newest structurally valid root, with fallback to the
@@ -91,13 +102,20 @@ document/free-extent counts, and page counts by kind.
 ## Verify a database directory
 
 ```sh
-go run ./cmd/vibedb-verify verify ./data/database
+./bin/vibedb-verify verify ./data/database
 ```
 
 Directory verification inspects primary/journal identity pairing and scans
 `txn.vtm` decisions and conditional journal records. It detects missing,
 unreadable, mismatched, in-doubt, and torn-tail state without appending,
 recycling, truncating, or deleting anything.
+
+A healthy directory ends with:
+
+```text
+summary txn_log=absent decisions=0 journals=1 findings=0
+result ok
+```
 
 This check is transaction metadata inspection, not a recursive structural walk
 of every collection. Verify individual collection files as well when both
@@ -106,7 +124,7 @@ properties matter.
 ## Salvage catalog loss
 
 ```sh
-go run ./cmd/vibedb-verify salvage ./broken.vdb ./salvaged.vdb
+./bin/vibedb-verify salvage ./broken.vdb ./salvaged.vdb
 ```
 
 Salvage ignores routing state and scans page-aligned extents for valid,
@@ -124,6 +142,13 @@ Use salvage only for its narrow recovery model:
 | Duplicate leaf versions | Older versions counted and skipped |
 | Index/schema recovery | Not reconstructed from arbitrary corrupt metadata |
 
+A successful run prints one summary line, for example:
+
+```text
+salvage leaves_scanned=2 buckets=1 documents=2 overflow_skipped=0 duplicate_skipped=0 output_file_end=118784
+result ok
+```
+
 A zero process exit status does not mean an overflow-bearing source was
 recovered completely. Read the summary and require `overflow_skipped=0` for an
 exact inline-row recovery.
@@ -131,7 +156,7 @@ exact inline-row recovery.
 ## Repack a healthy store
 
 ```sh
-go run ./cmd/vibedb-verify repack ./closed.vdb ./repacked.vdb
+./bin/vibedb-verify repack ./closed.vdb ./repacked.vdb
 ```
 
 Repack opens a cleanly closed source, snapshots it, scans live keys in bytewise
@@ -169,6 +194,17 @@ in tests qualify their fixtures and hosts; they are not production SLAs.
 4. Verify the output offline.
 5. Open and test it with the exact same build and options.
 6. Replace paths only through an operator-controlled, recoverable cutover.
+
+## Limitations
+
+- `verify` on a store file walks structure; it does not run every admission
+  check `Open` performs or prove application invariants.
+- `verify` on a directory inspects transaction metadata only; verify each
+  collection file separately.
+- `salvage` does not recover overflow values, indexes, or schema.
+- These tools operate on embedded store files. They do not verify RF3 node
+  logs, Raft state, or cluster membership.
+- Output format is line-oriented text for this build, not a stable interface.
 
 ## Source map
 

@@ -38,7 +38,15 @@ backup_dir=/absolute/path/to/new-backup
 ./bin/vibedb-verify verify "$backup_dir"
 ```
 
-The copy command refuses an existing destination. Preserve permissions and
+For a healthy copy, `vibedb-verify` ends with a summary and `result ok`:
+
+```text
+summary txn_log=absent decisions=0 journals=1 findings=0
+result ok
+```
+
+`txn_log=absent` is normal for a database that has not used multi-collection
+transactions. The copy command refuses an existing destination. Preserve permissions and
 protect the backup under the same access policy as the source. Store the
 application revision, build settings, configuration, and any external keys
 beside your backup inventory.
@@ -63,6 +71,13 @@ directory was copied, and the verifier matches the writer build. Use
 [offline verification and salvage](verification.md) to investigate remaining
 findings. Salvage can omit unprovable data, so its output needs a separate
 application-level review.
+
+## Limitations
+
+- There is no online or incremental backup for embedded databases; the
+  application must close the database first.
+- No tool records which build wrote a directory. Keep that record yourself.
+- A backup restores only with the same build; see [upgrades](upgrades.md).
 
 ## Source map
 

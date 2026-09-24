@@ -14,8 +14,17 @@
    the change affects.
 4. Keep unrelated working-tree changes intact.
 
-The repository targets the Go version in `go.mod`. Use focused tests while
-iterating, then run the root and nested-module checks that match the change.
+The repository targets the Go version in `go.mod` (Go 1.27). Use focused tests
+while iterating, then run the root and nested-module checks that match the
+change.
+
+The [developer guide](docs/development/README.md) has the
+[repository map](docs/development/repository-map.md),
+[build and test workflow](docs/development/build-and-test.md) (CI shards, race
+lanes, Linux-only tests, a Linux container from macOS),
+[testing strategy](docs/development/testing-strategy.md),
+[debugging guide](docs/development/debugging.md), and
+[coding conventions](docs/development/conventions.md).
 
 ## Default build, test, and benchmark commands
 
@@ -43,7 +52,7 @@ and nested modules, set `GOEXPERIMENT=simd` in the command or shell environment;
 
 ## Fast feedback
 
-```bash
+```sh
 make test PACKAGES=./path/to/package TEST_FLAGS='-run ^TestName$ -count=1'
 make test PACKAGES=./path/to/package TEST_FLAGS='-race -run ^TestConcurrentName$ -count=1'
 ```
@@ -52,9 +61,15 @@ Use fault injection and reopen oracles for persistence work. Use real process
 or transport tests when the contract crosses a process, TLS, or filesystem
 boundary. A benchmark is never a correctness test.
 
+Process qualifications skip unless their `VIBEDB_..._E2E` gate is set, and most
+are Linux-only. On macOS a filtered run of a Linux-only test reports
+`ok ... [no tests to run]`, which is not a pass. See
+[process and qualification gates](docs/development/build-and-test.md#process-and-qualification-gates).
+Use `-count=1` so a cached result is not mistaken for a new run.
+
 ## Root checks
 
-```bash
+```sh
 make build
 make vet
 make test TEST_FLAGS='-p=1 -timeout=25m'
@@ -62,22 +77,29 @@ make test GOEXPERIMENT=nosimd PACKAGES='./distribution ./internal/rangesplit ./s
 git diff --check
 ```
 
-Check [current status](docs/status.md) for any recorded baseline failure. Do not
+Check [current status](docs/status.md) for any recorded baseline failure, and
+compare a CI failure with the latest `main` run of the same job. Do not
 silently attribute an old failure to your change or hide a new one as
 “pre-existing.” Record the exact command and comparison.
 
 ## Nested modules
 
-```bash
+```sh
 (cd bench/competitive && GOEXPERIMENT=simd go test ./...)
 (cd integration/pgclient && GOEXPERIMENT=simd go test -timeout=2m ./...)
 (cd integration/pgcompat && GOEXPERIMENT=simd go test ./...)
 (cd x/vitessroute && GOEXPERIMENT=simd go test ./...)
 ```
 
-Java/JDBC, stock `psql`, Linux fault, Docker, and Kind lanes are opt-in or
-environment-specific. Their individual docs state prerequisites and what a
-pass proves.
+No workflow runs the `x/vitessroute` tests; run them whenever you touch
+`distribution` mappers or that module. `integration/pgclient` runs in the
+`ci` recovery job, and `integration/pgcompat` runs nightly.
+
+Java/JDBC probes (`integration/jdbc`), stock `psql` (`VIBEDB_TEST_PSQL=1`,
+needs Docker), Linux fault, and Kind lanes are opt-in or environment-specific.
+Their individual docs state prerequisites and what a pass proves. The
+[qualification index](docs/qualification/README.md) lists every CI
+qualification workflow and its trigger.
 
 ## Match evidence to the change
 
@@ -108,9 +130,12 @@ In the same commit:
 
 ## Generated contracts
 
-Run the generators after changing their source:
+Run the generators after changing their source. The `repository contracts` CI
+job regenerates the build manifest, feature ledger, and competitive coverage
+and fails on any difference. Tests check the capability matrix and unsafe
+inventory.
 
-```bash
+```sh
 go generate ./internal/buildgate
 go generate ./internal/featurestate
 go generate ./internal/conformance
@@ -121,7 +146,7 @@ go test ./internal/buildgate ./internal/featurestate ./internal/conformance
 
 Refresh the unsafe inventory when a production import changes:
 
-```bash
+```sh
 go test ./internal/unsafeaudit -run TestUnsafeFileListMatchesSource -update
 ```
 
@@ -130,7 +155,7 @@ Do not hand-edit generated blocks in `UNSAFE.md`, `docs/capabilities.md`,
 
 ## Measure performance honestly
 
-```bash
+```sh
 go run ./bench/gate
 ```
 
@@ -164,7 +189,7 @@ README or status page.
 
 ## Final review
 
-```bash
+```sh
 git status --short
 git diff --check
 git diff --stat

@@ -3,20 +3,21 @@
 [Documentation](../README.md) / [API guides](README.md) · [Development status](../status.md)
 
 Use `github.com/thesyncim/vibedb` when an application wants VibeDB to own an
-embedded database lifecycle. It provides named JSON collections, exact indexes,
-full-text search, typed queries, and serializable transactions without exposing storage pages or
-snapshot leases.
+embedded database lifecycle. It provides named JSON collections, exact
+secondary indexes, full-text (tin) indexes, typed queries, and serializable
+transactions without exposing storage pages or snapshot leases.
 
-This guide describes the root `vibedb` package only. The `store` and
-`store/durable` packages are lower-level engines with different JSON,
-ownership, snapshot, indexing, and lifecycle contracts. Read [Low-level storage
-engines](../store.md) before using either directly.
+This guide covers the root `vibedb` package. The `store` and `store/durable`
+packages are lower-level engines with different JSON, ownership, snapshot,
+indexing, and lifecycle contracts; read [storage engines](../store.md) before
+using either directly. The SQL driver keeps its own catalog format; a
+database opened with `vibedb.Open` is not a SQL catalog.
 
 ## Open and close a database
 
-`Open` uses the `Durable` profile by default and owns the directory, collection
-files, recovery journals, transaction marker, descriptors, and writer locks
-behind the returned database.
+`Open` uses the `Durable` profile by default. It owns the directory, the
+collection files, their recovery journals, the transaction decision log, the
+descriptors, and the writer locks behind the returned database.
 
 ```go
 package main
@@ -24,28 +25,33 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/thesyncim/vibedb"
 )
 
 func main() {
 	if err := run(); err != nil {
-		panic(err)
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 }
 
 func run() (err error) {
-	db, err := vibedb.Open("./data")
+	dir, err := os.MkdirTemp("", "vibedb-native-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+
+	db, err := vibedb.Open(dir)
 	if err != nil {
 		return err
 	}
 	defer func() { err = errors.Join(err, db.Close()) }()
 
 	users := db.Collection("users")
-	created, err := users.Put(
-		"user:42",
-		[]byte(`{"name":"Ada","active":true}`),
-	)
+	created, err := users.Put("user:42", []byte(`{"name":"Ada","active":true}`))
 	if err != nil {
 		return err
 	}
@@ -59,153 +65,155 @@ func run() (err error) {
 }
 ```
 
-Do not read, rename, replace, copy, truncate, or delete files inside an open
-database directory. Close the complete database before treating the directory
-as a backup unit. `Close` is required for resource release even in the
-`Durable` profile.
+Expected output:
+
+```text
+created=true found=true doc={"active":true,"name":"Ada"}
+```
+
+Object members come back sorted because the facade stores canonical JSON; see
+[canonical JSON](../data-model.md#canonical-json).
+
+A durable collection named `users` is stored as `c-7573657273.vjc` (the
+hex-encoded name) plus `c-7573657273.vjc.rjournal`. A database that has run a
+multi-collection transaction also owns `txn.vtm`. Do not read, rename,
+replace, copy, truncate, or delete files inside an open database directory.
+Close the complete database before treating the directory as a backup unit;
+see [embedded backup](../operations/embedded-backup.md). `Close` is required
+for resource release in every profile.
 
 ## Choose a durability profile
 
-Select a profile with `WithDurability` or as the `Durability` field of
+Select a profile with `WithDurability` or the `Durability` field of
 `AdvancedOptions`.
 
 | Profile | Successful mutation means | Multi-collection transaction |
 | --- | --- | --- |
-| `Durable` | Its recovery record passed the power-safe fence before visibility and acknowledgement | Supported |
-| `Buffered` | Its new generation is visible in this process; it may be lost before a successful `Flush` or `Close` | One dirty collection only |
-| `Memory` | Its new generation is visible in memory; `Open` ignores the path and performs no filesystem operation | Supported; no crash persistence |
+| `Durable` | Its recovery record passed the power-safe fence before visibility and acknowledgement | Supported, crash-atomic |
+| `Buffered` | Its new generation is visible in this process; it can be lost until a successful `Flush` or `Close` | Refused with `ErrTxUnsupportedLane` |
+| `Memory` | Its new generation is visible in process memory; `Open` ignores the path and performs no filesystem operation | Supported, visibility-atomic, no persistence |
 
-Buffered acknowledgement does not include a durability fence for that
-mutation. It also does not mean “no I/O”: lazy creation and journal preparation
-can create, allocate, or synchronize metadata.
+`Buffered` acknowledgement includes no durability fence for that mutation, but
+it is not a promise of zero I/O: lazy creation and journal preparation can
+create, allocate, or synchronize metadata.
 
-The durability wording describes the implemented fence, not a certification of
-the filesystem, controller, device cache, hypervisor, or power-loss behavior.
-See [Durability and recovery](../durability.md) for the failure model.
+The durability wording describes the implemented fence. It is not a
+certification of the filesystem, controller, device cache, hypervisor, or
+power-loss behavior. See [durability and recovery](../durability.md).
 
 ## Configure `Open`
 
 Most callers need only `WithDurability`. `WithAdvancedOptions` replaces the
-complete advanced configuration; when options are combined, `Open` applies
-them from left to right.
+complete advanced configuration; combined options apply from left to right.
 
 | `AdvancedOptions` field | Purpose |
 | --- | --- |
 | `Durability` | Selects `Durable`, `Buffered`, or `Memory` |
-| `Engine` | Supplies low-level collection schema, index, geometry, and resource settings for newly created collections |
+| `Engine` | Low-level `durable.Options` (schema, exact indexes, geometry, resource bounds) for newly created collections |
 | `FileMode` | Permissions for newly created files; zero selects `0600` |
 | `DirMode` | Permissions for newly created directories; zero selects `0700` |
-| `TxnLimits` | Bounds dirty collections, staged documents, and staged bytes across one transaction |
+| `TxnLimits` | Whole-transaction bounds on dirty collections, staged documents, and staged bytes |
 
-Important validation rules:
+Validation rules:
 
-- `Durable` and `Buffered` require a nonempty path. `Memory` ignores its path.
+- `Durable` and `Buffered` require a nonempty path. `Memory` ignores it.
 - The selected profile owns `Engine.Durability`; a conflicting engine mode is
-  rejected. The facade also rejects `Engine.RecoveryJournal` because it would
-  change the selected acknowledgement contract.
+  rejected. `Engine.RecoveryJournal` is rejected because it would change the
+  selected acknowledgement contract.
 - `Memory` accepts only `Engine.Collection`; disk-specific engine settings and
   file modes are rejected.
-- Invalid options are rejected before `Open` creates, truncates, or locks
-  filesystem state.
-- Existing durable collections retain their persisted immutable contract. A
-  zero-option reopen adopts persisted key and document limits.
-- Treat configuration values as immutable after `Open`. The facade freezes
-  schema and exact-index definitions, but this development snapshot has a
-  [known shallow-copy defect](../status.md#known-limitations) for
-  `Engine.SkipIndexes` used by later lazy collections.
+- Invalid options return `ErrInvalidOptions` before `Open` creates, truncates,
+  or locks filesystem state. A nil `Option` is also invalid.
+- `Open` copies and freezes the schema and index definitions it is given.
+- Existing durable collections keep their persisted contract. A zero-option
+  reopen adopts each collection's persisted key and document limits, and
+  transactions enforce the same persisted limits as direct writes.
 
-`Engine` is intentionally an expert escape hatch. In particular, do not enable
-`OpaqueValues` through the root facade: current direct and transactional facade
-writes do not apply one consistent opaque-value rule. Use `store/durable`
-directly if uninterpreted byte values are required.
+`Engine` is an expert escape hatch. Do not enable `Engine.OpaqueValues`
+through the facade: direct, lazy, and transactional facade writes do not apply
+one consistent opaque-value rule. Use `store/durable` directly for
+uninterpreted byte values.
 
 ## Use lazy collections
 
-`Database.Collection(name)` returns the same pointer for each valid name while
-the database is open. It performs no I/O and does not create storage. Reads from
-an absent collection behave like reads from an empty collection; the first
-valid `Put`, a successful transaction that writes it, or `CreateIndex`
+`Database.Collection(name)` returns the same pointer for a valid name while
+the database is open. It performs no I/O and creates no storage. Reads from an
+absent collection behave like reads from an empty one. The first valid `Put`,
+a committed transaction that writes it, `CreateIndex`, or `CreateTinIndex`
 materializes it.
 
-Name validation is deferred because `Collection` cannot return an error. A data
-operation on an invalid handle returns `ErrInvalidCollectionName`. A portable
-name is nonempty valid UTF-8 and at most `MaxCollectionNameBytes` (currently 120
-bytes). Avoid NUL: its handling is not yet consistent between memory and disk
-layers.
+`Collection` cannot return an error, so name validation is deferred: every
+data operation on an invalid handle returns `ErrInvalidCollectionName`. A
+valid name is nonempty, valid UTF-8, contains no NUL, and is at most
+`MaxCollectionNameBytes` (120) bytes. Names are logical strings: separators,
+trailing dots or spaces, and distinct Unicode normalization forms are legal
+and remain distinct.
 
 ## Read and write JSON
 
-The facade stores one nonempty JSON value under each nonempty key. `Put`
-validates and canonicalizes the complete value, then inserts or replaces it
-atomically.
+The facade stores one nonempty JSON value under each nonempty key.
 
 ```go
-created, err := users.Put("user:42", []byte(`{
-  "active": true,
-  "name": "Ada"
-}`))
-
+created, err := users.Put("user:42", []byte(`{"active": true, "name": "Ada"}`))
 deleted, err := users.Delete("user:42")
 ```
 
-- `Put` returns `created == true` only when the key was absent in the operation's
-  view.
+- `Put` validates and canonicalizes the complete value, then inserts or
+  replaces it atomically. `created` is true only when the key was absent.
 - `Delete` returns `deleted == false` for an absent key and does not create a
   lazy collection.
 - Invalid JSON, a schema violation, or an admission refusal publishes nothing.
   An invalid first write does not create collection files.
 - `Get` returns caller-owned canonical JSON. A miss is `(nil, false, nil)`.
-- `Append` appends an owned value to caller-provided storage. A miss leaves the
-  destination unchanged.
-- `Range` visits one immutable collection generation. Its key and document are
-  borrowed, read-only views valid only during the callback; copy either before
-  retaining it.
-- A callback error stops `Range` and is returned unchanged.
+- `Append` appends a caller-owned value to `dst`. A miss leaves `dst`
+  unchanged.
+- `Range` visits one immutable generation. Its key and document are borrowed
+  read-only views, valid only during the callback; copy either before
+  retaining it. A callback error stops `Range` and is returned unchanged.
 
-Do not depend on `Range` order. The facade makes no portable ordering promise:
-the memory and durable profiles currently traverse different physical orders.
-Use a typed query with `OrderBy` when order is part of the result contract.
+`Range` order is not portable. Disk profiles visit keys in bytewise lexical
+order; `Memory` visits physical chunk and slot order. Use a typed query with
+`OrderBy` when order is part of the result.
 
-The default key limit is 256 bytes and the default document limit is 4 MiB.
-Empty keys return `ErrKeyTooLarge`; empty documents return
-`ErrDocumentTooLarge`. See [Data model](../data-model.md) for canonical JSON,
-schemas, names, and exact value semantics.
+Keys are limited to 256 bytes and documents to 4 MiB by default. An empty key
+returns `ErrKeyTooLarge` and an empty document returns `ErrDocumentTooLarge`.
+See the [data model](../data-model.md) for canonical JSON, schemas, and exact
+value semantics.
 
 ## Create an exact index
 
 `CreateIndex` builds one non-unique exact scalar or compound index and returns
-only after its facade-visible build completes.
+after its build completes.
 
 ```go
 if err := users.CreateIndex("by_team", "/team"); err != nil {
 	return err
 }
-
 if err := users.CreateIndex("by_team_and_active", "/team", "/active"); err != nil {
 	return err
 }
 ```
 
-An index has one to four distinct RFC 6901 JSON Pointer paths. Path order is
-significant for a compound index. Missing, unresolvable, array, and object
-values are omitted; scalar candidates are rechecked against source documents,
-so an index changes the access path rather than query results.
+An index has one to four distinct RFC 6901 JSON Pointer paths; order matters
+for a compound index. Null, boolean, number, and string values are indexed.
+Missing paths, arrays, and objects are omitted. Candidates are rechecked
+against the documents, so an index changes the access path, never the result.
 
-The facade has no `DropIndex` or unique-index method. Applications that need
-lower-level index DDL must accept the direct engine's separate ownership and
-stability contract.
+A failed build on `Memory` is rolled back so the name can be reused. The
+facade has no `DropIndex` and no unique index; use `store/durable` or SQL for
+those.
 
-## Search text with a tin index
+<a id="search-text-with-a-tin-index"></a>
 
-`CreateTinIndex` declares a full-text index over exactly one text path, and
-`TinSearch` returns up to `topK` hits ranked by BM25 score from the
-collection's current generation.
+## Search text
+
+`CreateTinIndex(name, path)` declares a full-text index over one string path,
+and `TinSearch(path, tinql, topK)` returns ranked hits:
 
 ```go
 if err := docs.CreateTinIndex("body_tin", "/body"); err != nil {
 	return err
 }
-
 hits, err := docs.TinSearch("/body", `luxury AND "vintage watches"`, 10)
 if err != nil {
 	return err
@@ -215,15 +223,9 @@ for _, hit := range hits {
 }
 ```
 
-Hits arrive by descending score, ties by document identity. The query is
-TINQL, parsed against the searched generation's index; see the
-[SQL reference](../reference/sql.md) for the language. A path without a tin
-index reports `store.ErrIndexNotFound`, an invalid query reports its parse
-error, and `topK <= 0` returns no hits. `CreateTinIndex` follows the same
-one-shot contract as `CreateIndex` on both profiles. On `Memory` it warms the
-index before returning; on durable profiles the declaration publishes
-immediately and each generation's postings build on first use. Only string
-values are indexed.
+Tin indexes are rebuilt in memory for each new generation that is searched.
+See [full-text search](search.md) for the query language, ranking, cost
+model, and limitations.
 
 ## Run typed queries
 
@@ -243,9 +245,9 @@ defer result.Release()
 ```
 
 `Collection.Run` takes one fresh immutable generation and returns a one-off
-`query.Result`. Call `Release` when finished so retained result and execution
-storage can be dropped. A nil compiled query returns `ErrInvalidQuery`; querying
-an absent lazy collection returns an ordinary empty result.
+`query.Result`. Call `Release` when finished. A nil query returns
+`ErrInvalidQuery`; querying an absent lazy collection returns an empty
+result.
 
 For a hot loop, keep one session per consumer:
 
@@ -262,55 +264,48 @@ _ = result
 ```
 
 Each `Session.Run` takes a fresh generation. Its result pointer, cells, and
-session-owned workspace remain valid only until the next `Run` or `Release`.
-A session is single-consumer and must not be copied or used concurrently. A
-compiled query is immutable after compilation and may be shared; concurrent
-execution needs an independent session per goroutine.
+workspace remain valid only until the next `Run` or `Release`. A session is
+single-consumer and must not be copied or shared. A compiled query is
+immutable and may be shared; give each goroutine its own session.
 
-See [Typed query API](query.md) for builders, result cells, joins, execution
-budgets, and direct-source ownership.
+The facade accepts builder queries only. To run SQL text, use the
+[SQL driver](sql.md) or `query.PrepareStatement` over a lower-level source;
+see the [query API](query.md).
 
 ## Run serializable transactions
 
 Use `Update` for a read-write transaction and `View` for a coherent read-only
-database cut.
+cut.
 
 ```go
 err := db.Update(func(tx *vibedb.Tx) error {
-	users := tx.Collection("users")
-	audit := tx.Collection("audit")
-
-	if _, err := users.Put("user:42", updatedUser); err != nil {
+	if _, err := tx.Collection("users").Put("user:42", updatedUser); err != nil {
 		return err
 	}
-	_, err := audit.Put("event:9001", auditEvent)
+	_, err := tx.Collection("audit").Put("event:9001", auditEvent)
 	return err
 })
 ```
 
-`Update` commits only when the callback returns nil. It rolls back on a returned
-error and rolls back before re-panicking. It does not retry conflicts. `View`
-uses the same `Get`, `Append`, `Range`, and `Run` vocabulary, but `Put` and
-`Delete` return `ErrTxReadOnly`.
+`Update` commits when the callback returns nil, rolls back on an error, and
+rolls back before re-panicking. It does not retry conflicts. `View` offers the
+same `Get`, `Append`, `Range`, and `Run` vocabulary; `Put` and `Delete` return
+`ErrTxReadOnly`. `Begin` and `BeginReadOnly` give the caller control of
+`Commit` and `Rollback`.
 
-Use `Begin` or `BeginReadOnly` when the caller must control `Commit` and
-`Rollback`. Do not let `Tx` or `TxCollection` escape their lifetime: after
-commit or rollback, operations return `ErrTxDone`. Nested `Update` or `View` on
-the same goroutine is refused with `ErrTxNested`; there are no native
-savepoints.
+Committed read-write transactions are serializable: commit validates point
+reads, absent-key reads, scans, queries, and lazy-collection creation, and
+returns `ErrTxConflict` without publishing if any of them changed. The reads a
+callback observes are provisional until commit succeeds: each collection is
+snapshotted when the transaction first touches it, so reads from two
+collections can come from different moments. Do not perform external side
+effects based on reads inside `Update`. `View` reads one coherent database cut
+captured at `BeginReadOnly`.
 
-Transactions read one coherent begin cut plus their staged overlay. Commit
-checks point reads, absent-key reads, scans, queries, phantoms, ABA writes, and
-lazy-collection races. `ErrTxConflict` publishes nothing; retry the complete
-operation with a new transaction.
-
-Profile support differs at publication time: `Buffered` refuses a transaction
-that dirties two or more collections with `ErrTxUnsupportedLane`. `Durable` and
-`Memory` support bounded multi-collection publication. Read-only and empty
-transactions do not materialize lazy collections.
-
-See [Transactions](../transactions.md) for serializability, retries, admission
-limits, and crash-atomic multi-collection commit.
+After commit or rollback, `Tx` and every `TxCollection` return `ErrTxDone`.
+Reentering `Update` or `View` on the same goroutine returns `ErrTxNested`;
+there are no native savepoints. See [transactions](../transactions.md) for
+retries, admission limits, and the crash-atomic commit protocol.
 
 ## Know the default limits
 
@@ -320,142 +315,146 @@ limits, and crash-atomic multi-collection commit.
 | Point operation | Key bytes | 256 |
 | Point operation | JSON document bytes | 4 MiB |
 | Exact index | Ordered paths | 1–4 |
-| Tin index | Text paths | 1 |
+| Tin index | String paths | 1 |
 | One dirty collection in a transaction | Distinct staged keys | 64 |
 | One dirty collection in a transaction | Staged key and document bytes | 16,793,600 |
 | Whole transaction | Dirty collections | 16 |
 | Whole transaction | Distinct staged keys | 256 |
 | Whole transaction | Staged key and document bytes | 67,174,400 |
 | Whole read-write transaction | Exact read keys before coarse escalation | 4,096 |
-| Whole read-write transaction | Retained exact-key bytes before coarse escalation | 1 MiB |
+| Whole read-write transaction | Retained read-key bytes before coarse escalation | 1 MiB |
 | Whole read-write transaction | Collections with read dependencies | 128 |
 
-`AdvancedOptions.TxnLimits` changes the three whole-transaction write limits;
-it does not change per-collection batch bounds or read-dependency bounds. Query
-execution and result materialization have separate limits described in the
-[query guide](query.md).
-
-> [!WARNING]
-> This snapshot has a known bounds mismatch: after reopening a collection with
-> custom persisted key or document limits, direct operations use the persisted
-> limits but transactional operations use the database-open limits. Avoid that
-> configuration until the defect in [current status](../status.md) is fixed.
+`AdvancedOptions.TxnLimits` changes the three whole-transaction write limits.
+Per-collection bounds come from each collection's `MaxBatchDocuments` and
+`MaxBatchBytes`. Query execution has separate budgets described in the
+[query guide](query.md#resource-controls).
 
 ## Flush, observe, and close
 
-`Collection.Flush` makes that collection's currently visible generation
-recoverable. `Database.Flush` attempts every materialized collection and
-returns the first mapped error, but it is not a coherent database-wide
-persistence cut: concurrent writers can publish around its per-collection
-walk. Flush is a no-op for `Memory` and for an unmaterialized lazy collection.
+`Collection.Flush` makes that collection's visible generation recoverable.
+`Database.Flush` flushes every materialized collection and returns the first
+error. It is not a database-wide persistence cut: concurrent writers can
+publish around its per-collection walk. Flush is a no-op for `Memory` and for
+an unmaterialized collection.
 
 `Collection.Metrics` returns a detached snapshot:
 
 | Field | Meaning |
 | --- | --- |
-| `Durability` | Selected facade profile |
+| `Durability` | Selected profile |
 | `Documents` | Documents in the sampled generation |
 | `PublishedGeneration` | Per-collection reader-visible publication counter |
-| `DurableGeneration` | Recoverable generation; zero for `Memory`, and possibly behind publication for `Buffered` |
+| `DurableGeneration` | Recoverable generation; zero for `Memory`, and behind publication for `Buffered` until `Flush` or `Close` |
 
-Generation is observability data, not a database revision, transaction ID,
-wall clock, or application version.
+A generation is observability data, not a database revision, transaction ID,
+or application version.
 
-`Database.Close` closes admission, synchronizes as required by the profile, and
-releases all database-owned resources. It is idempotent after teardown
-completes. Collections returned by `Database.Collection` are managed handles;
-calling their `Close` returns `ErrManagedCollection`.
+`Database.Close` closes admission, synchronizes as required by the profile,
+and releases database-owned resources. It is idempotent once teardown
+completes. Handles from `Database.Collection` are managed: their `Close`
+returns `ErrManagedCollection`.
 
 A close attempt can return an error before every lease or writer lock is
-released. `CloseCompleted` distinguishes incomplete teardown from a completed
-close carrying a sticky persistence error. Release the blocker and call
-`Close` again only when completion is false. Once close begins, data operations
-remain closed and return `ErrClosed`.
+released. `CloseCompleted` separates incomplete teardown from a completed
+close that carries a sticky persistence error. Release the blocker (for
+example an open transaction) and call `Close` again only while completion is
+false. After close begins, data operations return `ErrClosed`.
 
 ### Handle persistence errors and unknown outcomes
 
-Keep publication failure separate from ordinary validation:
-
-- Validation, schema, index-definition, admission, and transaction-conflict
-  errors publish no requested logical mutation.
-- `ErrCommitOutcomeUnknown` is the ambiguous durable decision-fence window for
-  a multi-collection commit. Stop writes, close the complete database, and
-  reopen it to recover either all participants or none before inspecting state
-  or retrying.
-- Other I/O or durability-fence errors can poison a writer even when the API
-  cannot prove what reached stable storage. Do not blindly submit different
-  data. Close and reopen the owned database, inspect application identity, and
-  retry only through an idempotent policy.
+- Validation, schema, index-definition, admission, and conflict errors
+  publish nothing.
+- `ErrCommitOutcomeUnknown` is the ambiguous decision window of a
+  multi-collection durable commit. Stop writing, close the complete database,
+  and reopen it; recovery applies all participants or none.
+- Other I/O or fence errors can poison a writer even though the API cannot
+  prove what reached stable storage. Close and reopen, inspect state by
+  application identity, and retry only through an idempotent policy.
 
 ## Borrow one file instead of a directory
 
-`OpenFile` is the standalone facade for one durable collection. Use it only
-when the application must own the primary `*os.File` descriptor.
+`OpenFile(file, options)` opens one durable collection on a caller-owned
+`*os.File`. Use it only when the application must own the primary descriptor.
 
-The descriptor must name a regular, non-symlink file through a stable nonempty
-absolute path. The caller retains ownership but lends it exclusively to the
-collection: keep it open and do not read, write, seek, truncate, lock, rename,
-replace, or unlink it until `Collection.Close` completes. The parent directory
-must grant the engine create, read, write, and sync authority for the
-`.rjournal` sibling.
+The descriptor must name a regular, non-symlink file through a stable
+absolute path that still resolves to the same inode. The caller lends it
+exclusively: do not read, write, seek, truncate, lock, rename, replace, or
+unlink it until `Collection.Close` completes. The engine creates
+`<path>.rjournal` beside it, so the parent directory needs create, write, and
+sync permission.
 
-`Collection.Close` flushes and releases engine resources but does not close the
-caller-owned primary descriptor. Check `CloseCompleted`, retry incomplete
-teardown if necessary, and only then close the file. `OpenFile` rejects the
-`Memory` profile and file/directory permission options. It does not provide a
-database catalog or multi-collection transactions.
+`Collection.Close` flushes and releases engine resources but does not close
+the caller's descriptor. Check `CloseCompleted` before closing the file.
+`OpenFile` rejects `Memory` and file-mode options. It has no catalog and no
+transactions.
 
 ## Ownership and concurrency reference
 
 | Value or bytes | Owner and concurrency rule |
 | --- | --- |
-| `*Database` | Owns catalog resources; concurrent operations are supported; do not copy after first use |
-| `*Collection` from `Database.Collection` | Stable managed handle; use the pointer, do not copy it; close through the database |
-| Standalone `*Collection` from `OpenFile` | Owns the exclusive engine borrow, not the primary descriptor; close it explicitly |
-| `Get` / `Append` bytes | Caller-owned and valid across later writes and close |
-| `Range` callback bytes | Borrowed, read-only, callback-lifetime only |
-| `query.Result` from one-off `Run` | Caller releases it |
-| `*Session` and its result | Single-consumer; result invalidated by the next run or release |
-| `*Tx` / `*TxCollection` | Transaction-lifetime, single-consumer handles; inert after finish |
-| Compiled `*query.Query` | Reusable and concurrency-safe; each concurrent session remains independent |
+| `*Database` | Owns catalog resources; safe for concurrent use; do not copy |
+| `*Collection` from `Database.Collection` | Stable managed handle; safe for concurrent use; close through the database |
+| Standalone `*Collection` from `OpenFile` | Owns the engine borrow, not the descriptor; close it explicitly |
+| `Get` / `Append` bytes | Caller-owned; valid after later writes and close |
+| `Range` callback bytes | Borrowed, read-only, callback lifetime |
+| `query.Result` from `Run` | Caller releases it |
+| `*Session` and its result | Single consumer; result invalidated by the next run or release |
+| `*Tx` / `*TxCollection` | Single consumer; inert after finish |
+| Compiled `*query.Query` | Immutable after first use; share across goroutines |
 
-Readers use immutable generations. Writes to one collection are serialized at
-publication. Transaction commits are serialized per database, but a commit's
-collection fences cover only its participants, so unrelated direct writes need
-not wait. Operations admitted concurrently with `Close` either complete safely
-or return `ErrClosed`.
+Readers use immutable generations and do not block writers. Writes to one
+collection serialize at publication. A transaction that reads and writes only
+one collection commits in parallel with transactions on other collections;
+a transaction that spans collections takes a database-wide commit lock.
+Operations admitted concurrently with `Close` either complete or return
+`ErrClosed`.
 
 ## Match errors by identity
 
-Use `errors.Is`; do not compare error text. Validation and engine errors not
-listed here can propagate through the facade with their typed identity intact.
+Use `errors.Is`; do not compare error text. Lower-level typed errors, such as
+`store.ErrSchemaViolation`, `store.ErrIndexDefinition`, `store.ErrIndexExists`,
+and `store.ErrIndexNotFound`, pass through the facade intact.
 
 | Error | Action |
 | --- | --- |
-| `ErrInvalidOptions` | Correct the configuration; invalid `Open` does not touch storage |
+| `ErrInvalidOptions` | Correct the configuration; storage was not touched |
 | `ErrInvalidCollectionName` | Correct the logical name |
-| `ErrKeyTooLarge` / `ErrDocumentTooLarge` | Supply a nonempty value within the selected collection contract |
+| `ErrKeyTooLarge` / `ErrDocumentTooLarge` | Supply a nonempty value within the collection's limits |
 | `ErrInvalidQuery` | Supply a non-nil compiled query |
 | `ErrManagedCollection` | Close the owning database, not its child handle |
-| `ErrClosed` | Stop using the handle; finish or retry teardown as appropriate |
-| `ErrTxConflict` | Retry the whole transaction against a fresh cut |
-| `ErrTxTooLarge` | Reduce the transaction or deliberately change its configured limits |
+| `ErrClosed` | Stop using the handle; finish or retry teardown |
+| `ErrTxConflict` | Retry the whole transaction |
+| `ErrTxTooLarge` | Reduce the transaction or raise its configured limits |
 | `ErrTxReadOnly` | Remove the mutation from `View` / `BeginReadOnly` |
-| `ErrTxUnsupportedLane` | Use one dirty collection or a supported profile |
-| `ErrTxNested` | Compose in one transaction; native savepoints do not exist |
-| `ErrTxDone` | Discard the finished transaction handle |
-| `ErrCommitOutcomeUnknown` | Close and reopen the complete database before inspecting or retrying |
+| `ErrTxUnsupportedLane` | Write one collection per transaction, or use another profile |
+| `ErrTxNested` | Compose work in one transaction |
+| `ErrTxDone` | Discard the finished handle |
+| `ErrCommitOutcomeUnknown` | Close and reopen the database before inspecting or retrying |
 
-Malformed JSON and schema/index failures use lower-level typed errors, such as
-`store.ErrSchemaViolation`, `store.ErrIndexDefinition`, and `store.ErrIndexExists`.
-They remain safe to match through `errors.Is`.
+## Limitations
+
+- No SQL text, joins across collections, or unique indexes through the
+  facade; use the [SQL driver](sql.md) or [query API](query.md).
+- No `DropIndex`, collection drop, or rename in the facade.
+- No savepoints, automatic retries, or deadline/cancellation parameters on
+  facade calls.
+- `Range` order differs between profiles.
+- Read-write transactions do not give a callback a coherent cross-collection
+  snapshot; only a successful commit is serializable.
+- `Buffered` cannot commit a transaction that writes two or more collections.
+- Full-text indexes are rebuilt per searched generation; see
+  [full-text search](search.md#limitations).
+- There is no stable API or on-disk format across development revisions; see
+  [stability](../status.md).
 
 ## Source map
 
 - Open, profiles, options, CRUD, indexes, metrics, and lifecycle: [vibedb.go](../../vibedb.go)
 - Query execution and session ownership: [vibedb_query.go](../../vibedb_query.go)
 - Transactions, limits, conflicts, and commit outcomes: [vibedb_txn.go](../../vibedb_txn.go)
-- Facade contract tests: [vibedb_test.go](../../vibedb_test.go), [vibedb_txn_test.go](../../vibedb_txn_test.go)
-- Serializable conflict tests: [vibedb_txn_serializable_test.go](../../vibedb_txn_serializable_test.go)
+- Collection-name codec: [internal/collectionname/collectionname.go](../../internal/collectionname/collectionname.go)
+- Facade contract tests: [vibedb_test.go](../../vibedb_test.go), [vibedb_txn_test.go](../../vibedb_txn_test.go), [vibedb_tin_test.go](../../vibedb_tin_test.go)
+- Serializable conflict and cut tests: [vibedb_txn_serializable_test.go](../../vibedb_txn_serializable_test.go), [vibedb_txn_snapshot_internal_test.go](../../vibedb_txn_snapshot_internal_test.go)
 - Close retry and close-race tests: [vibedb_lifecycle_internal_test.go](../../vibedb_lifecycle_internal_test.go)
 - Executable profile matrix: [capability_matrix_facade_test.go](../../capability_matrix_facade_test.go)

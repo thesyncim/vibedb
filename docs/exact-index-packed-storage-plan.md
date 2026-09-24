@@ -1,6 +1,8 @@
 # Decision: compress durable images, preserve canonical resident indexes
 
-Planning decision, 2026-09-08. Source candidate `11b2cf141`; scan/census follow-up `0dc8ac187` in draft PR 230. This plan was produced by one Astra Max planning pass, with production implementation assigned to Sol. The plan itself does not establish a production performance result.
+[Documentation](README.md) / [Research records](design/research.md)
+
+Planning decision, 2026-09-08. Source candidate `11b2cf141`; scan/census follow-up `0dc8ac187` in draft PR 230. This is a planning record. The plan itself does not establish a production performance result.
 
 ## Recommendation
 
@@ -133,6 +135,6 @@ Proposed measurable release budgets (engineering targets, not forecasts):
 * Prepared resident point and range probes stay at **zero additional allocations** and within **2% median / 5% p99** of baseline over paired repeated runs. Primary full scans must not regress merely because secondary storage changed. Open, recovery and cold reads get separate results.
 * Buffered insert/update including final Flush stays within **5% throughput and 10% p99 latency** of baseline on unchanged fields, changed shared fields, changed unshared fields, and mixed churn. Include bytes written and time spent in maintenance. A tradeoff outside that budget needs an explicit decision, not a hidden threshold.
 * Meaningful correctness coverage: randomized index equivalence; range boundaries and giant terms; duplicate/member/index-identity corruption; short/truncated/invalid LZ4; mixed-index drop; retained snapshots through repeated repacks; one member replaced while siblings survive; last-member retirement; allocator reuse; failure before/after each publication boundary; reopen after each crash point. Exercise portable and Linux io_uring/direct I/O in bounded CI shards.
-* Use the project environment wrapper for Go commands and a stable `CODEX_AGENT_ID` when concurrent. The local experiment used `/Users/thesyncim/.codex/bin/project-env` because this revision has no `scripts/project-env`. Do not run expensive tests in the conflicted original checkout. Compare the same acknowledgement contract, cache size, schema, logical data and final Flush/reopen state; report live physical bytes, total file bytes, filesystem allocation, retained snapshots and peak staging separately.
+* Use the standard Go build cache for Go commands. The local experiment used a private environment wrapper because this revision has no `scripts/project-env`. Do not run expensive tests in the conflicted original checkout. Compare the same acknowledgement contract, cache size, schema, logical data and final Flush/reopen state; report live physical bytes, total file bytes, filesystem allocation, retained snapshots and peak staging separately.
 
 This plan intentionally makes the first production step smaller than a general compressed-page cache and stronger than another string microcodec. It has a measured large opportunity, preserves the current read algorithms, and makes the principal new risk—shared physical ownership under mutation—explicit and testable.

@@ -1044,46 +1044,51 @@ _Evidence:_ [E281](#evidence-281), [E282](#evidence-282), [E283](#evidence-283),
 Route-seed control installation performs one attested catch-up read before serving. After
 installation, every subsequent authenticated catalog read and publication crosses one
 certified-head observer before holder exposure. Byte-identical heads avoid disk I/O; newer
-exact-self-route heads promote live. Any catalog self-route change durably stages the candidate,
-seals authority, signals shutdown, and requires quiescence plus old-session Retire, Release,
-journal destruction, and candidate promotion before restart. Catalog publication, topology
-journals, schema rollout records, shard installers, and authenticated control services retain
-exact catalog, group, relation-manifest, and contract digests.
+exact-self-route heads and address-only catalog moves promote live. A changed catalog command
+binding durably stages the candidate, opens a successor catalog session journal, completes the
+durable predecessor-session handoff, and then promotes the seed live. Only local seed corruption
+or durability uncertainty seals authority and requires quiescence plus old-session Retire,
+Release, journal destruction, and candidate promotion before restart. Catalog publication,
+topology journals, schema rollout records, shard installers, and authenticated control services
+retain exact catalog, group, relation-manifest, and contract digests.
 
-_Evidence:_ [E286](#evidence-286), [E287](#evidence-287), [E288](#evidence-288), [E289](#evidence-289), [E40](#evidence-40), [E290](#evidence-290)
+_Evidence:_ [E286](#evidence-286), [E287](#evidence-287), [E26](#evidence-26), [E288](#evidence-288), [E289](#evidence-289), [E40](#evidence-40), [E290](#evidence-290)
 
 **Development command — Yes**
 
 Replicated gateway mode requires an immutable -catalog genesis and a distinct private
--catalog-route-seed. On a certified catalog self-route change, runServe drains public and
-control users, settles the old native session, promotes the staged seed, and exits with the
-typed restart-required error for supervisor restart; startup resumes every pending/journal crash
-cut. vibedb cluster dev automatically derives the private route-seed path by appending
-`.route-seed` to the catalog path. serve-rf3 installs the authenticated schema control service.
-Startup authenticates an exact committed source N+1 transition, opens only a fenced recovery
-handle, settles local catalog publication, closes the source, and opens the target before
-runtime adoption. The experimental schema-rollout command conditionally publishes one exact
-catalog successor; it is not a general SQL DDL endpoint or a completed repeated-rollout
-lifecycle.
+-catalog-route-seed. A certified catalog self-route change, including a catalog replica move
+during scaling, rolls the route seed and catalog session live without a restart. If the local
+seed is corrupt or its durability is uncertain, runServe drains public and control users,
+settles the old native session, and exits with the typed restart-required error for supervisor
+restart; startup resumes every pending/journal crash cut. vibedb cluster dev automatically
+derives the private route-seed path by appending `.route-seed` to the catalog path. serve-rf3
+installs the authenticated schema control service. Startup authenticates an exact committed
+source N+1 transition, opens only a fenced recovery handle, settles local catalog publication,
+closes the source, and opens the target before runtime adoption. The experimental schema-rollout
+command conditionally publishes one exact catalog successor; it is not a general SQL DDL
+endpoint or a completed repeated-rollout lifecycle.
 
 _Evidence:_ [E291](#evidence-291), [E292](#evidence-292), [E5](#evidence-5), [E293](#evidence-293), [E107](#evidence-107), [E40](#evidence-40), [E294](#evidence-294), [E290](#evidence-290)
 
 **Qualification — Partial**
 
 Catalog tests cover quorum publication, leader loss, sealed-receipt rejection, same-route live
-promotion, self-route-change staging, preauthorized-mutator refusal, path aliasing, near-maximum
-heads, and startup recovery. The external durable RF3 gate adds distinct gateway route seeds and
-catalog-voter failure. Initial route helpers distinguish logical SQL and exact machine
-manifests. Schema tests cover activation, restart, pre-activation abort, mixed-old/new refusal,
-authenticated control, installer reopen, command-plan validation, and leader-loss recovery.
-Directory publication and retry sync fixes are implemented; local normal and race tests cover
-exact committed-source recovery and settlement before runtime adoption, while the physical Linux
-startup gate remains unqualified. The schema digest caller audit, post-drain replacement of
-write-once rollout artifacts, and trusted retained-identity rollover for repeated DDL remain
-incomplete. No external self-route-change handoff, rolling mixed-build, or SQL DDL rollback gate
-exists.
+promotion, self-route-change staging, live binding handoff, address-only advance,
+preauthorized-mutator refusal, path aliasing, near-maximum heads, and startup recovery. The
+external durable RF3 gate adds distinct gateway route seeds and catalog-voter failure. Initial
+route helpers distinguish logical SQL and exact machine manifests. Schema tests cover
+activation, restart, pre-activation abort, mixed-old/new refusal, authenticated control,
+installer reopen, command-plan validation, and leader-loss recovery. Directory publication and
+retry sync fixes are implemented; local normal and race tests cover exact committed-source
+recovery and settlement before runtime adoption, while the physical Linux startup gate remains
+unqualified. The schema digest caller audit, post-drain replacement of write-once rollout
+artifacts, and trusted retained-identity rollover for repeated DDL remain incomplete. The
+seamless scale-in/out process gate moves catalog voters onto newly joined nodes while surviving
+frontends keep serving, then cold-restarts every catalog voter. No rolling mixed-build or SQL
+DDL rollback gate exists.
 
-_Evidence:_ [E295](#evidence-295), [E296](#evidence-296), [E297](#evidence-297), [E298](#evidence-298), [E299](#evidence-299), [E300](#evidence-300), [E301](#evidence-301), [E302](#evidence-302), [E303](#evidence-303), [E304](#evidence-304), [E21](#evidence-21), [E305](#evidence-305), [E306](#evidence-306), [E307](#evidence-307), [E308](#evidence-308), [E309](#evidence-309)
+_Evidence:_ [E295](#evidence-295), [E296](#evidence-296), [E297](#evidence-297), [E298](#evidence-298), [E299](#evidence-299), [E300](#evidence-300), [E301](#evidence-301), [E302](#evidence-302), [E303](#evidence-303), [E304](#evidence-304), [E305](#evidence-305), [E21](#evidence-21), [E306](#evidence-306), [E307](#evidence-307), [E308](#evidence-308), [E309](#evidence-309), [E310](#evidence-310)
 
 
 </details>
@@ -1096,7 +1101,7 @@ _Evidence:_ [E295](#evidence-295), [E296](#evidence-296), [E297](#evidence-297),
 Bounded pressure selection, failure-domain placement, split planning, and replica-move selection
 exist.
 
-_Evidence:_ [E310](#evidence-310), [E311](#evidence-311)
+_Evidence:_ [E311](#evidence-311), [E312](#evidence-312)
 
 **Integrated — Yes**
 
@@ -1104,7 +1109,7 @@ Routed requests feed bounded per-allocation recorders. A collector publishes can
 cuts through catalog RF3. A clockless controller qualifies sustained pressure, selects either a
 split or replica move, and hands one idempotent admission to the existing operation journals.
 
-_Evidence:_ [E312](#evidence-312), [E56](#evidence-56), [E313](#evidence-313)
+_Evidence:_ [E313](#evidence-313), [E56](#evidence-56), [E314](#evidence-314)
 
 **Development command — Partial**
 
@@ -1118,7 +1123,7 @@ source/catalog fences; relation-aware global-index snapshot/tail/prune, repeated
 capture, and gateway source-discovery qualification remain incomplete. External split and
 restart qualification is still required.
 
-_Evidence:_ [E314](#evidence-314), [E315](#evidence-315), [E5](#evidence-5), [E107](#evidence-107)
+_Evidence:_ [E315](#evidence-315), [E316](#evidence-316), [E5](#evidence-5), [E107](#evidence-107)
 
 **Qualification — Partial**
 
@@ -1132,7 +1137,165 @@ allocated-storage, WAL-allocation, request-count, exact public client request/re
 wire-byte, and snapshot-payload-byte ceilings; they do not measure total network traffic.
 Qualification remains Partial until the mandatory unskipped Ubuntu evidence is recorded.
 
-_Evidence:_ [E316](#evidence-316), [E317](#evidence-317), [E318](#evidence-318), [E319](#evidence-319), [E280](#evidence-280), [E162](#evidence-162)
+_Evidence:_ [E317](#evidence-317), [E318](#evidence-318), [E319](#evidence-319), [E320](#evidence-320), [E280](#evidence-280), [E162](#evidence-162)
+
+
+</details>
+
+<details>
+<summary><strong>Shared node log persistence</strong> — Primitive:Yes · Integrated:Yes · Command:Yes · Qualification:Partial</summary>
+
+**Primitive — Yes**
+
+One node store owns device-level Raft persistence for every group on a physical node. A bounded
+submission sequencer admits immutable per-group Ready submissions and persists them in
+authenticated waves with one data sync per wave; each group keeps its own log identity,
+incarnation, commit position, and applied state.
+
+_Evidence:_ [E321](#evidence-321), [E322](#evidence-322), [E323](#evidence-323)
+
+**Integrated — Yes**
+
+The pipelined Raft runtime persists through a node-log group view. A sync error poisons the
+handle and reopen recovers it; an exact wave retry is a no-op. One node-wide checkpoint
+coordinator captures application checkpoints and reclaims retired segments.
+
+_Evidence:_ [E324](#evidence-324), [E325](#evidence-325)
+
+**Development command — Yes**
+
+serve-node and serve-rf3 open the shared node log when the manifest has a node_log section; the
+physical-node development topology always uses it.
+
+_Evidence:_ [E326](#evidence-326), [E107](#evidence-107)
+
+**Qualification — Partial**
+
+Library tests cover wave fusion and ordering, durable commit hints, entry caches,
+descriptor-catalog checkpoints, crash cuts, and snapshot registration. The fused-node RF3
+process gate runs three and six physical nodes with SIGKILL and reopen. Physical WAL tears,
+exhaustive device fault cuts, and mixed-build upgrades are not qualified.
+
+_Evidence:_ [E327](#evidence-327), [E328](#evidence-328), [E329](#evidence-329)
+
+
+</details>
+
+<details>
+<summary><strong>Seamless physical-node scale-out and scale-in</strong> — Primitive:Yes · Integrated:Yes · Command:Partial · Qualification:Partial</summary>
+
+**Primitive — Yes**
+
+Catalog node records carry a joining, active, draining, and decommissioned lifecycle. Scaling
+intents, group enrollment intents, and node directory cuts advance by compare-and-swap with
+deterministic operation IDs and durable blockers.
+
+_Evidence:_ [E330](#evidence-330), [E331](#evidence-331), [E332](#evidence-332)
+
+**Integrated — Yes**
+
+The designated controller frontend enrolls empty nodes, plans replica moves over the complete
+route inventory including catalog, request-ledger, internal, and application groups, drains
+retiring nodes, and records safe-to-stop only after a fresh, complete reference scan.
+
+_Evidence:_ [E333](#evidence-333), [E334](#evidence-334)
+
+**Development command — Partial**
+
+vibedb cluster nodes, join, rebalance, decommission, and status drive durable operations through
+an authenticated frontend. No shipped command creates the operator credential, the empty-node
+preparation manifest, or the public node descriptor.
+
+_Evidence:_ [E335](#evidence-335)
+
+**Qualification — Partial**
+
+A Linux process gate runs three physical 3-to-4-to-3 waves with open-loop SQL and native
+traffic, controller and target restarts, exact acknowledgement conservation, forced migration
+pacing, and a cold restart of every catalog voter. It uses a named shared-runner performance
+profile. It covers one fixture topology; larger clusters and other device classes are not
+qualified.
+
+_Evidence:_ [E336](#evidence-336)
+
+
+</details>
+
+<details>
+<summary><strong>Frontend drain on node retirement</strong> — Primitive:Yes · Integrated:Yes · Command:Yes · Qualification:Partial</summary>
+
+**Primitive — Yes**
+
+Frontend drain records move through prepared, enforcing, and retired states bound to the node
+record, service fence, and session revision. Prepared acknowledgement cuts bind the receiver
+roster, source identity, and digest.
+
+_Evidence:_ [E337](#evidence-337), [E338](#evidence-338)
+
+**Integrated — Yes**
+
+Decommission closes public native and PostgreSQL admission while control listeners and accepted
+sessions keep running. The catalog publishes a continuation grant for sockets accepted before
+the fence, and each receiver installs it only after the complete committed service cut. The
+drain record and node directory advance together.
+
+_Evidence:_ [E339](#evidence-339), [E340](#evidence-340), [E341](#evidence-341)
+
+**Development command — Yes**
+
+vibedb cluster decommission drains the retiring node's embedded frontend. There is no timeout or
+forced close: safe_to_stop stays false while a client connection to that frontend remains open.
+
+_Evidence:_ [E335](#evidence-335), [E342](#evidence-342)
+
+**Qualification — Partial**
+
+Tests keep accepted native and PostgreSQL sessions across the drain, close admission before
+listener accept after restart, and reject stale rosters and catalogs. The seamless scale process
+gate keeps a retiring-frontend session open, requires safe_to_stop to stay false until it
+disconnects, and verifies surviving sessions. No external gate covers a client that never
+disconnects.
+
+_Evidence:_ [E343](#evidence-343), [E344](#evidence-344), [E336](#evidence-336)
+
+
+</details>
+
+<details>
+<summary><strong>Node migration budget and pressure feedback</strong> — Primitive:Yes · Integrated:Yes · Command:Partial · Qualification:Partial</summary>
+
+**Primitive — Yes**
+
+One per-process budget bounds concurrent heavyweight phases, transient chunk workspace, and CPU,
+disk, and network rates. A pressure controller halves rates on backpressure, pauses new
+heavyweight phases under sustained severe pressure, and restores rates additively. Go scheduler
+latency is a separate CPU-contention signal that downshifts but never pauses.
+
+_Evidence:_ [E345](#evidence-345), [E346](#evidence-346), [E347](#evidence-347)
+
+**Integrated — Yes**
+
+Every snapshot source and target transfer on a physical node draws from the same budget. On the
+node-log lane, a sampler reads submission backpressure, queue depth, and ready-queue wait every
+250 ms.
+
+_Evidence:_ [E348](#evidence-348)
+
+**Development command — Partial**
+
+Physical nodes that use the shared node log apply pressure feedback. Per-group WAL processes use
+static budget rates.
+
+_Evidence:_ [E348](#evidence-348)
+
+**Qualification — Partial**
+
+Tests cover shared permits, bounded bursts, cancellation, directional buffer credits,
+hysteresis, pause and recovery, and scheduler-latency downshift. The seamless scale process gate
+requires observed pacing during migration. The default rates are not tuned for a particular
+device class.
+
+_Evidence:_ [E349](#evidence-349), [E350](#evidence-350), [E336](#evidence-336)
 
 
 </details>
@@ -1143,7 +1306,7 @@ Evidence is deduplicated across features. Links point to source or executable te
 repository.
 
 <details>
-<summary>319 unique source and test references</summary>
+<summary>350 unique source and test references</summary>
 
 1. <a id="evidence-1"></a>[gateway/catalog.go](../gateway/catalog.go) — `Snapshot`
 2. <a id="evidence-2"></a>[gateway/executor.go](../gateway/executor.go) — `Executor`
@@ -1447,23 +1610,54 @@ repository.
 300. <a id="evidence-300"></a>[internal/replicatedstate/initial_manifest_test.go](../internal/replicatedstate/initial_manifest_test.go) — `TestInitialJSONRelationManifestMatchesPreparedCollection`
 301. <a id="evidence-301"></a>[gateway/replicated_catalog_authority_test.go](../gateway/replicated_catalog_authority_test.go) — `TestReplicatedCatalogRouteSeedTrackerPersistsSameRouteBeforeHolderPublish`
 302. <a id="evidence-302"></a>[gateway/replicated_catalog_authority_test.go](../gateway/replicated_catalog_authority_test.go) — `TestReplicatedCatalogRouteSeedTrackerCompletesLiveBindingHandoff`
-303. <a id="evidence-303"></a>[gateway/replicated_catalog_authority_test.go](../gateway/replicated_catalog_authority_test.go) — `TestReplicatedCatalogRouteSeedLockedCheckRejectsPreauthorizedWaiter`
-304. <a id="evidence-304"></a>[internal/gatewayruntime/catalog_route_seed_test.go](../internal/gatewayruntime/catalog_route_seed_test.go) — `TestRecoverReplicatedCatalogRouteSeedStartupSettlesExactOldBinding`
-305. <a id="evidence-305"></a>[gateway/schema_rollout_test.go](../gateway/schema_rollout_test.go) — `TestSchemaRolloutPrepareActivateExactCatalog`
-306. <a id="evidence-306"></a>[gateway/schema_rollout_process_test.go](../gateway/schema_rollout_process_test.go) — `TestSchemaRolloutExternalProcessLeaderLossAndMixedGenerationRecovery`
-307. <a id="evidence-307"></a>[internal/schemainstall/installer_test.go](../internal/schemainstall/installer_test.go) — `TestInstallerCrashReopenAuthorizationActivationAndDrain`
-308. <a id="evidence-308"></a>[internal/gatewayruntime/schema_rollout_admin_test.go](../internal/gatewayruntime/schema_rollout_admin_test.go) — `TestGatewaySchemaRolloutManifestRequiresCanonicalVibeJSON`
-309. <a id="evidence-309"></a>[internal/raftservice/controlplane_catalog_rf3_test.go](../internal/raftservice/controlplane_catalog_rf3_test.go) — `TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart`
-310. <a id="evidence-310"></a>[internal/topologyscheduler/admission.go](../internal/topologyscheduler/admission.go) — `SelectSplits`
-311. <a id="evidence-311"></a>[internal/topologyscheduler/replica_move.go](../internal/topologyscheduler/replica_move.go) — `SelectReplicaMoves`
-312. <a id="evidence-312"></a>[internal/hotshard/collector.go](../internal/hotshard/collector.go) — `Collector`
-313. <a id="evidence-313"></a>[internal/hotshard/operation_sink.go](../internal/hotshard/operation_sink.go) — `OperationSink`
-314. <a id="evidence-314"></a>[internal/gatewayruntime/hot_shard_runtime.go](../internal/gatewayruntime/hot_shard_runtime.go) — `gatewayHotShardRuntime`
-315. <a id="evidence-315"></a>[internal/gatewayruntime/hot_shard_runtime.go](../internal/gatewayruntime/hot_shard_runtime.go) — `runPressurePass`
-316. <a id="evidence-316"></a>[internal/hotshard/controller_test.go](../internal/hotshard/controller_test.go) — `TestControllerQualifiesHotShardAndRetriesByteIdenticalAdmission`
-317. <a id="evidence-317"></a>[internal/hotshard/controller_test.go](../internal/hotshard/controller_test.go) — `TestControllerClockSkewCannotAdvanceReplicatedEvidence`
-318. <a id="evidence-318"></a>[internal/gatewayruntime/hot_shard_runtime_test.go](../internal/gatewayruntime/hot_shard_runtime_test.go) — `TestGatewayHotShardPressurePassCreatesExactEnrolledReplicaMove`
-319. <a id="evidence-319"></a>[internal/gatewayruntime/hot_shard_shipped_e2e_test.go](../internal/gatewayruntime/hot_shard_shipped_e2e_test.go) — `TestGatewayHotShardForegroundP99Overhead`
+303. <a id="evidence-303"></a>[gateway/replicated_catalog_authority_test.go](../gateway/replicated_catalog_authority_test.go) — `TestReplicatedCatalogRouteSeedAddressOnlyAdvancePrecedesLiveHandoff`
+304. <a id="evidence-304"></a>[gateway/replicated_catalog_authority_test.go](../gateway/replicated_catalog_authority_test.go) — `TestReplicatedCatalogRouteSeedLockedCheckRejectsPreauthorizedWaiter`
+305. <a id="evidence-305"></a>[internal/gatewayruntime/catalog_route_seed_test.go](../internal/gatewayruntime/catalog_route_seed_test.go) — `TestRecoverReplicatedCatalogRouteSeedStartupSettlesExactOldBinding`
+306. <a id="evidence-306"></a>[gateway/schema_rollout_test.go](../gateway/schema_rollout_test.go) — `TestSchemaRolloutPrepareActivateExactCatalog`
+307. <a id="evidence-307"></a>[gateway/schema_rollout_process_test.go](../gateway/schema_rollout_process_test.go) — `TestSchemaRolloutExternalProcessLeaderLossAndMixedGenerationRecovery`
+308. <a id="evidence-308"></a>[internal/schemainstall/installer_test.go](../internal/schemainstall/installer_test.go) — `TestInstallerCrashReopenAuthorizationActivationAndDrain`
+309. <a id="evidence-309"></a>[internal/gatewayruntime/schema_rollout_admin_test.go](../internal/gatewayruntime/schema_rollout_admin_test.go) — `TestGatewaySchemaRolloutManifestRequiresCanonicalVibeJSON`
+310. <a id="evidence-310"></a>[internal/raftservice/controlplane_catalog_rf3_test.go](../internal/raftservice/controlplane_catalog_rf3_test.go) — `TestReplicatedCatalogAuthorityRF3QuorumReplayAndControllerRestart`
+311. <a id="evidence-311"></a>[internal/topologyscheduler/admission.go](../internal/topologyscheduler/admission.go) — `SelectSplits`
+312. <a id="evidence-312"></a>[internal/topologyscheduler/replica_move.go](../internal/topologyscheduler/replica_move.go) — `SelectReplicaMoves`
+313. <a id="evidence-313"></a>[internal/hotshard/collector.go](../internal/hotshard/collector.go) — `Collector`
+314. <a id="evidence-314"></a>[internal/hotshard/operation_sink.go](../internal/hotshard/operation_sink.go) — `OperationSink`
+315. <a id="evidence-315"></a>[internal/gatewayruntime/hot_shard_runtime.go](../internal/gatewayruntime/hot_shard_runtime.go) — `gatewayHotShardRuntime`
+316. <a id="evidence-316"></a>[internal/gatewayruntime/hot_shard_runtime.go](../internal/gatewayruntime/hot_shard_runtime.go) — `runPressurePass`
+317. <a id="evidence-317"></a>[internal/hotshard/controller_test.go](../internal/hotshard/controller_test.go) — `TestControllerQualifiesHotShardAndRetriesByteIdenticalAdmission`
+318. <a id="evidence-318"></a>[internal/hotshard/controller_test.go](../internal/hotshard/controller_test.go) — `TestControllerClockSkewCannotAdvanceReplicatedEvidence`
+319. <a id="evidence-319"></a>[internal/gatewayruntime/hot_shard_runtime_test.go](../internal/gatewayruntime/hot_shard_runtime_test.go) — `TestGatewayHotShardPressurePassCreatesExactEnrolledReplicaMove`
+320. <a id="evidence-320"></a>[internal/gatewayruntime/hot_shard_shipped_e2e_test.go](../internal/gatewayruntime/hot_shard_shipped_e2e_test.go) — `TestGatewayHotShardForegroundP99Overhead`
+321. <a id="evidence-321"></a>[internal/raftstore/node_store.go](../internal/raftstore/node_store.go) — `NodeStore`
+322. <a id="evidence-322"></a>[internal/raftstore/node_sequencer.go](../internal/raftstore/node_sequencer.go) — `NodeSubmissionSequencer`
+323. <a id="evidence-323"></a>[internal/raftstore/seglog/engine.go](../internal/raftstore/seglog/engine.go) — `PersistWave`
+324. <a id="evidence-324"></a>[internal/raftstore/node_store.go](../internal/raftstore/node_store.go) — `GroupView`
+325. <a id="evidence-325"></a>[internal/raftstore/node_sequencer_test.go](../internal/raftstore/node_sequencer_test.go) — `TestNodeSubmissionSequencerFusesFIFOAndCompletesInTicketOrder`
+326. <a id="evidence-326"></a>[internal/raftstore/node_store.go](../internal/raftstore/node_store.go) — `OpenNodeStore`
+327. <a id="evidence-327"></a>[internal/raftstore/node_group_bootstrap_test.go](../internal/raftstore/node_group_bootstrap_test.go) — `TestNodeStoreSnapshotRegistrationCrashCutsLeaveNoPartialGroup`
+328. <a id="evidence-328"></a>[internal/raftstore/node_commit_hint_test.go](../internal/raftstore/node_commit_hint_test.go) — `TestNodeCommitHintDoesNotPublishMixedWaveOnSyncFailure`
+329. <a id="evidence-329"></a>[internal/gatewayruntime/fused_node_process_test.go](../internal/gatewayruntime/fused_node_process_test.go) — `TestFusedRF3NodeProcessQualification`
+330. <a id="evidence-330"></a>[gateway/scaling_metadata.go](../gateway/scaling_metadata.go) — `NodeRecord`
+331. <a id="evidence-331"></a>[gateway/scaling_metadata.go](../gateway/scaling_metadata.go) — `NodeLifecycle`
+332. <a id="evidence-332"></a>[internal/nodecontrol/control.go](../internal/nodecontrol/control.go) — `Record`
+333. <a id="evidence-333"></a>[internal/gatewayruntime/scaling_controller.go](../internal/gatewayruntime/scaling_controller.go) — `ScalingController`
+334. <a id="evidence-334"></a>[gateway/replicated_scaling_test.go](../gateway/replicated_scaling_test.go) — `TestReplicatedScalingReferenceScanBlocksRetirement`
+335. <a id="evidence-335"></a>[cmd/vibedb/cluster_control.go](../cmd/vibedb/cluster_control.go) — `runClusterControl`
+336. <a id="evidence-336"></a>[internal/gatewayruntime/seamless_scale_process_test.go](../internal/gatewayruntime/seamless_scale_process_test.go) — `TestSeamlessScaleInOutProcessQualification`
+337. <a id="evidence-337"></a>[gateway/frontend_drain.go](../gateway/frontend_drain.go) — `FrontendDrainRecord`
+338. <a id="evidence-338"></a>[internal/frontenddrain/prepared_ack.go](../internal/frontenddrain/prepared_ack.go) — `PreparedAckCut`
+339. <a id="evidence-339"></a>[internal/gatewayruntime/frontend_drain.go](../internal/gatewayruntime/frontend_drain.go) — `BeginFrontendDrain`
+340. <a id="evidence-340"></a>[internal/gatewayruntime/frontend_drain.go](../internal/gatewayruntime/frontend_drain.go) — `InstallFrontendContinuationGrant`
+341. <a id="evidence-341"></a>[gateway/frontend_drain_storage_test.go](../gateway/frontend_drain_storage_test.go) — `TestReplicatedFrontendDrainAtomicEnforceAndRetire`
+342. <a id="evidence-342"></a>[internal/gatewayruntime/scaling_frontend_drain_lifecycle_test.go](../internal/gatewayruntime/scaling_frontend_drain_lifecycle_test.go) — `TestScalingRetirementRequiresTerminalFrontendAckBeforeSafeToStop`
+343. <a id="evidence-343"></a>[internal/gatewayruntime/frontend_drain_test.go](../internal/gatewayruntime/frontend_drain_test.go) — `TestFrontendDrainKeepsAcceptedNativeConnection`
+344. <a id="evidence-344"></a>[internal/gatewayruntime/frontend_drain_test.go](../internal/gatewayruntime/frontend_drain_test.go) — `TestPreparedFrontendDrainRestartClosesAdmissionBeforeListenerAccept`
+345. <a id="evidence-345"></a>[internal/migrationbudget/budget.go](../internal/migrationbudget/budget.go) — `Budget`
+346. <a id="evidence-346"></a>[internal/migrationbudget/budget.go](../internal/migrationbudget/budget.go) — `DefaultConfig`
+347. <a id="evidence-347"></a>[internal/migrationbudget/scheduling.go](../internal/migrationbudget/scheduling.go) — `SchedulingLatencyProbe`
+348. <a id="evidence-348"></a>[cmd/vibedb-shard/rf3_migration_pressure.go](../cmd/vibedb-shard/rf3_migration_pressure.go) — `startMigrationPressureSampler`
+349. <a id="evidence-349"></a>[internal/migrationbudget/pressure_test.go](../internal/migrationbudget/pressure_test.go) — `TestPressureDownshiftsPausesAndRecoversWithHysteresis`
+350. <a id="evidence-350"></a>[internal/migrationbudget/scheduling_test.go](../internal/migrationbudget/scheduling_test.go) — `TestSchedulingPressureDownshiftsWithoutPausing`
 
 </details>
 

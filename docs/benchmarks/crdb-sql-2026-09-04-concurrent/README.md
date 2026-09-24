@@ -45,7 +45,7 @@ not an interleaved controlled old/new experiment or a general speedup claim.
 
 ## Changes and guarantees
 
-The [implementation](../../distributed-write-lane-proposal.md) gives eligible
+The [implementation](../../history/distributed-write-lane-proposal.md) gives eligible
 single-group PG autocommit writes 16 bounded independent issuer slots. Sequence
 blocks are reserved durably before use, eliminating the two per-statement gateway
 outbox syncs. Exact recipes remain in memory until a live slot knows its outcome;

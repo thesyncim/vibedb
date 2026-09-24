@@ -1,6 +1,10 @@
-# Observe an RF3 development cluster
+# Observe an RF3 cluster
 
-[Documentation](../README.md) / [Operations](README.md) · [Development status](../status.md)
+[Documentation](../README.md) / [Operations](README.md) / Observability
+
+VibeDB exposes raw counters, not a monitoring system. Use this page to choose
+the surface that answers your question and to avoid reading more into a
+counter than its source measures.
 
 ## Choose an observation path
 
@@ -12,20 +16,30 @@
 
 ### Collect a physical-node diagnostic
 
-On a supported Unix host, identify the exact `vibedb-shard serve-node` PID in
-your process supervisor, then send that process `SIGUSR1`. Do not signal the
-launcher or an unrelated process. The serving process emits a bounded JSON
-diagnostic and publishes `rf3-diagnostics.json` in the directory of its serving root.
+On Linux or macOS, find the exact `vibedb-shard serve-node` PID for the node
+and send it `SIGUSR1`. Do not signal the launcher or any other process.
 
-The record includes PID, NodeID, group count, Ready waves, node-log append
-barriers, checkpoint activity, local/remote dispatch, and storage-overlay fold
-counters. Diagnostics use detached observations; they do not request a storage
-snapshot, flush, or checkpoint. The diagnostic file itself is written and synced.
+```sh
+kill -USR1 <serve-node-pid>
+```
 
-Compare samples only for the same process and compatible group/schema
-inventory. Inspect availability, coverage, failure, and overflow fields before
-using storage counters. A provider change can reset collection counters within
-one PID. Keep raw samples when deriving rates or per-operation costs.
+The process writes one JSON record to its stderr, prefixed with
+`VIBEDB_RF3_DIAGNOSTIC`, and, when it has a node log, atomically replaces
+`rf3-diagnostics.json` in the node-log's parent directory (for the local
+launcher, `<root>/node-<n>/rf3-diagnostics.json`). The file is written and
+synced before it is renamed into place; only the latest record is kept.
+Under the local launcher, stderr goes to the supervisor's in-memory buffer, so
+read the file.
+
+The record includes PID, node ID, group count, Ready waves, node-log append
+barriers, checkpoint activity, local and remote dispatch, read-authority
+evidence, and storage-overlay fold counters. It reads detached counters; it
+does not take a storage snapshot, flush, or checkpoint.
+
+Compare samples only for the same PID and a compatible group and schema
+inventory. Check the availability, coverage, failure, and overflow fields
+before using storage counters. A provider change can reset collection
+counters within one PID. Keep raw samples when deriving rates.
 
 ## Read the current counter snapshot
 
@@ -36,7 +50,9 @@ listener:
 {"op":"metrics"}
 ```
 
-The peer needs `topology` capability. No SQL, parameters, request identity,
+The peer needs the `topology` capability. The local launcher's generated
+client credential has only `data_read` and `data_write`, so it cannot request
+metrics; an evaluator must add a principal with `topology` to the policy. No SQL, parameters, request identity,
 class, routing hint, or result budget may accompany the operation. The composed
 distributed path uses TLS; explicit development plaintext is limited to the
 loopback-only listener.
@@ -80,9 +96,10 @@ Group-specific sampling requires a provider implementing `GroupProvider`.
 A provider without that interface returns `ErrMetrics` for a group request.
 
 The gateway fixes the group/member and unique-node sample directory from its
-startup routes. A bounded worker set periodically performs authenticated
-shard-control reads. Each internal request is exactly 80 bytes and each response
-is exactly 408 bytes.
+startup routes. A bounded worker set refreshes it with authenticated shard-control reads at
+most once per second (the larger of `-controller-interval` and 1 s). Each
+internal request is exactly 80 bytes; each response is a 408-byte payload plus
+a 32-byte SHA-256 digest.
 
 `distributed_metrics.members` contains two kinds of entries:
 
@@ -186,6 +203,21 @@ duration. Build alerts only from semantics the source actually exports.
 Collection failure increments explicit fault counters and leaves the last cached
 sample; it never changes routing, membership, cleanup, acknowledgement, split,
 or move authority.
+
+## Scaling and migration status
+
+Replica-move pacing is not in the `metrics` response. `vibedb cluster status
+--json` returns a `budget` object with `throttled_calls`, `throttled_bytes`,
+`peak_active`, and `max_active`, aggregated from the same distributed sample,
+plus moved-group counts and blockers. See [scaling](scaling.md).
+
+## Limitations
+
+- No Prometheus, OpenTelemetry, or HTTP endpoint exists. Collection means
+  sending the native request yourself over mutual TLS.
+- No latency histograms, traces, or alerts.
+- Counters reset on process restart.
+- Logs are unstructured stderr text.
 
 The [diagnostics qualification record](../qualification/fused-diagnostics-2026-09-04/README.md)
 describes the storage-sampling checks.

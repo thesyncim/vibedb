@@ -33,7 +33,7 @@ not mean the product surface is complete or that the cell has been measured.
 
 ## Allocation gate
 
-```bash
+```sh
 go run ./bench/gate
 go run ./bench/gate -base <commit>
 ```
@@ -106,6 +106,17 @@ report's method and exclusions before using its numbers.
 publication registry for that harness and remains empty. CI also uploads raw
 qualification artifacts for limited retention. Neither a CI artifact nor an
 engineering report automatically becomes an endorsed registry entry.
+
+## Limitations
+
+- The competitive publication registry has no endorsed results; dated
+  engineering reports apply only to their recorded revision and hardware.
+- The allocation gate never measures time; a pass is not a latency or
+  throughput result.
+- `mixedsuite` summary TSV has a header/row mismatch (above).
+- No harness in this repository establishes horizontal scaling or
+  production capacity; see the [coverage matrix](../bench/competitive/COVERAGE.md)
+  for what is outside its scope.
 
 ## Source map
 

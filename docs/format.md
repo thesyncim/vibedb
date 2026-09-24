@@ -178,6 +178,16 @@ unreleased format. An intentional grammar change must:
 Golden fixtures are test evidence only. They are not files that future versions
 promise to open.
 
+## Limitations
+
+- Format 0 is edited in place; there are no readers for earlier layouts and no
+  migration tool.
+- CRC32C checksums detect accidental corruption only; collection files are
+  not authenticated or encrypted (the Raft WAL is).
+- Overflow values are not compressed or deduplicated.
+- Full-text postings are not part of the format; only tin declarations are
+  persisted.
+
 ## Source map
 
 - [internal/storeio/page.go](../internal/storeio/page.go), `state_root.go`, `inline_superblock.go`,

@@ -108,7 +108,7 @@ The first baseline has slow unchanged-read-path trials before UPDATE: C8 hit app
 
 The before-first baseline retained Raft lines at 16:39:40 show member 1 moving from term 2 to term 3 during the read phase. The bounded logs lack sufficient group identity and history to attribute all earlier read bursts or the later slow C1 trial to that event. Other fixtures have no retained post-start transition line; missing lines do not prove no transition.
 
-The campaign operator reported one live host snapshot during a baseline: Docker VM 330.6% CPU, WindowServer 42%, Codex renderer 38.7%, and no additional Go compilers in the top ten. The operator reports no team tests/builds/profile processing during timing. This one snapshot, without an exact trial timestamp supplied to this auditor, does not prove a quiet or exclusive host and is not used as a causal explanation for individual samples.
+The campaign operator reported one live host snapshot during a baseline: Docker VM 330.6% CPU, WindowServer 42%, one desktop application renderer 38.7%, and no additional Go compilers in the top ten. The operator reports no team tests/builds/profile processing during timing. This one snapshot, without an exact trial timestamp supplied to this auditor, does not prove a quiet or exclusive host and is not used as a causal explanation for individual samples.
 
 Both CRDB fixtures required a post-measurement forced shutdown, with one server process exiting 137 each; all VibeDB fixtures stopped without force and exited zero. This run does not qualify durability or recovery. Runtime warning/counter counts remain recorded separately from zero SQL errors.
 

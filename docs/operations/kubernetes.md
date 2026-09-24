@@ -1,6 +1,6 @@
 # Kubernetes RF3 qualification lane
 
-[Documentation](../README.md) / [Operations](README.md) · [Development status](../status.md)
+[Documentation](../README.md) / [Operations](README.md) / Kind qualification
 
 This lane creates a disposable four-node Kind cluster—one control plane and three workers—then exercises a fixed RF3 topology across restart. `vibedb-operator` is only a manifest renderer and init helper. It is not a Kubernetes controller or reconciler.
 
@@ -43,7 +43,7 @@ in `go-backend.txt`.
 
 Choose a new evidence directory for each run. The script refuses to replace an existing Kind cluster named `vibedb-qualification`.
 
-```bash
+```sh
 go install sigs.k8s.io/kind@v0.32.0
 
 mkdir -p "$PWD/.artifacts"
@@ -72,7 +72,24 @@ The evidence path is created with `mkdir -p` rather than required-new or cleared
 | `vibedb-gateway` StatefulSet | 1 | `1Gi` | gateway session journal |
 | learner template | 0 | none while scaled to zero | fixed qualification scaffold, not autoscaling |
 
-The empty `storageClassName` default uses the cluster default. The application image is built locally from `deploy/kubernetes/Dockerfile`, loaded into Kind, and referenced by the mutable test tag `vibedb:kube-qualification`.
+The empty `storageClassName` default uses the cluster default. The script builds CGO-disabled, stripped binaries on the host, packages them with `deploy/kubernetes/Dockerfile.prebuilt`, loads the image into Kind, and references it by the mutable test tag `vibedb:kube-qualification`. `deploy/kubernetes/Dockerfile` is a standalone multi-stage alternative that compiles inside `golang:1.27-bookworm`.
+
+This layout differs from the local launcher: each shard Pod runs one `vibedb-shard serve-rf3` process for one group replica, and a separate `vibedb-gateway` Pod serves clients. Results from one layout do not carry over to the other.
+
+## Render the manifests without a cluster
+
+Rendering needs no Docker or Kind and is the quickest way to inspect the topology. From the repository root, with binaries built into `./bin`:
+
+```sh
+state_dir="$(mktemp -d)"
+chmod 0700 "$state_dir"
+./bin/vibedb-operator bootstrap -namespace vibedb-test -state-dir "$state_dir" > bootstrap.yaml
+./bin/vibedb-operator render -namespace vibedb-test -image vibedb:kube-qualification \
+  -bootstrap-state-dir "$state_dir" > topology.yaml
+./bin/vibedb-operator validate -manifest topology.yaml
+```
+
+`bootstrap` prints the generated node IDs on stderr, and `validate` exits 0 on success. `topology.yaml` contains one Namespace, six Services, five StatefulSets (three shard roles, the gateway, and a learner template at zero replicas), and four PodDisruptionBudgets. `bootstrap.yaml` and the state directory contain private keys; delete them when finished.
 
 ## Exact sequence
 
@@ -109,7 +126,7 @@ Failure collectors cap their diagnostic files, but failures before evidence-dire
 
 ## Container and Pod security properties
 
-The checked-in Dockerfile builds CGO-disabled, stripped `vibedb`, shard, gateway, operator, and qualifier binaries, then copies them into a distroless non-root image. `vibedb-verify` is not included.
+Both Dockerfiles produce a distroless non-root image (`gcr.io/distroless/static-debian12:nonroot`) containing CGO-disabled, stripped `vibedb`, shard, gateway, operator, and qualifier binaries. `vibedb-verify` is not included.
 
 Generated Pods:
 
@@ -126,6 +143,15 @@ The generated topology does **not** set CPU/memory limits, a read-only root file
 The `kubernetes-rf3` job in `.github/workflows/ci.yml` runs this script on `ubuntu-latest` with a 45-minute job timeout and uploads evidence for 30 days, including on failure when files exist. The workflow requests only `contents: read` and deploys nowhere outside the disposable Kind cluster.
 
 A green job proves that the exact tested revision completed this bounded lane on that runner. It does not prove that the check is required by branch protection, that another commit is compatible, or that VibeDB is ready for production Kubernetes.
+
+## Limitations
+
+- `vibedb-operator` renders and prepares; it does not watch, reconcile,
+  scale, or repair anything. Scaling the StatefulSets does not add capacity.
+- The topology is fixed at three replicas per role and one gateway.
+- Test PKI is valid for seven days and stored in ordinary Secrets.
+- No CPU or memory limits, NetworkPolicies, or image digests are set.
+- Only Kind on a Linux CI runner is qualified.
 
 ## Source map
 

@@ -82,7 +82,7 @@ between runs should not be attributed entirely to the range code, especially
 for operations that cannot use it.
 
 The update failure still follows direct inserts with coordinated ledger admission
-under one sequence counter. A [write-lane proposal](../../distributed-write-lane-proposal.md)
+under one sequence counter. A [write-lane proposal](../../history/distributed-write-lane-proposal.md)
 describes a fix and its required recovery tests. Automatic approval review blocked
 that protocol change; no write-protocol implementation is included in this revision.
 Unknown writes were not retried under a new identity or removed to obtain a result.

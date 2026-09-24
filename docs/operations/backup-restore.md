@@ -1,6 +1,13 @@
 # Back up and restore RF3 data
 
-[Documentation](../README.md) / [Operations](README.md) · [Development status](../status.md)
+[Documentation](../README.md) / [Operations](README.md) / Backup and restore
+
+Export a running RF3 cluster as a certified set of per-group snapshots, and
+restore that set into a new cluster with fresh identities. Backup is a native
+gateway request; restore is a multi-step workflow driven by
+`vibedb-operator` and `vibedb-gateway` commands with hand-built inputs. The
+`restore-rf3-external` workflow qualifies restored replicas serving and
+failing over on Linux. There is no one-command backup or restore.
 
 ## Contract at a glance
 
@@ -44,6 +51,11 @@ vibedb-gateway serve <replicated-catalog-and-TLS-options> \
   -backup-max-artifact-bytes 68719476736 \
   -backup-max-disk-bytes 274877906944
 ```
+
+The local launcher already configures node 1's frontend this way, with the
+repository at `<root>/backups` and the default limits above. Its generated
+client credential lacks the `backup` capability, so issuing a backup against a
+launcher cluster requires adding a principal with `backup` to the policy.
 
 The gateway refuses a relative or unclean repository path, static catalog,
 plaintext serving, missing replica controls, invalid limits, or insufficient
@@ -210,6 +222,20 @@ session identities to force progress.
   a serving grant.
 - No recovery-time objective, recovery-point objective, key-management service,
   cross-build archive, or mixed-version procedure is provided.
+
+## Limitations
+
+- No command-line client sends `backup` or `backup_status`; you write the
+  native request over mutual TLS yourself.
+- Backups stay in a server-local directory. Copying them off the host and
+  scheduling backups are yours to arrange.
+- A backup is a vector of per-group cuts, not a consistent point-in-time
+  snapshot across groups.
+- Restore requires hand-built target plans, schema templates, and credentials;
+  no tool produces them end to end.
+- Restore works only with the exact build that took the backup; see
+  [upgrades](upgrades.md).
+- No recovery-time or recovery-point objective is stated or measured.
 
 ## Source map
 

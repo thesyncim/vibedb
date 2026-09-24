@@ -1,430 +1,170 @@
-# Distributed internals and operation
+# Distributed internals
 
-[Documentation](../README.md) / [Operations](README.md) · [Development status](../status.md)
+[Documentation](../README.md) / [Operations](README.md) · [Design](../design/README.md) · [Development status](../status.md)
 
-This design guide explains routing fences, consensus, persistence, and recovery.
-For commands, use the [operator guide](README.md) or
-[troubleshooting](troubleshooting.md). Physical-node composition is shown in
-[architecture](../architecture.md#system-map).
+This guide is the operator's map of the RF3 runtime: what each layer owns,
+which invariants a procedure must not break, and how to read a failure. Each
+section links to the design page that explains the mechanism. For commands,
+use the [operator guide](README.md) and [troubleshooting](troubleshooting.md).
 
-## Start with the deployment model
+## Deployment model
 
-“Static” and “RF3” describe different things. Treating them as synonyms leads to unsafe
-recovery and misleading availability claims.
+"Static" and "RF3" describe different things. Treating them as synonyms leads
+to unsafe recovery and misleading availability claims.
 
-| Term | What it means | What it does not mean |
+| Term | Means | Does not mean |
 | --- | --- | --- |
-| Embedded or local operation | One process owns a local database without the distributed RF3 serving path. | A replicated database or a quorum-backed fallback for RF3. |
-| Static bootstrap | The immutable index-one snapshot and initial `ConfState` from which one Raft group starts. | Membership must remain static forever, or that the group has one member. |
-| Static peer enrollment | A bounded list of authenticated nodes that may participate in configured groups. | Permission to send traffic; committed group membership grants that authority. |
-| RF3 serving policy | A steady-state catalog, data, or request-ledger group has three voters and commits through a majority. | A property built into the generic Raft kernel. The kernel can represent other voter counts. |
+| Embedded operation | One process owns a local database without the RF3 serving path. | A replicated database or a fallback for RF3. |
+| Static shards | Development `vibedb-shard serve` endpoints with a static catalog file. | RF3 request identity, recovery, or read semantics. |
+| Static bootstrap | The immutable index-one snapshot and initial configuration a Raft group starts from. | That membership stays fixed or that the group has one member. |
+| RF3 serving policy | A catalog, request-ledger, or data group has three voters and commits through a majority. | A property of the Raft kernel, which can represent other voter counts. |
+| Physical node | One `serve-node` process hosting replicas of many groups and an embedded frontend. | A consensus domain; groups stay independent. |
 
-Replacement temporarily has four voters and returns to three only after catch-up, safe
-leadership, and source removal. Generic tests also exercise RF1 and RF2; that does not make a
-non-RF3 layout a supported distributed deployment.
+The development launcher starts three (or six) physical nodes with a shared
+node log per node, independent catalog, request-ledger, and data groups, and
+one designated controller frontend. See the [local cluster guide](local-cluster.md).
 
-## Follow one operation through the ownership chain
+## Ownership chain
 
-The distributed path is a chain of single-owner boundaries. There is no hidden layer that can
-repair an invalid route, reinterpret a command, or make a stale replica authoritative.
+A request crosses a chain of single-owner boundaries. No layer repairs an
+invalid route, reinterprets a command, or makes a stale replica authoritative.
 
 ```mermaid
 flowchart LR
-    C[Client request] --> G["Gateway<br/>pin catalog generation"]
-    G -->|exact route and command fence| O["Replica Owner<br/>serving admission"]
-    O --> H["Multi-Raft Host<br/>bounded scheduling"]
-    H --> R["Group Runtime<br/>WAL + SQL apply + Raft node"]
-    R --> N[Raft Ready]
-    N -->|persist first| W[(Authenticated WAL)]
-    N -->|then send| P[Peer transport]
-    N -->|then apply| M[(Replicated state)]
-    M -->|published result| O
+    C[Client] --> F["Frontend<br/>pins catalog generation"]
+    F -->|exact route + command fence| O["Replica owner<br/>serving admission"]
+    O --> H["Execution lane<br/>bounded scheduling"]
+    H --> R["Group runtime<br/>log + apply + Raft"]
+    R -->|persist| W[(Group WAL or node log)]
+    R -->|replicate| P[Peers]
+    R -->|apply| M[(Replicated state)]
+    M -->|settled result| O
 ```
 
-The boundaries have distinct jobs:
-
-1. The gateway pins one catalog generation and sends exact ownership, schema, route,
-   replica-set, and policy coordinates.
-2. The replica `Owner`, sole caller of its host, rejects any command or serving-fence mismatch.
-3. The host gives runnable groups bounded Ready, input, proposal, and logical-tick turns.
-4. One runtime owns one group identity, WAL namespace, SQL apply root, state machine, and node;
-   physical and logical incarnations prevent accidental path adoption.
-
-An accepted proposal is not committed, and a transport write is not proposal acceptance. A log
-entry is not externally complete until deterministic apply and result publication finish.
-
-## Catalog generations are operation leases
-
-Catalog publication is atomic: a reader sees one whole old or new immutable generation, never
-a mixture. Pin that generation, retain it through return, and build every route and command from
-it. After a stale-fence failure, pin a newer generation and rebuild from the original request;
-do not splice newer metadata into the old command.
-
-Forwarding, where explicitly supported, preserves the old command bytes and checks a
-catalog-authorized window. Generation drain is a metadata and execution fence, not a database
-snapshot: groups that read through separate Raft barriers do not gain one global point-in-time
-cut merely because their routes came from one catalog generation.
-
-Publication only moves forward. Exact-predecessor cutovers compare-and-publish; a stale
-controller must re-observe and replan, not publish an unrelated higher generation.
-
-Warm and cold catalog readers install the same complete, authenticated ReadIndex cut.
-The canonical head is bound to the immutable genesis and its atomic generation/length/digest
-witness. This witness is a digest record, not an independent signature: authority comes from
-the authenticated catalog service and its Raft commit. Writers validate membership grants,
-distribution ownership and predecessor CAS before publication. Readers check current proof,
-structure and monotone identity fences; they do not replay historical membership receipts.
-Operation receipts remain for completion and idempotent retries. A reader may miss intermediate
-catalog generations without losing recovery progress.
-
-## Raft persistence and reads
-
-The current profile uses pre-vote, quorum checking, safe ReadIndex, heartbeat tick 1, and
-election tick 10. Proposal forwarding is disabled. Ticks are logical inputs supplied by the
-owner; the consensus core does not sample wall-clock time or run an autonomous ticker.
-
-Physical-node serving uses a shared `NodeStore` and submission sequencer. Each
-group retains its own log identity, incarnation, commit position, and apply
-state. The sequencer admits bounded immutable submissions, persists node-log
-waves, and returns completion to the submitting groups. A wave can share
-physical persistence across groups; it does not share consensus authority.
-Contiguous Ready values from one group can form a bounded series, with at
-most one series per group in a wave.
-
-The older per-group WAL path remains in the repository. Its dual-slot protocol
-below explains that storage lane; do not interpret its two durability phases
-as the physical-node log's barrier count. Use [node diagnostics](observability.md)
-for shared append waves and persistence observations.
-
-### Per-group WAL persistence
-
-Ready processing is an ordered durability protocol:
-
-1. Capture one Ready and assign its `(node incarnation, Ready ID)`.
-2. Prove the named WAL, append the authenticated Ready record, and complete the
-   platform record-ordering barrier before any selector can name it. Linux uses
-   `fdatasync`; Darwin uses `F_BARRIERFSYNC` with `File.Sync` fallback; other
-   platforms use `File.Sync`.
-3. Prove the namespace again, write the alternate authenticated current slot,
-   complete the final `File.Sync`, and re-prove the named file. This final sync
-   is the power-safe acknowledgement boundary for the selected image.
-4. Release outbound messages. A failed callback may cause the same message to be sent again.
-5. Apply committed entries serially and atomically publish state, membership, and results.
-6. Release eligible read barriers and advance the Raft node.
-
-The same Ready ID may be retried only with the exact same bytes. Persistence failure is
-retryable while that captured batch remains owned. A record/barrier failure is definite, but a
-failure after the current-slot write begins is outcome-unknown; exact retry reads the slot,
-avoids rewriting an already exact image, and completes the final sync. Apply failure is terminal
-for the runtime: publication may be ambiguous, so restart and recovery must reconcile WAL and
-applied state.
-
-### Read modes
-
-| Read path | Admission | Guarantee |
+| Layer | Owns | Design page |
 | --- | --- | --- |
-| Leader data read | Exact serving fence, current leader/term, quorum-backed ReadIndex, local apply through the barrier, storage-generation lease | A group-local leader/quorum cut. It is not a multi-group snapshot. |
-| Route-gate or catalog-authority read | Leader and quorum-backed ReadIndex, exact authority revision | Linearizable authority observation for that group. |
-| Explicit follower read | Exact serving fence and term, local applied index at or above the caller’s floor | A local applied-floor read only. **It is not linearizable and has no bounded-staleness promise.** |
+| Frontend | Catalog pin, planning, request identity, ledger programs | [Request routing](../design/routing.md), [exactly-once writes](../design/exactly-once-writes.md) |
+| Replica owner | Fence and term checks immediately before proposal admission | [Request routing](../design/routing.md#routes-and-command-fences) |
+| Execution lane and runtime | Raft ordering, persistence, apply, membership | [Replication](../design/replication.md) |
+| Controllers | Replica moves, scaling, splits, backup, schema rollouts | [Topology changes](../design/topology-changes.md), [backup internals](../design/backup-restore.md) |
 
-If leadership or node incarnation changes before a ReadIndex barrier becomes locally applied,
-the barrier is lost and the read fails. It is never silently answered from the new leadership
-state. Data reads also filter transferred ownership before joins, aggregation, and `LIMIT`, and
-fail closed when a group-level active transaction intent blocks the requested cut.
+An accepted proposal is not committed, and a socket write is not an
+acknowledgement. An entry is externally complete only after deterministic
+apply and result publication.
 
-A serving-discovery probe reads status and publication plus one fixed-width durable authorization
-fence. It does not acquire collection snapshots or scan the hidden state image, and pending result
-settlement remains a hard fence. After a read request's complete serving fence is admitted, a
-successful response preserves that exact fence and advances only the monotonic applied/commit
-watermarks to the returned data cut; it does not pair the result with a later status probe. Failure
-paths may probe again to return refreshed refusal state.
+## Invariants a procedure must preserve
 
-### Shared node log
-
-The node store owns its descriptor catalog, segmented log, and checkpoint
-inventory. Group registration and persistence go through the node owner;
-shared files do not permit independent group writers. Recovery validates the
-node and group identities before exposing each group's retained log.
-
-Node segment size, maximum wave bytes, group capacity, and Ready-series span
-are independent bounds. Capacity pressure is an admission or maintenance
-condition, not permission to discard a group's live recovery state. See
-[NodeStore](../../internal/raftstore/node_store.go),
-[submission sequencing](../../internal/raftstore/node_sequencer.go), and
-[series tests](../../internal/raftstore/node_series_test.go).
-
-## WAL generations and snapshots
-
-The Raft WAL is bounded, preallocated, encrypted/authenticated, digest-chained, and tied to an
-immutable placement identity. Its active limits are sealed into the format; a manifest may choose
-smaller values than the constructor defaults. See [defaults and limits](../reference/limits.md)
-for the current ceilings. Capacity exhaustion is an admission failure, not permission to
-overwrite live history.
-
-Startup authenticates the family manifest, header, dual current slots, records, key, recovery
-epoch, and SQL/apply binding before adoption. One torn current slot can be selected around, but
-the process cannot prove whether the damage was a crash tear or post-ack rollback without an
-external anti-rollback witness. Such a root is quarantined and must not serve or rejoin merely
-because local recovery found a plausible higher slot.
-
-Snapshots do not travel as ordinary Raft `MsgSnap` messages. The ordinary node, runtime, WAL
-Ready path, and peer frame preflight reject `MsgSnap`.
-
-The supported mechanism is a separate authenticated snapshot-data traffic class:
-
-1. Capture a bounded collection artifact and certificate at an exact applied index and term.
-2. Transfer and stage it in a non-serving target. Staged rows carry no routing or serving
-   authority.
-3. Verify the complete image and install/checkpoint it before making a new WAL base selectable.
-4. Publish and activate the sibling WAL generation, then adopt it through normal runtime
-   recovery.
-
-Artifact data is therefore out-of-band; only the certified snapshot/base relationship enters
-the Raft/WAL lifecycle. A crash during staging can replay at most one chunk. A crash during WAL
-generation activation is settled from the authenticated family state before runtime adoption.
-There is no cluster-wide or multi-group snapshot protocol here.
-
-## Peer transport: authenticate, bound, then distrust delivery
-
-Internal peers use mutual TLS 1.3. A critical certificate extension carries the exact cluster
-ID, cluster incarnation, and node ID; subject names, DNS names, and common names do not grant
-peer authority. Ordinary Raft, snapshot data, shard-native, SQL, client, and control traffic use
-separate ALPN classes. Handshake and stream deadlines are mandatory.
-
-TLS authenticates a node and its pinned physical incarnation/key. The per-group registry checks
-the exact source and destination member mappings and current durable membership. Ordinary Raft
-frames carry no roster digest or applied membership generation: those positions may legitimately
-differ after a lost configuration append or commit, including across a cold restart.
-
-This is crash-fault Raft with trusted, authenticated members, not Byzantine consensus. Inbound
-append and heartbeat messages from a current member or the exact active installed grant target
-reach Raft's term/log checks: a follower can miss both addition and promotion before that target
-becomes leader. The grant must match the follower's exact initial membership cut. A compromised
-authorized replication participant could therefore inject leader-origin replication messages;
-transport does not provide Byzantine leader authentication. Generic endpoint enrollment, an old
-or revoked grant, and removed identities grant no such access. The local producer requires its
-own committed voter role, and the Raft owner emits leader messages only after election. Election
-traffic requires current voter roles or an exact locally durable promotion entry bound to the
-installed grant; a local learner cannot campaign. Configuration entries still require that exact
-grant's ordered transitions or exact retained durable-log evidence.
-
-Application serving, snapshots and read-authority frames retain their strict current ownership
-and membership fences. In particular, read-authority frames carry the exact current roster digest
-and applied membership version. Receiving ordinary replication never publishes those authorities
-without the normal durable apply boundary.
-
-Delivery remains a lossy, duplicating boundary:
-
-- `Send` means validation, bounded queue reservation, and local ownership of encoded bytes.
-- A completed socket write increments local counters; it is **not** a receiver ACK, Raft ACK,
-  commit acknowledgement, or apply acknowledgement.
-- A write failure retains the batch, so retry can duplicate a frame.
-- Exact transport backpressure may cause the owner to discard one ordinary packet to avoid
-  head-of-line blocking. Raft retransmission is expected to repair it.
-- Queue, byte, coalescing, peer, and deadline limits fail closed; they are not elastic buffers.
-
-Certificate validity and I/O deadlines are explicit wall-clock seams. Raft ordering, leases,
-and recovery do not derive authority from that clock.
+- **Exact identity.** Group, member, node, store, and incarnation identities are
+  never reused, copied into another cluster, or edited. Restore creates fresh
+  ones.
+- **Catalog generations move forward.** Controllers publish by exact-predecessor
+  compare-and-swap. Never hand-edit a catalog, route seed, or journal.
+- **Membership comes from grants.** Replicas accept membership changes only from
+  catalog-committed grants. Never force a voter set from local observations.
+- **Recovery uses the original identity.** An uncertain write is retried with the
+  same identity and bytes, in the lane that produced it.
+- **Non-serving stays non-serving.** Staged snapshots, restored roots, and
+  quarantined WALs gain serving authority only through their certified path.
+- **One build.** Use documentation, binaries, and data from one revision. There
+  is no rolling or mixed-build upgrade path.
 
 ## RF3 quorum and replica replacement
 
-In a healthy steady-state RF3 group, any two voters form a quorum. One reachable voter cannot
-elect or commit. It must refuse, time out, or return an outcome-unknown condition rather than
-claim progress.
-
-| Reachable voters | Expected behavior |
+| Reachable voters | Behavior |
 | ---: | --- |
-| 3 | Elect and commit, subject to normal fencing and capacity. |
-| 2 | Elect and commit with reduced fault tolerance. Restore the third replica before another fault. |
-| 1 | No safe commit. Reads requiring ReadIndex and all writes fail or time out. |
-| 0 | Unavailable. Recover processes/storage; do not manufacture membership. |
+| 3 | Elect and commit, subject to fences and capacity. |
+| 2 | Elect and commit with no remaining fault tolerance. Restore the third replica before another fault. |
+| 1 | No commit; `ReadIndex` reads and writes fail or time out. |
+| 0 | Unavailable. Recover processes or storage; do not manufacture membership. |
 
-Replacement is an externally authorized, resumable sequence—not automatic joint consensus:
+Replacement is an authorized, resumable sequence: grant, add learner, install
+snapshot and catch up, promote to a fourth voter, transfer leadership if
+needed, remove the source, and observe the final roster in the catalog. It
+never uses joint consensus, and a removed source is fenced from rejoining.
+With read authority enabled, an election after a leader crash also waits for
+outstanding voter promises (up to 5 s under the development policy). See
+[membership changes](../design/replication.md#membership-changes),
+[replica moves](../design/topology-changes.md#replica-moves-and-replacement),
+and [node failure](node-failure.md).
 
-```mermaid
-stateDiagram-v2
-    [*] --> Grant: linearizable catalog grant
-    Grant --> Learner: add target
-    Learner --> CaughtUp: active, no pending snapshot, match >= commit
-    CaughtUp --> RF4: promote target voter
-    RF4 --> Transferred: move leadership if source is leader
-    Transferred --> RF3: remove source voter
-    RF3 --> [*]: catalog observes exact final roster
-```
-
-The grant binds one source, one target, the initial three voters, catalog generation, and exact
-transition digest. Its generation identifies the authorization cut; unrelated catalog updates
-do not invalidate an unchanged group. Move admission and recovery still require the exact
-initial roster, replica-set fence, enrolled target, source descriptor, and current durable
-distribution owner or publication receipt. Adding the learner does not authorize removal. Promotion must be durably
-observed. Removal is accepted only from the four-voter intermediate state, with no learner or
-joint configuration, after an exact same-term leadership transfer when needed.
-
-Scaling status includes the current move execution error when its controller is reachable.
-This bounded diagnostic clears after a successful pass; only durable catalog and retirement
-proofs determine completion or safe-to-stop.
-
-Absence of a grant is not by itself revocation; revocation requires a linearizable catalog
-observation. After restart, durable membership returns, but volatile leadership does not. The
-group needs real peer traffic and heartbeats before it can serve as leader again.
+After a restart, durable membership returns but volatile leadership does not.
+Scaling status includes the current move error while the controller is
+reachable; only durable catalog and retirement proofs decide completion or
+safe-to-stop.
 
 ## Retries and outcome-unknown
 
-Retry safety exists at three layers:
+After possible admission, retry the exact canonical request bytes under the
+same identity. Do not mint a new request ID, change the payload, or infer
+failure from a lost connection.
 
-| Layer | Purpose |
-| --- | --- |
-| In-flight waiter registry | Coalesces the exact same local attempt onto one enqueue and shares settlement with bounded waiters. |
-| Replicated session ring | Retains recent sequence outcomes under tenant/client/session epoch, retry home, fingerprint, logical digest, and cumulative ACK. |
-| Durable request ledger | Recovers multi-step or cross-group work from authenticated request identity through planning, preparation, terminal outcome, ACK, and reclamation. |
-
-The safe operator/client rule is simple: after possible admission, retry the **exact canonical
-request bytes with the same identity**. Do not create a new request ID, change the fingerprint,
-or infer failure from a lost connection.
-
-- A refusal before local core admission is safe to reroute or rebuild as directed by its typed
-  error.
-- Cancellation or connection loss after registry admission returns outcome-unknown with the
-  exact retry bytes because the entry may still commit and apply.
-- An exact duplicate within the retained session window returns the retained result. Changed
-  bytes under the same logical identity conflict.
-- Cumulative ACK advances retention; a sequence below the retained floor is retired, not
-  guessed. Session release validates and removes the full bounded retry ring atomically.
-- Durable ledger ACK is final only after all pre-ACK durable bytes are reclaimed. Work wider
-  than 256 participants proceeds in monotone waves; 256 is a wave bound, not a workflow bound.
-
-Transport retry and request retry solve different problems. Re-sending a peer frame repairs
-Raft delivery. Re-submitting the exact client command settles whether the logical operation
-committed and what result it produced.
-
-## Indexed updates and deletes
-
-> [!IMPORTANT]
-> The checked-in static listener exposes this path only through `exec` for one
-> single-base-owner statement. Independently placed index writes may add
-> transaction participants, but general multi-statement or cross-base-shard
-> static `exec_batch` is not exposed. Public `exec_batch` is reserved for
-> authenticated durable RF3 and never takes an unsequenced fallback.
-
-The static and RF3 lanes reach the same index relations through different
-replay contracts:
-
-| Lane | Base-row proof | Retry behavior |
+| Response | Meaning | Action |
 | --- | --- | --- |
-| Static `exec` | The base shard captures canonical key, before-image, and after-image without publishing. Prepare checks the old digest, executes the original SQL, and checks the resulting digest before any participant commits. | Apply executes the staged SQL again. A computed right-hand side is therefore not an exactly-once evaluation contract. |
-| Durable RF3 `exec_batch` | An exact-primary-key update performs one linearizable old-row read, evaluates supported top-level declared-column assignments simultaneously over that row, canonicalizes the postimage, and retains it with the old byte length and SHA-256 digest. | The retained mutation bytes are the recovery program. Apply uses an exact old-value CAS and never re-evaluates the SQL expression. |
+| Pre-admission refusal (stale fence, not leader, proposal refused) | This attempt reached no Raft log. | Rebuild from the original request; a newer catalog is fine. |
+| Outcome unknown | The write may still commit. | Re-drive the same identity; query ledger state where applicable. |
+| Terminal result | Retained outcome for that identity. | Use it; acknowledge coordinated results so they can be collected. |
+| Deterministic abort | The state machine durably rejected the command. | New identity for any new attempt. |
 
-An RF3 update of a missing key retains a durable zero-row no-op and does not
-evaluate its assignments.
+The frontend's PostgreSQL endpoint resolves its own attempts but cannot make an
+application's retry after a lost connection exactly-once. Resending a peer frame
+repairs Raft delivery; it is not a request retry. Details:
+[exactly-once writes](../design/exactly-once-writes.md).
 
-Both lanes derive global-index changes from canonical images. RF3 removal is
-digest-guarded; a new locator is absent-or-equal. When an index key stays the
-same, one digest-compare replacement proves the exact old locator before
-installing the new one. A stale base row or locator aborts rather than
-publishing a partial base/index state.
+## Read guarantees
 
-This is optimistic materialization, not an automatic recompute loop. An
-ordinary exact retry may first replan, but after ledger admission the retained
-program is authoritative; transaction execution and recovery use those bytes.
-Recomputing from a newer row requires a new logical request identity.
-
-Only `Ready` global indexes are read-plannable, although every lifecycle state
-is write-maintained. RF3 computed updates remain inside the narrow mutation
-surface: exact primary-key equality, top-level declared columns, supported
-scalar expressions, and no primary-key move. `RETURNING`, `ORDER BY`, `LIMIT`,
-nested targets, and `ON CONFLICT` remain fenced; gateway pgwire exposes writes
-only as durable autocommit operations. Local tests cover retained canonical
-postimages, simultaneous evaluation, exact retry, index derivation, and
-same-key locator replacement. The external RF3 chaos workload still uses
-whole-document updates, so it does not qualify computed-update recovery under
-process, leader, or partition faults.
-
-## Transactions and logical clocks
-
-> [!WARNING]
-> Current static distributed-transaction journal compaction omits durable
-> coordinator recovery-pulse records. Reopening after compaction can reset that
-> pulse state. Do not treat the compacted journal as qualified recovery
-> authority for an in-flight coordinator.
-
-Replicated commands carry deterministic bytes and explicit fences. They do not contain local
-time, SQL text, a serialized planner, a physical WAL generation, or a Raft term/index chosen by
-the client. At apply, transaction control, participant intents, relation mutations, and state
-publication are committed atomically within that group. Conflicting ordinary mutations fail
-closed while an active intent owns the affected scope.
-
-The request ledger coordinates recoverable cross-group work, but it does not create a global
-clock. Its program is bound to exact catalog/schema/routing identities and progresses through
-monotone durable revisions. Recovery replays those durable facts rather than process memory.
-
-Time-like values have separate domains:
-
-- Raft elections and maintenance use logical ticks.
-- Catalog publication, ownership, route gates, and transaction records use monotone revisions
-  or epochs.
-- Execution-pin leases are catalog applied-index intervals, not wall-clock durations. External
-  effects must re-read the exact lease certificate and stay inside that interval.
-- The bounded transaction conflict clock implements first-committer-wins. History overflow or
-  uncertainty causes a conservative conflict; it never permits an unproven commit.
-- X.509 validity, network deadlines, and caller-supplied session deadlines are outer wall-clock
-  inputs. They do not provide cross-group timestamp ordering.
-
-There is no global MVCC timestamp, global snapshot read, or wall-clock-derived consensus lease.
+Leader reads are linearizable per group. Follower reads guarantee only the
+caller's applied floor. Multi-group reads return independent per-group cuts;
+there is no global timestamp. Reads that meet an active transaction intent are
+refused rather than blocked. See [reads, leases, and time](../design/reads-and-time.md).
 
 ## Failure handling
 
 | Observation | Meaning | Safe response |
 | --- | --- | --- |
-| Not leader or leadership lost | The local serving term is no longer authoritative. | Refresh the exact route/fence and retry under the same logical identity. |
-| Outcome unknown / connection lost after admission | Commit and apply may still happen. | Retry identical canonical bytes and identity; query durable ledger state when applicable. |
-| Transport backpressure | A bounded local queue refused work; one ordinary Raft packet may have been dropped. | Relieve pressure and let Raft repair; do not count `Send` as delivery. |
-| Retryable Ready persistence error | The exact captured batch is still pending. | Preserve the root, restore the storage condition, and drive another owner pulse/ingress. |
-| Apply failure | Durable publication may be ambiguous. | Stop that runtime and recover from WAL plus applied state; do not continue in place. |
-| Torn-slot quarantine | Local WAL recovery lacks an external anti-rollback proof. | Keep the replica non-serving and rebuild or certify it through the supported recovery path. |
-| No RF3 majority | The group cannot safely commit or perform ReadIndex. | Restore connectivity/processes; never force a voter set from local observations. |
-| Snapshot staging interruption | The target is incomplete and non-serving. | Resume the certified artifact transfer; do not expose staged rows. |
-| Stale catalog or ownership fence | Topology changed after planning. | Re-pin a newer catalog generation and rebuild from the original logical request. |
+| Not leader, leadership lost | The local term is no longer authoritative. | Refresh the route; retry under the same identity. |
+| Stale catalog or ownership fence | Topology or schema changed after planning. | Re-pin a newer generation and rebuild from the original request. |
+| Outcome unknown after admission | Commit and apply may still happen. | Re-drive the identical identity and bytes. |
+| Read refused for an active intent | A distributed transaction holds the key or group. | Retry after it completes. |
+| Transport backpressure | A bounded queue refused work; one ordinary Raft packet may have been dropped. | Relieve pressure; Raft repairs delivery. |
+| Retryable persistence error | The captured batch is still pending. | Preserve the root, fix the storage condition, let the owner retry. |
+| Apply failure | Durable publication may be ambiguous. | Stop that runtime and recover from the log and applied state. |
+| Torn-slot quarantine | Local recovery lacks an anti-rollback proof. | Keep the replica non-serving; replace it. |
+| No majority | The group cannot commit or confirm reads. | Restore connectivity or processes. |
+| Interrupted snapshot staging | The target is incomplete and non-serving. | Let the controller resume or cancel through its catalog witness. |
+| Route-seed durability failure | The frontend cannot prove where the catalog lives. | Quiesce and restart that frontend. |
 
 ## Bounds worth monitoring
 
-The current numeric ceilings live in [defaults and limits](../reference/limits.md); do not copy
-them into deployment assumptions. Watch queues, WAL generations, read barriers, retained
-results, ledger cleanup reserve, leadership churn, and catalog drains. These are admission
-accounts, not sizing recommendations or exact RSS limits. Raising one requires complete
-same-build qualification because tighter bounds at another layer still win.
+Numeric ceilings live in [defaults and limits](../reference/limits.md). Watch
+queues, log capacity, read barriers, retained results, ledger collection,
+leadership churn, migration pacing, and catalog drains
+([observability](observability.md)). These are admission accounts, not sizing
+recommendations or RSS limits. Raising one requires same-build qualification,
+because a tighter bound at another layer still wins.
 
-The checked-in `serve-rf3` command uses a 112 MiB process-wide native frame
-account shared by every local RF3 group. From an otherwise empty account, that
-admits two worst-bound 40 MiB SQL execution reservations and their maximum
-request frames while retaining headroom for ordinary native traffic; a third
-worst-bound query is refused before execution. The reservation is conservative,
-not actual allocation, RSS, or a throughput promise, and other in-flight native
-traffic can reduce available concurrency.
+## Current gaps
 
-## Current non-guarantees
+- One designated frontend runs controllers and owns DDL, with no automatic
+  failover of that role.
+- Request-ledger ranges are immutable; the ledger cannot split online.
+- Online splits are base-relation only; globally indexed tables do not split.
+- Coordinated writes run participant waves sequentially.
+- Local `UNIQUE` indexes are not supported on replicated relations.
+- Large completion-digest references have no durable blob-store path.
+- Deterministic simulation does not model physical log tears, TLS framing,
+  process scheduling, or autonomous election timing.
+- Production PKI, key management, and mixed-build upgrades are out of scope.
+  Formats are unreleased and have no legacy decoder.
 
-The earlier sections define the principal non-guarantees. Additional gaps are:
-
-- request-ledger ranges cannot change online; a different range needs a fresh certified group;
-- local `UNIQUE` indexes are not supported on replicated relations;
-- large completion-digest references have no finished durable blob-store fulfillment path;
-- deterministic simulation does not prove physical WAL tears, TLS/framing, process behavior,
-  autonomous election timing, or external-network behavior;
-- production PKI provisioning is outside this repository and does not relax the exact
-  certificate and trust-domain model.
-
-Several formats explicitly identify themselves as unreleased and have no legacy decoder.
-Preserve artifacts, but assume only the exact creating build can understand them.
+The [distributed feature ledger](../distributed-feature-state.md) records the
+primitive, integration, command, and qualification state of each feature.
 
 ## Source map
 
-- Catalog pinning/routing: [`gateway/catalog.go`](../../gateway/catalog.go), [`gateway/route.go`](../../gateway/route.go)
-- Serving: [`internal/raftservice/owner.go`](../../internal/raftservice/owner.go), [`internal/raftservice/data_read.go`](../../internal/raftservice/data_read.go), [`shardservice/replicated_server.go`](../../shardservice/replicated_server.go)
-- Group ownership: [`internal/raftmember/runtime.go`](../../internal/raftmember/runtime.go), [`internal/multiraft/host.go`](../../internal/multiraft/host.go)
-- Raft: [`internal/raftmodel/config.go`](../../internal/raftmodel/config.go), [`internal/raftmodel/node.go`](../../internal/raftmodel/node.go), [`internal/raftmodel/ports.go`](../../internal/raftmodel/ports.go)
-- WAL/snapshots: [`internal/raftstore/store.go`](../../internal/raftstore/store.go), [`internal/raftstore/generation_activate.go`](../../internal/raftstore/generation_activate.go), [`internal/replicatedstate/snapshot_artifact.go`](../../internal/replicatedstate/snapshot_artifact.go)
-- Peer transport: [`internal/rafttransport/identity.go`](../../internal/rafttransport/identity.go), [`internal/rafttransport/registry.go`](../../internal/rafttransport/registry.go), [`internal/rafttransport/transport.go`](../../internal/rafttransport/transport.go)
-- Membership: [`internal/membershipgrant/grant.go`](../../internal/membershipgrant/grant.go), [`internal/raftservice/owner.go`](../../internal/raftservice/owner.go)
-- Retry/state: [`internal/raftserve/registry.go`](../../internal/raftserve/registry.go), [`internal/replicatedstate/apply.go`](../../internal/replicatedstate/apply.go), [`internal/requestledger/types.go`](../../internal/requestledger/types.go)
-- Static indexed mutations: [`sql/driver/mutation_capture.go`](../../sql/driver/mutation_capture.go), [`shardservice/execute.go`](../../shardservice/execute.go), [`gateway/writer.go`](../../gateway/writer.go), [`gateway/transaction.go`](../../gateway/transaction.go)
-- Fences/clocks: [`internal/executionpin/transition.go`](../../internal/executionpin/transition.go), [`internal/routegate/machine.go`](../../internal/routegate/machine.go), [`internal/routeforward/resolve.go`](../../internal/routeforward/resolve.go), [`internal/txnclock/clock.go`](../../internal/txnclock/clock.go)
+| Area | Entry points |
+| --- | --- |
+| Frontend and catalog | [`gateway/catalog.go`](../../gateway/catalog.go), [`gateway/replicated_native.go`](../../gateway/replicated_native.go), [`gatewayruntime/runtime.go`](../../internal/gatewayruntime/runtime.go) |
+| Serving and admission | [`raftservice/owner.go`](../../internal/raftservice/owner.go), [`shardservice/replicated_server.go`](../../shardservice/replicated_server.go) |
+| Raft and persistence | [`raftmodel/config.go`](../../internal/raftmodel/config.go), [`raftmember/runtime.go`](../../internal/raftmember/runtime.go), [`raftstore/node_store.go`](../../internal/raftstore/node_store.go) |
+| Retry and ledger | [`raftserve/registry.go`](../../internal/raftserve/registry.go), [`requestledger/types.go`](../../internal/requestledger/types.go) |
+| Physical node command | [`serve_node.go`](../../cmd/vibedb-shard/serve_node.go), [`serve_rf3.go`](../../cmd/vibedb-shard/serve_rf3.go) |

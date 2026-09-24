@@ -1,5 +1,7 @@
 # Batch slot preservation: September 8 improvement round
 
+[Documentation](../README.md) / [History](README.md)
+
 Existing-key PUT batches now preserve row slots in indexed leaves. When their
 exact-index projections remain unchanged, they avoid rebuilding the indexes.
 Changed projections use the established structural exact rebase, which keeps
@@ -110,9 +112,9 @@ Run each compiled baseline/candidate durable test binary separately:
 
 Raw results:
 
-- [Baseline updates](benchmarks/storage-round-2026-09-08/final-base-writes.txt)
-  and [candidate updates](benchmarks/storage-round-2026-09-08/final-candidate-writes.txt).
-- [Baseline reads](benchmarks/storage-round-2026-09-08/final-base-reads.txt)
-  and [candidate reads](benchmarks/storage-round-2026-09-08/final-candidate-reads.txt).
-- [Baseline inserts](benchmarks/storage-round-2026-09-08/final-base-inserts.txt)
-  and [candidate inserts](benchmarks/storage-round-2026-09-08/final-candidate-inserts.txt).
+- [Baseline updates](../benchmarks/storage-round-2026-09-08/final-base-writes.txt)
+  and [candidate updates](../benchmarks/storage-round-2026-09-08/final-candidate-writes.txt).
+- [Baseline reads](../benchmarks/storage-round-2026-09-08/final-base-reads.txt)
+  and [candidate reads](../benchmarks/storage-round-2026-09-08/final-candidate-reads.txt).
+- [Baseline inserts](../benchmarks/storage-round-2026-09-08/final-base-inserts.txt)
+  and [candidate inserts](../benchmarks/storage-round-2026-09-08/final-candidate-inserts.txt).

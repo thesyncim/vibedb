@@ -33,10 +33,25 @@ every internal constant. MiB and GiB are binary units.
 | multi-collection transaction | 16 collections; 256 documents; 67,174,400 bytes | default | facade, `vibedb.go` |
 | exact serializable read tracking | 4,096 keys and 1 MiB before coarse dependency tracking | threshold | native transaction, `vibedb_txn.go` |
 | serializable collection dependencies | 128 | hard | native transaction, `vibedb_txn.go` |
+| conflict history per collection | 4,096 written keys | hard; overflow causes conservative conflicts | native transaction, `internal/txnclock/clock.go` |
 
 Crossing the key/byte tracking threshold does not make a transaction
 non-serializable; it escalates that collection to a coarser dependency. The
 collection-count ceiling is a refusal.
+
+## Full-text search
+
+| Resource | Current value | Kind | Layer / source |
+| --- | ---: | --- | --- |
+| paths per tin index | 1 | hard | `store/store_index_tin.go` |
+| tin declarations per durable collection | 64 | hard | `internal/storeio/page_catalog.go` |
+| cached tin builds per collection | 4 generations (heap and durable) | hard | `store/store_index_tin.go`, `store/durable/store_file_tin.go` |
+| parallel segment search | at least 32,768 documents and `GOMAXPROCS >= 2`; up to 8 segments | threshold | heap only, `query/match.go` |
+| TINQL numeric arguments / boost | unsigned 32-bit / `[0, 10000]` | hard | `internal/tin/parse.go` |
+
+Tin builds are resident and unbounded by any execution budget: their size is
+proportional to the indexed text. Wildcard and fuzzy expansions are not
+capped. See [full-text search](../api/search.md#limitations).
 
 ## Query execution
 
@@ -143,6 +158,50 @@ limits and the caller's `max_result_bytes` may make the effective cap smaller.
 `MaxAttempts` includes the first attempt. Retries reuse the exact original
 command; increasing attempts is not permission to rebuild a mutation under a
 new identity.
+
+### Physical nodes and frontends
+
+| Resource | Current value | Kind | Layer / source |
+| --- | ---: | --- | --- |
+| groups in one RF3 manifest | 64 | hard | `cmd/vibedb-shard/rf3_manifest.go` |
+| groups prepared per local-launcher node log | 64 | launcher configuration | `cmd/vibedb/cluster_dev_physical.go` |
+| node-log segment / maximum write wave | 32 MiB / 20 MiB | zero-value defaults | `internal/raftstore/node_store.go` |
+| Raft execution lanes | 8 default; power of two, 1–64 | flag default / hard | `cmd/vibedb-shard/serve_rf3.go`, `internal/multiraft/lanes.go` |
+| frontend client connections / TLS handshakes | 1,024 / 64 | zero-value defaults | `cmd/vibedb-shard/serve_node.go` |
+| frontend connections / handshakes per shard pool | 4,096 / 64 | defaults | `cmd/vibedb-shard/serve_node.go` |
+| replica-control listener connections / handshakes | 32 / 8 | fixed | `cmd/vibedb-shard/serve_rf3.go` |
+| distributed metrics refresh | at most once per second | floor | `internal/gatewayruntime/runtime_control.go` |
+| launcher child readiness / shutdown grace | 30 s per child / 10 s total | fixed | `cmd/vibedb/cluster_dev.go` |
+| launcher retained child output | 64 KiB per child | fixed | `cmd/vibedb/cluster_dev.go` |
+
+### Cluster control and migration
+
+| Resource | Current value | Kind | Layer / source |
+| --- | ---: | --- | --- |
+| control request / response frame | 1 MiB / 4 MiB | hard | `internal/clustercontrol/control.go` |
+| node descriptor file | 1 MiB | hard | `internal/clustercontrol/control.go` |
+| nodes / blockers in one response | 4,096 / 256 | hard | `internal/clustercontrol/control.go` |
+| server-side `--wait` | 24 hours | hard | `internal/clustercontrol/control.go` |
+| client deadline | `--wait` + 15 s, or 30 s | fixed | `cmd/vibedb/cluster_control.go` |
+| rebalance moves / migration bytes | 4,096 / 1 GiB when zero; moves at most 4,096 | CLI defaults | `cmd/vibedb/cluster_control.go` |
+| migration rates: CPU proxy, disk read, disk write | 64 MiB/s each, 4 MiB burst | defaults, set at node preparation | `internal/migrationbudget/budget.go` |
+| migration rates: network send, receive | 32 MiB/s each, 2 MiB burst | defaults, set at node preparation | `internal/migrationbudget/budget.go` |
+| concurrent heavy migration phases | 2 default; 1–256 | default / hard | `internal/migrationbudget/budget.go` |
+| migration transient workspace | 16 MiB per node | default | `internal/migrationbudget/budget.go` |
+| migration rate floor under pressure | 12.5% of configured | default | `internal/migrationbudget/budget.go` |
+| hot-shard trigger | 90% of window capacity in 6 of 8 windows; 8-window cooldown | default | `autosplit/tracker.go` |
+| topology operations admitted per pressure cut | 1 split, 1 move | default | `internal/hotshard/controller.go` |
+
+### Backup and schema rollout
+
+| Resource | Current value | Kind | Layer / source |
+| --- | ---: | --- | --- |
+| retained certified backups | 16 | gateway flag default | `internal/gatewayruntime/standalone_flags.go` |
+| retained backup artifacts | 4,096 | gateway flag default | same |
+| bytes per backup artifact / repository | 64 GiB / 256 GiB | gateway flag defaults | same |
+| schema rollout plan / bundle | 4 MiB / 64 MiB | hard | `internal/gatewayruntime/schema_rollout_admin.go`, `internal/schemainstall/types.go` |
+| gateway replica operations in one rollout | 64 | hard | `gateway/schema_rollout_controller.go` |
+| shard installer concurrency / journal records / artifact bytes | 8 / 256 / 1 GiB | checked-in `serve-rf3` | `cmd/vibedb-shard/serve_rf3.go`, `schema_control_rf3.go` |
 
 ### Distributed transactions and exchange
 

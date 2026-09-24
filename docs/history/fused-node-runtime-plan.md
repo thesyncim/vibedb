@@ -1,10 +1,10 @@
 # Fused physical-node runtime: structural implementation contract
 
-[Documentation](README.md) / [Research records](design/research.md)
+[Documentation](../README.md) / [History](README.md)
 
 **Record scope:** This page retains a dated proposal or investigation. Its
 revision-specific findings and future work are not the current operating guide.
-See [architecture](architecture.md) and [operations](operations/README.md).
+See [architecture](../architecture.md) and [operations](../operations/README.md).
 
 The original implementation baseline is
 `fff5d6892e27db30f919c3ff7081b291cf71e4a1`; the inconclusive query experiment
@@ -25,7 +25,7 @@ then reproduced and fixed lost conflict history during quiescence/overflow,
 stale pruning boundaries, counter exhaustion, and retained finished handles.
 The corrected main and final comparison parent is
 `82ea6abfcf51de01745a99609d5ffb0cbbb828d0`. Its clean root race suite passes;
-[regressions and raw validation](qualification/sharded-clock-2026-09-04/README.md)
+[regressions and raw validation](../qualification/sharded-clock-2026-09-04/README.md)
 are retained. Both engines keep these upstream improvements. No tranche timing
 preceded this baseline change, and the promotion thresholds remain unchanged.
 
@@ -242,14 +242,14 @@ work under the same full goal.
 ## Current measured checkpoint (2026-09-04)
 
 The first shortened comparison is retained in
-[the independent audit](benchmarks/fused-node-short-2026-09-04/audit-summary.md).
+[the independent audit](../benchmarks/fused-node-short-2026-09-04/audit-summary.md).
 Candidate `27b89cd6` achieved 1.081x and 1.244x the `82ea6abf` parent
 throughput geomean in the two orders, and 0.418x and 0.534x CockroachDB.
 Its observed gateway locality differed between orders. Writes showed no
 reproducible gain. The 1,024-row, one-table run does not qualify this tranche.
 Main `fc7548a7` was merged after measurement and is excluded from those results.
 
-The subsequent [isolated health-observation comparison](benchmarks/fused-health-2026-09-04/README.md)
+The subsequent [isolated health-observation comparison](../benchmarks/fused-health-2026-09-04/README.md)
 includes that main revision in both fused arms. Before `494cf2aa` and after
 `2184dca3` share the same catalog-publication race fix; only the health path
 differs. All VibeDB and shared-client binaries prove Go 1.27 with
@@ -265,14 +265,14 @@ in the retained logs even though health publication is active in every arm.
 
 Main `ea866504` (window-count and sorting optimizations) was then merged at
 `0383eb86` and passed the focused query tests and independent review. A fresh
-[SIMD write profile](benchmarks/fused-health-2026-09-04/write-profile-0383eb86/README.md)
+[SIMD write profile](../benchmarks/fused-health-2026-09-04/write-profile-0383eb86/README.md)
 verifies 16,000 updates with zero errors. Compressed leaf reconstruction takes
 12.6–25.8% of each node's sampled CPU; proposal/apply and node-log durability
 waits remain substantial. These instrumented timings are not a new speedup
 claim. The next investigations are private guarded preimage reads and compact
 column patching during batch application.
 
-The [compact batch experiment](benchmarks/fused-storage-2026-09-04/README.md)
+The [compact batch experiment](../benchmarks/fused-storage-2026-09-04/README.md)
 at `7aa4f496` passed focused correctness/race tests but failed its SQL performance
 comparison: after/before geomeans 0.884x / 0.852x, with inconsistent write results.
 Reverse-order locality differs; first-order local-read slow bursts are unresolved.
@@ -280,7 +280,7 @@ All 120 trials validate, and all regressions are retained. Revert `d6374d33`
 removes the experiment. The separately reviewed guarded-preimage change at
 `7b8efb88` is not included in those timings.
 
-Its [independent guarded-update comparison](benchmarks/fused-guarded-update-2026-09-04/README.md)
+Its [independent guarded-update comparison](../benchmarks/fused-guarded-update-2026-09-04/README.md)
 measures C8 update throughput at 1.946x / 1.997x baseline, p99 at 0.489x / 0.461x,
 and cluster append barriers/update about 49% lower in both orders. These writes
 remain 0.633x / 0.645x CockroachDB. Overall after/before geomeans are 1.791x /
@@ -319,7 +319,7 @@ The durable bounded-scan binary-prefix, overflow and held-snapshot regression
 also passed with SIMD enabled from a frozen archive of `38e5ff72`, excluding
 the active row-overlay experiment.
 
-The [catalog refresh qualification](qualification/fused-catalog-refresh-2026-09-04/README.md)
+The [catalog refresh qualification](../qualification/fused-catalog-refresh-2026-09-04/README.md)
 at frozen `6402842c` now passes both physical3 and physical6 on Go 1.27 SIMD,
 Linux ARM64. Each layout checks 18 acknowledged rows across three tables,
 SIGKILLs every exact serving child, reopens the same roots and verifies topology,

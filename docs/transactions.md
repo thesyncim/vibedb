@@ -2,51 +2,47 @@
 
 [Documentation](README.md) / [Design](design/README.md) · [Development status](status.md)
 
-Use root `vibedb` for serializable application transactions over named
-collections. `store` and `store/durable` are lower-level engine primitives with
-different lifecycle and commit contracts.
+Use the root `vibedb` package for serializable application transactions over
+named collections. This page explains what those transactions guarantee, how
+they detect conflicts, and how a commit that touches several durable
+collections stays atomic across a crash. SQL transactions (Read Committed,
+Repeatable Read, Serializable, savepoints) are described in the
+[SQL API](api/sql.md#transactions-and-savepoints).
 
-The code calls each independently addressed atomic resource a **transaction
-target**. Traditional atomic-commit literature calls the same role a
-participant. An embedded target is a dirty collection; an RF3 target is one
-exact distribution, shard, and route incarnation with its grouped mutations.
+The code calls each independently committed resource a **transaction
+target**; commit-protocol literature calls it a participant. In the embedded
+engine a target is one dirty collection.
 
 ## Choose an API
 
 | Need | API | Contract |
 | --- | --- | --- |
-| Read and write application data | `(*vibedb.Database).Update` | Serializable; commits on a nil callback result |
+| Read and write application data | `(*vibedb.Database).Update` | Serializable; commits when the callback returns nil |
 | Read one coherent database cut | `(*vibedb.Database).View` | Read-only; mutations return `ErrTxReadOnly` |
 | Control commit and rollback | `Begin` / `BeginReadOnly` | Caller owns the `Tx` lifetime |
-| Atomically publish heap-engine states | `store.UpdateCollections` | Visibility atomic to `store.Database.Snapshot`; no durability |
+| Publish several heap collections atomically | `store.UpdateCollections` | Visibility-atomic to `store.Database.Snapshot`; no persistence |
 | Batch one durable collection | `(*durable.Collection).Update` | One logical failure-atomic publication |
 | Commit several durable collections | `(*durable.Database).Update` | Conditional prepares plus one durable decision |
 
-## Run a root transaction
+## Run a transaction
 
 ```go
 err := db.Update(func(tx *vibedb.Tx) error {
 	accounts := tx.Collection("accounts")
 	audit := tx.Collection("audit")
 
-	if _, err := accounts.Put(
-		"account:1",
-		[]byte(`{"balance":90}`),
-	); err != nil {
+	if _, err := accounts.Put("account:1", []byte(`{"balance":90}`)); err != nil {
 		return err
 	}
-	_, err := audit.Put(
-		"entry:1",
-		[]byte(`{"account":"account:1","delta":-10}`),
-	)
+	_, err := audit.Put("entry:1", []byte(`{"account":"account:1","delta":-10}`))
 	return err
 })
 ```
 
-`Update` rolls back when the callback returns an error. It also rolls back
-before propagating a panic. It does not retry automatically.
+`Update` rolls back when the callback returns an error or panics (and then
+re-panics). It does not retry.
 
-Use `Begin` when commit belongs outside a callback:
+Use `Begin` when the commit decision belongs outside a callback:
 
 ```go
 tx, err := db.Begin()
@@ -61,30 +57,55 @@ if _, err := tx.Collection("jobs").Put("job:7", body); err != nil {
 return tx.Commit()
 ```
 
-After `Commit` or `Rollback`, the transaction and every escaped `TxCollection`
-return `ErrTxDone`. `Rollback` after commit is safe and returns nil.
+After `Commit` or `Rollback`, the `Tx` and every escaped `TxCollection` return
+`ErrTxDone`. `Rollback` after `Commit` is a nil no-op.
 
 ## What a transaction sees
 
-A transaction reads an immutable database cut captured at `Begin`, plus its
-own staged overlay. `Get`, `Range`, and `Run` all provide read-your-writes.
-Uncommitted changes are not visible outside the transaction.
+The two transaction kinds read differently:
 
-The root transaction is serializable, not snapshot isolation. Commit validates:
+| Kind | Reads | Guarantee |
+| --- | --- | --- |
+| `View` / `BeginReadOnly` | One coherent cut of every collection, captured at begin | Every read belongs to the same database state |
+| `Update` / `Begin` | Each collection is snapshotted when the transaction first touches it, plus the transaction's own staged writes | A successful commit is serializable |
 
-- point reads, including reads of absent keys;
-- ABA changes to a key;
-- write existence used to compute `Put` and `Delete` results;
-- collection-wide scans and queries, including phantoms; and
-- lazy collection creation races.
+A read-write transaction samples a database-wide logical revision at begin
+and snapshots collections lazily. Its reads are therefore **provisional**: if
+another transaction commits between the moments two collections are first
+touched, the callback can observe values from different database states. Such
+a transaction never commits; validation rejects it with `ErrTxConflict`. Code
+inside `Update` must not trigger external side effects based on reads, and
+must tolerate seeing a combination of values that no committed state
+contained. Use `View` when a callback needs a coherent read-only cut.
 
-Disjoint-key transactions can both commit. A transaction that loses required
-revision history can fail conservatively even when no current value differs.
-Treat `ErrTxConflict` as a normal whole-transaction retry signal.
+`Get`, `Range`, and `Run` all include the transaction's own staged writes.
+Uncommitted changes are invisible outside the transaction.
+
+## How conflicts are detected
+
+Commit validates, against every commit published after the transaction's
+begin revision:
+
+- exact point reads, including reads of absent keys;
+- the existence assumptions behind each `Put` and `Delete` result, including
+  ABA changes;
+- whole-collection reads by `Range` and `Run` (phantoms), tracked as a coarse
+  collection dependency;
+- races on lazily created collections.
+
+Disjoint-key transactions on the same collection can both commit. Each
+transaction tracks up to 4,096 exact read keys or 1 MiB of key bytes; beyond
+that the collection escalates to a coarse dependency, so any later write to
+that collection conflicts. Each collection keeps a bounded history of up to
+4,096 recently written keys while transactions are active; when history is
+discarded, transactions that began before the discard conflict
+conservatively. `ErrTxConflict` can therefore occur without a real anomaly.
+Treat it as a normal retry signal.
 
 ## Retry conflicts
 
-Retry the complete closure against a fresh cut. Never reuse a finished `Tx`.
+Retry the complete closure against a fresh transaction. Never reuse a finished
+`Tx`.
 
 ```go
 for attempt := 0; ; attempt++ {
@@ -99,12 +120,9 @@ for attempt := 0; ; attempt++ {
 }
 ```
 
-Choose a bounded retry policy appropriate for the request. VibeDB supplies no
-default backoff, deadline, or retry count.
+VibeDB supplies no default backoff, deadline, or retry count.
 
 ## Admission limits
-
-The default root limits are fixed and checked before publication.
 
 | Scope | Resource | Default maximum |
 | --- | --- | ---: |
@@ -113,110 +131,128 @@ The default root limits are fixed and checked before publication.
 | Whole transaction | Dirty collections | 16 |
 | Whole transaction | Distinct staged keys | 256 |
 | Whole transaction | Staged key and value bytes | 67,174,400 |
-| Whole transaction | Exact read keys | 4,096 |
-| Whole transaction | Retained exact-key bytes | 1 MiB |
+| Whole transaction | Exact read keys before coarse escalation | 4,096 |
+| Whole transaction | Retained read-key bytes before coarse escalation | 1 MiB |
 | Whole transaction | Collections with read dependencies | 128 |
+| Whole transaction | Distinct absent collections touched | 128 |
 
-The exact-read counters are transaction-wide. Reaching either bound escalates
-the current collection to a coarse dependency; it is not a per-collection
-allowance. Exceeding a non-escalating bound returns `ErrTxTooLarge`.
-
-Configure whole-transaction write bounds with
-`AdvancedOptions.TxnLimits`. Per-collection bounds come from each engine
-collection and are not changed by `TxnLimits`.
+Staging beyond a write bound returns `ErrTxTooLarge` from that `Put` or
+`Delete` and leaves the transaction usable. Configure the three
+whole-transaction write bounds with `AdvancedOptions.TxnLimits`; per-collection
+bounds come from each collection's `MaxBatchDocuments` and `MaxBatchBytes`.
 
 ## Profile support
 
-| Root profile | One dirty collection | Two or more dirty collections |
+| Profile | One dirty collection | Two or more dirty collections |
 | --- | --- | --- |
-| `Durable` | Supported | Supported; crash-atomic decision protocol |
-| `Buffered` | Supported | Refused with `ErrTxUnsupportedLane` |
-| `Memory` | Supported | Supported; visibility atomic, no crash guarantee |
+| `Durable` | One journal record and one sync | Crash-atomic decision protocol |
+| `Buffered` | Supported; durable only after `Flush` or `Close` | Refused at commit with `ErrTxUnsupportedLane` |
+| `Memory` | Supported | Visibility-atomic; no persistence |
 
-Only dirty collections select the commit path. An empty or read-only commit
-does not create lazy storage.
+An empty or read-only commit publishes nothing and does not create lazy
+collections, but a read-write transaction with reads and no writes still
+validates its reads.
 
-## Publication and generations
+## Commit concurrency
 
-The facade serializes transaction validation and publication. It holds the
-participant fences in name order, so a direct write cannot slip between
-validation and publication. Direct writes to unrelated collections remain
-independent.
+Commit acquires the fence of every collection it read or wrote, in name
+order, and holds them through validation and publication. A direct `Put` or
+`Delete` on one of those collections therefore happens entirely before
+validation or entirely after publication. A transaction that reads and writes
+only one collection commits in parallel with transactions on other
+collections; a transaction that spans collections takes a database-wide
+commit lock. Direct writes to unrelated collections never wait.
 
-For a durable single-collection batch, rows and exact-index postings form one
-logical failure-atomic publication. Preparing a batch can first publish a
-content-equivalent topology generation. If later validation or persistence
-fails, logical rows can remain unchanged while `Generation may advance`.
-Never use generation equality as the only proof that a failed batch changed
-nothing.
+For a durable single-collection commit, rows and exact-index postings publish
+as one logical failure-atomic publication. Preparing a batch can first publish
+a content-equivalent topology generation. If a later step fails, logical rows
+are unchanged, but `Generation` may advance. Never use generation equality as
+proof that a failed batch changed nothing.
 
 ## Durable multi-collection commit
 
-With two or more dirty durable collections, the low-level protocol is:
+With two or more dirty durable collections:
 
-1. append one conditional prepare to each participant journal;
-2. synchronize all `K` participant journals;
-3. append and synchronize one decision in `txn.vtm`; and
-4. publish all participant states while holding every snapshot gate.
+```mermaid
+sequenceDiagram
+    participant Tx as Commit
+    participant J as Participant journals (K)
+    participant D as txn.vtm decision log
+    participant R as Readers
+    Tx->>J: append one conditional prepare per collection
+    Tx->>J: sync all K journals
+    Tx->>D: append and sync the commit decision
+    Note over D: commit point
+    Tx->>R: publish all participants under every snapshot gate
+```
 
-The decision is the commit point. The protocol uses `K+1` synchronization
-operations; publication after the durable decision is designed to be infallible.
+Scope: one database directory on one node. The commit uses `K+1` sync
+operations. Publication after the durable decision is designed not to fail.
+On reopen, a valid decision rolls every participant forward; no decision
+means presumed abort. A standalone open of one collection with an
+unresolved conditional record fails closed.
 
-An append or synchronization error can return `ErrCommitOutcomeUnknown`; it does
-not prove abort. Close and reopen the poisoned, complete database directory to
-resolve the all-or-none result before retrying.
+A failed decision append or sync returns `ErrCommitOutcomeUnknown` and
+poisons the catalog's writers. It does not prove abort. Close and reopen the
+complete database directory to resolve the all-or-none outcome before
+inspecting or retrying.
 
-Low-level `durable.UpdateCollections` requires explicit nonzero `TxnLimits` for
-two or more dirty collections. `durable.Database.Update` supplies defaults; one
-dirty collection bypasses the cross-collection protocol and limits.
-
-`durable.Database.Update` holds the catalog read lock through its callback.
-Do not run collection DDL from that callback. The heap
-`store.Database.Update` has a different contract: it copies the catalog first
-and releases the catalog lock before invoking the callback.
+Low-level `durable.UpdateCollections` requires explicit nonzero `TxnLimits`
+for two or more dirty collections; `durable.Database.Update` supplies
+defaults. Only the synchronous-journal and buffered-journal lanes can join a
+multi-collection commit. `durable.Database.Update` holds the catalog read lock
+through its callback, so do not run collection DDL inside it. The heap
+`store.Database.Update` instead copies the catalog and releases its lock
+before the callback.
 
 ## Heap publication
 
-`store.UpdateCollections` stages all participant batches before locking. It
-then locks named participants in sorted order, plans every next state, and
-publishes the state pointers only after all fallible work succeeds.
-
-A concurrent `store.Database.Snapshot` sees every participant before or after
-the commit. Independent single-collection snapshots can observe different sides
-of the pointer-flip sequence. There is no persistence or crash-recovery
-dimension in this API.
+`store.UpdateCollections` stages all participant batches before locking, then
+locks the participants in name order, plans every next state, and publishes
+the state pointers only after all fallible work succeeds. A concurrent
+`store.Database.Snapshot` sees every participant before or after the commit.
+Independent single-collection snapshots can observe different sides of the
+pointer-flip sequence.
 
 ## Errors and nesting
 
-Use `errors.Is` with:
+| Error | Meaning |
+| --- | --- |
+| `ErrTxConflict` | Serialization conflict; nothing published |
+| `ErrTxTooLarge` | Bounded admission refusal |
+| `ErrTxDone` | Finished transaction handle |
+| `ErrTxReadOnly` | Mutation in `View` or `BeginReadOnly` |
+| `ErrTxUnsupportedLane` | Multi-collection commit on `Buffered` |
+| `ErrCommitOutcomeUnknown` | Ambiguous durable decision; close and reopen |
+| `ErrTxNested` | `Update` or `View` reentered on the same goroutine |
 
-- `ErrTxConflict` for serialization conflicts;
-- `ErrTxTooLarge` for bounded admission refusal;
-- `ErrTxDone` for a finished transaction;
-- `ErrTxReadOnly` for a mutation in `View` or `BeginReadOnly`;
-- `ErrTxUnsupportedLane` for an unsupported durability profile;
-- `ErrCommitOutcomeUnknown` for an ambiguous durable decision; and
-- `ErrTxNested` for same-goroutine reentry through `Update` or `View`.
+A `Tx` is single-consumer and must not be copied or shared across
+goroutines. `ErrTxNested` only detects closure reentry; a manual `Begin`
+inside a callback starts an independent transaction that can conflict with
+the outer one.
 
-Native transactions do not implement savepoints. `ErrTxNested` describes
-closure-helper reentry; it is not a general statement about every manual
-`Begin` pattern. A `Tx` is single-consumer and must not be copied after first
-use.
+## Limitations
 
-## Non-guarantees
-
-- A conflict does not retry itself.
-- A successful visibility-atomic heap commit is not durable.
-- `Buffered` does not support facade transactions that dirty several collections.
-- A database snapshot is a local coherent visibility cut, not a durable or distributed timestamp.
-- A persistence error does not necessarily mean the last durable transaction aborted.
+- No savepoints, nested transactions, or automatic retry in the native API.
+- Read-write transactions are optimistic and give no cross-collection read
+  consistency before commit (no opacity).
+- Conflict tracking is bounded; heavy write traffic or long transactions
+  produce conservative conflicts.
+- A multi-collection commit takes a database-wide lock; throughput of
+  cross-collection transactions does not scale with collection count.
+- `Buffered` cannot commit multi-collection transactions.
+- A transaction's snapshot is a local visibility cut, not a durable or
+  distributed timestamp.
+- Full-text matching is refused inside a transaction after staging writes to
+  the searched collection.
 
 ## Source map
 
-- Facade transaction API: [vibedb_txn.go](../vibedb_txn.go), [vibedb.go](../vibedb.go)
+- Facade transactions: [vibedb_txn.go](../vibedb_txn.go), [vibedb.go](../vibedb.go)
+- Conflict history: [internal/txnclock/clock.go](../internal/txnclock/clock.go), [internal/txnclock/history.go](../internal/txnclock/history.go)
 - Serializable anomaly tests: [vibedb_txn_serializable_test.go](../vibedb_txn_serializable_test.go)
+- Cut and fractured-read tests: [vibedb_txn_snapshot_internal_test.go](../vibedb_txn_snapshot_internal_test.go)
 - Profile and retry tests: [vibedb_txn_test.go](../vibedb_txn_test.go), [capability_matrix_facade_test.go](../capability_matrix_facade_test.go)
 - Heap atomic publication: [store/store_database_txn.go](../store/store_database_txn.go)
-- Durable decision protocol: [store/durable/store_database_txn.go](../store/durable/store_database_txn.go)
-- Durable recovery: [store/durable/store_database_txn_recovery.go](../store/durable/store_database_txn_recovery.go)
+- Durable decision protocol and recovery: [store/durable/store_database_txn.go](../store/durable/store_database_txn.go), [store/durable/store_database_txn_recovery.go](../store/durable/store_database_txn_recovery.go)
 - Crash matrix: [store/durable/store_database_txn_crash_test.go](../store/durable/store_database_txn_crash_test.go)
