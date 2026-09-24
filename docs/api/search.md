@@ -241,8 +241,8 @@ children; boosts multiply.
 
 Scores are relative within one generation. They change when any document in
 the collection changes, and they are not comparable with scores from another
-engine or another VibeDB revision. BM25 kernels can differ in the last bits
-between SIMD and scalar builds; see [SIMD kernels](../simd.md#full-text-fold-and-bm25-kernels).
+engine or another VibeDB revision. SIMD and scalar builds compute identical
+scores; see [SIMD kernels](../simd.md#full-text-fold-and-bm25-kernels).
 
 ## How execution uses the index
 
