@@ -28,31 +28,30 @@ sources from the heap or durable store; the heap store also serves as a
 reference model. Read [storage engines](store.md) before owning those lower
 handles directly.
 
-In distributed mode, a physical node combines a frontend/coordinator, a set
-of Raft group replicas, and shared storage scheduling:
+In distributed mode, a physical node combines an embedded frontend, replicas
+of many independent Raft groups, and shared persistence and scheduling:
 
 ```mermaid
 flowchart LR
-    Client[SQL client] --> Frontend
-    subgraph Node[One physical node]
-        Frontend[Frontend and coordinator] --> Dispatch[Authenticated dispatch]
+    Client[SQL or native client] --> Frontend
+    subgraph Node["One physical node"]
+        Frontend["Frontend<br/>catalog pin, planning, request identity"] --> Dispatch[Authenticated dispatch]
         Dispatch --> Local[Local replica owners]
-        Local --> Groups[Independent Raft groups]
-        Groups --> Sequencer[Node submission sequencer]
-        Sequencer --> Log[Shared node log]
+        Local --> Lanes["Execution lanes<br/>one owner per lane"]
+        Lanes --> Groups["Independent Raft groups<br/>catalog, request ledger, data"]
+        Groups --> Log["Shared node log<br/>one sync per wave"]
         Groups --> Apply[Replicated apply]
         Apply --> Collections[Durable collections]
     end
-    Dispatch --> Remote[Remote node transport]
-    Groups <--> Peers[Raft peers]
+    Dispatch --> Remote[Remote node over mTLS]
+    Groups <--> Peers[Raft peers on other nodes]
 ```
 
-Local dispatch avoids a socket and wire encoding while retaining identity,
-authorization, bounds, and serving checks. Remote requests use authenticated
-transport. The local launcher defaults to three physical serving nodes, with
-RF3 replicas placed across them; six-node placement is also available.
-Physical-node count, Raft-group count, and replication factor are separate
-quantities. See the [local cluster guide](operations/local-cluster.md).
+Local dispatch avoids a socket and wire encoding but keeps identity,
+authorization, bounds, and serving checks. The local launcher starts three
+physical nodes by default (six is also available), each hosting one replica of
+every RF3 group. Physical-node count, Raft-group count, and replication factor
+are separate quantities. See the [local cluster guide](operations/local-cluster.md).
 
 RF3 collection journals and transaction markers retain fixed file sizes through
 portable allocation on macOS and Linux. Allocation is performed at creation;
@@ -125,40 +124,31 @@ release rule.
 
 ## Distributed path
 
-A coordinator pins one immutable catalog generation for routing, endpoints,
-table metadata, and RF3 identities. It admits and authenticates the request
-before dispatching to a local owner or remote node.
+The [design guide](design/README.md) covers each step in depth.
 
-A read obtains a group-local cut: leader reads use quorum-backed ReadIndex;
-explicit follower reads wait for the requested applied floor. Cross-group
-results combine independent group cuts and do not provide a global timestamp.
-
-Writes use the domain appropriate to the operation. Eligible single-participant
-SQL writes retain their request result in the data group. Coordinated writes
-use the request ledger and participant protocol. Each domain has its own
-identity and sequencing rules; after an uncertain response, recovery must use
-the original identity. [Distributed write domains](distributed-write-lane-proposal.md)
-records the protocol and its introduction.
-
-Coordinated terminal publication uses three ledger transitions: persist the
-prepared result and ACK capability, atomically release the co-located execution
-pin with its certificate, then publish the terminal result. The release checks
-the current gateway principal and exact lease in the same Raft apply that
-removes the active pin. A lost reply or replacement gateway recovers the
-committed certificate from the ledger under its own service identity. It needs
-no separate release session, pending pin state, or original gateway credentials.
-
-Split tail requests contain the authenticated batch and immutable child binding.
-Each receiver checks its own durable cursor and accepts only the next entry,
-its pending crash receipt, or its exact completed result. Sender restarts need
-no remembered child cursor, and the source acknowledges only after every
-prepared replica has durably recognized the batch.
-
-RF3 is a placement and membership policy above the generic Raft kernel.
-Ordinary Raft `MsgSnap` is refused; snapshots move through a separate certified,
-non-serving artifact pipeline. Replica replacement uses sequential membership
-changes and an RF4 intermediate. The detailed [distributed design](operations/distributed.md)
-covers fences, recovery, and failure cases.
+1. **Route.** The frontend pins one immutable catalog generation and builds
+   commands carrying exact route and command fences. Replicas refuse any
+   mismatch before proposal admission, and the frontend rebuilds from the
+   original request under a newer generation.
+   See [request routing](design/routing.md).
+2. **Replicate.** Each shard, the catalog, and the request ledger is an
+   independent RF3 Raft group. Groups on one physical node share a node log
+   (one sync per multi-group wave) and execution lanes, never consensus.
+   See [replication](design/replication.md).
+3. **Write exactly once.** Single-group writes use one proposal whose result the
+   data group retains under the request identity. Multi-group writes run a
+   sealed program in the request ledger through route-gate pins and a fused
+   prepare/decide/apply protocol. After an uncertain response, recovery uses
+   the original identity. See [exactly-once writes](design/exactly-once-writes.md)
+   and [distributed transactions](design/distributed-transactions.md).
+4. **Read.** A leader read is a linearizable per-group cut, through `ReadIndex`
+   or an optional quorum read authority. Follower reads guarantee only a
+   requested applied floor. Multi-group results combine independent cuts; there
+   is no global timestamp. See [reads, leases, and time](design/reads-and-time.md).
+5. **Change topology.** Replica replacement, node scale-in and scale-out, and
+   hot-shard splits are durable, catalog-fenced operations. State moves as
+   certified snapshot artifacts, never as Raft `MsgSnap`.
+   See [topology changes](design/topology-changes.md).
 
 ## Why these boundaries exist
 
@@ -177,9 +167,10 @@ its process, filesystem, and network boundary.
 
 Distributed service paths bind TLS 1.3 identities to exact binary NodeIDs and
 separate traffic classes. Authorization policies grant explicit capabilities
-and generations. Development plaintext is opt-in and literal-loopback only.
-TLS rotation can close an in-flight stream; a lost response can therefore mean
-the operation committed.
+at an exact policy generation. Development plaintext is opt-in and
+literal-loopback only. TLS rotation can close an in-flight stream; a lost
+response can therefore mean the operation committed. See the
+[security model](design/security.md).
 
 Writer locks coordinate cooperating processes. They cannot prevent an external
 administrator or process from truncating, replacing, copying, or editing live
@@ -194,8 +185,10 @@ files.
   guarantee.
 - Backup certificates bind per-group cuts; they are not global wall-clock
   snapshots.
-- Autosplit records pressure and proposes desired state; it does not by itself
-  publish a manifest or move data.
+- Autosplit records pressure and recommends split points; the split controller
+  performs the durable, catalog-fenced split.
+- The distributed runtime is development software with partial qualification;
+  see the [distributed feature ledger](distributed-feature-state.md).
 - The planner package is infrastructure. Operator names and test rules do not
   imply that every physical plan is used by SQL.
 
@@ -205,6 +198,7 @@ files.
 | --- | --- |
 | Native ownership and transactions | [Facade](../vibedb.go), [transactions](../vibedb_txn.go), [snapshot regressions](../vibedb_txn_snapshot_internal_test.go) |
 | Query and optimizer | [Query package](../query/), [planner](../planner/), [execution guide](design/query-execution.md) |
+| Distributed design | [Design guide](design/README.md), [distributed internals](operations/distributed.md) |
 | Physical-node provisioning | [Placement](../cmd/vibedb/cluster_dev_physical.go), [composition tests](../cmd/vibedb/cluster_dev_physical_test.go) |
 | Embedded frontend | [serve-node](../cmd/vibedb-shard/serve_node.go), [gateway runtime](../internal/gatewayruntime/) |
 | Consensus and persistence | [Replica ownership](../internal/raftmember/), [Multi-Raft](../internal/multiraft/), [node log](../internal/raftstore/) |

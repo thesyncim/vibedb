@@ -1,12 +1,14 @@
 # String compression and shared index fields
 
+[Documentation](../README.md) / [History](README.md)
+
 This work evaluates two sources of storage cost: long strings in primary
 dictionary streams, and fields repeated across different secondary indexes.
 The per-string compression experiment was rejected for production because
 its physical savings were inconsistent and it slowed resident reads. Its
 measurements are retained below. The chosen next implementation is bounded
 physical packs of canonical exact-index leaves, compressed once on disk and
-decoded at Open. See [the implementation plan](exact-index-packed-storage-plan.md).
+decoded at Open. See [the implementation plan](../exact-index-packed-storage-plan.md).
 Durable pack integration and its performance qualification are still pending.
 The completed [batch slot-preservation round](batch-slot-preservation-results.md)
 measures the separate write optimization, read controls, and remaining limits.

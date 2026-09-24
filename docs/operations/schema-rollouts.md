@@ -1,6 +1,6 @@
 # Roll out one RF3 schema generation
 
-[Documentation](../README.md) / [Operations](README.md) · [Development status](../status.md)
+[Documentation](../README.md) / [Operations](README.md) / Schema rollouts
 
 `vibedb-gateway schema-rollout` coordinates one exact catalog transition across
 every replica of every changed RF3 group. Each changed shard moves from schema
@@ -156,10 +156,10 @@ change, require the previous catalog operation to be complete, prove every
 affected replica drained, build a new exact successor from the now-current
 catalog, and requalify the sequence on the pinned build.
 
-## Limits and claim boundary
+## Limitations
 
 Current hard ceilings include 64 concurrent gateway replica operations, 8 shard
-installer operations, 64 MiB per bundle, 16 retained shard artifacts, 1 GiB of
+installer operations, 64 MiB per bundle, 256 retained shard artifacts, 1 GiB of
 artifact storage, and 256 shard rollout journal records. These are refusal
 bounds, not recommended capacity or latency targets.
 

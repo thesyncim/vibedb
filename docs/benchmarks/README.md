@@ -20,6 +20,15 @@ is separate from this engineering archive.
 
 | Date | Report |
 | --- | --- |
+| 2026-09-14 | [Direct PostgreSQL write ownership](pgwire-direct-ownership-2026-09-14/README.md) |
+| 2026-09-14 | [Replicated integer delta writes](replicated-int64-delta-2026-09-14/README.md) |
+| 2026-09-09 | [Cancelled 10M-row comparison: insertion scaling](../history/ten-million-row-run-2026-09-09.md) (raw summary in `ten-million-2026-09-09/`) |
+| 2026-09-08 | [Batch slot preservation: September 8 improvement round](../history/batch-slot-preservation-results.md) (raw rows in `storage-round-2026-09-08/`) |
+| 2026-09-06 | [Bounded owner progress and isolated performance evidence](owner-progress-2026-09-06/README.md) |
+| 2026-09-06 | [Direct point execution checkpoint](point-direct-2026-09-06/README.md) |
+| 2026-09-06 | [Raft persistence and transport improvements](raft-impact-2026-09-06/README.md) |
+| 2026-09-06 | [Read coalescing: merged PR 194 performance](read-coalesce-2026-09-06/README.md) |
+| 2026-09-06 | [Read coalescing: fast path and update-regression follow-up](read-coalesce-followup-2026-09-06/README.md) |
 | 2026-09-05 | [Distributed projected-range comparison](distributed-projected-ranges-2026-09-05/README.md) |
 | 2026-09-05 | [Distributed integer GROUP BY comparison](distributed-integer-groups-2026-09-05/README.md) |
 | 2026-09-05 | [RF3 Ready-series comparison](rf3-ready-series-2026-09-05/README.md) |
@@ -27,6 +36,12 @@ is separate from this engineering archive.
 | 2026-09-05 | [Packed integer extrema final qualification](packed-extrema-simd-final-2026-09-05/README.md) |
 | 2026-09-05 | [Packed integer extrema SIMD evidence](packed-extrema-simd-2026-09-05/README.md) |
 | 2026-09-05 | [Packed SIMD layout regression follow-up](packed-extrema-simd-layout-fix-2026-09-05/README.md) |
+| 2026-09-05 | [Distributed point-read evidence](distributed-point-reads-2026-09-05/README.md) |
+| 2026-09-05 | [Prepared distributed-read reuse microbenchmark](distributed-read-preparation-2026-09-05/README.md) |
+| 2026-09-05 | [Storage-format research](format-research-2026-09-05/README.md) |
+| 2026-09-05 | [Horizontal execution investigation](horizontal-execution-2026-09-05/README.md) |
+| 2026-09-05 | [Point-read compiler reuse evidence](point-compiler-reuse-2026-09-05/README.md) |
+| 2026-09-05 | [Shared-node RF3 history reclamation](space-rf3-2026-09-05/README.md) |
 | 2026-09-04 | [Wide packed equality count SIMD measurements](packed-count-simd-wide-2026-09-04/README.md) |
 | 2026-09-04 | [Shared-node log: matched SQL comparison](crdb-sql-2026-09-04-node/README.md) |
 | 2026-09-04 | [Retained pgwire semantic prepare](prepared-pgwire-reads-2026-09-04/README.md) |
@@ -51,6 +66,19 @@ is separate from this engineering archive.
 | 2026-09-04 | [Asynchronous Raft serving comparison](crdb-sql-2026-09-04-pipelined/README.md) |
 | 2026-09-04 | [AMD64 packed equality count SIMD measurements](packed-count-simd-amd64-2026-09-04/README.md) |
 | 2026-09-03 | [CockroachDB comparison: 2026-09-03](crdb-sql-2026-09-03/README.md) |
+
+## Investigations and raw files
+
+- [Distributed SQL bottleneck investigation, 2026-09-04](distributed-sql-bottlenecks-2026-09-04.md).
+- [Wide-key update and mixed-read workload plan](wide-update-workload-plan.md), a proposal rather than a measurement.
+- [Distributed planner raw output, Go 1.27](distributed-planner-go127.txt), used by the
+  [distributed optimizer guide](../distributed-optimizer.md).
+
+Many reports compare VibeDB with CockroachDB on a single Docker host with a
+shared CPU and memory ceiling. They are engineering measurements for one
+revision and workload, not product performance claims. Several record results
+where VibeDB is slower than the comparison system. CI qualification runs are
+listed separately in the [qualification index](../qualification/README.md).
 
 ## Read archived evidence
 

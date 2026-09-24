@@ -2,9 +2,16 @@
 
 [Documentation](README.md) / [Research records](design/research.md)
 
-**Record scope:** This page retains a dated proposal or investigation. Its
-revision-specific findings and future work are not the current operating guide.
-See [architecture](architecture.md) and [operations](operations/README.md).
+**Record scope:** This is the 2026-09-04 CI performance investigation. Its final
+proof run is main commit `2c1fb725`. The findings describe that workflow
+revision. For the current CI layout and how to reproduce each job, see
+[build and test](development/build-and-test.md#the-ci-workflow-at-a-glance).
+
+Changes since this record: `ci.yml` gained two jobs, `Native RF3 SQL and
+restart` (Ubuntu and macOS) and `RF3 read-authority default and protocol`. A
+recent `main` run has 28 jobs instead of 25. Several qualifications also run as
+separate workflows, listed in the [qualification index](qualification/README.md). The measurements below were not
+repeated for the current layout.
 
 The original target was a 5x reduction from the 27m40s historical passing
 run, or 5m32s end to end. The later same-source-era target was a 2x reduction

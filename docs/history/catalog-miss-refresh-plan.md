@@ -1,10 +1,12 @@
 # Catalog visibility across physical frontends
 
-[Documentation](README.md) / [Research records](design/research.md)
+[Documentation](../README.md) / [History](README.md)
+
+> **Superseded:** implemented in `6402842cb`; see [request routing](../design/routing.md#catalog-generations).
 
 **Record scope:** This page retains a dated proposal or investigation. Its
 revision-specific findings and future work are not the current operating guide.
-See [architecture](architecture.md) and [operations](operations/README.md).
+See [architecture](../architecture.md) and [operations](../operations/README.md).
 
 Frozen baseline `7dc21395110fa79b90b13dde7848a3bc13090d6d` reproduces two
 failures in the real Linux/ARM64 process qualification with Go 1.27 SIMD:

@@ -3,69 +3,67 @@
 [Documentation](README.md) / [Design](design/README.md) · [Development status](status.md)
 
 VibeDB stores keyed JSON values in named collections. This page defines the
-application-visible model of the root `vibedb` package and calls out the places
-where the two low-level storage packages deliberately differ.
+application-visible model of the root `vibedb` package and notes where the
+low-level storage packages and the SQL driver differ.
 
 ## Keep the API layers separate
 
 | Layer | Model | Intended use |
 | --- | --- | --- |
-| `vibedb` | Owned database lifecycle, canonical JSON, three durability profiles | Applications; this page uses this layer by default |
-| `store` | Heap-resident engine, explicit immutable snapshots and engine geometry | Engine integration and specialized in-process workloads |
-| `store/durable` | File-backed engine, explicit descriptor and snapshot ownership | Storage integrations that need low-level control |
+| `vibedb` | Owned database lifecycle, canonical JSON, three durability profiles | Applications; this page describes this layer unless noted |
+| `sql/driver` | SQL tables over the same document engine, with declared columns and a primary-key path | SQL applications and pgwire |
+| `store` | Heap-resident engine with explicit immutable snapshots | Engine integration and in-process workloads |
+| `store/durable` | File-backed engine with explicit descriptor and snapshot ownership | Storage integrations that need low-level control |
 
-A guarantee made by one layer does not automatically belong to another. In
-particular, `store.Collection` does not promise the facade's canonical output,
-and `store/durable.Options.OpaqueValues` is not part of the facade's JSON model.
+A guarantee of one layer does not automatically hold in another. For example,
+`store.Collection` does not canonicalize values, and
+`store/durable.Options.OpaqueValues` is not part of the facade's JSON model.
 
 ## Logical shape
 
 ```text
 Database
-└── Collection name
-    ├── Key → JSON value
-    ├── Key → JSON value
-    └── Exact indexes over JSON Pointer paths
+└── Collection (by name)
+    ├── key → JSON value
+    ├── key → JSON value
+    ├── exact indexes over JSON Pointer paths
+    └── tin (full-text) indexes over one string path each
 ```
 
 - A database is a catalog of collections.
-- A collection is a map from one key to one JSON value.
-- A key is unique only within its collection.
-- A `Put` for an existing key replaces the complete value atomically.
-- A `Delete` of a missing key is a successful no-op.
-- The facade has no foreign keys, cascades, or cross-collection uniqueness.
+- A collection maps each key to exactly one JSON value.
+- A key is unique within its collection.
+- `Put` for an existing key replaces the complete value atomically; there is
+  no partial update or patch operation in the facade.
+- `Delete` of a missing key is a successful no-op.
+- There are no foreign keys, cascades, or cross-collection uniqueness.
 
-`Database.Collection(name)` returns a stable, lazy handle. Getting the handle
-does no I/O and creates no collection. Reads from an absent collection behave as
-empty reads; its first valid mutation creates it. `CreateIndex` also materializes
-an absent collection.
+`Database.Collection(name)` returns a stable, lazy handle. Getting it does no
+I/O. Reads from an absent collection behave as empty; the first valid
+mutation or index creation creates it.
 
 ## Names and keys
 
-| Item | Facade rule | Default bound |
+| Item | Rule | Default bound |
 | --- | --- | ---: |
-| Collection name | Non-empty, valid UTF-8, at most `MaxCollectionNameBytes` | 120 bytes |
-| Key | Non-empty Go string; treated as bytes, not JSON | 256 bytes |
-| JSON value | Non-empty, valid JSON, within the collection limit | 4 MiB |
+| Collection name | Nonempty, valid UTF-8, no NUL | 120 bytes |
+| Key | Nonempty Go string, compared as bytes | 256 bytes |
+| JSON value | Nonempty, one complete JSON value | 4 MiB |
 
-The key and value bounds can be changed for newly created disk collections with
-`AdvancedOptions.Engine`. A zero-option reopen adopts the bounds persisted in
-an existing collection rather than overwriting them with facade defaults.
+Key and value bounds can be changed for newly created disk collections with
+`AdvancedOptions.Engine` (`MaxKeyBytes`, `MaxDocumentBytes`). A zero-option
+reopen adopts the bounds persisted in each existing collection.
 
-Collection names are logical strings, not path fragments. Durable catalogs
-encode them into portable filenames; separators, trailing spaces, and distinct
-Unicode normalization forms remain distinct names. Do not infer a collection
-name from, or construct one of, those filenames.
-
-For behavior that is portable across all current profiles, exclude NUL from
-collection names. The facade and durable codec accept it as UTF-8, while the
-low-level heap catalog currently rejects NUL-bearing names.
+Collection names are logical strings, not path fragments. Disk profiles
+hex-encode them into file names (`users` becomes `c-7573657273.vjc`), so
+separators, trailing spaces, and different Unicode normalization forms remain
+distinct names. Do not construct or parse those file names.
 
 ## JSON values
 
-Any JSON root value is legal unless a schema narrows it: object, array, string,
-number, boolean, or null. The facade validates every write and returns canonical
-JSON bytes from `Get`, `Append`, and `Range`.
+Any JSON root value is legal unless a schema narrows it: object, array,
+string, number, boolean, or null. The facade validates every write and returns
+canonical JSON from `Get`, `Append`, and `Range`.
 
 ```go
 created, err := users.Put("user:42", []byte(`{
@@ -74,128 +72,145 @@ created, err := users.Put("user:42", []byte(`{
 }`))
 
 doc, found, err := users.Get("user:42")
-// doc is caller-owned canonical JSON.
+// doc is `{"active":true,"name":"Ada"}` and is owned by the caller.
 ```
 
-Canonicalization is an encoding contract, not an application schema. Code that
-needs a field to exist or have a particular type must define a schema or check
-the value. Do not depend on the input's whitespace or other source spelling
-surviving a facade write.
+### Canonical JSON
 
-`store/durable` can instead persist non-empty opaque bytes. Opaque mode disables
-JSON parsing, schemas, exact indexes, skip indexes, and JSON representation
-options. Use that low-level API directly; do not enable opaque mode through
-`vibedb.AdvancedOptions`, whose facade operations retain JSON semantics.
+Canonicalization is a deterministic storage encoding, not RFC 8785:
+
+- insignificant whitespace is removed;
+- object members are sorted by key bytes (UTF-8 order), recursively;
+- duplicate member names are kept, in their original relative order;
+- array order is preserved;
+- string escapes are normalized;
+- **number spellings are preserved**: `1.0e0` stays `1.0e0`.
+
+Queries compare numbers by exact decimal value, so `1`, `1.0`, and `1e0` are
+equal in predicates, grouping, and indexes even though their stored bytes
+differ. When an object has duplicate member names, path reads use the last
+occurrence. Code that needs a field to exist or have a type must use a schema
+or check the value; do not depend on input byte spelling surviving a write.
+
+`store/durable` can instead store nonempty opaque bytes. Opaque mode disables
+JSON parsing, schemas, and indexes. Use that low-level API directly; do not
+enable it through `vibedb.AdvancedOptions`.
 
 ## Schemas
 
-A schema is compiled once with `store.CompileSchema` and supplied in collection
-options. It can constrain the root and selected RFC 6901 JSON Pointer paths.
+A schema is compiled once with `store.CompileSchema` and supplied in
+`AdvancedOptions.Engine.Collection.Schema`. It constrains the root type and
+selected RFC 6901 paths:
+
+```go
+schema, err := store.CompileSchema(store.SchemaDefinition{
+	Root: store.SchemaObject,
+	Fields: []store.SchemaField{
+		{Path: "/name", Types: store.SchemaString, Required: true},
+		{Path: "/age", Types: store.SchemaInteger | store.SchemaNull},
+	},
+})
+```
 
 | Rule | Meaning |
 | --- | --- |
-| `Root == 0` | Accept any JSON root type |
-| `Required == true` | The path must be present |
+| `Root == 0` | Accept any root type |
+| `Required: true` | The path must be present |
 | `SchemaNull` in `Types` | A present JSON null is allowed |
-| Unspecified path | Allowed; schemas are open to additional fields |
-| `SchemaInteger` | Lexical JSON integer: no fraction or exponent |
+| Unspecified path | Allowed; schemas are open to extra fields |
+| `SchemaInteger` | A number written without a fraction or exponent |
 | `SchemaNumber` | Any JSON number, including integers |
 
-Compilation rejects invalid or duplicate paths. A failed write returns a typed
-`*store.SchemaViolationError`, matches `store.ErrSchemaViolation` with
-`errors.Is`, and publishes nothing. Compiled schemas are immutable and safe to
-share. Collection creation freezes the schema contract.
+Compilation rejects invalid or duplicate paths. A failed write returns a
+`*store.SchemaViolationError` that matches `store.ErrSchemaViolation` and
+publishes nothing. A schema is frozen when the collection is created;
+existing durable collections keep their persisted schema. SQL tables derive
+a schema from their declared columns.
 
 ## Exact indexes
 
-The facade creates an index with `Collection.CreateIndex(name, paths...)`.
+`Collection.CreateIndex(name, paths...)` creates a non-unique exact index.
 
-- Each path is an RFC 6901 JSON Pointer.
-- One path creates a scalar index; two to four create an order-sensitive
-  compound index.
-- Null, booleans, numbers, and strings are indexable.
-- Missing paths, unresolvable paths, arrays, and objects are omitted.
-- Index hashes only select candidates; execution rechecks values for correctness.
-- The facade call completes the online build before returning success.
+- Each path is an RFC 6901 JSON Pointer; one path makes a scalar index, two
+  to four make an order-sensitive compound index.
+- Null, booleans, numbers (by exact value), and strings are indexed.
+- Missing paths, arrays, and objects are omitted; an array's elements are not
+  indexed individually.
+- Index terms select candidates only; execution rechecks every candidate.
+- The facade call completes the build before returning.
 
-The facade exposes non-unique exact indexes only. Unique exact indexes are a
-`store/durable` feature; heap `store.Collection.CreateIndex` rejects `Unique`.
-
-Indexes change access paths, not query results. A building low-level heap index
-uses exact scan fallback for uncovered chunks. Later writes maintain every
-published index before their new generation becomes visible.
+Unique exact indexes exist in `store/durable` and SQL (`CREATE UNIQUE
+INDEX`), not in the facade. Later writes maintain every published index
+before their generation becomes visible.
 
 ## Full-text (tin) indexes
 
 `Collection.CreateTinIndex(name, path)` and SQL `CREATE INDEX ... USING tin`
-declare a positional full-text index over exactly one JSON Pointer path. Only
-string values are indexed; other values, null, and absent paths are omitted
-and never match. Text is tokenized into words and folded for case and
-accents. Index contents are derived per generation from that generation's
-own documents, so a reader never sees postings from another generation. The
-durable catalog stores the declaration, not the postings: each durable
-generation builds its postings on first use. A durable catalog admits at most
-64 tin declarations. Full-text predicates rank with BM25; see the
-[native search API](api/native.md#search-text-with-a-tin-index) and the
-[SQL reference](reference/sql.md).
+declare a full-text index over one string path. Other values never match.
+Text is tokenized into words and folded for case and Latin-1 accents. The
+index is derived from the same generation a query reads, and it is rebuilt in
+memory for each new generation that is searched. See
+[full-text search](api/search.md).
 
 ## Reads and immutable generations
 
-Every successful state-changing mutation publishes an immutable collection state.
-Readers that already hold the old state continue to see it.
+Every successful mutation publishes a new immutable collection generation.
+Readers that hold an older generation keep seeing it.
 
 | Operation | View and ownership |
 | --- | --- |
-| `Get` | Current value; returned bytes are owned by the caller |
+| `Get` | Current value; bytes owned by the caller |
 | `Append` | Appends an owned value to caller storage; a miss leaves it unchanged |
-| `Range` | One immutable generation; key and value are borrowed for the callback |
-| `Run` | One immutable generation; release the one-off query result |
-| `Session.Run` | Fresh generation per call; result lasts until the next run or release |
+| `Range` | One immutable generation; key and value borrowed for the callback |
+| `Run` | One immutable generation; release the result |
+| `Session.Run` | Fresh generation per call; result valid until the next run |
 | `Database.View` | One coherent cut across all collections |
 
-Copy callback bytes before retaining them. Do not mutate borrowed bytes. The
-facade does not promise a portable `Range` order: heap traversal is stable
-chunk/slot order, while durable traversal is bytewise lexical key order.
-
-Several independent `Get` calls are not a snapshot and may cross publications.
-Use `Database.View` when reads from different keys or collections must belong to
-one coherent cut.
+`Range` order is bytewise lexical key order on disk profiles and physical
+slot order on `Memory`. Separate `Get` calls are not a snapshot; use
+`Database.View` when reads from different keys or collections must come from
+one cut.
 
 ## Transactions and generations
 
 `Database.Update` and `Begin` provide serializable, read-your-writes
-transactions. A conflict publishes nothing and returns `ErrTxConflict`; the
-caller owns the retry policy. `Database.View` and `BeginReadOnly` never publish.
+transactions; a conflict publishes nothing and returns `ErrTxConflict`.
+`Buffered` refuses a transaction that writes two or more collections. See
+[transactions](transactions.md).
 
-The `Buffered` facade profile accepts a transaction that dirties one collection
-but refuses a transaction that dirties two or more with
-`ErrTxUnsupportedLane`. `Durable` and `Memory` support bounded
-multi-collection commits.
-
-A generation is a per-collection publication counter. It is not a database
-revision, wall clock, transaction ID, or cross-collection ordering token. In the
-buffered profile, `Metrics.DurableGeneration` may trail
-`PublishedGeneration` until `Flush` or `Close` succeeds. The Memory profile
-reports a durable generation of zero.
+A generation is a per-collection publication counter, not a database
+revision, clock, transaction ID, or cross-collection ordering token. A failed
+low-level batch can advance it without changing logical content. On
+`Buffered`, `Metrics.DurableGeneration` trails `PublishedGeneration` until
+`Flush` or `Close`; on `Memory` it is zero.
 
 ## Modeling guidance
 
-- Use stable, compact keys that encode application identity, not JSON structure.
-- Keep one consistency boundary in one document when whole-value replacement is
-  the natural update.
-- Split collections by lifecycle, schema, or access pattern—not by physical
-  filename concerns.
-- Use a transaction for invariants spanning documents or collections.
-- Treat generation numbers as observability data, not durable business versions.
-- Keep exportable source data while testing upgrades; there is no compatibility
-  or migration promise between development commits.
+- Use stable, compact keys that encode application identity.
+- Keep data that changes together in one document when whole-value
+  replacement is the natural update.
+- Split collections by lifecycle, schema, or access pattern.
+- Use a transaction for invariants that span documents or collections.
+- Treat generation numbers as observability data, not business versions.
+- Keep exportable source data: there is no compatibility or migration promise
+  between development revisions.
+
+## Limitations
+
+- No partial updates, JSON patch, or server-side document merge in the
+  facade; SQL `UPDATE` assignments are the only field-level write path.
+- No secondary indexes over array elements, and no expression or partial
+  indexes.
+- Keys are opaque bytes with no range-scan API in the facade; ordered access
+  goes through queries.
+- Canonical output preserves number spelling and duplicate members, so two
+  semantically equal documents can have different stored bytes.
 
 ## Source map
 
-- Facade model and bounds: [vibedb.go](../vibedb.go) (`Open`, `Collection`, `Put`, `Get`, `Range`, `Metrics`)
+- Facade model and bounds: [vibedb.go](../vibedb.go)
 - Transaction cuts and overlays: [vibedb_txn.go](../vibedb_txn.go)
-- Query result lifetimes: [vibedb_query.go](../vibedb_query.go)
 - Collection-name codec: [internal/collectionname/collectionname.go](../internal/collectionname/collectionname.go)
 - Schemas and exact indexes: [store/store_schema.go](../store/store_schema.go), [store/store_index_exact.go](../store/store_index_exact.go)
-- Heap snapshot behavior: [store/engine.go](../store/engine.go)
-- Durable opaque mode and limits: [store/durable/store_file_options.go](../store/durable/store_file_options.go)
+- Heap snapshots: [store/engine.go](../store/engine.go)
+- Durable options and opaque mode: [store/durable/store_file_options.go](../store/durable/store_file_options.go)

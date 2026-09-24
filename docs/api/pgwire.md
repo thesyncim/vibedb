@@ -75,7 +75,15 @@ func run() (err error) {
 }
 ```
 
-Run the program, connect psql to the printed URL, and press `Ctrl-C` to stop.
+Run the program from a scratch directory; it creates the catalog `app.vdb`
+(with `app.vdb.lock` and `app.vdb.tables`) there. Connect psql to the printed
+URL, and press `Ctrl-C` to stop:
+
+```sh
+psql 'postgresql://app@127.0.0.1:PORT/app?sslmode=disable' -c 'SELECT 1'
+```
+
+Replace `PORT` with the port the program printed.
 
 `NewServer` borrows the database. Close the server first; `Server.Close` stops
 listeners, cancels sessions, waits for them, and then returns. Close the
@@ -267,12 +275,21 @@ TCP and SCRAM. TLS+SCRAM has a pgx gate. Stock psql 18.4 and Java 17 with JDBC
 Zero-valued options select finite defaults. `-1` disables supported connection,
 result, intermediate, or timeout limits; other execution limits still apply.
 
-## Explicitly unsupported
+## Limitations
 
-Do not expect COPY, replication, LISTEN/NOTIFY, logical decoding, large objects,
-PostgreSQL extensions/functions, materialized views, general catalog queries,
-direct TLS, holdable cursors, or arbitrary ORM discovery. Unsupported SQL maps
-to `0A000`; unknown frontend messages map to `08P01`.
+- Not PostgreSQL: the SQL dialect, type system, and catalogs are VibeDB's.
+  The PostgreSQL regression ratchet has zero approved tests.
+- No COPY, replication, LISTEN/NOTIFY, logical decoding, large objects,
+  PostgreSQL extensions or functions, materialized views, general catalog
+  queries, direct TLS, holdable cursors, or arbitrary ORM discovery.
+  Unsupported SQL maps to `0A000`; unknown frontend messages map to `08P01`.
+- Catalog discovery recognizes only exact captured query shapes.
+- No SCRAM channel binding, SASLprep, MD5, GSS, or credential persistence.
+- Text-format integer and float parameters bind as exact JSON numbers without
+  PostgreSQL width or range checks; binary `numeric` is unsupported.
+- `RowDescription` reports zero table OIDs and attribute numbers.
+- The embedded backend serves one catalog in one process; the RF3 backend is
+  autocommit-only for writes.
 
 ## Source map
 

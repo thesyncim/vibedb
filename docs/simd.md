@@ -116,10 +116,10 @@ architecture, fixtures, and exact revision pairs.
 
 The tin full-text engine has two vector kernels under the same build guard,
 `go1.27 && !go1.28 && goexperiment.simd`. The ASCII case fold (string and
-byte variants) folds 16-byte windows; the commit that introduced it recorded
-13.7 GB/s, 6.9x its scalar loop. The BM25 kernel scores document pairs in
-`Float64x2` lanes; its introducing commit recorded 1.79x scalar with zero
-allocations. ARM64 selects both unconditionally because NEON is baseline;
+byte variants) folds 16-byte windows. The BM25 kernel scores document pairs in
+`Float64x2` lanes. No dated benchmark report covers these two kernels yet;
+`internal/tin` benchmarks (`bench_test.go`, `token_bench_test.go`) measure
+them locally. ARM64 selects both unconditionally because NEON is baseline;
 AMD64 selects them only after the runtime AVX2 check. Every other build
 keeps the scalar fold and BM25 functions.
 
@@ -135,6 +135,19 @@ SQL `SCORE()`) uses the scalar spelling.
 ```sh
 GOEXPERIMENT=nosimd go test ./internal/tin
 ```
+
+## Limitations
+
+- SIMD requires Go 1.27 exactly (`go1.27 && !go1.28`) and
+  `GOEXPERIMENT=simd`; raw `go build` without the experiment, other Go
+  releases, and other architectures use scalar code.
+- AMD64 kernels require AVX2 at run time; there is no AVX-512 path.
+- Only durable, unindexed, ungrouped `COUNT(*)` with one equality or integer
+  ordering predicate, and unfiltered `MIN`/`MAX` over FOR-encoded integers,
+  reach the packed kernels. Any other shape, or any declining leaf, runs the
+  generic executor.
+- Exact decimal `SUM` and `AVG` are never vectorized.
+- BM25 scores can differ in the last bits between SIMD and scalar builds.
 
 ## Source map
 

@@ -1,5 +1,7 @@
 # Executable embedded capability matrix
 
+[Documentation](README.md) / [Stability](status.md) / Embedded capabilities
+
 > [!CAUTION]
 > This is generated evidence for one unreleased commit. APIs, commands, and
 > wire/disk formats may break at any commit. Use matching docs/binaries and
@@ -10,6 +12,12 @@ The matrix is generated from `internal/conformance.Cases`. The native,
 `database/sql`, and embedded pgwire test suites consume the same case IDs. It
 answers whether one exact operation shape succeeds, fails with a documented
 error, and rolls back its rejected sibling.
+
+The matrix covers mutation publication and transaction atomicity. It does not
+list read features: see [search](api/search.md) for tin indexes and their
+transaction refusals, [query execution](design/query-execution.md) for access
+paths, and the [distributed ledger](distributed-feature-state.md) for the RF3
+runtime. [Stability](status.md) lists current limitations.
 
 ## Read the matrix
 

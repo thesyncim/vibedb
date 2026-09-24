@@ -1,6 +1,12 @@
 # Online replica migration
 
-[Documentation](../README.md) / [Operations](README.md) · [Development status](../status.md)
+[Documentation](../README.md) / [Operations](README.md) / Replica migration
+
+This page explains how replica moves are paced on each physical node, how to
+configure that pacing, and how to tell a slow but healthy move from a stuck
+one. Moves are started by [scaling operations](scaling.md) and
+[hot-shard splits](hot-shard-splits.md); there is no separate command to move
+one replica.
 
 Replica movement uses a durable, target-bound snapshot artifact. A scale-out
 learner, a scale-in replacement, and node decommissioning all use the same
@@ -10,11 +16,11 @@ Raft membership, and learner promotion remain separate control-plane steps.
 
 ## Node budget
 
-Migration work is bounded per physical serving node. Construct one
-`migrationbudget.Budget` for the process and inject the same pointer into every
-group provider, source data service, receiver, and cold learner installer on
-that node. Constructing one budget per group would multiply the configured
-allowance as groups are added and would defeat the foreground protection.
+Migration work is bounded per physical serving node, not per group. Every
+group on a node shares one budget, so adding groups does not multiply the
+allowance. (Code that embeds the runtime must inject the same
+`migrationbudget.Budget` into every provider, data service, receiver, and
+learner installer on the node.)
 
 The default is deliberately conservative:
 
@@ -51,8 +57,11 @@ acquisitions, cancellations, and releases.
 Prepared RF3 nodes persist these values in
 `replica_control.migration_budget`. The same object is copied to the node
 runtime when several groups share one physical node, and all groups must agree
-on it. A preparation input may set the optional top-level `migration_budget`
-object; omitted input uses the defaults above. Its shape is:
+on it. A node preparation input (the manifest given to
+`vibedb-shard prepare-node-rf3`) may set the optional top-level
+`migration_budget` object; omitted input uses the defaults above. The local
+launcher always uses the defaults and has no flag to change them. The shape
+is:
 
 ```json
 "migration_budget": {
@@ -71,21 +80,30 @@ source disk work. A phase can account several classes when it really performs
 several kinds of work, but each class is charged once at its corresponding
 execution boundary.
 
-The node-log owner also feeds a lightweight foreground-pressure controller
-from the lock-free `NodeSubmissionSequencer.Stats()` snapshot every 250 ms. It
-uses queue occupancy plus interval deltas for backpressure submissions and
-ready-queue wait time; the initial sample establishes a baseline, and a
-counter reset never becomes a synthetic pressure spike. A high queue, wait
-window, or backpressure event immediately halves the effective migration rate
-and clamps accumulated tokens to the new scaled burst. Severe pressure for
-two samples pauses new heavyweight phases before their next bounded chunk.
-The pause is visible as `Metrics().Pressure.Paused`; it does not revoke work
-already in a bounded read, write, or hash. Three quiet samples recover one
-additive rate step and wake paused work, without a catch-up token windfall.
-The sampler reads detached atomics and never holds a foreground, Raft, or
-authority lock while migration waits. The byte-work CPU class remains a proxy,
-and pressure feedback does not claim an operating-system CPU quota or a zero
-latency penalty under continuous foreground saturation.
+### Foreground pressure
+
+Every 250 ms the node samples its own foreground load and scales the effective
+migration rate. The inputs and default thresholds:
+
+| Signal | High (halve the rate) | Severe (counts toward pause) |
+| --- | --- | --- |
+| Node-log submission queue occupancy | 75% | 90% |
+| Ready-queue wait per submission | 25 ms | 100 ms |
+| Go scheduling latency p99 | 5 ms | never pauses |
+| Backpressure submissions in the interval | any | any |
+
+A high sample halves the rate, down to a floor of 12.5% of the configured
+value, and clamps accumulated tokens so there is no burst afterwards. Two
+consecutive severe samples pause new heavy phases before their next bounded
+chunk; work already inside a read, write, or hash finishes. Three quiet samples
+(queue at most 25%, no high signal) restore 12.5 percentage points and wake
+paused work. Scheduling latency measures CPU contention between foreground and
+migration work in the same process; it slows migration but never pauses it.
+
+The first sample sets a baseline, and a counter reset never becomes a false
+spike. The sampler reads detached atomics and holds no foreground, Raft, or
+authority lock. Pressure feedback reduces migration's share; it does not
+guarantee zero foreground latency impact under continuous saturation.
 
 `CPU` is a serialized snapshot encoding and hashing byte-work proxy. It does
 not reserve cores or impose an operating-system CPU quota. Artifact framing
@@ -173,7 +191,7 @@ remain in force. If transfers repeatedly hit their deadline, increase
 the operation deadline to cover the selected rate after checking peer health;
 do not mint a new operation identity or discard its cursor.
 
-## Boundaries and limits
+## Limitations
 
 The budget bounds the migration paths that call it. It does not make a
 filesystem, host scheduler, kernel socket buffer, or every internal encoder
@@ -186,6 +204,13 @@ The artifact descriptor, membership fence, source and target identities, and
 repository cursor remain authoritative during retries. Budget metrics never
 grant membership, serving authority, or a promotion. Only the catalog and
 Raft barriers can complete a scale operation.
+
+- The budget values are fixed at node preparation. Changing them means
+  preparing the node again; there is no runtime control.
+- The pressure thresholds have no configuration surface in the manifest.
+- The `seamless-scale-in-out` qualification lowers network rates to 8 MiB/s
+  with 64 KiB bursts to force visible pacing; the defaults above are not what
+  that workflow measured.
 
 ## Source map
 

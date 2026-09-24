@@ -2,125 +2,109 @@
 
 [Documentation](../README.md) / [Reference](README.md) · [Development status](../status.md)
 
-The repository builds six commands. They are not all end-user tools.
+The repository builds six operator-relevant commands. They are development
+interfaces tied to one exact build; flags and output can change.
 
 | Binary | Role | Status |
 | --- | --- | --- |
-| `vibedb` | local cluster launcher | development convenience |
-| `vibedb-shard` | static and Raft shard process | internal server/admin surface |
-| `vibedb-gateway` | routing, SQL, durable request, and control endpoint | internal server/admin surface |
-| `vibedb-verify` | offline verification, salvage, and repack | operator-facing, requires quiescent input |
-| `vibedb-operator` | render and prepare the Kubernetes test topology | qualification helper, not a controller |
-| `vibedb-kube-qualify` | probe the Kubernetes test topology | qualification helper, not a general client |
+| `vibedb` | Local cluster launcher and online cluster control client | Development |
+| `vibedb-shard` | Static shard, RF3 member, and physical-node server | Internal server and admin surface |
+| `vibedb-gateway` | Standalone gateway, schema rollout, and restore activation | Internal server and admin surface |
+| `vibedb-verify` | Offline verification, salvage, and repack | Operator-facing; requires quiescent input |
+| `vibedb-operator` | Render and prepare the Kind test topology; restore helpers | Qualification helper, not a controller |
+| `vibedb-kube-qualify` | Probe the Kind test topology | Qualification helper, not a general client |
 
-Go's flag parser accepts `-flag` and `--flag` for these commands. Usage errors normally return status 2 and runtime failures status 1, except `vibedb-operator`, which returns 2 for every reported failure. `vibedb-verify` has positional syntax and no conventional `--help` command.
+`cmd/vibedb-sql-audit` is a development audit tool and is not covered here.
+
+## Conventions
+
+- Go's flag parser accepts `-flag` and `--flag`.
+- Every binary prints a usage block and exits 2 when run without a command.
+- Usage errors exit 2 and runtime failures exit 1, with these exceptions:
+  `vibedb-operator` exits 2 for every reported failure; `vibedb-kube-qualify`
+  exits 1 for errors including `-h`; `vibedb-shard` exits 2 when a manifest
+  fails to load.
+- `vibedb-verify` has positional syntax; `-h` is parsed as a path.
 
 ## `vibedb`
 
-### `cluster dev`
-
 ```text
 vibedb cluster dev --root <absolute-path> [flags]
+vibedb cluster nodes|join|rebalance|decommission|status --profile <file> [flags]
 ```
 
-Creates or reopens one durable local development topology and supervises its child processes.
+### `cluster dev`
+
+Creates or reopens one local development topology and supervises its child
+processes until `SIGINT` or `SIGTERM`. Procedure:
+[local cluster](../operations/local-cluster.md).
 
 | Flag | Default | Meaning |
-| --- | ---: | --- |
-| `--root` | none | Required clean absolute cluster directory. It must be absent or empty initially, or contain the exact retained development manifest. |
-| `--replicas` | `3` | `1` for development-only RF1/no HA, or `3` for RF3. |
-| `--physical-nodes` | `0` resolves to `3` for RF3 | RF3 serving-process count: `3` or `6`; rejected for RF1. |
-| `--node-log` | `false` | Shared-log option for development provisioning; physical-node RF3 already requires and creates shared node logs. |
-| `--nodes` | `0` | Deprecated alias for `--replicas`; conflicting values are rejected. |
-| `--shard-binary` | sibling/PATH | Explicit `vibedb-shard` executable. |
-| `--gateway-binary` | sibling/PATH | Explicit `vibedb-gateway` executable; used only for RF3. |
-| `--diagnostics-on-exit` | `false` | Print bounded child log tails after shutdown. |
-| `--pg-listen` | disabled | RF3-only PostgreSQL endpoint on the first physical node. Requires a literal loopback IP and port `1..65535`. |
-| `--pg-listens` | disabled | Comma-separated distinct loopback endpoints, one per physical node. Mutually exclusive with `--pg-listen`. |
-| `--tls-ca-certificate` | disabled | Absolute PEM CA certificate used to sign this local cluster's leaf identities; must be paired with `--tls-ca-key`. The CA is local provisioning input. |
-| `--tls-ca-key` | disabled | Absolute PEM CA private key paired with `--tls-ca-certificate`; it is read only during local provisioning and is never transmitted. |
-| `--read-authority` | omitted | Explicitly enable or disable quorum read authority on RF3 physical-node voters. When omitted, a fresh supported Linux RF3 physical cluster enables the fixed policy automatically; a retained cluster reuses its recorded policy exactly. |
-| `--table-schema` | none | Repeatable RF3-only file, each containing one `CREATE TABLE` with one primary key; retained on restart. |
+| --- | --- | --- |
+| `--root` | required | Absolute, clean path. Absent or empty on first start (a leftover `.supervisor.lock` is allowed), or holding the exact retained manifest. |
+| `--replicas` | `3` | `1` (development only, no HA) or `3`. |
+| `--physical-nodes` | `0`, meaning `3` for RF3 | `3` or `6` for RF3; an explicit `0` and any value with RF1 are refused. Must match the root on restart. |
+| `--pg-listen` | disabled | RF3 only. SQL endpoint on physical node 1. Literal loopback IP and port. |
+| `--pg-listens` | disabled | RF3 only. Comma-separated distinct loopback endpoints, one per physical node. Exclusive with `--pg-listen`. |
+| `--table-schema` | none | RF3 only, repeatable. File with one `CREATE TABLE` and one primary key; provisioned as an extra group and retained. |
+| `--read-authority` | omitted | Explicitly enable or disable the RF3 read-authority policy. Omitted: platform default on first start, recorded policy on restart. A value that differs from the recorded policy is refused. |
+| `--tls-ca-certificate`, `--tls-ca-key` | generated | Absolute PEM CA pair used to sign this cluster's leaf identities. Both or neither. The key is read locally and never transmitted. |
+| `--shard-binary` | beside `vibedb`, then `PATH` | Explicit `vibedb-shard` executable. |
+| `--gateway-binary` | unused for RF3 | Only resolved for the legacy RF1 path when given explicitly. RF3 frontends run inside `vibedb-shard`. |
+| `--node-log` | `false` | RF3 only; shared node log for a non-physical layout. Physical-node RF3 always uses node logs. |
+| `--nodes` | `0` | Deprecated alias for `--replicas`; conflicting values are refused. |
+| `--diagnostics-on-exit` | `false` | Print the last 64 KiB of each child's output when the supervisor stops. |
 
-RF1 starts three independent single-member Raft groups and no gateway. RF3
-starts three physical serving nodes by default, or six with `--physical-nodes`.
-Each node embeds a frontend and shares node storage across its groups; each
-catalog, request-ledger, and data group still has three replicas. The current
-launcher persists format-2 topology and rejects obsolete layouts. See the
-[local cluster tutorial](../operations/local-cluster.md).
+Output and lifecycle:
 
-Fresh RF3 physical clusters with three or six serving nodes use the fixed
-read-authority policy automatically when the qualified elapsed clock is
-available. Use `--read-authority=false` to keep a fresh cluster on ReadIndex,
-or `--read-authority=true` to require the policy explicitly. On restart, an
-omitted flag reuses the manifest's exact policy; an explicit value that differs
-from the retained policy is refused before reconciliation. Unsupported
-platforms keep fresh deployments on ReadIndex, while a retained enabled policy
-fails closed rather than being removed.
+- Readiness line for physical-node RF3:
+  `VibeDB development RF3 physical cluster ready: <native-client-address> (<n> nodes)`.
+  RF1 prints `VibeDB development RF1 ready (no HA): <address>`.
+- Each child must report ready within 30 seconds.
+- If a child exits, the supervisor stops the others and exits 1.
+- On shutdown, children receive `SIGTERM`; any still running after 10 seconds
+  in total are killed.
+- A second supervisor on the same root is refused through `.supervisor.lock`.
 
-```sh
-go build -o ./bin/vibedb ./cmd/vibedb
-go build -o ./bin/vibedb-shard ./cmd/vibedb-shard
-go build -o ./bin/vibedb-gateway ./cmd/vibedb-gateway
-```
-
-The switch uses
-Linux `CLOCK_BOOTTIME`, a fixed v1 policy (5 s maximum grant, 100000 ppm rate
-bound, and 1 ms margin), and an authenticated asynchronous incarnation cache.
-Deployment assumes every participant's elapsed clock rate stays within ±10% of
-real elapsed time, including VM or container suspension and resume. Linux
-`CLOCK_BOOTTIME` availability and one successful startup `Now` call cannot
-prove that rate assumption or future suspend behavior, so qualify the host and
-virtualization environment separately. The holder's usable interval is about
-4.09 s of elapsed-clock time; a promise can delay a follower's election edge
-by the configured 5 s elapsed-clock grant window. These configured durations
-are not hard wall-clock upper bounds under the ±10% assumption (a slow clock
-can make 5 s about 5.56 s of real time). A restarted voter remains in about
-6.11 s of configured elapsed-clock quarantine, including the margin. An
-explicit enable on an unsupported platform or an unsupported
-topology is refused before the local policy marker is written. With the feature
-disabled, linearizable reads keep using the ordinary ReadIndex path. The
-launcher rejects a forgotten, changed, or downgraded setting on an existing
-root.
-An old binary cannot interpret the marker, so deployments must not restore a
-pre-enrollment manifest with an old binary while an authority marker is live.
+The read-authority policy requires Linux `CLOCK_BOOTTIME`; see
+[local cluster](../operations/local-cluster.md#read-authority-policy) for the
+clock assumption and timing.
 
 ### Online cluster control
 
-The `nodes`, `join`, `rebalance`, `decommission`, and `status` commands use
-the authenticated gateway-client listener. They send one canonical,
-newline-delimited control envelope and return one bounded response. The
-profile is a local file containing the endpoint, expected server node ID, and
-the client certificate, key, roots, and identity OID paths:
-
-```json
-{"format":1,"address":"127.0.0.1:17400","server_node":"<32 hex characters>","certificate":"/path/client-cert.pem","key":"/path/client-key.pem","roots":"/path/roots.pem","identity_oid":"1.3.6.1.4.1.32473.1.1"}
-```
+`nodes`, `join`, `rebalance`, `decommission`, and `status` send one canonical
+request to a frontend's authenticated native client listener and print one
+bounded response. Procedure: [scale and decommission](../operations/scaling.md).
 
 ```text
-vibedb cluster nodes --profile <auth-client.vibejson> [--json] [--wait duration]
-vibedb cluster join --profile <auth-client.vibejson> --node-file <public-node.vibejson> [--json] [--request-id <64 hex characters>] [--wait duration]
-vibedb cluster rebalance --profile <auth-client.vibejson> [--max-moves n] [--max-migration-bytes n] [--desired-node-count n] [--hysteresis-ppm n] [--json] [--request-id <64 hex characters>] [--wait duration]
-vibedb cluster decommission --profile <auth-client.vibejson> --node <32 hex characters> --incarnation n [--json] [--request-id <64 hex characters>] [--wait duration]
-vibedb cluster status --profile <auth-client.vibejson> --operation <64 hex characters> [--json] [--wait duration]
+vibedb cluster nodes        --profile <file> [--json] [--wait d]
+vibedb cluster join         --profile <file> --node-file <descriptor> [--request-id hex] [--json] [--wait d]
+vibedb cluster rebalance    --profile <file> [--desired-node-count n] [--max-moves n] [--max-migration-bytes n] [--hysteresis-ppm n] [--request-id hex] [--json] [--wait d]
+vibedb cluster decommission --profile <file> --node <32 hex> --incarnation n [--request-id hex] [--json] [--wait d]
+vibedb cluster status       --profile <file> --operation <64 hex> [--json] [--wait d]
 ```
 
-Mutating requests use the same request ID when retried after an ambiguous
-response. The server returns an operation ID before a long wait completes;
-`status --operation` resolves that durable operation later. Cancelling
-`--wait` only ends the client wait and never rolls back the operation. A join
-descriptor contains public node identity, roles, listener addresses, and
-capacity facts. Private keys, certificate paths, WAL paths, and process roots
-are rejected by the descriptor decoder and never enter the request envelope.
-`--json` emits the canonical response, including directory and catalog
-revisions, blockers, safe-to-stop, retirement evidence, and migration-budget
-counters.
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--profile` | required | Operator profile: `format`, `address`, `server_node`, `certificate`, `key`, `roots`, `identity_oid`. |
+| `--request-id` | random | 64 lowercase hex characters; the idempotency key. Pass it explicitly for mutations so you can retry. |
+| `--wait` | `0` | Server-side progress wait, at most `24h`. Ending the wait never cancels the operation. |
+| `--json` | `false` | Print the canonical response, including phase, budget, evidence, and moved-group counts. |
+| `--node-file` | join only | Public node descriptor; paths and private keys are rejected. |
+| `--node`, `--incarnation` | decommission only | Node ID (32 hex) and nonzero incarnation. |
+| `--operation` | status only | Operation ID (64 hex). |
+| `--desired-node-count` | `0` | Rebalance target, at most 4096. |
+| `--max-moves` | `4096` when `0` | Moves admitted across the whole operation, at most 4096. |
+| `--max-migration-bytes` | 1 GiB when `0` | Bytes admitted across the whole operation. |
+| `--hysteresis-ppm` | `0` | Minimum placement improvement per move. |
 
-`--max-moves` and `--max-migration-bytes` limit admission across the entire
-durable rebalance request, including completed moves and controller restarts.
-They do not reset for each planning wave. If the remaining budget cannot admit
-the next move, status retains a budget blocker; it never reports a node safe
-to stop merely because the request reached its limit.
+Flags that belong to another operation are refused. `nodes` and `status`
+require the `topology` capability; the mutations also require `membership`.
+The client deadline is `--wait` plus 15 seconds, or 30 seconds without a wait.
+Exit status: 0 for `ok=true`, 1 for `ok=false` or a transport failure, 2 for a
+usage error. Text output prints one summary line, one line per node, one line
+per blocker, and `error=` when present. Error messages use the internal
+operation name, for example `cluster cluster_status: load profile: ...`.
 
 ## `vibedb-shard`
 
@@ -131,8 +115,9 @@ to stop merely because the request reached its limit.
 | `init` | `-store`, `-distribution`, `-shard`, nonzero `-allocation-generation` | Creates a static local shard store and prints its persisted binding and log ID to stderr. |
 | `serve` | the four `init` fields plus nonzero `-epoch` and `-routing-version` | Serves a statically owned shard. This is ownership fencing, not RF3 election. |
 | `prepare-rf3` | `-manifest` | Atomically prepares an RF3 member from a canonical manifest. An exact existing preparation is verified and accepted; it is not blindly overwritten. |
-| `prepare-node-rf3` | `-manifest` | Prepares multiple group replicas under a shared physical-node log. |
-| `serve-node` | `-manifest` | Serves prepared grouped node storage with an embedded gateway; requires explicit gateway configuration and node log. |
+| `prepare-node-rf3` | `-manifest` | Prepares a physical node: its shared node log and zero or more group replicas. With no groups it prepares an empty node for `vibedb cluster join`. |
+| `prepare-node-group-rf3` | `-manifest` | Prepares one more group's SQL state for an existing node without opening its live node log; the serving node adopts it. |
+| `serve-node` | `-manifest` | Serves a prepared physical node with its embedded frontend. Requires a `node_log`, and either groups or an empty-node incarnation. |
 | `serve-rf3` | `-manifest` | Opens exactly prepared artifacts and serves one or more group members. It creates and repairs nothing. |
 | `bootstrap-rf3` | `-manifest` | Installs an authenticated snapshot into a cold learner, then reopens through the ordinary serving path. It continues serving until stopped. |
 | `adopt-restored-rf3` | `-manifest` | Validates restored state against the target identity, roster, apply state, and snapshot, then publishes or verifies `serve-rf3.vibejson`. |
@@ -157,13 +142,20 @@ Without explicit plaintext development mode, the complete TLS profile and author
 | --- | ---: | --- |
 | `-manifest` | none | Required canonical prepared manifest. |
 | `-reload-prepared-groups` | `false` | Allows SIGHUP to append or retire durably prepared groups from the same manifest. |
-| `-execution-lanes` | `8` | Must be a supported power of two. |
+| `-execution-lanes` | `8` | Power of two from 1 to 64. |
 
-A process may serve 1–64 prepared group members. A manifest can explicitly
+A manifest may describe at most 64 groups. A manifest can explicitly
 describe RF1 development-only/no-HA; otherwise this is the RF3 path.
-`serve-node` accepts the same three flags and requires a grouped manifest,
-shared `node_log`, and embedded `gateway` configuration. The local launcher
-constructs this composed path.
+`serve-node` accepts the same three flags. The local launcher runs
+`serve-node -manifest <root>/node-<n>/serve-rf3.vibejson -reload-prepared-groups`.
+Checked-in RF3 listener bounds: native service 64 connections and 16
+concurrent handshakes, replica control 32 and 8, 15 s per native request. The
+embedded frontend defaults to 1,024 client connections and 64 handshakes.
+
+Signals: `SIGUSR1` writes a node diagnostic (see
+[observability](../operations/observability.md#collect-a-physical-node-diagnostic));
+`SIGHUP` reloads prepared groups when `-reload-prepared-groups` is set;
+`SIGINT` and `SIGTERM` stop the process.
 
 ## `vibedb-gateway`
 
@@ -181,6 +173,7 @@ constructs this composed path.
 
 | Area | Flags |
 | --- | --- |
+| bootstrap | `-initial-node-directory ""` (trusted initial physical-node directory for first bootstrap) |
 | catalog | `-catalog ""`; repeatable `-register-table-catalog`; `-catalog-route-seed ""`; `-dev-static-catalog=false`; `-catalog-bootstrap-if-missing=false`; `-catalog-relation=0` |
 | catalog attempts | `-catalog-attempts=8`; `-catalog-attempt-timeout=5s` |
 | controller identity | `-catalog-session-journal ""`; `-durable-ack-key ""`; `-catalog-client-id ""`; `-catalog-retry-home ""`; `-catalog-session-lease=24h` |
@@ -260,7 +253,19 @@ This binary is a development test probe used by the Kind lane. It is not an appl
 | `measure` | `-root=/var/lib/vibedb`; `-max-rss-bytes=1073741824`; `-max-storage-bytes=1073741824`; `-max-wal-bytes=536870912` | On Linux, reads `/proc/1/status`, walks at most 100,000 nonsymlink files, and emits canonical JSON resource evidence. |
 | `dns` | `-namespace=vibedb-test`; `-timeout=30s` | Resolves nine shard Pod names plus the gateway and emits canonical JSON. Timeout must not exceed two minutes. |
 
-Client runs have a two-minute whole-run bound, fifteen-second round trips, a 1 MiB response bound, and 1–4096 samples. The exact request state path must be canonical and absolute. Errors, including flag-help termination, return status 1; a missing command returns 2.
+`-address=127.0.0.1:17400`, `-samples=128`, `-max-p99=1s`, and
+`-max-latency=5s` apply to `write` and `verify`. Client runs have a two-minute whole-run bound, fifteen-second round trips, a 1 MiB response bound, and 1–4096 samples. The exact request state path must be canonical and absolute. Errors, including flag-help termination, return status 1; a missing command returns 2.
+
+## Limitations
+
+- No command generates an operator client profile, an empty-node preparation
+  manifest, or a join descriptor.
+- No command rotates certificates, edits authorization policy, or changes a
+  node's migration budget after preparation.
+- `vibedb-gateway serve` is a standalone surface; RF3 physical-node clusters
+  run their frontend inside `vibedb-shard serve-node` with the equivalent
+  settings taken from the node manifest.
+- `--help` output is Go's default flag listing and is not a stable format.
 
 ## Source map
 

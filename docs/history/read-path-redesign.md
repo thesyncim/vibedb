@@ -1,10 +1,12 @@
 # Read-path redesign, active investigation
 
-[Documentation](README.md) / [Research records](design/research.md)
+[Documentation](../README.md) / [History](README.md)
+
+> **Superseded:** the current read design is [reads, leases, and time](../design/reads-and-time.md).
 
 **Record scope:** This page retains a dated proposal or investigation. Its
 revision-specific findings and future work are not the current operating guide.
-See [architecture](architecture.md) and [operations](operations/README.md).
+See [architecture](../architecture.md) and [operations](../operations/README.md).
 
 The admission change removes a measured concurrency limit, but does not remove
 the per-statement quorum round trip or SQL execution cost. The 2x CRDB goal is

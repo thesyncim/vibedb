@@ -44,7 +44,7 @@ are median successful operations/second across the three repetitions.
 | Existing-row update | 8 | 162.8 | 4,107.8 | 0.040× |
 
 These tests do not establish full CockroachDB feature or guarantee parity.
-[The protocol changes](../../distributed-write-lane-proposal.md) retain exact
+[The protocol changes](../../history/distributed-write-lane-proposal.md) retain exact
 prepared mutation bytes across server-side recovery and preserve quorum and
 storage durability. [The bottleneck investigation](../distributed-sql-bottlenecks-2026-09-04.md)
 distinguishes measured latency from remaining hypotheses.

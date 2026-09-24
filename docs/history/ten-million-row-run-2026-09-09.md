@@ -1,6 +1,8 @@
 # Cancelled 10M-row comparison: insertion scaling
 
-The user stopped this run during VibeDB loading. The client acknowledged
+[Documentation](../README.md) / [History](README.md)
+
+This run was stopped manually during VibeDB loading. The client acknowledged
 4,871,616 rows in 930.79 seconds (15m31s), averaging 5,234 rows/s.
 CockroachDB and the measured read trials never started. This is not a
 completed 10M comparison and establishes no space advantage over CockroachDB.
@@ -32,7 +34,7 @@ from an autonomous database failure. Full post-load verification did not run.
 
 ## Concrete structural issue
 
-The current [resident router](../internal/storeio/resident_primary_router.go)
+The current [resident router](../../internal/storeio/resident_primary_router.go)
 performs work proportional to the collection's entire leaf count during a
 local leaf split. `SplitLeafPartition` scans every resident route to validate
 tablet identities, allocates a new global image, copies every routing entry
@@ -40,9 +42,9 @@ and fence, and rebuilds all search keys. The scalar `SplitLeaf` path also
 copies the global image. This cost increases as the table grows even when
 the corresponding on-disk change is local.
 
-The [batch topology path](../store/durable/store_file_primary_batch_topology.go)
+The [batch topology path](../../store/durable/store_file_primary_batch_topology.go)
 first calls `flushPendingForStructural`. Its
-[structural transaction implementation](../store/durable/store_file_primary_structural.go)
+[structural transaction implementation](../../store/durable/store_file_primary_structural.go)
 checkpoints pending canonical changes before the split and flushes the
 structural publication afterward. These barriers currently protect durable
 root and retirement ordering; simply deleting them would be incorrect.
@@ -76,7 +78,7 @@ containers were untouched.
 - Client source: `bce6064d02f11e8d7364166b3c06ec54bc89f9b5`.
 - Frozen runner SHA-256:
   `c90c6b0747173194fae107ad266fa69bd8ddffcd0c1465ca6d0ed63579f56c57`.
-- [Machine-readable partial results and evidence hashes](benchmarks/ten-million-2026-09-09/cancelled-summary.json).
+- [Machine-readable partial results and evidence hashes](../benchmarks/ten-million-2026-09-09/cancelled-summary.json).
 - Local raw evidence: `/private/tmp/vibedb-10m-final-23f884e-sep8`.
 - Earlier profile:
   `/private/tmp/vibedb-insert-rf3-scale-ccf-20260908-retry1/tail/leader-structural.cpu.top.txt`.

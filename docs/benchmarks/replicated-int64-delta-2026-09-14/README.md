@@ -122,8 +122,7 @@ clean checkout of `df5c0637375a89e0b51a48ba76961521cca309bb`):
 
 ```sh
 PATH=/private/tmp/vibedb-go-shim:$PATH \
-CODEX_AGENT_ID=write_validation \
-/Users/thesyncim/.codex/bin/project-env python3 scripts/bench/run-crdb-sql-comparison.py /new/evidence/path \
+python3 scripts/bench/run-crdb-sql-comparison.py /new/evidence/path \
   --node-log --rows 8192 --operations 50000 --scans 5000 \
   --warmup 5000 --repetitions 3 --clients 8 \
   --workloads update_existing --order vibedb-first --timeout 30m
@@ -197,8 +196,7 @@ The retry-mode campaigns were reproduced with:
 
 ```sh
 PATH=/private/tmp/vibedb-go-shim:$PATH \
-CODEX_AGENT_ID=write_validation \
-/Users/thesyncim/.codex/bin/project-env python3 scripts/bench/run-crdb-sql-comparison.py /new/evidence/path \
+python3 scripts/bench/run-crdb-sql-comparison.py /new/evidence/path \
   --node-log --rows 8192 --operations 10000 --scans 1000 \
   --warmup 1000 --repetitions 3 --clients 8 \
   --workloads update_hot --retry-transient --order vibedb-first --timeout 30m
@@ -303,13 +301,13 @@ therefore supports a material 2.80× improvement for this workload, not the
 
 ## Validation
 
-All Go commands used `/Users/thesyncim/.codex/bin/project-env`:
+All Go commands ran through a private environment wrapper that selects the Go toolchain:
 
 ```sh
-CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test ./gateway ./internal/replication ./internal/replicatedstate -count=1 -timeout=20m
-CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test -race ./gateway -run 'TestPreparedDirectIntegerUpdate|TestDurableSQLSingleTargetFastPathSkipsLedgerAndReplaysExactly|TestReplicatedDirectMutationIsOneProposalWithCrossGatewayExactRetry|TestReplicatedDirectInt64DeltaConcurrentSameKeyIncrements' -count=1 -timeout=15m
-CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test -race ./internal/replication ./internal/replicatedstate -run 'TestJSONInt64Delta|TestMaterializeJSONInt64Delta|TestGolden|TestApplyContract|TestTransition' -count=1 -timeout=15m
-cd integration/pgclient && CODEX_AGENT_ID=write_validation /Users/thesyncim/.codex/bin/project-env go test ./cmd/rf3-sqlbench -count=1 -timeout=15m
+go test ./gateway ./internal/replication ./internal/replicatedstate -count=1 -timeout=20m
+go test -race ./gateway -run 'TestPreparedDirectIntegerUpdate|TestDurableSQLSingleTargetFastPathSkipsLedgerAndReplaysExactly|TestReplicatedDirectMutationIsOneProposalWithCrossGatewayExactRetry|TestReplicatedDirectInt64DeltaConcurrentSameKeyIncrements' -count=1 -timeout=15m
+go test -race ./internal/replication ./internal/replicatedstate -run 'TestJSONInt64Delta|TestMaterializeJSONInt64Delta|TestGolden|TestApplyContract|TestTransition' -count=1 -timeout=15m
+cd integration/pgclient && go test ./cmd/rf3-sqlbench -count=1 -timeout=15m
 ```
 
 The first command passed gateway (84.413s), replication (0.520s), and
