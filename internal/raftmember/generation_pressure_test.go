@@ -120,6 +120,13 @@ func TestRuntimeWALPressureRecoveryAfterRestart(t *testing.T) {
 	}
 }
 
+// testAsyncDeadline bounds waits on work that runs on the runtime's own
+// workers (pipelined appends, fsync, generation builds). Shared CI runners do
+// not bound fsync or scheduling latency, and a tight wall clock turned a slow
+// runner into a false stall; a genuine stall still fails, with state, well
+// inside the package test timeout.
+const testAsyncDeadline = 45 * time.Second
+
 func TestPipelinedWALPressureDrainsUncapturedReady(t *testing.T) {
 	options := testWALOptions()
 	options.MaxRecords = 16
@@ -129,7 +136,7 @@ func TestPipelinedWALPressureDrainsUncapturedReady(t *testing.T) {
 	drain := func() {
 		t.Helper()
 		var workspace ReadyWorkspace
-		deadline := time.Now().Add(5 * time.Second)
+		deadline := time.Now().Add(testAsyncDeadline)
 		for time.Now().Before(deadline) {
 			if fixture.runtime.walGenerationQuiescent() {
 				return
@@ -145,7 +152,9 @@ func TestPipelinedWALPressureDrainsUncapturedReady(t *testing.T) {
 				time.Sleep(100 * time.Microsecond)
 			}
 		}
-		t.Fatal("pipelined pressure drain stalled")
+		ready, readyErr := fixture.runtime.node.HasReady()
+		t.Fatalf("pipelined pressure drain stalled: phase=%v pipeline=%s ready=%t err=%v",
+			fixture.runtime.node.Phase(), fixture.runtime.pipelined, ready, readyErr)
 	}
 	drain()
 	if err := fixture.runtime.Campaign(); err != nil {
@@ -224,7 +233,7 @@ func TestPipelinedRuntimeWALPressureCompactsBeforePeriodicMaintenance(t *testing
 	})
 	drain := func() {
 		t.Helper()
-		deadline := time.NewTimer(5 * time.Second)
+		deadline := time.NewTimer(testAsyncDeadline)
 		defer deadline.Stop()
 		var workspace ReadyWorkspace
 		for {

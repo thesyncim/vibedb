@@ -26,7 +26,7 @@ func TestPipelinedRuntimeProbesRetainedBaseAfterLostFollowerProgress(t *testing.
 	var rejectProbe bool
 	transportFailure := errors.New("probe transport interrupted")
 	drain := func() error {
-		deadline := time.NewTimer(5 * time.Second)
+		deadline := time.NewTimer(testAsyncDeadline)
 		defer deadline.Stop()
 		var workspace ReadyWorkspace
 		for {

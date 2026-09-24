@@ -83,7 +83,7 @@ func TestPipelinedNodeAppendSubmitsQueuedReadyPrefixAfterFirstCompletion(t *test
 		if readyID == 1 {
 			select {
 			case <-entered:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testAsyncDeadline):
 				t.Fatal("first node persistence did not enter the sync fence")
 			}
 		}
@@ -161,7 +161,7 @@ func TestPipelinedNodeAppendShrinksUnsupportedSeriesPrefix(t *testing.T) {
 	}
 	select {
 	case <-entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testAsyncDeadline):
 		t.Fatal("first node persistence did not enter the sync fence")
 	}
 	if err := p.enqueueAppend(pipelinedTestAppendMessage(base.MemberID, 3, 2)); err != nil {
@@ -269,7 +269,7 @@ func pipelinedTestAppendMessage(memberID, entryIndex, readyID uint64) *pb.Messag
 
 func waitPipelinedAppendResult(t *testing.T, p *pipelinedRuntime) DriveResult {
 	t.Helper()
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(testAsyncDeadline)
 	for {
 		result, consumed, err := p.consumeAppendResult()
 		if err != nil {
