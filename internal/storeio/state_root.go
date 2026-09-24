@@ -83,6 +83,21 @@ const (
 	StateOptionTinIndexes
 )
 
+// stateRootMonotonicOptions are catalog-content flags a later generation may
+// set but never clear (declarations are never removed). Every other option is
+// fixed at creation. Root-copy pairing must compare only the fixed options and
+// require the monotonic ones to be non-decreasing in generation order;
+// treating a monotonic flag as fixed makes the pre- and post-declaration root
+// copies look like two unrelated Stores.
+const stateRootMonotonicOptions = StateOptionTinIndexes
+
+// optionsFollow reports whether newer's options may succeed older's in one
+// Store history.
+func optionsFollow(older, newer uint32) bool {
+	return older&^stateRootMonotonicOptions == newer&^stateRootMonotonicOptions &&
+		older&stateRootMonotonicOptions&^newer == 0
+}
+
 const stateRootKnownOptions = StateOptionSchema |
 	StateOptionSkipIndexes |
 	StateOptionCanonicalMaterialization |

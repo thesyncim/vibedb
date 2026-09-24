@@ -82,6 +82,15 @@ func DiscoverMutableInlineBootstrap(
 			discovered != root {
 			return ErrSuperblockConflict
 		}
+		if found && discovered.Generation != root.Generation {
+			older, newer := discovered, root
+			if older.Generation > newer.Generation {
+				older, newer = newer, older
+			}
+			if !optionsFollow(older.State.Options, newer.State.Options) {
+				return ErrSuperblockConflict
+			}
+		}
 		if !found || root.Generation > discovered.Generation {
 			discovered = root
 			found = true

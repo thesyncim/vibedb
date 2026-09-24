@@ -759,6 +759,9 @@ func orderedInlineSuperblocks(
 		if candidates[1].root.Generation > candidates[0].root.Generation {
 			candidates[0], candidates[1] = candidates[1], candidates[0]
 		}
+		if !optionsFollow(candidates[1].root.State.Options, candidates[0].root.State.Options) {
+			return candidates, 0, ErrSuperblockConflict
+		}
 	}
 	return candidates, count, nil
 }
@@ -772,7 +775,8 @@ func sameImmutableInlineConfiguration(
 		left.State.MaxKeyBytes == right.State.MaxKeyBytes &&
 		left.State.InlineValueBytes == right.State.InlineValueBytes &&
 		left.State.MaxDocumentBytes == right.State.MaxDocumentBytes &&
-		left.State.Options == right.State.Options &&
+		left.State.Options&^stateRootMonotonicOptions ==
+			right.State.Options&^stateRootMonotonicOptions &&
 		left.State.IndexMaxDepth == right.State.IndexMaxDepth &&
 		left.State.MaterializationDamageGranule ==
 			right.State.MaterializationDamageGranule
