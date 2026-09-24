@@ -123,14 +123,14 @@ them locally. ARM64 selects both unconditionally because NEON is baseline;
 AMD64 selects them only after the runtime AVX2 check. Every other build
 keeps the scalar fold and BM25 functions.
 
-The fold is exact, so both dispatches produce identical tokens. BM25 is
-bit-identical across dispatches and paths: the scalar spelling performs the
-same IEEE operations in the same order as the vector lanes and rounds each
-product explicitly, so the compiler cannot fuse it into an FMA
-(`TestBM25WideMatchesScalar` demands bit equality). Full sort, top-K, WAND,
-single-document scoring (`ScoreSingle`, SQL `SCORE()`), and sharded batches
-therefore agree on every score (`TestBM25BatchingIndependent`,
-`TestTopKScoredMatchesFullSort`).
+The fold is exact, so both dispatches produce identical tokens. BM25 is not
+bit-identical across dispatches: compiler FMA fusion changes the scalar
+rounding, so the kernel is gated against scalar at a 1e-12 relative
+tolerance. Within one build, every multi-document scoring path, including an
+odd tail, runs through the same kernel lanes, so a document's score does not
+depend on how its postings were batched or sharded
+(`TestBM25BatchingIndependent`). Single-document scoring (`ScoreSingle`,
+SQL `SCORE()`) uses the scalar spelling.
 
 ```sh
 GOEXPERIMENT=nosimd go test ./internal/tin
@@ -147,6 +147,7 @@ GOEXPERIMENT=nosimd go test ./internal/tin
   reach the packed kernels. Any other shape, or any declining leaf, runs the
   generic executor.
 - Exact decimal `SUM` and `AVG` are never vectorized.
+- BM25 scores can differ in the last bits between SIMD and scalar builds.
 
 ## Source map
 
