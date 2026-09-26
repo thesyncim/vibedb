@@ -48,7 +48,52 @@ type JournaledDurableRequestExecutionPinSessionFactory struct {
 	executor  *ReplicatedExecutor
 	directory string
 	principal serviceauthz.Authority
-	stripes   [durableExecutionPinSessionStripes]sync.Mutex
+	stripes   [durableExecutionPinSessionStripes]executionPinSessionLatch
+}
+
+// executionPinSessionLatch is a zero-value, lazily initialized semaphore.
+// Its token keeps stripe storage bounded and lets queued callers select on
+// their own cancellation without allocating waiter goroutines.
+type executionPinSessionLatch struct {
+	initialize sync.Once
+	token      chan struct{}
+}
+
+func (latch *executionPinSessionLatch) acquire(ctx context.Context) error {
+	if ctx == nil {
+		return ErrDurableRequest
+	}
+	if cause := executionPinSessionContextCause(ctx); cause != nil {
+		return cause
+	}
+	latch.initialize.Do(func() {
+		latch.token = make(chan struct{}, 1)
+		latch.token <- struct{}{}
+	})
+	select {
+	case <-ctx.Done():
+		if cause := executionPinSessionContextCause(ctx); cause != nil {
+			return cause
+		}
+		return context.Canceled
+	case <-latch.token:
+		if cause := executionPinSessionContextCause(ctx); cause != nil {
+			latch.token <- struct{}{}
+			return cause
+		}
+		return nil
+	}
+}
+
+func (latch *executionPinSessionLatch) release() {
+	latch.token <- struct{}{}
+}
+
+func executionPinSessionContextCause(ctx context.Context) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	return ctx.Err()
 }
 
 func NewJournaledDurableRequestExecutionPinSessionFactory(
@@ -92,13 +137,12 @@ func (factory *JournaledDurableRequestExecutionPinSessionFactory) openExecutionP
 	}
 	identity := durableExecutionPinSessionIdentity(pin, factory.principal)
 	stripe := &factory.stripes[durableExecutionPinSessionStripe(identity)]
-	stripe.Lock()
-	released := false
+	if err = stripe.acquire(ctx); err != nil {
+		return nil, serviceauthz.Authority{}, nil, err
+	}
+	var releaseOnce sync.Once
 	release := func() {
-		if !released {
-			released = true
-			stripe.Unlock()
-		}
+		releaseOnce.Do(stripe.release)
 	}
 
 	resolver := BaseRelationResolver{Relation: 1}
@@ -238,15 +282,22 @@ func (factory *JournaledDurableRequestExecutionPinSessionFactory) RetireAcknowle
 	route ReplicatedRoute,
 	releaseCertificate replication.Digest,
 ) error {
-	if factory == nil || ctx == nil || ctx.Err() != nil || pin == (executionpin.PinID{}) ||
-		releaseCertificate == (replication.Digest{}) || !validReplicatedRoute(route) ||
-		!factory.principal.Valid() {
+	if factory == nil || ctx == nil {
+		return ErrDurableRequest
+	}
+	if cause := executionPinSessionContextCause(ctx); cause != nil {
+		return cause
+	}
+	if pin == (executionpin.PinID{}) || releaseCertificate == (replication.Digest{}) ||
+		!validReplicatedRoute(route) || !factory.principal.Valid() {
 		return ErrDurableRequest
 	}
 	identity := durableExecutionPinSessionIdentity(pin, factory.principal)
 	stripe := &factory.stripes[durableExecutionPinSessionStripe(identity)]
-	stripe.Lock()
-	defer stripe.Unlock()
+	if err := stripe.acquire(ctx); err != nil {
+		return err
+	}
+	defer stripe.release()
 	base, _, _, err := executionPinJournalPath(filepath.Join(factory.directory, hex.EncodeToString(identity[:])))
 	if err != nil {
 		return err
