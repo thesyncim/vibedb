@@ -232,3 +232,110 @@ func TestSchemaRolloutControllerSettlesReplicaOutcomeUnknownInline(t *testing.T)
 			authority.holder.Current().Generation(), client.activated.Load(), err)
 	}
 }
+
+func TestRetrySchemaReplicaOutcomeRetriesTransientControlOpenOnly(t *testing.T) {
+	reset := errors.Join(schemainstall.ErrTransientControlOpen, rafttransport.ErrPeerAuthentication,
+		errors.New("connection reset during TLS handshake"))
+	t.Run("handshake connection reset retries exact action", func(t *testing.T) {
+		calls := 0
+		err := retrySchemaReplicaOutcome(context.Background(), func() error {
+			calls++
+			if calls == 1 {
+				return reset
+			}
+			return nil
+		})
+		if err != nil || calls != 2 {
+			t.Fatalf("retry result=%v calls=%d, want success after 2 attempts", err, calls)
+		}
+	})
+	t.Run("authentication and identity rejection are terminal", func(t *testing.T) {
+		for name, rejection := range map[string]error{
+			"certificate": errors.Join(rafttransport.ErrPeerAuthentication,
+				errors.New("x509: certificate signed by unknown authority")),
+			"identity":      rafttransport.ErrWrongPeer,
+			"key":           rafttransport.ErrPeerKeyMismatch,
+			"build":         rafttransport.ErrPeerBuild,
+			"authorization": rafttransport.ErrUnauthorized,
+		} {
+			t.Run(name, func(t *testing.T) {
+				calls := 0
+				err := retrySchemaReplicaOutcome(context.Background(), func() error {
+					calls++
+					return rejection
+				})
+				if !errors.Is(err, rejection) || calls != 1 {
+					t.Fatalf("rejection=%v calls=%d, want terminal rejection", err, calls)
+				}
+			})
+		}
+	})
+	t.Run("cancellation stops transient retry", func(t *testing.T) {
+		alreadyCanceled, cancelBeforeRun := context.WithCancel(context.Background())
+		cancelBeforeRun()
+		calls := 0
+		err := retrySchemaReplicaOutcome(alreadyCanceled, func() error {
+			calls++
+			return reset
+		})
+		if !errors.Is(err, context.Canceled) || calls != 0 {
+			t.Fatalf("pre-canceled retry=%v calls=%d, want cancellation before attempt", err, calls)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		calls = 0
+		err = retrySchemaReplicaOutcome(ctx, func() error {
+			calls++
+			cancel()
+			return reset
+		})
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, schemainstall.ErrTransientControlOpen) || calls != 1 {
+			t.Fatalf("canceled retry=%v calls=%d, want cancellation after 1 attempt", err, calls)
+		}
+	})
+}
+
+func TestSchemaRolloutParallelCancelsRetryingWorkerAfterHardFailure(t *testing.T) {
+	controller := &SchemaRolloutController{workers: 2}
+	outerCtx, cancelOuter := context.WithCancel(context.Background())
+	defer cancelOuter()
+	firstRetryAttempt := make(chan struct{})
+	hardFailureReady := make(chan struct{})
+	var attempts atomic.Uint64
+	hardErr := errors.Join(rafttransport.ErrUnauthorized, errors.New("permanent replica authorization rejection"))
+	done := make(chan error, 1)
+	go func() {
+		done <- controller.parallel(outerCtx, 2, func(workerCtx context.Context, index int) error {
+			if index == 0 {
+				<-firstRetryAttempt
+				close(hardFailureReady)
+				return hardErr
+			}
+			return retrySchemaReplicaOutcome(workerCtx, func() error {
+				if attempts.Add(1) == 1 {
+					close(firstRetryAttempt)
+				}
+				return schemainstall.ErrTransientControlOpen
+			})
+		})
+	}()
+	select {
+	case <-hardFailureReady:
+	case <-time.After(time.Second):
+		cancelOuter()
+		err := <-done
+		t.Fatalf("workers did not reach the hard failure, parallel error=%v", err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, rafttransport.ErrUnauthorized) || attempts.Load() == 0 {
+			t.Fatalf("parallel error=%v attempts=%d, want hard authorization error after a retry started",
+				err, attempts.Load())
+		}
+	case <-time.After(500 * time.Millisecond):
+		cancelOuter()
+		err := <-done
+		t.Fatalf("parallel did not cancel transient retry promptly; it returned only after outer cancellation: %v", err)
+	}
+}

@@ -20,7 +20,11 @@ var (
 	ErrMissing        = errors.New("schemainstall: operation is missing")
 	ErrBound          = errors.New("schemainstall: configured bound reached")
 	ErrOutcomeUnknown = errors.New("schemainstall: outcome is unknown")
-	ErrClosed         = errors.New("schemainstall: installer is closed")
+	// ErrTransientControlOpen marks a cause-specific transport failure before
+	// any control request bytes were sent. Callers may retry the exact request;
+	// authentication, identity, build, and authorization failures never carry it.
+	ErrTransientControlOpen = errors.New("schemainstall: transient control connection open failure")
+	ErrClosed               = errors.New("schemainstall: installer is closed")
 )
 
 const (
