@@ -201,6 +201,9 @@ func (b *WriteBatch) replaceValue(at int, src []byte) {
 		b.values = b.values[:len(b.values)+delta]
 	}
 	copy(b.values[start:start+len(src)], src)
+	if delta == 0 {
+		return
+	}
 	for i := range b.entries {
 		if i != at && b.entries[i].valueOffset >= oldEnd {
 			b.entries[i].valueOffset += delta

@@ -309,6 +309,15 @@ func (receiver *OrdinaryReceiver) Serve(
 			}
 			return fmt.Errorf("%w: stream record body: %w", ErrInvalidFrame, err)
 		}
+		// The directory may rotate while a complete frame is arriving. Keep
+		// the pre-read binding check so stale peers fail before consuming more
+		// traffic, and verify again at the frame boundary before decoding or
+		// delivering bytes received during that transition.
+		if err := receiver.registry.VerifyPeerConnectionBinding(connection); err != nil &&
+			!errors.Is(err, ErrPeerUnauthorized) {
+			receiver.frames.put(ownedFrame)
+			return err
+		}
 		inbound, decodeErr := receiver.registry.DecodeInbound(identity, frame)
 		receiver.frames.put(ownedFrame)
 		if decodeErr != nil {
