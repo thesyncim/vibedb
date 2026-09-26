@@ -86,6 +86,33 @@ medians changed only from 5.372 s to 5.337 s. It combined three realistic
 17,920-byte records per 64 KiB write without establishing a material overall
 gain. Its durable integration crash qualification was not completed.
 
+## Scalar alphabet packer follow-up
+
+The alphabet writer now accumulates width-0–6 character codes in a bit reservoir
+instead of calling the generic bit writer for each character. A frozen copy of
+the prior scalar algorithm checks complete encoded bytes across widths, partial
+tails, empty values, affixes, restart boundaries and reused scratch. Alphabet
+selection, decoding, representation sizes and checkpoint policy are unchanged.
+
+The final shared-host kernel run used a normally selected 64-symbol alphabet
+with 130 rows of 256-byte payloads. Three samples per implementation measured
+median 57.711 µs for the scalar reference and 20.718 µs for the reservoir
+(2.79×), with zero bytes and allocations per operation. One reservoir sample was
+47.365 µs, demonstrating the noise on this host. [Raw kernel samples](alphabet-kernel.txt)
+and [source hashes and public-operation controls](alphabet-metadata.json) are included.
+
+This is a kernel improvement, not an additional demonstrated application
+throughput gain. The single public write pair was effectively flat: shared
+5.320 s → 5.340 s, varied 18.753 s → 18.577 s. Encoded-size oracles and the
+public controls preserve the space bounds, disk footprint and barrier counts.
+
+Full storeio SIMD and SIMD-disabled suites, focused race coverage and vet
+passed. An earlier concurrent run hit a page-cache queue-depth assertion;
+isolated and final reruns passed. The byte-parity test runs in race builds too.
+The strict warm-zero-allocation assertion runs without race instrumentation;
+a race-only control requires the optimized and reference writers to have equal
+allocation counts (observed two each at width zero and four each at width six).
+
 ## Reproduction
 
 Run the write benchmarks separately with a fixed single operation:

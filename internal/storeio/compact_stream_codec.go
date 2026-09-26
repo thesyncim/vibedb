@@ -568,13 +568,32 @@ func (s *compactStreamScratch) finishAlphabet(
 			)
 		}
 		start := len(data)
-		data = append(data, make([]byte, (characters*width+7)/8)...)
-		bit := 0
-		for _, value := range values[first:last] {
-			middle := value[plan.prefix : len(value)-plan.suffix]
-			for _, b := range middle {
-				compactPutBits(data[start:], bit, width, uint64(code[b]))
-				bit += width
+		packedBytes := (characters*width + 7) / 8
+		data = append(data, make([]byte, packedBytes)...)
+		if width != 0 {
+			// The reservoir is LSB-first and spans adjacent rows. Localizing it
+			// here resets packing only at the restart boundary above.
+			var reservoir uint64
+			bufferedBits, packedAt := 0, 0
+			for _, value := range values[first:last] {
+				middle := value[plan.prefix : len(value)-plan.suffix]
+				for _, b := range middle {
+					reservoir |= uint64(code[b]) << uint(bufferedBits)
+					bufferedBits += width
+					if bufferedBits >= 8 {
+						data[start+packedAt] = byte(reservoir)
+						packedAt++
+						reservoir >>= 8
+						bufferedBits -= 8
+					}
+				}
+			}
+			if bufferedBits != 0 {
+				data[start+packedAt] = byte(reservoir)
+				packedAt++
+			}
+			if packedAt != packedBytes {
+				panic("compact alphabet bit-pack sizing drift")
 			}
 		}
 	}

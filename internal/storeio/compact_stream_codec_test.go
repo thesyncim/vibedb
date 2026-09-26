@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math/bits"
+	"slices"
 	"strconv"
 	"testing"
 )
@@ -270,6 +271,165 @@ func TestCompactAlphabetSequentialZeroWidthMiddle(t *testing.T) {
 		if !valid || !bytes.Equal(got, values[row]) {
 			t.Fatalf("row=%d got=%q valid=%v want=%q", row, got, valid, values[row])
 		}
+	}
+}
+
+// finishCompactAlphabetScalarReference freezes the pre-reservoir writer. Keep
+// this bit-at-a-time implementation in tests so optimized output is checked
+// byte-for-byte independently of the production loop.
+func finishCompactAlphabetScalarReference(
+	s *compactStreamScratch,
+	slot int,
+	values [][]byte,
+	plan compactAlphabetPlan,
+) compactStreamEncoding {
+	alphabet := s.alphabet[slot]
+	var code [256]uint8
+	for id, b := range alphabet {
+		code[b] = uint8(id)
+	}
+	blocks := (len(values) + compactStreamRestart - 1) / compactStreamRestart
+	width, totalBytes := plan.width, plan.totalBytes
+	data := slices.Grow(s.data[slot][:0], totalBytes)[:4*blocks]
+	clear(data)
+	for first := 0; first < len(values); first += compactStreamRestart {
+		last := min(first+compactStreamRestart, len(values))
+		block := first / compactStreamRestart
+		binary.LittleEndian.PutUint32(data[block*4:], uint32(len(data)))
+		lo, hi, characters := 0, 0, 0
+		for row, value := range values[first:last] {
+			middle := len(value) - plan.prefix - plan.suffix
+			if row == 0 {
+				lo, hi = middle, middle
+			} else {
+				lo, hi = min(lo, middle), max(hi, middle)
+			}
+			characters += middle
+		}
+		lengthWidth := bits.Len(uint(hi - lo))
+		data = appendCompactUvarint(data, uint64(lo))
+		data = append(data, byte(lengthWidth))
+		lengthStart := len(data)
+		data = append(data, make([]byte, ((last-first)*lengthWidth+7)/8)...)
+		for row, value := range values[first:last] {
+			middle := len(value) - plan.prefix - plan.suffix
+			compactPutBits(
+				data[lengthStart:], row*lengthWidth, lengthWidth,
+				uint64(middle-lo),
+			)
+		}
+		start := len(data)
+		data = append(data, make([]byte, (characters*width+7)/8)...)
+		bit := 0
+		for _, value := range values[first:last] {
+			middle := value[plan.prefix : len(value)-plan.suffix]
+			for _, b := range middle {
+				compactPutBits(data[start:], bit, width, uint64(code[b]))
+				bit += width
+			}
+		}
+	}
+	if len(data) != totalBytes {
+		panic("reference compact alphabet sizing drift")
+	}
+	dictionaryEntries := 1
+	if plan.prefix != 0 || plan.suffix != 0 {
+		dictionaryEntries = 3
+	}
+	dictionary := slices.Grow(s.dict[slot][:0], dictionaryEntries)[:dictionaryEntries]
+	dictionary[0] = alphabet
+	if dictionaryEntries == 3 {
+		dictionary[1] = values[0][:plan.prefix]
+		dictionary[2] = values[0][len(values[0])-plan.suffix:]
+	}
+	s.data[slot], s.dict[slot] = data, dictionary
+	return compactStreamEncoding{
+		kind: compactStreamAlphabet, width: uint8(width), count: len(values),
+		data: data, dict: dictionary,
+	}
+}
+
+func compactAlphabetReservoirTestValues(cardinality int) [][]byte {
+	values := make([][]byte, 2*compactStreamRestart+3)
+	seed := make([]byte, cardinality)
+	for symbol := range cardinality {
+		seed[symbol] = byte('A' + symbol)
+	}
+	values[0] = append(append([]byte{'"'}, seed...), '"')
+	for row := 1; row < len(values); row++ {
+		length := row * 13 % 19
+		middle := make([]byte, length)
+		for char := range middle {
+			middle[char] = byte('A' + (row*7+char*3)%cardinality)
+		}
+		if row%17 == 0 {
+			middle = middle[:0]
+		}
+		values[row] = append(append([]byte{'"'}, middle...), '"')
+	}
+	return values
+}
+
+func TestCompactAlphabetReservoirMatchesFrozenScalarReference(t *testing.T) {
+	var optimized, reference compactStreamScratch
+	for _, cardinality := range []int{1, 2, 3, 5, 9, 17, 33, 64} {
+		values := compactAlphabetReservoirTestValues(cardinality)
+
+		const slot = 2
+		plan, ok := optimized.measureAlphabet(slot, values, 0)
+		wantWidth := bits.Len(uint(cardinality - 1))
+		if !ok || plan.width != wantWidth {
+			t.Fatalf("cardinality=%d alphabet plan=%+v ok=%v, want width %d",
+				cardinality, plan, ok, wantWidth)
+		}
+		blocks := 0
+		partialByteBlock, emptyMiddle := plan.width == 0, false
+		for first := 0; first < len(values); first += compactStreamRestart {
+			last := min(first+compactStreamRestart, len(values))
+			characters := 0
+			for _, value := range values[first:last] {
+				characters += len(value) - plan.prefix - plan.suffix
+				if len(value) == plan.prefix+plan.suffix {
+					emptyMiddle = true
+				}
+			}
+			if characters*plan.width%8 != 0 {
+				partialByteBlock = true
+			}
+			blocks++
+		}
+		if !emptyMiddle || !partialByteBlock || blocks != 3 {
+			t.Fatalf("cardinality=%d missed empty/partial/restart coverage: empty=%v partial=%v blocks=%d",
+				cardinality, emptyMiddle, partialByteBlock, blocks)
+		}
+		// The independent reference gets its own alphabet bytes and reusable
+		// output storage, then emits the old scalar bit-at-a-time representation.
+		reference.alphabet[slot] = append(reference.alphabet[slot][:0], optimized.alphabet[slot]...)
+		got := optimized.finishAlphabet(slot, values, plan)
+		want := finishCompactAlphabetScalarReference(&reference, slot, values, plan)
+		if !bytes.Equal(got.data, want.data) || len(got.dict) != len(want.dict) {
+			t.Fatalf("cardinality=%d width=%d data or dictionary size differs from scalar reference",
+				cardinality, wantWidth)
+		}
+		for index := range got.dict {
+			if !bytes.Equal(got.dict[index], want.dict[index]) {
+				t.Fatalf("cardinality=%d dictionary entry %d differs", cardinality, index)
+			}
+		}
+		gotBinary, err := got.appendBinary(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantBinary, err := want.appendBinary(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(gotBinary, wantBinary) || len(gotBinary) != plan.encoded {
+			t.Fatalf("cardinality=%d serialized bytes differ: got=%d want=%d planned=%d",
+				cardinality, len(gotBinary), len(wantBinary), plan.encoded)
+		}
+		view := compactCodecRoundTrip(t, got, values)
+		checkCompactSequentialSeeks(t, view)
 	}
 }
 
