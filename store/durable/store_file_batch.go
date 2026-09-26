@@ -11,14 +11,29 @@ import (
 var ErrBatchTooLarge = errors.New("vibedb: collection write batch exceeds configured bound")
 
 // ErrBatchClosed reports use of a WriteBatch after the Update that owns it
-// returned. Batches are pooled per collection, so a retained one would write
-// into a later caller's mutations.
+// returned, or use of a shallow copy that is not the callback's exact handle.
 var ErrBatchClosed = errors.New("vibedb: collection write batch is no longer active")
 
-// WriteBatch accumulates the mutations one Update applies as one logical atomic
-// publication. Most batches need one generation. When the final rows cannot fit
-// the current leaf topology, Update may first publish a content-equivalent
-// topology generation and publish the logical batch in the following generation.
+// writeBatchWorkspace contains the pooled, private staging storage for a
+// WriteBatch handle.
+type writeBatchWorkspace struct {
+	collection *Collection
+	entries    []writeBatchEntry
+	position   map[string]int
+	keys       []byte
+	values     []byte
+	owner      *WriteBatch
+	private    *WriteBatch
+	canonical  bool
+	recovery   bool
+}
+
+// WriteBatch is the callback-scoped handle for the mutations one Update applies
+// as one logical atomic publication. Its private workspace may be reused by the
+// Collection, but this public handle is never reused. Most batches need one
+// generation. When the final rows cannot fit the current leaf topology, Update
+// may first publish a content-equivalent topology generation and publish the
+// logical batch in the following generation.
 //
 // Keys are deduplicated as they arrive: mutating the same key twice keeps only
 // the second mutation, so the published generation contains exactly one row
@@ -31,16 +46,11 @@ var ErrBatchClosed = errors.New("vibedb: collection write batch is no longer act
 // coordinates are not part of the collection contract.
 //
 // JSON syntax is validated when Update applies a JSON collection's batch, not
-// when Put records it. Opaque collections do no syntax validation.
+// when Put records it. Opaque collections do no syntax validation. The private
+// workspace records this exact handle as owner, so a shallow copy cannot mutate
+// the active callback's batch.
 type WriteBatch struct {
-	collection *Collection
-	entries    []writeBatchEntry
-	position   map[string]int
-	keys       []byte
-	values     []byte
-	active     bool
-	canonical  bool
-	recovery   bool
+	*writeBatchWorkspace
 }
 
 type writeBatchEntry struct {
@@ -57,18 +67,53 @@ func (b *WriteBatch) value(entry writeBatchEntry) []byte {
 	return b.values[entry.valueOffset : entry.valueOffset+entry.valueLength]
 }
 
-func (b *WriteBatch) reset() {
-	b.entries = b.entries[:0]
-	b.keys = b.keys[:0]
-	b.values = b.values[:0]
-	clear(b.position)
-	b.canonical = false
-	b.recovery = false
+func (workspace *writeBatchWorkspace) reset() {
+	workspace.entries = workspace.entries[:0]
+	workspace.keys = workspace.keys[:0]
+	workspace.values = workspace.values[:0]
+	clear(workspace.position)
+	workspace.canonical = false
+	workspace.recovery = false
+}
+
+func (b *WriteBatch) owned() bool {
+	return b != nil && b.writeBatchWorkspace != nil &&
+		b.writeBatchWorkspace.owner == b
+}
+
+func newWriteBatchHandle(workspace *writeBatchWorkspace) *WriteBatch {
+	if workspace == nil {
+		return nil
+	}
+	batch := &WriteBatch{writeBatchWorkspace: workspace}
+	workspace.owner = batch
+	return batch
+}
+
+// newPrivateWriteBatchHandle returns the workspace's reusable private handle.
+// Only package-owned callbacks that cannot escape to callers may borrow it.
+func newPrivateWriteBatchHandle(workspace *writeBatchWorkspace) *WriteBatch {
+	if workspace == nil {
+		return nil
+	}
+	if workspace.private == nil {
+		workspace.private = &WriteBatch{}
+	}
+	batch := workspace.private
+	batch.writeBatchWorkspace = workspace
+	workspace.owner = batch
+	return batch
+}
+
+func newOwnedWriteBatch(collection *Collection, maxDocuments int) *WriteBatch {
+	workspace := &writeBatchWorkspace{collection: collection}
+	workspace.ensurePositionCapacity(maxDocuments)
+	return newWriteBatchHandle(workspace)
 }
 
 // Len reports how many distinct keys the batch will mutate.
 func (b *WriteBatch) Len() int {
-	if b == nil {
+	if !b.owned() {
 		return 0
 	}
 	return len(b.entries)
@@ -82,7 +127,7 @@ func (b *WriteBatch) Len() int {
 // returns: the batch copies it into its own arena. The caller may reuse or
 // mutate the backing array as soon as Put returns.
 func (b *WriteBatch) Put(key []byte, src []byte) error {
-	if b == nil || !b.active {
+	if !b.owned() {
 		return ErrBatchClosed
 	}
 	if len(key) > b.collection.options.MaxKeyBytes {
@@ -98,7 +143,7 @@ func (b *WriteBatch) Put(key []byte, src []byte) error {
 // hold is not an error and publishes nothing for it. key is borrowed for the
 // call only; the batch copies it into its own arena.
 func (b *WriteBatch) Delete(key []byte) error {
-	if b == nil || !b.active {
+	if !b.owned() {
 		return ErrBatchClosed
 	}
 	if len(key) > b.collection.options.MaxKeyBytes {
@@ -108,7 +153,9 @@ func (b *WriteBatch) Delete(key []byte) error {
 }
 
 func (b *WriteBatch) record(key []byte, src []byte, remove bool) error {
-	b.canonical = false
+	if !b.owned() {
+		return ErrBatchClosed
+	}
 	if b.position == nil {
 		b.ensurePositionCapacity(b.collection.options.MaxBatchDocuments)
 	}
@@ -118,6 +165,7 @@ func (b *WriteBatch) record(key []byte, src []byte, remove bool) error {
 		if len(src) > b.collection.options.MaxBatchBytes-nextBytes {
 			return ErrBatchTooLarge
 		}
+		b.canonical = false
 		b.replaceValue(at, src)
 		b.entries[at].remove = remove
 		return nil
@@ -129,6 +177,7 @@ func (b *WriteBatch) record(key []byte, src []byte, remove bool) error {
 	if len(src) > b.collection.options.MaxBatchBytes-nextBytes {
 		return ErrBatchTooLarge
 	}
+	b.canonical = false
 	entry := writeBatchEntry{
 		keyOffset: len(b.keys), keyLength: len(key),
 		valueOffset: len(b.values), valueLength: len(src), remove: remove,
@@ -152,7 +201,7 @@ func (b *WriteBatch) record(key []byte, src []byte, remove bool) error {
 // record. The ordinary apply path still validates persisted key/document/schema
 // semantics before publication.
 func (b *WriteBatch) appendRecovery(key, src []byte, remove bool) error {
-	if b == nil || !b.active {
+	if !b.owned() {
 		return ErrBatchClosed
 	}
 	if b.position == nil {
@@ -175,11 +224,11 @@ func (b *WriteBatch) appendRecovery(key, src []byte, remove bool) error {
 	return nil
 }
 
-func (b *WriteBatch) ensurePositionCapacity(maxDocuments int) {
-	if b.position == nil {
-		b.position = make(map[string]int, maxDocuments)
+func (workspace *writeBatchWorkspace) ensurePositionCapacity(maxDocuments int) {
+	if workspace.position == nil {
+		workspace.position = make(map[string]int, maxDocuments)
 	} else {
-		clear(b.position)
+		clear(workspace.position)
 	}
 }
 
@@ -216,12 +265,14 @@ func (b *WriteBatch) replaceValue(at int, src []byte) {
 // publication.
 //
 // The logical batch either publishes whole or publishes nothing: an error
-// returned by fn, or by any mutation the batch stages, exposes no subset of its
-// primary rows or exact-index postings. If the final rows cannot fit the current
-// leaf topology, Update may first publish one content-equivalent topology
-// generation. A later logical or durability error can therefore leave the rows
-// and postings unchanged while Generation may advance. A prepare-time rejection
-// is ordinary and never poisons; only a durability fence failure does.
+// returned by fn or by apply-time validation exposes no subset of its primary
+// rows or exact-index postings. Put/Delete admission errors reject only that
+// mutation without changing the staged entries, so fn may handle one and
+// continue. If the final rows cannot fit the current leaf topology, Update may
+// first publish one content-equivalent topology generation. A later logical or
+// durability error can therefore leave the rows and postings unchanged while
+// Generation may advance. A prepare-time rejection is ordinary and never
+// poisons; only a durability fence failure does.
 //
 // The logical commit is one rewritten leaf frame per touched leaf, one batch
 // journal record synced once, and every logical leaf change published in one
@@ -242,23 +293,50 @@ func (c *Collection) Update(fn func(*WriteBatch) error) (err error) {
 	return c.updatePrimaryBatch(fn)
 }
 
-// fileWriteBatch borrows the reusable WriteBatch handle, resetting it for a
-// fresh Update. The handle and its dedup map are pooled on the Collection so a
-// steady-state batch allocates nothing.
+// fileWriteBatch borrows the reusable private workspace, resets it for a fresh
+// Update, and returns a new small public owner wrapper. The dedup map and byte
+// arenas remain pooled on the Collection.
 func (c *Collection) fileWriteBatch() *WriteBatch {
 	if c.batch == nil {
-		c.batch = &WriteBatch{
-			collection: c,
-		}
+		c.batch = &writeBatchWorkspace{collection: c}
 		c.batch.ensurePositionCapacity(c.options.MaxBatchDocuments)
 	}
-	batch := c.batch
-	batch.reset()
-	batch.active = true
-	return batch
+	workspace := c.batch
+	workspace.reset()
+	return newWriteBatchHandle(workspace)
+}
+
+// filePrivateWriteBatch borrows one stable internal handle. This is reserved
+// for package-owned callbacks such as recovery; no caller can retain it.
+func (c *Collection) filePrivateWriteBatch() *WriteBatch {
+	if c.batch == nil {
+		c.batch = &writeBatchWorkspace{collection: c}
+		c.batch.ensurePositionCapacity(c.options.MaxBatchDocuments)
+	}
+	workspace := c.batch
+	workspace.reset()
+	return newPrivateWriteBatchHandle(workspace)
 }
 
 func (c *Collection) releaseFileWriteBatch(batch *WriteBatch) {
-	batch.active = false
-	batch.reset()
+	if batch == nil || batch.writeBatchWorkspace == nil {
+		return
+	}
+	workspace := batch.writeBatchWorkspace
+	if workspace.owner == batch {
+		workspace.owner = nil
+		workspace.reset()
+	}
+	batch.writeBatchWorkspace = nil
+}
+
+func (c *Collection) releasePrivateFileWriteBatch(batch *WriteBatch) {
+	if batch == nil || batch.writeBatchWorkspace == nil {
+		return
+	}
+	workspace := batch.writeBatchWorkspace
+	if workspace.owner == batch {
+		workspace.owner = nil
+		workspace.reset()
+	}
 }

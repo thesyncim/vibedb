@@ -664,11 +664,16 @@ type DatabaseBatch struct {
 	byName  map[string]*WriteBatch
 	members []NamedCollection
 	batches []*WriteBatch
+	owner   *DatabaseBatch
+}
+
+func (b *DatabaseBatch) owned() bool {
+	return b != nil && b.owner == b
 }
 
 // Collection returns the member WriteBatch for name.
 func (b *DatabaseBatch) Collection(name string) (*WriteBatch, error) {
-	if b == nil {
+	if !b.owned() {
 		return nil, ErrTxnCollection
 	}
 	batch, ok := b.byName[name]
@@ -683,7 +688,7 @@ func (b *DatabaseBatch) Collection(name string) (*WriteBatch, error) {
 // count is transaction-bounded, so a compact linear probe avoids allocating a
 // second map on every commit.
 func (b *DatabaseBatch) CollectionHandle(collection *Collection) (*WriteBatch, error) {
-	if b == nil || collection == nil || len(b.members) != len(b.batches) {
+	if !b.owned() || collection == nil || len(b.members) != len(b.batches) {
 		return nil, ErrTxnCollection
 	}
 	for i := range b.members {
@@ -730,20 +735,18 @@ func UpdateCollections(
 	}
 	batches := make([]*WriteBatch, len(ordered))
 	batch.batches = batches
+	batch.owner = batch
 	for i, member := range ordered {
 		initialDocuments := member.BatchDocumentsHint
 		if initialDocuments == 0 {
 			initialDocuments = member.Collection.options.MaxBatchDocuments
 		}
-		wb := &WriteBatch{
-			collection: member.Collection,
-			active:     true,
-		}
-		wb.ensurePositionCapacity(initialDocuments)
+		wb := newOwnedWriteBatch(member.Collection, initialDocuments)
 		batches[i] = wb
 		batch.byName[member.Name] = wb
 	}
 	defer closeDurableWriteBatches(batches)
+	defer closeDatabaseBatch(batch)
 
 	if err := fn(batch); err != nil {
 		return err
@@ -857,19 +860,37 @@ func validateTxnMembers(members []NamedCollection) ([]NamedCollection, error) {
 
 func closeDurableWriteBatches(batches []*WriteBatch) {
 	for _, batch := range batches {
-		if batch == nil {
-			continue
-		}
-		batch.active = false
-		batch.reset()
+		closeDurableWriteBatch(batch)
 	}
+}
+
+func closeDurableWriteBatch(batch *WriteBatch) {
+	if batch == nil {
+		return
+	}
+	workspace := batch.writeBatchWorkspace
+	if workspace != nil && workspace.owner == batch {
+		workspace.owner = nil
+		workspace.reset()
+	}
+	batch.writeBatchWorkspace = nil
+}
+
+func closeDatabaseBatch(batch *DatabaseBatch) {
+	if batch == nil {
+		return
+	}
+	batch.owner = nil
+	batch.byName = nil
+	batch.members = nil
+	batch.batches = nil
 }
 
 func applyWriteBatchViaUpdate(c *Collection, src *WriteBatch) error {
 	entries := append([]writeBatchEntry(nil), src.entries...)
 	keys := append([]byte(nil), src.keys...)
 	values := append([]byte(nil), src.values...)
-	return c.Update(func(dst *WriteBatch) error {
+	return c.updatePrimaryBatchPrivate(func(dst *WriteBatch) error {
 		for _, entry := range entries {
 			key := keys[entry.keyOffset : entry.keyOffset+entry.keyLength]
 			if entry.remove {

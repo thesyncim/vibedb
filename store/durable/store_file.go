@@ -589,9 +589,9 @@ type Collection struct {
 	// fixed arena only after this marker clears.
 	freeImageScratchInUse bool
 
-	// batch is the reusable transactional WriteBatch handle. The batch type and
-	// its options are shared; only the primary apply path remains.
-	batch *WriteBatch
+	// batch is the reusable private staging workspace. Every public Update gets
+	// a fresh WriteBatch owner wrapper around it.
+	batch *writeBatchWorkspace
 
 	// Ordered-primary batch scratch. One Update over the primary graph resolves
 	// every mutation, rewrites one frame per touched leaf, and publishes them all

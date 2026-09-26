@@ -367,10 +367,7 @@ func checkpointGroupTestStageUncertifiedAtMarkerEpoch(
 	group.markerEpoch = epoch
 	log.commitMu.Unlock()
 
-	write := &WriteBatch{
-		collection: members[0].Collection,
-		active:     true,
-	}
+	write := newOwnedWriteBatch(members[0].Collection, 1)
 	defer closeDurableWriteBatches([]*WriteBatch{write})
 	if err := write.Put([]byte(key), []byte(`{"n":1}`)); err != nil {
 		t.Fatal(err)

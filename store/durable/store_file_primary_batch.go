@@ -137,7 +137,20 @@ type stagedPrimaryBatch struct {
 // Single-collection Update recomposes stage → kind-3 journal fence → publish
 // with its own snapshotGate acquisition so on-disk journal bytes stay
 // byte-identical to the pre-phase-split path.
-func (c *Collection) updatePrimaryBatch(fn func(*WriteBatch) error) (err error) {
+func (c *Collection) updatePrimaryBatch(fn func(*WriteBatch) error) error {
+	return c.updatePrimaryBatchWithHandle(fn, false)
+}
+
+// updatePrimaryBatchPrivate uses the reusable internal owner wrapper. The
+// callback must remain package-private and must never retain the batch.
+func (c *Collection) updatePrimaryBatchPrivate(fn func(*WriteBatch) error) error {
+	return c.updatePrimaryBatchWithHandle(fn, true)
+}
+
+func (c *Collection) updatePrimaryBatchWithHandle(
+	fn func(*WriteBatch) error,
+	private bool,
+) (err error) {
 	if c == nil {
 		return ErrClosed
 	}
@@ -169,8 +182,14 @@ func (c *Collection) updatePrimaryBatch(fn func(*WriteBatch) error) (err error) 
 	if !c.deferredCanonicalLane() {
 		return ErrPrimaryBatchUnsupportedLane
 	}
-	batch := c.fileWriteBatch()
-	defer c.releaseFileWriteBatch(batch)
+	var batch *WriteBatch
+	if private {
+		batch = c.filePrivateWriteBatch()
+		defer c.releasePrivateFileWriteBatch(batch)
+	} else {
+		batch = c.fileWriteBatch()
+		defer c.releaseFileWriteBatch(batch)
+	}
 	if err := fn(batch); err != nil {
 		return err
 	}

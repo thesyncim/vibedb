@@ -359,15 +359,15 @@ type CheckpointGroup struct {
 }
 
 // checkpointGroupBatchWorkspace is protected by CheckpointGroup.mu. Fixed
-// group ownership means every update can reuse the same bounded staging
-// handles, dedup maps, and byte arenas; only cold growth allocates. The public
-// DatabaseBatch remains valid solely for the callback, exactly as before.
+// group ownership means every update can reuse the same bounded private
+// staging backings, dedup maps, and byte arenas; only cold growth allocates.
+// Public DatabaseBatch and WriteBatch owner wrappers are fresh per callback.
 type checkpointGroupBatchWorkspace struct {
-	database     DatabaseBatch
-	byName       map[string]*WriteBatch
-	writeBatches []WriteBatch
-	batches      []*WriteBatch
-	dirty        []NamedCollection
+	database      *DatabaseBatch
+	byName        map[string]*WriteBatch
+	writeBackings []writeBatchWorkspace
+	batches       []*WriteBatch
+	dirty         []NamedCollection
 }
 
 func (workspace *checkpointGroupBatchWorkspace) prepare(
@@ -411,10 +411,10 @@ func (workspace *checkpointGroupBatchWorkspace) prepare(
 	} else {
 		clear(workspace.byName)
 	}
-	if cap(workspace.writeBatches) < len(members) {
-		workspace.writeBatches = make([]WriteBatch, len(members))
+	if cap(workspace.writeBackings) < len(members) {
+		workspace.writeBackings = make([]writeBatchWorkspace, len(members))
 	} else {
-		workspace.writeBatches = workspace.writeBatches[:len(members)]
+		workspace.writeBackings = workspace.writeBackings[:len(members)]
 	}
 	if cap(workspace.batches) < len(members) {
 		workspace.batches = make([]*WriteBatch, len(members))
@@ -422,31 +422,36 @@ func (workspace *checkpointGroupBatchWorkspace) prepare(
 		workspace.batches = workspace.batches[:len(members)]
 	}
 	for index, member := range members {
-		write := &workspace.writeBatches[index]
-		write.collection = member.Collection
+		backing := &workspace.writeBackings[index]
+		backing.collection = member.Collection
 		hint := member.BatchDocumentsHint
 		if hint == 0 {
 			hint = member.Collection.options.MaxBatchDocuments
 		}
-		write.ensurePositionCapacity(hint)
-		write.reset()
-		write.active = true
+		backing.ensurePositionCapacity(hint)
+		backing.reset()
+		write := newWriteBatchHandle(backing)
 		workspace.batches[index] = write
 		workspace.byName[member.Name] = write
 	}
-	workspace.database.byName = workspace.byName
-	workspace.database.members = members
-	workspace.database.batches = workspace.batches
+	database := &DatabaseBatch{
+		byName:  workspace.byName,
+		members: members,
+		batches: workspace.batches,
+	}
+	database.owner = database
+	workspace.database = database
 	workspace.dirty = workspace.dirty[:0]
-	return &workspace.database, nil
+	return database, nil
 }
 
 func (workspace *checkpointGroupBatchWorkspace) release() {
+	closeDatabaseBatch(workspace.database)
+	workspace.database = nil
 	for index := range workspace.batches {
 		write := workspace.batches[index]
 		if write != nil {
-			write.active = false
-			write.reset()
+			closeDurableWriteBatch(write)
 		}
 		workspace.batches[index] = nil
 	}
@@ -454,7 +459,6 @@ func (workspace *checkpointGroupBatchWorkspace) release() {
 	clear(workspace.dirty)
 	workspace.batches = workspace.batches[:0]
 	workspace.dirty = workspace.dirty[:0]
-	workspace.database = DatabaseBatch{}
 }
 
 // checkpointGroupFaultPoint is a package test seam. Production leaves the hook
@@ -1536,11 +1540,7 @@ func (g *CheckpointGroup) Seed(
 		return err
 	}
 
-	wb := &WriteBatch{
-		collection: owned,
-		active:     true,
-	}
-	wb.ensurePositionCapacity(1)
+	wb := newOwnedWriteBatch(owned, 1)
 	defer closeDurableWriteBatches([]*WriteBatch{wb})
 	if err := wb.Put(key, seed.Envelope); err != nil {
 		return err
