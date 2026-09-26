@@ -1903,13 +1903,21 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	}
 	leaf.docDelta = len(final) - len(baseRows)
 	leaf.finalLen = len(final)
-	if len(final) > storeio.CommonPrimaryLeafWideSlots {
+	if len(final) > storeio.CompactPrimaryStripeMaxRows {
 		c.primaryLeafSplitRequired.Add(1)
 		return c.primaryBatchProspectiveSplitKey(final), errors.Join(
 			ErrPrimaryLeafSplitRequired, storeio.ErrCommonPrimaryLeafFull,
 		)
 	}
-	if !leaf.stableSlots {
+	maintainSlots := primarySlotGeometryMaintained(state.root)
+	if len(final) > storeio.CommonPrimaryLeafWideSlots && maintainSlots {
+		c.primaryLeafSplitRequired.Add(1)
+		return c.primaryBatchProspectiveSplitKey(final), errors.Join(
+			ErrPrimaryLeafSplitRequired, storeio.ErrCommonPrimaryLeafFull,
+		)
+	}
+	if !leaf.stableSlots &&
+		(len(final) <= storeio.CommonPrimaryLeafWideSlots || maintainSlots) {
 		if err := storeio.PlaceCommonPrimaryLeafRecords(
 			storeio.CommonPrimaryLeafWide, c.storeID, final,
 		); err != nil {

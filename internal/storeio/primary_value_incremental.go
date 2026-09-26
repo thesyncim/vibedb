@@ -38,31 +38,68 @@ func (p *PrimaryValueLeafWindowPlanner) Plan(
 	records []CommonPrimaryLeafRecord,
 	maxExtent int,
 ) (count, extent int, payload []byte, err error) {
+	return p.plan(records, maxExtent, CommonPrimaryLeafWideSlots, false)
+}
+
+// PlanUnplaced plans the largest compact-stripe prefix without 256-slot
+// placement or dependence on input Slot fields. It is used by scan-oriented
+// leaves, whose compact stripe grammar supports wider windows while indexed
+// and tin-maintained leaves retain the stable 256-slot shape through Plan.
+// For prefixes within the slot geometry it reserves a worst-case slot-map byte
+// per row, so its extent remains a safe bound when runtime mutation placement
+// later emits an explicit map.
+func (p *PrimaryValueLeafWindowPlanner) PlanUnplaced(
+	records []CommonPrimaryLeafRecord,
+	maxExtent int,
+) (count, extent int, payload []byte, err error) {
+	return p.plan(records, maxExtent, CompactPrimaryStripeMaxRows, true)
+}
+
+func (p *PrimaryValueLeafWindowPlanner) plan(
+	records []CommonPrimaryLeafRecord,
+	maxExtent, maxRows int,
+	unplaced bool,
+) (count, extent int, payload []byte, err error) {
 	if p == nil || p.builder == nil || len(records) == 0 ||
-		len(records) > CommonPrimaryLeafWideSlots ||
+		len(records) > maxRows ||
 		maxExtent < int(physicalPageQuantum) ||
 		maxExtent > CommonPrimaryLeafMaxExtentBytes {
 		return 0, 0, nil, fmt.Errorf("%w: incremental primary values", ErrInvalidWrite)
 	}
-	if err = prepareCompactPrimaryStripe(records, p.builder); err != nil {
+	if unplaced {
+		err = prepareCompactPrimaryStripeUnplaced(records, p.builder)
+	} else {
+		err = prepareCompactPrimaryStripe(records, p.builder)
+	}
+	if err != nil {
 		return
 	}
-	fits := func(n int) (int, bool, error) {
+	fits := func(n int) (int, []byte, bool, error) {
 		built, buildErr := buildPreparedCompactPrimaryStripePayload(records[:n], p.builder)
 		if buildErr == ErrCommonPrimaryLeafFull {
-			return maxExtent + int(physicalPageQuantum), false, nil
+			return maxExtent + int(physicalPageQuantum), nil, false, nil
 		}
 		if buildErr != nil {
-			return 0, false, buildErr
+			return 0, nil, false, buildErr
 		}
 		need := PageHeaderSize + len(built) + PageTrailerSize
+		if unplaced && n <= CommonPrimaryLeafWideSlots {
+			need += n
+		}
 		quantum := int(physicalPageQuantum)
 		candidate := (need + quantum - 1) &^ (quantum - 1)
-		return candidate, candidate <= maxExtent, nil
+		return candidate, built, candidate <= maxExtent, nil
+	}
+	fullExtent, fullPayload, fullFits, fullErr := fits(len(records))
+	if fullErr != nil {
+		return 0, 0, nil, fullErr
+	}
+	if fullFits {
+		return len(records), fullExtent, fullPayload, nil
 	}
 	for low, high := 1, len(records); low <= high; {
 		middle := (low + high) / 2
-		candidate, ok, fitErr := fits(middle)
+		candidate, _, ok, fitErr := fits(middle)
 		if fitErr != nil {
 			return 0, 0, nil, fitErr
 		}

@@ -837,10 +837,10 @@ func TestFileStoreInlineFreeLogSpillsAndReopens(t *testing.T) {
 	options.BufferCount = 4096
 	options.MaxRetiredExtents = 4096
 	// A batch cannot split a fresh leaf mid-fold, so the seed batch's documents
-	// must fit one leaf. Sixteen ~1.2 KiB documents stay within that budget; the
-	// collection has split into many leaves by the time the later batches land,
-	// and the spill this test asserts comes from the retirement volume of deleting
-	// every key, not from any single batch's width.
+	// must fit one leaf. Sixteen incompressible ~1.8 KiB inline documents stay
+	// within that budget; the collection has split into many leaves by the time
+	// the later batches land, and the spill this test asserts comes from the
+	// retirement volume of deleting every key, not from any single batch's width.
 	options.MaxBatchDocuments = 16
 	options.InlineValueBytes = 2048
 	options.ResidentBytes = 32 << 20
@@ -851,14 +851,14 @@ func TestFileStoreInlineFreeLogSpillsAndReopens(t *testing.T) {
 
 	// Class 5's denser leaves and exact retirement coalescing keep the former
 	// 512 small-row workload below the 106-record inline root. A wider corpus
-	// still runs quickly but creates enough independently retired extents to
+	// with incompressible values creates enough independently retired extents to
 	// prove the external spill/replay path remains live.
 	const documents = 4096
 	for base := 0; base < documents; base += options.MaxBatchDocuments {
 		if err := fs.Update(func(batch *WriteBatch) error {
 			for i := base; i < base+options.MaxBatchDocuments; i++ {
 				value := []byte(fmt.Sprintf(
-					`{"id":%d,"padding":%q}`, i, strings.Repeat("x", 1200),
+					`{"id":%d,"padding":%q}`, i, structuralCertificationPayload(i, 1800),
 				))
 				if err := batch.Put([]byte(fmt.Sprintf("spill-%03d", i)), value); err != nil {
 					return err

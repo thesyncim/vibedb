@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibejson"
 )
 
@@ -39,12 +40,24 @@ func structuralCertificationOptions() Options {
 	return options
 }
 
+func structuralCertificationExactOptions(options Options) Options {
+	options.Indexes = []store.IndexDefinition{{
+		Name: "by_n", Paths: []string{"/n"},
+	}}
+	return options
+}
+
 func newStructuralCertificationGroup(
 	t *testing.T,
 ) (string, []NamedCollection, *TxnLog, *CheckpointGroup, Options) {
+	return newStructuralCertificationGroupWithOptions(t, structuralCertificationOptions())
+}
+
+func newStructuralCertificationGroupWithOptions(
+	t *testing.T, options Options,
+) (string, []NamedCollection, *TxnLog, *CheckpointGroup, Options) {
 	t.Helper()
 	dir := t.TempDir()
-	options := structuralCertificationOptions()
 	members := []NamedCollection{
 		openTxnNamedCollection(t, dir, "system", options),
 		openTxnNamedCollection(t, dir, "user", options),
@@ -73,6 +86,23 @@ func structuralCertificationBatch(
 	writeNames map[string]bool,
 	callbackCount *int,
 ) error {
+	return structuralCertificationBatchWithValue(
+		t, group, members, firstApplied, writeNames, callbackCount,
+		func(row int) []byte {
+			return []byte(fmt.Sprintf(`{"n":%d}`, row))
+		},
+	)
+}
+
+func structuralCertificationBatchWithValue(
+	t testing.TB,
+	group *CheckpointGroup,
+	members []NamedCollection,
+	firstApplied uint64,
+	writeNames map[string]bool,
+	callbackCount *int,
+	valueFor func(int) []byte,
+) error {
 	t.Helper()
 	lastApplied := firstApplied + structuralCertificationBatchRows - 1
 	return group.UpdateConsecutive(
@@ -89,8 +119,7 @@ func structuralCertificationBatch(
 				}
 				for row := int(firstApplied - 1); row < int(lastApplied); row++ {
 					key := []byte(fmt.Sprintf("row-%08d", row))
-					value := []byte(fmt.Sprintf(`{"n":%d}`, row))
-					if err := write.Put(key, value); err != nil {
+					if err := write.Put(key, valueFor(row)); err != nil {
 						return err
 					}
 				}
@@ -98,6 +127,66 @@ func structuralCertificationBatch(
 			return nil
 		},
 	)
+}
+
+func structuralCertificationWideValue(row int) []byte {
+	return fmt.Appendf(
+		nil, `{"n":%d,"payload":%q}`, row,
+		structuralCertificationPayload(row, 128),
+	)
+}
+
+func structuralCertificationPayload(row, size int) []byte {
+	const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+	payload := make([]byte, size)
+	state := uint64(row+1) * 0x9e3779b97f4a7c15
+	for index := range payload {
+		state ^= state >> 12
+		state ^= state << 25
+		state ^= state >> 27
+		state *= 0x2545f4914f6cdd1d
+		payload[index] = alphabet[state%uint64(len(alphabet))]
+	}
+	return payload
+}
+
+// structuralCertificationUnindexedBoundaryRows uses the same canonical rows
+// as the group test to find the 64 KiB compact-stripe boundary. Rounding down
+// to a whole publication leaves the next 64-row batch as the first overflowing
+// publication, independently of the maintained 256-slot geometry.
+func structuralCertificationUnindexedBoundaryRows(t testing.TB) int {
+	t.Helper()
+	records := make([]storeio.CommonPrimaryLeafRecord, storeio.CompactPrimaryStripeMaxRows)
+	for row := range records {
+		records[row] = storeio.CommonPrimaryLeafRecord{
+			Key: []byte(fmt.Sprintf("row-%08d", row)),
+			Value: storeio.CommonPrimaryLeafValue{
+				Inline: structuralCertificationWideValue(row),
+			},
+		}
+	}
+	planner, err := storeio.NewPrimaryValueLeafWindowPlanner(nil)
+	if err != nil {
+		t.Fatalf("create compact boundary planner: %v", err)
+	}
+	count, extent, _, err := planner.PlanUnplaced(
+		records, storeio.CommonPrimaryLeafMaxExtentBytes,
+	)
+	if err != nil {
+		t.Fatalf("plan compact boundary: %v", err)
+	}
+	if count <= storeio.CommonPrimaryLeafWideSlots ||
+		count >= storeio.CompactPrimaryStripeMaxRows ||
+		extent > storeio.CommonPrimaryLeafMaxExtentBytes {
+		t.Fatalf("compact boundary = %d rows/%d bytes, want byte-limited range in (%d,%d)",
+			count, extent, storeio.CommonPrimaryLeafWideSlots,
+			storeio.CompactPrimaryStripeMaxRows)
+	}
+	seedRows := count / structuralCertificationBatchRows * structuralCertificationBatchRows
+	if seedRows <= storeio.CommonPrimaryLeafWideSlots || seedRows+structuralCertificationBatchRows <= count {
+		t.Fatalf("rounded compact boundary = %d of %d rows, next batch would not overflow", seedRows, count)
+	}
+	return seedRows
 }
 
 func structuralNamedCollectionsFromHandles(
@@ -117,10 +206,20 @@ func structuralNamedCollectionsFromHandles(
 func requireStructuralCertificationRows(
 	t testing.TB, collection *Collection, first, last int, present bool,
 ) {
+	requireStructuralCertificationRowsWithValue(
+		t, collection, first, last, present,
+		func(row int) []byte { return []byte(fmt.Sprintf(`{"n":%d}`, row)) },
+	)
+}
+
+func requireStructuralCertificationRowsWithValue(
+	t testing.TB, collection *Collection, first, last int, present bool,
+	valueFor func(int) []byte,
+) {
 	t.Helper()
 	for row := first; row < last; row++ {
 		key := []byte(fmt.Sprintf("row-%08d", row))
-		want := []byte(fmt.Sprintf(`{"n":%d}`, row))
+		want := valueFor(row)
 		got, found, err := collection.AppendRaw(nil, key)
 		if err != nil {
 			t.Fatalf("row %d read: %v", row, err)
@@ -137,10 +236,20 @@ func requireStructuralCertificationRows(
 func requireStructuralCertificationSnapshotRows(
 	t testing.TB, snapshot *Snapshot, first, last int, present bool,
 ) {
+	requireStructuralCertificationSnapshotRowsWithValue(
+		t, snapshot, first, last, present,
+		func(row int) []byte { return []byte(fmt.Sprintf(`{"n":%d}`, row)) },
+	)
+}
+
+func requireStructuralCertificationSnapshotRowsWithValue(
+	t testing.TB, snapshot *Snapshot, first, last int, present bool,
+	valueFor func(int) []byte,
+) {
 	t.Helper()
 	for row := first; row < last; row++ {
 		key := []byte(fmt.Sprintf("row-%08d", row))
-		want := []byte(fmt.Sprintf(`{"n":%d}`, row))
+		want := valueFor(row)
 		got, found, err := snapshot.AppendRaw(nil, key)
 		if err != nil {
 			t.Fatalf("snapshot row %d read: %v", row, err)
@@ -192,10 +301,10 @@ func openStructuralCertificationCopy(
 	return collections, log, group
 }
 
-// TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut exercises the
-// real five-batch boundary: four 64-row publications fill one compact leaf and
-// the fifth publication requires a structural split. Certification advances
-// only the preceding group cut; the split collection performs its own durable
+// TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut exercises a
+// byte-limited unindexed compact stripe wider than 256 rows. The next 64-row
+// publication requires a structural split. Certification advances only the
+// preceding group cut; the split collection performs its own durable
 // structural flush while the idle member remains at its prior physical root.
 // The failed-prepare image contains only the newly certified preceding cut and
 // no decision; it must reopen at that exact prefix and accept the next-index
@@ -203,14 +312,18 @@ func openStructuralCertificationCopy(
 // uncertified decision and exercises the same recovery rule.
 func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 	dir, members, _, group, options := newStructuralCertificationGroup(t)
+	seedRows := structuralCertificationUnindexedBoundaryRows(t)
+	seedBatches := seedRows / structuralCertificationBatchRows
+	finalRows := seedRows + structuralCertificationBatchRows
 	allMembers := map[string]bool{"system": true, "user": true}
 	targetOnly := map[string]bool{"system": true}
 	callbackCount := 0
 	var heldSnapshot *Snapshot
-	for batch := 0; batch < 4; batch++ {
+	for batch := 0; batch < seedBatches; batch++ {
 		first := uint64(batch*structuralCertificationBatchRows + 1)
-		if err := structuralCertificationBatch(
+		if err := structuralCertificationBatchWithValue(
 			t, group, members, first, allMembers, &callbackCount,
+			structuralCertificationWideValue,
 		); err != nil {
 			t.Fatalf("seed batch %d: %v", batch, err)
 		}
@@ -233,18 +346,41 @@ func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 				t.Fatalf("snapshot changed group state: before=%+v after=%+v",
 					beforeSnapshot, afterSnapshot)
 			}
-			requireStructuralCertificationSnapshotRows(
+			requireStructuralCertificationSnapshotRowsWithValue(
 				t, heldSnapshot, 0, structuralCertificationBatchRows, true,
+				structuralCertificationWideValue,
 			)
-			requireStructuralCertificationSnapshotRows(
+			requireStructuralCertificationSnapshotRowsWithValue(
 				t, heldSnapshot, structuralCertificationBatchRows,
-				structuralCertificationBatchRows*5, false,
+				finalRows, false, structuralCertificationWideValue,
 			)
 		}
 	}
+	if got := members[0].Collection.primaryRouter.Load().Len(); got != 1 {
+		t.Fatalf("pre-split unindexed router leaves = %d, want one", got)
+	}
+	preSplitRoute, ok := members[0].Collection.primaryRouter.Load().RouteAtRank(0)
+	if !ok {
+		t.Fatal("pre-split unindexed route missing")
+	}
+	preSplitLease, err := members[0].Collection.cache.Acquire(preSplitRoute.Ref)
+	if err != nil {
+		t.Fatalf("acquire pre-split unindexed stripe: %v", err)
+	}
+	preSplitStripe, valid := storeio.AdmittedCompactPrimaryStripe(
+		preSplitLease.Page(), members[0].Collection.storeID, preSplitRoute.Bucket,
+	)
+	preSplitLease.Release()
+	if !valid || preSplitStripe.Len() != seedRows ||
+		preSplitStripe.Len() <= storeio.CommonPrimaryLeafWideSlots {
+		t.Fatalf("pre-split unindexed stripe = %d rows/valid=%v, want %d rows wider than 256",
+			preSplitStripe.Len(), valid, seedRows)
+	}
 	before := group.Stats()
-	if before.TransactionHighWater != 4 || before.CheckpointTransactions != 1 ||
-		before.PhysicalCheckpoints != 2 {
+	if before.AppliedIndex != uint64(seedRows) ||
+		before.CheckpointAppliedIndex != structuralCertificationBatchRows ||
+		before.TransactionHighWater != uint64(seedBatches) ||
+		before.CheckpointTransactions != 1 || before.PhysicalCheckpoints != 2 {
 		t.Fatalf("pre-split stats = %+v", before)
 	}
 	targetGenerationBefore := members[0].Collection.Generation()
@@ -261,8 +397,9 @@ func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 		}
 		return nil
 	}
-	err := structuralCertificationBatch(
-		t, group, members, 257, targetOnly, &callbackCount,
+	err = structuralCertificationBatchWithValue(
+		t, group, members, uint64(seedRows+1), targetOnly, &callbackCount,
+		structuralCertificationWideValue,
 	)
 	checkpointGroupFaultHook = previousHook
 	if !errors.Is(err, fault) {
@@ -271,8 +408,8 @@ func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 	if !preparedAfterCertification {
 		t.Fatal("fault hook did not observe local shape after preceding certification")
 	}
-	if callbackCount != 5 {
-		t.Fatalf("faulted split callbacks = %d, want one callback", callbackCount)
+	if callbackCount != seedBatches+1 {
+		t.Fatalf("faulted split callbacks = %d, want %d", callbackCount, seedBatches+1)
 	}
 	faulted := group.Stats()
 	if faulted.AppliedIndex != before.AppliedIndex ||
@@ -298,15 +435,20 @@ func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 	// retry, so the original owner must still expose only the certified prefix
 	// while retaining the old snapshot view.
 	for _, member := range members {
-		requireStructuralCertificationRows(t, member.Collection, 0, 256, true)
-		requireStructuralCertificationRows(t, member.Collection, 256, 320, false)
+		requireStructuralCertificationRowsWithValue(
+			t, member.Collection, 0, seedRows, true, structuralCertificationWideValue,
+		)
+		requireStructuralCertificationRowsWithValue(
+			t, member.Collection, seedRows, finalRows, false, structuralCertificationWideValue,
+		)
 	}
-	requireStructuralCertificationSnapshotRows(
+	requireStructuralCertificationSnapshotRowsWithValue(
 		t, heldSnapshot, 0, structuralCertificationBatchRows, true,
+		structuralCertificationWideValue,
 	)
-	requireStructuralCertificationSnapshotRows(
+	requireStructuralCertificationSnapshotRowsWithValue(
 		t, heldSnapshot, structuralCertificationBatchRows,
-		structuralCertificationBatchRows*5, false,
+		finalRows, false, structuralCertificationWideValue,
 	)
 	faultImage := copyCheckpointGroupDirectory(t, dir)
 
@@ -315,19 +457,24 @@ func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 	// accept the same next-index batch without evaluating it twice.
 	faultRecovered, _, faultReopened := openStructuralCertificationCopy(t, faultImage, options)
 	faultRecoveredStats := faultReopened.Stats()
-	if faultRecoveredStats.AppliedIndex != 256 ||
-		faultRecoveredStats.CheckpointAppliedIndex != 256 ||
-		faultRecoveredStats.TransactionHighWater != 4 {
+	if faultRecoveredStats.AppliedIndex != uint64(seedRows) ||
+		faultRecoveredStats.CheckpointAppliedIndex != uint64(seedRows) ||
+		faultRecoveredStats.TransactionHighWater != uint64(seedBatches) {
 		t.Fatalf("faulted image recovered stats = %+v", faultRecoveredStats)
 	}
 	for _, collection := range faultRecovered {
-		requireStructuralCertificationRows(t, collection, 0, 256, true)
-		requireStructuralCertificationRows(t, collection, 256, 320, false)
+		requireStructuralCertificationRowsWithValue(
+			t, collection, 0, seedRows, true, structuralCertificationWideValue,
+		)
+		requireStructuralCertificationRowsWithValue(
+			t, collection, seedRows, finalRows, false, structuralCertificationWideValue,
+		)
 	}
 	faultRecoveryCallbacks := 0
-	if err := structuralCertificationBatch(
+	if err := structuralCertificationBatchWithValue(
 		t, faultReopened, structuralNamedCollectionsFromHandles(faultRecovered),
-		257, targetOnly, &faultRecoveryCallbacks,
+		uint64(seedRows+1), targetOnly, &faultRecoveryCallbacks,
+		structuralCertificationWideValue,
 	); err != nil {
 		t.Fatalf("faulted image exact retry: %v", err)
 	}
@@ -341,27 +488,35 @@ func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 	if err := faultReopened.Checkpoint(); err != nil {
 		t.Fatalf("faulted image final checkpoint: %v", err)
 	}
-	if got := faultReopened.CheckpointAppliedIndex(); got != 320 {
-		t.Fatalf("faulted image final checkpoint = %d, want 320", got)
+	if got := faultReopened.CheckpointAppliedIndex(); got != uint64(finalRows) {
+		t.Fatalf("faulted image final checkpoint = %d, want %d", got, finalRows)
 	}
-	requireStructuralCertificationRows(t, faultRecovered[0], 0, 320, true)
-	requireStructuralCertificationRows(t, faultRecovered[1], 0, 256, true)
+	requireStructuralCertificationRowsWithValue(
+		t, faultRecovered[0], 0, finalRows, true, structuralCertificationWideValue,
+	)
+	requireStructuralCertificationRowsWithValue(
+		t, faultRecovered[1], 0, seedRows, true, structuralCertificationWideValue,
+	)
 
 	mixedRecovered, _, mixedReopened := openStructuralCertificationCopy(t, mixedImage, options)
 	mixedStats := mixedReopened.Stats()
-	if mixedStats.AppliedIndex != 256 ||
-		mixedStats.CheckpointAppliedIndex != 256 ||
-		mixedStats.TransactionHighWater != 4 {
+	if mixedStats.AppliedIndex != uint64(seedRows) ||
+		mixedStats.CheckpointAppliedIndex != uint64(seedRows) ||
+		mixedStats.TransactionHighWater != uint64(seedBatches) {
 		t.Fatalf("mixed-root recovered stats = %+v", mixedStats)
 	}
 	for _, collection := range mixedRecovered {
-		requireStructuralCertificationRows(t, collection, 0, 256, true)
-		requireStructuralCertificationRows(t, collection, 256, 320, false)
+		requireStructuralCertificationRowsWithValue(
+			t, collection, 0, seedRows, true, structuralCertificationWideValue,
+		)
+		requireStructuralCertificationRowsWithValue(
+			t, collection, seedRows, finalRows, false, structuralCertificationWideValue,
+		)
 	}
 	callbackCount = 0
-	if err := structuralCertificationBatch(
-		t, mixedReopened, structuralNamedCollectionsFromHandles(mixedRecovered), 257,
-		targetOnly, &callbackCount,
+	if err := structuralCertificationBatchWithValue(
+		t, mixedReopened, structuralNamedCollectionsFromHandles(mixedRecovered),
+		uint64(seedRows+1), targetOnly, &callbackCount, structuralCertificationWideValue,
 	); err != nil {
 		t.Fatalf("mixed-root exact next-index retry: %v", err)
 	}
@@ -371,11 +526,15 @@ func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 	if err := mixedReopened.Checkpoint(); err != nil {
 		t.Fatalf("mixed-root recovery full checkpoint: %v", err)
 	}
-	if got := mixedReopened.CheckpointAppliedIndex(); got != 320 {
-		t.Fatalf("mixed-root recovered final checkpoint = %d, want 320", got)
+	if got := mixedReopened.CheckpointAppliedIndex(); got != uint64(finalRows) {
+		t.Fatalf("mixed-root recovered final checkpoint = %d, want %d", got, finalRows)
 	}
-	requireStructuralCertificationRows(t, mixedRecovered[0], 0, 320, true)
-	requireStructuralCertificationRows(t, mixedRecovered[1], 0, 256, true)
+	requireStructuralCertificationRowsWithValue(
+		t, mixedRecovered[0], 0, finalRows, true, structuralCertificationWideValue,
+	)
+	requireStructuralCertificationRowsWithValue(
+		t, mixedRecovered[1], 0, seedRows, true, structuralCertificationWideValue,
+	)
 }
 
 // TestCheckpointGroupStructuralSplitCertificatePreflightRejectsTerminalMember
@@ -384,7 +543,8 @@ func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 // certificate, root, marker, or logical publication changes; repairing that
 // member permits the exact same batch to retry once.
 func TestCheckpointGroupStructuralSplitCertificatePreflightRejectsTerminalMember(t *testing.T) {
-	dir, members, _, group, _ := newStructuralCertificationGroup(t)
+	indexedOptions := structuralCertificationExactOptions(structuralCertificationOptions())
+	dir, members, _, group, _ := newStructuralCertificationGroupWithOptions(t, indexedOptions)
 	allMembers := map[string]bool{"system": true, "user": true}
 	targetOnly := map[string]bool{"system": true}
 	callbackCount := 0
@@ -447,7 +607,7 @@ func TestCheckpointGroupStructuralSplitCertificatePreflightRejectsTerminalMember
 // uncertified split and accepts the exact next-index replay under the same
 // asymmetric public options.
 func TestCheckpointGroupStructuralSplitMixedMemberRoots(t *testing.T) {
-	smallOptions := syncPrimaryJournalTestOptions()
+	smallOptions := structuralCertificationExactOptions(syncPrimaryJournalTestOptions())
 	smallOptions.MaxBatchDocuments = 1
 	smallOptions.MaxKeyBytes = 64
 	smallOptions.InlineValueBytes = 512
@@ -623,17 +783,26 @@ func TestCheckpointGroupStructuralSplitMixedMemberRoots(t *testing.T) {
 func TestCheckpointGroupStructuralSplitCertifiesBeforeOverlayPressure(t *testing.T) {
 	options := syncPrimaryJournalTestOptions()
 	options.MaxBatchDocuments = structuralCertificationBatchRows
-	options.InlineValueBytes = 512
+	options.InlineValueBytes = 1024
 	options.MaxDocumentBytes = 1 << 10
 	options.BufferCount = 768
 	options.ResidentBytes = 32 << 20
-	if _, err := options.normalized(); err != nil {
+	normalizedOptions, err := options.normalized()
+	if err != nil {
 		t.Fatalf("overlay pressure options: %v", err)
+	}
+	systemOptions := structuralCertificationExactOptions(options)
+	// Exact posting maintenance adds bounded descriptors to the system
+	// transaction geometry; leave the user collection at the smaller arena
+	// because it is the member whose overlay bucket limit this test crosses.
+	systemOptions.BufferCount = 1024
+	if _, err := systemOptions.normalized(); err != nil {
+		t.Fatalf("indexed system options: %v", err)
 	}
 
 	dir := t.TempDir()
 	members := []NamedCollection{
-		openTxnNamedCollection(t, dir, "system", options),
+		openTxnNamedCollection(t, dir, "system", systemOptions),
 		openTxnNamedCollection(t, dir, "user", options),
 	}
 	log, err := NewTxnLog(dir, TxnLogOptions{})
@@ -655,16 +824,27 @@ func TestCheckpointGroupStructuralSplitCertifiesBeforeOverlayPressure(t *testing
 		keys[index] = fmt.Sprintf("primary-key-%09d", index)
 	}
 	canonicalValue := func(value int) []byte {
-		raw := []byte(fmt.Sprintf(
-			`{"v":%d,"w":10,"payload":%q}`, value, strings.Repeat("x", 256),
-		))
+		raw := fmt.Appendf(
+			nil, `{"v":%d,"w":10,"payload":%q}`,
+			value, strings.Repeat("x", 256),
+		)
 		canonical, err := vibejson.AppendCanonicalize(nil, raw)
 		if err != nil {
 			t.Fatalf("canonical pressure value %d: %v", value, err)
 		}
 		return canonical
 	}
-	seedValue := canonicalValue(0)
+	seedValue := func(row int) []byte {
+		raw := fmt.Appendf(
+			nil, `{"v":0,"w":10,"payload":%q}`,
+			structuralCertificationPayload(row, 768),
+		)
+		canonical, err := vibejson.AppendCanonicalize(nil, raw)
+		if err != nil {
+			t.Fatalf("canonical pressure seed row %d: %v", row, err)
+		}
+		return canonical
+	}
 	valueFor := func(value int) []byte {
 		return canonicalValue(value)
 	}
@@ -689,9 +869,10 @@ func TestCheckpointGroupStructuralSplitCertifiesBeforeOverlayPressure(t *testing
 			},
 		)
 	}
-	// Four 64-row system publications fill exactly one leaf. User rows are
-	// seeded separately so the later user overlay can be the second dirty
-	// member after the system split has crossed the certification boundary.
+	// The system's exact /n index retains the 256-slot geometry, so four
+	// 64-row publications fill one leaf. User rows are seeded separately so the
+	// later user overlay can be the second dirty member after the system split
+	// has crossed the certification boundary.
 	for batch := 0; batch < 4; batch++ {
 		start := batch * structuralCertificationBatchRows
 		if err := writeRange(
@@ -710,15 +891,51 @@ func TestCheckpointGroupStructuralSplitCertifiesBeforeOverlayPressure(t *testing
 		firstApplied := uint64(userSeedStart + start + 1)
 		if err := writeRange(
 			members[1], firstApplied, start, end,
-			func(int) []byte { return seedValue },
+			seedValue,
 		); err != nil {
 			t.Fatalf("user seed range [%d,%d): %v", start, end, err)
+		}
+	}
+	// Saturated, high-entropy 64 KiB leaves decline changed-row overlay batches.
+	// Rewrite the corpus with same-shape short values and checkpoint once; this
+	// preserves its route buckets while leaving scalar overlay replacements room
+	// below the leaf extent ceiling for the actual pressure exercise.
+	countBuckets := func() int {
+		state := members[1].Collection.state.Load()
+		seen := make(map[storeio.BucketID]struct{})
+		for _, key := range keys {
+			route, routeErr := members[1].Collection.currentPrimaryResidentRoute(
+				state, []byte(key),
+			)
+			if routeErr != nil {
+				t.Fatalf("route compacted user key %q: %v", key, routeErr)
+			}
+			seen[route.Bucket] = struct{}{}
+		}
+		return len(seen)
+	}
+	userBucketsBeforeShrink := countBuckets()
+	userShrinkStart := userSeedStart + userSeedRows
+	for start := 0; start < userSeedRows; start += structuralCertificationBatchRows {
+		end := min(start+structuralCertificationBatchRows, userSeedRows)
+		firstApplied := uint64(userShrinkStart + start + 1)
+		if err := writeRange(
+			members[1], firstApplied, start, end,
+			func(int) []byte { return canonicalValue(0) },
+		); err != nil {
+			t.Fatalf("user compacting range [%d,%d): %v", start, end, err)
 		}
 	}
 	if err := group.Checkpoint(); err != nil {
 		t.Fatalf("seed checkpoint: %v", err)
 	}
-	seedApplied := uint64(userSeedStart + userSeedRows)
+	if userBucketsAfterShrink := countBuckets(); userBucketsAfterShrink < userBucketsBeforeShrink ||
+		userBucketsAfterShrink <= normalizedOptions.primaryUnifiedOverlayBuckets {
+		t.Fatalf("user route buckets after compacting = %d, before = %d, overlay limit = %d",
+			userBucketsAfterShrink, userBucketsBeforeShrink,
+			normalizedOptions.primaryUnifiedOverlayBuckets)
+	}
+	seedApplied := uint64(userShrinkStart + userSeedRows)
 	baseline := group.Stats()
 	if baseline.AppliedIndex != seedApplied ||
 		baseline.CheckpointAppliedIndex != seedApplied ||
@@ -739,6 +956,10 @@ func TestCheckpointGroupStructuralSplitCertifiesBeforeOverlayPressure(t *testing
 		route, routeErr := user.currentPrimaryResidentRoute(state, []byte(key))
 		if routeErr != nil {
 			t.Fatalf("route seed key %q: %v", key, routeErr)
+		}
+		if route.Ref.Length >= storeio.CommonPrimaryLeafMaxExtentBytes {
+			t.Fatalf("compacted user bucket %d extent=%d, want headroom below %d",
+				route.Bucket, route.Ref.Length, storeio.CommonPrimaryLeafMaxExtentBytes)
 		}
 		if _, exists := seen[route.Bucket]; exists {
 			continue
@@ -781,7 +1002,7 @@ func TestCheckpointGroupStructuralSplitCertifiesBeforeOverlayPressure(t *testing
 	beforeOverlayBuckets := user.primaryUnifiedOverlay.bucketCount.Load()
 	if before.CheckpointAppliedIndex != baseline.CheckpointAppliedIndex ||
 		before.TransactionHighWater != baseline.TransactionHighWater+1 ||
-		beforeOverlayBuckets == 0 || int(beforeOverlayBuckets) >= pressureLimit {
+		int(beforeOverlayBuckets) != preCount || int(beforeOverlayBuckets) >= pressureLimit {
 		t.Fatalf("overlay prefix state = %+v buckets=%d limit=%d",
 			before, beforeOverlayBuckets, pressureLimit)
 	}

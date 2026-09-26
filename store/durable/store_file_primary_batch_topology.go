@@ -154,7 +154,7 @@ func (c *Collection) preparePrimaryBatchTopology(
 	c.structuralRows = prospective
 
 	cuts, unionKeys, err := c.planPrimaryBatchTopologyCuts(
-		baseRows, prospective,
+		baseRows, prospective, primarySlotGeometryMaintained(state.root),
 	)
 	if err != nil {
 		return err
@@ -426,7 +426,20 @@ func (c *Collection) preparePrimaryBatchTopology(
 // fails symmetrically for inserts and growth.
 func (c *Collection) planPrimaryBatchTopologyCuts(
 	current, prospective []storeio.CommonPrimaryLeafRecord,
+	maintainSlots bool,
 ) (cuts, unionKeys [][]byte, err error) {
+	planStarts := func(
+		dst []int, rows []storeio.CommonPrimaryLeafRecord,
+	) ([]int, error) {
+		if maintainSlots {
+			return storeio.AppendCommonPrimaryUnifiedLeafStarts(
+				dst, c.primaryUnifiedBuilder, c.storeID, rows,
+			)
+		}
+		return storeio.AppendCommonPrimaryCompactLeafStarts(
+			dst, c.primaryUnifiedBuilder, c.storeID, rows,
+		)
+	}
 	// The sparse-empty case is important enough to keep direct: the prospective
 	// image is already strictly sorted and its canonical spans are self-validating.
 	// There is no current content for another dataset's cuts to subdivide, so a
@@ -436,15 +449,10 @@ func (c *Collection) planPrimaryBatchTopologyCuts(
 		for at := range prospective {
 			unionKeys[at] = prospective[at].Key
 		}
-		starts, planErr := storeio.AppendCommonPrimaryUnifiedLeafStarts(
-			nil, c.primaryUnifiedBuilder, c.storeID, prospective,
-		)
+		starts, planErr := planStarts(nil, prospective)
 		if planErr != nil {
 			for at := range prospective {
-				_, singleErr := storeio.AppendCommonPrimaryUnifiedLeafStarts(
-					nil, c.primaryUnifiedBuilder, c.storeID,
-					prospective[at:at+1],
-				)
+				_, singleErr := planStarts(nil, prospective[at:at+1])
 				if singleErr != nil {
 					return nil, nil, fmt.Errorf(
 						"%w: primary row %q cannot fit one leaf: %v",
@@ -496,18 +504,13 @@ func (c *Collection) planPrimaryBatchTopologyCuts(
 					)
 				}
 				if end > at {
-					starts, err = storeio.AppendCommonPrimaryUnifiedLeafStarts(
-						starts[:0], c.primaryUnifiedBuilder, c.storeID,
-						dataset.rows[at:end],
-					)
+					starts, err = planStarts(starts[:0], dataset.rows[at:end])
 					if err != nil {
 						if dataset.prospective {
 							for rowAt := at; rowAt < end; rowAt++ {
-								_, singleErr :=
-									storeio.AppendCommonPrimaryUnifiedLeafStarts(
-										nil, c.primaryUnifiedBuilder, c.storeID,
-										dataset.rows[rowAt:rowAt+1],
-									)
+								_, singleErr := planStarts(
+									nil, dataset.rows[rowAt:rowAt+1],
+								)
 								if singleErr != nil {
 									return nil, nil, fmt.Errorf(
 										"%w: primary row %q cannot fit one leaf: %v",

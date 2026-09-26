@@ -731,6 +731,9 @@ func TestFilePrimaryOverlayFoldStatsExcludeDeviceCheckpoints(t *testing.T) {
 			t.Fatal(err)
 		}
 		quietDeviceCommits := quiet.Stats().DeviceCommits - quietBefore.DeviceCommits
+		if quietDeviceCommits != 0 {
+			t.Fatalf("quiet equivalent batch device commits = %d, want 0", quietDeviceCommits)
+		}
 
 		collection, keys := open(t)
 		if _, err := collection.Put(
@@ -739,6 +742,7 @@ func TestFilePrimaryOverlayFoldStatsExcludeDeviceCheckpoints(t *testing.T) {
 			t.Fatal(err)
 		}
 		before := collection.Stats()
+		beforeDurableGeneration := collection.DurableGeneration()
 		if err := collection.Update(func(batch *WriteBatch) error {
 			// Existing-key Updates stay on the ordinary overlay. A batch
 			// delete declines to COW, which must still barrier-fold the
@@ -747,9 +751,21 @@ func TestFilePrimaryOverlayFoldStatsExcludeDeviceCheckpoints(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		// The compact foreground fold seals one physical publication before the
-		// batch's own publication; it is not an automatic durability checkpoint.
-		assertFold(t, collection, before, quietDeviceCommits+1, primaryMaterializationBarrier)
+		// The foreground barrier fold materializes the pending overlay into the
+		// next visible root without an incidental structural split; this remains
+		// device-silent while the fold, barrier reason, and batch result are counted.
+		assertFold(t, collection, before, 0, primaryMaterializationBarrier)
+		after := collection.Stats()
+		if after.PrimaryLeafSplits != before.PrimaryLeafSplits {
+			t.Fatalf("batch-pre-fold leaf splits = %d, before %d",
+				after.PrimaryLeafSplits, before.PrimaryLeafSplits)
+		}
+		if collection.DurableGeneration() != beforeDurableGeneration {
+			t.Fatalf("batch-pre-fold advanced durable generation %d -> %d",
+				beforeDurableGeneration, collection.DurableGeneration())
+		}
+		assertPrimaryRaw(t, collection, keys[0], []byte(`{"fold":"before-batch"}`), true)
+		assertPrimaryRaw(t, collection, keys[1], nil, false)
 	})
 
 	t.Run("snapshot-fold", func(t *testing.T) {

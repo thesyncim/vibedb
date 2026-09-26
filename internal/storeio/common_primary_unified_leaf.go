@@ -150,6 +150,7 @@ type UnifiedPrimaryLeafBuilder struct {
 	records      []CommonPrimaryLeafRecord
 	graphRecords []PrimaryGraphRecord
 	graphPlaced  bool
+	unplaced     bool
 	plan         unifiedPrefixPlan
 	shapeRows    []int32
 	shapeSavings []int64
@@ -277,6 +278,9 @@ func (b *UnifiedPrimaryLeafBuilder) slotAt(i int) uint8 {
 		if b.graphPlaced {
 			return uint8(i)
 		}
+		return 0
+	}
+	if b.unplaced {
 		return 0
 	}
 	return b.records[i].Slot
@@ -438,6 +442,19 @@ func (b *UnifiedPrimaryLeafBuilder) extract(records []CommonPrimaryLeafRecord) e
 	b.records = records
 	b.graphRecords = nil
 	b.graphPlaced = false
+	b.unplaced = false
+	return b.extractRows(len(records))
+}
+
+// extractUnplaced ignores mutation-record slots and uses the compact stripe's
+// implicit lexical rank when no index geometry is maintained.
+func (b *UnifiedPrimaryLeafBuilder) extractUnplaced(
+	records []CommonPrimaryLeafRecord,
+) error {
+	b.records = records
+	b.graphRecords = nil
+	b.graphPlaced = false
+	b.unplaced = true
 	return b.extractRows(len(records))
 }
 
@@ -451,6 +468,7 @@ func (b *UnifiedPrimaryLeafBuilder) extractPrimaryGraph(
 	b.records = nil
 	b.graphRecords = records
 	b.graphPlaced = placed
+	b.unplaced = false
 	return b.extractRows(len(records))
 }
 
