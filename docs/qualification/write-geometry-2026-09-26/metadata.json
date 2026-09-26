@@ -1,0 +1,26 @@
+{
+  "base": "f9a9627a513a1599bc00bdaf59f4eb93470d9fbf",
+  "candidate": "94accf7d3276b9235ea6f9c347d222aeeb1523e0",
+  "go": "go1.27.0",
+  "experiment": "simd",
+  "os": "darwin",
+  "arch": "arm64",
+  "cpu": "Apple M4 Max",
+  "write_repetitions": 3,
+  "write_order": "main/candidate, candidate/main, main/candidate for each workload",
+  "write_production_source_sha256": {
+    "internal/storeio/common_primary_unified_leaf.go": "c5e6b2136ecd1616399a7855d32b60cdf530ad6b550741e0161a2307512a43f7",
+    "internal/storeio/common_primary_unified_plan.go": "86d681dc17bf8e3b2d204d1d2515883c388352e40eff682a4e93429e7c91a081",
+    "internal/storeio/compact_primary_stripe.go": "5c49fc5927e094e362013023af47e482d1a8b862a58c8398ad3a238c0e8ed068",
+    "internal/storeio/primary_value_incremental.go": "b1702be7413071d13bf19cd0694ef8bd8dc4a1e19fd6f2cac090cbac4393a3d6",
+    "store/durable/store_file_batch.go": "69dff3cae97852df288e1eed55c6d0603a7c90c35a867f92ee0ee2f839353bb8",
+    "store/durable/store_file_primary_batch.go": "b8132fbd4f29c0d6bdd63e617273b552dea51b55f6f3abb8f26e7d4a980b8046",
+    "store/durable/store_file_primary_batch_topology.go": "2d15259d77b166b123f3fc2ffb7ce3bfc6c5600c29c2529561463e8bae3994a8"
+  },
+  "write_benchmark_sha256": "729aecb98499032f9e667a91d5e71a694e1470ae31ec93cb48a3faecef3ece27",
+  "read_binaries_sha256": {
+    "main": "fdf562e708b966ac4734e7eec0584b823739bfb5e4bced14b8ee1e9efcb7c566",
+    "leaf": "154b6dac8df6095b007740b5a5f72f1e312f7381cb5b212c08a1d9efa8f32b06"
+  },
+  "scope": "Shared host. Three durable collections, not three Raft replicas. No admission, network, or RF3. End-to-end apply preparation and final checkpoint are timed. Read setup/warming/oracles are untimed. Disk peaks are sampled, not exact."
+}
