@@ -11,7 +11,7 @@ import (
 
 func TestExternalProcessReadinessRestartAndBoundedCleanup(t *testing.T) {
 	process := &ExternalProcess{Binary: "/bin/sh", Args: []string{"-c",
-		"echo fixture-ready; trap 'exit 0' TERM; while :; do sleep 1; done"}, Env: os.Environ()}
+		"trap 'exit 0' TERM; echo fixture-ready; while :; do sleep 1; done"}, Env: os.Environ()}
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := process.Start(); err != nil {
 			t.Fatal(err)
