@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"io"
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -162,7 +163,8 @@ func transientControlOpenFailure(err error) bool {
 		hardControlOpenRejection(err) {
 		return false
 	}
-	return transientControlOpenSystemCause(err)
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		transientControlOpenSystemCause(err)
 }
 
 func hardControlOpenRejection(err error) bool {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -207,6 +209,108 @@ func TestSchemaRolloutControllerResumesRunningCutAfterShardFailure(t *testing.T)
 	result, err = controller.Execute(context.Background(), id, target, plans)
 	if err != nil || result.Record.State != ReplicatedOperationComplete {
 		t.Fatalf("resumed result=%+v err=%v", result, err)
+	}
+}
+
+type schemaControllerCommitAttempt struct {
+	node          rafttransport.NodeID
+	request       schemainstall.Request
+	authorization schemainstall.Authorization
+}
+
+type schemaControllerCommitOpenEOFClient struct {
+	*schemaControllerClient
+	targetNode rafttransport.NodeID
+	mu         sync.Mutex
+	attempts   []schemaControllerCommitAttempt
+}
+
+func (client *schemaControllerCommitOpenEOFClient) Commit(
+	ctx context.Context,
+	node rafttransport.NodeID,
+	request schemainstall.Request,
+	authorization schemainstall.Authorization,
+) (schemainstall.Record, error) {
+	client.mu.Lock()
+	client.attempts = append(client.attempts, schemaControllerCommitAttempt{
+		node: node, request: request, authorization: authorization,
+	})
+	attempt := 0
+	if node == client.targetNode {
+		for _, prior := range client.attempts {
+			if prior.node == node {
+				attempt++
+			}
+		}
+	}
+	client.mu.Unlock()
+	if attempt == 1 {
+		return schemainstall.Record{}, errors.Join(schemainstall.ErrTransientControlOpen,
+			rafttransport.ErrPeerAuthentication, io.EOF)
+	}
+	return client.schemaControllerClient.Commit(ctx, node, request, authorization)
+}
+
+func TestSchemaRolloutControllerRetriesClassifiedOpenEOFForMemberThreeCommit(t *testing.T) {
+	authority, _, current := newCatalogAuthorityFixture(t)
+	target, _ := testSchemaRolloutTarget(t, current)
+	id := sha256.Sum256([]byte("schema-controller-member-three-open-eof"))
+	plans := schemaControllerPlans(t, id, current, target)
+	var memberThree SchemaRolloutReplicaPlan
+	for _, plan := range plans {
+		if plan.Member == 3 {
+			memberThree = plan
+			break
+		}
+	}
+	if memberThree.Member != 3 {
+		t.Fatal("schema rollout fixture does not contain member 3")
+	}
+	baseClient := &schemaControllerClient{authority: authority, base: current.Generation()}
+	client := &schemaControllerCommitOpenEOFClient{
+		schemaControllerClient: baseClient,
+		targetNode:             memberThree.Node,
+	}
+	controller, err := NewSchemaRolloutController(SchemaRolloutControllerOptions{
+		Authority: authority, Client: client, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := controller.Execute(t.Context(), id, target, plans)
+	if err != nil || result.Record.State != ReplicatedOperationComplete ||
+		authority.holder.Current().Generation() != target.Generation() {
+		t.Fatalf("rollout result=%+v generation=%d err=%v", result,
+			authority.holder.Current().Generation(), err)
+	}
+	installed, err := authority.Read(t.Context())
+	if err != nil || installed.Generation() != target.Generation() {
+		t.Fatalf("catalog generation=%d err=%v, want exact target generation %d",
+			installed.Generation(), err, target.Generation())
+	}
+
+	client.mu.Lock()
+	attempts := append([]schemaControllerCommitAttempt(nil), client.attempts...)
+	client.mu.Unlock()
+	if len(attempts) != len(plans)+1 {
+		t.Fatalf("commit attempts=%d, want one per member plus member 3 retry", len(attempts))
+	}
+	var memberThreeAttempts []schemaControllerCommitAttempt
+	for _, attempt := range attempts {
+		if attempt.node == memberThree.Node {
+			memberThreeAttempts = append(memberThreeAttempts, attempt)
+		}
+	}
+	if len(memberThreeAttempts) != 2 {
+		t.Fatalf("member 3 commit attempts=%d, want opening EOF followed by one retry", len(memberThreeAttempts))
+	}
+	for index, attempt := range memberThreeAttempts {
+		if attempt.request != memberThree.Request || attempt.authorization != result.Authorization {
+			t.Fatalf("member 3 commit attempt %d changed request or authorization", index+1)
+		}
+	}
+	if memberThreeAttempts[0] != memberThreeAttempts[1] {
+		t.Fatal("member 3 retry did not use the byte-identical request and authorization")
 	}
 }
 
