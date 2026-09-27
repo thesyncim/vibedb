@@ -463,7 +463,6 @@ jobs:
           evidence="${RUNNER_TEMP}/whole-main-write"
           build="${evidence}/build"
           mkdir -p "${TMPDIR}" "${build}" "${RUNNER_TEMP}/whole-main-write-checkouts"
-          workflow_revision="$(cat "${build}/workflow-revision.txt")"
           base="$(cat "${build}/baseline-revision.txt")"
           candidate="$(cat "${build}/candidate-revision.txt")"
           harness_revision='9a136523919e89187edd2bd70d8645caeb22c579'
