@@ -4147,6 +4147,14 @@ func (owner *Owner) submit(
 	}
 	result := Result{Outcome: taken, Completion: completion, State: reply.state}
 	if outcomeErr := taken.Err(); outcomeErr != nil {
+		switch taken.Code {
+		case raftserve.OutcomeNotLeader, raftserve.OutcomeProposalAbandoned:
+			// These infrastructure outcomes do not distinguish admission from
+			// refusal and cannot prove that no peer committed the command.
+			return result, &UnknownOutcomeError{
+				Command: owned[:len(owned):len(owned)], Cause: outcomeErr,
+			}
+		}
 		return result, outcomeErr
 	}
 	return result, nil

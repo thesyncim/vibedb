@@ -850,11 +850,11 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 			return &ReplicatedResponse{Kind: ReplicatedMembershipAccepted, HasState: true, State: wireState}
 		}
 		switch {
-		case errors.Is(err, raftmodel.ErrNotLeader):
-			return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}
 		case errors.Is(err, raftservice.ErrOutcomeUnknown), errors.Is(err, context.Canceled),
 			errors.Is(err, context.DeadlineExceeded):
 			return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
+		case errors.Is(err, raftmodel.ErrNotLeader):
+			return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}
 		case errors.Is(err, raftservice.ErrMembershipUnauthorized):
 			return membershipRefusal(wireState, ReplicatedRefusalMembershipUnauthorized)
 		case errors.Is(err, raftservice.ErrMembershipStale), errors.Is(err, raftservice.ErrServingFence):
@@ -1288,13 +1288,25 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 		wireState = replicatedWireState(refreshed)
 	}
 	switch {
-	case errors.Is(err, raftmodel.ErrNotLeader):
-		return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}
+	case result.Outcome.Code == raftserve.OutcomeProposalAbandoned ||
+		errors.Is(err, raftserve.ErrProposalAbandoned):
+		server.proposalUnknownAbandoned.Add(1)
+		return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
+	case result.Outcome.Code == raftserve.OutcomeNotLeader:
+		server.proposalUnknownSubmit.Add(1)
+		return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
 	case errors.Is(err, raftservice.ErrOutcomeUnknown),
 		errors.Is(err, context.Canceled),
 		errors.Is(err, context.DeadlineExceeded):
 		// SubmitOwned was entered with a complete canonical proposal. A local
 		// deadline cannot prove whether admission won the cancellation race.
+		server.proposalUnknownSubmit.Add(1)
+		return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
+	case isTypedPreAdmissionNotLeader(err):
+		return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}
+	case errors.Is(err, raftmodel.ErrNotLeader):
+		// A bare sentinel does not distinguish a refusal before registry
+		// admission from a settled or otherwise uncertain admitted result.
 		server.proposalUnknownSubmit.Add(1)
 		return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
 	case errors.Is(err, raftservice.ErrServingFence):
@@ -1307,10 +1319,6 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 			Kind: ReplicatedRefusal, Refusal: ReplicatedRefusalUnavailable,
 			HasState: true, State: wireState,
 		}
-	case result.Outcome.Code == raftserve.OutcomeProposalAbandoned ||
-		errors.Is(err, raftserve.ErrProposalAbandoned):
-		server.proposalUnknownAbandoned.Add(1)
-		return &ReplicatedResponse{Kind: ReplicatedOutcomeUnknown, HasState: true, State: wireState}
 	case result.Outcome.Code == raftserve.OutcomeProposalRefused ||
 		errors.Is(err, raftserve.ErrProposalRefused):
 		return &ReplicatedResponse{
@@ -1534,6 +1542,11 @@ func replicatedCompletionInvalidReasons(
 
 func membershipRefusal(state ReplicatedMemberState, code ReplicatedRefusalCode) *ReplicatedResponse {
 	return &ReplicatedResponse{Kind: ReplicatedRefusal, Refusal: code, HasState: true, State: state}
+}
+
+func isTypedPreAdmissionNotLeader(err error) bool {
+	var notLeader *raftservice.NotLeaderError
+	return errors.As(err, &notLeader)
 }
 
 func replicatedServingFence(fence ReplicatedFence) raftservice.ServingFence {

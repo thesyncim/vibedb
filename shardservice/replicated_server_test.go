@@ -13,6 +13,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/executionpin"
 	"github.com/thesyncim/vibedb/internal/raftmember"
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -478,6 +479,8 @@ func TestReplicatedServerMembershipTypedRefusals(t *testing.T) {
 			code: ReplicatedRefusalMembershipMalformed},
 		{err: raftservice.ErrMembershipNotCaughtUp, kind: ReplicatedRefusal,
 			code: ReplicatedRefusalMembershipNotCaughtUp},
+		{err: errors.Join(raftservice.ErrOutcomeUnknown, raftmodel.ErrNotLeader),
+			kind: ReplicatedOutcomeUnknown},
 	}
 	for _, test := range tests {
 		owner := &fakeReplicatedOwner{state: state, membershipErr: test.err}
@@ -648,7 +651,7 @@ func TestReplicatedServerClosesEveryOwnerOutcomeOnTheWire(t *testing.T) {
 			wantRefusal = ReplicatedRefusalProposalRefused
 		case code == raftserve.OutcomeNotLeader:
 			ownerErr = result.Outcome.Err()
-			want = ReplicatedNotLeader
+			want = ReplicatedOutcomeUnknown
 			wantRefusal = ReplicatedRefusalNone
 		case code == raftserve.OutcomeProposalAbandoned:
 			ownerErr = result.Outcome.Err()
@@ -671,6 +674,66 @@ func TestReplicatedServerClosesEveryOwnerOutcomeOnTheWire(t *testing.T) {
 		if err != nil || decoded.Kind != want || decoded.Refusal != wantRefusal {
 			t.Fatalf("outcome %d = %+v error=%v want kind/refusal %d/%d",
 				code, decoded, err, want, wantRefusal)
+		}
+	}
+}
+
+func TestReplicatedServerRequiresTypedPreAdmissionNotLeaderEvidence(t *testing.T) {
+	fence := testReplicatedFence()
+	command := testReplicatedCommand(t, fence)
+	state := testReplicatedServingState()
+	typedNotLeader := &raftservice.NotLeaderError{Status: state.Status}
+	cases := []struct {
+		name   string
+		result raftservice.Result
+		err    error
+		want   ReplicatedResponseKind
+	}{
+		{name: "typed pre-admission refusal", err: typedNotLeader, want: ReplicatedNotLeader},
+		{name: "bare not leader is uncertain", err: raftmodel.ErrNotLeader, want: ReplicatedOutcomeUnknown},
+		{name: "unknown cause wraps not leader", err: &raftservice.UnknownOutcomeError{
+			Command: bytes.Clone(command), Cause: raftmodel.ErrNotLeader,
+		}, want: ReplicatedOutcomeUnknown},
+		{name: "joined unknown beats typed not leader", err: errors.Join(
+			raftservice.ErrOutcomeUnknown, typedNotLeader,
+		), want: ReplicatedOutcomeUnknown},
+		{name: "settled not leader beats contradictory typed error",
+			result: raftservice.Result{Outcome: raftserve.Outcome{Code: raftserve.OutcomeNotLeader}},
+			err:    typedNotLeader, want: ReplicatedOutcomeUnknown},
+		{name: "settled abandoned beats contradictory typed error",
+			result: raftservice.Result{Outcome: raftserve.Outcome{Code: raftserve.OutcomeProposalAbandoned}},
+			err:    typedNotLeader, want: ReplicatedOutcomeUnknown},
+		{name: "cancellation is uncertain", err: context.Canceled, want: ReplicatedOutcomeUnknown},
+		{name: "deadline is uncertain", err: context.DeadlineExceeded, want: ReplicatedOutcomeUnknown},
+	}
+	for _, authorized := range []bool{false, true} {
+		path := "ordinary"
+		if authorized {
+			path = "authorized"
+		}
+		for _, test := range cases {
+			t.Run(path+"/"+test.name, func(t *testing.T) {
+				base := &fakeReplicatedOwner{state: state, result: test.result, err: test.err}
+				var owner replicatedOwner = base
+				if authorized {
+					owner = &fakeAuthorizedReplicatedOwner{fakeReplicatedOwner: base}
+				}
+				server := testReplicatedServer(owner)
+				if authorized {
+					if err := server.BindServingAuthority(func(candidate raftservice.ServingState) bool {
+						return candidate == state
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				response := server.executeReplicated(context.Background(), &ReplicatedRequest{
+					Operation: ReplicatedPropose, Fence: fence, Command: command,
+				})
+				if response.Kind != test.want {
+					t.Fatalf("response=%+v, want kind %d for err %T %v",
+						response, test.want, test.err, test.err)
+				}
+			})
 		}
 	}
 }
