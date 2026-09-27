@@ -51,10 +51,15 @@ on:
           - write
         default: primary
       format_diagnostics:
-        description: 'Run checksum-alignment, stabilized-sink, ABBA, and profile diagnostics after all-suite timing'
+        description: 'Run opt-in post-timing diagnostics: format controls/profiles for all, CPU profiles for write'
         required: false
         type: boolean
         default: false
+      write_candidate_revision:
+        description: 'Optional candidate commit for the write suite; defaults to the workflow revision'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -407,13 +412,14 @@ jobs:
       GOMAXPROCS: '2'
       LC_ALL: C
       FORMAT_BASE: ${{ inputs.format_base }}
+      WRITE_CANDIDATE_REVISION: ${{ inputs.write_candidate_revision }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.27'
+          go-version: '1.27.1'
       - name: Test the comparison runner before building or timing
         shell: bash
         env:
@@ -423,17 +429,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/whole-main-write/build"
-          printf 'format_suite=write\n' > "${RUNNER_TEMP}/whole-main-write/build/dispatch.txt"
+          repo="${GITHUB_WORKSPACE}"
+          evidence="${RUNNER_TEMP}/whole-main-write"
+          build="${evidence}/build"
+          mkdir -p "${build}"
+          printf 'format_suite=write\n' > "${build}/dispatch.txt"
           if [[ -z "${FORMAT_BASE//[[:space:]]/}" ]]; then
             echo "::error::format_suite=write requires format_base to name a valid commit."
             exit 2
           fi
-          if ! base="$(git rev-parse --verify "${FORMAT_BASE}^{commit}" 2>/dev/null)"; then
-            echo "::error::format_base '${FORMAT_BASE}' does not resolve to a commit."
+          if ! base="$(python3 scripts/bench/run-whole-main-write-comparison.py \
+            --resolve-commit "${FORMAT_BASE}" --repository "${repo}" 2>/dev/null)"; then
+            echo "::error::format_base does not resolve to a valid commit."
             exit 2
           fi
-          printf '%s\n' "${base}" > "${RUNNER_TEMP}/whole-main-write-base-revision.txt"
+          workflow_revision="$(git -C "${repo}" rev-parse --verify 'HEAD^{commit}')"
+          if ! candidate="$(python3 scripts/bench/run-whole-main-write-comparison.py \
+            --resolve-commit "${WRITE_CANDIDATE_REVISION}" \
+            --default-commit "${workflow_revision}" --repository "${repo}" 2>/dev/null)"; then
+            echo "::error::write_candidate_revision does not resolve to a valid commit."
+            exit 2
+          fi
+          printf '%s\n' "${workflow_revision}" > "${build}/workflow-revision.txt"
+          printf '%s\n' "${base}" > "${build}/baseline-revision.txt"
+          printf '%s\n' "${candidate}" > "${build}/candidate-revision.txt"
       - name: Build identical pinned Batch64 benchmark binaries and preflight them
         shell: bash
         env:
@@ -444,8 +463,9 @@ jobs:
           evidence="${RUNNER_TEMP}/whole-main-write"
           build="${evidence}/build"
           mkdir -p "${TMPDIR}" "${build}" "${RUNNER_TEMP}/whole-main-write-checkouts"
-          base="$(cat "${RUNNER_TEMP}/whole-main-write-base-revision.txt")"
-          candidate="$(git -C "${repo}" rev-parse HEAD)"
+          workflow_revision="$(cat "${build}/workflow-revision.txt")"
+          base="$(cat "${build}/baseline-revision.txt")"
+          candidate="$(cat "${build}/candidate-revision.txt")"
           harness_revision='9a136523919e89187edd2bd70d8645caeb22c579'
           harness_path='sql/driver/replicated_apply_batch64_bench_test.go'
           expected_harness_sha='729aecb98499032f9e667a91d5e71a694e1470ae31ec93cb48a3faecef3ece27'
@@ -555,6 +575,7 @@ jobs:
           settings = json.loads((root / "go-settings.json").read_text())
           metadata = {
               "schema": "vibedb.whole-main-batch64-write-build.v1",
+              "workflow_revision": (root / "workflow-revision.txt").read_text().strip(),
               "baseline_revision": (root / "baseline-revision.txt").read_text().strip(),
               "candidate_revision": (root / "candidate-revision.txt").read_text().strip(),
               "harness_revision": (root / "harness-revision.txt").read_text().strip(),
@@ -587,6 +608,27 @@ jobs:
             --output "${evidence}/comparison" \
             --gomaxprocs "${GOMAXPROCS}" \
             --time-binary /usr/bin/time
+      - name: Capture serial CPU profiles and pprof source exports
+        if: success() && inputs.format_diagnostics == true
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/whole-main-write-tmp
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/whole-main-write"
+          build="${evidence}/build"
+          python3 scripts/bench/run-whole-main-write-comparison.py \
+            --profiles \
+            --baseline "${build}/baseline-driver.test" \
+            --candidate "${build}/candidate-driver.test" \
+            --output "${evidence}/profiles" \
+            --timing-output "${evidence}/comparison" \
+            --build-metadata "${build}/build-metadata.json" \
+            --baseline-source-dir "${RUNNER_TEMP}/whole-main-write-checkouts/baseline" \
+            --candidate-source-dir "${RUNNER_TEMP}/whole-main-write-checkouts/candidate" \
+            --gomaxprocs "${GOMAXPROCS}" \
+            --time-binary /usr/bin/time \
+            --go-command "$(command -v go)"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

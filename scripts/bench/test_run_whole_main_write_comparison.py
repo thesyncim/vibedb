@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -112,7 +113,7 @@ class WholeMainWriteComparisonTest(unittest.TestCase):
                 pair_samples = [sample for sample in selected if sample["pair"] == pair]
                 self.assertEqual([sample["arm"] for sample in pair_samples], expected_arms[pair])
 
-    def make_inputs(self, root):
+    def make_inputs(self, root, tmpdir=None):
         binaries = {}
         for arm in ("baseline", "candidate"):
             path = root / f"{arm}.test"
@@ -358,6 +359,354 @@ class WholeMainWriteComparisonTest(unittest.TestCase):
                     time_binary="fake-time")
             self.assertEqual(calls, [])
             self.assertEqual(json.loads(prior_success.read_text())["sentinel"], "old")
+
+
+class WholeMainWriteProfileTest(unittest.TestCase):
+    def make_inputs(self, root, tmpdir=None):
+        binaries = {}
+        sources = {}
+        for arm in ("baseline", "candidate"):
+            binary = root / f"{arm}.test"
+            binary.write_bytes((arm + " diagnostic binary").encode())
+            source = root / f"{arm}-source"
+            source.mkdir()
+            binaries[arm] = binary
+            sources[arm] = source
+        timing = root / "comparison"
+        timing.mkdir()
+        (timing / "runs.json").write_text(json.dumps({
+            "status": "complete",
+            "runs": [{"ordinal": index} for index in range(12)],
+            "goexperiment": "simd",
+            "gomaxprocs": 2,
+            "tmpdir": str(tmpdir if tmpdir is not None else MODULE.os.environ.get("TMPDIR", "")),
+            "binary_sha256": {
+                arm: hashlib.sha256(path.read_bytes()).hexdigest()
+                for arm, path in binaries.items()
+            },
+        }))
+        (timing / "comparison.json").write_text(json.dumps({"status": "complete"}))
+        build = root / "build-metadata.json"
+        build.write_text(json.dumps({
+            "workflow_revision": "d" * 40,
+            "baseline_revision": "a" * 40,
+            "candidate_revision": "b" * 40,
+            "harness_revision": "c" * 40,
+            "harness_sha256": "e" * 64,
+            "go_version": "go version go1.27.1 linux/amd64",
+            "go_settings": {"GOOS": "linux", "GOARCH": "amd64"},
+            "goexperiment": "simd",
+            "gomaxprocs": "2",
+            "tmpdir": str(tmpdir if tmpdir is not None else MODULE.os.environ.get("TMPDIR", "")),
+        }))
+        return binaries, sources, timing, build
+
+    def make_runner(self, calls, fail_export_at=None, omit_profile_at=None,
+                    malformed_profile_at=None, empty_export_at=None,
+                    silent_export_at=None, silent_export_status=1):
+        profile_calls = 0
+        export_calls = 0
+
+        def run(argv, **kwargs):
+            nonlocal profile_calls, export_calls
+            calls.append((list(argv), dict(kwargs)))
+            if argv[0] == "fake-time":
+                index = profile_calls
+                profile_calls += 1
+                if index != omit_profile_at:
+                    profile_arg = next(arg for arg in argv if arg.startswith("-test.cpuprofile="))
+                    Path(profile_arg.split("=", 1)[1]).write_bytes(b"test profile bytes")
+                benchmark = next(arg.split("=", 1)[1].strip("^$")
+                                 for arg in argv if arg.startswith("-test.bench="))
+                if index == malformed_profile_at:
+                    return successful_process(argv, "BenchmarkUnexpected-2 1 1 ns/op\n",
+                                              FAKE_TIME_STDERR)
+                return successful_process(
+                    argv, benchmark_line(benchmark), FAKE_TIME_STDERR +
+                    "User time (seconds): 0.01\nSystem time (seconds): 0.00\n"
+                    "Percent of CPU this job got: 100%\n")
+            self.assert_pprof = True
+            index = export_calls
+            export_calls += 1
+            if index == empty_export_at:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="no matches found for regexp\n")
+            if index == silent_export_at:
+                return subprocess.CompletedProcess(
+                    argv, silent_export_status, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                argv,
+                1 if index == fail_export_at else 0,
+                stdout="Showing nodes accounting for 90%, 2.5s total\n",
+                stderr="",
+            )
+
+        return run
+
+    def test_optional_candidate_revision_defaults_and_resolves_to_full_sha(self):
+        workflow_sha = "A" * 40
+        requested_sha = "b" * 40
+        calls = []
+
+        def resolve(argv, **kwargs):
+            calls.append((argv, kwargs))
+            selected = argv[-1].split("^{", 1)[0]
+            value = workflow_sha if selected == "refs/workflow" else requested_sha
+            return subprocess.CompletedProcess(argv, 0, stdout=value + "\n", stderr="")
+
+        self.assertEqual(MODULE.resolve_commit_revision(
+            "", "refs/workflow", Path("/repo"), process_runner=resolve), workflow_sha.lower())
+        self.assertEqual(MODULE.resolve_commit_revision(
+            "refs/candidate", "refs/workflow", Path("/repo"), process_runner=resolve),
+            requested_sha)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("refs/workflow^{commit}", calls[0][0])
+        self.assertIn("refs/candidate^{commit}", calls[1][0])
+        with self.assertRaisesRegex(MODULE.RunnerError, "revision is required"):
+            MODULE.resolve_commit_revision("", "", Path("/repo"), process_runner=resolve)
+
+        def invalid_revision(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 128, stdout="", stderr="bad revision")
+
+        with self.assertRaisesRegex(MODULE.RunnerError, "does not resolve"):
+            MODULE.resolve_commit_revision(
+                "missing", "", Path("/repo"), process_runner=invalid_revision)
+
+    def test_profile_plan_has_four_separate_one_shot_diagnostics(self):
+        samples = MODULE.planned_profile_samples()
+        self.assertEqual(len(samples), 4)
+        self.assertEqual(
+            [(sample["workload"], sample["arm"]) for sample in samples],
+            [("sequential-insert", "baseline"), ("sequential-insert", "candidate"),
+             ("compact-shared-payload", "baseline"),
+             ("compact-shared-payload", "candidate")],
+        )
+        self.assertEqual(MODULE.PROFILE_SCOPE["iterations_per_process"], 1)
+        self.assertTrue(MODULE.PROFILE_SCOPE["diagnostic_only"])
+
+    def test_profiles_reject_binary_or_environment_drift_before_starting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tmpdir = root / "temp-db"
+            tmpdir.mkdir()
+            binaries, sources, timing, build = self.make_inputs(root, tmpdir=tmpdir)
+            calls = []
+            binaries["candidate"].write_bytes(b"changed after timing")
+            with mock.patch.dict(MODULE.os.environ, {
+                "GOEXPERIMENT": "simd", "TMPDIR": str(tmpdir),
+            }):
+                with self.assertRaisesRegex(MODULE.RunnerError, "do not match"):
+                    MODULE.run_profiles(
+                        binaries, root / "profile-hash-mismatch", 2, timing, build, sources,
+                        process_runner=self.make_runner(calls), time_binary="fake-time",
+                        go_command="fake-go")
+            self.assertEqual(calls, [])
+
+        for name, target, setting, value, expected_error in (
+            ("build GOEXPERIMENT", "build", "goexperiment", "nosimd", "GOEXPERIMENT differs from the timed build"),
+            ("build GOMAXPROCS", "build", "gomaxprocs", "3", "GOMAXPROCS differs from the timed build"),
+            ("build TMPDIR", "build", "tmpdir", "/other/tmp", "TMPDIR differs from the timed build"),
+            ("timing GOEXPERIMENT", "timing", "goexperiment", "nosimd", "GOEXPERIMENT differs from the completed timing run"),
+            ("timing GOMAXPROCS", "timing", "gomaxprocs", 3, "GOMAXPROCS differs from the completed timing run"),
+            ("timing TMPDIR", "timing", "tmpdir", "/other/tmp", "TMPDIR differs from the completed timing run"),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                tmpdir = root / "timed-temp"
+                tmpdir.mkdir()
+                binaries, sources, timing, build = self.make_inputs(root, tmpdir=tmpdir)
+                metadata_path = build if target == "build" else timing / "runs.json"
+                metadata = json.loads(metadata_path.read_text())
+                metadata[setting] = value
+                metadata_path.write_text(json.dumps(metadata))
+                calls = []
+                with mock.patch.dict(MODULE.os.environ, {
+                    "GOEXPERIMENT": "simd", "TMPDIR": str(tmpdir),
+                }):
+                    with self.assertRaisesRegex(MODULE.RunnerError, expected_error):
+                        MODULE.run_profiles(
+                            binaries, root / "profile-environment-mismatch", 2,
+                            timing, build, sources,
+                            process_runner=self.make_runner(calls), time_binary="fake-time",
+                            go_command="fake-go")
+                self.assertEqual(calls, [])
+
+    def test_profiles_require_successful_timing_and_preserve_it_on_profile_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binaries, sources, timing, build = self.make_inputs(root)
+            runs_before = hashlib.sha256((timing / "runs.json").read_bytes()).hexdigest()
+            comparison_before = hashlib.sha256((timing / "comparison.json").read_bytes()).hexdigest()
+            (timing / "runs.json").write_text(json.dumps({"status": "running", "runs": []}))
+            calls = []
+            with self.assertRaisesRegex(MODULE.RunnerError, "twelve completed"):
+                MODULE.run_profiles(
+                    binaries, root / "profiles", 2, timing, build, sources,
+                    process_runner=self.make_runner(calls), time_binary="fake-time",
+                    go_command="fake-go")
+            self.assertEqual(calls, [])
+            tmpdir = root / "outside-temp"
+            tmpdir.mkdir()
+            (timing / "runs.json").write_text(json.dumps({
+                "status": "complete", "runs": [{"ordinal": index} for index in range(12)],
+                "goexperiment": "simd", "gomaxprocs": 2, "tmpdir": str(tmpdir),
+                "binary_sha256": {
+                    arm: hashlib.sha256(path.read_bytes()).hexdigest()
+                    for arm, path in binaries.items()
+                },
+            }))
+            runs_before = hashlib.sha256((timing / "runs.json").read_bytes()).hexdigest()
+            comparison_before = hashlib.sha256((timing / "comparison.json").read_bytes()).hexdigest()
+            build_data = json.loads(build.read_text())
+            build_data["tmpdir"] = str(tmpdir)
+            build.write_text(json.dumps(build_data))
+
+            with mock.patch.dict(MODULE.os.environ, {
+                "GOEXPERIMENT": "simd", "TMPDIR": str(tmpdir),
+            }):
+                with self.assertRaisesRegex(MODULE.RunnerError, "pprof exited with status 1"):
+                    MODULE.run_profiles(
+                        binaries, root / "profiles", 2, timing, build, sources,
+                        process_runner=self.make_runner(calls, fail_export_at=2),
+                        time_binary="fake-time", go_command="fake-go")
+            manifest = json.loads((root / "profiles" / "profiles.json").read_text())
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(manifest["runs"][0]["status"], "failed")
+            self.assertEqual(manifest["runs"][0]["exports"][-1]["status"], "failed")
+            self.assertEqual(len(manifest["runs"]), 1)
+            self.assertTrue((root / "profiles" / manifest["runs"][0]["profile_file"]).is_file())
+            self.assertTrue(all((root / "profiles" / item).is_file() for item in (
+                manifest["runs"][0]["stdout_file"],
+            )))
+            self.assertEqual(manifest["runs"][0]["stderr_capture"], "captured")
+            self.assertEqual(manifest["runs"][0]["exports"][-1]["stderr_capture"], "captured")
+            self.assertEqual(runs_before, hashlib.sha256((timing / "runs.json").read_bytes()).hexdigest())
+            self.assertEqual(comparison_before, hashlib.sha256((timing / "comparison.json").read_bytes()).hexdigest())
+
+    def test_profiles_run_serially_capture_raw_logs_and_export_flat_cumulative_and_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tmpdir = root / "temp-db"
+            tmpdir.mkdir()
+            binaries, sources, timing, build = self.make_inputs(root, tmpdir=tmpdir)
+            calls = []
+            with mock.patch.dict(MODULE.os.environ, {
+                "GOEXPERIMENT": "simd", "TMPDIR": str(tmpdir),
+            }):
+                manifest = MODULE.run_profiles(
+                    binaries, root / "profiles", 2, timing, build, sources,
+                    process_runner=self.make_runner(calls), time_binary="fake-time",
+                    go_command="fake-go")
+            self.assertEqual(manifest["status"], "complete")
+            self.assertEqual(len(manifest["runs"]), 4)
+            self.assertEqual(manifest["tmpdir"], str(tmpdir))
+            self.assertEqual(manifest["profile_scope"]["processes"], 4)
+            self.assertEqual(len(calls), 4 * (1 + 2 + len(MODULE.PROFILE_GROUPS)))
+            for run in manifest["runs"]:
+                with self.subTest(ordinal=run["ordinal"]):
+                    self.assertEqual(run["status"], "complete")
+                    self.assertEqual(run["iterations"], 1)
+                    self.assertEqual(run["metrics"]["rows"], 131072)
+                    self.assertEqual(run["time_metrics"]["maximum_resident_set_kib"], 1234)
+                    self.assertEqual(run["time_metrics"]["user_seconds"], 0.01)
+                    self.assertEqual(run["time_metrics"]["cpu_percent"], 100.0)
+                    self.assertTrue((root / "profiles" / run["profile_file"]).is_file())
+                    self.assertIn("-test.cpuprofile=", " ".join(run["command"]))
+                    self.assertEqual(len(run["exports"]), 2 + len(MODULE.PROFILE_GROUPS))
+                    labels = {export["name"] for export in run["exports"]}
+                    self.assertIn("flat-top", labels)
+                    self.assertIn("cumulative-top", labels)
+                    for label in MODULE.PROFILE_GROUPS:
+                        self.assertIn("source-" + label, labels)
+                    for export in run["exports"]:
+                        self.assertEqual(export["status"], "complete")
+                        self.assertTrue((root / "profiles" / export["stdout_file"]).is_file())
+            for argv, kwargs in calls:
+                self.assertEqual(kwargs["env"]["GOMAXPROCS"], "2")
+                self.assertEqual(kwargs["env"]["GOEXPERIMENT"], "simd")
+                self.assertEqual(kwargs["env"]["LC_ALL"], "C")
+                self.assertEqual(kwargs["env"]["TMPDIR"], str(tmpdir))
+                self.assertIn("cwd", kwargs)
+
+    def test_empty_source_category_is_distinguished_from_failed_profile_processing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tmpdir = root / "temp-db"
+            tmpdir.mkdir()
+            binaries, sources, timing, build = self.make_inputs(root, tmpdir=tmpdir)
+            calls = []
+            with mock.patch.dict(MODULE.os.environ, {
+                "GOEXPERIMENT": "simd", "TMPDIR": str(tmpdir),
+            }):
+                manifest = MODULE.run_profiles(
+                    binaries, root / "profiles", 2, timing, build, sources,
+                    process_runner=self.make_runner(calls, empty_export_at=2),
+                    time_binary="fake-time", go_command="fake-go")
+            self.assertEqual(manifest["status"], "complete")
+            empty = manifest["runs"][0]["exports"][2]
+            self.assertEqual(empty["status"], "empty")
+            self.assertIn("no matching sampled source", empty["empty_reason"])
+
+    def test_silent_nonzero_pprof_source_exports_fail_and_preserve_raw_captures(self):
+        for name, returncode in (("silent exit 1", 1), ("killed", -9)):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                tmpdir = root / "temp-db"
+                tmpdir.mkdir()
+                binaries, sources, timing, build = self.make_inputs(root, tmpdir=tmpdir)
+                calls = []
+                with mock.patch.dict(MODULE.os.environ, {
+                    "GOEXPERIMENT": "simd", "TMPDIR": str(tmpdir),
+                }):
+                    with self.assertRaisesRegex(MODULE.RunnerError, "pprof exited with status"):
+                        MODULE.run_profiles(
+                            binaries, root / "profiles", 2, timing, build, sources,
+                            process_runner=self.make_runner(
+                                calls, silent_export_at=2, silent_export_status=returncode),
+                            time_binary="fake-time", go_command="fake-go")
+                manifest = json.loads((root / "profiles" / "profiles.json").read_text())
+                run = manifest["runs"][0]
+                export = run["exports"][2]
+                self.assertEqual(manifest["status"], "failed")
+                self.assertEqual(export["status"], "failed")
+                self.assertEqual(export["exit_code"], returncode)
+                self.assertEqual(export["stdout_capture"], "captured")
+                self.assertEqual(export["stderr_capture"], "captured")
+                self.assertEqual((root / "profiles" / export["stdout_file"]).read_text(), "")
+                self.assertEqual((root / "profiles" / export["stderr_file"]).read_text(), "")
+                self.assertEqual(len(calls), 1 + 3)
+
+    def test_malformed_profile_benchmark_keeps_captured_output_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binaries, sources, timing, build = self.make_inputs(root)
+            calls = []
+            with self.assertRaisesRegex(MODULE.RunnerError, "unexpected benchmark row"):
+                MODULE.run_profiles(
+                    binaries, root / "profiles", 2, timing, build, sources,
+                    process_runner=self.make_runner(calls, malformed_profile_at=0),
+                    time_binary="fake-time", go_command="fake-go")
+            run = json.loads((root / "profiles" / "profiles.json").read_text())["runs"][0]
+            self.assertEqual(run["status"], "failed")
+            self.assertEqual(run["stdout_capture"], "captured")
+            self.assertEqual(run["stderr_capture"], "captured")
+            self.assertTrue((root / "profiles" / run["stdout_file"]).is_file())
+            self.assertTrue((root / "profiles" / run["stderr_file"]).is_file())
+
+    def test_missing_profile_file_is_a_preserved_diagnostic_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binaries, sources, timing, build = self.make_inputs(root)
+            calls = []
+            with self.assertRaisesRegex(MODULE.RunnerError, "nonempty CPU profile"):
+                MODULE.run_profiles(
+                    binaries, root / "profiles", 2, timing, build, sources,
+                    process_runner=self.make_runner(calls, omit_profile_at=0),
+                    time_binary="fake-time", go_command="fake-go")
+            manifest = json.loads((root / "profiles" / "profiles.json").read_text())
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(manifest["runs"][0]["profile_capture"], "unavailable")
+            self.assertTrue((root / "profiles" / manifest["runs"][0]["stdout_file"]).is_file())
 
 
 if __name__ == "__main__":
