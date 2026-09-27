@@ -1,8 +1,10 @@
 package driver
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
+	"reflect"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 )
@@ -158,4 +160,140 @@ func (a *ReplicatedApply) ObserveReplicatedSchemaTransitionAlias(
 		return 0, false, err
 	}
 	return a.machine.ObserveSchemaTransitionAlias(local, committed)
+}
+
+// AppendReplicatedSchemaTransitionAlias builds this replica's canonical
+// activation envelope for an already-applied RF3 transition. The committed
+// command is authoritative for every replicated field; only the local
+// CatalogCASDigest is recomputed from this replica's exact source catalog and
+// prepared target. Before returning, the method proves the exact committed
+// command/index against the live machine through ObserveSchemaTransitionAlias.
+// It does not persist, propose, or publish the alias.
+func (a *ReplicatedApply) AppendReplicatedSchemaTransitionAlias(
+	dst []byte,
+	proof ReplicatedSchemaTargetProof,
+	authority ReplicatedSchemaTransitionAuthority,
+	committed []byte,
+	expectedApplied uint64,
+) ([]byte, error) {
+	if a == nil || a.database == nil || expectedApplied == 0 ||
+		proof.SourceApplied == 0 || expectedApplied <= proof.SourceApplied ||
+		proof.Catalog.Digest == ([sha256.Size]byte{}) ||
+		proof.Catalog.SchemaGeneration == 0 ||
+		proof.Catalog.RelationManifestDigest == ([sha256.Size]byte{}) ||
+		proof.ApplyContract == ([sha256.Size]byte{}) ||
+		proof.Membership.Sequence == 0 || !proof.Relations.Valid() ||
+		proof.Witness == ([sha256.Size]byte{}) ||
+		authority.RequestDigest == ([sha256.Size]byte{}) ||
+		authority.AuthorizationDigest == ([sha256.Size]byte{}) {
+		return dst, ErrReplicatedSchemaCatalogImage
+	}
+
+	marker, found, err := readReplicatedSchemaStageMarker(a.database.dataDir)
+	if err != nil || !found || marker.schemaGeneration != proof.Catalog.SchemaGeneration ||
+		marker.sourceApplied != proof.SourceApplied || marker.membership != proof.Membership ||
+		marker.catalogDigest != proof.Catalog.Digest || marker.relationWitness != proof.Relations.Witness ||
+		marker.placementDigest != proof.Relations.PlacementDigest ||
+		marker.applyContract != proof.ApplyContract || marker.authorization != authority.RequestDigest ||
+		marker.targetWitness != proof.Witness || proof.Witness != replicatedSchemaTargetProofDigest(proof) {
+		return dst, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+
+	committedView, err := replicatedstate.OpenSchemaTransition(committed)
+	if err != nil {
+		return dst, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	transition := committedView.SchemaTransition
+	if transition.RequestDigest != authority.RequestDigest ||
+		transition.AuthorizationDigest != authority.AuthorizationDigest ||
+		transition.ToSchemaGeneration != proof.Catalog.SchemaGeneration ||
+		transition.ToManifest != proof.Catalog.RelationManifestDigest ||
+		transition.ToApplyContract != proof.ApplyContract ||
+		transition.ToPlacementDigest != proof.Relations.PlacementDigest {
+		return dst, ErrReplicatedSchemaCatalogImage
+	}
+	membershipSequence := proof.Membership.Sequence
+	membershipSource, membershipTarget := proof.Membership.Source, proof.Membership.Target
+	if authority.CoordinationSequence != 0 || authority.CoordinationSource != ([sha256.Size]byte{}) ||
+		authority.CoordinationTarget != ([sha256.Size]byte{}) {
+		if authority.CoordinationSequence == 0 || authority.CoordinationSource == ([sha256.Size]byte{}) ||
+			authority.CoordinationTarget == ([sha256.Size]byte{}) || authority.CoordinationSource == authority.CoordinationTarget {
+			return dst, ErrReplicatedSchemaCatalogImage
+		}
+		membershipSequence = authority.CoordinationSequence
+		membershipSource, membershipTarget = authority.CoordinationSource, authority.CoordinationTarget
+	}
+	if transition.MembershipSequence != membershipSequence ||
+		transition.MembershipSource != membershipSource || transition.MembershipTarget != membershipTarget {
+		return dst, ErrReplicatedSchemaCatalogImage
+	}
+
+	// Capture a bounded canonical image of the complete in-memory catalog while
+	// it is read-locked. The persisted image must match this byte-for-byte before
+	// it can supply the replica-local CAS input. ObserveSchemaTransitionAlias
+	// does the final locked live-machine proof immediately before returning.
+	d := a.database
+	d.mu.RLock()
+	if err := a.checkLocked(); err != nil || a.machine.Applied() != expectedApplied ||
+		d.catalog.ReplicatedShardStore == nil || d.catalog.ReplicatedApply == nil {
+		d.mu.RUnlock()
+		return dst, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	canonicalBound, err := catalogSizeUpperBound(d.catalog)
+	if err != nil {
+		d.mu.RUnlock()
+		return dst, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	sourceCanonical, err := appendCatalogJSON(make([]byte, 0, canonicalBound), d.catalog)
+	if err != nil {
+		d.mu.RUnlock()
+		return dst, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	dataDir, path := d.dataDir, d.path
+	base := *d.catalog.ReplicatedShardStore
+	applyProfile := *d.catalog.ReplicatedApply
+	from := replicatedStateBindingAt(base, applyProfile.Placement.Range)
+	d.mu.RUnlock()
+
+	sourceRaw, sourceFound, err := readCatalogFile(path)
+	if err != nil || !sourceFound || !bytes.Equal(sourceRaw, sourceCanonical) {
+		return dst, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	sourceCatalog, sourceImage, err := openReplicatedSchemaCatalogImage(sourceRaw)
+	if err != nil || sourceImage.SchemaGeneration != transition.From.SchemaGeneration ||
+		sourceImage.RelationManifestDigest != transition.FromManifest || transition.From != from ||
+		!sourceCatalog.ReplicatedShardStore.Equal(base) ||
+		!reflect.DeepEqual(sourceCatalog.ReplicatedApply, &applyProfile) {
+		return dst, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	targetRaw, err := readReplicatedSchemaTargetCatalog(dataDir, proof.Catalog)
+	if err != nil {
+		return dst, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	_, targetImage, err := openReplicatedSchemaCatalogImage(targetRaw)
+	if err != nil || targetImage != proof.Catalog {
+		return dst, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	sourceDigest := sha256.Sum256(sourceCanonical)
+	if sourceImage.Digest != sourceDigest {
+		return dst, ErrReplicatedSchemaCatalogImage
+	}
+	localCAS := replicatedSchemaCatalogCASDigest(
+		sourceDigest, targetImage.Digest, authority.RequestDigest, authority.AuthorizationDigest,
+	)
+	if localCAS == ([sha256.Size]byte{}) {
+		return dst, ErrReplicatedSchemaCatalogImage
+	}
+	transition.CatalogCASDigest = localCAS
+	start := len(dst)
+	local, err := replicatedstate.AppendSchemaTransition(dst, transition)
+	if err != nil {
+		return dst, err
+	}
+	command := local[start:]
+	applied, observed, err := a.ObserveReplicatedSchemaTransitionAlias(command, committed)
+	if err != nil || !observed || applied != expectedApplied {
+		return dst, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	return local, nil
 }

@@ -70,6 +70,14 @@ func newRF3NodeRecoveryFixture(t *testing.T) *rf3NodeRecoveryFixture {
 }
 
 func newRF3NodeRecoveryFixtureWithLearner(t *testing.T, learner bool) *rf3NodeRecoveryFixture {
+	return newRF3NodeRecoveryFixtureWithLearnerAndCreateTable(
+		t, learner, `CREATE TABLE docs (PRIMARY KEY (id))`,
+	)
+}
+
+func newRF3NodeRecoveryFixtureWithLearnerAndCreateTable(
+	t *testing.T, learner bool, createTable string,
+) *rf3NodeRecoveryFixture {
 	t.Helper()
 	root := t.TempDir()
 	node := raftstore.NodeIdentity{ClusterID: [16]byte{1}, ClusterIncarnation: [16]byte{2}, NodeID: [16]byte{3}}
@@ -123,7 +131,7 @@ func newRF3NodeRecoveryFixtureWithLearner(t *testing.T, learner bool) *rf3NodeRe
 		if err != nil {
 			t.Fatal(err)
 		}
-		statement, err := session.Prepare(t.Context(), `CREATE TABLE docs (PRIMARY KEY (id))`)
+		statement, err := session.Prepare(t.Context(), createTable)
 		if err == nil {
 			_, err = statement.Exec(t.Context(), nil)
 		}
