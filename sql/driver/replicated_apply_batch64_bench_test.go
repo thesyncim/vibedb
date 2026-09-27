@@ -647,6 +647,22 @@ func reportReplicatedApplyBatch64UserMetrics(
 	b.ReportMetric(appendDelta(afterFold.CommittedBatches, afterAppend.CommittedBatches), "final-fold-committed-batches")
 	b.ReportMetric(float64(afterAppend.PrimaryOverlayRetainedRecords), "overlay-records-at-append-end")
 	b.ReportMetric(float64(afterFold.PrimaryOverlayRetainedRecords), "overlay-records-after-fold")
+	b.ReportMetric(
+		float64(afterAppend.PrimaryTailSplitCurrentChargeBytes),
+		"tail-split-current-charge-at-append-end-bytes",
+	)
+	b.ReportMetric(
+		float64(afterAppend.PrimaryTailSplitPeakChargeBytes),
+		"tail-split-peak-charge-at-append-end-bytes",
+	)
+	b.ReportMetric(
+		float64(afterFold.PrimaryTailSplitCurrentChargeBytes),
+		"tail-split-current-charge-after-fold-bytes",
+	)
+	b.ReportMetric(
+		float64(afterFold.PrimaryTailSplitPeakChargeBytes),
+		"tail-split-peak-charge-after-fold-bytes",
+	)
 }
 
 func reportReplicatedApplyBatch64ResourceMetrics(

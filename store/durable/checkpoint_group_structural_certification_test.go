@@ -136,6 +136,13 @@ func structuralCertificationWideValue(row int) []byte {
 	)
 }
 
+func structuralCertificationOverflowValue(row int) []byte {
+	return fmt.Appendf(
+		nil, `{"n":%d,"payload":%q}`, row,
+		structuralCertificationPayload(row, 512),
+	)
+}
+
 func structuralCertificationPayload(row, size int) []byte {
 	const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
 	payload := make([]byte, size)
@@ -311,10 +318,21 @@ func openStructuralCertificationCopy(
 // retry. A later successful copy contains mixed member roots plus an
 // uncertified decision and exercises the same recovery rule.
 func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
-	dir, members, _, group, options := newStructuralCertificationGroup(t)
+	options := structuralCertificationOptions()
+	// A single overflow value in the final publication makes the batch
+	// ineligible for the append-only volatile split lane while leaving the
+	// byte-limited unindexed compact-stripe geometry intact.
+	options.InlineValueBytes = 256
+	dir, members, _, group, options := newStructuralCertificationGroupWithOptions(t, options)
 	seedRows := structuralCertificationUnindexedBoundaryRows(t)
 	seedBatches := seedRows / structuralCertificationBatchRows
 	finalRows := seedRows + structuralCertificationBatchRows
+	finalValue := func(row int) []byte {
+		if row == seedRows {
+			return structuralCertificationOverflowValue(row)
+		}
+		return structuralCertificationWideValue(row)
+	}
 	allMembers := map[string]bool{"system": true, "user": true}
 	targetOnly := map[string]bool{"system": true}
 	callbackCount := 0
@@ -399,7 +417,7 @@ func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 	}
 	err = structuralCertificationBatchWithValue(
 		t, group, members, uint64(seedRows+1), targetOnly, &callbackCount,
-		structuralCertificationWideValue,
+		finalValue,
 	)
 	checkpointGroupFaultHook = previousHook
 	if !errors.Is(err, fault) {
@@ -474,7 +492,7 @@ func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 	if err := structuralCertificationBatchWithValue(
 		t, faultReopened, structuralNamedCollectionsFromHandles(faultRecovered),
 		uint64(seedRows+1), targetOnly, &faultRecoveryCallbacks,
-		structuralCertificationWideValue,
+		finalValue,
 	); err != nil {
 		t.Fatalf("faulted image exact retry: %v", err)
 	}
@@ -492,7 +510,7 @@ func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 		t.Fatalf("faulted image final checkpoint = %d, want %d", got, finalRows)
 	}
 	requireStructuralCertificationRowsWithValue(
-		t, faultRecovered[0], 0, finalRows, true, structuralCertificationWideValue,
+		t, faultRecovered[0], 0, finalRows, true, finalValue,
 	)
 	requireStructuralCertificationRowsWithValue(
 		t, faultRecovered[1], 0, seedRows, true, structuralCertificationWideValue,
@@ -516,7 +534,7 @@ func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 	callbackCount = 0
 	if err := structuralCertificationBatchWithValue(
 		t, mixedReopened, structuralNamedCollectionsFromHandles(mixedRecovered),
-		uint64(seedRows+1), targetOnly, &callbackCount, structuralCertificationWideValue,
+		uint64(seedRows+1), targetOnly, &callbackCount, finalValue,
 	); err != nil {
 		t.Fatalf("mixed-root exact next-index retry: %v", err)
 	}
@@ -530,7 +548,7 @@ func TestCheckpointGroupStructuralSplitCertifiesOnlyPrecedingCut(t *testing.T) {
 		t.Fatalf("mixed-root recovered final checkpoint = %d, want %d", got, finalRows)
 	}
 	requireStructuralCertificationRowsWithValue(
-		t, mixedRecovered[0], 0, finalRows, true, structuralCertificationWideValue,
+		t, mixedRecovered[0], 0, finalRows, true, finalValue,
 	)
 	requireStructuralCertificationRowsWithValue(
 		t, mixedRecovered[1], 0, seedRows, true, structuralCertificationWideValue,

@@ -358,16 +358,21 @@ func filePrimaryPendingParentFromPath(
 }
 
 func (c *Collection) clearPrimaryVolatileRetiredLocked() {
-	if len(c.primaryVolatileRetired) == 0 {
+	if len(c.primaryVolatileRetired) == 0 &&
+		c.primaryTailRetiredRouterBytes.Load() == 0 {
 		return
 	}
 	c.snapshotGate.Lock()
 	c.beginReaderFence()
 	if !c.anyActiveReaders() {
-		c.cache.MarkUnreachable(c.primaryVolatileRetired)
+		if len(c.primaryVolatileRetired) != 0 {
+			c.cache.MarkUnreachable(c.primaryVolatileRetired)
+		}
 		clear(c.primaryVolatileRetired)
 		c.primaryVolatileRetired =
 			c.primaryVolatileRetired[:0]
+		c.primaryTailRetiredRouterBytes.Store(0)
+		c.refreshPrimaryTailSplitChargeLocked()
 	}
 	c.endReaderFence()
 	c.snapshotGate.Unlock()
@@ -2034,7 +2039,7 @@ func (c *Collection) materializePrimaryOverlayPressureLocked() error {
 func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 	overlayPending := c.primaryUnifiedOverlay.hasPending()
 	if len(c.primaryPendingParents) == 0 &&
-		!overlayPending {
+		!overlayPending && c.primaryTailSplit == nil {
 		return nil
 	}
 	if overlayPending {
@@ -2063,14 +2068,18 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 			return err
 		}
 	}
-	if len(c.primaryPendingParents) == 0 {
+	if len(c.primaryPendingParents) == 0 && c.primaryTailSplit == nil {
 		return nil
 	}
 	c.clearPrimaryVolatileRetiredLocked()
 	pendingRetirements := 0
-	for index := range c.primaryPendingParents {
-		if c.primaryPendingParents[index].volatileRef != (storeio.PageRef{}) {
-			pendingRetirements++
+	if c.primaryTailSplit != nil {
+		pendingRetirements = len(c.primaryTailSplit.leaves)
+	} else {
+		for index := range c.primaryPendingParents {
+			if c.primaryPendingParents[index].volatileRef != (storeio.PageRef{}) {
+				pendingRetirements++
+			}
 		}
 	}
 	if err := c.reservePrimaryVolatileRetiredCapacityLocked(
@@ -2156,93 +2165,222 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 	c.retireRefScratch = c.retireRefScratch[:0]
 	c.primaryCheckpointVolatileOverflow =
 		c.primaryCheckpointVolatileOverflow[:0]
+	var tailFold *primaryTailSplitFold
 
 	layout, layoutErr := storeio.MutableStoreLayout(uint32(c.options.PageSize))
 	if layoutErr != nil {
 		return layoutErr
 	}
 
-	// Allocate the checkpointed leaves in ascending lexical rank so consecutive
-	// ranks claim consecutive reusable extents. The nearest-fit placement below
-	// only preserves order if the requests arrive in order: an out-of-order high
-	// rank would otherwise take a low reusable slot a lower rank wanted. The
-	// subsequent parent loops group by page reference and are order independent,
-	// so this reordering is confined to placement quality.
-	slices.SortFunc(c.primaryPendingParents, func(a, b filePrimaryPendingParent) int {
-		switch {
-		case a.leafRoute.Bucket < b.leafRoute.Bucket:
-			return -1
-		case a.leafRoute.Bucket > b.leafRoute.Bucket:
-			return 1
-		default:
-			return 0
+	if c.primaryTailSplit != nil {
+		tailFold, err = c.stagePrimaryTailSplitCheckpointLocked(
+			tx, base, visible, generation,
+		)
+		if err != nil {
+			return err
 		}
-	})
+	} else {
+		// Allocate the checkpointed leaves in ascending lexical rank so consecutive
+		// ranks claim consecutive reusable extents. The nearest-fit placement below
+		// only preserves order if the requests arrive in order: an out-of-order high
+		// rank would otherwise take a low reusable slot a lower rank wanted. The
+		// subsequent parent loops group by page reference and are order independent,
+		// so this reordering is confined to placement quality.
+		slices.SortFunc(c.primaryPendingParents, func(a, b filePrimaryPendingParent) int {
+			switch {
+			case a.leafRoute.Bucket < b.leafRoute.Bucket:
+				return -1
+			case a.leafRoute.Bucket > b.leafRoute.Bucket:
+				return 1
+			default:
+				return 0
+			}
+		})
 
-	// Native compact VCS1 work is CPU-only until a sealed image exists. Run that
-	// qualification and encoding in small foreground waves, then consume every
-	// result in the same lexical order as before. AllocateNear, Stage, retirement,
-	// parent rewrites, and publication therefore remain strictly serial.
-	nativeContexts := c.primaryNativeFoldActiveContexts(
-		len(c.primaryPendingParents),
-	)
-	if nativeContexts != 0 {
-		// Results borrow the overlay arena. Drop their live slice prefixes after
-		// workers have stopped, including every error/abort path.
-		defer c.resetPrimaryNativeFoldResults(nativeContexts)
-	}
-	nativeWorkersRunning := false
-	if nativeContexts > 1 {
-		c.startPrimaryNativeFoldWorkers(nativeContexts)
-		nativeWorkersRunning = true
-		defer func() {
-			if nativeWorkersRunning {
-				c.stopPrimaryNativeFoldWorkers(nativeContexts)
-			}
-		}()
-	}
-	waveWidth := max(1, nativeContexts)
-	for index := range c.primaryPendingParents {
-		waveIndex := index % waveWidth
-		if nativeContexts != 0 && waveIndex == 0 {
-			waveCount := min(
-				waveWidth, len(c.primaryPendingParents)-index,
-			)
-			c.preparePrimaryNativeFoldWave(
-				index, waveCount, base, visible, generation,
-			)
-		}
-		pending := &c.primaryPendingParents[index]
-		var prepared *primaryNativeFoldContext
+		// Native compact VCS1 work is CPU-only until a sealed image exists. Run that
+		// qualification and encoding in small foreground waves, then consume every
+		// result in the same lexical order as before. AllocateNear, Stage, retirement,
+		// parent rewrites, and publication therefore remain strictly serial.
+		nativeContexts := c.primaryNativeFoldActiveContexts(
+			len(c.primaryPendingParents),
+		)
 		if nativeContexts != 0 {
-			prepared = &c.primaryNativeFoldContexts[waveIndex]
-			if prepared.retrySerial {
-				// Every worker in this wave has joined and released its lease.
-				// Retry the native certificate once on the coordinator so a
-				// transient parallel cache pin cannot select a different extent
-				// or force the expensive full planner nondeterministically.
-				c.preparePrimaryNativeFold(
-					prepared, pending, base, visible, generation,
-				)
-			}
-			if prepared.err != nil {
-				return prepared.err
-			}
-			if prepared.native {
-				page, allocateErr := tx.AllocateNear(
-					storeio.PagePrimaryLeaf,
-					uint32(len(prepared.image)),
-					pending.volatileRef.LogicalID,
-					primaryLeafPlacementHint(
-						pending.leafRoute.Bucket, layout.DataStart,
-					),
-				)
-				if allocateErr == nil {
-					copy(page.Bytes(), prepared.image)
-					allocateErr = page.Stage()
+			// Results borrow the overlay arena. Drop their live slice prefixes after
+			// workers have stopped, including every error/abort path.
+			defer c.resetPrimaryNativeFoldResults(nativeContexts)
+		}
+		nativeWorkersRunning := false
+		if nativeContexts > 1 {
+			c.startPrimaryNativeFoldWorkers(nativeContexts)
+			nativeWorkersRunning = true
+			defer func() {
+				if nativeWorkersRunning {
+					c.stopPrimaryNativeFoldWorkers(nativeContexts)
 				}
-				if allocateErr != nil {
-					return allocateErr
+			}()
+		}
+		waveWidth := max(1, nativeContexts)
+		for index := range c.primaryPendingParents {
+			waveIndex := index % waveWidth
+			if nativeContexts != 0 && waveIndex == 0 {
+				waveCount := min(
+					waveWidth, len(c.primaryPendingParents)-index,
+				)
+				c.preparePrimaryNativeFoldWave(
+					index, waveCount, base, visible, generation,
+				)
+			}
+			pending := &c.primaryPendingParents[index]
+			var prepared *primaryNativeFoldContext
+			if nativeContexts != 0 {
+				prepared = &c.primaryNativeFoldContexts[waveIndex]
+				if prepared.retrySerial {
+					// Every worker in this wave has joined and released its lease.
+					// Retry the native certificate once on the coordinator so a
+					// transient parallel cache pin cannot select a different extent
+					// or force the expensive full planner nondeterministically.
+					c.preparePrimaryNativeFold(
+						prepared, pending, base, visible, generation,
+					)
+				}
+				if prepared.err != nil {
+					return prepared.err
+				}
+				if prepared.native {
+					page, allocateErr := tx.AllocateNear(
+						storeio.PagePrimaryLeaf,
+						uint32(len(prepared.image)),
+						pending.volatileRef.LogicalID,
+						primaryLeafPlacementHint(
+							pending.leafRoute.Bucket, layout.DataStart,
+						),
+					)
+					if allocateErr == nil {
+						copy(page.Bytes(), prepared.image)
+						allocateErr = page.Stage()
+					}
+					if allocateErr != nil {
+						return allocateErr
+					}
+					pending.checkpointLeaf = page.Ref()
+					if appendErr := c.appendPrimaryRetirement(
+						base, pending.leafRoute.Ref,
+					); appendErr != nil {
+						return appendErr
+					}
+					continue
+				}
+			}
+			lease, acquireErr := c.cache.Acquire(
+				pending.volatileRef,
+			)
+			if acquireErr != nil {
+				return acquireErr
+			}
+			header := lease.Header()
+			if storeio.PrimaryLeafClass(lease.Page()) ==
+				storeio.CommonPrimaryLeafCompact {
+				stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+					lease.Page(), c.storeID, pending.leafRoute.Bucket,
+				)
+				if !ok {
+					pageBytes := len(lease.Page())
+					lease.Release()
+					return fmt.Errorf(
+						"%w: checkpoint compact bucket=%d ref=%+v header=%+v bytes=%d",
+						storeio.ErrCommonPrimaryLeafCorrupt,
+						pending.leafRoute.Bucket, pending.volatileRef,
+						header, pageBytes,
+					)
+				}
+				records, renderErr :=
+					stripe.RenderRecordsWithScratch(
+						c.primaryLeafMutationScratch,
+					)
+				if renderErr != nil {
+					renderErr = fmt.Errorf(
+						"render compact checkpoint bucket=%d rows=%d: %w",
+						pending.leafRoute.Bucket, stripe.Len(), renderErr,
+					)
+				}
+				if renderErr == nil && c.primaryUnifiedOverlay.pendingBucket(
+					pending.leafRoute.Bucket,
+				) {
+					records, renderErr = c.primaryUnifiedOverlay.applyBucket(
+						records, pending.leafRoute.Bucket, generation,
+					)
+					if renderErr != nil {
+						renderErr = fmt.Errorf(
+							"apply compact checkpoint overlay bucket=%d base_rows=%d: %w",
+							pending.leafRoute.Bucket, stripe.Len(), renderErr,
+						)
+					}
+				}
+				if renderErr == nil {
+					for row := range records {
+						head := records[row].Value.Overflow
+						if !records[row].Value.IsOverflow() || head.Offset < base.fileEnd {
+							continue
+						}
+						var resolved []byte
+						resolved, renderErr = c.appendPrimaryOverflowValue(
+							c.overflowValueScratch[:0], head,
+							c.primaryLeafBounds(visible),
+						)
+						if renderErr != nil {
+							break
+						}
+						c.overflowValueScratch = resolved
+						var extents []storeio.PageRef
+						extents, renderErr = c.collectPrimaryOverflowExtents(
+							c.primaryCheckpointVolatileOverflow, head,
+							c.primaryLeafBounds(visible),
+						)
+						if renderErr != nil {
+							break
+						}
+						c.primaryCheckpointVolatileOverflow = extents
+						records[row].Value.Overflow, renderErr =
+							c.stagePrimaryOverflowChain(tx, resolved, generation)
+						if renderErr != nil {
+							break
+						}
+					}
+				}
+				leafHeader := stripe.Header()
+				leafHeader.Generation = generation
+				var image []byte
+				if renderErr == nil {
+					image, renderErr =
+						storeio.EncodeBestCompactPrimaryStripe(
+							c.primaryLeafScratch, leafHeader, c.storeID,
+							records, c.primaryUnifiedBuilder,
+						)
+					if renderErr != nil {
+						renderErr = fmt.Errorf(
+							"encode compact checkpoint bucket=%d rows=%d: %w",
+							pending.leafRoute.Bucket, len(records), renderErr,
+						)
+					}
+				}
+				var page storeio.TransactionPage
+				if renderErr == nil {
+					page, renderErr = tx.AllocateNear(
+						storeio.PagePrimaryLeaf, uint32(len(image)),
+						pending.volatileRef.LogicalID,
+						primaryLeafPlacementHint(
+							pending.leafRoute.Bucket,
+							layout.DataStart,
+						),
+					)
+				}
+				if renderErr == nil {
+					copy(page.Bytes(), image)
+					renderErr = page.Stage()
+				}
+				lease.Release()
+				if renderErr != nil {
+					return renderErr
 				}
 				pending.checkpointLeaf = page.Ref()
 				if appendErr := c.appendPrimaryRetirement(
@@ -2252,117 +2390,74 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 				}
 				continue
 			}
-		}
-		lease, acquireErr := c.cache.Acquire(
-			pending.volatileRef,
-		)
-		if acquireErr != nil {
-			return acquireErr
-		}
-		header := lease.Header()
-		if storeio.PrimaryLeafClass(lease.Page()) ==
-			storeio.CommonPrimaryLeafCompact {
-			stripe, ok := storeio.AdmittedCompactPrimaryStripe(
-				lease.Page(), c.storeID, pending.leafRoute.Bucket,
+			// Draw the checkpointed leaf toward its sorted-rank target rather than its
+			// last physical offset, so churn pulls each leaf back into lexical order
+			// instead of scattering it. See primaryLeafPlacementHint.
+			page, allocateErr := tx.AllocateNear(
+				storeio.PagePrimaryLeaf, header.PageSize,
+				pending.volatileRef.LogicalID,
+				primaryLeafPlacementHint(pending.leafRoute.Bucket, layout.DataStart),
 			)
-			if !ok {
-				pageBytes := len(lease.Page())
+			if allocateErr != nil {
 				lease.Release()
-				return fmt.Errorf(
-					"%w: checkpoint compact bucket=%d ref=%+v header=%+v bytes=%d",
-					storeio.ErrCommonPrimaryLeafCorrupt,
-					pending.leafRoute.Bucket, pending.volatileRef,
-					header, pageBytes,
-				)
+				return allocateErr
 			}
-			records, renderErr :=
-				stripe.RenderRecordsWithScratch(
-					c.primaryLeafMutationScratch,
+			header.Generation = generation
+			payload, initErr := storeio.InitPage(
+				page.Bytes(), header,
+			)
+			if initErr == nil {
+				copy(payload, lease.Payload())
+				// A leaf carrying a volatile overflow head must have its chain minted
+				// durable in this checkpoint transaction and its head patched to the
+				// durable one in place before the leaf seals; a head the base already
+				// made durable is carried forward untouched. Reading the volatile chain
+				// resolves against the visible bounds it was minted under.
+				view := storeio.AdmittedCommonPrimaryLeaf(
+					lease.Page(), c.storeID, pending.leafRoute.Bucket,
+					c.primaryLeafBounds(visible),
 				)
-			if renderErr != nil {
-				renderErr = fmt.Errorf(
-					"render compact checkpoint bucket=%d rows=%d: %w",
-					pending.leafRoute.Bucket, stripe.Len(), renderErr,
-				)
-			}
-			if renderErr == nil && c.primaryUnifiedOverlay.pendingBucket(
-				pending.leafRoute.Bucket,
-			) {
-				records, renderErr = c.primaryUnifiedOverlay.applyBucket(
-					records, pending.leafRoute.Bucket, generation,
-				)
-				if renderErr != nil {
-					renderErr = fmt.Errorf(
-						"apply compact checkpoint overlay bucket=%d base_rows=%d: %w",
-						pending.leafRoute.Bucket, stripe.Len(), renderErr,
+				if view.HasOverflowRows() {
+					initErr = view.RewriteOverflowRefs(
+						payload, func(head storeio.PageRef) (storeio.PageRef, error) {
+							if head.Offset < base.fileEnd {
+								return head, nil
+							}
+							resolved, rErr := c.appendPrimaryOverflowValue(
+								c.overflowValueScratch[:0], head,
+								c.primaryLeafBounds(visible),
+							)
+							if rErr != nil {
+								return storeio.PageRef{}, rErr
+							}
+							c.overflowValueScratch = resolved
+							// The volatile chain is now superseded by the durable one
+							// minted below; record its extents so their memory-only frames
+							// drop once this checkpoint publishes.
+							extents, cErr := c.collectPrimaryOverflowExtents(
+								c.primaryCheckpointVolatileOverflow, head,
+								c.primaryLeafBounds(visible),
+							)
+							if cErr != nil {
+								return storeio.PageRef{}, cErr
+							}
+							c.primaryCheckpointVolatileOverflow = extents
+							return c.stagePrimaryOverflowChain(
+								tx, resolved, generation,
+							)
+						},
 					)
 				}
-			}
-			if renderErr == nil {
-				for row := range records {
-					head := records[row].Value.Overflow
-					if !records[row].Value.IsOverflow() || head.Offset < base.fileEnd {
-						continue
-					}
-					var resolved []byte
-					resolved, renderErr = c.appendPrimaryOverflowValue(
-						c.overflowValueScratch[:0], head,
-						c.primaryLeafBounds(visible),
-					)
-					if renderErr != nil {
-						break
-					}
-					c.overflowValueScratch = resolved
-					var extents []storeio.PageRef
-					extents, renderErr = c.collectPrimaryOverflowExtents(
-						c.primaryCheckpointVolatileOverflow, head,
-						c.primaryLeafBounds(visible),
-					)
-					if renderErr != nil {
-						break
-					}
-					c.primaryCheckpointVolatileOverflow = extents
-					records[row].Value.Overflow, renderErr =
-						c.stagePrimaryOverflowChain(tx, resolved, generation)
-					if renderErr != nil {
-						break
-					}
+				if initErr == nil {
+					_, initErr = storeio.SealPage(page.Bytes())
 				}
-			}
-			leafHeader := stripe.Header()
-			leafHeader.Generation = generation
-			var image []byte
-			if renderErr == nil {
-				image, renderErr =
-					storeio.EncodeBestCompactPrimaryStripe(
-						c.primaryLeafScratch, leafHeader, c.storeID,
-						records, c.primaryUnifiedBuilder,
-					)
-				if renderErr != nil {
-					renderErr = fmt.Errorf(
-						"encode compact checkpoint bucket=%d rows=%d: %w",
-						pending.leafRoute.Bucket, len(records), renderErr,
-					)
-				}
-			}
-			var page storeio.TransactionPage
-			if renderErr == nil {
-				page, renderErr = tx.AllocateNear(
-					storeio.PagePrimaryLeaf, uint32(len(image)),
-					pending.volatileRef.LogicalID,
-					primaryLeafPlacementHint(
-						pending.leafRoute.Bucket,
-						layout.DataStart,
-					),
-				)
-			}
-			if renderErr == nil {
-				copy(page.Bytes(), image)
-				renderErr = page.Stage()
 			}
 			lease.Release()
-			if renderErr != nil {
-				return renderErr
+			if initErr != nil {
+				return initErr
+			}
+			if stageErr := page.Stage(); stageErr != nil {
+				return stageErr
 			}
 			pending.checkpointLeaf = page.Ref()
 			if appendErr := c.appendPrimaryRetirement(
@@ -2370,87 +2465,11 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 			); appendErr != nil {
 				return appendErr
 			}
-			continue
 		}
-		// Draw the checkpointed leaf toward its sorted-rank target rather than its
-		// last physical offset, so churn pulls each leaf back into lexical order
-		// instead of scattering it. See primaryLeafPlacementHint.
-		page, allocateErr := tx.AllocateNear(
-			storeio.PagePrimaryLeaf, header.PageSize,
-			pending.volatileRef.LogicalID,
-			primaryLeafPlacementHint(pending.leafRoute.Bucket, layout.DataStart),
-		)
-		if allocateErr != nil {
-			lease.Release()
-			return allocateErr
+		if nativeWorkersRunning {
+			c.stopPrimaryNativeFoldWorkers(nativeContexts)
+			nativeWorkersRunning = false
 		}
-		header.Generation = generation
-		payload, initErr := storeio.InitPage(
-			page.Bytes(), header,
-		)
-		if initErr == nil {
-			copy(payload, lease.Payload())
-			// A leaf carrying a volatile overflow head must have its chain minted
-			// durable in this checkpoint transaction and its head patched to the
-			// durable one in place before the leaf seals; a head the base already
-			// made durable is carried forward untouched. Reading the volatile chain
-			// resolves against the visible bounds it was minted under.
-			view := storeio.AdmittedCommonPrimaryLeaf(
-				lease.Page(), c.storeID, pending.leafRoute.Bucket,
-				c.primaryLeafBounds(visible),
-			)
-			if view.HasOverflowRows() {
-				initErr = view.RewriteOverflowRefs(
-					payload, func(head storeio.PageRef) (storeio.PageRef, error) {
-						if head.Offset < base.fileEnd {
-							return head, nil
-						}
-						resolved, rErr := c.appendPrimaryOverflowValue(
-							c.overflowValueScratch[:0], head,
-							c.primaryLeafBounds(visible),
-						)
-						if rErr != nil {
-							return storeio.PageRef{}, rErr
-						}
-						c.overflowValueScratch = resolved
-						// The volatile chain is now superseded by the durable one
-						// minted below; record its extents so their memory-only frames
-						// drop once this checkpoint publishes.
-						extents, cErr := c.collectPrimaryOverflowExtents(
-							c.primaryCheckpointVolatileOverflow, head,
-							c.primaryLeafBounds(visible),
-						)
-						if cErr != nil {
-							return storeio.PageRef{}, cErr
-						}
-						c.primaryCheckpointVolatileOverflow = extents
-						return c.stagePrimaryOverflowChain(
-							tx, resolved, generation,
-						)
-					},
-				)
-			}
-			if initErr == nil {
-				_, initErr = storeio.SealPage(page.Bytes())
-			}
-		}
-		lease.Release()
-		if initErr != nil {
-			return initErr
-		}
-		if stageErr := page.Stage(); stageErr != nil {
-			return stageErr
-		}
-		pending.checkpointLeaf = page.Ref()
-		if appendErr := c.appendPrimaryRetirement(
-			base, pending.leafRoute.Ref,
-		); appendErr != nil {
-			return appendErr
-		}
-	}
-	if nativeWorkersRunning {
-		c.stopPrimaryNativeFoldWorkers(nativeContexts)
-		nativeWorkersRunning = false
 	}
 
 	// Retire the durable overflow chains that buffered Puts and Deletes superseded
@@ -2953,9 +2972,13 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 		nextState.root.ExactIndexRoot = exactRoot
 	}
 	volatileRetirements := 0
-	for index := range c.primaryPendingParents {
-		if c.primaryPendingParents[index].volatileRef != (storeio.PageRef{}) {
-			volatileRetirements++
+	if tailFold != nil {
+		volatileRetirements = len(tailFold.leaves)
+	} else {
+		for index := range c.primaryPendingParents {
+			if c.primaryPendingParents[index].volatileRef != (storeio.PageRef{}) {
+				volatileRetirements++
+			}
 		}
 	}
 	for _, ref := range c.primaryCheckpointVolatileOverflow {
@@ -3008,12 +3031,20 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 		return err
 	}
 	abort = false
-	for index := range c.primaryPendingParents {
-		pending := &c.primaryPendingParents[index]
-		c.primaryRouter.Load().UpdateLeaf(
-			pending.resident, pending.checkpointLeaf,
-			generation,
-		)
+	router := c.primaryRouter.Load()
+	if tailFold != nil {
+		for index := range tailFold.leaves {
+			leaf := &tailFold.leaves[index]
+			router.UpdateLeaf(leaf.route, leaf.checkpoint, generation)
+		}
+	} else {
+		for index := range c.primaryPendingParents {
+			pending := &c.primaryPendingParents[index]
+			router.UpdateLeaf(
+				pending.resident, pending.checkpointLeaf,
+				generation,
+			)
+		}
 	}
 	// The fold's fresh epoch (empty overlay) publishes in the same gate +
 	// fence section as the checkpointed state, retiring the consumed epoch
@@ -3037,10 +3068,20 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 			c.primaryVolatileRetired[:0]
 		c.extractNeverDurableRetirements(absorbedStart)
 	}
-	for index := range c.primaryPendingParents {
-		c.retirePrimaryVolatileRefLocked(
-			c.primaryPendingParents[index].volatileRef,
-		)
+	if tailFold != nil {
+		for index := range tailFold.leaves {
+			c.retirePrimaryVolatileRefLocked(
+				tailFold.leaves[index].volatile,
+			)
+		}
+		c.primaryTailSplit = nil
+		c.refreshPrimaryTailSplitChargeLocked()
+	} else {
+		for index := range c.primaryPendingParents {
+			c.retirePrimaryVolatileRefLocked(
+				c.primaryPendingParents[index].volatileRef,
+			)
+		}
 	}
 	// Drop the memory-only frames of every volatile overflow chain this checkpoint
 	// re-minted durable, deferring past an active reader exactly as the volatile

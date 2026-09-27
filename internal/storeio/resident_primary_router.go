@@ -6,6 +6,7 @@ import (
 	"math/bits"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 const residentPrimaryRouterWords = 4
@@ -329,6 +330,28 @@ func (r *ResidentPrimaryRouter) ResolveBucketID(
 		return residentCellRoute(entry, rank, 0)
 	}
 	return ResidentPrimaryRoute{}, false
+}
+
+// CopyTabletLocalIDs copies the live local-ID bitmap for tabletID into dst.
+// The router's radix index is immutable after publication, so the copy needs
+// no lock and does not expose the router's backing storage to the caller.
+func (r *ResidentPrimaryRouter) CopyTabletLocalIDs(
+	tabletID uint32,
+	dst *[TabletLocalIdentityLocalCount / 64]uint64,
+) bool {
+	if dst == nil {
+		return false
+	}
+	clear(dst[:])
+	if r == nil || r.buckets == nil {
+		return false
+	}
+	locals, ok := r.buckets.tabletLocals(tabletID)
+	if !ok || locals == nil {
+		return false
+	}
+	*dst = locals.words
+	return true
 }
 
 // ResolveBucketFloor returns one coherent mutable leaf handle together with
@@ -824,6 +847,102 @@ func (r *ResidentPrimaryRouter) ResidentBytes() int {
 		}
 	}
 	return int(total)
+}
+
+// SplitLeafPartitionAllocationUpperBound returns a conservative bound for the
+// temporary and retained allocations made by SplitLeafPartition when it
+// replaces one route with replacementCount routes. addedFenceBytes is the
+// total owned fence payload supplied for the right-hand replacement routes;
+// the copied source/leftmost fence is covered by the complete current-image
+// allowance. The bound charges a complete current image, every persistent
+// bucket-index path copied by the delete and K inserts, and K newly owned route
+// entries/fences plus bounded tree packing scratch. It intentionally does not
+// report the new image's ResidentBytes delta: snapshots may retain the previous
+// immutable root while the new image is live.
+func (r *ResidentPrimaryRouter) SplitLeafPartitionAllocationUpperBound(
+	replacementCount, addedFenceBytes int,
+) (uint64, bool) {
+	if r == nil || replacementCount < 2 || addedFenceBytes < 0 {
+		return 0, false
+	}
+	limit := uint64(maxIntValue)
+	bound := uint64(r.ResidentBytes())
+	add := func(value uint64) bool {
+		if value > limit-bound {
+			return false
+		}
+		bound += value
+		return true
+	}
+	mulAdd := func(count uint64, size uintptr) bool {
+		if size != 0 && count > limit/uint64(size) {
+			return false
+		}
+		return add(count * uint64(size))
+	}
+
+	// A BucketID is 32 bits and the radix consumes four bits per level, so its
+	// maximum path is eight branches. delete(source) followed by set(each
+	// replacement) path-copies that maximum radix path and the tablet-local
+	// bitmap/leaf at the affected depths. Charging
+	// that full path per operation also bounds transient intermediate indexes.
+	indexOps := uint64(replacementCount) + 1
+	indexPathBytes := uint64(8)*uint64(unsafe.Sizeof(residentBucketBranch{})) +
+		uint64(unsafe.Sizeof(residentTabletLocalSet{})) +
+		uint64(unsafe.Sizeof(residentBucketLeaf{})) +
+		uint64(unsafe.Sizeof(residentBucketIndex{}))
+	if indexPathBytes != 0 && indexOps > limit/indexPathBytes ||
+		!add(indexOps*indexPathBytes) {
+		return 0, false
+	}
+
+	// The new route cells and entry/fence headers are distinct from the old
+	// image. New leaf blocks and branch levels are bounded by the number of
+	// replacement entries, rounded up at each fixed tree fanout.
+	if !mulAdd(uint64(replacementCount), unsafe.Sizeof(residentRouteCell{})) ||
+		!mulAdd(uint64(replacementCount), unsafe.Sizeof(residentRouteEntry{})) ||
+		!mulAdd(uint64(replacementCount), unsafe.Sizeof(SegmentedTabletRouterLeaf{})) ||
+		!add(uint64(addedFenceBytes)) {
+		return 0, false
+	}
+	leafBlocks := (uint64(replacementCount) + residentRouteBlockSize - 1) /
+		residentRouteBlockSize
+	if !mulAdd(leafBlocks,
+		unsafe.Sizeof(residentRouteNode{})+
+			uintptr(residentRouteBlockSize)*unsafe.Sizeof(residentRouteEntry{})+
+			uintptr(residentRouteBlockSize)*unsafe.Sizeof(uint64(0))) {
+		return 0, false
+	}
+	for branches := leafBlocks; branches > 1; {
+		branches = (branches + residentRouteFanout - 1) / residentRouteFanout
+		if !mulAdd(branches,
+			unsafe.Sizeof(residentRouteNode{})+
+				uintptr(residentRouteFanout)*unsafe.Sizeof((*residentRouteNode)(nil))+
+				uintptr(residentRouteFanout)*unsafe.Sizeof(int(0))+
+				uintptr(residentRouteFanout)*unsafe.Sizeof(uint64(0))) {
+			return 0, false
+		}
+	}
+	// The resident tree fanout is 64 and a leaf block covers 128 entries. A
+	// uint32 route cardinality needs at most ceil(log_64(ceil(2^32/128))) = 5
+	// branch levels. Two fresh nodes per level conservatively cover path copying
+	// and a split at each possible level.
+	// Rebalancing at the previous image's fanout boundary can add a fresh parent
+	// even when the small replacement itself needs one leaf block.
+	branchSize := unsafe.Sizeof(residentRouteNode{}) +
+		uintptr(residentRouteFanout)*unsafe.Sizeof((*residentRouteNode)(nil)) +
+		uintptr(residentRouteFanout)*unsafe.Sizeof(int(0)) +
+		uintptr(residentRouteFanout)*unsafe.Sizeof(uint64(0))
+	if !mulAdd(10, branchSize) {
+		return 0, false
+	}
+	// replaceResidentTreeRange also holds one routed-entry scratch slice and a
+	// bounded path of child pointers while it packs the changed tree image.
+	if !mulAdd(uint64(replacementCount)+residentRouteBlockSize, unsafe.Sizeof(residentRouteEntry{})) ||
+		!mulAdd(uint64(8*residentRouteFanout), unsafe.Sizeof((*residentRouteNode)(nil))) {
+		return 0, false
+	}
+	return bound, true
 }
 
 // BuildDuration reports the wall time spent walking and packing the graph,

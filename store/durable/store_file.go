@@ -20,6 +20,31 @@ type fileStoreState struct {
 	freeHead storeio.PageRef
 }
 
+// primaryTailSplitLeaf is one reader-visible volatile descendant of the
+// original physical leaf held by primaryTailSplitLineage. localFloor is an
+// owned tablet-local fence; volatile is the newest complete row image for
+// this identity. zone is retained for the physical anchor rewrite at fold.
+type primaryTailSplitLeaf struct {
+	localID    uint16
+	localFloor []byte
+	volatile   storeio.PageRef
+	zone       storeio.BucketZone
+}
+
+// primaryTailSplitLineage keeps one original physical parent while the right
+// edge of its leaf range is split in volatile generations. The descriptor is
+// writer-owned and is replaced only by a decided primary batch publication.
+type primaryTailSplitLineage struct {
+	source               filePrimaryPendingParent
+	tabletID             uint32
+	leaves               []primaryTailSplitLeaf
+	chargedBytes         uint64
+	peakChargedBytes     uint64
+	routerRetainedBytes  uint64
+	routerWorstCaseBytes uint64
+	peakRouterBytes      uint64
+}
+
 // collectionClosePhase is the last teardown boundary completed under writer.
 // Close advances monotonically so a retry resumes after the exact resource
 // that blocked it instead of rerunning persistence against a half-detached
@@ -462,7 +487,20 @@ type Collection struct {
 	primaryUnifiedCanonicalWS  storeio.CanonicalWorkspace
 	primaryRootScratch         []byte
 	primaryPendingParents      []filePrimaryPendingParent
-	primaryVolatileRetired     []storeio.PageRef
+	primaryTailSplit           *primaryTailSplitLineage
+	// primaryTailRetiredRouterBytes tracks immutable resident-router roots that
+	// an already admitted reader may still hold. The existing reader fence clears
+	// this charge when the last such reader is gone, even if no page ref needed
+	// deferred retirement.
+	primaryTailRetiredRouterBytes atomic.Uint64
+	primaryTailCurrentChargeBytes atomic.Uint64
+	primaryTailPeakChargeBytes    atomic.Uint64
+	// primaryTailFallbackOnce suppresses one retry of the volatile-tail lane
+	// after its bounded admission declines, so the checkpoint-group pressure
+	// retry can use the established structural path instead of repeating the
+	// same reservation failure on an empty pending set.
+	primaryTailFallbackOnce bool
+	primaryVolatileRetired  []storeio.PageRef
 	// overflowChainScratch and overflowOffsetScratch stage one out-of-line value's
 	// overflow-extent chain during a mutation transaction: the reserved transaction
 	// pages and each piece's start offset in the value. They are writer-private and
@@ -650,6 +688,13 @@ type Stats struct {
 	PhysicalCapacityBytes  uint64
 	PhysicalHighWaterBytes uint64
 	ResidentBytes          uint64
+	// PrimaryTailSplitCurrentChargeBytes reports the bounded live lineage
+	// metadata plus immutable router images deferred for readers. PeakChargeBytes
+	// is the high-water charged reservation: current dirty frame-arena bytes,
+	// retained router history, and an in-flight tail admission's planning
+	// scratch and frame/router/fold bounds. Neither metric is process RSS.
+	PrimaryTailSplitCurrentChargeBytes uint64
+	PrimaryTailSplitPeakChargeBytes    uint64
 	// ReservedBytes is the cache arena actually owned by resident extents.
 	// It can exceed ResidentBytes when an exact on-disk extent occupies the
 	// next buddy size class in RAM, but never exceeds CapacityBytes.

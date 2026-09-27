@@ -418,6 +418,30 @@ func (c *Collection) preparePrimaryBatchTopology(
 	return err
 }
 
+// appendPrimaryTopologyKeyBounded grows geometrically but never beyond
+// maxCapacity, so planner scratch has an admission bound before the first
+// materialization. The planner keeps its existing sort-and-compact pass.
+func appendPrimaryTopologyKeyBounded(
+	dst [][]byte, key []byte, maxCapacity int,
+) ([][]byte, bool) {
+	if maxCapacity < len(dst)+1 {
+		return dst, false
+	}
+	if len(dst) == cap(dst) {
+		newCapacity := maxCapacity
+		if cap(dst) <= maxCapacity/2 {
+			newCapacity = max(1, cap(dst)*2)
+		}
+		if newCapacity < len(dst)+1 {
+			return dst, false
+		}
+		grown := make([][]byte, len(dst), newCapacity)
+		copy(grown, dst)
+		dst = grown
+	}
+	return append(dst, key), true
+}
+
 // planPrimaryBatchTopologyCuts refines a shared cut set until every resulting
 // key range is one canonical VCS1 span for both the currently published rows
 // and the prospective post-batch rows. Planning only the latter is insufficient:
@@ -449,7 +473,9 @@ func (c *Collection) planPrimaryBatchTopologyCuts(
 		for at := range prospective {
 			unionKeys[at] = prospective[at].Key
 		}
-		starts, planErr := planStarts(nil, prospective)
+		starts, planErr := planStarts(
+			make([]int, 0, len(prospective)), prospective,
+		)
 		if planErr != nil {
 			for at := range prospective {
 				_, singleErr := planStarts(nil, prospective[at:at+1])
@@ -469,7 +495,15 @@ func (c *Collection) planPrimaryBatchTopologyCuts(
 		return cuts, unionKeys, nil
 	}
 
-	unionKeys = make([][]byte, 0, len(current)+len(prospective))
+	maxInt := int(^uint(0) >> 1)
+	if len(current) > maxInt-len(prospective) {
+		return nil, nil, storeio.ErrInvalidWrite
+	}
+	keyCapacity := len(current) + len(prospective)
+	if keyCapacity == 0 || keyCapacity > maxInt/2 {
+		return nil, nil, storeio.ErrInvalidWrite
+	}
+	unionKeys = make([][]byte, 0, keyCapacity)
 	for at := range current {
 		unionKeys = append(unionKeys, current[at].Key)
 	}
@@ -482,7 +516,8 @@ func (c *Collection) planPrimaryBatchTopologyCuts(
 		return nil, nil, storeio.ErrInvalidWrite
 	}
 
-	var starts []int
+	starts := make([]int, 0, max(len(current), len(prospective)))
+	cuts = make([][]byte, 0)
 	datasets := [...]struct {
 		rows        []storeio.CommonPrimaryLeafRecord
 		prospective bool
@@ -490,7 +525,7 @@ func (c *Collection) planPrimaryBatchTopologyCuts(
 		{rows: current},
 		{rows: prospective, prospective: true},
 	}
-	var additions [][]byte
+	additions := make([][]byte, 0)
 	for {
 		before := len(cuts)
 		additions = additions[:0]
@@ -523,16 +558,29 @@ func (c *Collection) planPrimaryBatchTopologyCuts(
 						return nil, nil, err
 					}
 					for startAt := 1; startAt < len(starts); startAt++ {
-						additions = append(
+						var inserted bool
+						additions, inserted = appendPrimaryTopologyKeyBounded(
 							additions,
 							dataset.rows[at+starts[startAt]].Key,
+							keyCapacity,
 						)
+						if !inserted {
+							return nil, nil, storeio.ErrInvalidWrite
+						}
 					}
 				}
 				at = end
 			}
 		}
-		cuts = append(cuts, additions...)
+		for _, addition := range additions {
+			var appended bool
+			cuts, appended = appendPrimaryTopologyKeyBounded(
+				cuts, addition, 2*keyCapacity,
+			)
+			if !appended {
+				return nil, nil, storeio.ErrInvalidWrite
+			}
+		}
 		slices.SortFunc(cuts, bytes.Compare)
 		cuts = slices.CompactFunc(cuts, bytes.Equal)
 		if len(cuts) == before {

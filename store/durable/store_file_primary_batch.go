@@ -88,18 +88,22 @@ type primaryBatchLeaf struct {
 	firstKey     []byte
 	pending      filePrimaryPendingParent
 	pendingIndex int
-	nextLeaf     storeio.PageRef
-	imageOffset  int
-	imageLength  int
-	applied      int
-	frameGen     uint64
-	initialLen   int
-	finalLen     int
-	docDelta     int
-	mutationAt   int
-	mutationEnd  int
-	stableSlots  bool
-	skip         bool
+	// tailLineageIndex is the current descendant in primaryTailSplit, or -1
+	// when the resident route still resolves through the sealed graph/pending
+	// parent table.
+	tailLineageIndex int
+	nextLeaf         storeio.PageRef
+	imageOffset      int
+	imageLength      int
+	applied          int
+	frameGen         uint64
+	initialLen       int
+	finalLen         int
+	docDelta         int
+	mutationAt       int
+	mutationEnd      int
+	stableSlots      bool
+	skip             bool
 	// basePage is a copy of the leaf's pre-batch page, kept only when the
 	// batch rewrites slots with exact indexes active. It lets exact-index
 	// preparation diff the base and final bucket contributions and emit
@@ -120,6 +124,7 @@ type stagedPrimaryBatch struct {
 	preparedExact   primaryExactPrepared
 	preparedOverlay primaryUnifiedOverlayBatchPrepared
 	overlayDocDelta int
+	tailSplit       *primaryTailSplitStage
 	live            bool
 }
 
@@ -959,6 +964,11 @@ func (c *Collection) stagePrimaryBatchUnifiedOverlayLocked(
 	if c.state.Load() != state {
 		return stagedPrimaryBatch{}, false, nil
 	}
+	c.clearPrimaryVolatileRetiredLocked()
+	if c.cache == nil || c.cache.DirtyCapacityAvailable() <
+		c.primaryTailCurrentChargeBytes.Load() {
+		return stagedPrimaryBatch{}, true, ErrCheckpointGroupPressure
+	}
 	prepared, prepareErr := overlay.prepareBatch(generation, mutations)
 	if prepareErr != nil {
 		if errors.Is(prepareErr, storeio.ErrPageCachePinned) {
@@ -1042,12 +1052,28 @@ func (c *Collection) reservePrimaryUnifiedOverlayRetentionLocked(
 func (c *Collection) stagePrimaryBatchForJournalLocked(
 	batch *WriteBatch, conditional bool,
 ) (stagedPrimaryBatch, error) {
-	if conditional {
+	if c.primaryTailSplit != nil && !conditional {
+		// A lineaged source has one representative physical parent and several
+		// current resident descendants. Ordinary writes cannot extend that
+		// conditional-only state, so fold it before entering the established lane.
+		if err := c.materializePrimaryParentsLocked(
+			primaryMaterializationBarrier,
+		); err != nil {
+			return stagedPrimaryBatch{}, err
+		}
+	}
+	suppressTailOnce := c.primaryTailFallbackOnce && c.primaryTailSplit == nil
+	if suppressTailOnce {
+		c.primaryTailFallbackOnce = false
+	}
+	if c.primaryTailSplit == nil && conditional {
 		if staged, handled, err := c.stagePrimaryBatchUnifiedOverlayLocked(batch); handled {
 			return staged, err
 		}
-	} else if staged, handled, err := c.stagePrimaryBatchOrdinaryOverlayLocked(batch); handled {
-		return staged, err
+	} else if c.primaryTailSplit == nil {
+		if staged, handled, err := c.stagePrimaryBatchOrdinaryOverlayLocked(batch); handled {
+			return staged, err
+		}
 	}
 	c.absorbOverlayOnCOW = false
 	if c.primaryUnifiedOverlay.hasPending() {
@@ -1087,6 +1113,11 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 		if err := c.planPrimaryBatch(state, batch); err != nil {
 			return stagedPrimaryBatch{}, err
 		}
+		tailCandidate := !suppressTailOnce &&
+			c.primaryTailBatchCandidate(state, conditional)
+		if c.primaryTailSplit != nil && !tailCandidate {
+			return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+		}
 		// Validate the complete final image before leaf rendering or structural
 		// preparation. A conflicting insert routed to a highly compressed leaf
 		// must report the typed constraint error without first trying an
@@ -1115,6 +1146,21 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 		if errors.Is(buildErr, ErrPrimaryLeafSplitRequired) {
 			lastErr = buildErr
 			c.absorbOverlayOnCOW = false
+			if tailCandidate {
+				staged, tailErr := c.preparePrimaryTailBatchSplitLocked(
+					state, state.root.Generation+1,
+				)
+				if tailErr == nil {
+					return staged, nil
+				}
+				if errors.Is(tailErr, ErrCheckpointGroupPressure) {
+					// The owning group gets one pressure checkpoint, then retries via
+					// the established structural splitter once the prior lineage has
+					// also folded. This prevents repeating an impossible reservation.
+					c.primaryTailFallbackOnce = true
+				}
+				return stagedPrimaryBatch{}, tailErr
+			}
 			if group := c.checkpointGroup.Load(); group != nil &&
 				group.visibleTxn.Load() > group.certTxn.Load() {
 				// The failed leaf build has not admitted frames or prepared a
@@ -1136,6 +1182,18 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 		}
 		if !c.primaryBatchHasLiveLeaf() {
 			return stagedPrimaryBatch{}, nil
+		}
+		if tailCandidate && c.primaryTailSplit != nil {
+			staged, tailErr := c.preparePrimaryTailBatchUpdateLocked(
+				state, generation,
+			)
+			if tailErr == nil {
+				return staged, nil
+			}
+			if errors.Is(tailErr, ErrCheckpointGroupPressure) {
+				c.primaryTailFallbackOnce = true
+			}
+			return stagedPrimaryBatch{}, tailErr
 		}
 		if err := c.validatePrimaryUniqueBatch(); err != nil {
 			return stagedPrimaryBatch{}, err
@@ -1532,6 +1590,9 @@ func (c *Collection) planPrimaryBatch(state *fileStoreState, batch *WriteBatch) 
 				pendingIndex: c.primaryPendingParentIndex(
 					mutation.resident.Bucket,
 				),
+				tailLineageIndex: c.primaryTailSplitLeafIndex(
+					mutation.resident.Bucket,
+				),
 				mutationAt: i, mutationEnd: i + 1,
 			})
 			leafIndex++
@@ -1632,7 +1693,27 @@ func (c *Collection) primaryBatchHasLiveLeaf() bool {
 //   - durable retirement room for every superseded on-device overflow page;
 //   - admission bookkeeping for every new chain page and leaf.
 func (c *Collection) ensurePrimaryBatchCapacity(conditional bool) (bool, error) {
+	return c.ensurePrimaryBatchCapacityWithCharge(conditional, 0)
+}
+
+// ensurePrimaryBatchCapacityWithCharge reserves ordinary batch resources and
+// a caller-supplied bounded metadata allowance from the same dirty-capacity
+// headroom. It prevents tail-router/fold reservations from being treated as a
+// second independent budget beside the pending leaf frames.
+func (c *Collection) ensurePrimaryBatchCapacityWithCharge(
+	conditional bool, extraCharge uint64,
+) (bool, error) {
+	return c.ensurePrimaryBatchCapacityWithPolicy(conditional, extraCharge, true)
+}
+
+func (c *Collection) ensurePrimaryBatchCapacityWithPolicy(
+	conditional bool, extraCharge uint64, checkpointOnPressure bool,
+) (bool, error) {
 	before := c.automaticCheckpoints.Load()
+	// Retired immutable routers consume metadata headroom just like page-cache
+	// dirty frames. Reclaim them before calculating every batch admission; a
+	// held reader keeps the charge live through the reader fence.
+	c.clearPrimaryVolatileRetiredLocked()
 	newDistinct := 0
 	liveLeaves := 0
 	volatileRetirements := len(c.batchPrimaryOverflowVolatile)
@@ -1655,7 +1736,19 @@ func (c *Collection) ensurePrimaryBatchCapacity(conditional bool) (bool, error) 
 		}
 		requiredDirty += reserved
 	}
+	if requiredDirty > math.MaxUint64-extraCharge {
+		return false, storeio.ErrInvalidWrite
+	}
+	requiredDirty += extraCharge
+	historyCharge := c.primaryTailRetiredRouterBytes.Load()
+	if requiredDirty > math.MaxUint64-historyCharge {
+		return false, storeio.ErrInvalidWrite
+	}
+	requiredDirty += historyCharge
 	if len(c.primaryPendingParents)+newDistinct > cap(c.primaryPendingParents) {
+		if !checkpointOnPressure {
+			return false, ErrCheckpointGroupPressure
+		}
 		if err := c.checkpointBufferedLocked(); err != nil {
 			return false, err
 		}
@@ -1664,7 +1757,13 @@ func (c *Collection) ensurePrimaryBatchCapacity(conditional bool) (bool, error) 
 	}
 	var journalErr error
 	if conditional {
-		journalErr = c.ensurePrimaryBatchConditionalJournalRoom(c.batchJournalEntries)
+		if checkpointOnPressure {
+			journalErr = c.ensurePrimaryBatchConditionalJournalRoom(c.batchJournalEntries)
+		} else {
+			journalErr = c.ensurePrimaryBatchConditionalJournalRoomNoCheckpoint(
+				c.batchJournalEntries,
+			)
+		}
 	} else {
 		journalErr = c.ensurePrimaryBatchJournalRoom(c.batchJournalEntries)
 	}
@@ -1675,10 +1774,23 @@ func (c *Collection) ensurePrimaryBatchCapacity(conditional bool) (bool, error) 
 		return true, nil
 	}
 	if c.cache.DirtyCapacityAvailable() < requiredDirty {
+		if !checkpointOnPressure {
+			return false, ErrCheckpointGroupPressure
+		}
 		if err := c.checkpointBufferedLocked(); err != nil {
 			return false, err
 		}
 		c.automaticCheckpoints.Add(1)
+		// The checkpoint may have retired the lineage router history and then
+		// swept it if no reader remained. Recompute that component before testing
+		// the post-checkpoint admission instead of retaining a stale reservation.
+		requiredDirty -= historyCharge
+		c.clearPrimaryVolatileRetiredLocked()
+		historyCharge = c.primaryTailRetiredRouterBytes.Load()
+		if requiredDirty > math.MaxUint64-historyCharge {
+			return false, storeio.ErrInvalidWrite
+		}
+		requiredDirty += historyCharge
 		if c.cache.DirtyCapacityAvailable() < requiredDirty {
 			return false, fmt.Errorf(
 				"%w: ordered primary batch needs %d dirty bytes",
@@ -1707,15 +1819,20 @@ func (c *Collection) ensurePrimaryBatchCapacity(conditional bool) (bool, error) 
 	}
 	if len(c.primaryPendingOverflowRetire)+
 		len(c.batchPrimaryOverflowDurable) > cap(c.primaryPendingOverflowRetire) {
+		if !checkpointOnPressure {
+			return false, ErrCheckpointGroupPressure
+		}
 		if err := c.checkpointBufferedLocked(); err != nil {
 			return false, err
 		}
 		c.automaticCheckpoints.Add(1)
 		return true, nil
 	}
-	c.clearPrimaryVolatileRetiredLocked()
 	volatileNeeded := len(c.primaryVolatileRetired) + volatileRetirements
 	if volatileNeeded > c.options.MaxRetiredExtents {
+		if !checkpointOnPressure {
+			return false, ErrCheckpointGroupPressure
+		}
 		c.retirementPressureCheckpoints.Add(1)
 		if err := c.checkpointBufferedLocked(); err != nil {
 			return false, err
@@ -1735,6 +1852,9 @@ func (c *Collection) ensurePrimaryBatchCapacity(conditional bool) (bool, error) 
 	if err := c.reservePrimaryVolatileRetiredCapacityLocked(
 		volatileNeeded,
 	); err != nil {
+		if !checkpointOnPressure {
+			return false, ErrCheckpointGroupPressure
+		}
 		return false, c.absorbRetirementPressure(
 			primaryVolatileRetiredCapacityError(
 				c.options.MaxRetiredExtents,
@@ -1831,7 +1951,27 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		lease storeio.PageLease
 		page  []byte
 	)
-	if leaf.pendingIndex < 0 {
+	if c.primaryTailSplit != nil && leaf.tailLineageIndex >= 0 {
+		lineage := c.primaryTailSplit
+		if lineage == nil || leaf.tailLineageIndex >= len(lineage.leaves) {
+			return nil, storeio.ErrSegmentedTabletRouterCorrupt
+		}
+		tailLeaf := lineage.leaves[leaf.tailLineageIndex]
+		if tailLeaf.volatile == (storeio.PageRef{}) {
+			return nil, storeio.ErrSegmentedTabletRouterCorrupt
+		}
+		acquired, err := c.cache.Acquire(tailLeaf.volatile)
+		if err != nil {
+			return nil, err
+		}
+		lease = acquired
+		defer lease.Release()
+		leaf.pending = lineage.source
+		// Capacity preflight needs the one superseded volatile tail image. The
+		// published representative retains no single-descendant volatile ref.
+		leaf.pending.volatileRef = tailLeaf.volatile
+		page = lease.Page()
+	} else if leaf.pendingIndex < 0 {
 		if err := c.acquirePrimaryRoutingPath(
 			&path, state, leaf.firstKey, leaf.resident,
 		); err != nil {
@@ -2218,6 +2358,10 @@ func (c *Collection) publishPrimaryBatch(staged stagedPrimaryBatch) {
 // Update acquires the gate itself via publishPrimaryBatch. The writer must
 // already be held. Infallible by construction — see publishPrimaryBatch.
 func (c *Collection) publishPrimaryBatchGateHeld(staged stagedPrimaryBatch) {
+	if staged.tailSplit != nil {
+		c.publishPrimaryTailBatchGateHeld(staged)
+		return
+	}
 	state := staged.state
 	generation := staged.generation
 	if staged.preparedOverlay.live {
