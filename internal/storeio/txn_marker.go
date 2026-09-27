@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"syscall"
 )
 
 // The transaction decision log (txn.vtm) is a database-scoped sidecar that
@@ -180,6 +181,12 @@ type TxnMarker struct {
 	file *os.File
 	root *os.Root
 	path string
+	// fileIdentity is captured from the descriptor only after the entry and
+	// descriptor are proven to name the same regular file at open time. The
+	// descriptor identity is immutable; EntryCurrent compares it with a fresh
+	// lookup of the live name instead of issuing Fstat on every check.
+	fileIdentity os.FileInfo
+	rawConn      syscall.RawConn
 	// sourceDir is canonicalized once at open/create for diagnostics. The
 	// physical directory identity is retained separately so decisions cannot be
 	// paired with a collection through a retargeted path.
@@ -957,7 +964,7 @@ func createTxnMarkerInRoot(
 		}
 	}
 
-	file, sourceDirInfo, err := openTxnMarkerEntry(
+	file, sourceDirInfo, fileIdentity, err := openTxnMarkerEntry(
 		root, name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600,
 	)
 	if err != nil {
@@ -1003,9 +1010,12 @@ func createTxnMarkerInRoot(
 		return nil, err
 	}
 
-	m := newTxnMarkerManager(
-		file, root, path, sourceDir, sourceDirInfo, header,
+	m, err := newTxnMarkerManager(
+		file, root, path, sourceDir, sourceDirInfo, fileIdentity, header,
 	)
+	if err != nil {
+		return nil, err
+	}
 	if err := m.writeHeaderFaultable(0, header); err != nil {
 		return nil, err
 	}
@@ -1070,7 +1080,7 @@ func InspectTxnMarker(
 	if err != nil {
 		return nil, nil, err
 	}
-	file, sourceDirInfo, err := openTxnMarkerEntry(
+	file, sourceDirInfo, fileIdentity, err := openTxnMarkerEntry(
 		root, filepath.Base(path), os.O_RDONLY, 0,
 	)
 	if err != nil {
@@ -1094,9 +1104,12 @@ func InspectTxnMarker(
 			return nil, nil, fmt.Errorf("%w: transaction marker inspection: %w", ErrSealedCapacityMismatch, err)
 		}
 	}
-	marker := newTxnMarkerManager(
-		file, root, path, sourceDir, sourceDirInfo, header,
+	marker, err := newTxnMarkerManager(
+		file, root, path, sourceDir, sourceDirInfo, fileIdentity, header,
 	)
+	if err != nil {
+		return nil, nil, err
+	}
 	marker.headerSlot = uint32(selected)
 	decisions := &TxnDecisions{}
 	if err := marker.scanDecisions(decisions); err != nil {
@@ -1138,7 +1151,7 @@ func openTxnMarkerInRoot(
 		_ = root.Close()
 		return nil, nil, err
 	}
-	file, sourceDirInfo, err := openTxnMarkerEntry(
+	file, sourceDirInfo, fileIdentity, err := openTxnMarkerEntry(
 		root, name, os.O_RDWR, 0o600,
 	)
 	if err != nil {
@@ -1193,9 +1206,12 @@ func openTxnMarkerInRoot(
 		}
 	}
 
-	m := newTxnMarkerManager(
-		file, root, path, sourceDir, sourceDirInfo, header,
+	m, err := newTxnMarkerManager(
+		file, root, path, sourceDir, sourceDirInfo, fileIdentity, header,
 	)
+	if err != nil {
+		return nil, nil, err
+	}
 	m.headerSlot = uint32(selected)
 	decisions := &TxnDecisions{}
 	if err := m.scanDecisions(decisions); err != nil {
@@ -1283,12 +1299,23 @@ func newTxnMarkerManager(
 	path string,
 	sourceDir string,
 	sourceDirInfo os.FileInfo,
+	fileIdentity os.FileInfo,
 	h TxnMarkerHeader,
-) *TxnMarker {
+) (*TxnMarker, error) {
+	if file == nil || root == nil || fileIdentity == nil ||
+		!fileIdentity.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: invalid transaction marker handle identity", ErrInvalidWrite)
+	}
+	rawConn, err := file.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
 	m := &TxnMarker{
 		file:          file,
 		root:          root,
 		path:          path,
+		fileIdentity:  fileIdentity,
+		rawConn:       rawConn,
 		sourceDir:     sourceDir,
 		sourceDirInfo: sourceDirInfo,
 		header:        h,
@@ -1296,25 +1323,25 @@ func newTxnMarkerManager(
 		markerSync:    dataSync,
 	}
 	m.writeAt = file.WriteAt
-	return m
+	return m, nil
 }
 
 func openTxnMarkerEntry(
 	root *os.Root, name string, flag int, perm os.FileMode,
-) (*os.File, os.FileInfo, error) {
+) (*os.File, os.FileInfo, os.FileInfo, error) {
 	dirInfo, err := root.Stat(".")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	creating := flag&os.O_CREATE != 0 && flag&os.O_EXCL != 0
 	var before os.FileInfo
 	if !creating {
 		before, err = root.Lstat(name)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if !before.Mode().IsRegular() {
-			return nil, nil, fmt.Errorf(
+			return nil, nil, nil, fmt.Errorf(
 				"%w: transaction log entry is not a regular non-symlink file",
 				ErrInvalidWrite,
 			)
@@ -1322,7 +1349,7 @@ func openTxnMarkerEntry(
 	}
 	file, err := root.OpenFile(name, flag, perm)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	fileInfo, fileErr := file.Stat()
 	entryInfo, entryErr := root.Lstat(name)
@@ -1335,17 +1362,17 @@ func openTxnMarkerEntry(
 	if !stable {
 		_ = file.Close()
 		if fileErr != nil {
-			return nil, nil, fileErr
+			return nil, nil, nil, fileErr
 		}
 		if entryErr != nil {
-			return nil, nil, entryErr
+			return nil, nil, nil, entryErr
 		}
-		return nil, nil, fmt.Errorf(
+		return nil, nil, nil, fmt.Errorf(
 			"%w: transaction log entry is not a stable regular file",
 			ErrInvalidWrite,
 		)
 	}
-	return file, dirInfo, nil
+	return file, dirInfo, fileInfo, nil
 }
 
 func validTxnMarkerName(name string) bool {
@@ -1401,19 +1428,25 @@ func (m *TxnMarker) SameFile(other *TxnMarker) (bool, error) {
 // EntryCurrent proves that the live marker descriptor is still the exact
 // regular, non-symlink txn.vtm entry under its pinned root.
 func (m *TxnMarker) EntryCurrent() (bool, error) {
-	if m == nil || m.file == nil || m.root == nil {
+	if m == nil || m.file == nil || m.root == nil ||
+		m.fileIdentity == nil || m.rawConn == nil {
 		return false, ErrInvalidWrite
 	}
-	fileInfo, err := m.file.Stat()
-	if err != nil {
-		return false, err
+	if err := m.rawConn.Control(txnMarkerRawConnControl); err != nil {
+		return false, fmt.Errorf(
+			"vibedb: transaction marker descriptor is closed: %w",
+			errors.Join(os.ErrClosed, err),
+		)
 	}
 	entryInfo, err := m.root.Lstat(filepath.Base(m.path))
 	if err != nil {
 		return false, err
 	}
-	return entryInfo.Mode().IsRegular() && os.SameFile(fileInfo, entryInfo), nil
+	return entryInfo.Mode().IsRegular() &&
+		os.SameFile(m.fileIdentity, entryInfo), nil
 }
+
+func txnMarkerRawConnControl(uintptr) {}
 
 // NextSequence reports the DCSN the next appended record will carry.
 func (m *TxnMarker) NextSequence() uint64 { return m.nextSequence }
@@ -1736,14 +1769,18 @@ func (m *TxnMarker) Close() error {
 	if m == nil {
 		return nil
 	}
+	file := m.file
+	root := m.root
+	m.file = nil
+	m.fileIdentity = nil
+	m.rawConn = nil
+	m.root = nil
 	var fileErr, rootErr error
-	if m.file != nil {
-		fileErr = m.file.Close()
-		m.file = nil
+	if file != nil {
+		fileErr = file.Close()
 	}
-	if m.root != nil {
-		rootErr = m.root.Close()
-		m.root = nil
+	if root != nil {
+		rootErr = root.Close()
 	}
 	return errors.Join(fileErr, rootErr)
 }
@@ -1768,8 +1805,7 @@ func (m *TxnMarker) Remove() (err error) {
 		)
 	}
 	name := filepath.Base(m.path)
-	closeErr := m.file.Close()
-	m.file = nil
+	closeErr := m.closeFileHandle()
 	if closeErr != nil {
 		return closeErr
 	}
@@ -1779,6 +1815,20 @@ func (m *TxnMarker) Remove() (err error) {
 		syncErr = syncTxnMarkerParentDir(m.root)
 	}
 	return errors.Join(removeErr, syncErr)
+}
+
+func (m *TxnMarker) closeFileHandle() error {
+	if m == nil {
+		return nil
+	}
+	file := m.file
+	m.file = nil
+	m.fileIdentity = nil
+	m.rawConn = nil
+	if file == nil {
+		return nil
+	}
+	return file.Close()
 }
 
 func syncTxnMarkerParentDir(root *os.Root) error {
