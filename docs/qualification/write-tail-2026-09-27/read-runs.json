@@ -1,0 +1,269 @@
+{
+  "schema": "vibedb.write-tail-qualification-read-runs/1",
+  "started_utc": "2026-09-27T02:09:06.966844+00:00",
+  "scope": "One matched 50x pass per binary over the unchanged 131072-row ReplicatedApply warm point-read benchmark; four cases: varied/shared payloads, sequential/permuted order. One diagnostic pair only; no gain claim or aggregation from historical runs.",
+  "pair_order": [
+    "candidate",
+    "baseline"
+  ],
+  "candidate_head": "0478cfad76eb0fd4dd783c50850c991e060d3099",
+  "candidate_base": "f9a9627a513a1599bc00bdaf59f4eb93470d9fbf",
+  "binary_sha256": {
+    "baseline": "fdf562e708b966ac4734e7eec0584b823739bfb5e4bced14b8ee1e9efcb7c566",
+    "candidate": "bb609065d42fac3e2e04380f63ded753b5f1c0c4ecb49a7023489b8b6ec6fff7"
+  },
+  "benchmark_source_sha256": "752c58760b421901a5d40577861e00e45195b83e5646a418edb913791f06ce47",
+  "source_identity_sha256": {
+    "baseline_binary": "fdf562e708b966ac4734e7eec0584b823739bfb5e4bced14b8ee1e9efcb7c566",
+    "candidate_binary": "bb609065d42fac3e2e04380f63ded753b5f1c0c4ecb49a7023489b8b6ec6fff7",
+    "frozen_baseline_bench_source": "752c58760b421901a5d40577861e00e45195b83e5646a418edb913791f06ce47",
+    "frozen_candidate_bench_source": "752c58760b421901a5d40577861e00e45195b83e5646a418edb913791f06ce47",
+    "current_bench_source": "752c58760b421901a5d40577861e00e45195b83e5646a418edb913791f06ce47"
+  },
+  "runs": [
+    {
+      "lane": "candidate",
+      "binary": "candidate-driver.test",
+      "binary_sha256": "bb609065d42fac3e2e04380f63ded753b5f1c0c4ecb49a7023489b8b6ec6fff7",
+      "wall_seconds": 27.113322,
+      "exit_code": 0,
+      "argv": [
+        "project-env",
+        "<candidate-driver.test>",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkReplicatedApplyBatch64RuntimeWarmPointRead$",
+        "-test.benchtime=50x",
+        "-test.count=1",
+        "-test.benchmem",
+        "-test.timeout=20m"
+      ],
+      "environment": {
+        "GOEXPERIMENT": "simd"
+      },
+      "raw_output": "run-20260927T020906Z/candidate.bench.txt",
+      "raw_output_sha256": "9696a2d2c45b9f3e90a835b312b11bb8e0a410a0370edc35aaee7b800eef7446",
+      "measurements": [
+        {
+          "case": "varied/sequential",
+          "metrics": {
+            "ns/op": 59978294.0,
+            "B/read": 0.0,
+            "allocs/read": 0.0,
+            "cache-hits/read": 1.0,
+            "cache-misses/read": 0.0,
+            "empty-leaves": 0.0,
+            "evictions/read": 0.0,
+            "final-allocated-file-B": 63643648.0,
+            "final-apparent-file-B": 63431168.0,
+            "final-files": 8.0,
+            "leaf-splits": 2.0,
+            "ns/read": 457.6,
+            "page-reads/read": 0.0,
+            "pinned-pages": 0.0,
+            "read-bytes/read": 0.0,
+            "resident-bytes": 25681920.0,
+            "rows/read-pass": 131072.0,
+            "B/op": 0.0,
+            "allocs/op": 0.0
+          }
+        },
+        {
+          "case": "varied/permuted",
+          "metrics": {
+            "ns/op": 92764802.0,
+            "B/read": 0.0,
+            "allocs/read": 0.0,
+            "cache-hits/read": 1.0,
+            "cache-misses/read": 0.0,
+            "empty-leaves": 0.0,
+            "evictions/read": 0.0,
+            "final-allocated-file-B": 63643648.0,
+            "final-apparent-file-B": 63431168.0,
+            "final-files": 8.0,
+            "leaf-splits": 2.0,
+            "ns/read": 707.7,
+            "page-reads/read": 0.0,
+            "pinned-pages": 0.0,
+            "read-bytes/read": 0.0,
+            "resident-bytes": 25681920.0,
+            "rows/read-pass": 131072.0,
+            "B/op": 0.0,
+            "allocs/op": 0.0
+          }
+        },
+        {
+          "case": "shared/sequential",
+          "metrics": {
+            "ns/op": 38136182.0,
+            "B/read": 0.0,
+            "allocs/read": 0.0,
+            "cache-hits/read": 1.0,
+            "cache-misses/read": 0.0,
+            "empty-leaves": 0.0,
+            "evictions/read": 0.0,
+            "final-allocated-file-B": 37789696.0,
+            "final-apparent-file-B": 38322688.0,
+            "final-files": 8.0,
+            "leaf-splits": 0.0,
+            "ns/read": 291.0,
+            "page-reads/read": 0.0,
+            "pinned-pages": 0.0,
+            "read-bytes/read": 0.0,
+            "resident-bytes": 491520.0,
+            "rows/read-pass": 131072.0,
+            "B/op": 0.0,
+            "allocs/op": 0.0
+          }
+        },
+        {
+          "case": "shared/permuted",
+          "metrics": {
+            "ns/op": 54920769.0,
+            "B/read": 0.0,
+            "allocs/read": 0.0,
+            "cache-hits/read": 1.0,
+            "cache-misses/read": 0.0,
+            "empty-leaves": 0.0,
+            "evictions/read": 0.0,
+            "final-allocated-file-B": 37789696.0,
+            "final-apparent-file-B": 38322688.0,
+            "final-files": 8.0,
+            "leaf-splits": 0.0,
+            "ns/read": 419.0,
+            "page-reads/read": 0.0,
+            "pinned-pages": 0.0,
+            "read-bytes/read": 0.0,
+            "resident-bytes": 491520.0,
+            "rows/read-pass": 131072.0,
+            "B/op": 0.0,
+            "allocs/op": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "lane": "baseline",
+      "binary": "main-driver.test",
+      "binary_sha256": "fdf562e708b966ac4734e7eec0584b823739bfb5e4bced14b8ee1e9efcb7c566",
+      "wall_seconds": 67.681281334,
+      "exit_code": 0,
+      "argv": [
+        "project-env",
+        "<baseline-driver.test>",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkReplicatedApplyBatch64RuntimeWarmPointRead$",
+        "-test.benchtime=50x",
+        "-test.count=1",
+        "-test.benchmem",
+        "-test.timeout=20m"
+      ],
+      "environment": {
+        "GOEXPERIMENT": "simd"
+      },
+      "raw_output": "run-20260927T020906Z/baseline.bench.txt",
+      "raw_output_sha256": "c27dcb9334fecc26d9a5be13016fbd41b9ba8b08963fea2879cc36c5c1eb1db4",
+      "measurements": [
+        {
+          "case": "varied/sequential",
+          "metrics": {
+            "ns/op": 60661104.0,
+            "B/read": 0.0,
+            "allocs/read": 0.0,
+            "cache-hits/read": 1.0,
+            "cache-misses/read": 0.0,
+            "empty-leaves": 0.0,
+            "evictions/read": 0.0,
+            "final-allocated-file-B": 73457664.0,
+            "final-apparent-file-B": 72962560.0,
+            "final-files": 8.0,
+            "leaf-splits": 511.0,
+            "ns/read": 462.8,
+            "page-reads/read": 0.0,
+            "pinned-pages": 0.0,
+            "read-bytes/read": 0.0,
+            "resident-bytes": 35356672.0,
+            "rows/read-pass": 131072.0,
+            "B/op": 0.0,
+            "allocs/op": 0.0
+          }
+        },
+        {
+          "case": "varied/permuted",
+          "metrics": {
+            "ns/op": 107490760.0,
+            "B/read": 0.0,
+            "allocs/read": 0.0,
+            "cache-hits/read": 1.0,
+            "cache-misses/read": 0.0,
+            "empty-leaves": 0.0,
+            "evictions/read": 0.0,
+            "final-allocated-file-B": 73457664.0,
+            "final-apparent-file-B": 72962560.0,
+            "final-files": 8.0,
+            "leaf-splits": 511.0,
+            "ns/read": 820.1,
+            "page-reads/read": 0.0,
+            "pinned-pages": 0.0,
+            "read-bytes/read": 0.0,
+            "resident-bytes": 35356672.0,
+            "rows/read-pass": 131072.0,
+            "B/op": 0.0,
+            "allocs/op": 0.0
+          }
+        },
+        {
+          "case": "shared/sequential",
+          "metrics": {
+            "ns/op": 43292052.0,
+            "B/read": 0.0,
+            "allocs/read": 0.0,
+            "cache-hits/read": 1.0,
+            "cache-misses/read": 0.0,
+            "empty-leaves": 0.0,
+            "evictions/read": 0.0,
+            "final-allocated-file-B": 42487808.0,
+            "final-apparent-file-B": 43254272.0,
+            "final-files": 8.0,
+            "leaf-splits": 627.0,
+            "ns/read": 330.3,
+            "page-reads/read": 0.0,
+            "pinned-pages": 0.0,
+            "read-bytes/read": 0.0,
+            "resident-bytes": 4878336.0,
+            "rows/read-pass": 131072.0,
+            "B/op": 0.0,
+            "allocs/op": 0.0
+          }
+        },
+        {
+          "case": "shared/permuted",
+          "metrics": {
+            "ns/op": 64639572.0,
+            "B/read": 0.0,
+            "allocs/read": 0.0,
+            "cache-hits/read": 1.0,
+            "cache-misses/read": 0.0,
+            "empty-leaves": 0.0,
+            "evictions/read": 0.0,
+            "final-allocated-file-B": 42487808.0,
+            "final-apparent-file-B": 43254272.0,
+            "final-files": 8.0,
+            "leaf-splits": 627.0,
+            "ns/read": 493.2,
+            "page-reads/read": 0.0,
+            "pinned-pages": 0.0,
+            "read-bytes/read": 0.0,
+            "resident-bytes": 4878336.0,
+            "rows/read-pass": 131072.0,
+            "B/op": 0.0,
+            "allocs/op": 0.0
+          }
+        }
+      ]
+    }
+  ],
+  "source_evidence_sha256": {
+    "read_run_manifest": "82e1cbce5fa6727532c2b9559f4d776faf60ab24cc567e70a6e39c120f28847f",
+    "candidate_manifest": "6769a98397c7aaf771e8363aa8b5b8518eca56c27f1508f50a58628b9c67e775"
+  }
+}

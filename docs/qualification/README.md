@@ -94,6 +94,7 @@ limitations.
 
 | Record | Report |
 | --- | --- |
+| `write-tail-2026-09-27` | [Rightmost-tail split write qualification](write-tail-2026-09-27/README.md) |
 | `write-geometry-2026-09-26` | [Runtime write geometry and read control](write-geometry-2026-09-26/README.md) |
 | `horizontal-ci-2026-09-05` | [Horizontal CI checkpoint](horizontal-ci-2026-09-05/README.md) |
 | `timer-backpressure-2026-09-05` | [Timer backpressure fixture race evidence](timer-backpressure-2026-09-05/README.md) |
