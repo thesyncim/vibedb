@@ -141,7 +141,7 @@ func Repack(src, out *os.File, options Options) (RepackReport, error) {
 		if len(records) == 0 {
 			return nil
 		}
-		if err := target.Update(func(batch *WriteBatch) error {
+		if err := target.updatePrimaryBatchPrivate(func(batch *WriteBatch) error {
 			for _, row := range records {
 				if err := batch.Put(
 					arena[row.keyAt:row.keyEnd],

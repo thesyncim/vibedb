@@ -48,12 +48,18 @@ on:
           - primary
           - query
           - all
+          - write
         default: primary
       format_diagnostics:
-        description: 'Run checksum-alignment, stabilized-sink, ABBA, and profile diagnostics after all-suite timing'
+        description: 'Run opt-in post-timing diagnostics: format controls/profiles for all, CPU profiles for write'
         required: false
         type: boolean
         default: false
+      write_candidate_revision:
+        description: 'Optional candidate commit for the write suite; defaults to the workflow revision'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -67,7 +73,7 @@ concurrency:
 
 jobs:
   primary-format-performance:
-    if: github.event_name == 'workflow_dispatch' && inputs.format_base != ''
+    if: github.event_name == 'workflow_dispatch' && inputs.format_base != '' && inputs.format_suite != 'write'
     name: Paired primary-format performance
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -395,6 +401,239 @@ jobs:
             ${{ runner.temp }}/primary-format-comparison
             ${{ runner.temp }}/primary-format-build/*.txt
           if-no-files-found: error
+          retention-days: 30
+  write-batch64-performance:
+    if: github.event_name == 'workflow_dispatch' && inputs.format_suite == 'write'
+    name: Whole-main Batch64 write comparison
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GOEXPERIMENT: simd
+      GOMAXPROCS: '2'
+      LC_ALL: C
+      FORMAT_BASE: ${{ inputs.format_base }}
+      WRITE_CANDIDATE_REVISION: ${{ inputs.write_candidate_revision }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.1'
+      - name: Test the comparison runner before building or timing
+        shell: bash
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 scripts/bench/test_run_whole_main_write_comparison.py
+      - name: Validate the selected whole-main baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_WORKSPACE}"
+          evidence="${RUNNER_TEMP}/whole-main-write"
+          build="${evidence}/build"
+          mkdir -p "${build}"
+          printf 'format_suite=write\n' > "${build}/dispatch.txt"
+          if [[ -z "${FORMAT_BASE//[[:space:]]/}" ]]; then
+            echo "::error::format_suite=write requires format_base to name a valid commit."
+            exit 2
+          fi
+          if ! base="$(python3 scripts/bench/run-whole-main-write-comparison.py \
+            --resolve-commit "${FORMAT_BASE}" --repository "${repo}" 2>/dev/null)"; then
+            echo "::error::format_base does not resolve to a valid commit."
+            exit 2
+          fi
+          workflow_revision="$(git -C "${repo}" rev-parse --verify 'HEAD^{commit}')"
+          if ! candidate="$(python3 scripts/bench/run-whole-main-write-comparison.py \
+            --resolve-commit "${WRITE_CANDIDATE_REVISION}" \
+            --default-commit "${workflow_revision}" --repository "${repo}" 2>/dev/null)"; then
+            echo "::error::write_candidate_revision does not resolve to a valid commit."
+            exit 2
+          fi
+          printf '%s\n' "${workflow_revision}" > "${build}/workflow-revision.txt"
+          printf '%s\n' "${base}" > "${build}/baseline-revision.txt"
+          printf '%s\n' "${candidate}" > "${build}/candidate-revision.txt"
+      - name: Build identical pinned Batch64 benchmark binaries and preflight them
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/whole-main-write-tmp
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_WORKSPACE}"
+          evidence="${RUNNER_TEMP}/whole-main-write"
+          build="${evidence}/build"
+          mkdir -p "${TMPDIR}" "${build}" "${RUNNER_TEMP}/whole-main-write-checkouts"
+          base="$(cat "${build}/baseline-revision.txt")"
+          candidate="$(cat "${build}/candidate-revision.txt")"
+          harness_revision='9a136523919e89187edd2bd70d8645caeb22c579'
+          harness_path='sql/driver/replicated_apply_batch64_bench_test.go'
+          expected_harness_sha='729aecb98499032f9e667a91d5e71a694e1470ae31ec93cb48a3faecef3ece27'
+          harness="${build}/replicated_apply_batch64_bench_test.go"
+          git -C "${repo}" show "${harness_revision}:${harness_path}" > "${harness}"
+          actual_harness_sha="$(sha256sum "${harness}" | awk '{print $1}')"
+          test "${actual_harness_sha}" = "${expected_harness_sha}"
+          printf '%s\n' "${base}" > "${build}/baseline-revision.txt"
+          printf '%s\n' "${candidate}" > "${build}/candidate-revision.txt"
+          printf '%s\n' "${harness_revision}" > "${build}/harness-revision.txt"
+          printf '%s\n' "${actual_harness_sha}" > "${build}/harness-sha256.txt"
+          go version > "${build}/go-version.txt"
+          go env -json GOOS GOARCH GOVERSION GOTOOLCHAIN > "${build}/go-settings.json"
+          uname -a > "${build}/uname.txt"
+          lscpu > "${build}/cpu.txt"
+          printf '%s\n' "${TMPDIR}" > "${build}/tmpdir.txt"
+          df -T -B1 "${TMPDIR}" > "${build}/tmp-filesystem.txt"
+          stat -f -c 'filesystem_type=%T block_size=%S' "${TMPDIR}" >> "${build}/tmp-filesystem.txt"
+          baseline_dir="${RUNNER_TEMP}/whole-main-write-checkouts/baseline"
+          candidate_dir="${RUNNER_TEMP}/whole-main-write-checkouts/candidate"
+          {
+          printf 'git show %s:%s > %s\n' "${harness_revision}" "${harness_path}" "${harness}"
+            printf 'mkdir -p %s\n' "${TMPDIR}"
+            printf 'df -T -B1 %s\n' "${TMPDIR}"
+            printf "stat -f -c 'filesystem_type=%%T block_size=%%S' %q\n" "${TMPDIR}"
+            printf 'git worktree add --detach %s %s\n' "${baseline_dir}" "${base}"
+            printf 'git worktree add --detach %s %s\n' "${candidate_dir}" "${candidate}"
+            printf '(cd %s && TMPDIR=%s GOEXPERIMENT=simd GOMAXPROCS=2 go test -c -o %s/candidate-driver.test ./sql/driver)\n' "${candidate_dir}" "${TMPDIR}" "${build}"
+            printf '(cd %s && TMPDIR=%s GOEXPERIMENT=simd GOMAXPROCS=2 go test -c -o %s/baseline-driver.test ./sql/driver)\n' "${baseline_dir}" "${TMPDIR}" "${build}"
+            printf '%s -test.list=%s\n' "${build}/baseline-driver.test" '^BenchmarkReplicatedApplyBatch64'
+            printf 'TMPDIR=%s %s -test.run=%s -test.count=1 -test.timeout=5m\n' "${TMPDIR}" "${build}/baseline-driver.test" '^TestReplicatedApplyBatch64Preflight$'
+            printf '%s -test.list=%s\n' "${build}/candidate-driver.test" '^BenchmarkReplicatedApplyBatch64'
+            printf 'TMPDIR=%s %s -test.run=%s -test.count=1 -test.timeout=5m\n' "${TMPDIR}" "${build}/candidate-driver.test" '^TestReplicatedApplyBatch64Preflight$'
+          } > "${build}/build-commands.txt"
+          git -C "${repo}" worktree add --detach "${baseline_dir}" "${base}"
+          git -C "${repo}" worktree add --detach "${candidate_dir}" "${candidate}"
+          cp "${harness}" "${baseline_dir}/${harness_path}"
+          cp "${harness}" "${candidate_dir}/${harness_path}"
+          for arm in baseline candidate; do
+            checkout="${baseline_dir}"
+            if [[ "${arm}" == candidate ]]; then checkout="${candidate_dir}"; fi
+            source_sha="$(sha256sum "${checkout}/${harness_path}" | awk '{print $1}')"
+            test "${source_sha}" = "${expected_harness_sha}"
+            printf '%s\n' "${source_sha}" > "${build}/${arm}-harness-sha256.txt"
+          done
+
+          prove_harness_only() {
+            local arm="$1"
+            local checkout="$2"
+            local status_file="${build}/${arm}-source-status.txt"
+            git -C "${checkout}" status --short --untracked-files=all > "${status_file}"
+            python3 - "${status_file}" "${harness_path}" <<'PY'
+          from pathlib import Path
+          import sys
+
+          status_file, expected = Path(sys.argv[1]), sys.argv[2]
+          lines = status_file.read_text().splitlines()
+          paths = [line[3:] for line in lines if len(line) >= 4]
+          if any(path != expected for path in paths):
+              raise SystemExit(f"unexpected source changes after harness overlay: {paths!r}")
+          PY
+            if git -C "${checkout}" ls-files --error-unmatch "${harness_path}" >/dev/null 2>&1; then
+              git -C "${checkout}" diff --binary HEAD -- "${harness_path}" > "${build}/${arm}-harness.patch"
+            else
+              git -C "${checkout}" diff --no-index --binary /dev/null "${checkout}/${harness_path}" \
+                > "${build}/${arm}-harness.patch" || test "$?" -eq 1
+            fi
+            printf '%s\n' "${checkout}" > "${build}/${arm}-checkout.txt"
+          }
+          prove_harness_only baseline "${baseline_dir}"
+          prove_harness_only candidate "${candidate_dir}"
+
+          for arm in candidate baseline; do
+            checkout="${candidate_dir}"
+            if [[ "${arm}" == baseline ]]; then checkout="${baseline_dir}"; fi
+            (
+              cd "${checkout}"
+              go test -c -o "${build}/${arm}-driver.test" ./sql/driver
+            )
+            go version -m "${build}/${arm}-driver.test" > "${build}/${arm}-go-version-m.txt"
+            sha256sum "${build}/${arm}-driver.test" > "${build}/${arm}-binary-sha256.txt"
+          done
+
+          expected_benchmarks=(
+            BenchmarkReplicatedApplyBatch64SequentialInsert
+            BenchmarkReplicatedApplyBatch64CompactSharedPayload
+          )
+          for arm in baseline candidate; do
+            binary="${build}/${arm}-driver.test"
+            list="${build}/${arm}-benchmark-list.txt"
+            "${binary}" -test.list='^BenchmarkReplicatedApplyBatch64' > "${list}"
+            for benchmark in "${expected_benchmarks[@]}"; do
+              grep -Fqx "${benchmark}" "${list}"
+            done
+            "${binary}" -test.run='^TestReplicatedApplyBatch64Preflight$' \
+              -test.count=1 -test.timeout=5m > "${build}/${arm}-preflight.log" 2>&1
+          done
+
+          python3 - "${build}" <<'PY'
+          from pathlib import Path
+          import json
+          import os
+          import platform
+          import sys
+
+          root = Path(sys.argv[1])
+          settings = json.loads((root / "go-settings.json").read_text())
+          metadata = {
+              "schema": "vibedb.whole-main-batch64-write-build.v1",
+              "workflow_revision": (root / "workflow-revision.txt").read_text().strip(),
+              "baseline_revision": (root / "baseline-revision.txt").read_text().strip(),
+              "candidate_revision": (root / "candidate-revision.txt").read_text().strip(),
+              "harness_revision": (root / "harness-revision.txt").read_text().strip(),
+              "harness_sha256": (root / "harness-sha256.txt").read_text().strip(),
+              "go_version": (root / "go-version.txt").read_text().strip(),
+              "go_settings": settings,
+              "goexperiment": os.environ.get("GOEXPERIMENT", ""),
+              "gomaxprocs": os.environ.get("GOMAXPROCS", ""),
+              "tmpdir": os.environ.get("TMPDIR", ""),
+              "os": platform.platform(),
+              "machine": platform.machine(),
+              "timing_method": "/usr/bin/time -v around each serial benchmark process",
+              "source_overlay": "Only sql/driver/replicated_apply_batch64_bench_test.go is overlaid in each clean checkout.",
+              "temporary_database_directory_outside_uploaded_evidence": True,
+              "tmpdir_filesystem_evidence": "tmp-filesystem.txt",
+          }
+          (root / "build-metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+          PY
+      - name: Run the serial alternating whole-main comparison
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/whole-main-write-tmp
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/whole-main-write"
+          mkdir -p "${TMPDIR}"
+          python3 scripts/bench/run-whole-main-write-comparison.py \
+            --baseline "${evidence}/build/baseline-driver.test" \
+            --candidate "${evidence}/build/candidate-driver.test" \
+            --output "${evidence}/comparison" \
+            --gomaxprocs "${GOMAXPROCS}" \
+            --time-binary /usr/bin/time
+      - name: Capture serial CPU profiles and pprof source exports
+        if: success() && inputs.format_diagnostics == true
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/whole-main-write-tmp
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/whole-main-write"
+          build="${evidence}/build"
+          python3 scripts/bench/run-whole-main-write-comparison.py \
+            --profiles \
+            --baseline "${build}/baseline-driver.test" \
+            --candidate "${build}/candidate-driver.test" \
+            --output "${evidence}/profiles" \
+            --timing-output "${evidence}/comparison" \
+            --build-metadata "${build}/build-metadata.json" \
+            --baseline-source-dir "${RUNNER_TEMP}/whole-main-write-checkouts/baseline" \
+            --candidate-source-dir "${RUNNER_TEMP}/whole-main-write-checkouts/candidate" \
+            --gomaxprocs "${GOMAXPROCS}" \
+            --time-binary /usr/bin/time \
+            --go-command "$(command -v go)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: whole-main-batch64-write-${{ github.sha }}
+          path: ${{ runner.temp }}/whole-main-write
+          if-no-files-found: warn
           retention-days: 30
   qualify:
     name: Ubuntu fused RF3 physical-node qualification

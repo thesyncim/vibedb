@@ -917,7 +917,7 @@ func BenchmarkPrimaryBatchTopologyPlan(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		cuts, keys, err := collection.planPrimaryBatchTopologyCuts(
-			nil, prospective,
+			nil, prospective, false,
 		)
 		if err != nil || len(cuts) == 0 || len(keys) != rows {
 			b.Fatalf("plan = %d cuts/%d keys, %v", len(cuts), len(keys), err)

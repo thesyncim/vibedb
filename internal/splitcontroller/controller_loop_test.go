@@ -92,6 +92,55 @@ func newControllerLoopFixture(t testing.TB, plan *Plan, snapshot *gateway.Snapsh
 	return snapshot, catalog, observer, router, record
 }
 
+type noOpGatewayAwaitExecutor struct{}
+
+func (noOpGatewayAwaitExecutor) ExecuteGatewaySplitAction(
+	context.Context, *Plan, Observation, Action,
+) error {
+	return nil
+}
+
+func TestDirectControllerPassDoesNotMistakeRepeatedAwaitForProgress(t *testing.T) {
+	_, catalog, observer, router, _ := newDirectControllerLoopFixture(t)
+	plan, err := OpenPlanIntent(catalog.record.Intent, catalog.catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := Reconcile(plan, observer.observed)
+	if err != nil || action.Kind != ActionAwaitSourceLeader {
+		t.Fatalf("initial action=%+v err=%v, want a pure source-leader wait", action, err)
+	}
+	controller, err := NewControllerService(catalog, observer, router)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.gateway = noOpGatewayAwaitExecutor{}
+
+	first, err := RunDirectControllerPass(t.Context(), catalog, controller)
+	if err != nil || first.Discovered != 1 || first.Triggered != 1 || first.Progressed != 1 || router.calls != 0 {
+		t.Fatalf("first pass=%+v router_calls=%d err=%v", first, router.calls, err)
+	}
+	if catalog.record.State != gateway.ReplicatedOperationRunning {
+		t.Fatalf("first await did not bind a running cursor: %+v", catalog.record)
+	}
+	beforeRetry := catalog.record
+
+	second, err := RunDirectControllerPass(t.Context(), catalog, controller)
+	if err != nil || second.Discovered != 1 || second.Triggered != 1 || second.Progressed != 0 || router.calls != 0 {
+		t.Fatalf("second pass=%+v router_calls=%d err=%v", second, router.calls, err)
+	}
+	if !catalog.record.Equal(beforeRetry) {
+		t.Fatalf("repeated await changed the durable operation: before=%+v after=%+v",
+			beforeRetry, catalog.record)
+	}
+	// Triggered retains its attempt-count meaning; only the validated read-back
+	// distinguishes the repeated pure wait from the first durable transition.
+	if second.Triggered == 0 || catalog.record.Revision != beforeRetry.Revision {
+		t.Fatalf("repeated wait attempt/progress mismatch: pass=%+v record_revision=%d",
+			second, catalog.record.Revision)
+	}
+}
+
 func TestControllerPassSkipsValidNonSplitWitnessesAndRunsOnlySplit(t *testing.T) {
 	snapshot, base, observer, router, splitRecord := newDirectControllerLoopFixture(t)
 	ids := [][32]byte{{0x01}, {0x02}, {0x03}, splitRecord.ID}
@@ -113,7 +162,7 @@ func TestControllerPassSkipsValidNonSplitWitnessesAndRunsOnlySplit(t *testing.T)
 		t.Fatal(err)
 	}
 	pass, err := RunDirectControllerPass(context.Background(), directory, controller)
-	if err != nil || pass.Discovered != 4 || pass.Triggered != 1 || pass.Completed != 0 ||
+	if err != nil || pass.Discovered != 4 || pass.Triggered != 1 || pass.Progressed != 1 || pass.Completed != 0 ||
 		observer.calls != 1 || router.calls != 1 || base.record.State != gateway.ReplicatedOperationRunning {
 		t.Fatalf("pass=%+v observer=%d router=%d split=%+v err=%v", pass, observer.calls, router.calls, base.record, err)
 	}
@@ -135,7 +184,7 @@ func TestControllerPassSkipsValidNonSplitWitnessesInRemoteLoop(t *testing.T) {
 	directory := &mixedControllerDirectory{testControllerCatalog: base, ids: ids, records: extra}
 	client := newRecordingControllerTriggerClient()
 	pass, err := RunControllerPass(context.Background(), directory, client)
-	if err != nil || pass.Discovered != 4 || pass.Triggered != 1 || pass.Completed != 0 || client.calls != 1 {
+	if err != nil || pass.Discovered != 4 || pass.Triggered != 1 || pass.Progressed != 0 || pass.Completed != 0 || client.calls != 1 {
 		t.Fatalf("pass=%+v triggerCalls=%d err=%v", pass, client.calls, err)
 	}
 	if client.request.Operation != splitRecord.ID || client.request.Action != shardcontrol.ActionReconcileSplit {

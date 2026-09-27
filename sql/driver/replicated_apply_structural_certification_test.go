@@ -2,21 +2,24 @@ package driver
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 )
 
 // TestReplicatedApplyBatch64StructuralCertification exercises the split through
-// the production one-entry batch-completion path. Four 64-row entries fill the
-// user leaf; the fifth entry crosses its structural boundary while the real
-// system, user, and transition-capture members remain group-owned. The held
-// user snapshot is captured before any uncertified batch, and only the user
-// member's physical root may advance for the fifth admission because the
+// the production one-entry batch-completion path. It admits bounded 64-row
+// entries until the collection reports a real leaf split, so the fixture tracks
+// the compact stripe's byte or format-row boundary instead of assuming a fixed
+// count. Every earlier admission must remain uncertified. The held user
+// snapshot is captured before any uncertified batch, and only the user
+// member's physical root may advance for the split admission because the
 // preceding cut is certified separately from the local structural fold.
 func TestReplicatedApplyBatch64StructuralCertification(t *testing.T) {
 	database, claim, identity, group := newReplicatedApplyBatch64Fixture(t)
@@ -61,8 +64,25 @@ func TestReplicatedApplyBatch64StructuralCertification(t *testing.T) {
 			beforeSnapshot, afterSnapshot)
 	}
 
-	keys := make([][]byte, batch64Rows*5)
-	values := make([][]byte, batch64Rows*5)
+	const maxBatches = storeio.CompactPrimaryStripeMaxRows/batch64Rows + 1
+	keys := make([][]byte, batch64Rows*maxBatches)
+	values := make([][]byte, batch64Rows*maxBatches)
+	userOptions, err := durable.NormalizeOptions(durableOptions(userTable))
+	if err != nil {
+		t.Fatalf("normalize fixture user options: %v", err)
+	}
+	inlineLimit := userOptions.InlineValueBytes
+	if inlineLimit <= 0 {
+		t.Fatalf("fixture inline value limit = %d", inlineLimit)
+	}
+	// Keep this fixture on the physical structural path. Small inline values
+	// are eligible for volatile right-tail splitting, which this certification
+	// test does not measure. Overflow-backed values deliberately make that lane
+	// ineligible while preserving the replicated apply and certification path.
+	overflowPadding := strings.Repeat("x", inlineLimit+1)
+	physicalPathPayload := func(row int) string {
+		return replicatedApplyBatch64Payload(row) + overflowPadding
+	}
 	lanes := replicatedApplyBatch64Lanes()
 	var completions raftmodel.NormalApplyBatchCompletions
 
@@ -71,11 +91,17 @@ func TestReplicatedApplyBatch64StructuralCertification(t *testing.T) {
 		start := batch * batch64Rows
 		batchKeys := make([][]byte, batch64Rows)
 		batchValues := make([][]byte, batch64Rows)
-		if err := fillReplicatedApplyBatch64Rows(database, start, batchKeys, batchValues); err != nil {
+		if err := fillReplicatedApplyBatch64RowsWithPayload(
+			database, start, batchKeys, batchValues, physicalPathPayload,
+		); err != nil {
 			t.Fatalf("fill batch %d: %v", batch, err)
 		}
 		mutations := make([]replication.Mutation, batch64Rows)
 		for row := range mutations {
+			if len(batchValues[row]) <= inlineLimit {
+				t.Fatalf("batch %d row %d value length %d did not exceed inline limit %d",
+					batch, row, len(batchValues[row]), inlineLimit)
+			}
 			keys[start+row] = bytes.Clone(batchKeys[row])
 			canonical, err := vibejson.AppendCanonicalize(nil, batchValues[row])
 			if err != nil {
@@ -124,20 +150,41 @@ func TestReplicatedApplyBatch64StructuralCertification(t *testing.T) {
 		}
 	}
 
-	for batch := 0; batch < 4; batch++ {
+	var (
+		splitBatch     = -1
+		beforeSplit    durable.CheckpointGroupStats
+		afterSplit     durable.CheckpointGroupStats
+		physicalBefore [3]uint64
+	)
+	for batch := 0; batch < maxBatches; batch++ {
+		before := group.Stats()
+		leafSplitsBefore := user.Stats().PrimaryLeafSplits
+		memberGenerations := [3]uint64{
+			system.DurableGeneration(), user.DurableGeneration(), capture.DurableGeneration(),
+		}
 		applyBatch(batch)
+		after := group.Stats()
+		if user.Stats().PrimaryLeafSplits > leafSplitsBefore {
+			splitBatch = batch
+			beforeSplit = before
+			afterSplit = after
+			physicalBefore = memberGenerations
+			break
+		}
+		if after.CheckpointAppliedIndex != before.CheckpointAppliedIndex ||
+			after.TransactionHighWater != before.TransactionHighWater+1 {
+			t.Fatalf("pre-boundary batch %d certified or skipped its transaction: before=%+v after=%+v",
+				batch, before, after)
+		}
 	}
-	beforeSplit := group.Stats()
+	if splitBatch < 1 {
+		t.Fatalf("no real structural split after %d bounded 64-row admissions; split batch=%d",
+			maxBatches, splitBatch)
+	}
 	if beforeSplit.AppliedIndex == 0 || beforeSplit.CheckpointAppliedIndex >= beforeSplit.AppliedIndex ||
 		beforeSplit.PhysicalCheckpoints == 0 {
 		t.Fatalf("pre-split group state = %+v", beforeSplit)
 	}
-	physicalBefore := [3]uint64{
-		system.DurableGeneration(), user.DurableGeneration(), capture.DurableGeneration(),
-	}
-
-	applyBatch(4)
-	afterSplit := group.Stats()
 	if afterSplit.AppliedIndex != beforeSplit.AppliedIndex+1 ||
 		afterSplit.CheckpointAppliedIndex != beforeSplit.AppliedIndex ||
 		afterSplit.CheckpointTransactions != beforeSplit.TransactionHighWater ||
@@ -152,7 +199,8 @@ func TestReplicatedApplyBatch64StructuralCertification(t *testing.T) {
 		physicalAfter[1] <= physicalBefore[1] {
 		t.Fatalf("structural split member roots before=%v after=%v", physicalBefore, physicalAfter)
 	}
-	for row := range keys {
+	rowsApplied := (splitBatch + 1) * batch64Rows
+	for row := 0; row < rowsApplied; row++ {
 		got, found, readErr := user.AppendRaw(nil, keys[row])
 		if readErr != nil || !found || !bytes.Equal(got, values[row]) {
 			t.Fatalf("current row %d = %q/%v/%v", row, got, found, readErr)
@@ -161,7 +209,7 @@ func TestReplicatedApplyBatch64StructuralCertification(t *testing.T) {
 	if snapshot.Len() != 0 {
 		t.Fatalf("held pre-seed snapshot rows after split = %d, want 0", snapshot.Len())
 	}
-	for row := range keys {
+	for row := 0; row < rowsApplied; row++ {
 		got, found, readErr := snapshot.AppendRaw(nil, keys[row])
 		if readErr != nil || found {
 			t.Fatalf("held pre-seed snapshot row %d = %q/%v/%v, want absent", row, got, found, readErr)
@@ -173,9 +221,10 @@ func TestReplicatedApplyBatch64StructuralCertification(t *testing.T) {
 	snapshotClosed = true
 
 	completionStats := claim.BatchCompletionStats()
-	if completionStats.Batches != 5 || completionStats.Entries != 5 ||
-		completionStats.CompleteBatches != 5 {
-		t.Fatalf("batch completion stats = %+v, want five complete one-entry batches", completionStats)
+	wantBatches := uint64(splitBatch + 1)
+	if completionStats.Batches != wantBatches || completionStats.Entries != wantBatches ||
+		completionStats.CompleteBatches != wantBatches {
+		t.Fatalf("batch completion stats = %+v, want %d complete one-entry batches", completionStats, wantBatches)
 	}
 	if err := group.Checkpoint(); err != nil {
 		t.Fatalf("final all-member checkpoint: %v", err)

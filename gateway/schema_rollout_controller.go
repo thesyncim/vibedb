@@ -191,7 +191,7 @@ func schemaRolloutChangesFromPlans(plans []SchemaRolloutReplicaPlan) ([]schemaRo
 }
 
 func (controller *SchemaRolloutController) parallel(
-	ctx context.Context, count int, run func(int) error,
+	ctx context.Context, count int, run func(context.Context, int) error,
 ) error {
 	if controller == nil || ctx == nil || count <= 0 {
 		return ErrSchemaRollout
@@ -208,7 +208,7 @@ func (controller *SchemaRolloutController) parallel(
 		go func() {
 			defer wg.Done()
 			for index := range jobs {
-				if err := run(index); err != nil {
+				if err := run(ctx, index); err != nil {
 					once.Do(func() { first = err; cancel(err) })
 					return
 				}
@@ -235,19 +235,33 @@ func (controller *SchemaRolloutController) parallel(
 // response reaches the coordinator; treating that transport cut as failure
 // strands the durable Running operation until process restart. Retrying the
 // same request/authorization lets the installer observe its retained record
-// and return the already-completed phase. Deterministic conflicts, bounds and
-// authorization failures still return immediately.
+// and return the already-completed phase. The client also marks cause-specific
+// connection-open failures, which occurred before sending any command bytes.
+// Deterministic conflicts, bounds and authorization failures still return
+// immediately.
 func retrySchemaReplicaOutcome(ctx context.Context, run func() error) error {
 	if ctx == nil || run == nil {
 		return ErrSchemaRollout
 	}
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
+	var lastRetry error
 	for {
+		if cause := context.Cause(ctx); cause != nil {
+			return errors.Join(lastRetry, cause)
+		}
 		err := run()
-		if !errors.Is(err, schemainstall.ErrOutcomeUnknown) {
+		if err == nil {
+			return nil
+		}
+		if cause := context.Cause(ctx); cause != nil {
+			return errors.Join(err, cause)
+		}
+		if !errors.Is(err, schemainstall.ErrOutcomeUnknown) &&
+			!errors.Is(err, schemainstall.ErrTransientControlOpen) {
 			return err
 		}
+		lastRetry = err
 		select {
 		case <-ctx.Done():
 			return errors.Join(err, context.Cause(ctx))
@@ -356,11 +370,11 @@ func (controller *SchemaRolloutController) Execute(
 		return SchemaRolloutResult{}, errors.Join(err, ErrSchemaRollout)
 	}
 	receipts := make([]schemainstall.Receipt, len(plans))
-	if err = controller.parallel(ctx, len(plans), func(index int) error {
+	if err = controller.parallel(ctx, len(plans), func(workerCtx context.Context, index int) error {
 		plan := plans[index]
 		var prepareErr error
-		prepareErr = retrySchemaReplicaOutcome(ctx, func() error {
-			receipts[index], prepareErr = controller.client.Prepare(ctx, plan.Node, plan.Request, plan.Bundle)
+		prepareErr = retrySchemaReplicaOutcome(workerCtx, func() error {
+			receipts[index], prepareErr = controller.client.Prepare(workerCtx, plan.Node, plan.Request, plan.Bundle)
 			return prepareErr
 		})
 		if prepareErr != nil {
@@ -405,10 +419,10 @@ func (controller *SchemaRolloutController) Execute(
 		PreparedGroupCount:      intent.PreparedGroupCount,
 		PreparedGroupRoot:       intent.PreparedGroupRoot,
 		ContractDigest:          SchemaRolloutContractDigest()}
-	if err = controller.parallel(ctx, len(plans), func(index int) error {
+	if err = controller.parallel(ctx, len(plans), func(workerCtx context.Context, index int) error {
 		plan := plans[index]
-		phaseErr := retrySchemaReplicaOutcome(ctx, func() error {
-			_, retryErr := controller.client.Authorize(ctx, plan.Node, plan.Request, authorization)
+		phaseErr := retrySchemaReplicaOutcome(workerCtx, func() error {
+			_, retryErr := controller.client.Authorize(workerCtx, plan.Node, plan.Request, authorization)
 			return retryErr
 		})
 		if phaseErr != nil {
@@ -418,10 +432,10 @@ func (controller *SchemaRolloutController) Execute(
 	}); err != nil {
 		return SchemaRolloutResult{Record: running, Authorization: authorization}, err
 	}
-	if err = controller.parallel(ctx, len(plans), func(index int) error {
+	if err = controller.parallel(ctx, len(plans), func(workerCtx context.Context, index int) error {
 		plan := plans[index]
-		phaseErr := retrySchemaReplicaOutcome(ctx, func() error {
-			_, retryErr := controller.client.Commit(ctx, plan.Node, plan.Request, authorization)
+		phaseErr := retrySchemaReplicaOutcome(workerCtx, func() error {
+			_, retryErr := controller.client.Commit(workerCtx, plan.Node, plan.Request, authorization)
 			return retryErr
 		})
 		if phaseErr != nil {
@@ -463,11 +477,11 @@ func (controller *SchemaRolloutController) activateReplicaGroups(
 		}
 		groups[groupIndex] = append(groups[groupIndex], index)
 	}
-	return controller.parallel(ctx, len(groups), func(groupIndex int) error {
+	return controller.parallel(ctx, len(groups), func(workerCtx context.Context, groupIndex int) error {
 		for _, index := range groups[groupIndex] {
 			plan := plans[index]
-			phaseErr := retrySchemaReplicaOutcome(ctx, func() error {
-				_, retryErr := controller.client.Activate(ctx, plan.Node, plan.Request, authorization)
+			phaseErr := retrySchemaReplicaOutcome(workerCtx, func() error {
+				_, retryErr := controller.client.Activate(workerCtx, plan.Node, plan.Request, authorization)
 				return retryErr
 			})
 			if phaseErr != nil {
@@ -509,9 +523,9 @@ func (controller *SchemaRolloutController) Drain(
 	if controller == nil || ctx == nil || len(plans) == 0 {
 		return ErrSchemaRollout
 	}
-	return controller.parallel(ctx, len(plans), func(index int) error {
+	return controller.parallel(ctx, len(plans), func(workerCtx context.Context, index int) error {
 		plan := plans[index]
-		_, err := controller.client.Drain(ctx, plan.Node, plan.Request, authorization, proof)
+		_, err := controller.client.Drain(workerCtx, plan.Node, plan.Request, authorization, proof)
 		return err
 	})
 }

@@ -2230,6 +2230,18 @@ func (c *PageCache) DirtyCapacityAvailable() uint64 {
 	return capacity - dirty
 }
 
+// DirtyReservedBytes reports the frame-arena bytes currently held by dirty
+// pages. It reads the maintained reservation counter without scanning frames.
+func (c *PageCache) DirtyReservedBytes() uint64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	dirty := c.dirtyReservedBytes
+	c.mu.Unlock()
+	return dirty
+}
+
 // Close stops admission and prefetch, then releases the fixed arena. If a
 // caller still owns a lease, Close returns ErrPageCachePinned without releasing
 // the arena; release those leases and call Close again.

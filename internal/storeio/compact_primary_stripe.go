@@ -68,6 +68,21 @@ func prepareCompactPrimaryStripe(
 	records []CommonPrimaryLeafRecord,
 	builder *UnifiedPrimaryLeafBuilder,
 ) error {
+	return prepareCompactPrimaryStripeOptions(records, builder, false)
+}
+
+func prepareCompactPrimaryStripeUnplaced(
+	records []CommonPrimaryLeafRecord,
+	builder *UnifiedPrimaryLeafBuilder,
+) error {
+	return prepareCompactPrimaryStripeOptions(records, builder, true)
+}
+
+func prepareCompactPrimaryStripeOptions(
+	records []CommonPrimaryLeafRecord,
+	builder *UnifiedPrimaryLeafBuilder,
+	unplaced bool,
+) error {
 	if builder == nil || len(records) > CompactPrimaryStripeMaxRows {
 		return fmt.Errorf("%w: compact stripe input", ErrInvalidWrite)
 	}
@@ -78,7 +93,13 @@ func prepareCompactPrimaryStripe(
 			return fmt.Errorf("%w: compact stripe record", ErrInvalidWrite)
 		}
 	}
-	if err := builder.extract(records); err != nil {
+	var err error
+	if unplaced {
+		err = builder.extractUnplaced(records)
+	} else {
+		err = builder.extract(records)
+	}
+	if err != nil {
 		return err
 	}
 	return nil

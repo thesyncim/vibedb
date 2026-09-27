@@ -1,11 +1,11 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
@@ -234,20 +234,71 @@ func TestDurableExecutionPinSessionStripesDistributeAndOnlySameIdentitySerialize
 	if distinct < 3000 || durableExecutionPinSessionStripe(first) == durableExecutionPinSessionStripe(second) {
 		t.Fatalf("distinct stripes = %d/%d", distinct, durableExecutionPinSessionStripes)
 	}
-	var stripes [durableExecutionPinSessionStripes]sync.Mutex
-	stripes[durableExecutionPinSessionStripe(first)].Lock()
-	acquired := make(chan struct{})
+	factory := &JournaledDurableRequestExecutionPinSessionFactory{}
+	firstStripe := &factory.stripes[durableExecutionPinSessionStripe(first)]
+	secondStripe := &factory.stripes[durableExecutionPinSessionStripe(second)]
+	if err := firstStripe.acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	held := true
+	unlockFirst := func() {
+		if held {
+			held = false
+			firstStripe.release()
+		}
+	}
+	defer unlockFirst()
+	sameContext := newExecutionPinObservedDoneContext(context.Background())
+	sameIdentityAcquired := make(chan error, 1)
 	go func() {
-		stripes[durableExecutionPinSessionStripe(second)].Lock()
-		close(acquired)
-		stripes[durableExecutionPinSessionStripe(second)].Unlock()
+		err := firstStripe.acquire(sameContext)
+		if err == nil {
+			firstStripe.release()
+		}
+		sameIdentityAcquired <- err
 	}()
 	select {
-	case <-acquired:
+	case <-sameContext.observed:
 	case <-time.After(time.Second):
+		unlockFirst()
+		<-sameIdentityAcquired
+		t.Fatal("same-identity acquisition never reached its latch wait")
+	}
+	select {
+	case err := <-sameIdentityAcquired:
+		if err == nil {
+			t.Fatal("same-identity acquisition bypassed its held latch")
+		}
+		t.Fatalf("same-identity acquisition failed before release: %v", err)
+	default:
+	}
+	differentStripeAcquired := make(chan error, 1)
+	go func() {
+		err := secondStripe.acquire(context.Background())
+		if err == nil {
+			secondStripe.release()
+		}
+		differentStripeAcquired <- err
+	}()
+	select {
+	case err := <-differentStripeAcquired:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		unlockFirst()
+		<-sameIdentityAcquired
 		t.Fatal("unrelated execution-pin sessions serialized")
 	}
-	stripes[durableExecutionPinSessionStripe(first)].Unlock()
+	unlockFirst()
+	select {
+	case err := <-sameIdentityAcquired:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("same-identity acquisition remained blocked after release")
+	}
 }
 
 func BenchmarkDurableExecutionPinSessionStripe(b *testing.B) {

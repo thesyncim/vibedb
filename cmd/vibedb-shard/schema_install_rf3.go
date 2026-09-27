@@ -566,7 +566,8 @@ func (a *rf3SchemaActivator) Commit(
 	}
 	transition, found, err := sqldriver.ObservePublishedReplicatedSchemaTransition(state.path)
 	if err != nil || !found {
-		return errors.Join(err, schemainstall.ErrOutcomeUnknown)
+		return fmt.Errorf("schema activation observe published transition: %w",
+			errors.Join(err, schemainstall.ErrOutcomeUnknown))
 	}
 	err = a.owners.FenceCommittedSchemaGeneration(ctx, request.Group, transition.Bytes())
 	return err
@@ -594,7 +595,7 @@ func (a *rf3SchemaActivator) activate(
 	transition, published, err := sqldriver.ObservePublishedReplicatedSchemaTransition(state.path)
 	var command []byte
 	if err != nil {
-		return err
+		return fmt.Errorf("schema activation observe published transition: %w", err)
 	}
 	predecessor := published && rf3SchemaTransitionIsPredecessor(request, transition)
 	if predecessor {
@@ -618,6 +619,7 @@ func (a *rf3SchemaActivator) activate(
 			}
 		}
 		var adopted []byte
+		var adoptedIndex uint64
 		if !found {
 			var built bool
 			var sourceErr error
@@ -638,6 +640,7 @@ func (a *rf3SchemaActivator) activate(
 			if hasCommitted {
 				preCommandApplied = committedIndex - 1
 				adopted = committed
+				adoptedIndex = committedIndex
 			}
 			emptySuffix = preCommandApplied > preparedApplied
 			if emptySuffix {
@@ -648,7 +651,18 @@ func (a *rf3SchemaActivator) activate(
 		}
 		command, err = rf3SchemaActivationCommand(request, authorization, persisted, found, func() ([]byte, error) {
 			if adopted != nil {
-				return adopted, nil
+				proof, recoverErr := state.apply.RecoverPreparedReplicatedSchemaTargetAfterEmptySuffix(
+					raw, request.Operation,
+				)
+				if recoverErr != nil || validateRF3SchemaTarget(request, proof.Catalog, proof.ApplyContract) != nil {
+					return nil, errors.Join(recoverErr, schemainstall.ErrConflict)
+				}
+				authority := rf3SchemaTransitionAuthority(
+					request, authorization, authorizationDigest, [32]byte{},
+				)
+				return state.apply.AppendReplicatedSchemaTransitionAlias(
+					nil, proof, authority, adopted, adoptedIndex,
+				)
 			}
 			var proof sqldriver.ReplicatedSchemaTargetProof
 			var recoverErr error

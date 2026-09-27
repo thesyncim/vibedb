@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/rf3bench"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
 	pb "go.etcd.io/raft/v3/raftpb"
@@ -42,6 +43,36 @@ var batch64RetryHome = replication.RetryHome{'b', 'a', 't', 'c', 'h', '6', '4'}
 // every run; use -benchtime=1x so Go's calibration cannot silently change the
 // measured data set.
 func BenchmarkReplicatedApplyBatch64SequentialInsert(b *testing.B) {
+	benchmarkReplicatedApplyBatch64SequentialInsert(
+		b, fillReplicatedApplyBatch64Rows, verifyReplicatedApplyBatch64Rows,
+	)
+}
+
+// BenchmarkReplicatedApplyBatch64CompactSharedPayload holds the original
+// schema, row count, payload length, varying key/bucket/score dimensions,
+// 64-row apply batches, and three-member buffered-visible+journal durability
+// profile constant. The payload column draws from eight shared 256-byte
+// spellings to isolate compact-leaf packing from the varied-payload control.
+func BenchmarkReplicatedApplyBatch64CompactSharedPayload(b *testing.B) {
+	benchmarkReplicatedApplyBatch64SequentialInsert(
+		b, fillReplicatedApplyBatch64SharedRows,
+		verifyReplicatedApplyBatch64SharedRows,
+	)
+}
+
+type replicatedApplyBatch64RowsFunc func(
+	*Database, int, [][]byte, [][]byte,
+) error
+
+type replicatedApplyBatch64VerifyFunc func(
+	*Database, int, ReplicatedShardStoreIdentity,
+) error
+
+func benchmarkReplicatedApplyBatch64SequentialInsert(
+	b *testing.B,
+	fillRows replicatedApplyBatch64RowsFunc,
+	verifyRows replicatedApplyBatch64VerifyFunc,
+) {
 	if b.N != 1 {
 		b.Fatalf("use -benchtime=1x for the bounded measurement, got %d operations", b.N)
 	}
@@ -55,6 +86,12 @@ func BenchmarkReplicatedApplyBatch64SequentialInsert(b *testing.B) {
 		b.Fatal(err)
 	}
 	beforeUser := replicatedApplyBatch64UserStats(b, beforeResources, identity)
+	dataRoot := database.connector.db.dataDir
+	beforeFootprint, err := rf3bench.MeasureFootprint(dataRoot)
+	if err != nil {
+		b.Fatalf("measure initial storage footprint: %v", err)
+	}
+	peakFootprint := beforeFootprint
 	lanes := replicatedApplyBatch64Lanes()
 	keys := make([][]byte, batch64Rows)
 	values := make([][]byte, batch64Rows)
@@ -67,9 +104,10 @@ func BenchmarkReplicatedApplyBatch64SequentialInsert(b *testing.B) {
 
 	b.ReportAllocs()
 	b.ResetTimer()
+	var appendElapsed time.Duration
 	appendStarted := time.Now()
 	for batch := 0; batch < batch64MeasurementBatches; batch++ {
-		if err := fillReplicatedApplyBatch64Rows(database, batch*batch64Rows, keys, values); err != nil {
+		if err := fillRows(database, batch*batch64Rows, keys, values); err != nil {
 			b.Fatal(err)
 		}
 		for row := range mutations {
@@ -99,9 +137,25 @@ func BenchmarkReplicatedApplyBatch64SequentialInsert(b *testing.B) {
 		if batch >= batch64MeasurementBatches-16 {
 			latestCompletions = append(latestCompletions, append([]byte(nil), completion...))
 		}
+		if (batch+1)%64 == 0 {
+			appendElapsed += time.Since(appendStarted)
+			b.StopTimer()
+			footprint, footprintErr := rf3bench.MeasureFootprint(dataRoot)
+			if footprintErr != nil {
+				b.Fatalf("measure append storage footprint at batch %d: %v", batch+1, footprintErr)
+			}
+			peakFootprint = maxReplicatedApplyBatch64Footprint(peakFootprint, footprint)
+			b.StartTimer()
+			appendStarted = time.Now()
+		}
 	}
-	appendElapsed := time.Since(appendStarted)
+	appendElapsed += time.Since(appendStarted)
 	b.StopTimer()
+	afterAppendFootprint, err := rf3bench.MeasureFootprint(dataRoot)
+	if err != nil {
+		b.Fatal(err)
+	}
+	peakFootprint = maxReplicatedApplyBatch64Footprint(peakFootprint, afterAppendFootprint)
 	afterAppendDurability, err := claim.DurabilityStats()
 	if err != nil {
 		b.Fatal(err)
@@ -142,9 +196,14 @@ func BenchmarkReplicatedApplyBatch64SequentialInsert(b *testing.B) {
 		b.Fatal(err)
 	}
 	afterFoldUser := replicatedApplyBatch64UserStats(b, afterFoldResources, identity)
-	if err := verifyReplicatedApplyBatch64Rows(database, batch64MeasurementBatches*batch64Rows, identity); err != nil {
+	if err := verifyRows(database, batch64MeasurementBatches*batch64Rows, identity); err != nil {
 		b.Fatal(err)
 	}
+	afterFoldFootprint, err := rf3bench.MeasureFootprint(dataRoot)
+	if err != nil {
+		b.Fatal(err)
+	}
+	peakFootprint = maxReplicatedApplyBatch64Footprint(peakFootprint, afterFoldFootprint)
 
 	rows := uint64(batch64MeasurementBatches * batch64Rows)
 	wantApplied := uint64(batch64MeasurementBatches + 1)
@@ -162,6 +221,9 @@ func BenchmarkReplicatedApplyBatch64SequentialInsert(b *testing.B) {
 	reportReplicatedApplyBatch64GroupMetrics(b, beforeDurability, afterAppendDurability, afterFoldDurability)
 	reportReplicatedApplyBatch64UserMetrics(b, beforeUser, afterAppendUser, afterFoldUser)
 	reportReplicatedApplyBatch64ResourceMetrics(b, beforeResources, afterAppendResources, afterFoldResources, identity)
+	reportReplicatedApplyBatch64FootprintMetrics(
+		b, beforeFootprint, afterAppendFootprint, afterFoldFootprint, peakFootprint,
+	)
 	b.Logf("append_batches=%d rows=%d prepare_and_apply=%s final_full_fold=%s total=%s applied=%d checkpoint=%d pending_overlay_records=%d/%d->%d/%d reserved_fold_bytes=%d->%d",
 		batch64MeasurementBatches, rows, appendElapsed, foldElapsed, totalElapsed,
 		afterFoldDurability.AppliedIndex, afterFoldDurability.CheckpointAppliedIndex,
@@ -383,6 +445,40 @@ func fillReplicatedApplyBatch64Rows(
 	keys [][]byte,
 	values [][]byte,
 ) error {
+	return fillReplicatedApplyBatch64RowsWithPayload(
+		database, start, keys, values, replicatedApplyBatch64Payload,
+	)
+}
+
+func fillReplicatedApplyBatch64SharedRows(
+	database *Database,
+	start int,
+	keys [][]byte,
+	values [][]byte,
+) error {
+	return fillReplicatedApplyBatch64RowsWithPayload(
+		database, start, keys, values, replicatedApplyBatch64SharedPayload,
+	)
+}
+
+var replicatedApplyBatch64SharedPayloads = [...]string{
+	replicatedApplyBatch64Payload(0), replicatedApplyBatch64Payload(1),
+	replicatedApplyBatch64Payload(2), replicatedApplyBatch64Payload(3),
+	replicatedApplyBatch64Payload(4), replicatedApplyBatch64Payload(5),
+	replicatedApplyBatch64Payload(6), replicatedApplyBatch64Payload(7),
+}
+
+func replicatedApplyBatch64SharedPayload(row int) string {
+	return replicatedApplyBatch64SharedPayloads[row&7]
+}
+
+func fillReplicatedApplyBatch64RowsWithPayload(
+	database *Database,
+	start int,
+	keys [][]byte,
+	values [][]byte,
+	payload func(int) string,
+) error {
 	core := database.connector.db
 	core.mu.RLock()
 	table := core.tables["docs"]
@@ -394,7 +490,7 @@ func fillReplicatedApplyBatch64Rows(
 		ordinal := start + row
 		value := []byte(fmt.Sprintf(
 			`{"id":"key-%08d","bucket":%d,"score":%d,"payload":%q}`,
-			ordinal, ordinal%16, ordinal%100, replicatedApplyBatch64Payload(ordinal),
+			ordinal, ordinal%16, ordinal%100, payload(ordinal),
 		))
 		key, err := documentKey(value, table.meta.PrimaryKey, table.primary, table.collection.MaxKeyBytes())
 		if err != nil {
@@ -433,6 +529,27 @@ func verifyReplicatedApplyBatch64Rows(
 	rows int,
 	identity ReplicatedShardStoreIdentity,
 ) error {
+	return verifyReplicatedApplyBatch64RowsWithPayload(
+		database, rows, identity, replicatedApplyBatch64Payload,
+	)
+}
+
+func verifyReplicatedApplyBatch64SharedRows(
+	database *Database,
+	rows int,
+	identity ReplicatedShardStoreIdentity,
+) error {
+	return verifyReplicatedApplyBatch64RowsWithPayload(
+		database, rows, identity, replicatedApplyBatch64SharedPayload,
+	)
+}
+
+func verifyReplicatedApplyBatch64RowsWithPayload(
+	database *Database,
+	rows int,
+	identity ReplicatedShardStoreIdentity,
+	payload func(int) string,
+) error {
 	core := database.connector.db
 	core.mu.RLock()
 	table := core.tables[identity.UserTable]
@@ -453,7 +570,7 @@ func verifyReplicatedApplyBatch64Rows(
 	for ordinal := 0; ordinal < rows; ordinal++ {
 		value := []byte(fmt.Sprintf(
 			`{"id":"key-%08d","bucket":%d,"score":%d,"payload":%q}`,
-			ordinal, ordinal%16, ordinal%100, replicatedApplyBatch64Payload(ordinal),
+			ordinal, ordinal%16, ordinal%100, payload(ordinal),
 		))
 		canonical, err := vibejson.AppendCanonicalize(nil, value)
 		if err != nil {
@@ -530,6 +647,22 @@ func reportReplicatedApplyBatch64UserMetrics(
 	b.ReportMetric(appendDelta(afterFold.CommittedBatches, afterAppend.CommittedBatches), "final-fold-committed-batches")
 	b.ReportMetric(float64(afterAppend.PrimaryOverlayRetainedRecords), "overlay-records-at-append-end")
 	b.ReportMetric(float64(afterFold.PrimaryOverlayRetainedRecords), "overlay-records-after-fold")
+	b.ReportMetric(
+		float64(afterAppend.PrimaryTailSplitCurrentChargeBytes),
+		"tail-split-current-charge-at-append-end-bytes",
+	)
+	b.ReportMetric(
+		float64(afterAppend.PrimaryTailSplitPeakChargeBytes),
+		"tail-split-peak-charge-at-append-end-bytes",
+	)
+	b.ReportMetric(
+		float64(afterFold.PrimaryTailSplitCurrentChargeBytes),
+		"tail-split-current-charge-after-fold-bytes",
+	)
+	b.ReportMetric(
+		float64(afterFold.PrimaryTailSplitPeakChargeBytes),
+		"tail-split-peak-charge-after-fold-bytes",
+	)
 }
 
 func reportReplicatedApplyBatch64ResourceMetrics(
@@ -551,4 +684,36 @@ func reportReplicatedApplyBatch64ResourceMetrics(
 		name := fmt.Sprintf("relation-%d", identity.Relations[ordinal].Relation)
 		report(name, before.Relations[ordinal], afterAppend.Relations[ordinal], afterFold.Relations[ordinal])
 	}
+}
+
+func maxReplicatedApplyBatch64Footprint(
+	a, b rf3bench.Footprint,
+) rf3bench.Footprint {
+	return rf3bench.Footprint{
+		ApparentBytes:  max(a.ApparentBytes, b.ApparentBytes),
+		AllocatedBytes: max(a.AllocatedBytes, b.AllocatedBytes),
+		Files:          max(a.Files, b.Files),
+	}
+}
+
+func reportReplicatedApplyBatch64FootprintMetrics(
+	b *testing.B,
+	before, afterAppend, afterFold, observedPeak rf3bench.Footprint,
+) {
+	b.ReportMetric(float64(afterFold.ApparentBytes), "final-apparent-file-B")
+	b.ReportMetric(float64(afterFold.AllocatedBytes), "final-allocated-file-B")
+	b.ReportMetric(float64(afterFold.Files), "final-files")
+	b.ReportMetric(float64(observedPeak.ApparentBytes), "observed-peak-apparent-file-B")
+	b.ReportMetric(float64(observedPeak.AllocatedBytes), "observed-peak-allocated-file-B")
+	b.ReportMetric(float64(observedPeak.Files), "observed-peak-files")
+	b.ReportMetric(float64(afterFold.ApparentBytes-before.ApparentBytes), "apparent-file-growth-B")
+	b.ReportMetric(float64(afterFold.AllocatedBytes-before.AllocatedBytes), "allocated-file-growth-B")
+	b.ReportMetric(float64(afterAppend.ApparentBytes), "post-append-apparent-file-B")
+	b.ReportMetric(float64(afterAppend.AllocatedBytes), "post-append-allocated-file-B")
+	b.ReportMetric(float64(batch64MeasurementBatches/64), "observed-space-samples")
+	b.ReportMetric(64, "space-sample-interval-batches")
+	b.Logf("file_space_apparent=%dB allocated=%dB files=%d observed_sampled_peak_apparent=%dB observed_sampled_peak_allocated=%dB observed_sampled_peak_files=%d sample_every_64_batches=true",
+		afterFold.ApparentBytes, afterFold.AllocatedBytes, afterFold.Files,
+		observedPeak.ApparentBytes, observedPeak.AllocatedBytes,
+		observedPeak.Files)
 }

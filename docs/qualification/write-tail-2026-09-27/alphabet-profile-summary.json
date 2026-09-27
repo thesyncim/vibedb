@@ -1,0 +1,106 @@
+{
+  "schema": "vibedb.alphabet-union-profiles/1",
+  "binary_commit": "72c3a30af5360e822d51213078ad1b097d304b50",
+  "binary_sha256": "281abf63439f0d7c384bc6bedd9a51c65ecdd06560c5e6e43100c02650d181ac",
+  "scope": "One inclusive one-shot CPU profile for each fixed SQL workload. Profiles include benchmark setup and oracle work as well as timed work; profile duration is diagnostic, not a benchmark comparison.",
+  "profiles": [
+    {
+      "workload": "CompactSharedPayload",
+      "profile_process_wall_seconds": 5.2023,
+      "pprof_duration_seconds": 5.15,
+      "cpu_sample_seconds": 3.93,
+      "cpu_samples_as_percent_of_pprof_duration": 76.36,
+      "cpu_samples_as_percent_of_process_wall": 75.54,
+      "selected_cumulative_entries": {
+        "encodeShapeWithRankContext": {
+          "seconds": 0.56,
+          "percent_of_cpu_samples": 14.25
+        },
+        "RecoveryJournal.AppendPreparedConditionalBatch": {
+          "seconds": 1.8,
+          "percent_of_cpu_samples": 45.8
+        },
+        "TxnMarker.EntryCurrent": {
+          "seconds": 0.53,
+          "percent_of_cpu_samples": 13.49
+        },
+        "measureAlphabetWithSpellings": {
+          "seconds": 0.16,
+          "percent_of_cpu_samples": 4.07
+        },
+        "measureDictionary": {
+          "seconds": 0.14,
+          "percent_of_cpu_samples": 3.56
+        },
+        "parseCompactPrefixInt": {
+          "seconds": 0.08,
+          "percent_of_cpu_samples": 2.04
+        },
+        "measureCompactFront": {
+          "seconds": 0.03,
+          "percent_of_cpu_samples": 0.76
+        }
+      }
+    },
+    {
+      "workload": "SequentialInsert",
+      "profile_process_wall_seconds": 4.3894,
+      "pprof_duration_seconds": 4.34,
+      "cpu_sample_seconds": 3.1,
+      "cpu_samples_as_percent_of_pprof_duration": 71.49,
+      "cpu_samples_as_percent_of_process_wall": 70.62,
+      "selected_cumulative_entries": {
+        "encodeShapeWithRankContext": {
+          "seconds": 0.44,
+          "percent_of_cpu_samples": 14.19
+        },
+        "RecoveryJournal.AppendPreparedConditionalBatch": {
+          "seconds": 1.03,
+          "percent_of_cpu_samples": 33.23
+        },
+        "TxnMarker.EntryCurrent": {
+          "seconds": 0.55,
+          "percent_of_cpu_samples": 17.74
+        },
+        "finishAlphabet": {
+          "seconds": 0.2,
+          "percent_of_cpu_samples": 6.45
+        },
+        "measureAlphabetWithSpellings": {
+          "seconds": 0.09,
+          "percent_of_cpu_samples": 2.9
+        },
+        "measureDictionary": {
+          "seconds": 0.07,
+          "percent_of_cpu_samples": 2.26
+        },
+        "parseCompactPrefixInt": {
+          "seconds": 0.03,
+          "percent_of_cpu_samples": 0.97
+        },
+        "measureCompactFront": {
+          "seconds": 0.02,
+          "percent_of_cpu_samples": 0.65
+        }
+      }
+    }
+  ],
+  "host_snapshot": {
+    "snapshot_utc_approx": "2026-09-27T08:42Z",
+    "scope": "Post-run only; not time-aligned to individual samples.",
+    "vm_loadavg": [
+      9.26,
+      17.93,
+      17.39
+    ],
+    "process_count": 666,
+    "aggregate_reported_cpu_percent": 134.7,
+    "memory_free_percent": 81,
+    "physical_memory_bytes": 68719476736,
+    "kernel_release": "25.3.0",
+    "thermal_reading": "pmset -g thermlog returned no data",
+    "limitation": "This snapshot cannot establish host conditions during the benchmark samples and does not identify the cause of run-to-run timing spread."
+  },
+  "interpretation": "Profile function times are cumulative and overlap; they are not additive. Profiles include setup and oracle work and are not benchmark comparisons.",
+  "raw_profile_summary_files": "The ignored local evidence folder retains the .pprof files and full/focused pprof -top -cum exports."
+}

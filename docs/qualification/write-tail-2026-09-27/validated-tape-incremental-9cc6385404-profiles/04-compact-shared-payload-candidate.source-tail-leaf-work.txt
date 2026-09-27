@@ -1,0 +1,646 @@
+Total: 8.39s
+ROUTINE ======================== github.com/thesyncim/vibedb/store/durable.(*Collection).buildPrimaryBatchLeaf in <candidate-checkout>/store/durable/store_file_primary_batch.go
+         0      5.08s (flat, cum) 60.55% of Total
+         .          .   1946:func (c *Collection) buildPrimaryBatchLeaf(
+         .          .   1947:	state *fileStoreState, baseGen uint64, li int,
+         .          .   1948:) ([]byte, error) {
+         .          .   1949:	leaf := &c.batchPrimaryLeaves[li]
+         .          .   1950:	leaf.tailAppendOnly = false
+         .          .   1951:	replayStableSlots := c.journalReplaying && c.primaryUniqueReplayValidated &&
+         .          .   1952:		state.root.IndexCount != 0
+         .          .   1953:	leaf.stableSlots = replayStableSlots
+         .          .   1954:	inputBounds := c.primaryLeafBounds(state)
+         .          .   1955:	var (
+         .          .   1956:		path  filePrimaryMutationPath
+         .          .   1957:		lease storeio.PageLease
+         .          .   1958:		page  []byte
+         .          .   1959:	)
+         .          .   1960:	if c.primaryTailSplit != nil && leaf.tailLineageIndex >= 0 {
+         .          .   1961:		lineage := c.primaryTailSplit
+         .          .   1962:		if lineage == nil || leaf.tailLineageIndex >= len(lineage.leaves) {
+         .          .   1963:			return nil, storeio.ErrSegmentedTabletRouterCorrupt
+         .          .   1964:		}
+         .          .   1965:		tailLeaf := lineage.leaves[leaf.tailLineageIndex]
+         .          .   1966:		if tailLeaf.volatile == (storeio.PageRef{}) {
+         .          .   1967:			return nil, storeio.ErrSegmentedTabletRouterCorrupt
+         .          .   1968:		}
+         .          .   1969:		acquired, err := c.cache.Acquire(tailLeaf.volatile)
+         .          .   1970:		if err != nil {
+         .          .   1971:			return nil, err
+         .          .   1972:		}
+         .          .   1973:		lease = acquired
+         .          .   1974:		defer lease.Release()
+         .          .   1975:		leaf.pending = lineage.source
+         .          .   1976:		// Capacity preflight needs the one superseded volatile tail image. The
+         .          .   1977:		// published representative retains no single-descendant volatile ref.
+         .          .   1978:		leaf.pending.volatileRef = tailLeaf.volatile
+         .          .   1979:		page = lease.Page()
+         .          .   1980:	} else if leaf.pendingIndex < 0 {
+         .          .   1981:		if err := c.acquirePrimaryRoutingPath(
+         .          .   1982:			&path, state, leaf.firstKey, leaf.resident,
+         .          .   1983:		); err != nil {
+         .          .   1984:			return nil, err
+         .          .   1985:		}
+         .          .   1986:		defer path.Release()
+         .          .   1987:		leaf.pending = filePrimaryPendingParentFromPath(leaf.resident, &path)
+         .          .   1988:		page = path.leafLease.Page()
+         .          .   1989:	} else {
+         .          .   1990:		acquired, err := c.cache.Acquire(leaf.resident.Ref)
+         .          .   1991:		if err != nil {
+         .          .   1992:			return nil, err
+         .          .   1993:		}
+         .          .   1994:		lease = acquired
+         .          .   1995:		defer lease.Release()
+         .          .   1996:		leaf.pending = c.primaryPendingParents[leaf.pendingIndex]
+         .          .   1997:		page = lease.Page()
+         .          .   1998:	}
+         .          .   1999:	if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
+         .          .   2000:		return nil, storeio.ErrCommonPrimaryLeafCorrupt
+         .          .   2001:	}
+         .          .   2002:	stripe, ok := storeio.AdmittedCompactPrimaryStripe(
+         .          .   2003:		page, c.storeID, leaf.resident.Bucket,
+         .          .   2004:	)
+         .          .   2005:	if !ok {
+         .          .   2006:		return nil, storeio.ErrCommonPrimaryLeafCorrupt
+         .          .   2007:	}
+         .      1.23s   2008:	baseRows, err := stripe.RenderRecordsWithScratch(c.primaryLeafMutationScratch)
+         .          .   2009:	if err != nil {
+         .          .   2010:		return nil, err
+         .          .   2011:	}
+         .       40ms   2012:	if err := c.collectPrimaryBatchOverflowRetirements(
+         .          .   2013:		baseRows, leaf, inputBounds,
+         .          .   2014:	); err != nil {
+         .          .   2015:		return nil, err
+         .          .   2016:	}
+         .          .   2017:	if c.absorbOverlayOnCOW {
+         .          .   2018:		baseRows = slices.Grow(baseRows, storeio.CommonPrimaryLeafWideSlots)
+         .          .   2019:		appliedRows, applyErr := c.primaryUnifiedOverlay.applyBucket(
+         .          .   2020:			baseRows, leaf.resident.Bucket, state.root.Generation,
+         .          .   2021:		)
+         .          .   2022:		if applyErr != nil {
+         .          .   2023:			if errors.Is(applyErr, storeio.ErrCommonPrimaryLeafFull) {
+         .          .   2024:				c.primaryLeafSplitRequired.Add(1)
+         .          .   2025:				c.absorbOverlayOnCOW = false
+         .          .   2026:				return c.primaryBatchProspectiveSplitKey(appliedRows), errors.Join(
+         .          .   2027:					ErrPrimaryLeafSplitRequired, applyErr,
+         .          .   2028:				)
+         .          .   2029:			}
+         .          .   2030:			c.absorbOverlayOnCOW = false
+         .          .   2031:			return nil, applyErr
+         .          .   2032:		}
+         .          .   2033:		baseRows = appliedRows
+         .          .   2034:	}
+         .          .   2035:	leaf.initialLen = len(baseRows)
+         .          .   2036:	leaf.docDelta = 0
+         .       60ms   2037:	final, applied, err := c.mergePrimaryBatchLeafRows(
+         .          .   2038:		baseRows, leaf, c.structuralRows[:0],
+         .          .   2039:	)
+         .          .   2040:	if err != nil {
+         .          .   2041:		return nil, err
+         .          .   2042:	}
+         .          .   2043:	leaf.applied = applied
+         .          .   2044:	c.structuralRows = final
+         .          .   2045:	if leaf.applied == 0 {
+         .          .   2046:		leaf.skip = true
+         .          .   2047:		return nil, nil
+         .          .   2048:	}
+         .          .   2049:	// The fit helper may reuse this build's source proof only for the active
+         .          .   2050:	// lineage's trailing descendant. Merge has now populated each mutation's
+         .          .   2051:	// found bit, so the proof can require genuine inserts strictly beyond the
+         .          .   2052:	// source maximum. Publish the boolean only after the new image is complete.
+         .          .   2053:	tailAppendOnly := false
+         .          .   2054:	if lineage := c.primaryTailSplit; lineage != nil &&
+         .          .   2055:		len(lineage.leaves) > 0 &&
+         .          .   2056:		leaf.tailLineageIndex == len(lineage.leaves)-1 {
+         .          .   2057:		tailAppendOnly = c.validatePrimaryTailAppendOnly(leaf, baseRows) == nil
+         .          .   2058:	}
+         .          .   2059:	if replayStableSlots {
+         .          .   2060:		for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
+         .          .   2061:			if !c.batchPrimaryMutations[mutationAt].found {
+         .          .   2062:				leaf.stableSlots = false
+         .          .   2063:				break
+         .          .   2064:			}
+         .          .   2065:		}
+         .          .   2066:	} else if state.root.IndexCount != 0 && len(final) == len(baseRows) {
+         .          .   2067:		// An ordinary all-existing PUT batch can retain every row's posting
+         .          .   2068:		// slot. Inserts, deletes, and mixed topology keep the established
+         .          .   2069:		// placement and exact-rebase path below.
+         .          .   2070:		leaf.stableSlots = true
+         .          .   2071:		for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
+         .          .   2072:			mutation := &c.batchPrimaryMutations[mutationAt]
+         .          .   2073:			if !mutation.found || mutation.remove {
+         .          .   2074:				leaf.stableSlots = false
+         .          .   2075:				break
+         .          .   2076:			}
+         .          .   2077:		}
+         .          .   2078:	}
+         .          .   2079:	leaf.docDelta = len(final) - len(baseRows)
+         .          .   2080:	leaf.finalLen = len(final)
+         .          .   2081:	if len(final) > storeio.CompactPrimaryStripeMaxRows {
+         .          .   2082:		c.primaryLeafSplitRequired.Add(1)
+         .          .   2083:		return c.primaryBatchProspectiveSplitKey(final), errors.Join(
+         .          .   2084:			ErrPrimaryLeafSplitRequired, storeio.ErrCommonPrimaryLeafFull,
+         .          .   2085:		)
+         .          .   2086:	}
+         .          .   2087:	maintainSlots := primarySlotGeometryMaintained(state.root)
+         .          .   2088:	if len(final) > storeio.CommonPrimaryLeafWideSlots && maintainSlots {
+         .          .   2089:		c.primaryLeafSplitRequired.Add(1)
+         .          .   2090:		return c.primaryBatchProspectiveSplitKey(final), errors.Join(
+         .          .   2091:			ErrPrimaryLeafSplitRequired, storeio.ErrCommonPrimaryLeafFull,
+         .          .   2092:		)
+         .          .   2093:	}
+         .          .   2094:	if !leaf.stableSlots &&
+         .          .   2095:		(len(final) <= storeio.CommonPrimaryLeafWideSlots || maintainSlots) {
+         .       10ms   2096:		if err := storeio.PlaceCommonPrimaryLeafRecords(
+         .          .   2097:			storeio.CommonPrimaryLeafWide, c.storeID, final,
+         .          .   2098:		); err != nil {
+         .          .   2099:			if errors.Is(err, storeio.ErrCommonPrimaryLeafNeedsWide) ||
+         .          .   2100:				errors.Is(err, storeio.ErrCommonPrimaryLeafFull) {
+         .          .   2101:				c.primaryLeafSplitRequired.Add(1)
+         .          .   2102:				return c.primaryBatchProspectiveSplitKey(final), errors.Join(
+         .          .   2103:					ErrPrimaryLeafSplitRequired, err,
+         .          .   2104:				)
+         .          .   2105:			}
+         .          .   2106:			return nil, err
+         .          .   2107:		}
+         .          .   2108:	}
+         .          .   2109:	leaf.frameGen = baseGen + 1
+         .          .   2110:	var image []byte
+         .          .   2111:	if leaf.stableSlots {
+         .          .   2112:		c.batchPrimaryReplacements = c.batchPrimaryReplacements[:0]
+         .          .   2113:		for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
+         .          .   2114:			mutation := &c.batchPrimaryMutations[mutationAt]
+         .          .   2115:			c.batchPrimaryReplacements = append(
+         .          .   2116:				c.batchPrimaryReplacements,
+         .          .   2117:				storeio.CommonPrimaryUnifiedReplacement{
+         .          .   2118:					Key: mutation.key, Value: mutation.value, Slot: mutation.oldSlot,
+         .          .   2119:				},
+         .          .   2120:			)
+         .          .   2121:		}
+         .          .   2122:		patched, ok, patchErr := stripe.PatchCompactPrimaryStripeReplacements(
+         .          .   2123:			c.primaryLeafScratch, leaf.frameGen,
+         .          .   2124:			c.batchPrimaryReplacements, c.primaryUnifiedBuilder,
+         .          .   2125:		)
+         .          .   2126:		c.primaryCompactColumnPatchAttempts.Add(1)
+         .          .   2127:		if patchErr != nil {
+         .          .   2128:			return nil, patchErr
+         .          .   2129:		}
+         .          .   2130:		if ok {
+         .          .   2131:			c.primaryCompactColumnPatches.Add(1)
+         .          .   2132:			image = patched
+         .          .   2133:		}
+         .          .   2134:	}
+         .          .   2135:	if image == nil {
+         .      3.74s   2136:		encoded, err := storeio.EncodeBestCompactPrimaryStripe(
+         .          .   2137:			c.primaryLeafScratch,
+         .          .   2138:			storeio.CommonPrimaryLeafHeader{
+         .          .   2139:				StoreID: c.storeID, Generation: leaf.frameGen,
+         .          .   2140:				Bucket: leaf.resident.Bucket,
+         .          .   2141:			},
+ROUTINE ======================== github.com/thesyncim/vibedb/store/durable.(*Collection).preparePrimaryTailBatchSplitLocked in <candidate-checkout>/store/durable/store_file_primary_batch_tail.go
+         0      650ms (flat, cum)  7.75% of Total
+         .          .    550:func (c *Collection) preparePrimaryTailBatchSplitLocked(
+         .          .    551:	state *fileStoreState, generation uint64,
+         .          .    552:) (stagedPrimaryBatch, error) {
+         .          .    553:	if !c.primaryTailBatchCandidate(state, true) ||
+         .          .    554:		len(c.batchPrimaryLeaves) != 1 || generation != state.root.Generation+1 {
+         .          .    555:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    556:	}
+         .          .    557:	leaf := &c.batchPrimaryLeaves[0]
+         .       10ms    558:	baseRows, rowLease, err := c.primaryTailBatchBaseRows(state, leaf)
+         .          .    559:	if err != nil {
+         .          .    560:		return stagedPrimaryBatch{}, err
+         .          .    561:	}
+         .          .    562:	defer rowLease.Release()
+         .          .    563:	if err := c.validatePrimaryTailAppendOnly(leaf, baseRows); err != nil {
+         .          .    564:		return stagedPrimaryBatch{}, err
+         .          .    565:	}
+         .          .    566:	if len(c.structuralRows) == 0 {
+         .          .    567:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    568:	}
+         .          .    569:	prospective := c.structuralRows
+         .          .    570:
+         .          .    571:	var source filePrimaryPendingParent
+         .          .    572:	var prefix []primaryTailSplitLeaf
+         .          .    573:	prefixCount := 0
+         .          .    574:	tabletID, sourceLocalID, ok := storeio.SplitTabletLocalIdentityBucket(
+         .          .    575:		uint32(leaf.pending.leafRoute.Bucket),
+         .          .    576:	)
+         .          .    577:	if !ok {
+         .          .    578:		return stagedPrimaryBatch{}, storeio.ErrSegmentedTabletRouterCorrupt
+         .          .    579:	}
+         .          .    580:	tailSourceLocal := uint16(sourceLocalID)
+         .          .    581:	if c.primaryTailSplit != nil {
+         .          .    582:		old := c.primaryTailSplit
+         .          .    583:		if old.tabletID != tabletID || len(old.leaves) < 2 ||
+         .          .    584:			leaf.tailLineageIndex != len(old.leaves)-1 {
+         .          .    585:			return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    586:		}
+         .          .    587:		source = old.source
+         .          .    588:		prefixCount = len(old.leaves) - 1
+         .          .    589:		tailSourceLocal = old.leaves[len(old.leaves)-1].localID
+         .          .    590:	} else {
+         .          .    591:		source = leaf.pending
+         .          .    592:	}
+         .          .    593:	source.volatileRef = storeio.PageRef{}
+         .          .    594:	source.resident = storeio.ResidentPrimaryRoute{
+         .          .    595:		Ref: source.resident.Ref, Bucket: source.resident.Bucket,
+         .          .    596:		Hash: source.resident.Hash,
+         .          .    597:	}
+         .          .    598:	lineageTablet, originalLocal, valid := storeio.SplitTabletLocalIdentityBucket(
+         .          .    599:		uint32(source.leafRoute.Bucket),
+         .          .    600:	)
+         .          .    601:	if !valid || lineageTablet != tabletID || uint16(originalLocal) !=
+         .          .    602:		uint16(sourceLocalID) {
+         .          .    603:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    604:	}
+         .          .    605:
+         .          .    606:	// Root the physical metadata path at the original sealed source while rows
+         .          .    607:	// are read from the current trailing volatile descendant. Its whole unsplit
+         .          .    608:	// range still belongs to this physical leaf until the final fold.
+         .          .    609:	var path filePrimaryMutationPath
+         .          .    610:	if err := c.acquirePrimaryRoutingPath(
+         .          .    611:		&path, state, leaf.firstKey, source.resident,
+         .          .    612:	); err != nil {
+         .          .    613:		return stagedPrimaryBatch{}, err
+         .          .    614:	}
+         .          .    615:	defer path.Release()
+         .          .    616:	if path.leafRoute.Ref != source.leafRoute.Ref ||
+         .          .    617:		path.leafRoute.Bucket != source.leafRoute.Bucket ||
+         .          .    618:		path.tablet.TabletID() != tabletID {
+         .          .    619:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    620:	}
+         .          .    621:	anchorCount := path.anchor.Count()
+         .          .    622:	anchorPages := path.tablet.AnchorCount()
+         .          .    623:	if anchorCount <= 0 || anchorPages <= 0 {
+         .          .    624:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    625:	}
+         .          .    626:	lastAnchor, lastAnchorOK := path.tablet.AnchorAt(anchorPages - 1)
+         .          .    627:	if !lastAnchorOK || lastAnchor != source.anchorRoute ||
+         .          .    628:		path.anchorRoute != lastAnchor {
+         .          .    629:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    630:	}
+         .          .    631:	lastPhysicalLeaf, lastPhysicalLeafOK := path.anchor.RouteAt(anchorCount-1, 0)
+         .          .    632:	physicalTablet, physicalLocal, physicalIdentityOK :=
+         .          .    633:		storeio.SplitTabletLocalIdentityBucket(uint32(lastPhysicalLeaf.Bucket))
+         .          .    634:	if !lastPhysicalLeafOK || !physicalIdentityOK ||
+         .          .    635:		physicalTablet != tabletID || uint16(physicalLocal) != uint16(sourceLocalID) ||
+         .          .    636:		lastPhysicalLeaf.Ref != source.leafRoute.Ref ||
+         .          .    637:		lastPhysicalLeaf.Bucket != source.leafRoute.Bucket ||
+         .          .    638:		lastPhysicalLeaf.PageID != source.leafRoute.PageID ||
+         .          .    639:		lastPhysicalLeaf.Zone != source.leafRoute.Zone {
+         .          .    640:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    641:	}
+         .          .    642:	if c.primaryTailSplit == nil {
+         .          .    643:		if leaf.pending.resident.Bucket != source.leafRoute.Bucket {
+         .          .    644:			return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    645:		}
+         .          .    646:	} else {
+         .          .    647:		old := c.primaryTailSplit
+         .          .    648:		if len(old.leaves) == 0 || old.leaves[0].localID != uint16(sourceLocalID) ||
+         .          .    649:			old.source.leafRoute.Ref != source.leafRoute.Ref {
+         .          .    650:			return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    651:		}
+         .          .    652:		for index := range old.leaves {
+         .          .    653:			bucket, bucketOK := storeio.MakeTabletLocalIdentityBucket(
+         .          .    654:				old.tabletID, uint32(old.leaves[index].localID),
+         .          .    655:			)
+         .          .    656:			route, routeOK := c.primaryRouter.Load().ResolveBucketID(
+         .          .    657:				storeio.BucketID(bucket),
+         .          .    658:			)
+         .          .    659:			if !bucketOK || !routeOK || route.Ref != old.leaves[index].volatile {
+         .          .    660:				return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    661:			}
+         .          .    662:		}
+         .          .    663:	}
+         .          .    664:
+         .          .    665:	router := c.primaryRouter.Load()
+         .          .    666:	if router == nil {
+         .          .    667:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    668:	}
+         .          .    669:	selected, residentFloor, selectedOK := router.ResolveBucketFloor(
+         .          .    670:		leaf.resident.Bucket,
+         .          .    671:	)
+         .          .    672:	lastRoute, lastOK := router.RouteAtRank(router.Len() - 1)
+         .          .    673:	if !selectedOK || selected.Ref != leaf.resident.Ref ||
+         .          .    674:		selected.Bucket != leaf.resident.Bucket ||
+         .          .    675:		!lastOK || lastRoute.Bucket != selected.Bucket ||
+         .          .    676:		lastRoute.Ref != selected.Ref {
+         .          .    677:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    678:	}
+         .          .    679:	var allUsed [storeio.TabletLocalIdentityLocalCount / 64]uint64
+         .          .    680:	if !router.CopyTabletLocalIDs(tabletID, &allUsed) {
+         .          .    681:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    682:	}
+         .          .    683:	usedCount := 0
+         .          .    684:	for _, word := range allUsed {
+         .          .    685:		usedCount += bits.OnesCount64(word)
+         .          .    686:	}
+         .          .    687:	if usedCount == 0 ||
+         .          .    688:		allUsed[tailSourceLocal>>6]&(uint64(1)<<uint(tailSourceLocal&63)) == 0 {
+         .          .    689:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    690:	}
+         .          .    691:
+         .          .    692:	maxFinalLeaves := 1 + storeio.SegmentedTabletRouterRowsPerPage - anchorCount
+         .          .    693:	if maxFinalLeaves < prefixCount+2 {
+         .          .    694:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    695:	}
+         .          .    696:	planningCharge, chargeOK := primaryTailSplitPlanningScratchCharge(
+         .          .    697:		len(baseRows), len(prospective),
+         .          .    698:		func() int {
+         .          .    699:			if c.primaryTailSplit == nil {
+         .          .    700:				return 0
+         .          .    701:			}
+         .          .    702:			return len(c.primaryTailSplit.leaves)
+         .          .    703:		}(), maxFinalLeaves,
+         .          .    704:	)
+         .          .    705:	if !chargeOK {
+         .          .    706:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    707:	}
+         .          .    708:	preflight := c.primaryTailCurrentChargeBytes.Load()
+         .          .    709:	if c.primaryTailSplit == nil {
+         .          .    710:		preflight, chargeOK = primaryTailAddCharge(
+         .          .    711:			preflight, uint64(router.ResidentBytes()),
+         .          .    712:		)
+         .          .    713:		if !chargeOK {
+         .          .    714:			return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    715:		}
+         .          .    716:	}
+         .          .    717:	preflight, chargeOK = primaryTailAddCharge(preflight, planningCharge)
+         .          .    718:	if !chargeOK || c.cache == nil ||
+         .          .    719:		c.cache.DirtyCapacityAvailable() < preflight {
+         .          .    720:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    721:	}
+         .          .    722:	preplannerPeak, peakOK := primaryTailAddCharge(
+         .          .    723:		c.cache.DirtyReservedBytes(), preflight,
+         .          .    724:	)
+         .          .    725:	if !peakOK {
+         .          .    726:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    727:	}
+         .          .    728:	c.recordPrimaryTailSplitPeak(preplannerPeak)
+         .          .    729:
+         .      580ms    730:	cuts, unionKeys, err := c.planPrimaryBatchTopologyCuts(
+         .          .    731:		baseRows, prospective, false,
+         .          .    732:	)
+         .          .    733:	if err != nil {
+         .          .    734:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    735:	}
+         .          .    736:	newFloorCount := len(cuts) + 1
+         .          .    737:	if len(cuts) == 0 || prefixCount+newFloorCount > maxFinalLeaves ||
+         .          .    738:		usedCount-1+newFloorCount > storeio.TabletLocalIdentityLocalCount {
+         .          .    739:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    740:	}
+         .          .    741:
+         .          .    742:	if c.primaryTailSplit != nil {
+         .          .    743:		prefix = slices.Clone(
+         .          .    744:			c.primaryTailSplit.leaves[:len(c.primaryTailSplit.leaves)-1],
+         .          .    745:		)
+         .          .    746:	}
+         .          .    747:	newFloors := make([][]byte, len(cuts)+1)
+         .          .    748:	if c.primaryTailSplit == nil {
+         .          .    749:		floor, floorOK := path.anchor.AppendFenceAt(
+         .          .    750:			make([]byte, 0, storeio.CommonPrimaryLeafMaxKeyBytes), anchorCount-1,
+         .          .    751:		)
+         .          .    752:		if !floorOK || len(floor) > storeio.CommonPrimaryLeafMaxKeyBytes {
+         .          .    753:			return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    754:		}
+         .          .    755:		newFloors[0] = floor
+         .          .    756:	} else {
+         .          .    757:		newFloors[0] = slices.Clone(
+         .          .    758:			c.primaryTailSplit.leaves[len(c.primaryTailSplit.leaves)-1].localFloor,
+         .          .    759:		)
+         .          .    760:	}
+         .          .    761:	for at, cut := range cuts {
+         .          .    762:		position := sort.Search(len(unionKeys), func(i int) bool {
+         .          .    763:			return bytes.Compare(unionKeys[i], cut) >= 0
+         .          .    764:		})
+         .          .    765:		if position <= 0 || position >= len(unionKeys) ||
+         .          .    766:			!bytes.Equal(unionKeys[position], cut) {
+         .          .    767:			return stagedPrimaryBatch{}, storeio.ErrInvalidWrite
+         .          .    768:		}
+         .          .    769:		floor, floorErr := storeio.ShortestPrimaryFence(
+         .          .    770:			make([]byte, len(cut)), unionKeys[position-1], cut,
+         .          .    771:		)
+         .          .    772:		if floorErr != nil {
+         .          .    773:			return stagedPrimaryBatch{}, floorErr
+         .          .    774:		}
+         .          .    775:		newFloors[at+1] = floor
+         .          .    776:	}
+         .          .    777:
+         .          .    778:	allUsed[tailSourceLocal>>6] &^= uint64(1) << uint(tailSourceLocal&63)
+         .          .    779:	outputIDs := make([]uint16, len(newFloors))
+         .          .    780:	outputIDs[0] = tailSourceLocal
+         .          .    781:	allUsed[tailSourceLocal>>6] |= uint64(1) << uint(tailSourceLocal&63)
+         .          .    782:	nextOutputID := 1
+         .          .    783:	for local := 0; local < storeio.TabletLocalIdentityLocalCount &&
+         .          .    784:		nextOutputID < len(outputIDs); local++ {
+         .          .    785:		if allUsed[local>>6]&(uint64(1)<<uint(local&63)) != 0 {
+         .          .    786:			continue
+         .          .    787:		}
+         .          .    788:		outputIDs[nextOutputID] = uint16(local)
+         .          .    789:		allUsed[local>>6] |= uint64(1) << uint(local&63)
+         .          .    790:		nextOutputID++
+         .          .    791:	}
+         .          .    792:	if nextOutputID != len(outputIDs) {
+         .          .    793:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    794:	}
+         .          .    795:
+         .          .    796:	newLeaves := make([]primaryTailSplitLeaf, 0, len(prefix)+len(newFloors))
+         .          .    797:	newLeaves = append(newLeaves, prefix...)
+         .          .    798:	zone := source.leafRoute.Zone
+         .          .    799:	for rank := range newFloors {
+         .          .    800:		leafZone := storeio.BucketZone{}
+         .          .    801:		if rank == 0 {
+         .          .    802:			leafZone = zone
+         .          .    803:		}
+         .          .    804:		newLeaves = append(newLeaves, primaryTailSplitLeaf{
+         .          .    805:			localID: outputIDs[rank], localFloor: newFloors[rank], zone: leafZone,
+         .          .    806:		})
+         .          .    807:	}
+         .          .    808:	for index := 1; index < len(newLeaves); index++ {
+         .          .    809:		if bytes.Compare(newLeaves[index-1].localFloor,
+         .          .    810:			newLeaves[index].localFloor) >= 0 {
+         .          .    811:			return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    812:		}
+         .          .    813:	}
+         .          .    814:	rightFences := make([][]byte, len(newLeaves)-1)
+         .          .    815:	for index := 1; index < len(newLeaves); index++ {
+         .          .    816:		rightFences[index-1] = newLeaves[index].localFloor
+         .          .    817:	}
+         .          .    818:	partition, err := path.tablet.PlanLeafPartition(
+         .          .    819:		&path.anchor, source.leafRoute, rightFences,
+         .          .    820:	)
+         .          .    821:	if err != nil {
+         .          .    822:		return stagedPrimaryBatch{}, err
+         .          .    823:	}
+         .          .    824:	if partition.RequiresTabletRebuild() ||
+         .          .    825:		int(partition.ReplacementCount()) != len(newLeaves) {
+         .          .    826:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    827:	}
+         .          .    828:
+         .          .    829:	if _, ok := c.primaryTailFoldResourceCharge(len(newLeaves)); !ok {
+         .          .    830:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    831:	}
+         .          .    832:	replacementFences := make([][]byte, len(newFloors))
+         .          .    833:	replacementFences[0] = residentFloor
+         .          .    834:	var addedFenceBytes uint64
+         .          .    835:	for rank := 1; rank < len(newFloors); rank++ {
+         .          .    836:		replacementFences[rank] = newFloors[rank]
+         .          .    837:		addedFenceBytes, ok = primaryTailAddCharge(
+         .          .    838:			addedFenceBytes, uint64(cap(newFloors[rank])),
+         .          .    839:		)
+         .          .    840:		if !ok || addedFenceBytes > math.MaxInt {
+         .          .    841:			return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    842:		}
+         .          .    843:	}
+         .          .    844:	routerWorstCase, ok := router.SplitLeafPartitionAllocationUpperBound(
+         .          .    845:		len(newFloors), int(addedFenceBytes),
+         .          .    846:	)
+         .          .    847:	if !ok {
+         .          .    848:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    849:	}
+         .          .    850:
+         .          .    851:	// Encode the prospective batch image into one frame per final range. The
+         .          .    852:	// planner used both current and prospective rows above, so the same topology
+         .          .    853:	// is safe for content-equivalent recovery and for this atomic publication.
+         .          .    854:	originalDocDelta := leaf.docDelta
+         .          .    855:	originalMutationAt, originalMutationEnd := leaf.mutationAt, leaf.mutationEnd
+         .          .    856:	c.batchPrimaryLeafArena = c.batchPrimaryLeafArena[:0]
+         .          .    857:	var oldTailRef storeio.PageRef
+         .          .    858:	if c.primaryTailSplit != nil {
+         .          .    859:		oldTailRef = c.primaryTailSplit.leaves[len(c.primaryTailSplit.leaves)-1].volatile
+         .          .    860:	} else if leaf.pending.volatileRef != (storeio.PageRef{}) {
+         .          .    861:		oldTailRef = leaf.pending.volatileRef
+         .          .    862:	}
+         .          .    863:	c.batchPrimaryLeaves = c.batchPrimaryLeaves[:0]
+         .          .    864:	if cap(c.batchPrimaryLeaves) < len(newFloors) {
+         .          .    865:		c.batchPrimaryLeaves = slices.Grow(
+         .          .    866:			c.batchPrimaryLeaves, len(newFloors)-len(c.batchPrimaryLeaves),
+         .          .    867:		)
+         .          .    868:	}
+         .          .    869:	baseAt, finalAt := 0, 0
+         .          .    870:	for rank := range newFloors {
+         .          .    871:		baseEnd, finalEnd := len(baseRows), len(prospective)
+         .          .    872:		if rank+1 < len(newFloors) {
+         .          .    873:			baseEnd = primaryBatchTopologyLowerBound(
+         .          .    874:				baseRows, baseAt, newFloors[rank+1],
+         .          .    875:			)
+         .          .    876:			finalEnd = primaryBatchTopologyLowerBound(
+         .          .    877:				prospective, finalAt, newFloors[rank+1],
+         .          .    878:			)
+         .          .    879:		}
+         .          .    880:		if baseEnd < baseAt || finalEnd < finalAt || finalEnd == finalAt {
+         .          .    881:			return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    882:		}
+         .          .    883:		bucketValue, bucketOK := storeio.MakeTabletLocalIdentityBucket(
+         .          .    884:			tabletID, uint32(outputIDs[rank]),
+         .          .    885:		)
+         .          .    886:		logicalID, logicalOK := storeio.CommonPrimaryLeafLogicalID(
+         .          .    887:			storeio.BucketID(bucketValue),
+         .          .    888:		)
+         .          .    889:		if !bucketOK || !logicalOK {
+         .          .    890:			return stagedPrimaryBatch{}, storeio.ErrSegmentedTabletRouterCorrupt
+         .          .    891:		}
+         .          .    892:		// prospective is the private c.structuralRows workspace; slot placement
+         .          .    893:		// mutates only these copied record headers, while key/value bodies remain
+         .          .    894:		// borrowed from the private merge and source rows.
+         .          .    895:		rows := prospective[finalAt:finalEnd]
+         .          .    896:		if len(rows) <= storeio.CommonPrimaryLeafWideSlots {
+         .          .    897:			if err := storeio.PlaceCommonPrimaryLeafRecords(
+         .          .    898:				storeio.CommonPrimaryLeafWide, c.storeID, rows,
+         .          .    899:			); err != nil {
+         .          .    900:				return stagedPrimaryBatch{}, err
+         .          .    901:			}
+         .          .    902:		}
+         .       60ms    903:		image, encodeErr := storeio.EncodeBestCompactPrimaryStripe(
+         .          .    904:			c.primaryLeafScratch,
+         .          .    905:			storeio.CommonPrimaryLeafHeader{
+         .          .    906:				StoreID: c.storeID, Generation: generation,
+         .          .    907:				Bucket: storeio.BucketID(bucketValue),
+         .          .    908:			},
+ROUTINE ======================== github.com/thesyncim/vibedb/store/durable.(*Collection).preparePrimaryTailBatchUpdateLocked in <candidate-checkout>/store/durable/store_file_primary_batch_tail.go
+         0       10ms (flat, cum)  0.12% of Total
+         .          .    458:func (c *Collection) preparePrimaryTailBatchUpdateLocked(
+         .          .    459:	state *fileStoreState, generation uint64,
+         .          .    460:) (stagedPrimaryBatch, error) {
+         .          .    461:	if !c.primaryTailBatchCandidate(state, true) ||
+         .          .    462:		c.primaryTailSplit == nil || len(c.batchPrimaryLeaves) != 1 {
+         .          .    463:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    464:	}
+         .          .    465:	leaf := &c.batchPrimaryLeaves[0]
+         .          .    466:	if !leaf.tailAppendOnly {
+         .          .    467:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    468:	}
+         .          .    469:	if generation != state.root.Generation+1 ||
+         .          .    470:		leaf.frameGen != generation || leaf.nextLeaf.Generation != generation {
+         .          .    471:		return stagedPrimaryBatch{}, storeio.ErrGenerationOrder
+         .          .    472:	}
+         .          .    473:	lineage := *c.primaryTailSplit
+         .          .    474:	if len(lineage.leaves) < 2 {
+         .          .    475:		return stagedPrimaryBatch{}, storeio.ErrSegmentedTabletRouterCorrupt
+         .          .    476:	}
+         .          .    477:	lineage.leaves = slices.Clone(c.primaryTailSplit.leaves)
+         .          .    478:	last := len(lineage.leaves) - 1
+         .          .    479:	previous := lineage.leaves[last].volatile
+         .          .    480:	if previous == (storeio.PageRef{}) || leaf.resident.Ref != previous ||
+         .          .    481:		leaf.pending.volatileRef != previous {
+         .          .    482:		return stagedPrimaryBatch{}, storeio.ErrSegmentedTabletRouterCorrupt
+         .          .    483:	}
+         .          .    484:	lineage.leaves[last].volatile = leaf.nextLeaf
+         .          .    485:	lineage.source.volatileRef = storeio.PageRef{}
+         .          .    486:	metadata, ok := primaryTailLineageMetadataCharge(&lineage)
+         .          .    487:	if !ok {
+         .          .    488:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    489:	}
+         .          .    490:	lineage.chargedBytes = metadata
+         .          .    491:	lineage.peakChargedBytes = max(
+         .          .    492:		lineage.peakChargedBytes, metadata,
+         .          .    493:	)
+         .          .    494:	nextDocumentCount, ok := fileLogicalDocumentCount(
+         .          .    495:		state.root.DocumentCount, leaf.docDelta,
+         .          .    496:	)
+         .          .    497:	if !ok {
+         .          .    498:		return stagedPrimaryBatch{}, storeio.ErrInvalidWrite
+         .          .    499:	}
+         .          .    500:	stage := &primaryTailSplitStage{
+         .          .    501:		nextLineage:        lineagePointer(lineage),
+         .          .    502:		nextFileEnd:        c.batchPrimaryFileEnd,
+         .          .    503:		nextLogicalID:      c.batchPrimaryNextLogicalID,
+         .          .    504:		nextDocumentCount:  nextDocumentCount,
+         .          .    505:		documentCountDelta: leaf.docDelta,
+         .          .    506:		updatedRoute:       leaf.resident,
+         .          .    507:		updatedRef:         leaf.nextLeaf,
+         .          .    508:	}
+         .          .    509:	if previous != (storeio.PageRef{}) {
+         .          .    510:		stage.retireAtPublish = []storeio.PageRef{previous}
+         .          .    511:	}
+         .          .    512:	leaf.pending = lineage.source
+         .          .    513:	leaf.pending.volatileRef = previous
+         .          .    514:	leaf.pendingIndex = 0 // the original source parent represents the lineage
+         .          .    515:	extra, ok := c.primaryTailSplitAdmissionCharge(stage.nextLineage, 0)
+         .          .    516:	if !ok {
+         .          .    517:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    518:	}
+         .          .    519:	stage.reservationBytes, ok = c.primaryTailBatchReservationBytes(extra)
+         .          .    520:	if !ok {
+         .          .    521:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    522:	}
+         .          .    523:	if _, err := c.ensurePrimaryBatchCapacityWithPolicy(
+         .          .    524:		true, extra, false,
+         .          .    525:	); err != nil {
+         .          .    526:		return stagedPrimaryBatch{}, err
+         .          .    527:	}
+         .          .    528:	if !c.recordPrimaryTailAdmissionPeak(stage.reservationBytes) {
+         .          .    529:		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
+         .          .    530:	}
+         .          .    531:	c.batchPrimaryAdmitted = c.batchPrimaryAdmitted[:0]
+         .          .    532:	if err := c.admitPrimaryBatchOverflow(); err != nil {
+         .          .    533:		c.unadmitPrimaryBatchLeaves()
+         .          .    534:		return stagedPrimaryBatch{}, err
+         .          .    535:	}
+         .       10ms    536:	if err := c.admitPrimaryBatchLeaves(); err != nil {
+         .          .    537:		c.unadmitPrimaryBatchLeaves()
+         .          .    538:		return stagedPrimaryBatch{}, err
+         .          .    539:	}
+         .          .    540:	return stagedPrimaryBatch{
+         .          .    541:		state: state, generation: generation,

@@ -64,7 +64,7 @@ func TestDirectControllerPassKeepsCatalogAuthorityInGateway(t *testing.T) {
 		t.Fatal(err)
 	}
 	pass, err := RunDirectControllerPass(t.Context(), catalog, controller)
-	if err != nil || pass.Discovered != 1 || pass.Triggered != 1 || pass.Completed != 0 ||
+	if err != nil || pass.Discovered != 1 || pass.Triggered != 1 || pass.Progressed != 1 || pass.Completed != 0 ||
 		observer.calls != 1 || router.calls != 1 || journal.record.State != gateway.ReplicatedOperationRunning {
 		t.Fatalf("pass=%+v observer=%d router=%d record=%+v err=%v",
 			pass, observer.calls, router.calls, journal.record, err)

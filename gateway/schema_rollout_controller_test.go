@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -210,6 +212,108 @@ func TestSchemaRolloutControllerResumesRunningCutAfterShardFailure(t *testing.T)
 	}
 }
 
+type schemaControllerCommitAttempt struct {
+	node          rafttransport.NodeID
+	request       schemainstall.Request
+	authorization schemainstall.Authorization
+}
+
+type schemaControllerCommitOpenEOFClient struct {
+	*schemaControllerClient
+	targetNode rafttransport.NodeID
+	mu         sync.Mutex
+	attempts   []schemaControllerCommitAttempt
+}
+
+func (client *schemaControllerCommitOpenEOFClient) Commit(
+	ctx context.Context,
+	node rafttransport.NodeID,
+	request schemainstall.Request,
+	authorization schemainstall.Authorization,
+) (schemainstall.Record, error) {
+	client.mu.Lock()
+	client.attempts = append(client.attempts, schemaControllerCommitAttempt{
+		node: node, request: request, authorization: authorization,
+	})
+	attempt := 0
+	if node == client.targetNode {
+		for _, prior := range client.attempts {
+			if prior.node == node {
+				attempt++
+			}
+		}
+	}
+	client.mu.Unlock()
+	if attempt == 1 {
+		return schemainstall.Record{}, errors.Join(schemainstall.ErrTransientControlOpen,
+			rafttransport.ErrPeerAuthentication, io.EOF)
+	}
+	return client.schemaControllerClient.Commit(ctx, node, request, authorization)
+}
+
+func TestSchemaRolloutControllerRetriesClassifiedOpenEOFForMemberThreeCommit(t *testing.T) {
+	authority, _, current := newCatalogAuthorityFixture(t)
+	target, _ := testSchemaRolloutTarget(t, current)
+	id := sha256.Sum256([]byte("schema-controller-member-three-open-eof"))
+	plans := schemaControllerPlans(t, id, current, target)
+	var memberThree SchemaRolloutReplicaPlan
+	for _, plan := range plans {
+		if plan.Member == 3 {
+			memberThree = plan
+			break
+		}
+	}
+	if memberThree.Member != 3 {
+		t.Fatal("schema rollout fixture does not contain member 3")
+	}
+	baseClient := &schemaControllerClient{authority: authority, base: current.Generation()}
+	client := &schemaControllerCommitOpenEOFClient{
+		schemaControllerClient: baseClient,
+		targetNode:             memberThree.Node,
+	}
+	controller, err := NewSchemaRolloutController(SchemaRolloutControllerOptions{
+		Authority: authority, Client: client, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := controller.Execute(t.Context(), id, target, plans)
+	if err != nil || result.Record.State != ReplicatedOperationComplete ||
+		authority.holder.Current().Generation() != target.Generation() {
+		t.Fatalf("rollout result=%+v generation=%d err=%v", result,
+			authority.holder.Current().Generation(), err)
+	}
+	installed, err := authority.Read(t.Context())
+	if err != nil || installed.Generation() != target.Generation() {
+		t.Fatalf("catalog generation=%d err=%v, want exact target generation %d",
+			installed.Generation(), err, target.Generation())
+	}
+
+	client.mu.Lock()
+	attempts := append([]schemaControllerCommitAttempt(nil), client.attempts...)
+	client.mu.Unlock()
+	if len(attempts) != len(plans)+1 {
+		t.Fatalf("commit attempts=%d, want one per member plus member 3 retry", len(attempts))
+	}
+	var memberThreeAttempts []schemaControllerCommitAttempt
+	for _, attempt := range attempts {
+		if attempt.node == memberThree.Node {
+			memberThreeAttempts = append(memberThreeAttempts, attempt)
+		}
+	}
+	if len(memberThreeAttempts) != 2 {
+		t.Fatalf("member 3 commit attempts=%d, want opening EOF followed by one retry", len(memberThreeAttempts))
+	}
+	for index, attempt := range memberThreeAttempts {
+		if attempt.request != memberThree.Request || attempt.authorization != result.Authorization {
+			t.Fatalf("member 3 commit attempt %d changed request or authorization", index+1)
+		}
+	}
+	if memberThreeAttempts[0] != memberThreeAttempts[1] {
+		t.Fatal("member 3 retry did not use the byte-identical request and authorization")
+	}
+}
+
 func TestSchemaRolloutControllerSettlesReplicaOutcomeUnknownInline(t *testing.T) {
 	authority, _, current := newCatalogAuthorityFixture(t)
 	target, _ := testSchemaRolloutTarget(t, current)
@@ -230,5 +334,112 @@ func TestSchemaRolloutControllerSettlesReplicaOutcomeUnknownInline(t *testing.T)
 		client.activated.Load() != uint64(len(plans)+1) {
 		t.Fatalf("result=%+v generation=%d activations=%d err=%v", result,
 			authority.holder.Current().Generation(), client.activated.Load(), err)
+	}
+}
+
+func TestRetrySchemaReplicaOutcomeRetriesTransientControlOpenOnly(t *testing.T) {
+	reset := errors.Join(schemainstall.ErrTransientControlOpen, rafttransport.ErrPeerAuthentication,
+		errors.New("connection reset during TLS handshake"))
+	t.Run("handshake connection reset retries exact action", func(t *testing.T) {
+		calls := 0
+		err := retrySchemaReplicaOutcome(context.Background(), func() error {
+			calls++
+			if calls == 1 {
+				return reset
+			}
+			return nil
+		})
+		if err != nil || calls != 2 {
+			t.Fatalf("retry result=%v calls=%d, want success after 2 attempts", err, calls)
+		}
+	})
+	t.Run("authentication and identity rejection are terminal", func(t *testing.T) {
+		for name, rejection := range map[string]error{
+			"certificate": errors.Join(rafttransport.ErrPeerAuthentication,
+				errors.New("x509: certificate signed by unknown authority")),
+			"identity":      rafttransport.ErrWrongPeer,
+			"key":           rafttransport.ErrPeerKeyMismatch,
+			"build":         rafttransport.ErrPeerBuild,
+			"authorization": rafttransport.ErrUnauthorized,
+		} {
+			t.Run(name, func(t *testing.T) {
+				calls := 0
+				err := retrySchemaReplicaOutcome(context.Background(), func() error {
+					calls++
+					return rejection
+				})
+				if !errors.Is(err, rejection) || calls != 1 {
+					t.Fatalf("rejection=%v calls=%d, want terminal rejection", err, calls)
+				}
+			})
+		}
+	})
+	t.Run("cancellation stops transient retry", func(t *testing.T) {
+		alreadyCanceled, cancelBeforeRun := context.WithCancel(context.Background())
+		cancelBeforeRun()
+		calls := 0
+		err := retrySchemaReplicaOutcome(alreadyCanceled, func() error {
+			calls++
+			return reset
+		})
+		if !errors.Is(err, context.Canceled) || calls != 0 {
+			t.Fatalf("pre-canceled retry=%v calls=%d, want cancellation before attempt", err, calls)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		calls = 0
+		err = retrySchemaReplicaOutcome(ctx, func() error {
+			calls++
+			cancel()
+			return reset
+		})
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, schemainstall.ErrTransientControlOpen) || calls != 1 {
+			t.Fatalf("canceled retry=%v calls=%d, want cancellation after 1 attempt", err, calls)
+		}
+	})
+}
+
+func TestSchemaRolloutParallelCancelsRetryingWorkerAfterHardFailure(t *testing.T) {
+	controller := &SchemaRolloutController{workers: 2}
+	outerCtx, cancelOuter := context.WithCancel(context.Background())
+	defer cancelOuter()
+	firstRetryAttempt := make(chan struct{})
+	hardFailureReady := make(chan struct{})
+	var attempts atomic.Uint64
+	hardErr := errors.Join(rafttransport.ErrUnauthorized, errors.New("permanent replica authorization rejection"))
+	done := make(chan error, 1)
+	go func() {
+		done <- controller.parallel(outerCtx, 2, func(workerCtx context.Context, index int) error {
+			if index == 0 {
+				<-firstRetryAttempt
+				close(hardFailureReady)
+				return hardErr
+			}
+			return retrySchemaReplicaOutcome(workerCtx, func() error {
+				if attempts.Add(1) == 1 {
+					close(firstRetryAttempt)
+				}
+				return schemainstall.ErrTransientControlOpen
+			})
+		})
+	}()
+	select {
+	case <-hardFailureReady:
+	case <-time.After(time.Second):
+		cancelOuter()
+		err := <-done
+		t.Fatalf("workers did not reach the hard failure, parallel error=%v", err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, rafttransport.ErrUnauthorized) || attempts.Load() == 0 {
+			t.Fatalf("parallel error=%v attempts=%d, want hard authorization error after a retry started",
+				err, attempts.Load())
+		}
+	case <-time.After(500 * time.Millisecond):
+		cancelOuter()
+		err := <-done
+		t.Fatalf("parallel did not cancel transient retry promptly; it returned only after outer cancellation: %v", err)
 	}
 }

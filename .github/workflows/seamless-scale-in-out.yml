@@ -78,6 +78,29 @@ jobs:
           grep -Fqx "${test_name}" "${evidence}/test-list.txt"
           printf 'TMPDIR=%s VIBEDB_SEAMLESS_SCALE_E2E=1 VIBEDB_SEAMLESS_SCALE_EVIDENCE=%s go test -json -count=1 -timeout=35m -run %s ./internal/gatewayruntime\n' \
             "${test_root}" "${evidence}/qualification.tsv" "^${test_name}$" > "${evidence}/command.txt"
+          race_test_regex='^Test(WaitSeamlessScaleManifestGateway|ScalePostgres)'
+          go test -list "${race_test_regex}" ./internal/gatewayruntime > "${evidence}/readiness-race-test-list.txt"
+          cat > "${evidence}/readiness-race-test-list.expected.txt" <<'EOF'
+          TestScalePostgresPlainCloseCanLeaveMaxConnectionSlotOccupied
+          TestScalePostgresTerminateBarrierRejectsUnboundedContextAndUnexpectedData
+          TestScalePostgresTerminateBarrierWaitsThenReleasesExactlyOneSlot
+          TestWaitSeamlessScaleManifestGatewayCancellationClosesPostgresProbe
+          TestWaitSeamlessScaleManifestGatewayNativeOnly
+          TestWaitSeamlessScaleManifestGatewayReturnsPostgresStartupFailure
+          TestWaitSeamlessScaleManifestGatewayWaitsForPostgresReady
+          EOF
+          grep -E "${race_test_regex}" "${evidence}/readiness-race-test-list.txt" | LC_ALL=C sort > "${evidence}/readiness-race-test-list.actual.txt"
+          diff -u "${evidence}/readiness-race-test-list.expected.txt" "${evidence}/readiness-race-test-list.actual.txt"
+          printf 'go test -race -count=20 -timeout=5m -run %s ./internal/gatewayruntime\n' \
+            "${race_test_regex}" > "${evidence}/readiness-race-command.txt"
+      - name: Race-check scale readiness and PostgreSQL shutdown barrier
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -race -count=20 -timeout=5m \
+            -run '^Test(WaitSeamlessScaleManifestGateway|ScalePostgres)' \
+            ./internal/gatewayruntime \
+            | tee "${RUNNER_TEMP}/seamless-scale-in-out/readiness-race-and-shutdown.txt"
       - name: Run strict seamless scale qualification
         shell: bash
         env:

@@ -36,8 +36,7 @@ func TestWriteBatchWarmedRecordAllocations(t *testing.T) {
 		t.Fatal(err)
 	}
 	collection := &Collection{options: options}
-	batch := &WriteBatch{collection: collection, active: true}
-	batch.ensurePositionCapacity(4)
+	batch := newOwnedWriteBatch(collection, 4)
 	key := []byte("alpha")
 	values := [][]byte{[]byte(`{"n":1}`), []byte(`{"n":2}`)}
 	for index := range values {
@@ -46,10 +45,8 @@ func TestWriteBatchWarmedRecordAllocations(t *testing.T) {
 		}
 	}
 	batch.reset()
-	batch.active = true
 	allocations := testing.AllocsPerRun(1_000, func() {
 		batch.reset()
-		batch.active = true
 		for index := range values {
 			if putErr := batch.Put(key, values[index]); putErr != nil {
 				panic(putErr)

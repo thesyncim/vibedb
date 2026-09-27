@@ -1,0 +1,74 @@
+Total: 7.12s
+ROUTINE ======================== github.com/thesyncim/vibedb/internal/storeio.(*RecoveryJournal).AppendPreparedConditionalBatch in <baseline-checkout>/internal/storeio/recovery_journal_conditional.go
+         0       40ms (flat, cum)  0.56% of Total
+         .          .    369:func (rj *RecoveryJournal) AppendPreparedConditionalBatch(
+         .          .    370:	generation uint64,
+         .          .    371:	markerID [16]byte,
+         .          .    372:	markerEpoch, txnID uint64,
+         .          .    373:	entries []RecoveryBatchEntry,
+         .          .    374:	plan RecoveryBatchPlan,
+         .          .    375:) (uint64, error) {
+         .          .    376:	if rj.nextSequence == 0 {
+         .          .    377:		return 0, ErrRecoveryJournalFull
+         .          .    378:	}
+         .          .    379:	if !plan.validForKind(
+         .          .    380:		recoveryRecordKindConditionalBatch, rj.header.SectorSize, len(entries),
+         .          .    381:	) {
+         .          .    382:		return 0, fmt.Errorf("%w: conditional batch plan", ErrInvalidWrite)
+         .          .    383:	}
+         .          .    384:	end, ok := checkedSizeAdd(
+         .          .    385:		rj.cursor, uint64(plan.padded), ^uint64(0),
+         .          .    386:	)
+         .          .    387:	if !ok || end > rj.header.Capacity {
+         .          .    388:		return 0, ErrRecoveryJournalFull
+         .          .    389:	}
+         .          .    390:	if cap(rj.scratch) < plan.padded {
+         .          .    391:		rj.scratch = make([]byte, plan.padded)
+         .          .    392:	}
+         .          .    393:	rec := RecoveryRecord{
+         .          .    394:		Sequence:   rj.nextSequence,
+         .          .    395:		Generation: generation,
+         .          .    396:		Kind:       recoveryRecordKindConditionalBatch,
+         .          .    397:		Entries:    entries,
+         .          .    398:		Conditional: RecoveryConditionalHeader{
+         .          .    399:			MarkerID:    markerID,
+         .          .    400:			MarkerEpoch: markerEpoch,
+         .          .    401:			TxnID:       txnID,
+         .          .    402:		},
+         .          .    403:	}
+         .          .    404:	nextFamily, nextDeltaEnd, nextAtomicGeneration, nextAtomicKind, nextConditional, err :=
+         .          .    405:		rj.validateAppendRecord(rec)
+         .          .    406:	if err != nil {
+         .          .    407:		return 0, err
+         .          .    408:	}
+         .       10ms    409:	if _, err := encodeRecoveryConditionalBatchRecordPrepared(
+         .          .    410:		rj.scratch[:plan.padded], rj.header.SectorSize, rec, plan,
+         .          .    411:	); err != nil {
+         .          .    412:		return 0, err
+         .          .    413:	}
+         .          .    414:	offset := int64(recoveryJournalRegionStart) + int64(rj.cursor)
+         .       30ms    415:	if err := writeRecoveryJournalFull(
+         .          .    416:		rj.writeAt, rj.scratch[:plan.padded], offset,
+         .          .    417:	); err != nil {
+         .          .    418:		return 0, err
+         .          .    419:	}
+         .          .    420:	rj.cursor = end
+ROUTINE ======================== github.com/thesyncim/vibedb/internal/storeio.(*TxnMarker).EntryCurrent in <baseline-checkout>/internal/storeio/txn_marker.go
+         0       20ms (flat, cum)  0.28% of Total
+         .          .   1430:func (m *TxnMarker) EntryCurrent() (bool, error) {
+         .          .   1431:	if m == nil || m.file == nil || m.root == nil ||
+         .          .   1432:		m.fileIdentity == nil || m.rawConn == nil {
+         .          .   1433:		return false, ErrInvalidWrite
+         .          .   1434:	}
+         .          .   1435:	if err := m.rawConn.Control(txnMarkerRawConnControl); err != nil {
+         .          .   1436:		return false, fmt.Errorf(
+         .          .   1437:			"vibedb: transaction marker descriptor is closed: %w",
+         .          .   1438:			errors.Join(os.ErrClosed, err),
+         .          .   1439:		)
+         .          .   1440:	}
+         .       20ms   1441:	entryInfo, err := m.root.Lstat(filepath.Base(m.path))
+         .          .   1442:	if err != nil {
+         .          .   1443:		return false, err
+         .          .   1444:	}
+         .          .   1445:	return entryInfo.Mode().IsRegular() &&
+         .          .   1446:		os.SameFile(m.fileIdentity, entryInfo), nil

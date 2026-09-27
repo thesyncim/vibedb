@@ -13,6 +13,24 @@ dated records kept in this directory. For how to run and debug them locally,
 see [build and test](../development/build-and-test.md#process-and-qualification-gates)
 and [debugging distributed failures](../development/debugging.md).
 
+## Whole-main write comparisons
+
+Two separate Ubuntu windows compare whole main `f9a9627a` with candidate
+`afa3eeec`; their samples are not pooled. The shared-payload result changes
+sign between the windows, so the data does not show a consistent shared-workload
+regression or establish why the windows differ. Neither window reaches 10×.
+
+| Window | Workload | Baseline median | Candidate median | Baseline/candidate ratio |
+| --- | --- | ---: | ---: | ---: |
+| [36311055724](https://github.com/thesyncim/vibedb/actions/runs/36311055724) | Distinct varied payloads | 10.074139 s | 6.336657 s | 1.589819× |
+| [36311055724](https://github.com/thesyncim/vibedb/actions/runs/36311055724) | Shared 256-byte payloads | 8.833278 s | 9.252889 s | 0.954651× |
+| [36313523724](https://github.com/thesyncim/vibedb/actions/runs/36313523724) | Distinct varied payloads | 9.391908 s | 5.315740 s | 1.766811× |
+| [36313523724](https://github.com/thesyncim/vibedb/actions/runs/36313523724) | Shared 256-byte payloads | 8.436975 s | 7.569802 s | 1.114557× |
+
+The [first-window report and captures](write-tail-2026-09-27/README.md#first-whole-main-ubuntu-comparison-run-36311055724)
+and [separate second-window report, captures, and profiles](write-tail-2026-09-27/whole-main-ubuntu-second-window-36313523724.md)
+retain independent provenance and results. The separate [incremental validated-tape comparison](write-tail-2026-09-27/validated-tape-incremental-9cc6385404.md) is `e9a718b1`→`9cc63854`, not a whole-main result; its ratios must not be multiplied into either window.
+
 ## Qualification workflows
 
 Durations are job run times (from start to completion, excluding queue time)
@@ -94,6 +112,8 @@ limitations.
 
 | Record | Report |
 | --- | --- |
+| `write-tail-2026-09-27` | [Rightmost-tail split write qualification](write-tail-2026-09-27/README.md) |
+| `write-geometry-2026-09-26` | [Runtime write geometry and read control](write-geometry-2026-09-26/README.md) |
 | `horizontal-ci-2026-09-05` | [Horizontal CI checkpoint](horizontal-ci-2026-09-05/README.md) |
 | `timer-backpressure-2026-09-05` | [Timer backpressure fixture race evidence](timer-backpressure-2026-09-05/README.md) |
 | `read-authority-2026-09-05` | [Intermediate quorum read authority qualification](read-authority-2026-09-05/README.md) |

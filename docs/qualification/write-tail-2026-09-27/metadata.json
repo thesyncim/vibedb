@@ -1,0 +1,215 @@
+{
+  "schema": "vibedb.write-tail-qualification/1",
+  "date": "2026-09-27",
+  "status": "performance diagnostic; the requested 10x minimum is not met",
+  "revisions": {
+    "candidate": "0478cfad76eb0fd4dd783c50850c991e060d3099",
+    "common_base": "f9a9627a513a1599bc00bdaf59f4eb93470d9fbf",
+    "baseline_scaffold": "5a689170ae5b1a4aba533e2e3e683876c4896a60"
+  },
+  "environment": {
+    "go": "go1.27.0 (verified from both test binaries)",
+    "goexperiment": "simd",
+    "goos": "darwin",
+    "goarch": "arm64",
+    "cpu": "Apple M4 Max",
+    "memory_gib": 64,
+    "macos": "26.3.1(a), build 25D771280a",
+    "contention": "Shared host; other applications were not stopped."
+  },
+  "workload": {
+    "write_rows_per_operation": 131072,
+    "rows_per_apply_batch": 64,
+    "durable_collections": 3,
+    "timed_scope": "SQL ReplicatedApply plus final checkpoint/fold",
+    "acknowledgement_contract": "Checkpoint-group marker-backed publication for each apply; final full-group certificate and fold are timed before the operation ends.",
+    "excluded_scope": [
+      "RF3/network traffic",
+      "proposal admission"
+    ],
+    "disk_sampling": "Every 64 batches outside timing; observed peak is sampled, not a guaranteed maximum.",
+    "payloads": {
+      "SequentialInsert": "Distinct varied generated payloads.",
+      "CompactSharedPayload": "256-byte payloads drawn from eight spellings."
+    }
+  },
+  "baseline_provenance": {
+    "kind": "storage overlay onto a diagnostic scaffold, not a whole-main build",
+    "base": "f9a9627a513a1599bc00bdaf59f4eb93470d9fbf",
+    "scaffold_head": "5a689170ae5b1a4aba533e2e3e683876c4896a60",
+    "overlaid_storage_files": [
+      "internal/storeio/common_primary_unified_leaf.go",
+      "internal/storeio/common_primary_unified_plan.go",
+      "internal/storeio/compact_primary_stripe.go",
+      "internal/storeio/primary_value_incremental.go",
+      "store/durable/store_file_batch.go",
+      "store/durable/store_file_primary_batch.go",
+      "store/durable/store_file_primary_batch_topology.go"
+    ],
+    "overlaid_source_sha256": {
+      "internal/storeio/common_primary_unified_leaf.go": "c5e6b2136ecd1616399a7855d32b60cdf530ad6b550741e0161a2307512a43f7",
+      "internal/storeio/common_primary_unified_plan.go": "86d681dc17bf8e3b2d204d1d2515883c388352e40eff682a4e93429e7c91a081",
+      "internal/storeio/compact_primary_stripe.go": "5c49fc5927e094e362013023af47e482d1a8b862a58c8398ad3a238c0e8ed068",
+      "internal/storeio/primary_value_incremental.go": "b1702be7413071d13bf19cd0694ef8bd8dc4a1e19fd6f2cac090cbac4393a3d6",
+      "store/durable/store_file_batch.go": "69dff3cae97852df288e1eed55c6d0603a7c90c35a867f92ee0ee2f839353bb8",
+      "store/durable/store_file_primary_batch.go": "b8132fbd4f29c0d6bdd63e617273b552dea51b55f6f3abb8f26e7d4a980b8046",
+      "store/durable/store_file_primary_batch_topology.go": "2d15259d77b166b123f3fc2ffb7ce3bfc6c5600c29c2529561463e8bae3994a8"
+    },
+    "scaffold_source_sha256": {
+      "internal/storeio/primary_graph_incremental_test.go": "755cc74653fdfe75e726b11234fa653228660c7e3a2d144111bd95ebef7a794c",
+      "store/durable/store_file_batch_equal_replace_test.go": "cf4bef190f0f66e8091b73c2e9dbd1998af4b49cb1fc57a230c0d6465b99b575",
+      "store/durable/store_file_primary_batch_topology_test.go": "f0745529833b30b01f78878654bd29cf0844f9442bf266232d7d35b6fc98fff4",
+      "store/durable/store_file_primary_batch_compact_window_test.go": "e496ea4279d7d26958f93f22626f4c6af5a97f8b648f0799563d23d8deb91ccd"
+    },
+    "benchmark_source_sha256": "729aecb98499032f9e667a91d5e71a694e1470ae31ec93cb48a3faecef3ece27",
+    "benchmark_source_commit": "9a1365239",
+    "benchmark_source_file": "sql/driver/replicated_apply_batch64_bench_test.go",
+    "benchmark_source_role": "Untimed metrics and equivalent workload/timing scaffold from the committed pre-tail benchmark source.",
+    "binary_sha256": "6435ff51323e644064a995a8486b2820c4c4aaa9def41b70d8b3e41d48afee8b",
+    "provenance_inputs_sha256": {
+      "candidate2_manifest": "f6438dccfcbe7ed57d4c63aade689b0a12cc3f1208f7d269a00907fa82226535",
+      "main_overlay_manifest": "e896c12c2b194a5dc46a610ad828e50fe021400033f6cd73e9739e6fa90efb4e"
+    }
+  },
+  "candidate_provenance": {
+    "head": "0478cfad76eb0fd4dd783c50850c991e060d3099",
+    "base": "f9a9627a513a1599bc00bdaf59f4eb93470d9fbf",
+    "binary_sha256": "bb609065d42fac3e2e04380f63ded753b5f1c0c4ecb49a7023489b8b6ec6fff7",
+    "benchmark_source_sha256": "6723b2c66c29910c89dbc51db515e59edb0f2266350caaa2cb48fff30db71b3a",
+    "read_benchmark_source_sha256": "752c58760b421901a5d40577861e00e45195b83e5646a418edb913791f06ce47",
+    "source_sha256": {
+      "UNSAFE.md": "a8a1969a5cea6ac7a22744809cb7e5cbd2370dd10b4a6973bbe9ea0883aec718",
+      "docs/qualification/README.md": "d25e0828bfa04c7a826ccd5361ca3695ce388e9db35d28ec3ebdd284831e2511",
+      "docs/qualification/write-geometry-2026-09-26/README.md": "bc3aec95a3bb229ee42d6f2624132ffb3a2b1ecd54351123df82b136a9bc2ffa",
+      "docs/qualification/write-geometry-2026-09-26/alphabet-kernel.txt": "bbdf407aa8cd07473d40efd2c2b6128e94096ca2a45ffc0d9fd3b0c02f0bea15",
+      "docs/qualification/write-geometry-2026-09-26/alphabet-metadata.json": "6038f8f5d42d4501c322db88c70efeefeca07380e9be6bf894f6b4bd04009304",
+      "docs/qualification/write-geometry-2026-09-26/metadata.json": "17ec53c33a4531714981987f3340ef979688e4435c4ba90cbea918e797cec74a",
+      "docs/qualification/write-geometry-2026-09-26/read-runs.json": "bc0ac7a5d69f19f4e27ca51a7959317f89d6f289fcc00d32aa0a5aad694fe9be",
+      "docs/qualification/write-geometry-2026-09-26/write-runs.json": "f344060e3e306bad7a53c8ad9987e8e06c57340baf0343a66490ec3b1dec6c1a",
+      "gateway/replicated_request_execution_pin_session_cancellation_test.go": "5dfadbaa991db5b333ed1f38f295468076bcd541e2de3d2afdc90040f516de99",
+      "gateway/replicated_request_execution_pin_session_factory.go": "8e6535e1b537c103e7f317ff1181a7683aa005c3443a01d817e091ace566125d",
+      "gateway/replicated_request_execution_pin_session_factory_test.go": "be36465f93c86ee0d44a98b578498835c118db61e828dec64a5d12b2ed20bdd3",
+      "gateway/schema_rollout_controller.go": "4324ae492c28daa37e910a94cb9223aa48d53445211d0efacdc3c50d3a5b6200",
+      "gateway/schema_rollout_controller_test.go": "1aae0910ff9177b4629125f9dd9e26c8d3470ddfa80025c7bd28dc9b321383dc",
+      "go.mod": "d8a2247c51e90ad2c1c02d6674ce763989852bbcdc07e538da11b97de874aa83",
+      "go.sum": "1345b5aa59dd81fe475fa71f871e2af68df9e97819eeea077fc033b1171cdf85",
+      "internal/rafttransport/stream.go": "cb62f653ae8c5cc6d56e7d8a74652c4c0411c42d03274987d7cdc1211d743bbd",
+      "internal/rafttransport/stream_lifecycle_test.go": "5d1a217e02c99bb8c064e0450b6f1a3aea745aa6c51e2c9a23c57daa48df60ba",
+      "internal/rf3testfixture/process_lifecycle_unix_test.go": "d8e57989610163c7155d0b929abd0d8c846cd05e779b600b9ee29650e53357dd",
+      "internal/schemainstall/client.go": "9110d8bbe7644ba9c250fbc17ceadb2c1f30733440d488dca55378b2094756d9",
+      "internal/schemainstall/client_retry_test.go": "bf4e7713b92b27d8912b20710792bdf1490322603fba2b74f0b9fcafc7d4bea6",
+      "internal/schemainstall/client_retry_unix_test.go": "33e961dd29fab1af06728e7b225853077495f1bb6044d83a0f39858ac2cfb23f",
+      "internal/schemainstall/client_retry_windows_test.go": "d43204f792d4631c74f87efa3d7537ff762d5370e8476113b49719b3ba0b38d8",
+      "internal/schemainstall/transient_open_unix.go": "ee57216a490c56a446a17937ace448ac64ff4d24be1c3cca4e1cef7c35cfaa27",
+      "internal/schemainstall/transient_open_windows.go": "904f84ffc1ff05f74456427080af970f5ff62d0cef3d44d548a4d5078239d2a6",
+      "internal/schemainstall/types.go": "b550005deb1457465a6428f844f063b8449745525e685ab45c00a5d8973190e8",
+      "internal/storeio/common_primary_unified_leaf.go": "c5e6b2136ecd1616399a7855d32b60cdf530ad6b550741e0161a2307512a43f7",
+      "internal/storeio/common_primary_unified_plan.go": "86d681dc17bf8e3b2d204d1d2515883c388352e40eff682a4e93429e7c91a081",
+      "internal/storeio/compact_primary_stripe.go": "5c49fc5927e094e362013023af47e482d1a8b862a58c8398ad3a238c0e8ed068",
+      "internal/storeio/compact_stream_codec.go": "2393de05c8d18dbb1e59b7f2000007d2d3dcd94bfdf262185e90854af64d8e30",
+      "internal/storeio/compact_stream_codec_alphabet_alloc_race_test.go": "703c7313c94ee51acc25bdc329ba801476ed29db081061c8ea78f244fad86117",
+      "internal/storeio/compact_stream_codec_alphabet_alloc_test.go": "0e8de6004a63068efa8b469fb52dd11fbb9b59632b74333eb19e8f5960a19e7d",
+      "internal/storeio/compact_stream_codec_alphabet_bench_test.go": "478c5409297e1b0b5127bb33c4faebe2cc8ebe9952178baf1b5b6268d5949db8",
+      "internal/storeio/compact_stream_codec_test.go": "ab48fdc864d3078e0c2a1bedc5d6417516393bb34bcc5f5ffd5c3ebceb451e73",
+      "internal/storeio/page_cache.go": "f40df2db492b2f5c9e0af10f0d41870b6bf68b7d05c461de52de060044ab83bc",
+      "internal/storeio/primary_graph_incremental_test.go": "58cc9e7062e4497300401da0fc79b90ca498b677f3e233b67bd58e1f955bf7fb",
+      "internal/storeio/primary_value_incremental.go": "b1702be7413071d13bf19cd0694ef8bd8dc4a1e19fd6f2cac090cbac4393a3d6",
+      "internal/storeio/resident_primary_router.go": "b0acc585ea1be224c6de46bf7dabded141f08d6138e6047c024d5c5564c610f7",
+      "internal/storeio/resident_primary_router_allocation_test.go": "4b6688f6f82808de08ab1afbd8d780c34544a0293c2e9ff451db98b8d21a52fe",
+      "sql/driver/replicated_apply_batch64_bench_test.go": "6723b2c66c29910c89dbc51db515e59edb0f2266350caaa2cb48fff30db71b3a",
+      "sql/driver/replicated_apply_batch64_read_bench_test.go": "752c58760b421901a5d40577861e00e45195b83e5646a418edb913791f06ce47",
+      "sql/driver/replicated_apply_structural_certification_test.go": "bac0b4a64f671026dbff56d6660a8c1cbf6c33e9dab5b5af1386f35eb0a522da",
+      "store/durable/checkpoint_group.go": "d7eb339628290f05bd3891871f3b9d2c2acd0174c14d3850c0eb93f473b0e17e",
+      "store/durable/checkpoint_group_structural_certification_test.go": "72c462504aa6fae348eee96f2065c6baac73aa8e63524ff956b94d839deb6a70",
+      "store/durable/checkpoint_group_terminal_test.go": "d8b32f37932970d2f846ff11817ffb11f67da2c0aab8ebf56268bb942fb331d8",
+      "store/durable/store_batch_owner_test.go": "a34aee9f25639deebc38dcc47ae123e406abe3e22dcf627ffaa44fca1e1b1263",
+      "store/durable/store_database_txn.go": "5866c69ba8577fc5b2b82d6c65f674f6b96ee78f3ec0c5009888b5717f353c4e",
+      "store/durable/store_file.go": "70f870121e970e41ed7b8fe0bc5b84bba9ccee1d5ed7ad0da320efafb1e1cc93",
+      "store/durable/store_file_alloc_test.go": "a001f31934fc6e3a02bc0220e7b95f76c723a8a4da5b0c88d2b67db846b107a3",
+      "store/durable/store_file_batch.go": "9ff5941236d8158dd9e35c2c9fcd451728e427b6a7cd9a686a7f8fc225a936c3",
+      "store/durable/store_file_batch_equal_replace_test.go": "cf4bef190f0f66e8091b73c2e9dbd1998af4b49cb1fc57a230c0d6465b99b575",
+      "store/durable/store_file_free_test.go": "050d3b2b4673125f689a027aa67f2d2b5d69f66739a7e748686d5657a8dc33f5",
+      "store/durable/store_file_journal.go": "f8277a1b73d55c601d2efb6f104ed75945f39464e6dc40ff104c87858e64d862",
+      "store/durable/store_file_lifecycle.go": "6e2a04920c0952be01e3bc73d6d6f98469e5c85d198189753fee450fba0532a1",
+      "store/durable/store_file_mutation_combiner.go": "6f8a70c34f6c0ffd936a12d6355eaa3a47a8b1d62756535ac4cd61b80b571fac",
+      "store/durable/store_file_operations.go": "d1fc67e654b832716712ab0f1f3eba75ba5ab9621da07c402dbcfcecf0ede01d",
+      "store/durable/store_file_primary_batch.go": "1ac4f293f5b71e9b9597af0a4eb99f5d4f6cd9b240d2e3ab7e9c6ac077b42cd0",
+      "store/durable/store_file_primary_batch_canonical_test.go": "ac581024403a3905b4da6e7750735efde92ffda4b57632162b7fa7d5646a1d72",
+      "store/durable/store_file_primary_batch_compact_window_test.go": "94315cb098cb7170e456a2dfbcf1019692881549a11be24346eb981a56c4fbbe",
+      "store/durable/store_file_primary_batch_tail.go": "7a30958440c29d1b9a7c6cd068d5a46d08150d55958138e36c64bce7f0cb8183",
+      "store/durable/store_file_primary_batch_topology.go": "55af97ee8c1667d2af77f614bc25d6f1704ee871cda7f25c8a6c1dba5cd8092e",
+      "store/durable/store_file_primary_batch_topology_test.go": "f0745529833b30b01f78878654bd29cf0844f9442bf266232d7d35b6fc98fff4",
+      "store/durable/store_file_primary_mutation.go": "6dd46b72cec678b3e2d40f4eefbc7e325e16fecaa008af0c509aa97ebe519e5b",
+      "store/durable/store_file_primary_mutation_test.go": "72fa641b21c676e4cc244f4e0dd512fed54b8ca6275ba7681b75bdd5a21bd215",
+      "store/durable/store_file_primary_tail_accounting_test.go": "33c2d672c18e9e71b79af72235d1117e7840e8db9ef56827c7db9ef6563d22b4",
+      "store/durable/store_file_primary_tail_checkpoint.go": "f9fd7af939d269ecefc4603726b3073aede0c21120d8698d388c387ad38d85ce",
+      "store/durable/store_file_primary_tail_checkpoint_test.go": "44ddc6d6d3fbcc297b7f7a98677ea9c8c1a71ba108b0df74577c50334c193454",
+      "store/durable/store_file_primary_tail_epoch_test.go": "913b1c748d64e221adf690f327de9b5b0b1b6c5a37725d72f9119a4a10faf1f3",
+      "store/durable/store_file_repack.go": "403c8ba0d796ce26cdca2e6e9a9f4e81b380f6a6efba20ac7181337ed7504cd0"
+    },
+    "build_command": {
+      "argv": [
+        "project-env",
+        "go",
+        "test",
+        "-c",
+        "./sql/driver",
+        "-o",
+        "<candidate-driver.test>"
+      ],
+      "environment": {
+        "GOEXPERIMENT": "simd",
+        "CODEX_AGENT_ID": "<unique-per-run>"
+      }
+    },
+    "source_manifest_sha256": "6769a98397c7aaf771e8363aa8b5b8518eca56c27f1508f50a58628b9c67e775"
+  },
+  "read_control": {
+    "candidate_binary_sha256": "bb609065d42fac3e2e04380f63ded753b5f1c0c4ecb49a7023489b8b6ec6fff7",
+    "baseline_binary_sha256": "fdf562e708b966ac4734e7eec0584b823739bfb5e4bced14b8ee1e9efcb7c566",
+    "benchmark_source_sha256": "752c58760b421901a5d40577861e00e45195b83e5646a418edb913791f06ce47",
+    "pair_order": [
+      "candidate",
+      "baseline"
+    ],
+    "scope": "One fresh matched 50x pair; no aggregation with historical measurements."
+  },
+  "validation": {
+    "ci": {
+      "successful_checks": 45,
+      "optional_skipped_checks": 2,
+      "revision": "0478cfad76eb0fd4dd783c50850c991e060d3099",
+      "scope": "Across the final PR CI workflows; the linked workflow run includes SQL and race results.",
+      "run_url": "https://github.com/thesyncim/vibedb/actions/runs/36287261792"
+    },
+    "local_durable_simd": {
+      "result": "PASS",
+      "elapsed_seconds": 900.48
+    },
+    "initial_full_sql": {
+      "result": "FAIL",
+      "elapsed_seconds": 205.719,
+      "failed_test": "TestReplicatedApplyBatch64StructuralCertification",
+      "reason": "The fixture's final append stayed on the volatile tail lane instead of reaching the physical certification split. The fixture was corrected to include an overflow value and keep the physical path."
+    },
+    "after_sql_fixture_correction": {
+      "focused_race_nosimd": "PASS",
+      "final_full_sql_ci": "PASS",
+      "ci_run_url": "https://github.com/thesyncim/vibedb/actions/runs/36287261792"
+    }
+  },
+  "interpretation_limits": [
+    "The write baseline contains only the recorded storage overlay from main f9 in scaffold 5a; it is not a complete main build.",
+    "The one fresh read pair is diagnostic and does not establish a general read-latency claim.",
+    "Current tail charge includes lineage metadata and retained router history. Peak charge also includes dirty-frame and in-flight frame, router, planning-scratch and fold reservations; these budget charges are not RSS or total process memory.",
+    "The user-relation device-byte metric excludes system-collection bytes; final allocated file bytes cover all three collections.",
+    "The append-leaf-splits metric counts physical structural split transactions, not every logical tail split.",
+    "Sampled file-space peaks are observations, not hard bounds.",
+    "CPU profile runs include untimed setup and oracle work; profile times are not benchmark comparisons."
+  ],
+  "evidence_input_sha256": {
+    "tail_pair_metrics": "62ee1b64dac852a262d6e4aae93bd899f9b488dcddb1279ffe34c78c452c7464",
+    "tail_pair_runs": "7a22b4093bf0918b0fefe53dbdeb3b8fff6ca01e94bd7efed331ff42bed27e30",
+    "read_pair_runs": "82e1cbce5fa6727532c2b9559f4d776faf60ab24cc567e70a6e39c120f28847f"
+  }
+}

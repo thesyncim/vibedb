@@ -1,0 +1,197 @@
+Total: 9.69s
+ROUTINE ======================== github.com/thesyncim/vibedb/internal/storeio.(*compactStreamScratch).encodeShape in <baseline-checkout>/internal/storeio/compact_stream_codec.go
+         0      2.25s (flat, cum) 23.22% of Total
+         .          .    152:func (s *compactStreamScratch) encodeShape(values [][]byte, ranks []uint16, leafRows int) compactStreamEncoding {
+         .      2.25s    153:	return s.encodeShapeWithRankContext(values, ranks, leafRows, nil, nil)
+         .          .    154:}
+         .          .    155:
+         .          .    156:func (s *compactStreamScratch) encodeShapeWithRankContext(
+         .          .    157:	values [][]byte,
+         .          .    158:	ranks []uint16,
+ROUTINE ======================== github.com/thesyncim/vibedb/internal/storeio.(*compactStreamScratch).encodeShapeWithRankContext in <baseline-checkout>/internal/storeio/compact_stream_codec.go
+      20ms      2.25s (flat, cum) 23.22% of Total
+         .          .    156:func (s *compactStreamScratch) encodeShapeWithRankContext(
+         .          .    157:	values [][]byte,
+         .          .    158:	ranks []uint16,
+         .          .    159:	leafRows int,
+         .          .    160:	rankContext *compactRankContext,
+         .          .    161:	rankView *CompactPrimaryStripeView,
+         .          .    162:) compactStreamEncoding {
+         .          .    163:	if len(values) == 0 {
+         .          .    164:		return compactStreamEncoding{kind: compactStreamDictionary}
+         .          .    165:	}
+         .      560ms    166:	dictionaryBytes := s.measureDictionary(values)
+         .      170ms    167:	frontBytes := measureCompactFront(values)
+         .          .    168:	n := 3
+         .          .    169:	alphabetLimit := min(
+         .          .    170:		dictionaryBytes,
+         .          .    171:		frontBytes,
+         .          .    172:	)
+         .          .    173:	// The alphabet plan's row geometry still depends on every value in order,
+         .          .    174:	// but its symbol set only depends on the distinct spellings. Reuse the
+         .          .    175:	// dictionary census already built above when duplicates are present, while
+         .          .    176:	// keeping the original slice as the common all-unique case.
+         .          .    177:	alphabetSpellings := values
+         .          .    178:	if len(s.dict[0]) < len(values) {
+         .          .    179:		alphabetSpellings = s.dict[0]
+         .          .    180:	}
+         .      450ms    181:	alphabet, hasAlphabet := s.measureAlphabetWithSpellings(
+         .          .    182:		2, values, alphabetSpellings, alphabetLimit,
+         .          .    183:	)
+         .          .    184:	// Reserve the last backing slot for the prefix candidate so constructing
+         .          .    185:	// the ordinary numeric alternatives below cannot overwrite its bytes.
+         .      480ms    186:	numeric, hasPrefix := s.encodePrefixIntShapeWithRankContext(
+         .          .    187:		7, values, ranks, leafRows, rankContext, rankView,
+         .          .    188:	)
+         .          .    189:	rankNumber := hasPrefix && numeric.kind == compactStreamRankAffine &&
+         .          .    190:		numeric.data[0] == 2 && len(numeric.dict[0]) == 0 && len(numeric.dict[1]) == 0
+         .          .    191:	allIntegers := !rankNumber
+         .          .    192:	if allIntegers {
+         .          .    193:		s.integers = slices.Grow(s.integers[:0], len(values))[:len(values)]
+         .          .    194:		for i := range values {
+      20ms       80ms    195:			s.integers[i], allIntegers = CanonicalIntValue(values[i])
+         .          .    196:			if !allIntegers {
+         .          .    197:				break
+         .          .    198:			}
+         .          .    199:		}
+         .          .    200:	}
+         .          .    201:	// A bare rank descriptor is exactly 34 bytes and proves at least 64
+         .          .    202:	// distinct integers. FOR and varint delta need at least 68/87 bytes.
+         .          .    203:	// Packed delta needs at least 41 bytes: its only smaller 64-row case,
+         .          .    204:	// constant -1 deltas, already selected the local-affine prefix form.
+         .          .    205:	// Dictionary/front/alphabet choices and their tie policy still compete.
+         .          .    206:	if allIntegers {
+         .       60ms    207:		s.candidates[n] = s.encodeFOR(n, s.integers)
+         .          .    208:		n++
+         .       80ms    209:		s.candidates[n] = s.encodeDelta(n, s.integers)
+         .          .    210:		n++
+         .       70ms    211:		s.candidates[n] = s.encodeDeltaPack(n, s.integers)
+         .          .    212:		n++
+         .          .    213:	}
+         .          .    214:	allDates := !rankNumber
+         .          .    215:	if allDates {
+         .          .    216:		s.dates = slices.Grow(s.dates[:0], len(values))[:len(values)]
+         .          .    217:		for i := range values {
+         .          .    218:			s.dates[i], allDates = compactDateOrdinal(values[i])
+         .          .    219:			if !allDates {
+         .          .    220:				break
+         .          .    221:			}
+         .          .    222:		}
+         .          .    223:	}
+         .          .    224:	if allDates {
+         .          .    225:		s.candidates[n] = s.encodeDate(n, s.dates)
+         .          .    226:		n++
+         .          .    227:	}
+         .          .    228:	if hasPrefix {
+         .          .    229:		s.candidates[n] = numeric
+         .          .    230:		n++
+         .          .    231:	}
+         .          .    232:	bestBytes := frontBytes
+         .          .    233:	bestSlot := -1
+         .          .    234:	if hasAlphabet && alphabet.encoded < bestBytes {
+         .          .    235:		bestBytes = alphabet.encoded
+         .          .    236:		bestSlot = 2
+         .          .    237:	}
+         .          .    238:	for slot := 3; slot < n; slot++ {
+         .          .    239:		candidate := s.candidates[slot]
+         .          .    240:		if candidate.encodedBytes() < bestBytes {
+         .          .    241:			bestBytes = candidate.encodedBytes()
+         .          .    242:			bestSlot = slot
+         .          .    243:		}
+         .          .    244:	}
+         .          .    245:	// Dictionary was historically the first candidate, so an exact-size tie
+         .          .    246:	// must still select it. Defer its sort and row-ID stream until that work can
+         .          .    247:	// affect the result; high-cardinality columns normally choose alphabet or
+         .          .    248:	// front coding and otherwise paid for a discarded O(rows log rows) build.
+         .          .    249:	// A small dictionary scans packed IDs much faster than spelling-oriented
+         .          .    250:	// codecs. Keep it when its exact size is within 25% of the byte minimum;
+         .          .    251:	// this is a representation choice, not a posting index or row-skipping path.
+         .          .    252:	preferDictionaryScan := len(s.dict[0]) <= compactDictionaryScanPreferred &&
+         .          .    253:		dictionaryBytes <= bestBytes+bestBytes/4
+         .          .    254:	if dictionaryBytes <= bestBytes || preferDictionaryScan {
+         .      300ms    255:		return s.finishDictionary(values)
+         .          .    256:	}
+         .          .    257:	if bestSlot < 0 {
+         .          .    258:		return s.encodeFront(1, values)
+         .          .    259:	}
+         .          .    260:	if bestSlot == 2 {
+ROUTINE ======================== github.com/thesyncim/vibedb/internal/storeio.(*compactStreamScratch).measureAlphabetWithSpellings in <baseline-checkout>/internal/storeio/compact_stream_codec.go
+     130ms      450ms (flat, cum)  4.64% of Total
+         .          .    468:func (s *compactStreamScratch) measureAlphabetWithSpellings(
+         .          .    469:	slot int,
+         .          .    470:	values [][]byte,
+         .          .    471:	spellings [][]byte,
+         .          .    472:	limit int,
+         .          .    473:) (compactAlphabetPlan, bool) {
+         .          .    474:	blocks := (len(values) + compactStreamRestart - 1) / compactStreamRestart
+         .      310ms    475:	prefix, suffix := compactSharedAffixes(values)
+         .          .    476:	var present [256]bool
+         .          .    477:	count := 0
+         .          .    478:	for _, value := range spellings {
+         .          .    479:		middle := value[prefix : len(value)-suffix]
+      10ms       10ms    480:		for _, b := range middle {
+      70ms       70ms    481:			if !present[b] {
+         .          .    482:				present[b] = true
+         .          .    483:				count++
+         .          .    484:			}
+         .          .    485:		}
+         .          .    486:	}
+         .          .    487:	if count == 0 || count > 64 {
+         .          .    488:		return compactAlphabetPlan{}, false
+         .          .    489:	}
+      10ms       10ms    490:	width := bits.Len(uint(count - 1))
+         .          .    491:	totalBytes := 4 * blocks
+         .          .    492:	for first := 0; first < len(values); first += compactStreamRestart {
+         .          .    493:		last := min(first+compactStreamRestart, len(values))
+         .          .    494:		lo, hi, characters := 0, 0, 0
+         .          .    495:		for row, value := range values[first:last] {
+         .          .    496:			middle := len(value) - prefix - suffix
+      10ms       10ms    497:			if row == 0 {
+         .          .    498:				lo, hi = middle, middle
+         .          .    499:			} else {
+      10ms       10ms    500:				lo, hi = min(lo, middle), max(hi, middle)
+         .          .    501:			}
+      10ms       10ms    502:			characters += middle
+         .          .    503:		}
+         .          .    504:		lengthWidth := bits.Len(uint(hi - lo))
+         .       10ms    505:		totalBytes += compactUvarintLen(uint64(lo)) + 1 +
+      10ms       10ms    506:			((last-first)*lengthWidth+7)/8
+         .          .    507:		totalBytes += (characters*width + 7) / 8
+         .          .    508:	}
+         .          .    509:	dictionaryEntries, affixBytes := 1, 0
+         .          .    510:	if prefix != 0 || suffix != 0 {
+         .          .    511:		dictionaryEntries = 3
+ROUTINE ======================== github.com/thesyncim/vibedb/internal/storeio.(*compactStreamScratch).measureDictionary in <baseline-checkout>/internal/storeio/compact_stream_codec.go
+      90ms      560ms (flat, cum)  5.78% of Total
+         .          .    266:func (s *compactStreamScratch) measureDictionary(values [][]byte) int {
+         .          .    267:	dictionary := slices.Grow(s.dict[0][:0], len(values))[:0]
+         .          .    268:	s.dict[0] = dictionary
+         .          .    269:	dictionaryBytes := 0
+         .          .    270:	hashed := false
+      50ms       50ms    271:	for _, value := range values {
+         .          .    272:		if hashed {
+      10ms      340ms    273:			if _, found := s.dictionaryLookup(value); found {
+         .          .    274:				continue
+         .          .    275:			}
+         .          .    276:		} else {
+         .          .    277:			found := false
+      10ms       10ms    278:			for _, existing := range dictionary {
+         .       50ms    279:				if bytes.Equal(existing, value) {
+         .          .    280:					found = true
+         .          .    281:					break
+         .          .    282:				}
+         .          .    283:			}
+         .          .    284:			if found {
+         .          .    285:				continue
+         .          .    286:			}
+         .          .    287:		}
+      10ms       10ms    288:		dictionary = append(dictionary, value)
+         .          .    289:		s.dict[0] = dictionary
+      10ms       10ms    290:		dictionaryBytes += len(value)
+         .          .    291:		if hashed {
+         .       90ms    292:			s.dictionaryInsert(value, uint32(len(dictionary)-1))
+         .          .    293:		} else if len(dictionary) == compactDictionaryHashThreshold {
+         .          .    294:			s.resetDictionaryTable(len(values))
+         .          .    295:			for id, existing := range dictionary {
+         .          .    296:				s.dictionaryInsert(existing, uint32(id))
+         .          .    297:			}

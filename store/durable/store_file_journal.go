@@ -933,7 +933,7 @@ func (c *Collection) replayRecoveryJournalResolvedPolicyLocked(
 				// raw point expansion for deletes/overflow replacements and avoids
 				// a full-bucket exact rebase under a smaller reopening geometry.
 				// New inserts retain the historical point path below.
-				entryErr = c.Update(func(batch *WriteBatch) error {
+				entryErr = c.updatePrimaryBatchPrivate(func(batch *WriteBatch) error {
 					return batch.appendRecovery(
 						entry.Key, entry.Value,
 						entry.Kind == storeio.RecoveryRecordKindDelete,
@@ -979,7 +979,7 @@ func (c *Collection) replayRecoveryJournalResolvedPolicyLocked(
 		// memory and prevents a pressure checkpoint from persisting a prefix
 		// that a second recovery could mistake for the whole one-generation
 		// record.
-		batchErr := c.Update(func(batch *WriteBatch) error {
+		batchErr := c.updatePrimaryBatchPrivate(func(batch *WriteBatch) error {
 			for i := range rec.Entries {
 				entry := rec.Entries[i]
 				switch entry.Kind {

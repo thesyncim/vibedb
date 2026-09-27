@@ -3,6 +3,7 @@ package storeio
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"slices"
 	"strconv"
@@ -61,8 +62,12 @@ func checkCanonicalAgainstLibrary(t *testing.T, ws *CanonicalWorkspace, src []by
 			src, spanned, certificate.Bytes(), want,
 		)
 	}
-	if gotCheck, wantCheck := IndexIsCanonical(index, ws), bytes.Equal(src, want); gotCheck != wantCheck {
+	wantCheck := bytes.Equal(src, want)
+	if gotCheck := IndexIsCanonical(index, ws); gotCheck != wantCheck {
 		t.Fatalf("IndexIsCanonical(%q) = %v, want %v (canonical form %q)", src, gotCheck, wantCheck, want)
+	}
+	if gotCheck := indexIsCanonicalValidatedTape(index, ws); gotCheck != wantCheck {
+		t.Fatalf("indexIsCanonicalValidatedTape(%q) = %v, want %v (canonical form %q)", src, gotCheck, wantCheck, want)
 	}
 	// Idempotence: rendering the canonical bytes reproduces them and the
 	// fast check accepts them, so journal replay of canonical bytes is a
@@ -98,6 +103,9 @@ func checkCanonicalAgainstLibrary(t *testing.T, ws *CanonicalWorkspace, src []by
 	}
 	if !IndexIsCanonical(canonIndex, ws) {
 		t.Fatalf("IndexIsCanonical rejects its own render: %q", want)
+	}
+	if !indexIsCanonicalValidatedTape(canonIndex, ws) {
+		t.Fatalf("validated-tape checker rejects its own render: %q", want)
 	}
 }
 
@@ -141,6 +149,11 @@ func TestCanonicalRenderHandcrafted(t *testing.T) {
 		// Raw U+2028/U+2029 normalize to their lowercase escapes for
 		// JSON/JavaScript compatibility; those escaped spellings remain fixed.
 		"\"a b\"", "\"a b\"", "\"\\u2028\"", "\"\\u2029\"",
+		// The separator check must also cover object keys, byte boundaries,
+		// and valid multibyte text around the sequence.
+		"\" start\"", "\"end \"",
+		"{\"a \":1}", "{\"a \":1}", "{\"\\u2028\":1}",
+		"{\"é\":\"x y\",\"→\":\"z w\"}",
 		// Escaped keys sort by their *decoded* spelling: "c" decodes
 		// to "c" and must sort after "b" even though its raw first byte
 		// '\\' precedes 'b'.
@@ -161,12 +174,12 @@ func appendRandomCanonicalTestValue(dst []byte, rng *rand.Rand, depth int) []byt
 	keys := []string{
 		"a", "b", "aa", "ab", "z", "id", "name", "é", "\\u0061",
 		"\\n", "k\\u002fx", "→", "", "score", "active", "A", "Z",
-		"\\uD83D\\uDE00",
+		"\\uD83D\\uDE00", "line key", "para key", "line\\u2028key",
 	}
 	strs := []string{
 		"", "x", "hello world", "\\u0041\\u005A", "line\\nbreak", "\\/",
 		"emoji \\ud83d\\ude00", "é→", "tab\\there", "\\u001f",
-		"q\\\"q", "a b",
+		"q\\\"q", "a b", "before after", "a\\u2028b",
 	}
 	nums := []string{
 		"0", "-0", "1", "-1", "42", "1234567890123", "0.5", "-3.25",
@@ -286,6 +299,18 @@ func TestCanonicalCheckRejectsNonCanonical(t *testing.T) {
 	}
 }
 
+func TestIndexIsCanonicalStillChecksUTF8ForExternallyMutatedTapeSource(t *testing.T) {
+	src := []byte(`"é"`)
+	index := buildTestIndex(t, src)
+	// Index aliases its source. Mutate one byte without changing the length to
+	// model an index whose source no longer satisfies BuildIndex's proof. The
+	// exported check remains defensive and must reject malformed UTF-8.
+	src[1] = 0xff
+	if IndexIsCanonical(index, &CanonicalWorkspace{}) {
+		t.Fatalf("IndexIsCanonical accepted a tape with mutated invalid UTF-8 source %x", src)
+	}
+}
+
 func TestCanonicalRenderEmptyTapeFailsClosed(t *testing.T) {
 	ws := &CanonicalWorkspace{}
 	if _, err := AppendCanonicalIndexed(nil, vibejson.Index{}, ws); err == nil {
@@ -343,7 +368,83 @@ func TestCanonicalRenderZeroAllocs(t *testing.T) {
 	}); allocs != 0 {
 		t.Errorf("IndexIsCanonical allocates %.1f/op, want 0", allocs)
 	}
+	validatedOK := true
+	if allocs := testing.AllocsPerRun(200, func() {
+		validatedOK = validatedOK && indexIsCanonicalValidatedTape(canonIndex, ws)
+	}); allocs != 0 {
+		t.Errorf("indexIsCanonicalValidatedTape allocates %.1f/op, want 0", allocs)
+	}
 	if !ok {
 		t.Error("IndexIsCanonical rejected the canonical render")
+	}
+	if !validatedOK {
+		t.Error("validated-tape checker rejected the canonical render")
+	}
+}
+
+func TestCompactStripeValidatedTapeCanonicalBytes(t *testing.T) {
+	documents := []string{
+		`{"b":2,"a":"é→"}`,
+		`"before middle after"`,
+		`{"line key":"x","line\u2029key":"y"}`,
+		`{"a":[1,{"b":"x\u2028y","b":"y"}],"a":2}`,
+		`["x ","x\u2029","é"]`,
+	}
+	storeID := unifiedTestStoreID()
+	records := make([]CommonPrimaryLeafRecord, len(documents))
+	want := make([][]byte, len(documents))
+	for i, src := range documents {
+		records[i] = CommonPrimaryLeafRecord{
+			Key:   []byte(fmt.Sprintf("doc:%08d", i)),
+			Value: CommonPrimaryLeafValue{Inline: []byte(src)},
+		}
+		canonical, err := vibejson.AppendCanonicalize(nil, []byte(src))
+		if err != nil {
+			t.Fatalf("AppendCanonicalize row %d: %v", i, err)
+		}
+		want[i] = canonical
+	}
+	page, err := EncodeBestCompactPrimaryStripe(
+		make([]byte, CommonPrimaryLeafMaxExtentBytes),
+		CommonPrimaryLeafHeader{
+			StoreID: storeID, Generation: 1, Bucket: 0,
+		},
+		storeID, records, NewUnifiedPrimaryLeafBuilder(),
+	)
+	if err != nil {
+		t.Fatalf("EncodeBestCompactPrimaryStripe: %v", err)
+	}
+	view, ok := AdmittedCompactPrimaryStripe(page, storeID, 0)
+	if !ok || view.Len() != len(records) {
+		t.Fatalf("admitted compact stripe: ok=%v len=%d", ok, view.Len())
+	}
+	for row := range records {
+		got, ok := view.AppendValue(nil, row)
+		if !ok || !bytes.Equal(got, want[row]) {
+			t.Fatalf("row %d compact bytes: ok=%v got=%q want=%q", row, ok, got, want[row])
+		}
+	}
+}
+
+func TestUnifiedBuilderRejectsInvalidUTF8BeforeCanonicalFastCheck(t *testing.T) {
+	large := append([]byte{'"'}, bytes.Repeat([]byte{'x'}, 4096)...)
+	large = append(large[:len(large)-8], 0xff)
+	large = append(large, bytes.Repeat([]byte{'x'}, 7)...)
+	large = append(large, '"')
+	cases := [][]byte{
+		{'"', 0xff, '"'},
+		{'{', '"', 0xff, '"', ':', '1', '}'},
+		{'{', '"', 'k', '"', ':', '"', 0xe2, 0x28, 0xa1, '"', '}'},
+		large,
+	}
+	for i, src := range cases {
+		builder := NewUnifiedPrimaryLeafBuilder()
+		records := []CommonPrimaryLeafRecord{{
+			Key:   []byte("doc"),
+			Value: CommonPrimaryLeafValue{Inline: src},
+		}}
+		if err := builder.extract(records); err == nil {
+			t.Errorf("case %d: builder admitted malformed UTF-8 %x", i, src)
+		}
 	}
 }

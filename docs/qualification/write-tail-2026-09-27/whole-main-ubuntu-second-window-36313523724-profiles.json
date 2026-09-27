@@ -1,0 +1,320 @@
+{
+  "diagnostic_only": true,
+  "profile_scope": {
+    "arms": [
+      "baseline",
+      "candidate"
+    ],
+    "comparison_samples_are_not_timing_samples": true,
+    "cpu_profile_includes_benchmark_setup_and_final_row_oracle": true,
+    "diagnostic_only": true,
+    "iterations_per_process": 1,
+    "notes": "Each profile runs the same one-shot benchmark in a separate process. CPU samples include benchmark setup and the final row oracle, which are outside ns/op timing. Profiled ns/op values are diagnostic and are excluded from throughput comparisons.",
+    "processes": 4,
+    "workloads": [
+      "sequential-insert",
+      "compact-shared-payload"
+    ]
+  },
+  "provenance": {
+    "baseline_binary_sha256": "600d1fded7613b7c6c69b0fb3d88e3d13052b814710054ca4db2064730a7415d",
+    "baseline_revision": "f9a9627a513a1599bc00bdaf59f4eb93470d9fbf",
+    "build_metadata_sha256": "1e2dc4ce1403ebc360c9c8541a0b55bcb9919e3a801cc0649e523cacd9e3640b",
+    "candidate_binary_sha256": "cff6f167905b109e2d59aa2d140ddbcd7c58ed49e83e5c22d0946320eae24efe",
+    "candidate_revision": "afa3eeecb1d756b7732e2d510715913512d230a3",
+    "go_version": "go version go1.27.1 linux/amd64",
+    "goexperiment": "simd",
+    "gomaxprocs": 2,
+    "harness_revision": "9a136523919e89187edd2bd70d8645caeb22c579",
+    "harness_sha256": "729aecb98499032f9e667a91d5e71a694e1470ae31ec93cb48a3faecef3ece27",
+    "profile_binaries_are_not_copied": true,
+    "profile_binary_hash_note": "SHA-256 values identify the original .pprof files retained in the workflow artifact linked above.",
+    "profile_manifest_original_sha256": "85b1757f9a88b73401b5bcfe7cb89a690bf958fd9f57ffbefa0fbc0a4c178529",
+    "workflow_revision": "75294617bbb593eddf6e355168dd8045a615fc21"
+  },
+  "resource_scope": {
+    "disk_peak_is_a_hard_space_bound": false,
+    "disk_peak_is_sampled_not_continuously_observed": true,
+    "notes": "GNU time maximum RSS is KiB for the entire process, including setup and row oracles; it is diagnostic, not a memory bound. Disk peak values are sampled by the benchmark and are not a continuous maximum or hard space bound.",
+    "rss_is_a_hard_memory_bound": false,
+    "whole_process_rss_includes_setup_and_oracles": true
+  },
+  "runs": [
+    {
+      "arm": "baseline",
+      "benchmark": "BenchmarkReplicatedApplyBatch64SequentialInsert",
+      "benchmark_binary_sha256": "600d1fded7613b7c6c69b0fb3d88e3d13052b814710054ca4db2064730a7415d",
+      "benchmark_row": "BenchmarkReplicatedApplyBatch64SequentialInsert-2",
+      "captures": {
+        "stderr": {
+          "original_artifact_sha256": "a0c9abfc648eae1c3583ab74ea2717dd8f766b626027bcb1253a3b1bb9d93018",
+          "published_file_sha256": "85cc610e8245674d0d0e5ecb0ac9d8e841a093cb65a01e1d5f036250006ecd53",
+          "published_path_normalization_applied": true
+        },
+        "stdout": {
+          "original_artifact_sha256": "e2999924680b5c6f9f9217d6da5a67101ea89606da2b18d7e6cf796a9de89b0d",
+          "published_file_sha256": "e2999924680b5c6f9f9217d6da5a67101ea89606da2b18d7e6cf796a9de89b0d",
+          "published_path_normalization_applied": false
+        }
+      },
+      "completed_utc": "2026-09-27T10:49:43.024492+00:00",
+      "exit_code": 0,
+      "exports": {
+        "cumulative-top": {
+          "file": "whole-main-ubuntu-second-window-36313523724-profiles/01-sequential-insert-baseline.cumulative-top.txt",
+          "original_artifact_sha256": "51d252f8c32aa4434d7919460ca5b297965f3e716b75f148164d1ecda7129dd8",
+          "published_file_sha256": "51d252f8c32aa4434d7919460ca5b297965f3e716b75f148164d1ecda7129dd8",
+          "published_path_normalization_applied": false
+        },
+        "flat-top": {
+          "file": "whole-main-ubuntu-second-window-36313523724-profiles/01-sequential-insert-baseline.flat-top.txt",
+          "original_artifact_sha256": "0814fdb0b6a144810a7887e99f756bab7fdf422bd5fb9b4e1f25c730d3c9dce3",
+          "published_file_sha256": "0814fdb0b6a144810a7887e99f756bab7fdf422bd5fb9b4e1f25c730d3c9dce3",
+          "published_path_normalization_applied": false
+        }
+      },
+      "iterations": 1,
+      "ordinal": 1,
+      "pprof_artifact": {
+        "bytes": 40550,
+        "filename": "01-sequential-insert-baseline.pprof",
+        "published": false,
+        "sha256": "b90ab5997b0d4edb5423a560f35d85333c8baf16cb62474a576b841462f8112f",
+        "source": "workflow run 36313523724 profile artifact: profiles/01-sequential-insert-baseline.pprof"
+      },
+      "profile_command": [
+        "/usr/bin/time",
+        "-v",
+        "<baseline-driver.test>",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkReplicatedApplyBatch64SequentialInsert$",
+        "-test.benchtime=1x",
+        "-test.count=1",
+        "-test.benchmem",
+        "-test.timeout=20m",
+        "-test.cpuprofile=<01-sequential-insert-baseline.pprof>"
+      ],
+      "profile_total_cpu_samples_seconds": 7.83,
+      "profiled_benchmark_ns_op": 9121258615.0,
+      "started_utc": "2026-09-27T10:49:33.148473+00:00",
+      "status": "complete",
+      "time_metrics": {
+        "cpu_percent": 81.0,
+        "elapsed_wall_clock": "0:09.87",
+        "maximum_resident_set_kib": 147308,
+        "system_seconds": 0.44,
+        "user_seconds": 7.58
+      },
+      "wall_seconds": 9.875853,
+      "workload": "sequential-insert"
+    },
+    {
+      "arm": "candidate",
+      "benchmark": "BenchmarkReplicatedApplyBatch64SequentialInsert",
+      "benchmark_binary_sha256": "cff6f167905b109e2d59aa2d140ddbcd7c58ed49e83e5c22d0946320eae24efe",
+      "benchmark_row": "BenchmarkReplicatedApplyBatch64SequentialInsert-2",
+      "captures": {
+        "stderr": {
+          "original_artifact_sha256": "f541164fd8c82e406b93e429195774ed274d68ee624c7b72311f6b3cd4764213",
+          "published_file_sha256": "4f0d2ccaf799bf63ac0f20ea01a2d758d9ab0577fe467dd5846584b47d550b6d",
+          "published_path_normalization_applied": true
+        },
+        "stdout": {
+          "original_artifact_sha256": "ae7c9a8dca573c520b5de41b23b87bc29948d7c48af685faf142d0b48db1531d",
+          "published_file_sha256": "ae7c9a8dca573c520b5de41b23b87bc29948d7c48af685faf142d0b48db1531d",
+          "published_path_normalization_applied": false
+        }
+      },
+      "completed_utc": "2026-09-27T10:49:58.343996+00:00",
+      "exit_code": 0,
+      "exports": {
+        "cumulative-top": {
+          "file": "whole-main-ubuntu-second-window-36313523724-profiles/02-sequential-insert-candidate.cumulative-top.txt",
+          "original_artifact_sha256": "c2761741c0a464d659d3b001cb8b67e9789171957e4a2a7431e06e4c69416319",
+          "published_file_sha256": "c2761741c0a464d659d3b001cb8b67e9789171957e4a2a7431e06e4c69416319",
+          "published_path_normalization_applied": false
+        },
+        "flat-top": {
+          "file": "whole-main-ubuntu-second-window-36313523724-profiles/02-sequential-insert-candidate.flat-top.txt",
+          "original_artifact_sha256": "01f0f1af54c2fabbfbae1f2ed2419ae2696577fcba9c5eef809272438ceef206",
+          "published_file_sha256": "01f0f1af54c2fabbfbae1f2ed2419ae2696577fcba9c5eef809272438ceef206",
+          "published_path_normalization_applied": false
+        }
+      },
+      "iterations": 1,
+      "ordinal": 2,
+      "pprof_artifact": {
+        "bytes": 31978,
+        "filename": "02-sequential-insert-candidate.pprof",
+        "published": false,
+        "sha256": "e0f111451bedaa905d533995d3256ab38cbb16141b731117c11b9834add40a08",
+        "source": "workflow run 36313523724 profile artifact: profiles/02-sequential-insert-candidate.pprof"
+      },
+      "profile_command": [
+        "/usr/bin/time",
+        "-v",
+        "<candidate-driver.test>",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkReplicatedApplyBatch64SequentialInsert$",
+        "-test.benchtime=1x",
+        "-test.count=1",
+        "-test.benchmem",
+        "-test.timeout=20m",
+        "-test.cpuprofile=<02-sequential-insert-candidate.pprof>"
+      ],
+      "profile_total_cpu_samples_seconds": 5.9,
+      "profiled_benchmark_ns_op": 5306472591.0,
+      "started_utc": "2026-09-27T10:49:52.274871+00:00",
+      "status": "complete",
+      "time_metrics": {
+        "cpu_percent": 97.0,
+        "elapsed_wall_clock": "0:06.06",
+        "maximum_resident_set_kib": 127624,
+        "system_seconds": 0.09,
+        "user_seconds": 5.83
+      },
+      "wall_seconds": 6.068693,
+      "workload": "sequential-insert"
+    },
+    {
+      "arm": "baseline",
+      "benchmark": "BenchmarkReplicatedApplyBatch64CompactSharedPayload",
+      "benchmark_binary_sha256": "600d1fded7613b7c6c69b0fb3d88e3d13052b814710054ca4db2064730a7415d",
+      "benchmark_row": "BenchmarkReplicatedApplyBatch64CompactSharedPayload-2",
+      "captures": {
+        "stderr": {
+          "original_artifact_sha256": "10b1ff35d2a8ce7158aab864b174b40c0a2052793106f17a3492fe031338b02b",
+          "published_file_sha256": "a059799f37bcd20b5618d3110727c0a8187abecb9d75314142c71b8bd961808f",
+          "published_path_normalization_applied": true
+        },
+        "stdout": {
+          "original_artifact_sha256": "9cad1ae6274a399f7bf53a3d008670f9ac4fb12b4ea363401f5aae7d7f3ad468",
+          "published_file_sha256": "9cad1ae6274a399f7bf53a3d008670f9ac4fb12b4ea363401f5aae7d7f3ad468",
+          "published_path_normalization_applied": false
+        }
+      },
+      "completed_utc": "2026-09-27T10:50:07.943466+00:00",
+      "exit_code": 0,
+      "exports": {
+        "cumulative-top": {
+          "file": "whole-main-ubuntu-second-window-36313523724-profiles/03-compact-shared-payload-baseline.cumulative-top.txt",
+          "original_artifact_sha256": "ccc87a4939aab9160dbc105330b8edc0f90782af64300bb2561dd3f96af22a6f",
+          "published_file_sha256": "ccc87a4939aab9160dbc105330b8edc0f90782af64300bb2561dd3f96af22a6f",
+          "published_path_normalization_applied": false
+        },
+        "flat-top": {
+          "file": "whole-main-ubuntu-second-window-36313523724-profiles/03-compact-shared-payload-baseline.flat-top.txt",
+          "original_artifact_sha256": "87ff08a3ec7130c8aa490d21d46b8c26959c6f1b90bd93e0e17ae6fd5e19ce3c",
+          "published_file_sha256": "87ff08a3ec7130c8aa490d21d46b8c26959c6f1b90bd93e0e17ae6fd5e19ce3c",
+          "published_path_normalization_applied": false
+        }
+      },
+      "iterations": 1,
+      "ordinal": 3,
+      "pprof_artifact": {
+        "bytes": 35489,
+        "filename": "03-compact-shared-payload-baseline.pprof",
+        "published": false,
+        "sha256": "5b434f85bfa2317dc0941059dd167176c2b2af590979c2ea2834912680db1891",
+        "source": "workflow run 36313523724 profile artifact: profiles/03-compact-shared-payload-baseline.pprof"
+      },
+      "profile_command": [
+        "/usr/bin/time",
+        "-v",
+        "<baseline-driver.test>",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkReplicatedApplyBatch64CompactSharedPayload$",
+        "-test.benchtime=1x",
+        "-test.count=1",
+        "-test.benchmem",
+        "-test.timeout=20m",
+        "-test.cpuprofile=<03-compact-shared-payload-baseline.pprof>"
+      ],
+      "profile_total_cpu_samples_seconds": 6.43,
+      "profiled_benchmark_ns_op": 8441649086.0,
+      "started_utc": "2026-09-27T10:49:58.894728+00:00",
+      "status": "complete",
+      "time_metrics": {
+        "cpu_percent": 73.0,
+        "elapsed_wall_clock": "0:09.04",
+        "maximum_resident_set_kib": 106496,
+        "system_seconds": 0.41,
+        "user_seconds": 6.2
+      },
+      "wall_seconds": 9.04814,
+      "workload": "compact-shared-payload"
+    },
+    {
+      "arm": "candidate",
+      "benchmark": "BenchmarkReplicatedApplyBatch64CompactSharedPayload",
+      "benchmark_binary_sha256": "cff6f167905b109e2d59aa2d140ddbcd7c58ed49e83e5c22d0946320eae24efe",
+      "benchmark_row": "BenchmarkReplicatedApplyBatch64CompactSharedPayload-2",
+      "captures": {
+        "stderr": {
+          "original_artifact_sha256": "2d8687290629b499e2c8c66cb7e910723fdc25339cc95c5494296a8a6f5c4c37",
+          "published_file_sha256": "bc4e9f2aae0b929459778c3ccab4889d43ba369788b2b700522c876133e66c8d",
+          "published_path_normalization_applied": true
+        },
+        "stdout": {
+          "original_artifact_sha256": "be0f1888db65752479dc9cdded4fdc32d15935f93aaded3ba706e3fdf2e01203",
+          "published_file_sha256": "be0f1888db65752479dc9cdded4fdc32d15935f93aaded3ba706e3fdf2e01203",
+          "published_path_normalization_applied": false
+        }
+      },
+      "completed_utc": "2026-09-27T10:50:16.546839+00:00",
+      "exit_code": 0,
+      "exports": {
+        "cumulative-top": {
+          "file": "whole-main-ubuntu-second-window-36313523724-profiles/04-compact-shared-payload-candidate.cumulative-top.txt",
+          "original_artifact_sha256": "4ddc8624aeac66716f97aea3eb6df0857a591e4c23b8e61fa9e66e2b4a412660",
+          "published_file_sha256": "4ddc8624aeac66716f97aea3eb6df0857a591e4c23b8e61fa9e66e2b4a412660",
+          "published_path_normalization_applied": false
+        },
+        "flat-top": {
+          "file": "whole-main-ubuntu-second-window-36313523724-profiles/04-compact-shared-payload-candidate.flat-top.txt",
+          "original_artifact_sha256": "95abd7b828e6e3c8cf54127a3b27efa149778b6ff4bf33cf4e3833701c4d48d6",
+          "published_file_sha256": "95abd7b828e6e3c8cf54127a3b27efa149778b6ff4bf33cf4e3833701c4d48d6",
+          "published_path_normalization_applied": false
+        }
+      },
+      "iterations": 1,
+      "ordinal": 4,
+      "pprof_artifact": {
+        "bytes": 35525,
+        "filename": "04-compact-shared-payload-candidate.pprof",
+        "published": false,
+        "sha256": "8483830e894d568e8df15530638f6bd68f3bf803f27457376178300adab11547",
+        "source": "workflow run 36313523724 profile artifact: profiles/04-compact-shared-payload-candidate.pprof"
+      },
+      "profile_command": [
+        "/usr/bin/time",
+        "-v",
+        "<candidate-driver.test>",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkReplicatedApplyBatch64CompactSharedPayload$",
+        "-test.benchtime=1x",
+        "-test.count=1",
+        "-test.benchmem",
+        "-test.timeout=20m",
+        "-test.cpuprofile=<04-compact-shared-payload-candidate.pprof>"
+      ],
+      "profile_total_cpu_samples_seconds": 7.91,
+      "profiled_benchmark_ns_op": 7464760207.0,
+      "started_utc": "2026-09-27T10:50:08.483724+00:00",
+      "status": "complete",
+      "time_metrics": {
+        "cpu_percent": 98.0,
+        "elapsed_wall_clock": "0:08.06",
+        "maximum_resident_set_kib": 105928,
+        "system_seconds": 0.1,
+        "user_seconds": 7.83
+      },
+      "wall_seconds": 8.062172,
+      "workload": "compact-shared-payload"
+    }
+  ],
+  "schema": "vibedb.whole-main-batch64-write-profile-evidence.v1",
+  "status": "complete",
+  "workflow_run_id": 36313523724,
+  "workflow_run_url": "https://github.com/thesyncim/vibedb/actions/runs/36313523724"
+}

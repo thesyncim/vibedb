@@ -15,7 +15,12 @@ var unlockCollectionWriter = storeio.UnlockWriter
 func (c *Collection) ensureDirtyCapacityFor(
 	transactionPages int, transactionBytes uint64,
 ) error {
-	required := transactionBytes
+	c.clearPrimaryVolatileRetiredLocked()
+	tailCharge := c.primaryTailCurrentChargeBytes.Load()
+	if transactionBytes > ^uint64(0)-tailCharge {
+		return storeio.ErrInvalidWrite
+	}
+	required := transactionBytes + tailCharge
 	if c.cache.DirtyCapacityAvailable() >= required &&
 		!c.committer.NeedsFrameCheckpointFor(transactionPages) {
 		return nil
@@ -41,6 +46,18 @@ func (c *Collection) ensureDirtyCapacityFor(
 	c.automaticCheckpoints.Add(1)
 	if !c.deferredCanonicalLane() {
 		c.cache.MarkDurable(c.committer.DurableGeneration())
+	}
+	c.clearPrimaryVolatileRetiredLocked()
+	tailCharge = c.primaryTailCurrentChargeBytes.Load()
+	if transactionBytes > ^uint64(0)-tailCharge {
+		return storeio.ErrInvalidWrite
+	}
+	required = transactionBytes + tailCharge
+	if tailCharge != 0 && c.cache.DirtyCapacityAvailable() < required {
+		return fmt.Errorf(
+			"%w: retained primary-tail metadata needs %d dirty bytes",
+			storeio.ErrPageCachePinned, required,
+		)
 	}
 	return nil
 }

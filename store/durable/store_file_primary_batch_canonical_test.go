@@ -22,7 +22,7 @@ func newCanonicalBatch(t testing.TB, opaque bool) (*Collection, *WriteBatch) {
 		t.Fatal(err)
 	}
 	c := &Collection{options: normalized}
-	return c, &WriteBatch{collection: c, active: true}
+	return c, newOwnedWriteBatch(c, options.MaxBatchDocuments)
 }
 
 func canonicalBatchOracle(t testing.TB, raw []byte) []byte {

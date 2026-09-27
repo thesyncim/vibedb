@@ -217,7 +217,7 @@ func (c *Collection) applyPrimaryMutationGroup(
 		}
 	}
 
-	batchErr := c.Update(func(batch *WriteBatch) error {
+	batchErr := c.updatePrimaryBatchPrivate(func(batch *WriteBatch) error {
 		var seen [64]primaryMutationPresence
 		seenCount := 0
 		for _, request := range group {

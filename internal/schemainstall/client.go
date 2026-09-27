@@ -3,7 +3,10 @@ package schemainstall
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"io"
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -85,6 +88,12 @@ func (client *Client) execute(
 		if connection != nil {
 			_ = connection.Close()
 		}
+		if cause := context.Cause(ctx); cause != nil {
+			return Record{}, errors.Join(cause, err)
+		}
+		if transientControlOpenFailure(err) {
+			return Record{}, errors.Join(ErrTransientControlOpen, err)
+		}
 		return Record{}, err
 	}
 	if connection == nil {
@@ -147,6 +156,58 @@ func (client *Client) execute(
 		return Record{}, ErrConflict
 	}
 	return record, nil
+}
+
+func transientControlOpenFailure(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		hardControlOpenRejection(err) {
+		return false
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		transientControlOpenSystemCause(err)
+}
+
+func hardControlOpenRejection(err error) bool {
+	for _, rejection := range [...]error{
+		rafttransport.ErrPeerBuild,
+		rafttransport.ErrInvalidPeerIdentity,
+		rafttransport.ErrWrongTrustDomain,
+		rafttransport.ErrWrongPeer,
+		rafttransport.ErrWrongTrafficClass,
+		rafttransport.ErrPeerKeyMismatch,
+		rafttransport.ErrPeerUnauthorized,
+		rafttransport.ErrUnauthorized,
+	} {
+		if errors.Is(err, rejection) {
+			return true
+		}
+	}
+	var certificateVerification *tls.CertificateVerificationError
+	if errors.As(err, &certificateVerification) {
+		return true
+	}
+	var alert tls.AlertError
+	if errors.As(err, &alert) {
+		return true
+	}
+	var recordHeader tls.RecordHeaderError
+	if errors.As(err, &recordHeader) {
+		return true
+	}
+	var unknownAuthority x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuthority) {
+		return true
+	}
+	var invalidCertificate x509.CertificateInvalidError
+	if errors.As(err, &invalidCertificate) {
+		return true
+	}
+	var invalidHostname x509.HostnameError
+	if errors.As(err, &invalidHostname) {
+		return true
+	}
+	var missingRoots x509.SystemRootsError
+	return errors.As(err, &missingRoots)
 }
 
 func boundedClientDeadline(ctx context.Context, configured time.Time) time.Time {

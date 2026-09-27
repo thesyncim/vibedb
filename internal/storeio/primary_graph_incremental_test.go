@@ -518,6 +518,230 @@ func TestPrimaryValueLeafWindowPlannerStagesMixedOverflow(t *testing.T) {
 	}
 }
 
+func TestPrimaryValueUnplacedPlannerIgnoresAndDoesNotLeakSlots(t *testing.T) {
+	const rows = 300
+	records := make([]CommonPrimaryLeafRecord, rows)
+	wantSlots := make([]uint8, rows)
+	for row := range records {
+		records[row] = CommonPrimaryLeafRecord{
+			Slot:  uint8(row % 7),
+			Key:   fmt.Appendf(nil, "unplaced-%04d", row),
+			Value: CommonPrimaryLeafValue{Inline: []byte(`{"shared":"value"}`)},
+		}
+		wantSlots[row] = records[row].Slot
+	}
+	builder := NewUnifiedPrimaryLeafBuilder()
+	planner := &PrimaryValueLeafWindowPlanner{builder: builder}
+	starts, err := AppendCommonPrimaryCompactLeafStarts(
+		nil, builder, testStoreID, records,
+	)
+	if err != nil || len(starts) != 1 || starts[0] != 0 {
+		t.Fatalf("unplaced starts = %v, %v; want one range", starts, err)
+	}
+	for row := range records {
+		if records[row].Slot != wantSlots[row] {
+			t.Fatalf("topology planning changed source row %d slot to %d", row, records[row].Slot)
+		}
+	}
+	count, extent, _, err := planner.PlanUnplaced(
+		records, CommonPrimaryLeafMaxExtentBytes,
+	)
+	if err != nil || count != rows || extent > CommonPrimaryLeafMaxExtentBytes {
+		t.Fatalf("unplaced plan = %d rows/%d bytes, %v", count, extent, err)
+	}
+	for row := range records {
+		if records[row].Slot != wantSlots[row] {
+			t.Fatalf("PlanUnplaced changed source row %d slot to %d", row, records[row].Slot)
+		}
+	}
+
+	placed := make([]CommonPrimaryLeafRecord, 64)
+	for row := range placed {
+		placed[row] = CommonPrimaryLeafRecord{
+			Key:   fmt.Appendf(nil, "placed-%03d", row),
+			Value: CommonPrimaryLeafValue{Inline: []byte(`{"v":1}`)},
+		}
+	}
+	if err := PlaceCommonPrimaryLeafRecords(
+		CommonPrimaryLeafWide, testStoreID, placed,
+	); err != nil {
+		t.Fatalf("place follow-up indexed window: %v", err)
+	}
+	if _, err := BuildCompactPrimaryStripePayload(placed, builder); err != nil {
+		t.Fatalf("placed encode after unplaced plan: %v", err)
+	}
+	for row := range placed {
+		if got := builder.slotAt(row); got != placed[row].Slot {
+			t.Fatalf("placed slot %d = %d, want %d after unplaced planning", row, got, placed[row].Slot)
+		}
+	}
+}
+
+func TestPrimaryValueUnplacedPlannerBoundaryRangesRoundTrip(t *testing.T) {
+	cases := []struct {
+		name          string
+		opaque        bool
+		mixedOverflow bool
+		inlineBytes   int
+	}{
+		{name: "varied-inline", inlineBytes: 360},
+		{name: "opaque", opaque: true, inlineBytes: 360},
+		{name: "mixed-overflow", mixedOverflow: true, inlineBytes: 520},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			const rows = 700
+			overflow := PageRef{
+				Offset: 1 << 20, LogicalID: PrimaryFirstDynamicLogicalID + 1,
+				Generation: 7, Length: format0PageSize, Kind: PageOverflow,
+			}
+			records := make([]CommonPrimaryLeafRecord, rows)
+			sourceSlots := make([]uint8, rows)
+			for row := range records {
+				value := primaryBoundaryPayload(row, tc.inlineBytes)
+				if tc.opaque {
+					records[row].Value = CommonPrimaryLeafValue{Inline: value}
+				} else {
+					records[row].Value = CommonPrimaryLeafValue{
+						Inline: fmt.Appendf(nil, `{"payload":%q,"rank":%d}`, value, row),
+					}
+				}
+				if tc.mixedOverflow && row%5 == 0 {
+					records[row].Value = CommonPrimaryLeafValue{Overflow: overflow}
+				}
+				records[row].Key = fmt.Appendf(nil, "boundary-%04d", row)
+				records[row].Slot = uint8((row*37 + 11) % CommonPrimaryLeafWideSlots)
+				sourceSlots[row] = records[row].Slot
+			}
+
+			builder := NewUnifiedPrimaryLeafBuilder()
+			if err := builder.SetOpaqueValues(tc.opaque); err != nil {
+				t.Fatalf("set planner opaque mode: %v", err)
+			}
+			starts, err := AppendCommonPrimaryCompactLeafStarts(
+				nil, builder, testStoreID, records,
+			)
+			if err != nil {
+				t.Fatalf("plan 64 KiB compact ranges: %v", err)
+			}
+			if len(starts) < 2 || starts[0] != 0 {
+				t.Fatalf("compact starts = %v, want byte-bounded ranges", starts)
+			}
+			for row := range records {
+				if records[row].Slot != sourceSlots[row] {
+					t.Fatalf("planning changed source row %d slot to %d", row, records[row].Slot)
+				}
+			}
+
+			const bucket BucketID = 0
+			logicalID, ok := CommonPrimaryLeafLogicalID(bucket)
+			if !ok {
+				t.Fatal("common primary leaf logical ID")
+			}
+			bounds := CommonPrimaryLeafBounds{
+				FileEnd: 2 << 20, NextLogicalID: PrimaryFirstDynamicLogicalID + 16,
+				AllocationQuantum: format0PageSize,
+			}
+			for span, first := range starts {
+				end := rows
+				if span+1 < len(starts) {
+					end = starts[span+1]
+				}
+				if first < 0 || first >= end || end > rows {
+					t.Fatalf("span %d bounds = [%d,%d), rows=%d", span, first, end, rows)
+				}
+				window := append([]CommonPrimaryLeafRecord(nil), records[first:end]...)
+				if len(window) > CommonPrimaryLeafWideSlots {
+					t.Fatalf("byte-bounded span %d has %d rows; test must exercise placement", span, len(window))
+				}
+				if err := PlaceCommonPrimaryLeafRecords(
+					CommonPrimaryLeafWide, testStoreID, window,
+				); err != nil {
+					t.Fatalf("place compact span %d with %d rows: %v", span, len(window), err)
+				}
+
+				stripeBuilder := NewUnifiedPrimaryLeafBuilder()
+				if err := stripeBuilder.SetOpaqueValues(tc.opaque); err != nil {
+					t.Fatalf("set stripe opaque mode: %v", err)
+				}
+				payload, err := BuildCompactPrimaryStripePayload(window, stripeBuilder)
+				if err != nil {
+					t.Fatalf("build compact span %d: %v", span, err)
+				}
+				need := PageHeaderSize + len(payload) + PageTrailerSize
+				quantum := int(physicalPageQuantum)
+				extent := (need + quantum - 1) &^ (quantum - 1)
+				if extent > CommonPrimaryLeafMaxExtentBytes {
+					t.Fatalf("span %d encoded extent=%d, over 64 KiB", span, extent)
+				}
+				header := CommonPrimaryLeafHeader{
+					StoreID: testStoreID, Generation: 7, Bucket: bucket,
+					PageSize: uint32(extent),
+				}
+				page, err := EncodeCompactPrimaryStripe(
+					make([]byte, extent), header, window, stripeBuilder,
+				)
+				if err != nil {
+					t.Fatalf("encode real compact span %d: %v", span, err)
+				}
+				ref := PageRef{
+					Offset: uint64(format0PageSize), Length: uint32(extent),
+					LogicalID: logicalID, Generation: 7, Kind: PagePrimaryLeaf,
+				}
+				view, err := OpenCompactPrimaryStripe(
+					page, testStoreID, bucket, ref, 7, bounds,
+				)
+				if err != nil {
+					t.Fatalf("decode real compact span %d: %v", span, err)
+				}
+				if view.Len() != len(window) || len(page) > CommonPrimaryLeafMaxExtentBytes {
+					t.Fatalf("span %d decoded rows/extent=%d/%d, want %d and <=64 KiB",
+						span, view.Len(), len(page), len(window))
+				}
+				for offset, source := range records[first:end] {
+					key, ok := view.AppendKey(nil, offset)
+					if !ok || !bytes.Equal(key, source.Key) {
+						t.Fatalf("span %d row %d key=%q/%v, want %q",
+							span, offset, key, ok, source.Key)
+					}
+					if source.Value.IsOverflow() {
+						got, ok := view.OverflowRef(offset)
+						if !ok || got != source.Value.Overflow {
+							t.Fatalf("span %d row %d overflow=%+v/%v, want %+v",
+								span, offset, got, ok, source.Value.Overflow)
+						}
+						continue
+					}
+					got, ok := view.AppendValue(nil, offset)
+					if !ok || !bytes.Equal(got, source.Value.Inline) {
+						t.Fatalf("span %d row %d value=%q/%v, want %q",
+							span, offset, got, ok, source.Value.Inline)
+					}
+				}
+			}
+			for row := range records {
+				if records[row].Slot != sourceSlots[row] {
+					t.Fatalf("encoding changed source row %d slot to %d", row, records[row].Slot)
+				}
+			}
+		})
+	}
+}
+
+func primaryBoundaryPayload(row, size int) []byte {
+	const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+	payload := make([]byte, size)
+	state := uint64(row+1) * 0x9e3779b97f4a7c15
+	for index := range payload {
+		state ^= state >> 12
+		state ^= state << 25
+		state ^= state >> 27
+		state *= 0x2545f4914f6cdd1d
+		payload[index] = alphabet[state%uint64(len(alphabet))]
+	}
+	return payload
+}
+
 func incrementalPrimaryFileEnd(s *incrementalPrimaryTestSink) uint64 {
 	return max(s.next, uint64(GlobalTabletCatalogRootBytes))
 }

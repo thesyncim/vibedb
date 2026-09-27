@@ -1,6 +1,7 @@
 package splitcontroller
 
 import (
+	"bytes"
 	"context"
 	"errors"
 
@@ -22,7 +23,12 @@ type ControllerTriggerClient interface {
 
 type ControllerPass struct {
 	Discovered uint16
-	Triggered  uint16
+	// Triggered counts successfully attempted direct actions or accepted remote
+	// trigger requests. It is not proof that the durable operation advanced.
+	Triggered uint16
+	// Progressed counts direct operations whose authoritative durable record
+	// changed after execution. Remote trigger passes cannot observe this value.
+	Progressed uint16
 	Completed  uint16
 }
 
@@ -37,12 +43,18 @@ func RunDirectControllerPass(
 	if ctx == nil || directory == nil || controller == nil {
 		return ControllerPass{}, ErrControllerTrigger
 	}
+	if cause := context.Cause(ctx); cause != nil {
+		return ControllerPass{}, cause
+	}
 	ids, err := directory.ReadOperationIDs(ctx)
 	if err != nil || len(ids) > maxControllerPassOperations {
 		return ControllerPass{}, errors.Join(err, ErrControllerTrigger)
 	}
 	pass := ControllerPass{Discovered: uint16(len(ids))}
 	for _, id := range ids {
+		if cause := context.Cause(ctx); cause != nil {
+			return pass, cause
+		}
 		record, readErr := directory.ReadOperation(ctx, id)
 		if errors.Is(readErr, gateway.ErrReplicatedOperationMissing) {
 			continue
@@ -57,6 +69,12 @@ func RunDirectControllerPass(
 		if record.Kind != gateway.ReplicatedOperationSplit {
 			continue
 		}
+		// The controller may publish a new operation record while it executes.
+		// Keep an owned snapshot because some directory implementations may
+		// reuse decoded byte storage on their next read.
+		before := record
+		before.Intent = bytes.Clone(record.Intent)
+		before.Execution = bytes.Clone(record.Execution)
 		action, executeErr := controller.ExecuteReplicatedOperation(ctx, id)
 		if executeErr != nil {
 			return pass, executeErr
@@ -65,8 +83,53 @@ func RunDirectControllerPass(
 		if action.Kind == ActionComplete {
 			pass.Completed++
 		}
+		if cause := context.Cause(ctx); cause != nil {
+			return pass, cause
+		}
+		after, postReadErr := directory.ReadOperation(ctx, id)
+		if cause := context.Cause(ctx); cause != nil {
+			return pass, cause
+		}
+		progressed, progressErr := directOperationProgress(id, before, after, postReadErr)
+		if progressErr != nil {
+			return pass, progressErr
+		}
+		if progressed {
+			pass.Progressed++
+		}
 	}
 	return pass, nil
+}
+
+func directOperationProgress(
+	id [32]byte,
+	before, after gateway.ReplicatedOperationRecord,
+	readErr error,
+) (bool, error) {
+	if id == ([32]byte{}) || !before.Valid() || before.ID != id {
+		return false, ErrReplicatedExecution
+	}
+	if errors.Is(readErr, gateway.ErrReplicatedOperationMissing) {
+		return true, nil
+	}
+	if readErr != nil {
+		return false, errors.Join(readErr, ErrControllerTrigger)
+	}
+	if !after.Valid() || after.ID != id || after.Kind != before.Kind ||
+		after.IntentDigest != before.IntentDigest || !bytes.Equal(after.Intent, before.Intent) ||
+		after.CatalogGeneration < before.CatalogGeneration {
+		return false, ErrReplicatedExecution
+	}
+	if after.Revision < before.Revision {
+		return false, ErrReplicatedExecution
+	}
+	if after.Revision > before.Revision {
+		return true, nil
+	}
+	if !after.Equal(before) {
+		return false, ErrReplicatedExecution
+	}
+	return false, nil
 }
 
 // RunControllerPass reads the bounded RF3 directory and triggers at most one

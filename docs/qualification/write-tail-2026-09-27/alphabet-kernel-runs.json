@@ -1,0 +1,236 @@
+{
+  "schema": "vibedb.alphabet-kernel-evidence/1",
+  "candidate_commit": "72c3a30af5360e822d51213078ad1b097d304b50",
+  "benchmark": "BenchmarkCompactAlphabetUnionMeasurement",
+  "source_sha256": {
+    "production_codec": "c7c3df1f1457387de4ac83e5be53811892730efedfe3d43f4bbd9cadea7678cb",
+    "benchmark_test": "f84dbfc169f9aca8d61262b80b1f7ade10255d4f1c28df556a62017e08221074"
+  },
+  "kernel_driver_test_sha256": "9ae248455e9e54aaf2d5c776b7d28ca7bcbccc1ee87515c8dfd5b796adf0ca66",
+  "build_command": "CODEX_AGENT_ID=alphabet-kernel-build GOEXPERIMENT=simd project-env go test -c ./internal/storeio -o ./kernel-driver.test",
+  "benchmark_command": "CODEX_AGENT_ID=alphabet-kernel GOEXPERIMENT=simd project-env ./kernel-driver.test -test.run='^$' -test.bench='^BenchmarkCompactAlphabetUnionMeasurement$' -test.benchmem -test.benchtime=500ms -test.count=3",
+  "command_note": "This runs three samples per benchmark subcase in one kernel-only test-binary process; it is separate from the public SQL application benchmark.",
+  "environment": {
+    "goos": "darwin",
+    "goarch": "arm64",
+    "cpu": "Apple M4 Max",
+    "goexperiment": "simd"
+  },
+  "raw_log_sha256": "2d707383bf758799978d3a5cd75daf681fdc5b90a5b959aa63c29776480c719d",
+  "raw_benchmark_lines": [
+    "BenchmarkCompactAlphabetUnionMeasurement/repeated-eight-spellings-256B/full-values-16         \t    1656\t    370685 ns/op\t2828.75 MB/s\t       0 B/op\t       0 allocs/op",
+    "BenchmarkCompactAlphabetUnionMeasurement/repeated-eight-spellings-256B/full-values-16         \t    1659\t    358668 ns/op\t2923.53 MB/s\t       0 B/op\t       0 allocs/op",
+    "BenchmarkCompactAlphabetUnionMeasurement/repeated-eight-spellings-256B/full-values-16         \t    1704\t    365600 ns/op\t2868.10 MB/s\t       0 B/op\t       0 allocs/op",
+    "BenchmarkCompactAlphabetUnionMeasurement/repeated-eight-spellings-256B/dictionary-representatives-16         \t    2054\t    281437 ns/op\t3725.80 MB/s\t       0 B/op\t       0 allocs/op",
+    "BenchmarkCompactAlphabetUnionMeasurement/repeated-eight-spellings-256B/dictionary-representatives-16         \t    2151\t    281649 ns/op\t3722.99 MB/s\t       0 B/op\t       0 allocs/op",
+    "BenchmarkCompactAlphabetUnionMeasurement/repeated-eight-spellings-256B/dictionary-representatives-16         \t    2130\t    283421 ns/op\t3699.72 MB/s\t       0 B/op\t       0 allocs/op",
+    "BenchmarkCompactAlphabetUnionMeasurement/all-unique-256B/full-values-16                                      \t    1018\t    588950 ns/op\t1780.42 MB/s\t       0 B/op\t       0 allocs/op",
+    "BenchmarkCompactAlphabetUnionMeasurement/all-unique-256B/full-values-16                                      \t    1027\t    582392 ns/op\t1800.47 MB/s\t       0 B/op\t       0 allocs/op",
+    "BenchmarkCompactAlphabetUnionMeasurement/all-unique-256B/full-values-16                                      \t     864\t    589118 ns/op\t1779.91 MB/s\t       0 B/op\t       0 allocs/op",
+    "BenchmarkCompactAlphabetUnionMeasurement/all-unique-256B/dictionary-representatives-16                       \t    1012\t    587887 ns/op\t1783.64 MB/s\t       0 B/op\t       0 allocs/op",
+    "BenchmarkCompactAlphabetUnionMeasurement/all-unique-256B/dictionary-representatives-16                       \t    1003\t    599514 ns/op\t1749.04 MB/s\t       0 B/op\t       0 allocs/op",
+    "BenchmarkCompactAlphabetUnionMeasurement/all-unique-256B/dictionary-representatives-16                       \t    1030\t    592265 ns/op\t1770.45 MB/s\t       0 B/op\t       0 allocs/op"
+  ],
+  "samples": [
+    {
+      "case": "repeated-eight-spellings-256B/full-values-16",
+      "iterations": 1656,
+      "metrics": {
+        "ns/op": 370685.0,
+        "MB/s": 2828.75,
+        "B/op": 0.0,
+        "allocs/op": 0.0
+      }
+    },
+    {
+      "case": "repeated-eight-spellings-256B/full-values-16",
+      "iterations": 1659,
+      "metrics": {
+        "ns/op": 358668.0,
+        "MB/s": 2923.53,
+        "B/op": 0.0,
+        "allocs/op": 0.0
+      }
+    },
+    {
+      "case": "repeated-eight-spellings-256B/full-values-16",
+      "iterations": 1704,
+      "metrics": {
+        "ns/op": 365600.0,
+        "MB/s": 2868.1,
+        "B/op": 0.0,
+        "allocs/op": 0.0
+      }
+    },
+    {
+      "case": "repeated-eight-spellings-256B/dictionary-representatives-16",
+      "iterations": 2054,
+      "metrics": {
+        "ns/op": 281437.0,
+        "MB/s": 3725.8,
+        "B/op": 0.0,
+        "allocs/op": 0.0
+      }
+    },
+    {
+      "case": "repeated-eight-spellings-256B/dictionary-representatives-16",
+      "iterations": 2151,
+      "metrics": {
+        "ns/op": 281649.0,
+        "MB/s": 3722.99,
+        "B/op": 0.0,
+        "allocs/op": 0.0
+      }
+    },
+    {
+      "case": "repeated-eight-spellings-256B/dictionary-representatives-16",
+      "iterations": 2130,
+      "metrics": {
+        "ns/op": 283421.0,
+        "MB/s": 3699.72,
+        "B/op": 0.0,
+        "allocs/op": 0.0
+      }
+    },
+    {
+      "case": "all-unique-256B/full-values-16",
+      "iterations": 1018,
+      "metrics": {
+        "ns/op": 588950.0,
+        "MB/s": 1780.42,
+        "B/op": 0.0,
+        "allocs/op": 0.0
+      }
+    },
+    {
+      "case": "all-unique-256B/full-values-16",
+      "iterations": 1027,
+      "metrics": {
+        "ns/op": 582392.0,
+        "MB/s": 1800.47,
+        "B/op": 0.0,
+        "allocs/op": 0.0
+      }
+    },
+    {
+      "case": "all-unique-256B/full-values-16",
+      "iterations": 864,
+      "metrics": {
+        "ns/op": 589118.0,
+        "MB/s": 1779.91,
+        "B/op": 0.0,
+        "allocs/op": 0.0
+      }
+    },
+    {
+      "case": "all-unique-256B/dictionary-representatives-16",
+      "iterations": 1012,
+      "metrics": {
+        "ns/op": 587887.0,
+        "MB/s": 1783.64,
+        "B/op": 0.0,
+        "allocs/op": 0.0
+      }
+    },
+    {
+      "case": "all-unique-256B/dictionary-representatives-16",
+      "iterations": 1003,
+      "metrics": {
+        "ns/op": 599514.0,
+        "MB/s": 1749.04,
+        "B/op": 0.0,
+        "allocs/op": 0.0
+      }
+    },
+    {
+      "case": "all-unique-256B/dictionary-representatives-16",
+      "iterations": 1030,
+      "metrics": {
+        "ns/op": 592265.0,
+        "MB/s": 1770.45,
+        "B/op": 0.0,
+        "allocs/op": 0.0
+      }
+    }
+  ],
+  "summary": {
+    "repeated-eight-spellings-256B": {
+      "full-values": {
+        "ns/op_samples": [
+          370685.0,
+          358668.0,
+          365600.0
+        ],
+        "median_ns/op": 365600.0,
+        "allocs/op_samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "B/op_samples": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "dictionary-representatives": {
+        "ns/op_samples": [
+          281437.0,
+          281649.0,
+          283421.0
+        ],
+        "median_ns/op": 281649.0,
+        "allocs/op_samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "B/op_samples": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "speedup_full_over_representatives": 1.2980695830626063
+    },
+    "all-unique-256B": {
+      "full-values": {
+        "ns/op_samples": [
+          588950.0,
+          582392.0,
+          589118.0
+        ],
+        "median_ns/op": 588950.0,
+        "allocs/op_samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "B/op_samples": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "dictionary-representatives": {
+        "ns/op_samples": [
+          587887.0,
+          599514.0,
+          592265.0
+        ],
+        "median_ns/op": 592265.0,
+        "allocs/op_samples": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "B/op_samples": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "speedup_full_over_representatives": 0.9944028433218238
+    }
+  }
+}
