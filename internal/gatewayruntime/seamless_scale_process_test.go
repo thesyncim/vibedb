@@ -78,6 +78,7 @@ const (
 	seamlessScaleWorkloadConnections    = 16
 	seamlessScaleOperationWait          = 750 * time.Millisecond
 	seamlessScaleRecoveryBudget         = 10 * time.Second
+	seamlessScaleWorkerSQLShutdownLimit = 10 * time.Second
 	// The evidence split requires at least this many during windows fully
 	// outside every fault shadow. The actor drains to it before stopping so
 	// a fast run cannot cover all windows with recovery intervals.
@@ -2286,10 +2287,25 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 		t.Fatalf("acknowledged data oracle: %v", err)
 	}
 	// Every acknowledged row has now been verified on the original held SQL
-	// session. End the measured continuity interval and release all worker
-	// sessions before the independent fresh-session oracle: the workload uses
-	// the listener's entire bounded connection budget.
+	// session. End the measured continuity interval and send PostgreSQL Terminate
+	// on every idle worker session. Wait for the server's EOF before the
+	// independent fresh-session oracle: closing the client socket alone does
+	// not prove the server released its bounded session slot.
 	survivorSessionsStable := workload.SurvivorSessionsStable()
+	workerSQLConnections := make([]net.Conn, 0, len(workload.connections))
+	for index := range workload.connections {
+		if connection := workload.connections[index].sql; connection != nil {
+			workerSQLConnections = append(workerSQLConnections, connection)
+		}
+	}
+	shutdownCtx, shutdownCancel := context.WithTimeoutCause(ctx, seamlessScaleWorkerSQLShutdownLimit,
+		errors.New("timed out waiting for PostgreSQL worker sessions to shut down"))
+	shutdownErr := terminateAndWaitPostgresConnections(shutdownCtx, workerSQLConnections)
+	shutdownCancel()
+	if shutdownErr != nil {
+		workload.Close()
+		t.Fatalf("graceful worker SQL shutdown before fresh-session oracle: %v", shutdownErr)
+	}
 	workload.Close()
 	if err := workload.VerifyExactPG(ctx, pgListens[survivorIndex]); err != nil {
 		t.Fatalf("post-stop survivor SQL oracle: %v", err)
