@@ -170,7 +170,17 @@ func (s *compactStreamScratch) encodeShapeWithRankContext(
 		dictionaryBytes,
 		frontBytes,
 	)
-	alphabet, hasAlphabet := s.measureAlphabet(2, values, alphabetLimit)
+	// The alphabet plan's row geometry still depends on every value in order,
+	// but its symbol set only depends on the distinct spellings. Reuse the
+	// dictionary census already built above when duplicates are present, while
+	// keeping the original slice as the common all-unique case.
+	alphabetSpellings := values
+	if len(s.dict[0]) < len(values) {
+		alphabetSpellings = s.dict[0]
+	}
+	alphabet, hasAlphabet := s.measureAlphabetWithSpellings(
+		2, values, alphabetSpellings, alphabetLimit,
+	)
 	// Reserve the last backing slot for the prefix candidate so constructing
 	// the ordinary numeric alternatives below cannot overwrite its bytes.
 	numeric, hasPrefix := s.encodePrefixIntShapeWithRankContext(
@@ -448,11 +458,24 @@ func (s *compactStreamScratch) measureAlphabet(
 	values [][]byte,
 	limit int,
 ) (compactAlphabetPlan, bool) {
+	return s.measureAlphabetWithSpellings(slot, values, values, limit)
+}
+
+// measureAlphabetWithSpellings measures ordered row geometry from values and
+// the byte alphabet from spellings. spellings must be a complete set of exact
+// representatives drawn from values; the planner passes its already-built
+// dictionary census here so repeated spellings do not need to be scanned again.
+func (s *compactStreamScratch) measureAlphabetWithSpellings(
+	slot int,
+	values [][]byte,
+	spellings [][]byte,
+	limit int,
+) (compactAlphabetPlan, bool) {
 	blocks := (len(values) + compactStreamRestart - 1) / compactStreamRestart
 	prefix, suffix := compactSharedAffixes(values)
 	var present [256]bool
 	count := 0
-	for _, value := range values {
+	for _, value := range spellings {
 		middle := value[prefix : len(value)-suffix]
 		for _, b := range middle {
 			if !present[b] {
