@@ -167,27 +167,47 @@ func runServingSplitController(
 ) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for {
+	runServingSplitControllerLoop(ctx, func(ctx context.Context) (splitcontroller.ControllerPass, error) {
 		started := time.Now()
 		pass, err := splitcontroller.RunDirectControllerPass(ctx, directory, controller)
 		gatewayControllerMetricsFromContext(ctx).observeSplit(pass, err, time.Since(started))
+		return pass, err
+	}, func(ctx context.Context) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+			return true
+		}
+	}, logf)
+}
+
+func runServingSplitControllerLoop(
+	ctx context.Context,
+	runPass func(context.Context) (splitcontroller.ControllerPass, error),
+	waitForNext func(context.Context) bool,
+	logf func(string, ...any),
+) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		pass, err := runPass(ctx)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			logf("gateway: split controller: %v", err)
 		} else if pass.Triggered != 0 {
-			logf("gateway: split controller advanced %d/%d operation(s), completed %d",
-				pass.Triggered, pass.Discovered, pass.Completed)
+			logf("gateway: split controller attempted %d/%d operation(s), progressed %d, completed %d",
+				pass.Triggered, pass.Discovered, pass.Progressed, pass.Completed)
 		}
 		// A successful pass durably advances at most one step per operation. Run
 		// the next bounded step immediately while there is proven progress; the
 		// configured interval is the idle/error retry cadence, not an artificial
 		// delay between already-authorized topology actions.
-		if err == nil && pass.Triggered != 0 {
+		if err == nil && pass.Progressed != 0 {
 			continue
 		}
-		select {
-		case <-ctx.Done():
+		if !waitForNext(ctx) {
 			return
-		case <-ticker.C:
 		}
 	}
 }
