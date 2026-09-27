@@ -33,10 +33,12 @@ syncs were
 tail split. All remaining counters and each sample's individual values are in
 the run JSON.
 
-A separate later comparison and profiling window is recorded in workflow run
-[36313523724](https://github.com/thesyncim/vibedb/actions/runs/36313523724). Its twelve
-measurements and four diagnostic profiles are retained separately pending review;
-they are not included in these results.
+The separate second Ubuntu window, run
+[36313523724](https://github.com/thesyncim/vibedb/actions/runs/36313523724), also
+completed three alternating pairs per workload and collected four diagnostic
+profiles. Its timings are not pooled with this first window. See the
+[second-window report and evidence](whole-main-ubuntu-second-window-36313523724.md)
+for the independent metrics, captures, and profile provenance.
 
 The ratio is the main median divided by the candidate median. Per-pair times and
 links to each captured stdout/stderr file are listed below; the JSON run record

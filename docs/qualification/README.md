@@ -13,19 +13,23 @@ dated records kept in this directory. For how to run and debug them locally,
 see [build and test](../development/build-and-test.md#process-and-qualification-gates)
 and [debugging distributed failures](../development/debugging.md).
 
-## First whole-main write comparison
+## Whole-main write comparisons
 
-The first whole-main fixed-work window (run 36311055724) compares whole main
-`f9a9627a` with candidate `afa3eeec` on Ubuntu 24.04. Sequential inserts improved
-by 1.589819× by the ratio of median times; shared payloads regressed by 4.7503%
-(ratio 0.954651×). These measurements do not establish a 10× speedup. A separate
-later window (run 36313523724) is retained apart pending review. See the [full
-report and per-run captures](write-tail-2026-09-27/README.md#first-whole-main-ubuntu-comparison-run-36311055724).
+Two separate Ubuntu windows compare whole main `f9a9627a` with candidate
+`afa3eeec`; their samples are not pooled. The shared-payload result changes
+sign between the windows, so the data does not show a consistent shared-workload
+regression or establish why the windows differ. Neither window reaches 10×.
 
-| Workload | Main median | Candidate median | Main/candidate ratio of medians |
-| --- | ---: | ---: | ---: |
-| Distinct varied payloads | 10.074139 s | 6.336657 s | 1.589819× |
-| Shared 256-byte payloads | 8.833278 s | 9.252889 s | 0.954651× |
+| Window | Workload | Baseline median | Candidate median | Baseline/candidate ratio |
+| --- | --- | ---: | ---: | ---: |
+| [36311055724](https://github.com/thesyncim/vibedb/actions/runs/36311055724) | Distinct varied payloads | 10.074139 s | 6.336657 s | 1.589819× |
+| [36311055724](https://github.com/thesyncim/vibedb/actions/runs/36311055724) | Shared 256-byte payloads | 8.833278 s | 9.252889 s | 0.954651× |
+| [36313523724](https://github.com/thesyncim/vibedb/actions/runs/36313523724) | Distinct varied payloads | 9.391908 s | 5.315740 s | 1.766811× |
+| [36313523724](https://github.com/thesyncim/vibedb/actions/runs/36313523724) | Shared 256-byte payloads | 8.436975 s | 7.569802 s | 1.114557× |
+
+The [first-window report and captures](write-tail-2026-09-27/README.md#first-whole-main-ubuntu-comparison-run-36311055724)
+and [separate second-window report, captures, and profiles](write-tail-2026-09-27/whole-main-ubuntu-second-window-36313523724.md)
+retain independent provenance and results.
 
 ## Qualification workflows
 
