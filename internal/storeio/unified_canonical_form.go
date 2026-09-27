@@ -567,6 +567,20 @@ func hex4Lower(b []byte) (v int, lower bool) {
 // output. A true result guarantees AppendCanonicalIndexed(index) equals
 // index.Src byte for byte.
 func IndexIsCanonical(index vibejson.Index, ws *CanonicalWorkspace) bool {
+	return indexIsCanonical(index, ws, false)
+}
+
+// indexIsCanonicalValidatedTape is the builder-only sibling of
+// IndexIsCanonical. Its caller must pass a tape returned successfully by
+// vibejson.BuildIndex over the same unchanged source. BuildIndex validates
+// raw UTF-8 on every accepted engine; this check therefore only needs to
+// reject raw U+2028/U+2029 in unescaped strings. Escaped strings still use the
+// full canonical spelling check below.
+func indexIsCanonicalValidatedTape(index vibejson.Index, ws *CanonicalWorkspace) bool {
+	return indexIsCanonical(index, ws, true)
+}
+
+func indexIsCanonical(index vibejson.Index, ws *CanonicalWorkspace, validatedUTF8 bool) bool {
 	if len(index.Entries) == 0 || len(index.Src) == 0 {
 		return false
 	}
@@ -576,14 +590,14 @@ func IndexIsCanonical(index vibejson.Index, ws *CanonicalWorkspace) bool {
 	if root.Start != 0 || root.End != uint32(len(index.Src)) {
 		return false
 	}
-	_, ok := canonicalCheckEntry(index.Src, index.Entries, 0, root.Start, ws)
+	_, ok := canonicalCheckEntry(index.Src, index.Entries, 0, root.Start, ws, validatedUTF8)
 	return ok
 }
 
 // canonicalCheckEntry verifies the value at entry i begins exactly at pos
 // (whitespace-freedom) and is canonically spelled, returning one past its
 // last byte. The walk mirrors appendCanonicalEntry position for position.
-func canonicalCheckEntry(src []byte, entries []vibejson.IndexEntry, i int, pos uint32, ws *CanonicalWorkspace) (uint32, bool) {
+func canonicalCheckEntry(src []byte, entries []vibejson.IndexEntry, i int, pos uint32, ws *CanonicalWorkspace, validatedUTF8 bool) (uint32, bool) {
 	e := &entries[i]
 	if e.Start != pos {
 		return 0, false
@@ -592,7 +606,12 @@ func canonicalCheckEntry(src []byte, entries []vibejson.IndexEntry, i int, pos u
 	case document.String:
 		raw := src[e.Start:e.End]
 		if e.Flags()&vibejson.TapeFlagEscaped == 0 {
-			if !scanner.ValidUTF8NoLineSeparator(raw[1 : len(raw)-1]) {
+			text := raw[1 : len(raw)-1]
+			if validatedUTF8 {
+				if hasRawJSONLineSeparator(text) {
+					return 0, false
+				}
+			} else if !scanner.ValidUTF8NoLineSeparator(text) {
 				return 0, false
 			}
 		} else if !rawQuotedStringIsCanonical(raw) {
@@ -615,7 +634,7 @@ func canonicalCheckEntry(src []byte, entries []vibejson.IndexEntry, i int, pos u
 				p++ // ','
 			}
 			var ok bool
-			p, ok = canonicalCheckEntry(src, entries, child, p, ws)
+			p, ok = canonicalCheckEntry(src, entries, child, p, ws, validatedUTF8)
 			if !ok {
 				return 0, false
 			}
@@ -624,7 +643,7 @@ func canonicalCheckEntry(src []byte, entries []vibejson.IndexEntry, i int, pos u
 		// The close bracket must follow the last element immediately.
 		return e.End, e.End == p+1
 	case document.Object:
-		return canonicalCheckObject(src, entries, i, ws)
+		return canonicalCheckObject(src, entries, i, ws, validatedUTF8)
 	default:
 		return 0, false
 	}
@@ -634,7 +653,7 @@ func canonicalCheckEntry(src []byte, entries []vibejson.IndexEntry, i int, pos u
 // nondecreasing decoded-key order. Duplicate keys are equal and retain their
 // sequence order. Escaped keys decode into frame scratch
 // for the comparison; unescaped keys compare as source aliases.
-func canonicalCheckObject(src []byte, entries []vibejson.IndexEntry, i int, ws *CanonicalWorkspace) (uint32, bool) {
+func canonicalCheckObject(src []byte, entries []vibejson.IndexEntry, i int, ws *CanonicalWorkspace, validatedUTF8 bool) (uint32, bool) {
 	e := &entries[i]
 	count := int(e.Count())
 	if count == 0 {
@@ -654,7 +673,12 @@ func canonicalCheckObject(src []byte, entries []vibejson.IndexEntry, i int, ws *
 			return 0, false
 		}
 		if ke.Flags()&vibejson.TapeFlagEscaped == 0 {
-			if !scanner.ValidUTF8NoLineSeparator(src[ke.Start+1 : ke.End-1]) {
+			text := src[ke.Start+1 : ke.End-1]
+			if validatedUTF8 {
+				if hasRawJSONLineSeparator(text) {
+					return 0, false
+				}
+			} else if !scanner.ValidUTF8NoLineSeparator(text) {
 				return 0, false
 			}
 		} else if !rawQuotedStringIsCanonical(src[ke.Start:ke.End]) {
@@ -689,11 +713,33 @@ func canonicalCheckObject(src []byte, entries []vibejson.IndexEntry, i int, ws *
 		p = ke.End + 1 // ':'
 		value := key + 1
 		var ok bool
-		p, ok = canonicalCheckEntry(src, entries, value, p, ws)
+		p, ok = canonicalCheckEntry(src, entries, value, p, ws, validatedUTF8)
 		if !ok {
 			return 0, false
 		}
 		key = value + int(entries[value].Next)
 	}
 	return e.End, e.End == p+1
+}
+
+// hasRawJSONLineSeparator reports whether valid UTF-8 text contains the raw
+// UTF-8 spelling of U+2028 or U+2029. The validated-tape checker uses it only
+// after BuildIndex has proved UTF-8 validity, so a byte scan for E2 80 A8/A9 is
+// sufficient and does not repeat full UTF-8 validation for every string.
+func hasRawJSONLineSeparator(text []byte) bool {
+	for start := 0; start < len(text); {
+		rel := bytes.IndexByte(text[start:], 0xe2)
+		if rel < 0 {
+			return false
+		}
+		start += rel
+		if len(text)-start < 3 {
+			return false
+		}
+		if text[start+1] == 0x80 && (text[start+2] == 0xa8 || text[start+2] == 0xa9) {
+			return true
+		}
+		start++
+	}
+	return false
 }

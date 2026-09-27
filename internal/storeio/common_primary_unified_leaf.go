@@ -532,11 +532,15 @@ func (b *UnifiedPrimaryLeafBuilder) extractRows(count int) error {
 		if err != nil {
 			return err
 		}
+		// buildIndex validates raw UTF-8. This check is deliberately adjacent
+		// to that successful admission so the private checker can skip a
+		// second UTF-8 validation pass over each unescaped string.
+		canonicalInput := indexIsCanonicalValidatedTape(index, &b.ws)
 		if err := b.addCompactPrimarySummaryRow(inline); err != nil {
 			return err
 		}
 		row := unifiedPrimaryLeafRow{heapOff: -1}
-		if IndexIsCanonical(index, &b.ws) {
+		if canonicalInput {
 			row.length = int32(len(inline))
 		} else {
 			off := len(b.heap)

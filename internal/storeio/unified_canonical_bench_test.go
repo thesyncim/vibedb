@@ -174,6 +174,39 @@ func BenchmarkCanonicalCheckCanonical(b *testing.B) {
 	}
 }
 
+// BenchmarkCanonicalCheckValidatedTape compares the exported defensive check
+// with the private path used immediately after BuildIndex, whose successful
+// return already proves raw UTF-8 validity. The source remains identical in
+// both sub-benchmarks, including all canonical object/string checks.
+func BenchmarkCanonicalCheckValidatedTape(b *testing.B) {
+	canonical, err := vibejson.AppendCanonicalize(nil, []byte(competitiveShapeJSON))
+	if err != nil {
+		b.Fatal(err)
+	}
+	index := buildTestIndex(b, canonical)
+	ws := &CanonicalWorkspace{}
+	b.Run("public", func(b *testing.B) {
+		b.SetBytes(int64(len(canonical)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if !IndexIsCanonical(index, ws) {
+				b.Fatal("canonical input rejected")
+			}
+		}
+	})
+	b.Run("validated_tape", func(b *testing.B) {
+		b.SetBytes(int64(len(canonical)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if !indexIsCanonicalValidatedTape(index, ws) {
+				b.Fatal("canonical input rejected")
+			}
+		}
+	})
+}
+
 // BenchmarkCanonicalCheckNonCanonical prices the check on the raw corpus
 // spelling, which fails at the first out-of-order member.
 func BenchmarkCanonicalCheckNonCanonical(b *testing.B) {
