@@ -2331,8 +2331,28 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 			t.Fatalf("stop all catalog voters for cold recovery: %v", err)
 		}
 	}
+	coldLive := make([]*seamlessScaleNodeProcess, len(live))
+	t.Cleanup(func() {
+		for index := len(coldLive) - 1; index >= 0; index-- {
+			process := coldLive[index]
+			if process == nil {
+				continue
+			}
+			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			stopErr := process.StopContext(stopCtx)
+			cancel()
+			if t.Failed() {
+				t.Logf("cold restart process %d cleanup: stop=%v\n%s", index, stopErr,
+					seamlessScaleProcessDiagnosticTail(process, 32<<10))
+			} else if stopErr != nil {
+				t.Errorf("stop cold restart process %d: %v\n%s", index, stopErr,
+					seamlessScaleProcessDiagnosticTail(process, 32<<10))
+			}
+		}
+	})
 	for index, process := range live {
-		live[index] = launchSeamlessScaleNode(t, shardBinary, process.manifest, process.ready)
+		coldLive[index] = launchSeamlessScaleNode(t, shardBinary, process.manifest, process.ready)
+		live[index] = coldLive[index]
 	}
 	for _, process := range live {
 		if err := process.ready(ctx, process.manifest); err != nil {
@@ -4035,45 +4055,133 @@ func (process *seamlessScaleNodeProcess) markInstance() {
 }
 
 func waitSeamlessScaleManifestGateway(ctx context.Context, manifestPath string) error {
-	deadline := time.Now().Add(30 * time.Second)
-	var lastAddress string
-	var lastReadErr, lastDialErr error
-	for time.Now().Before(deadline) {
-		address, err := readSeamlessScaleGatewayAddress(manifestPath)
-		lastReadErr = err
-		if err == nil {
-			lastAddress = address
-			connection, dialErr := (&net.Dialer{Timeout: 500 * time.Millisecond}).DialContext(ctx, "tcp", address)
-			lastDialErr = dialErr
-			if dialErr == nil {
-				_ = connection.Close()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	readyCtx, cancelReady := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelReady()
+
+	gatewayAddress, postgresAddress, err := readSeamlessScaleGatewayEndpoints(manifestPath)
+	if err != nil {
+		return fmt.Errorf("read gateway readiness endpoints from %q: %w", manifestPath, err)
+	}
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	var lastGatewayErr, lastPostgresErr error
+	for {
+		if cause := context.Cause(readyCtx); cause != nil {
+			return seamlessScaleGatewayReadinessError(gatewayAddress, postgresAddress, cause,
+				lastGatewayErr, lastPostgresErr)
+		}
+		gatewayCtx, cancelGateway := context.WithTimeout(readyCtx, 500*time.Millisecond)
+		gatewayConn, gatewayErr := (&net.Dialer{Timeout: 500 * time.Millisecond}).DialContext(
+			gatewayCtx, "tcp", gatewayAddress)
+		cancelGateway()
+		if gatewayErr != nil {
+			lastGatewayErr = gatewayErr
+		} else {
+			_ = gatewayConn.Close()
+			lastGatewayErr = nil
+			if postgresAddress == "" {
 				return nil
 			}
+
+			postgresCtx, cancelPostgres := context.WithTimeout(readyCtx, 750*time.Millisecond)
+			postgresConn, postgresErr := fusedOpenDDLWire(postgresCtx, postgresAddress)
+			cancelPostgres()
+			if postgresErr == nil {
+				_ = postgresConn.Close()
+				return nil
+			}
+			if cause := context.Cause(readyCtx); cause != nil {
+				return seamlessScaleGatewayReadinessError(gatewayAddress, postgresAddress, cause,
+					lastGatewayErr, postgresErr)
+			}
+			if !seamlessScaleRetryablePostgresReadinessError(postgresErr) {
+				return fmt.Errorf("PostgreSQL startup handshake at %q: %w", postgresAddress, postgresErr)
+			}
+			lastPostgresErr = postgresErr
 		}
+
 		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		case <-time.After(50 * time.Millisecond):
+		case <-readyCtx.Done():
+			return seamlessScaleGatewayReadinessError(gatewayAddress, postgresAddress,
+				context.Cause(readyCtx), lastGatewayErr, lastPostgresErr)
+		case <-ticker.C:
 		}
 	}
-	return fmt.Errorf("empty node gateway did not become reachable at %q (read=%v dial=%v)",
-		lastAddress, lastReadErr, lastDialErr)
 }
 
-func readSeamlessScaleGatewayAddress(path string) (string, error) {
+func seamlessScaleGatewayReadinessError(gatewayAddress, postgresAddress string, cause, gatewayErr, postgresErr error) error {
+	if cause == nil {
+		cause = context.DeadlineExceeded
+	}
+	postgresEndpoint := postgresAddress
+	if postgresEndpoint == "" {
+		postgresEndpoint = "not configured"
+	}
+	return fmt.Errorf("gateway readiness at %q and PostgreSQL readiness at %q: %w (last gateway dial: %v; last PostgreSQL startup: %v)",
+		gatewayAddress, postgresEndpoint, cause, gatewayErr, postgresErr)
+}
+
+func seamlessScaleRetryablePostgresReadinessError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr)
+}
+
+func readSeamlessScaleGatewayEndpoints(path string) (string, string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	var document struct {
 		Gateway *struct {
-			Listen string `json:"listen"`
+			Listen   string `json:"listen"`
+			PGListen string `json:"pg_listen"`
 		} `json:"gateway"`
 	}
-	if err := json.Unmarshal(raw, &document); err != nil || document.Gateway == nil || document.Gateway.Listen == "" {
-		return "", errors.New("manifest has no gateway listener")
+	if err := json.Unmarshal(raw, &document); err != nil {
+		return "", "", err
 	}
-	return document.Gateway.Listen, nil
+	if document.Gateway == nil || document.Gateway.Listen == "" {
+		return "", "", errors.New("manifest has no gateway listener")
+	}
+	return document.Gateway.Listen, document.Gateway.PGListen, nil
+}
+
+func seamlessScaleProcessDiagnosticTail(process *seamlessScaleNodeProcess, maxBytes int) string {
+	if process == nil {
+		return "process is nil"
+	}
+	command, exited, diagnostic := process.runtimeSnapshot()
+	pid := 0
+	if command != nil && command.Process != nil {
+		pid = command.Process.Pid
+	}
+	state := "running"
+	if exited != nil {
+		select {
+		case <-exited:
+			state = "exited"
+		default:
+		}
+	}
+	output := ""
+	if diagnostic != nil {
+		output = diagnostic.String()
+	}
+	if maxBytes >= 0 && len(output) > maxBytes {
+		output = output[len(output)-maxBytes:]
+	}
+	return fmt.Sprintf("manifest=%q pid=%d state=%s diagnostic-tail:\n%s",
+		process.manifest, pid, state, output)
 }
 
 func readSeamlessScaleControlAddress(path string) (string, error) {

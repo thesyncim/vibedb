@@ -1536,13 +1536,13 @@ func fusedOpenDDLWire(ctx context.Context, address string) (net.Conn, error) {
 		return nil, err
 	}
 	result, err := fusedReadDDLWire(connection)
-	if err != nil {
-		_ = connection.Close()
-		return nil, err
-	}
 	if result.code != "" {
 		_ = connection.Close()
 		return nil, fmt.Errorf("PostgreSQL startup %s: %s", result.code, result.message)
+	}
+	if err != nil {
+		_ = connection.Close()
+		return nil, err
 	}
 	return connection, nil
 }
