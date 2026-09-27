@@ -103,7 +103,12 @@ type primaryBatchLeaf struct {
 	mutationAt       int
 	mutationEnd      int
 	stableSlots      bool
-	skip             bool
+	// tailAppendOnly is true only when this build successfully encoded an
+	// append-only image for the active trailing volatile lineage leaf. It
+	// carries the already-rendered source proof into tail fitting so that helper
+	// need not reacquire and render the same leaf a second time.
+	tailAppendOnly bool
+	skip           bool
 	// basePage is a copy of the leaf's pre-batch page, kept only when the
 	// batch rewrites slots with exact indexes active. It lets exact-index
 	// preparation diff the base and final bucket contributions and emit
@@ -1942,6 +1947,7 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	state *fileStoreState, baseGen uint64, li int,
 ) ([]byte, error) {
 	leaf := &c.batchPrimaryLeaves[li]
+	leaf.tailAppendOnly = false
 	replayStableSlots := c.journalReplaying && c.primaryUniqueReplayValidated &&
 		state.root.IndexCount != 0
 	leaf.stableSlots = replayStableSlots
@@ -2039,6 +2045,16 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	if leaf.applied == 0 {
 		leaf.skip = true
 		return nil, nil
+	}
+	// The fit helper may reuse this build's source proof only for the active
+	// lineage's trailing descendant. Merge has now populated each mutation's
+	// found bit, so the proof can require genuine inserts strictly beyond the
+	// source maximum. Publish the boolean only after the new image is complete.
+	tailAppendOnly := false
+	if lineage := c.primaryTailSplit; lineage != nil &&
+		len(lineage.leaves) > 0 &&
+		leaf.tailLineageIndex == len(lineage.leaves)-1 {
+		tailAppendOnly = c.validatePrimaryTailAppendOnly(leaf, baseRows) == nil
 	}
 	if replayStableSlots {
 		for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
@@ -2146,6 +2162,7 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		// longer describes the read-rule state once overlay rows merge in).
 		leaf.basePage = append(leaf.basePage[:0], page...)
 	}
+	leaf.tailAppendOnly = tailAppendOnly
 	return nil, nil
 }
 

@@ -430,12 +430,6 @@ func (c *Collection) primaryTailBatchBaseRows(
 		lease.Release()
 		return nil, storeio.PageLease{}, err
 	}
-	for index := range rows {
-		if rows[index].Value.IsOverflow() {
-			lease.Release()
-			return nil, storeio.PageLease{}, ErrCheckpointGroupPressure
-		}
-	}
 	return rows, lease, nil
 }
 
@@ -444,6 +438,11 @@ func (c *Collection) validatePrimaryTailAppendOnly(
 ) error {
 	if leaf == nil || len(baseRows) == 0 {
 		return ErrCheckpointGroupPressure
+	}
+	for index := range baseRows {
+		if baseRows[index].Value.IsOverflow() {
+			return ErrCheckpointGroupPressure
+		}
 	}
 	maximum := baseRows[len(baseRows)-1].Key
 	for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
@@ -464,18 +463,24 @@ func (c *Collection) preparePrimaryTailBatchUpdateLocked(
 		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
 	}
 	leaf := &c.batchPrimaryLeaves[0]
-	baseRows, lease, err := c.primaryTailBatchBaseRows(state, leaf)
-	if err != nil {
-		return stagedPrimaryBatch{}, err
+	if !leaf.tailAppendOnly {
+		return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
 	}
-	defer lease.Release()
-	if err := c.validatePrimaryTailAppendOnly(leaf, baseRows); err != nil {
-		return stagedPrimaryBatch{}, err
+	if generation != state.root.Generation+1 ||
+		leaf.frameGen != generation || leaf.nextLeaf.Generation != generation {
+		return stagedPrimaryBatch{}, storeio.ErrGenerationOrder
 	}
 	lineage := *c.primaryTailSplit
+	if len(lineage.leaves) < 2 {
+		return stagedPrimaryBatch{}, storeio.ErrSegmentedTabletRouterCorrupt
+	}
 	lineage.leaves = slices.Clone(c.primaryTailSplit.leaves)
 	last := len(lineage.leaves) - 1
 	previous := lineage.leaves[last].volatile
+	if previous == (storeio.PageRef{}) || leaf.resident.Ref != previous ||
+		leaf.pending.volatileRef != previous {
+		return stagedPrimaryBatch{}, storeio.ErrSegmentedTabletRouterCorrupt
+	}
 	lineage.leaves[last].volatile = leaf.nextLeaf
 	lineage.source.volatileRef = storeio.PageRef{}
 	metadata, ok := primaryTailLineageMetadataCharge(&lineage)
