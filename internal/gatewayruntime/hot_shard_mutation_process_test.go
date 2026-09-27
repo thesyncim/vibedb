@@ -1380,6 +1380,8 @@ type hotMutationAttemptObservation struct {
 	sequence      uint64
 	attempt       uint8
 	latency       time.Duration
+	startedAt     time.Time
+	completedAt   time.Time
 	response      []byte
 	responseBytes int
 }
@@ -1524,12 +1526,14 @@ func hotMutationResponseClass(response []byte) string {
 
 func (client *hotMutationWireClient) recordAttemptObservation(
 	sequence uint64, attempt uint8, response []byte, latency time.Duration,
+	startedAt time.Time, completedAt time.Time,
 ) {
 	if client.attemptObservationCount >= uint8(len(client.attemptObservations)) {
 		return
 	}
 	client.attemptObservations[client.attemptObservationCount] = hotMutationAttemptObservation{
 		sequence: sequence, attempt: attempt, latency: latency,
+		startedAt: startedAt, completedAt: completedAt,
 		response: response, responseBytes: len(response),
 	}
 	client.attemptObservationCount++
@@ -1552,9 +1556,12 @@ func (client *hotMutationWireClient) logObservedAttempts(t *testing.T) {
 	t.Helper()
 	for index := uint8(0); index < client.attemptObservationCount; index++ {
 		observation := client.attemptObservations[index]
-		t.Logf("hot split seq=%d attempt=%d latency=%s response=%s bytes=%d",
-			observation.sequence, observation.attempt, observation.latency,
-			hotMutationResponseClass(observation.response), observation.responseBytes)
+		t.Logf("hot split seq=%d attempt=%d started_at=%s completed_at=%s latency=%s response_class=%s response_bytes=%d response=%s",
+			observation.sequence, observation.attempt,
+			observation.startedAt.UTC().Format(time.RFC3339Nano),
+			observation.completedAt.UTC().Format(time.RFC3339Nano),
+			observation.latency, hotMutationResponseClass(observation.response),
+			observation.responseBytes, observation.response)
 	}
 	for index := uint8(0); index < client.logicalObservationCount; index++ {
 		observation := client.logicalObservations[index]
@@ -1610,17 +1617,31 @@ func (client *hotMutationWireClient) executeWithObservation(
 ) time.Duration {
 	t.Helper()
 	started := time.Now()
+	var firstAttemptStarted, firstAttemptCompleted time.Time
+	if observe {
+		firstAttemptStarted = time.Now()
+	}
 	response, latency := client.roundTrip(t, request)
+	if observe {
+		firstAttemptCompleted = time.Now()
+	}
 	firstResponse, firstLatency := response, latency
 	attempts := uint8(1)
 	var retryResponse []byte
 	var retryLatency time.Duration
+	var retryStarted, retryCompleted time.Time
 	// A leader handoff may explicitly leave this durable request unresolved.
 	// Resolve it with one exact public retry; include both attempts in the
 	// existing latency, request-count, and byte bounds.
 	if strings.Contains(string(response), gateway.ErrDurableRequestUnresolved.Error()) {
 		attempts++
+		if observe {
+			retryStarted = time.Now()
+		}
 		retryResponse, retryLatency = client.roundTrip(t, request)
+		if observe {
+			retryCompleted = time.Now()
+		}
 		response = retryResponse
 		latency = time.Since(started)
 	}
@@ -1628,9 +1649,11 @@ func (client *hotMutationWireClient) executeWithObservation(
 		// Store only fixed-size metadata and the already-owned response slices
 		// after the exact retry, if any, has completed. Classification and
 		// formatting are deferred until the original phase is over.
-		client.recordAttemptObservation(sequence, 1, firstResponse, firstLatency)
+		client.recordAttemptObservation(sequence, 1, firstResponse, firstLatency,
+			firstAttemptStarted, firstAttemptCompleted)
 		if attempts == 2 {
-			client.recordAttemptObservation(sequence, attempts, retryResponse, retryLatency)
+			client.recordAttemptObservation(sequence, attempts, retryResponse, retryLatency,
+				retryStarted, retryCompleted)
 		}
 		client.recordLogicalObservation(sequence, attempts, latency, response)
 	}
