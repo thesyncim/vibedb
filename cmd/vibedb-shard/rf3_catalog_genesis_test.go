@@ -20,6 +20,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replicaaction"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/shardservice"
 )
 
 func TestRF3CatalogGenesisOnlyFinishesForProvenSourceRetirement(t *testing.T) {
@@ -508,6 +509,37 @@ func TestRF3CatalogGenesisRetryableTransientOutcomes(t *testing.T) {
 		if rf3CatalogGenesisRetryable(err) {
 			t.Fatalf("terminal error %v became retryable", err)
 		}
+	}
+}
+
+func TestRF3CatalogGenesisSubmitFailureKindPreservesUncertainty(t *testing.T) {
+	status := raftmember.RuntimeStatus{MemberID: 1, LeaderID: 2, Term: 3}
+	typedNotLeader := &raftservice.NotLeaderError{Status: status}
+	for _, test := range []struct {
+		name   string
+		result raftservice.Result
+		err    error
+		want   shardservice.ReplicatedResponseKind
+	}{
+		{name: "typed pre-admission refusal", err: typedNotLeader, want: shardservice.ReplicatedNotLeader},
+		{name: "bare sentinel remains uncertain", err: raftmodel.ErrNotLeader, want: shardservice.ReplicatedOutcomeUnknown},
+		{name: "unknown wrapping sentinel", err: &raftservice.UnknownOutcomeError{Cause: raftmodel.ErrNotLeader}, want: shardservice.ReplicatedOutcomeUnknown},
+		{name: "unknown joined with typed refusal", err: errors.Join(raftservice.ErrOutcomeUnknown, typedNotLeader), want: shardservice.ReplicatedOutcomeUnknown},
+		{name: "settled not leader beats typed refusal",
+			result: raftservice.Result{Outcome: raftserve.Outcome{Code: raftserve.OutcomeNotLeader}},
+			err:    typedNotLeader, want: shardservice.ReplicatedOutcomeUnknown},
+		{name: "settled abandoned beats typed refusal",
+			result: raftservice.Result{Outcome: raftserve.Outcome{Code: raftserve.OutcomeProposalAbandoned}},
+			err:    typedNotLeader, want: shardservice.ReplicatedOutcomeUnknown},
+		{name: "cancellation is uncertain", err: context.Canceled, want: shardservice.ReplicatedOutcomeUnknown},
+		{name: "ordinary error remains unavailable", err: errRF3CatalogGenesis, want: shardservice.ReplicatedRefusal},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := rf3CatalogGenesisSubmitFailureKind(test.result, test.err); got != test.want {
+				t.Fatalf("failure kind=%d want=%d for result=%+v err=%T %v",
+					got, test.want, test.result, test.err, test.err)
+			}
+		})
 	}
 }
 

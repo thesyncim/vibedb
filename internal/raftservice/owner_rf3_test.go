@@ -702,7 +702,18 @@ func rf3RuntimeTestIdentity(memberID uint64, group int) raftstore.Identity {
 func newRF3RuntimeForTestIdentity(t testing.TB, identity raftstore.Identity, group int,
 	globalIndex bool,
 ) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
+	return newRF3RuntimeForTestIdentityWithVoters(
+		t, identity, group, globalIndex, []uint64{1, 2, 3},
+	)
+}
+
+func newRF3RuntimeForTestIdentityWithVoters(t testing.TB, identity raftstore.Identity, group int,
+	globalIndex bool, voters []uint64,
+) (*raftmember.Runtime, sqldriver.ReplicatedShardStoreIdentity, *sqldriver.ReplicatedApply) {
 	t.Helper()
+	if len(voters) == 0 {
+		t.Fatal("RF3 test Runtime requires at least one voter")
+	}
 	key := raftstore.Key{ID: "rf3-serving-key", Wrapped: []byte("opaque-wrapped-key")}
 	for index := range key.Material {
 		key.Material[index] = byte(index + 1 + group)
@@ -713,7 +724,7 @@ func newRF3RuntimeForTestIdentity(t testing.TB, identity raftstore.Identity, gro
 		raftstore.Bootstrap{TopologyRecoveryEpoch: 3, Snapshot: &pb.Snapshot{
 			Data: []byte("rf3-serving-bootstrap"),
 			Metadata: &pb.SnapshotMetadata{Index: &baseIndex, Term: &baseTerm,
-				ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}}},
+				ConfState: &pb.ConfState{Voters: append([]uint64(nil), voters...)}},
 		}},
 		raftstore.Options{MaxFileBytes: 256 << 20,
 			MaxRecordBytes: raftstore.DefaultMaxRecordBytes, MaxRecords: 4096,

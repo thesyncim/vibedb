@@ -397,11 +397,11 @@ func (client *rf3LocalCatalogGenesisClient) DoReplicated(
 			Refusal: shardservice.ReplicatedRefusalDeterministic, HasState: true, State: wireState,
 			Outcome: result.Outcome, RequestDigest: sha256.Sum256(request.Command)}, nil
 	}
-	if errors.Is(err, raftmodel.ErrNotLeader) {
-		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedNotLeader, HasState: true, State: wireState}, nil
-	}
-	if errors.Is(err, raftservice.ErrOutcomeUnknown) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	switch rf3CatalogGenesisSubmitFailureKind(result, err) {
+	case shardservice.ReplicatedOutcomeUnknown:
 		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedOutcomeUnknown, HasState: true, State: wireState}, nil
+	case shardservice.ReplicatedNotLeader:
+		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedNotLeader, HasState: true, State: wireState}, nil
 	}
 	if errors.Is(err, raftservice.ErrServingFence) {
 		return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedRefusal,
@@ -409,6 +409,24 @@ func (client *rf3LocalCatalogGenesisClient) DoReplicated(
 	}
 	return &shardservice.ReplicatedResponse{Kind: shardservice.ReplicatedRefusal,
 		Refusal: shardservice.ReplicatedRefusalUnavailable, HasState: true, State: wireState}, nil
+}
+
+func rf3CatalogGenesisSubmitFailureKind(result raftservice.Result, err error) shardservice.ReplicatedResponseKind {
+	if result.Outcome.Code == raftserve.OutcomeNotLeader ||
+		result.Outcome.Code == raftserve.OutcomeProposalAbandoned ||
+		errors.Is(err, raftserve.ErrProposalAbandoned) ||
+		errors.Is(err, raftservice.ErrOutcomeUnknown) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return shardservice.ReplicatedOutcomeUnknown
+	}
+	var preAdmissionNotLeader *raftservice.NotLeaderError
+	if errors.As(err, &preAdmissionNotLeader) {
+		return shardservice.ReplicatedNotLeader
+	}
+	if errors.Is(err, raftmodel.ErrNotLeader) {
+		return shardservice.ReplicatedOutcomeUnknown
+	}
+	return shardservice.ReplicatedRefusal
 }
 
 func (client *rf3LocalCatalogGenesisClient) commandMatches(view replication.CommandView) bool {
@@ -815,8 +833,9 @@ func initializeRF3CatalogGenesisSession(
 	if err = session.RetireReleaseAndDestroy(ctx); err != nil {
 		statusAfterRetireRelease := session.Status()
 		if client.lastSubmitErr != nil {
-			// Wrap the local owner's refusal: a lost election surfaces here as
-			// NotLeader and must reach the retry classifier, not kill the node.
+			// Wrap the local owner's refusal: a pre-admission election remains a
+			// definite NotLeader result, while an admitted loss carries explicit
+			// outcome-unknown state into the retry classifier.
 			return fmt.Errorf("rf3 catalog genesis session %s: client=%x retry=%x epoch=%d next=%d ack=%d pending=%t active=%t retired=%t released=%t local owner: %w: %w",
 				phase, client.clientID, client.retryHome, statusAfterRetireRelease.Epoch,
 				statusAfterRetireRelease.NextSequence, statusAfterRetireRelease.AckThrough,
