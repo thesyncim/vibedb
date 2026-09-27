@@ -1,0 +1,114 @@
+Total: 8.39s
+ROUTINE ======================== github.com/thesyncim/vibedb/internal/storeio.(*RecoveryJournal).AppendPreparedConditionalBatch in <candidate-checkout>/internal/storeio/recovery_journal_conditional.go
+      10ms       50ms (flat, cum)   0.6% of Total
+         .          .    369:func (rj *RecoveryJournal) AppendPreparedConditionalBatch(
+         .          .    370:	generation uint64,
+         .          .    371:	markerID [16]byte,
+         .          .    372:	markerEpoch, txnID uint64,
+         .          .    373:	entries []RecoveryBatchEntry,
+         .          .    374:	plan RecoveryBatchPlan,
+         .          .    375:) (uint64, error) {
+         .          .    376:	if rj.nextSequence == 0 {
+         .          .    377:		return 0, ErrRecoveryJournalFull
+         .          .    378:	}
+         .          .    379:	if !plan.validForKind(
+         .          .    380:		recoveryRecordKindConditionalBatch, rj.header.SectorSize, len(entries),
+         .          .    381:	) {
+         .          .    382:		return 0, fmt.Errorf("%w: conditional batch plan", ErrInvalidWrite)
+         .          .    383:	}
+         .          .    384:	end, ok := checkedSizeAdd(
+         .          .    385:		rj.cursor, uint64(plan.padded), ^uint64(0),
+         .          .    386:	)
+         .          .    387:	if !ok || end > rj.header.Capacity {
+         .          .    388:		return 0, ErrRecoveryJournalFull
+         .          .    389:	}
+         .          .    390:	if cap(rj.scratch) < plan.padded {
+         .          .    391:		rj.scratch = make([]byte, plan.padded)
+         .          .    392:	}
+         .          .    393:	rec := RecoveryRecord{
+         .          .    394:		Sequence:   rj.nextSequence,
+         .          .    395:		Generation: generation,
+         .          .    396:		Kind:       recoveryRecordKindConditionalBatch,
+         .          .    397:		Entries:    entries,
+         .          .    398:		Conditional: RecoveryConditionalHeader{
+         .          .    399:			MarkerID:    markerID,
+         .          .    400:			MarkerEpoch: markerEpoch,
+         .          .    401:			TxnID:       txnID,
+         .          .    402:		},
+         .          .    403:	}
+      10ms       10ms    404:	nextFamily, nextDeltaEnd, nextAtomicGeneration, nextAtomicKind, nextConditional, err :=
+         .          .    405:		rj.validateAppendRecord(rec)
+         .          .    406:	if err != nil {
+         .          .    407:		return 0, err
+         .          .    408:	}
+         .          .    409:	if _, err := encodeRecoveryConditionalBatchRecordPrepared(
+         .          .    410:		rj.scratch[:plan.padded], rj.header.SectorSize, rec, plan,
+         .          .    411:	); err != nil {
+         .          .    412:		return 0, err
+         .          .    413:	}
+         .          .    414:	offset := int64(recoveryJournalRegionStart) + int64(rj.cursor)
+         .       40ms    415:	if err := writeRecoveryJournalFull(
+         .          .    416:		rj.writeAt, rj.scratch[:plan.padded], offset,
+         .          .    417:	); err != nil {
+         .          .    418:		return 0, err
+         .          .    419:	}
+         .          .    420:	rj.cursor = end
+ROUTINE ======================== github.com/thesyncim/vibedb/internal/storeio.(*TxnMarker).AppendDecision in <candidate-checkout>/internal/storeio/txn_marker.go
+         0       10ms (flat, cum)  0.12% of Total
+         .          .   1608:func (m *TxnMarker) AppendDecision(
+         .          .   1609:	txnID uint64, targets []TxnCollectionRef) (uint64, error) {
+         .          .   1610:	if m.nextSequence == 0 {
+         .          .   1611:		return 0, ErrTxnMarkerFull
+         .          .   1612:	}
+         .          .   1613:	if txnID == 0 || txnID <= m.lastTxnID || txnID == ^uint64(0) {
+         .          .   1614:		return 0, fmt.Errorf("%w: txn id is not a usable strict successor", ErrInvalidWrite)
+         .          .   1615:	}
+         .          .   1616:	for _, target := range targets {
+         .          .   1617:		if _, retired := m.retired[target.StoreID]; retired {
+         .          .   1618:			return 0, fmt.Errorf(
+         .          .   1619:				"%w: decision names an already-retired participant", ErrInvalidWrite,
+         .          .   1620:			)
+         .          .   1621:		}
+         .          .   1622:	}
+         .          .   1623:	padded, ok := checkedTxnDecisionPaddedSize(len(targets))
+         .          .   1624:	if !ok {
+         .          .   1625:		return 0, fmt.Errorf("%w: decision record length", ErrInvalidWrite)
+         .          .   1626:	}
+         .          .   1627:	end, ok := checkedSizeAdd(m.cursor, uint64(padded), ^uint64(0))
+         .          .   1628:	if !ok || end > m.header.Capacity {
+         .          .   1629:		return 0, ErrTxnMarkerFull
+         .          .   1630:	}
+         .          .   1631:	if cap(m.scratch) < padded {
+         .          .   1632:		m.scratch = make([]byte, padded)
+         .          .   1633:	}
+         .          .   1634:	if _, err := encodeTxnDecisionRecord(
+         .          .   1635:		m.scratch[:padded], m.nextSequence, txnID, targets,
+         .          .   1636:	); err != nil {
+         .          .   1637:		return 0, err
+         .          .   1638:	}
+         .          .   1639:	offset := int64(txnMarkerRegionStart) + int64(m.cursor)
+         .       10ms   1640:	if err := writeTxnMarkerFull(m.writeAt, m.scratch[:padded], offset); err != nil {
+         .          .   1641:		return 0, err
+         .          .   1642:	}
+         .          .   1643:	m.cursor = end
+         .          .   1644:	sequence := m.nextSequence
+         .          .   1645:	m.nextSequence++
+ROUTINE ======================== github.com/thesyncim/vibedb/internal/storeio.(*TxnMarker).EntryCurrent in <candidate-checkout>/internal/storeio/txn_marker.go
+         0       10ms (flat, cum)  0.12% of Total
+         .          .   1430:func (m *TxnMarker) EntryCurrent() (bool, error) {
+         .          .   1431:	if m == nil || m.file == nil || m.root == nil ||
+         .          .   1432:		m.fileIdentity == nil || m.rawConn == nil {
+         .          .   1433:		return false, ErrInvalidWrite
+         .          .   1434:	}
+         .          .   1435:	if err := m.rawConn.Control(txnMarkerRawConnControl); err != nil {
+         .          .   1436:		return false, fmt.Errorf(
+         .          .   1437:			"vibedb: transaction marker descriptor is closed: %w",
+         .          .   1438:			errors.Join(os.ErrClosed, err),
+         .          .   1439:		)
+         .          .   1440:	}
+         .       10ms   1441:	entryInfo, err := m.root.Lstat(filepath.Base(m.path))
+         .          .   1442:	if err != nil {
+         .          .   1443:		return false, err
+         .          .   1444:	}
+         .          .   1445:	return entryInfo.Mode().IsRegular() &&
+         .          .   1446:		os.SameFile(m.fileIdentity, entryInfo), nil

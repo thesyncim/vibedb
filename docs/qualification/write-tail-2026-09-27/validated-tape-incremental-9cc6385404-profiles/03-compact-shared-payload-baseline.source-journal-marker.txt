@@ -1,0 +1,55 @@
+Total: 9.69s
+ROUTINE ======================== github.com/thesyncim/vibedb/internal/storeio.(*RecoveryJournal).AppendPreparedConditionalBatch in <baseline-checkout>/internal/storeio/recovery_journal_conditional.go
+         0       80ms (flat, cum)  0.83% of Total
+         .          .    369:func (rj *RecoveryJournal) AppendPreparedConditionalBatch(
+         .          .    370:	generation uint64,
+         .          .    371:	markerID [16]byte,
+         .          .    372:	markerEpoch, txnID uint64,
+         .          .    373:	entries []RecoveryBatchEntry,
+         .          .    374:	plan RecoveryBatchPlan,
+         .          .    375:) (uint64, error) {
+         .          .    376:	if rj.nextSequence == 0 {
+         .          .    377:		return 0, ErrRecoveryJournalFull
+         .          .    378:	}
+         .          .    379:	if !plan.validForKind(
+         .          .    380:		recoveryRecordKindConditionalBatch, rj.header.SectorSize, len(entries),
+         .          .    381:	) {
+         .          .    382:		return 0, fmt.Errorf("%w: conditional batch plan", ErrInvalidWrite)
+         .          .    383:	}
+         .          .    384:	end, ok := checkedSizeAdd(
+         .          .    385:		rj.cursor, uint64(plan.padded), ^uint64(0),
+         .          .    386:	)
+         .          .    387:	if !ok || end > rj.header.Capacity {
+         .          .    388:		return 0, ErrRecoveryJournalFull
+         .          .    389:	}
+         .          .    390:	if cap(rj.scratch) < plan.padded {
+         .          .    391:		rj.scratch = make([]byte, plan.padded)
+         .          .    392:	}
+         .          .    393:	rec := RecoveryRecord{
+         .          .    394:		Sequence:   rj.nextSequence,
+         .          .    395:		Generation: generation,
+         .          .    396:		Kind:       recoveryRecordKindConditionalBatch,
+         .          .    397:		Entries:    entries,
+         .          .    398:		Conditional: RecoveryConditionalHeader{
+         .          .    399:			MarkerID:    markerID,
+         .          .    400:			MarkerEpoch: markerEpoch,
+         .          .    401:			TxnID:       txnID,
+         .          .    402:		},
+         .          .    403:	}
+         .          .    404:	nextFamily, nextDeltaEnd, nextAtomicGeneration, nextAtomicKind, nextConditional, err :=
+         .          .    405:		rj.validateAppendRecord(rec)
+         .          .    406:	if err != nil {
+         .          .    407:		return 0, err
+         .          .    408:	}
+         .       10ms    409:	if _, err := encodeRecoveryConditionalBatchRecordPrepared(
+         .          .    410:		rj.scratch[:plan.padded], rj.header.SectorSize, rec, plan,
+         .          .    411:	); err != nil {
+         .          .    412:		return 0, err
+         .          .    413:	}
+         .          .    414:	offset := int64(recoveryJournalRegionStart) + int64(rj.cursor)
+         .       70ms    415:	if err := writeRecoveryJournalFull(
+         .          .    416:		rj.writeAt, rj.scratch[:plan.padded], offset,
+         .          .    417:	); err != nil {
+         .          .    418:		return 0, err
+         .          .    419:	}
+         .          .    420:	rj.cursor = end

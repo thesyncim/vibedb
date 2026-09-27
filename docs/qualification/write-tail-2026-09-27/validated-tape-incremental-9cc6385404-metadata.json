@@ -1,0 +1,244 @@
+{
+  "artifact_integrity": {
+    "normalization": "Textual output replaces ephemeral runner paths; native pprof captures are byte-identical.",
+    "original_comparison_json_sha256": "20f18499bb92b1c99149aa5e7f0fa610714e1dd04b06d2b930415987cb607b1c",
+    "original_profiles_json_sha256": "8251c4b92fcedfe5c444541814e0042d56f3284aad941c3c91dfdf5c7a975204",
+    "original_runs_json_sha256": "d87f1c43618ffdbdfd8b232996a0e7d61a3888c82a5148f92ffa197fecb74183",
+    "profile_artifacts_directory": "validated-tape-incremental-9cc6385404-profiles",
+    "published_profiles_json": "validated-tape-incremental-9cc6385404-profiles.json",
+    "published_runs_json": "validated-tape-incremental-9cc6385404-runs.json",
+    "published_summary_json": "validated-tape-incremental-9cc6385404-summary.json",
+    "raw_samples_directory": "validated-tape-incremental-9cc6385404-raw"
+  },
+  "date": "2026-09-27",
+  "environment": {
+    "cpu": "Intel Xeon Platinum 8370C virtual machine, 4 online vCPUs",
+    "filesystem": {
+      "available_bytes_at_snapshot": 90503790592,
+      "block_size_bytes": 4096,
+      "note": "Single pre-run snapshot, not a benchmark-time observation or bound.",
+      "reported_type_by_stat": "ext2/ext3",
+      "type": "ext4",
+      "use_percent_at_snapshot": 42,
+      "used_bytes_at_snapshot": 64373620736,
+      "volume_bytes_at_snapshot": 154894188544
+    },
+    "go_settings": {
+      "GOARCH": "amd64",
+      "GOOS": "linux",
+      "GOTOOLCHAIN": "local",
+      "GOVERSION": "go1.27.1"
+    },
+    "go_version": "go version go1.27.1 linux/amd64",
+    "goexperiment": "simd",
+    "gomaxprocs": 2,
+    "locale": "LC_ALL=C",
+    "os": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "runner": "GitHub Actions Ubuntu 24.04 hosted runner",
+    "temporary_directory": "Dedicated directory outside uploaded evidence; host path omitted.",
+    "timing_tool": "/usr/bin/time -v"
+  },
+  "profiles": {
+    "count": 4,
+    "diagnostic_only": true,
+    "manifest": "validated-tape-incremental-9cc6385404-profiles.json",
+    "native_profile_files": [
+      {
+        "arm": "baseline",
+        "file": "01-sequential-insert-baseline.pprof",
+        "pprof_duration": "Duration: 7.12s, Total samples = 7.12s (  100%)",
+        "sha256": "08e655932ad15f9d2dcf649733ab6653d4c13fba2a1fc90dca1288484afc5473",
+        "workload": "sequential-insert"
+      },
+      {
+        "arm": "candidate",
+        "file": "02-sequential-insert-candidate.pprof",
+        "pprof_duration": "Duration: 6.52s, Total samples = 6.48s (99.39%)",
+        "sha256": "3da76e5e6be31f6ca875d0f11ee0fcb771ddc98346b8289d7f39ef5f3fb7a613",
+        "workload": "sequential-insert"
+      },
+      {
+        "arm": "baseline",
+        "file": "03-compact-shared-payload-baseline.pprof",
+        "pprof_duration": "Duration: 9.72s, Total samples = 9.69s (99.70%)",
+        "sha256": "3cc330d99f93a3f27609b8eef7f61f002f497969914b4a8fbe47a65e3d4a4dff",
+        "workload": "compact-shared-payload"
+      },
+      {
+        "arm": "candidate",
+        "file": "04-compact-shared-payload-candidate.pprof",
+        "pprof_duration": "Duration: 8.41s, Total samples = 8.39s (99.79%)",
+        "sha256": "1e7a8aebaf9bf388f311c33e6601b910a8f7c84f94ce98081fd49dfc0107b09a",
+        "workload": "compact-shared-payload"
+      }
+    ],
+    "scope": "One separate profile per workload and arm; includes setup and final row oracle."
+  },
+  "reproduction": {
+    "build_command": "TMPDIR=<dedicated-temp> GOEXPERIMENT=simd GOMAXPROCS=2 go test -c -o <driver.test> ./sql/driver",
+    "build_commands_sha256": "2ea8dacacbdcf1356262ab05e06cfb0c3636c2ba040e02fb16d7e2acf7d549c2",
+    "preflight_command": "<driver.test> -test.run=^TestReplicatedApplyBatch64Preflight$ -test.count=1 -test.timeout=5m",
+    "steps": [
+      "Use two clean checkouts at the exact baseline and candidate revisions.",
+      "In both, overlay only sql/driver/replicated_apply_batch64_bench_test.go from the pinned harness revision.",
+      "Build ./sql/driver with Go 1.27.1, GOEXPERIMENT=simd and GOMAXPROCS=2, then run TestReplicatedApplyBatch64Preflight once per binary.",
+      "Run one exact benchmark per process with -test.benchtime=1x -test.count=1 -test.benchmem -test.timeout=20m, under /usr/bin/time -v, LC_ALL=C and a dedicated TMPDIR outside evidence.",
+      "Follow pair order and commands in the run JSON; the final full fold remains timed."
+    ],
+    "timed_command": "TMPDIR=<dedicated-temp> LC_ALL=C GOEXPERIMENT=simd GOMAXPROCS=2 /usr/bin/time -v <driver.test> -test.run=^$ -test.bench=^<one-exact-workload>$ -test.benchtime=1x -test.count=1 -test.benchmem -test.timeout=20m"
+  },
+  "result_summary": {
+    "paired_metric_equality": {
+      "matched_metric_scope": "All other metrics, including rows, topology/routing, certificate/sync counts, device writes/commits, and final/sampled file space, match in each pair.",
+      "matching_metrics_per_pair": 55,
+      "metrics_per_sample": 61,
+      "varying_metrics": [
+        "ns/op",
+        "prepare-apply-ns/row",
+        "total-ns/row",
+        "final-fold-ns/row",
+        "B/op",
+        "allocs/op"
+      ]
+    },
+    "ratio_definition": "Baseline median divided by candidate median across three runs per arm; this incremental result is not cumulative.",
+    "workloads": {
+      "compact-shared-payload": {
+        "B_op_baseline_candidate": [
+          189873600.0,
+          190047064.0
+        ],
+        "allocs_op_baseline_candidate": [
+          1173048.0,
+          1173137.0
+        ],
+        "baseline_median_ns_op": 9067105249.0,
+        "baseline_over_candidate_ratio_of_medians": 1.1772115416780444,
+        "candidate_median_ns_op": 7702188543.0,
+        "final_allocated_file_B_baseline_candidate": [
+          37765120.0,
+          37765120.0
+        ],
+        "final_apparent_file_B_baseline_candidate": [
+          38322688.0,
+          38322688.0
+        ],
+        "paired_ratios": [
+          1.1751643402624536,
+          1.1777905456682902,
+          1.1761606041484305
+        ],
+        "rss_KiB_baseline_candidate": [
+          103668,
+          104384
+        ]
+      },
+      "sequential-insert": {
+        "B_op_baseline_candidate": [
+          222691184.0,
+          222509520.0
+        ],
+        "allocs_op_baseline_candidate": [
+          1326438.0,
+          1326350.0
+        ],
+        "baseline_median_ns_op": 6284958485.0,
+        "baseline_over_candidate_ratio_of_medians": 1.1031659522254946,
+        "candidate_median_ns_op": 5697201289.0,
+        "final_allocated_file_B_baseline_candidate": [
+          62992384.0,
+          62992384.0
+        ],
+        "final_apparent_file_B_baseline_candidate": [
+          63431168.0,
+          63431168.0
+        ],
+        "paired_ratios": [
+          1.1079442071298036,
+          1.0940831992415225,
+          1.1045763148924026
+        ],
+        "rss_KiB_baseline_candidate": [
+          126028,
+          126508
+        ]
+      }
+    }
+  },
+  "schema": "vibedb.validated-tape-incremental-write-qualification.v1",
+  "source_and_binary_provenance": {
+    "arms": {
+      "baseline": {
+        "benchmark_list": [
+          "BenchmarkReplicatedApplyBatch64SequentialInsert",
+          "BenchmarkReplicatedApplyBatch64CompactSharedPayload",
+          "BenchmarkReplicatedApplyBatch64RuntimeWarmPointRead"
+        ],
+        "embedded_go": "go1.27.1-X:simd",
+        "harness_sha256": "729aecb98499032f9e667a91d5e71a694e1470ae31ec93cb48a3faecef3ece27",
+        "preflight": "PASS",
+        "sha256": "6a883d5e10e9193a9ecd7c47d8453cd389b011551ca9fca955c09a77c046ef8d",
+        "source_status": "M sql/driver/replicated_apply_batch64_bench_test.go"
+      },
+      "candidate": {
+        "benchmark_list": [
+          "BenchmarkReplicatedApplyBatch64SequentialInsert",
+          "BenchmarkReplicatedApplyBatch64CompactSharedPayload",
+          "BenchmarkReplicatedApplyBatch64RuntimeWarmPointRead"
+        ],
+        "embedded_go": "go1.27.1-X:simd",
+        "harness_sha256": "729aecb98499032f9e667a91d5e71a694e1470ae31ec93cb48a3faecef3ece27",
+        "preflight": "PASS",
+        "sha256": "b77d17083329b828e6a7f5d23dffb7a342910eea9cc6ddab12166ca68d55d953",
+        "source_status": "M sql/driver/replicated_apply_batch64_bench_test.go"
+      }
+    },
+    "baseline_revision": "e9a718b11fb2efac2a03927ec5402856159d37f9",
+    "candidate_revision": "9cc6385404a8c6c9c480f7179037748c2791aa1b",
+    "comparison_scope": "Incremental e9a718b11fb2efac2a03927ec5402856159d37f9 to 9cc6385404a8c6c9c480f7179037748c2791aa1b only; not multiplied by results from another revision pair.",
+    "harness_file_sha256": "729aecb98499032f9e667a91d5e71a694e1470ae31ec93cb48a3faecef3ece27",
+    "harness_patch_sha256": "86968950b5ebc757cbc6aed2647af280d599a14aab98e20a220f80712ed64fd0",
+    "harness_patches_equal": true,
+    "harness_revision": "9a136523919e89187edd2bd70d8645caeb22c579",
+    "harness_sha256": "729aecb98499032f9e667a91d5e71a694e1470ae31ec93cb48a3faecef3ece27",
+    "overlay": "The pinned SQL benchmark file was the only modified source file in both clean checkout builds."
+  },
+  "status": "complete incremental diagnostic; not a whole-main comparison; ratios are not cumulative",
+  "workflow": {
+    "artifact_sha256": "058d6bb2ab796a06a7b96d59dfb5dede6d8b3b589fda7eac6763efc2a6e4d3d4",
+    "comparison_job_conclusion": "success",
+    "completed_utc": "2026-09-27T11:34:17.711812+00:00",
+    "job": "Whole-main Batch64 write comparison",
+    "run_id": 36315886514,
+    "started_utc": "2026-09-27T11:32:42.601586+00:00",
+    "url": "https://github.com/thesyncim/vibedb/actions/runs/36315886514",
+    "workflow_revision": "9cc6385404a8c6c9c480f7179037748c2791aa1b"
+  },
+  "workload_and_timer": {
+    "batches_per_operation": 2048,
+    "excluded": [
+      "Raft",
+      "network transport",
+      "proposal admission",
+      "RF3 runtime"
+    ],
+    "final_full_fold_timed": true,
+    "path": "Local SQL ReplicatedApply across three durable collections; they are not physical replicas.",
+    "resource_limits": "GNU time RSS is whole-process, including setup/oracle, and diagnostic only. File space is sampled 32 times every 64 batches, not a continuous maximum or hard bound.",
+    "rows_per_batch": 64,
+    "rows_per_operation": 131072,
+    "timed": [
+      "Per-batch row/value generation",
+      "mutation and command construction",
+      "apply",
+      "completion/publication checks",
+      "final full checkpoint and fold"
+    ],
+    "untimed": [
+      "Database/schema setup and fixture construction before b.ResetTimer",
+      "final full-row oracle",
+      "post-run statistics",
+      "file-space sampling"
+    ]
+  }
+}

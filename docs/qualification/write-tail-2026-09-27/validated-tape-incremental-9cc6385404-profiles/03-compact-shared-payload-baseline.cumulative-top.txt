@@ -1,0 +1,49 @@
+File: baseline-driver.test
+Build ID: d4616cebd55ca466792fd421f6b251225ad839d9
+Type: cpu
+Time: 2026-09-27 11:34:42 UTC
+Duration: 9.72s, Total samples = 9.69s (99.70%)
+Showing nodes accounting for 1.96s, 20.23% of 9.69s total
+Dropped 295 nodes (cum <= 0.05s)
+Showing top 40 nodes out of 204
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%      9.56s 98.66%  github.com/thesyncim/vibedb/sql/driver.BenchmarkReplicatedApplyBatch64CompactSharedPayload
+         0     0%     0%      9.56s 98.66%  github.com/thesyncim/vibedb/sql/driver.benchmarkReplicatedApplyBatch64SequentialInsert
+         0     0%     0%      9.56s 98.66%  testing.(*B).run1.func1
+         0     0%     0%      9.56s 98.66%  testing.(*B).runN
+     0.01s   0.1%   0.1%      8.62s 88.96%  github.com/thesyncim/vibedb/internal/replicatedstate.(*Machine).applyNormalBatch
+         0     0%   0.1%      8.61s 88.85%  github.com/thesyncim/vibedb/internal/replicatedstate.(*Machine).ApplyNormalBatchWithCompletions
+         0     0%   0.1%      8.61s 88.85%  github.com/thesyncim/vibedb/sql/driver.(*ReplicatedApply).ApplyNormalBatchWithCompletions
+         0     0%   0.1%      7.68s 79.26%  github.com/thesyncim/vibedb/store/durable.(*CheckpointGroup).UpdateConsecutive
+         0     0%   0.1%      7.68s 79.26%  github.com/thesyncim/vibedb/store/durable.(*CheckpointGroup).updateLocked
+         0     0%   0.1%      7.32s 75.54%  github.com/thesyncim/vibedb/store/durable.(*CheckpointGroup).commitTransitionLocked
+         0     0%   0.1%      7.02s 72.45%  github.com/thesyncim/vibedb/store/durable.(*Collection).stagePrimaryBatchConditionalLocked (inline)
+         0     0%   0.1%      7.02s 72.45%  github.com/thesyncim/vibedb/store/durable.(*Collection).stagePrimaryBatchForJournalLocked
+     0.01s   0.1%  0.21%      6.17s 63.67%  github.com/thesyncim/vibedb/store/durable.(*Collection).buildPrimaryBatchLeaf
+         0     0%  0.21%      6.17s 63.67%  github.com/thesyncim/vibedb/store/durable.(*Collection).buildPrimaryBatchLeaves
+         0     0%  0.21%      5.06s 52.22%  github.com/thesyncim/vibedb/internal/storeio.BuildCompactPrimaryStripePayload
+         0     0%  0.21%      5.06s 52.22%  github.com/thesyncim/vibedb/internal/storeio.EncodeBestCompactPrimaryStripe
+         0     0%  0.21%      3.26s 33.64%  github.com/thesyncim/vibedb/internal/storeio.prepareCompactPrimaryStripeOptions
+     0.23s  2.37%  2.58%      3.22s 33.23%  github.com/thesyncim/vibedb/internal/storeio.(*UnifiedPrimaryLeafBuilder).extractRows
+         0     0%  2.58%      2.91s 30.03%  github.com/thesyncim/vibedb/internal/storeio.prepareCompactPrimaryStripe (inline)
+         0     0%  2.58%      2.88s 29.72%  github.com/thesyncim/vibedb/internal/storeio.(*UnifiedPrimaryLeafBuilder).extract (inline)
+         0     0%  2.58%      2.43s 25.08%  github.com/thesyncim/vibedb/internal/storeio.buildPreparedCompactPrimaryStripePayload
+     0.10s  1.03%  3.61%      2.43s 25.08%  github.com/thesyncim/vibedb/internal/storeio.buildPreparedCompactPrimaryStripePayloadRows
+         0     0%  3.61%      2.25s 23.22%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamScratch).encodeShape (inline)
+     0.02s  0.21%  3.82%      2.25s 23.22%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamScratch).encodeShapeWithRankContext
+     0.02s  0.21%  4.02%      1.70s 17.54%  github.com/thesyncim/vibedb/internal/storeio.IndexIsCanonical
+     0.04s  0.41%  4.44%      1.68s 17.34%  github.com/thesyncim/vibedb/internal/storeio.canonicalCheckEntry
+     0.17s  1.75%  6.19%      1.66s 17.13%  github.com/thesyncim/vibedb/internal/storeio.canonicalCheckObject
+     0.04s  0.41%  6.60%      1.39s 14.34%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryStripeView).RenderRecordsWithScratch
+     0.01s   0.1%  6.71%      1.26s 13.00%  github.com/thesyncim/vibejson/x/scanner.ValidUTF8NoLineSeparator (inline)
+         0     0%  6.71%      1.25s 12.90%  github.com/thesyncim/vibejson/x/scanner.validUTF8NoLineSeparatorFast (inline)
+     0.01s   0.1%  6.81%      1.25s 12.90%  github.com/thesyncim/vibejson/x/scanner.validUTF8NoLineSeparatorRuntime
+     0.57s  5.88% 12.69%      1.24s 12.80%  github.com/thesyncim/vibejson/x/scanner.validUTF8NoLineSeparatorGeneric
+     0.01s   0.1% 12.80%      1.12s 11.56%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryStripeView).AppendValue
+     0.49s  5.06% 17.85%      1.11s 11.46%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryStripeView).appendValueSingleShape
+     0.09s  0.93% 18.78%      0.85s  8.77%  github.com/thesyncim/vibedb/internal/storeio.(*UnifiedPrimaryLeafBuilder).buildIndex
+     0.14s  1.44% 20.23%      0.85s  8.77%  github.com/thesyncim/vibejson.buildIndexOptions
+         0     0% 20.23%      0.82s  8.46%  github.com/thesyncim/vibedb/store/durable.(*Collection).preparePrimaryTailBatchSplitLocked
+         0     0% 20.23%      0.78s  8.05%  github.com/thesyncim/vibejson.BuildIndex (inline)
+         0     0% 20.23%      0.74s  7.64%  github.com/thesyncim/vibedb/internal/replicatedstate.(*Machine).planSingleTargetApply
+         0     0% 20.23%      0.74s  7.64%  github.com/thesyncim/vibedb/internal/replicatedstate.(*Machine).planTransactionCommand

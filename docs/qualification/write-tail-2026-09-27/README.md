@@ -106,6 +106,10 @@ TMPDIR=<dedicated-temp-outside-evidence> LC_ALL=C GOEXPERIMENT=simd GOMAXPROCS=2
   -test.benchtime=1x -test.count=1 -test.benchmem -test.timeout=20m
 ```
 
+## Incremental validated-tape check: e9a718b1 to 9cc63854
+
+A separate comparison of the incremental `e9a718b1`→`9cc63854` change measured 1.103166× for sequential inserts and 1.177212× for shared 256-byte payloads by the ratio of medians. These values apply only to that revision pair and are not multiplied into either whole-main window. See the [twelve-run report, raw metrics, and four separate profiles](validated-tape-incremental-9cc6385404.md).
+
 ## Historical cumulative result: alphabet-union candidate, 2026-09-27
 
 Three alternating 1× pairs compared frozen `72c3a30a` against a main-derived

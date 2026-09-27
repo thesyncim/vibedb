@@ -29,7 +29,7 @@ regression or establish why the windows differ. Neither window reaches 10×.
 
 The [first-window report and captures](write-tail-2026-09-27/README.md#first-whole-main-ubuntu-comparison-run-36311055724)
 and [separate second-window report, captures, and profiles](write-tail-2026-09-27/whole-main-ubuntu-second-window-36313523724.md)
-retain independent provenance and results.
+retain independent provenance and results. The separate [incremental validated-tape comparison](write-tail-2026-09-27/validated-tape-incremental-9cc6385404.md) is `e9a718b1`→`9cc63854`, not a whole-main result; its ratios must not be multiplied into either window.
 
 ## Qualification workflows
 

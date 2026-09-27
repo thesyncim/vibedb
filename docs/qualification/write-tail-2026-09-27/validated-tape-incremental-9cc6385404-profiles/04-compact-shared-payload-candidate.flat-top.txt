@@ -1,0 +1,49 @@
+File: candidate-driver.test
+Build ID: e2d1f6ed4e1cd5dd97c8f7fe09cd9b67d61dd696
+Type: cpu
+Time: 2026-09-27 11:34:52 UTC
+Duration: 8.41s, Total samples = 8.39s (99.79%)
+Showing nodes accounting for 6.07s, 72.35% of 8.39s total
+Dropped 262 nodes (cum <= 0.04s)
+Showing top 40 nodes out of 199
+      flat  flat%   sum%        cum   cum%
+     0.52s  6.20%  6.20%      1.10s 13.11%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryStripeView).appendValueSingleShape
+     0.36s  4.29% 10.49%      0.36s  4.29%  crypto/internal/fips140/sha256.blockSHANI
+     0.32s  3.81% 14.30%      0.47s  5.60%  github.com/thesyncim/vibedb/internal/storeio.compactSharedAffixes
+     0.29s  3.46% 17.76%      2.15s 25.63%  github.com/thesyncim/vibedb/internal/storeio.(*UnifiedPrimaryLeafBuilder).extractRows
+     0.25s  2.98% 20.74%      0.25s  2.98%  memeqbody
+     0.24s  2.86% 23.60%      0.57s  6.79%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamScratch).encodePrefixIntShapeWithRankContext
+     0.24s  2.86% 26.46%      0.24s  2.86%  github.com/thesyncim/vibedb/internal/storeio.parseCompactPrefixInt
+     0.23s  2.74% 29.20%      0.23s  2.74%  cmpbody
+     0.20s  2.38% 31.59%      0.95s 11.32%  github.com/thesyncim/vibejson.buildIndexOptions
+     0.20s  2.38% 33.97%      0.20s  2.38%  runtime.memmove
+     0.18s  2.15% 36.11%      0.39s  4.65%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamScratch).dictionaryLookup
+     0.17s  2.03% 38.14%      0.17s  2.03%  indexbytebody
+     0.15s  1.79% 39.93%      0.73s  8.70%  github.com/thesyncim/vibejson.(*TapeBuilder).WalkFast
+     0.14s  1.67% 41.60%      0.14s  1.67%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamView).dictionaryEntry (inline)
+     0.14s  1.67% 43.27%      0.55s  6.56%  github.com/thesyncim/vibedb/internal/storeio.canonicalCheckObject
+     0.14s  1.67% 44.93%      0.15s  1.79%  github.com/thesyncim/vibedb/internal/storeio.compactCommonPrefixEqualHead
+     0.14s  1.67% 46.60%      0.54s  6.44%  github.com/thesyncim/vibedb/internal/storeio.compactStreamView.appendValue
+     0.13s  1.55% 48.15%      0.13s  1.55%  github.com/thesyncim/vibedb/internal/storeio.CanonicalIntValue
+     0.13s  1.55% 49.70%      0.13s  1.55%  github.com/thesyncim/vibedb/internal/storeio.compactPutBits (inline)
+     0.13s  1.55% 51.25%      0.21s  2.50%  github.com/thesyncim/vibejson/x/scanner.stringSpecialMask (inline)
+     0.13s  1.55% 52.80%      0.13s  1.55%  internal/runtime/maps.memHashAES
+     0.12s  1.43% 54.23%      0.25s  2.98%  github.com/thesyncim/vibedb/internal/storeio.(*UnifiedPrimaryLeafBuilder).shapeEqual
+     0.12s  1.43% 55.66%      2.33s 27.77%  github.com/thesyncim/vibedb/internal/storeio.buildPreparedCompactPrimaryStripePayloadRows
+     0.12s  1.43% 57.09%      0.12s  1.43%  internal/runtime/syscall/linux.Syscall6
+     0.11s  1.31% 58.40%      1.31s 15.61%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryStripeView).RenderRecordsWithScratch
+     0.11s  1.31% 59.71%      0.11s  1.31%  github.com/thesyncim/vibedb/internal/storeio.compactReadBits (inline)
+     0.11s  1.31% 61.03%      0.19s  2.26%  strconv.appendEscapedRune
+     0.10s  1.19% 62.22%      0.25s  2.98%  github.com/thesyncim/vibedb/internal/storeio.compactCommonPrefix
+     0.10s  1.19% 63.41%      0.31s  3.69%  strconv.appendQuotedWith
+     0.09s  1.07% 64.48%      0.56s  6.67%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamScratch).measureAlphabetWithSpellings
+     0.09s  1.07% 65.55%      0.45s  5.36%  github.com/thesyncim/vibejson.(*TapeBuilder).stringFast
+     0.09s  1.07% 66.63%      0.13s  1.55%  github.com/thesyncim/vibejson/x/scanner.scanStringSpecialAVX2
+     0.08s  0.95% 67.58%      0.08s  0.95%  github.com/thesyncim/vibejson/x/scanner.byteEqMask (inline)
+     0.07s  0.83% 68.41%      0.26s  3.10%  github.com/thesyncim/vibedb/internal/storeio.hasRawJSONLineSeparator
+     0.06s  0.72% 69.13%      0.07s  0.83%  github.com/thesyncim/vibedb/internal/storeio.(*CompactPrimaryStripeView).shapeEntry
+     0.06s  0.72% 69.85%      0.06s  0.72%  github.com/thesyncim/vibedb/store/durable.(*Collection).mergePrimaryBatchLeafRows
+     0.06s  0.72% 70.56%      0.06s  0.72%  strconv.IsPrint
+     0.05s   0.6% 71.16%      0.29s  3.46%  bytes.Compare (partial-inline)
+     0.05s   0.6% 71.75%      0.87s 10.37%  github.com/thesyncim/vibedb/internal/storeio.(*UnifiedPrimaryLeafBuilder).buildIndex
+     0.05s   0.6% 72.35%      0.42s  5.01%  github.com/thesyncim/vibedb/internal/storeio.(*compactStreamScratch).measureDictionary

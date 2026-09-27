@@ -1,0 +1,561 @@
+Total: 8.39s
+ROUTINE ======================== runtime.gcBgMarkWorker in /opt/hostedtoolcache/go/1.27.1/x64/src/runtime/mgc.go
+         0       40ms (flat, cum)  0.48% of Total
+         .          .   1766:func gcBgMarkWorker(ready chan struct{}) {
+         .          .   1767:	gp := getg()
+         .          .   1768:
+         .          .   1769:	// We pass node to a gopark unlock function, so it can't be on
+         .          .   1770:	// the stack (see gopark). Prevent deadlock from recursively
+         .          .   1771:	// starting GC by disabling preemption.
+         .          .   1772:	gp.m.preemptoff = "GC worker init"
+         .          .   1773:	// TODO: This is technically not allowed in the heap. See comment in tagptr.go.
+         .          .   1774:	//
+         .          .   1775:	// It is kept alive simply by virtue of being used in the infinite loop
+         .          .   1776:	// below. gcBgMarkWorkerPool keeps pointers to nodes that are not
+         .          .   1777:	// GC-visible, so this must be kept alive indefinitely (even if
+         .          .   1778:	// GOMAXPROCS decreases).
+         .          .   1779:	node := &new(gcBgMarkWorkerNodePadded).gcBgMarkWorkerNode
+         .          .   1780:	gp.m.preemptoff = ""
+         .          .   1781:
+         .          .   1782:	node.gp.set(gp)
+         .          .   1783:
+         .          .   1784:	node.m.set(acquirem())
+         .          .   1785:
+         .          .   1786:	ready <- struct{}{}
+         .          .   1787:	// After this point, the background mark worker is generally scheduled
+         .          .   1788:	// cooperatively by gcController.findRunnableGCWorker. While performing
+         .          .   1789:	// work on the P, preemption is disabled because we are working on
+         .          .   1790:	// P-local work buffers. When the preempt flag is set, this puts itself
+         .          .   1791:	// into _Gwaiting to be woken up by gcController.findRunnableGCWorker
+         .          .   1792:	// at the appropriate time.
+         .          .   1793:	//
+         .          .   1794:	// When preemption is enabled (e.g., while in gcMarkDone), this worker
+         .          .   1795:	// may be preempted and schedule as a _Grunnable G from a runq. That is
+         .          .   1796:	// fine; it will eventually gopark again for further scheduling via
+         .          .   1797:	// findRunnableGCWorker.
+         .          .   1798:	//
+         .          .   1799:	// Since we disable preemption before notifying ready, we guarantee that
+         .          .   1800:	// this G will be in the worker pool for the next findRunnableGCWorker.
+         .          .   1801:	// This isn't strictly necessary, but it reduces latency between
+         .          .   1802:	// _GCmark starting and the workers starting.
+         .          .   1803:
+         .          .   1804:	for {
+         .          .   1805:		// Go to sleep until woken by
+         .          .   1806:		// gcController.findRunnableGCWorker.
+         .          .   1807:		gopark(func(g *g, nodep unsafe.Pointer) bool {
+         .          .   1808:			node := (*gcBgMarkWorkerNode)(nodep)
+         .          .   1809:
+         .          .   1810:			if mp := node.m.ptr(); mp != nil {
+         .          .   1811:				// The worker G is no longer running; release
+         .          .   1812:				// the M.
+         .          .   1813:				//
+         .          .   1814:				// N.B. it is _safe_ to release the M as soon
+         .          .   1815:				// as we are no longer performing P-local mark
+         .          .   1816:				// work.
+         .          .   1817:				//
+         .          .   1818:				// However, since we cooperatively stop work
+         .          .   1819:				// when gp.preempt is set, if we releasem in
+         .          .   1820:				// the loop then the following call to gopark
+         .          .   1821:				// would immediately preempt the G. This is
+         .          .   1822:				// also safe, but inefficient: the G must
+         .          .   1823:				// schedule again only to enter gopark and park
+         .          .   1824:				// again. Thus, we defer the release until
+         .          .   1825:				// after parking the G.
+         .          .   1826:				releasem(mp)
+         .          .   1827:			}
+         .          .   1828:
+         .          .   1829:			// Release this G to the pool.
+         .          .   1830:			gcBgMarkWorkerPool.push(&node.node)
+         .          .   1831:			// Note that at this point, the G may immediately be
+         .          .   1832:			// rescheduled and may be running.
+         .          .   1833:			return true
+         .          .   1834:		}, unsafe.Pointer(node), waitReasonGCWorkerIdle, traceBlockSystemGoroutine, 0)
+         .          .   1835:
+         .          .   1836:		// Preemption must not occur here, or another G might see
+         .          .   1837:		// p.gcMarkWorkerMode.
+         .          .   1838:
+         .          .   1839:		// Disable preemption so we can use the gcw. If the
+         .          .   1840:		// scheduler wants to preempt us, we'll stop draining,
+         .          .   1841:		// dispose the gcw, and then preempt.
+         .          .   1842:		node.m.set(acquirem())
+         .          .   1843:		pp := gp.m.p.ptr() // P can't change with preemption disabled.
+         .          .   1844:
+         .          .   1845:		if gcBlackenEnabled == 0 {
+         .          .   1846:			println("worker mode", pp.gcMarkWorkerMode)
+         .          .   1847:			throw("gcBgMarkWorker: blackening not enabled")
+         .          .   1848:		}
+         .          .   1849:
+         .          .   1850:		if pp.gcMarkWorkerMode == gcMarkWorkerNotWorker {
+         .          .   1851:			throw("gcBgMarkWorker: mode not set")
+         .          .   1852:		}
+         .          .   1853:
+         .          .   1854:		startTime := nanotime()
+         .          .   1855:		pp.gcMarkWorkerStartTime = startTime
+         .          .   1856:		var trackLimiterEvent bool
+         .          .   1857:		if pp.gcMarkWorkerMode == gcMarkWorkerIdleMode {
+         .          .   1858:			trackLimiterEvent = pp.limiterEvent.start(limiterEventIdleMarkWork, startTime)
+         .          .   1859:		}
+         .          .   1860:
+         .          .   1861:		gcBeginWork()
+         .          .   1862:
+         .       40ms   1863:		systemstack(func() {
+         .          .   1864:			// Mark our goroutine preemptible so its stack can be scanned or observed
+         .          .   1865:			// by the execution tracer. This, for example, lets two mark workers scan
+         .          .   1866:			// each other (otherwise, they would deadlock).
+         .          .   1867:			//
+         .          .   1868:			// casGToWaitingForSuspendG marks the goroutine as ineligible for a
+ROUTINE ======================== runtime.gcBgMarkWorker.func2 in /opt/hostedtoolcache/go/1.27.1/x64/src/runtime/mgc.go
+         0       40ms (flat, cum)  0.48% of Total
+         .          .   1863:		systemstack(func() {
+         .          .   1864:			// Mark our goroutine preemptible so its stack can be scanned or observed
+         .          .   1865:			// by the execution tracer. This, for example, lets two mark workers scan
+         .          .   1866:			// each other (otherwise, they would deadlock).
+         .          .   1867:			//
+         .          .   1868:			// casGToWaitingForSuspendG marks the goroutine as ineligible for a
+         .          .   1869:			// stack shrink, effectively pinning the stack in memory for the duration.
+         .          .   1870:			//
+         .          .   1871:			// N.B. The execution tracer is not aware of this status transition and
+         .          .   1872:			// handles it specially based on the wait reason.
+         .          .   1873:			casGToWaitingForSuspendG(gp, _Grunning, waitReasonGCWorkerActive)
+         .          .   1874:			switch pp.gcMarkWorkerMode {
+         .          .   1875:			default:
+         .          .   1876:				throw("gcBgMarkWorker: unexpected gcMarkWorkerMode")
+         .          .   1877:			case gcMarkWorkerDedicatedMode:
+         .          .   1878:				gcDrainMarkWorkerDedicated(&pp.gcw, true)
+         .          .   1879:				if gp.preempt {
+         .          .   1880:					// We were preempted. This is
+         .          .   1881:					// a useful signal to kick
+         .          .   1882:					// everything out of the run
+         .          .   1883:					// queue so it can run
+         .          .   1884:					// somewhere else.
+         .          .   1885:					if drainQ := runqdrain(pp); !drainQ.empty() {
+         .          .   1886:						lock(&sched.lock)
+         .          .   1887:						globrunqputbatch(&drainQ)
+         .          .   1888:						unlock(&sched.lock)
+         .          .   1889:					}
+         .          .   1890:				}
+         .          .   1891:				// Go back to draining, this time
+         .          .   1892:				// without preemption.
+         .          .   1893:				gcDrainMarkWorkerDedicated(&pp.gcw, false)
+         .          .   1894:			case gcMarkWorkerFractionalMode:
+         .       20ms   1895:				gcDrainMarkWorkerFractional(&pp.gcw)
+         .          .   1896:			case gcMarkWorkerIdleMode:
+         .       20ms   1897:				gcDrainMarkWorkerIdle(&pp.gcw)
+         .          .   1898:			}
+         .          .   1899:			casgstatus(gp, _Gwaiting, _Grunning)
+         .          .   1900:		})
+         .          .   1901:
+         .          .   1902:		// Account for time and mark us as stopped.
+ROUTINE ======================== runtime.gcDrain in /opt/hostedtoolcache/go/1.27.1/x64/src/runtime/mgcmark.go
+         0       40ms (flat, cum)  0.48% of Total
+         .          .   1253:func gcDrain(gcw *gcWork, flags gcDrainFlags) {
+         .          .   1254:	if !writeBarrier.enabled {
+         .          .   1255:		throw("gcDrain phase incorrect")
+         .          .   1256:	}
+         .          .   1257:
+         .          .   1258:	// N.B. We must be running in a non-preemptible context, so it's
+         .          .   1259:	// safe to hold a reference to our P here.
+         .          .   1260:	gp := getg().m.curg
+         .          .   1261:	pp := gp.m.p.ptr()
+         .          .   1262:	preemptible := flags&gcDrainUntilPreempt != 0
+         .          .   1263:	flushBgCredit := flags&gcDrainFlushBgCredit != 0
+         .          .   1264:	idle := flags&gcDrainIdle != 0
+         .          .   1265:
+         .          .   1266:	initScanWork := gcw.heapScanWork
+         .          .   1267:
+         .          .   1268:	// checkWork is the scan work before performing the next
+         .          .   1269:	// self-preempt check.
+         .          .   1270:	checkWork := int64(1<<63 - 1)
+         .          .   1271:	var check func() bool
+         .          .   1272:	if flags&(gcDrainIdle|gcDrainFractional) != 0 {
+         .          .   1273:		checkWork = initScanWork + drainCheckThreshold
+         .          .   1274:		if idle {
+         .          .   1275:			check = pollWork
+         .          .   1276:		} else if flags&gcDrainFractional != 0 {
+         .          .   1277:			check = pollFractionalWorkerExit
+         .          .   1278:		}
+         .          .   1279:	}
+         .          .   1280:
+         .          .   1281:	if work.markrootNext.Load() < work.markrootJobs.Load() {
+         .          .   1282:		// Stop if we're preemptible, if someone wants to STW, or if
+         .          .   1283:		// someone is calling forEachP.
+         .          .   1284:		for !(gp.preempt && (preemptible || sched.gcwaiting.Load() || pp.runSafePointFn != 0)) {
+         .          .   1285:			job, ok := gcNextMarkRoot()
+         .          .   1286:			if !ok {
+         .          .   1287:				break
+         .          .   1288:			}
+         .       10ms   1289:			markroot(gcw, job, flushBgCredit)
+         .          .   1290:			if check != nil && check() {
+         .          .   1291:				goto done
+         .          .   1292:			}
+         .          .   1293:
+         .          .   1294:			// Spin up a new worker if requested.
+         .          .   1295:			if goexperiment.GreenTeaGC && gcw.mayNeedWorker {
+         .          .   1296:				gcw.mayNeedWorker = false
+         .          .   1297:				if gcphase == _GCmark {
+         .          .   1298:					gcController.enlistWorker()
+         .          .   1299:				}
+         .          .   1300:			}
+         .          .   1301:		}
+         .          .   1302:	}
+         .          .   1303:
+         .          .   1304:	// Drain heap marking jobs.
+         .          .   1305:	//
+         .          .   1306:	// Stop if we're preemptible, if someone wants to STW, or if
+         .          .   1307:	// someone is calling forEachP.
+         .          .   1308:	//
+         .          .   1309:	// TODO(mknyszek): Consider always checking gp.preempt instead
+         .          .   1310:	// of having the preempt flag, and making an exception for certain
+         .          .   1311:	// mark workers in retake. That might be simpler than trying to
+         .          .   1312:	// enumerate all the reasons why we might want to preempt, even
+         .          .   1313:	// if we're supposed to be mostly non-preemptible.
+         .          .   1314:	for !(gp.preempt && (preemptible || sched.gcwaiting.Load() || pp.runSafePointFn != 0)) {
+         .          .   1315:		// Try to keep work available on the global queue. We used to
+         .          .   1316:		// check if there were waiting workers, but it's better to
+         .          .   1317:		// just keep work available than to make workers wait. In the
+         .          .   1318:		// worst case, we'll do O(log(_WorkbufSize)) unnecessary
+         .          .   1319:		// balances.
+         .          .   1320:		if work.full == 0 {
+         .          .   1321:			gcw.balance()
+         .          .   1322:		}
+         .          .   1323:
+         .          .   1324:		// See mgcwork.go for the rationale behind the order in which we check these queues.
+         .          .   1325:		var b uintptr
+         .          .   1326:		var s objptr
+         .          .   1327:		if b = gcw.tryGetObjFast(); b == 0 {
+         .          .   1328:			if s = gcw.tryGetSpanFast(); s == 0 {
+         .          .   1329:				if b = gcw.tryGetObj(); b == 0 {
+         .          .   1330:					if s = gcw.tryGetSpan(); s == 0 {
+         .          .   1331:						// Flush the write barrier
+         .          .   1332:						// buffer; this may create
+         .          .   1333:						// more work.
+         .          .   1334:						wbBufFlush()
+         .          .   1335:						if b = gcw.tryGetObj(); b == 0 {
+         .          .   1336:							if s = gcw.tryGetSpan(); s == 0 {
+         .          .   1337:								s = gcw.tryStealSpan()
+         .          .   1338:							}
+         .          .   1339:						}
+         .          .   1340:					}
+         .          .   1341:				}
+         .          .   1342:			}
+         .          .   1343:		}
+         .          .   1344:		if b != 0 {
+         .       20ms   1345:			scanObject(b, gcw)
+         .          .   1346:		} else if s != 0 {
+         .       10ms   1347:			scanSpan(s, gcw)
+         .          .   1348:		} else {
+         .          .   1349:			// Unable to get work.
+         .          .   1350:			break
+         .          .   1351:		}
+         .          .   1352:
+ROUTINE ======================== runtime.gcDrainMarkWorkerFractional in /opt/hostedtoolcache/go/1.27.1/x64/src/runtime/mgcmark.go
+         0       20ms (flat, cum)  0.24% of Total
+         .          .   1197:func gcDrainMarkWorkerFractional(gcw *gcWork) {
+         .       20ms   1198:	gcDrain(gcw, gcDrainFractional|gcDrainUntilPreempt|gcDrainFlushBgCredit)
+         .          .   1199:}
+         .          .   1200:
+         .          .   1201:// gcNextMarkRoot safely increments work.markrootNext and returns the
+         .          .   1202:// index of the next root job. The returned boolean is true if the root job
+         .          .   1203:// is valid, and false if there are no more root jobs to be claimed,
+ROUTINE ======================== runtime.gcDrainMarkWorkerIdle in /opt/hostedtoolcache/go/1.27.1/x64/src/runtime/mgcmark.go
+         0       20ms (flat, cum)  0.24% of Total
+         .          .   1181:func gcDrainMarkWorkerIdle(gcw *gcWork) {
+         .       20ms   1182:	gcDrain(gcw, gcDrainIdle|gcDrainUntilPreempt|gcDrainFlushBgCredit)
+         .          .   1183:}
+         .          .   1184:
+         .          .   1185:// gcDrainMarkWorkerDedicated is a wrapper for gcDrain that exists to better account
+         .          .   1186:// mark time in profiles.
+         .          .   1187:func gcDrainMarkWorkerDedicated(gcw *gcWork, untilPreempt bool) {
+ROUTINE ======================== runtime.mallocgc in /opt/hostedtoolcache/go/1.27.1/x64/src/runtime/malloc.go
+      10ms      110ms (flat, cum)  1.31% of Total
+         .          .   1067:func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+         .          .   1068:	if doubleCheckMalloc {
+         .          .   1069:		if gcphase == _GCmarktermination {
+         .          .   1070:			throw("mallocgc called with gcphase == _GCmarktermination")
+         .          .   1071:		}
+         .          .   1072:	}
+         .          .   1073:
+         .          .   1074:	// Short-circuit zero-sized allocation requests.
+         .          .   1075:	if size == 0 {
+         .          .   1076:		return unsafe.Pointer(&zerobase)
+         .          .   1077:	}
+         .          .   1078:
+      10ms       10ms   1079:	if sizeSpecializedMallocEnabled && size < uintptr(len(mallocNoScanTable)) {
+         .          .   1080:		if typ == nil || !typ.Pointers() {
+         .          .   1081:			if size >= maxTinySize {
+         .       10ms   1082:				return mallocNoScanTable[size](size, typ, needzero)
+         .          .   1083:			}
+         .          .   1084:			return mallocgcTinySC2(size, typ, needzero)
+         .          .   1085:		} else {
+         .          .   1086:			if !needzero {
+         .          .   1087:				throw("objects with pointers must be zeroed")
+         .          .   1088:			}
+         .       10ms   1089:			return mallocScanTable[size](size, typ, needzero)
+         .          .   1090:		}
+         .          .   1091:	}
+         .          .   1092:
+         .          .   1093:	// It's possible for any malloc to trigger sweeping, which may in
+         .          .   1094:	// turn queue finalizers. Record this dynamic lock edge.
+         .          .   1095:	// N.B. Compiled away if lockrank experiment is not enabled.
+         .          .   1096:	lockRankMayQueueFinalizer()
+         .          .   1097:
+         .          .   1098:	// Pre-malloc debug hooks.
+         .          .   1099:	if debug.malloc {
+         .          .   1100:		if x := preMallocgcDebug(size, typ); x != nil {
+         .          .   1101:			return x
+         .          .   1102:		}
+         .          .   1103:	}
+         .          .   1104:
+         .          .   1105:	// For ASAN, we allocate extra memory around each allocation called the "redzone."
+         .          .   1106:	// These "redzones" are marked as unaddressable.
+         .          .   1107:	var asanRZ uintptr
+         .          .   1108:	if asanenabled {
+         .          .   1109:		asanRZ = redZoneSize(size)
+         .          .   1110:		size += asanRZ
+         .          .   1111:	}
+         .          .   1112:
+         .          .   1113:	// Assist the GC if needed. (On the reuse path, we currently compensate for this;
+         .          .   1114:	// changes here might require changes there.)
+         .          .   1115:	if gcBlackenEnabled != 0 {
+         .          .   1116:		deductAssistCredit(size)
+         .          .   1117:	}
+         .          .   1118:
+         .          .   1119:	// Actually do the allocation.
+         .          .   1120:	var x unsafe.Pointer
+         .          .   1121:	var elemsize uintptr
+         .          .   1122:	if sizeSpecializedMallocEnabled {
+         .          .   1123:		if size <= maxSmallSize-gc.MallocHeaderSize {
+         .          .   1124:			if typ == nil || !typ.Pointers() {
+         .       40ms   1125:				x, elemsize = mallocgcSmallNoscan(size, typ, needzero)
+         .          .   1126:			} else {
+         .          .   1127:				if !needzero {
+         .          .   1128:					throw("objects with pointers must be zeroed")
+         .          .   1129:				}
+         .          .   1130:				if heapBitsInSpan(size) {
+         .       30ms   1131:					x, elemsize = mallocgcSmallScanNoHeader(size, typ)
+         .          .   1132:				} else {
+         .          .   1133:					x, elemsize = mallocgcSmallScanHeader(size, typ)
+         .          .   1134:				}
+         .          .   1135:			}
+         .          .   1136:		} else {
+         .       10ms   1137:			x, elemsize = mallocgcLarge(size, typ, needzero)
+         .          .   1138:		}
+         .          .   1139:	} else {
+         .          .   1140:		if size <= maxSmallSize-gc.MallocHeaderSize {
+         .          .   1141:			if typ == nil || !typ.Pointers() {
+         .          .   1142:				// tiny allocations might be kept alive by other co-located values.
+ROUTINE ======================== runtime.mallocgcLarge in /opt/hostedtoolcache/go/1.27.1/x64/src/runtime/malloc.go
+         0       10ms (flat, cum)  0.12% of Total
+         .          .   1693:func mallocgcLarge(size uintptr, typ *_type, needzero bool) (unsafe.Pointer, uintptr) {
+         .          .   1694:	// Set mp.mallocing to keep from being preempted by GC.
+         .          .   1695:	mp := acquirem()
+         .          .   1696:	if doubleCheckMalloc {
+         .          .   1697:		if mp.mallocing != 0 {
+         .          .   1698:			throw("malloc deadlock")
+         .          .   1699:		}
+         .          .   1700:		if mp.gsignal == getg() {
+         .          .   1701:			throw("malloc during signal")
+         .          .   1702:		}
+         .          .   1703:	}
+         .          .   1704:	mp.mallocing = 1
+         .          .   1705:
+         .          .   1706:	c := getMCache(mp)
+         .          .   1707:	// For large allocations, keep track of zeroed state so that
+         .          .   1708:	// bulk zeroing can be happen later in a preemptible context.
+         .          .   1709:	span := c.allocLarge(size, typ == nil || !typ.Pointers())
+         .          .   1710:	span.freeindex = 1
+         .          .   1711:	span.allocCount = 1
+         .          .   1712:	span.largeType = nil // Tell the GC not to look at this yet.
+         .          .   1713:	size = span.elemsize
+         .          .   1714:	x := unsafe.Pointer(span.base())
+         .          .   1715:
+         .          .   1716:	// Ensure that the store above that sets largeType to
+         .          .   1717:	// nil happens before the caller can make x observable
+         .          .   1718:	// to the garbage collector.
+         .          .   1719:	//
+         .          .   1720:	// Otherwise, on weakly ordered machines, the garbage
+         .          .   1721:	// collector could follow a pointer to x, but see a stale
+         .          .   1722:	// largeType value.
+         .          .   1723:	publicationBarrier()
+         .          .   1724:
+         .          .   1725:	if writeBarrier.enabled {
+         .          .   1726:		// Allocate black during GC.
+         .          .   1727:		// All slots hold nil so no scanning is needed.
+         .          .   1728:		// This may be racing with GC so do it atomically if there can be
+         .          .   1729:		// a race marking the bit.
+         .          .   1730:		gcmarknewobject(span, uintptr(x))
+         .          .   1731:	} else {
+         .          .   1732:		// Track the last free index before the mark phase. This field
+         .          .   1733:		// is only used by the garbage collector. During the mark phase
+         .          .   1734:		// this is used by the conservative scanner to filter out objects
+         .          .   1735:		// that are both free and recently-allocated. It's safe to do that
+         .          .   1736:		// because we allocate-black if the GC is enabled. The conservative
+         .          .   1737:		// scanner produces pointers out of thin air, so without additional
+         .          .   1738:		// synchronization it might otherwise observe a partially-initialized
+         .          .   1739:		// object, which could crash the program.
+         .          .   1740:		span.freeIndexForScan = span.freeindex
+         .          .   1741:	}
+         .          .   1742:
+         .          .   1743:	// Note cache c only valid while m acquired; see #47302
+         .          .   1744:	//
+         .          .   1745:	// N.B. Use the full size because that matches how the GC
+         .          .   1746:	// will update the mem profile on the "free" side.
+         .          .   1747:	//
+         .          .   1748:	// TODO(mknyszek): We should really count the header as part
+         .          .   1749:	// of gc_sys or something. The code below just pretends it is
+         .          .   1750:	// internal fragmentation and matches the GC's accounting by
+         .          .   1751:	// using the whole allocation slot.
+         .          .   1752:	c.nextSample -= int64(size)
+         .          .   1753:	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
+         .       10ms   1754:		profilealloc(mp, x, size)
+         .          .   1755:	}
+         .          .   1756:	mp.mallocing = 0
+         .          .   1757:	releasem(mp)
+         .          .   1758:
+         .          .   1759:	// Check to see if we need to trigger the GC.
+ROUTINE ======================== runtime.mallocgcSmallNoScanSC4 in /opt/hostedtoolcache/go/1.27.1/x64/src/runtime/malloc_generated.go
+         0       10ms (flat, cum)  0.12% of Total
+         .          .   1389:func mallocgcSmallNoScanSC4(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+         .          .   1390:	if doubleCheckMalloc {
+         .          .   1391:		if gcphase == _GCmarktermination {
+         .          .   1392:			throw("mallocgc called with gcphase == _GCmarktermination")
+         .          .   1393:		}
+         .          .   1394:	}
+         .          .   1395:
+         .          .   1396:	var mp *m
+         .          .   1397:
+         .       10ms   1398:	mp = acquirem()
+         .          .   1399:
+         .          .   1400:	forceSlowPath := debug.malloc || gcBlackenEnabled != 0 || (goexperiment.RuntimeSecret && getg().secret > 0)
+         .          .   1401:
+         .          .   1402:	if forceSlowPath {
+         .          .   1403:		releasem(mp)
+ROUTINE ======================== runtime.mallocgcSmallNoscan in /opt/hostedtoolcache/go/1.27.1/x64/src/runtime/malloc.go
+         0       40ms (flat, cum)  0.48% of Total
+         .          .   1364:func mallocgcSmallNoscan(size uintptr, typ *_type, needzero bool) (unsafe.Pointer, uintptr) {
+         .          .   1365:	// Set mp.mallocing to keep from being preempted by GC.
+         .          .   1366:	mp := acquirem()
+         .          .   1367:	if doubleCheckMalloc {
+         .          .   1368:		if mp.mallocing != 0 {
+         .          .   1369:			throw("malloc deadlock")
+         .          .   1370:		}
+         .          .   1371:		if mp.gsignal == getg() {
+         .          .   1372:			throw("malloc during signal")
+         .          .   1373:		}
+         .          .   1374:		if typ != nil && typ.Pointers() {
+         .          .   1375:			throw("expected noscan type for noscan alloc")
+         .          .   1376:		}
+         .          .   1377:	}
+         .          .   1378:	mp.mallocing = 1
+         .          .   1379:
+         .          .   1380:	checkGCTrigger := false
+         .          .   1381:	c := getMCache(mp)
+         .          .   1382:	var sizeclass uint8
+         .          .   1383:	if size <= gc.SmallSizeMax-8 {
+         .          .   1384:		sizeclass = gc.SizeToSizeClass8[divRoundUp(size, gc.SmallSizeDiv)]
+         .          .   1385:	} else {
+         .          .   1386:		sizeclass = gc.SizeToSizeClass128[divRoundUp(size-gc.SmallSizeMax, gc.LargeSizeDiv)]
+         .          .   1387:	}
+         .          .   1388:	size = uintptr(gc.SizeClassToSize[sizeclass])
+         .          .   1389:	spc := makeSpanClass(sizeclass, true)
+         .          .   1390:	span := c.alloc[spc]
+         .          .   1391:
+         .          .   1392:	// First, check for a reusable object.
+         .          .   1393:	if runtimeFreegcEnabled && c.hasReusableNoscan(spc) {
+         .          .   1394:		// We have a reusable object, use it.
+         .          .   1395:		x := mallocgcSmallNoscanReuse(c, span, spc, size, needzero)
+         .          .   1396:		mp.mallocing = 0
+         .          .   1397:		releasem(mp)
+         .          .   1398:		return x, size
+         .          .   1399:	}
+         .          .   1400:
+         .       20ms   1401:	v := nextFreeFast(span)
+         .          .   1402:	if v == 0 {
+         .       10ms   1403:		v, span, checkGCTrigger = c.nextFree(spc)
+         .          .   1404:	}
+         .          .   1405:	x := unsafe.Pointer(v)
+         .          .   1406:	if needzero && span.needzero != 0 {
+         .          .   1407:		memclrNoHeapPointers(x, size)
+         .          .   1408:	}
+         .          .   1409:
+         .          .   1410:	// Ensure that the stores above that initialize x to
+         .          .   1411:	// type-safe memory and set the heap bits occur before
+         .          .   1412:	// the caller can make x observable to the garbage
+         .          .   1413:	// collector. Otherwise, on weakly ordered machines,
+         .          .   1414:	// the garbage collector could follow a pointer to x,
+         .          .   1415:	// but see uninitialized memory or stale heap bits.
+         .          .   1416:	publicationBarrier()
+         .          .   1417:
+         .          .   1418:	if writeBarrier.enabled {
+         .          .   1419:		// Allocate black during GC.
+         .          .   1420:		// All slots hold nil so no scanning is needed.
+         .          .   1421:		// This may be racing with GC so do it atomically if there can be
+         .          .   1422:		// a race marking the bit.
+         .       10ms   1423:		gcmarknewobject(span, uintptr(x))
+         .          .   1424:	} else {
+         .          .   1425:		// Track the last free index before the mark phase. This field
+         .          .   1426:		// is only used by the garbage collector. During the mark phase
+         .          .   1427:		// this is used by the conservative scanner to filter out objects
+         .          .   1428:		// that are both free and recently-allocated. It's safe to do that
+ROUTINE ======================== runtime.mallocgcSmallScanNoHeader in /opt/hostedtoolcache/go/1.27.1/x64/src/runtime/malloc.go
+         0       30ms (flat, cum)  0.36% of Total
+         .          .   1509:func mallocgcSmallScanNoHeader(size uintptr, typ *_type) (unsafe.Pointer, uintptr) {
+         .          .   1510:	// Set mp.mallocing to keep from being preempted by GC.
+         .          .   1511:	mp := acquirem()
+         .          .   1512:	if doubleCheckMalloc {
+         .          .   1513:		if mp.mallocing != 0 {
+         .          .   1514:			throw("malloc deadlock")
+         .          .   1515:		}
+         .          .   1516:		if mp.gsignal == getg() {
+         .          .   1517:			throw("malloc during signal")
+         .          .   1518:		}
+         .          .   1519:		if typ == nil || !typ.Pointers() {
+         .          .   1520:			throw("noscan allocated in scan-only path")
+         .          .   1521:		}
+         .          .   1522:		if !heapBitsInSpan(size) {
+         .          .   1523:			throw("heap bits in not in span for non-header-only path")
+         .          .   1524:		}
+         .          .   1525:	}
+         .          .   1526:	mp.mallocing = 1
+         .          .   1527:
+         .          .   1528:	checkGCTrigger := false
+         .          .   1529:	c := getMCache(mp)
+         .          .   1530:	sizeclass := gc.SizeToSizeClass8[divRoundUp(size, gc.SmallSizeDiv)]
+         .          .   1531:	spc := makeSpanClass(sizeclass, false)
+         .          .   1532:	span := c.alloc[spc]
+         .          .   1533:	v := nextFreeFast(span)
+         .          .   1534:	if v == 0 {
+         .       20ms   1535:		v, span, checkGCTrigger = c.nextFree(spc)
+         .          .   1536:	}
+         .          .   1537:	x := unsafe.Pointer(v)
+         .          .   1538:	if span.needzero != 0 {
+         .          .   1539:		memclrNoHeapPointers(x, size)
+         .          .   1540:	}
+         .          .   1541:	if goarch.PtrSize == 8 && sizeclass == 1 {
+         .          .   1542:		// initHeapBits already set the pointer bits for the 8-byte sizeclass
+         .          .   1543:		// on 64-bit platforms.
+         .          .   1544:		c.scanAlloc += 8
+         .          .   1545:	} else {
+         .       10ms   1546:		c.scanAlloc += heapSetTypeNoHeader(uintptr(x), size, typ, span)
+         .          .   1547:	}
+         .          .   1548:	size = uintptr(gc.SizeClassToSize[sizeclass])
+         .          .   1549:
+         .          .   1550:	// Ensure that the stores above that initialize x to
+         .          .   1551:	// type-safe memory and set the heap bits occur before
+ROUTINE ======================== runtime.mallocgcSmallScanNoHeaderSC2 in /opt/hostedtoolcache/go/1.27.1/x64/src/runtime/malloc_generated.go
+         0       10ms (flat, cum)  0.12% of Total
+         .          .    166:func mallocgcSmallScanNoHeaderSC2(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+         .          .    167:	if doubleCheckMalloc {
+         .          .    168:		if gcphase == _GCmarktermination {
+         .          .    169:			throw("mallocgc called with gcphase == _GCmarktermination")
+         .          .    170:		}
+         .          .    171:	}
+         .          .    172:
+         .          .    173:	var mp *m
+         .          .    174:
+         .       10ms    175:	mp = acquirem()
+         .          .    176:
+         .          .    177:	forceSlowPath := debug.malloc || gcBlackenEnabled != 0 || (goexperiment.RuntimeSecret && getg().secret > 0)
+         .          .    178:
+         .          .    179:	if forceSlowPath {
+         .          .    180:		releasem(mp)
