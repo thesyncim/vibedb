@@ -1,14 +1,110 @@
 # Rightmost-tail split and scalar alphabet write qualification, 2026-09-27
 
-The latest cumulative comparison uses the frozen `72c3a30a` candidate and a
-main-derived storage control. Its ratio of median control time to candidate time
-is 3.8686× for distinct varied payloads and 3.1213× for shared payloads. These
-results are materially below the earlier `0478cfad` comparison (6.94× and 5.33×),
-and the requested 10× minimum remains unmet. The earlier raw records remain
-unchanged. See the [qualification index](../README.md) and the earlier
-[write geometry report](../write-geometry-2026-09-26/README.md).
+The first whole-main Ubuntu window ([run 36311055724](https://github.com/thesyncim/vibedb/actions/runs/36311055724)) compares base `f9a9627a` with candidate `afa3eeec` using the same pinned benchmark harness. Sequential inserts improved by a median ratio of 1.589819×. The shared-payload case regressed: its baseline/candidate median ratio was 0.954651×, or 4.7503% more candidate time. These measurements do not establish a 10× speedup. The earlier Darwin measurements below remain historical records.
 
-## Latest cumulative result: alphabet-union candidate, 2026-09-27
+## First whole-main Ubuntu comparison, run 36311055724
+
+[Workflow run 36311055724](https://github.com/thesyncim/vibedb/actions/runs/36311055724)
+completed successfully. It built and preflighted both binaries from clean checkouts,
+then ran three alternating pairs for each workload, one process per sample. Each
+successful process applied exactly 131,072 rows in 2,048 batches of 64 and passed
+the benchmark's final row oracle.
+
+| Workload | Main median | Candidate median | Main/candidate ratio of medians | Candidate time change (vs main) |
+| --- | ---: | ---: | ---: | ---: |
+| Distinct varied payloads | 10.074139 s | 6.336657 s | 1.589819× | -37.10% |
+| Shared 256-byte payloads | 8.833278 s | 9.252889 s | 0.954651× | +4.75% |
+
+All following resource values are medians of three runs. Final file sizes cover all
+three durable collections.
+
+| Workload | B/op | Allocs/op | Final allocated-file bytes | Final apparent-file bytes | Whole-process maximum RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Distinct varied payloads | 500,828,552 → 222,509,712 | 1,995,280 → 1,326,341 | 72,622,080 → 62,992,384 | 72,962,560 → 63,431,168 | 142,580 → 126,404 KiB |
+| Shared 256-byte payloads | 308,326,976 → 189,704,968 | 1,326,039 → 1,172,961 | 42,119,168 → 37,765,120 | 43,254,272 → 38,322,688 | 105,876 → 105,884 KiB |
+
+The main and candidate user-relation device-write medians were 167,862,272 B →
+28,471,296 B for varied payloads and 134,651,904 B → 2,322,432 B for shared
+payloads. System-relation device writes rose from 204,800 B to 1,945,600 B and
+1,740,800 B, respectively, as the candidate folded more often. Median total certificates were 513 → 19 (varied) and 629 → 17 (shared); barrier
+syncs were
+2,052 → 76 and 2,516 → 68. The physical leaf-split counter was 511 → 2 and
+627 → 0; it counts physical structural split transactions, not every logical
+tail split. All remaining counters and each sample's individual values are in
+the run JSON.
+
+A separate later comparison and profiling window is recorded in workflow run
+[36313523724](https://github.com/thesyncim/vibedb/actions/runs/36313523724). Its twelve
+measurements and four diagnostic profiles are retained separately pending review;
+they are not included in these results.
+
+The ratio is the main median divided by the candidate median. Per-pair times and
+links to each captured stdout/stderr file are listed below; the JSON run record
+retains every metric from all twelve samples, including final-fold timing,
+certificates, device writes, syncs, sampled space and wall time.
+
+| Workload | Pair | Main time | Candidate time | Main captures | Candidate captures |
+| --- | ---: | ---: | ---: | --- | --- |
+| Distinct varied | 1 | 10.074139 s | 6.334165 s | [stdout](whole-main-ubuntu-raw/01-sequential-insert-pair1-baseline.stdout.txt), [stderr](whole-main-ubuntu-raw/01-sequential-insert-pair1-baseline.stderr.txt) | [stdout](whole-main-ubuntu-raw/02-sequential-insert-pair1-candidate.stdout.txt), [stderr](whole-main-ubuntu-raw/02-sequential-insert-pair1-candidate.stderr.txt) |
+| Distinct varied | 2 | 9.977874 s | 6.386311 s | [stdout](whole-main-ubuntu-raw/04-sequential-insert-pair2-baseline.stdout.txt), [stderr](whole-main-ubuntu-raw/04-sequential-insert-pair2-baseline.stderr.txt) | [stdout](whole-main-ubuntu-raw/03-sequential-insert-pair2-candidate.stdout.txt), [stderr](whole-main-ubuntu-raw/03-sequential-insert-pair2-candidate.stderr.txt) |
+| Distinct varied | 3 | 10.091110 s | 6.336657 s | [stdout](whole-main-ubuntu-raw/05-sequential-insert-pair3-baseline.stdout.txt), [stderr](whole-main-ubuntu-raw/05-sequential-insert-pair3-baseline.stderr.txt) | [stdout](whole-main-ubuntu-raw/06-sequential-insert-pair3-candidate.stdout.txt), [stderr](whole-main-ubuntu-raw/06-sequential-insert-pair3-candidate.stderr.txt) |
+| Shared 256-byte | 1 | 8.850670 s | 9.252889 s | [stdout](whole-main-ubuntu-raw/07-compact-shared-payload-pair1-baseline.stdout.txt), [stderr](whole-main-ubuntu-raw/07-compact-shared-payload-pair1-baseline.stderr.txt) | [stdout](whole-main-ubuntu-raw/08-compact-shared-payload-pair1-candidate.stdout.txt), [stderr](whole-main-ubuntu-raw/08-compact-shared-payload-pair1-candidate.stderr.txt) |
+| Shared 256-byte | 2 | 8.823801 s | 9.249119 s | [stdout](whole-main-ubuntu-raw/10-compact-shared-payload-pair2-baseline.stdout.txt), [stderr](whole-main-ubuntu-raw/10-compact-shared-payload-pair2-baseline.stderr.txt) | [stdout](whole-main-ubuntu-raw/09-compact-shared-payload-pair2-candidate.stdout.txt), [stderr](whole-main-ubuntu-raw/09-compact-shared-payload-pair2-candidate.stderr.txt) |
+| Shared 256-byte | 3 | 8.833278 s | 9.269831 s | [stdout](whole-main-ubuntu-raw/11-compact-shared-payload-pair3-baseline.stdout.txt), [stderr](whole-main-ubuntu-raw/11-compact-shared-payload-pair3-baseline.stderr.txt) | [stdout](whole-main-ubuntu-raw/12-compact-shared-payload-pair3-candidate.stdout.txt), [stderr](whole-main-ubuntu-raw/12-compact-shared-payload-pair3-candidate.stderr.txt) |
+
+The measured baseline is full main `f9a9627a513a1599bc00bdaf59f4eb93470d9fbf`;
+the measured candidate is `afa3eeecb1d756b7732e2d510715913512d230a3`. Both checkouts
+received the same `sql/driver/replicated_apply_batch64_bench_test.go` harness from
+`9a136523919e89187edd2bd70d8645caeb22c579` (SHA-256
+`729aecb98499032f9e667a91d5e71a694e1470ae31ec93cb48a3faecef3ece27`). The frozen
+baseline and candidate benchmark binary SHA-256 values are recorded in the metadata
+and run JSON. The preflight listed the target benchmark names and passed the
+one-transaction `TestReplicatedApplyBatch64Preflight` for both binaries.
+
+The workflow used Go 1.27.1, `GOEXPERIMENT=simd`, `GOMAXPROCS=2`, and
+`/usr/bin/time -v` on a four-vCPU AMD EPYC 7763 Ubuntu 24.04 runner. The dedicated
+benchmark temporary directory was on ext4 with 4 KiB blocks; the recorded filesystem
+capacity/free-space values are a single pre-run snapshot. The path itself is omitted.
+
+This measures local SQL `ReplicatedApply` through the checkpoint-group publication
+path over three durable collections; those collections are not physical replicas.
+Each apply completed through the group-backed publication path. The final group
+checkpoint certified and folded the last cut inside the timed operation. The result
+excludes Raft, network transport, proposal admission and RF3 runtime behavior.
+
+Per-batch key/value generation, mutation preparation, command construction, apply,
+and completion/publication checks are timed. The final full checkpoint and fold are
+also timed. Database/schema setup and fixture creation happen before `b.ResetTimer`;
+final full-row verification, post-run statistics and file-space sampling are outside
+the timer. Space is sampled every 64 batches while the Go timer is stopped, so peak
+file-space values are sampled observations rather than hard maxima. GNU time's
+maximum RSS is KiB for the whole process, including setup and row verification; it
+is diagnostic and not a memory bound.
+
+The [metadata](whole-main-ubuntu-metadata.json) records source, binary, toolchain,
+filesystem, workflow and command provenance. [All twelve run records](whole-main-ubuntu-runs.json)
+retain each metric and point to the published stdout/stderr captures in
+[the raw-output package](whole-main-ubuntu-raw/). To avoid exposing ephemeral
+runner paths, the published log copies replace only the timed binary's absolute
+runner path with `<baseline-driver.test>` or `<candidate-driver.test>`. The JSON
+records both the exact original artifact SHA-256 and the published normalized-file
+SHA-256 for each capture; benchmark output and metrics are unchanged.
+
+### Whole-main reproduction
+
+Use clean checkouts of the recorded main and candidate revisions, and overlay the
+pinned harness identically before building. Use a dedicated `TMPDIR` outside the
+evidence directory. The metadata contains the exact build and preflight commands;
+the run JSON contains each timed argv and pair order. The timed command shape is:
+
+```sh
+TMPDIR=<dedicated-temp-outside-evidence> LC_ALL=C GOEXPERIMENT=simd GOMAXPROCS=2 \
+  /usr/bin/time -v <baseline-driver.test-or-candidate-driver.test> \
+  -test.run='^$' -test.bench='^<one-exact-workload>$' \
+  -test.benchtime=1x -test.count=1 -test.benchmem -test.timeout=20m
+```
+
+## Historical cumulative result: alphabet-union candidate, 2026-09-27
 
 Three alternating 1× pairs compared frozen `72c3a30a` against a main-derived
 storage control. Each run applied 131,072 rows in 2,048 batches of 64 through SQL
@@ -77,7 +173,7 @@ varied profile sampled those entries for 1.03 s (33.23%) and 0.55 s (17.74%).
 Cumulative profile entries overlap and are not additive. Profile elapsed times
 are diagnostic only. See [profile summary](alphabet-profile-summary.json).
 
-## Method for the earlier 0478 comparison
+## Historical method for the 0478 comparison
 
 Each operation applies 131,072 rows as 2,048 batches of 64 through SQL
 `ReplicatedApply`, then performs the final checkpoint and fold. The three durable
@@ -105,7 +201,7 @@ per-run commands, and all raw values are in [metadata](metadata.json) and
 benchmark source adds four candidate-only tail-reservation reporting metrics; the
 row workload and timing boundaries are unchanged.
 
-## Write results
+## Historical write results: 0478 Darwin comparison
 
 Medians of the three fixed-work runs include final fold time:
 
@@ -127,7 +223,7 @@ device bytes are not whole-process totals; system device bytes rose with periodi
 folds. `write-runs.json` contains the twelve raw measurement rows and all recorded
 metrics.
 
-## Read control
+## Historical read control: 0478 Darwin comparison
 
 One fresh matched pair ran 50 passes over each of four cases: varied/shared payloads
 in sequential/permuted order. The input corpus was unchanged and the benchmark
@@ -138,7 +234,7 @@ reported zero allocations and zero cache misses. This single pair is diagnostic;
 does not support a general read-latency claim. The complete counters and hashes are
 in [read runs](read-runs.json).
 
-## Validation and limits
+## Historical validation and limits for the 0478 candidate
 
 The local full durable SIMD suite passed in 900.480 seconds. The final 0478 CI
 snapshot had 45 successful checks and two optional skips across its workflows; [the
@@ -154,7 +250,7 @@ This diagnostic is not an RF3 or end-to-end network throughput result. The fresh
 candidate speeds up both fixed workloads substantially, but it does not meet the
 10× target.
 
-## Reproduction
+## Historical reproduction
 
 Build the main-derived control in a clean checkout of scaffold `5a689170`, then
 replace the seven storage files below with their `f9a9627a` versions and the SQL
@@ -190,7 +286,7 @@ bound there by SHA-256; the baseline scaffold and source-overlay hashes are in
 [metadata](metadata.json). The [read control](read-runs.json) uses a separate frozen
 baseline binary and one matched 50× pair.
 
-### Latest cumulative 72c comparison
+### Historical cumulative 72c comparison
 
 The control build above is the recorded scaffold `5a689170` with seven storage
 files from main `f9a9627a` and the SQL benchmark source from `9a1365239`. Build
@@ -223,7 +319,7 @@ The exact per-workload command templates and source/binary hashes are also in
 [cumulative metadata](alphabet-cumulative-metadata.json) and
 [cumulative run records](alphabet-cumulative-runs.json).
 
-## Follow-up: cached transaction-marker identity, 2026-09-27
+## Historical follow-up: cached transaction-marker identity, 2026-09-27
 
 The marker-entry identity change at `8fcae2eb91509116117f7568800487b2b2311ae2`
 caches the marker descriptor's identity at open time. Each live-entry check
@@ -267,7 +363,7 @@ in [marker identity metadata](marker-identity-metadata.json) and
 [marker identity runs](marker-identity-runs.json). The raw local
 `EntryCurrent` samples are in [marker identity kernel output](marker-identity-kernel.txt).
 
-## Follow-up: fitting-tail source-render reuse, 2026-09-27
+## Historical follow-up: fitting-tail source-render reuse, 2026-09-27
 
 Commit 873d4dac3 carries append-only validation from the already rendered
 source image into the fitting-tail path. This removes the second source render
@@ -317,7 +413,7 @@ or 10x claim. See the [twelve raw measurements](fitting-reuse-runs.json),
 [source and binary metadata](fitting-reuse-metadata.json), and
 [profile notes](fitting-reuse-profile.txt).
 
-## Follow-up: alphabet-union census reuse, 2026-09-27
+## Historical follow-up: alphabet-union census reuse, 2026-09-27
 
 Commit `72c3a30a` reuses the complete dictionary census as the spelling set for
 alphabet measurement, avoiding a second scan of repeated strings while keeping

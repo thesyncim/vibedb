@@ -1,0 +1,259 @@
+{
+  "schema": "vibedb.whole-main-batch64-write-qualification.v1",
+  "date": "2026-09-27",
+  "status": "complete diagnostic; results do not establish a 10x speedup",
+  "headline": {
+    "varied_payload_ratio_of_medians": 1.589819189246412,
+    "shared_payload_ratio_of_medians": 0.9546508138720117,
+    "shared_payload_candidate_change_percent_vs_baseline": 4.750342792256634,
+    "interpretation": "Sequential inserts improved; shared payloads regressed by 4.7503% by median time. These measurements do not establish a 10x speedup.",
+    "tenfold_speedup_established": false
+  },
+  "workflow": {
+    "name": "fused RF3 physical-node qualification",
+    "job": "Whole-main Batch64 write comparison",
+    "run_id": 36311055724,
+    "url": "https://github.com/thesyncim/vibedb/actions/runs/36311055724",
+    "event": "workflow_dispatch",
+    "branch": "codex/write-distributed-hardening",
+    "workflow_revision": "afa3eeecb1d756b7732e2d510715913512d230a3",
+    "created_utc": "2026-09-27T09:58:42Z",
+    "completed_utc": "2026-09-27T10:04:44Z",
+    "conclusion": "success"
+  },
+  "source_and_binary_provenance": {
+    "baseline": {
+      "revision": "f9a9627a513a1599bc00bdaf59f4eb93470d9fbf",
+      "kind": "clean checkout of whole-main base",
+      "harness_overlay": "sql/driver/replicated_apply_batch64_bench_test.go only",
+      "harness_patch_sha256": "e8f65729563fd478b88ae3db9994e7ac84c326048196b83f5d199100b1b72b95",
+      "benchmark_binary_sha256": "600d1fded7613b7c6c69b0fb3d88e3d13052b814710054ca4db2064730a7415d",
+      "source_status": "Only the benchmark harness file was modified by the recorded overlay.",
+      "preflight": "PASS: both benchmark names listed; one-transaction preflight passed."
+    },
+    "candidate": {
+      "revision": "afa3eeecb1d756b7732e2d510715913512d230a3",
+      "kind": "clean checkout of measured candidate",
+      "harness_overlay": "sql/driver/replicated_apply_batch64_bench_test.go only",
+      "harness_patch_sha256": "86968950b5ebc757cbc6aed2647af280d599a14aab98e20a220f80712ed64fd0",
+      "benchmark_binary_sha256": "cff6f167905b109e2d59aa2d140ddbcd7c58ed49e83e5c22d0946320eae24efe",
+      "source_status": "Only the benchmark harness file was modified by the recorded overlay.",
+      "preflight": "PASS: both target benchmark names listed; one-transaction preflight passed."
+    },
+    "pinned_harness": {
+      "revision": "9a136523919e89187edd2bd70d8645caeb22c579",
+      "path": "sql/driver/replicated_apply_batch64_bench_test.go",
+      "sha256": "729aecb98499032f9e667a91d5e71a694e1470ae31ec93cb48a3faecef3ece27",
+      "applied_to": "Both clean checkouts, identically."
+    }
+  },
+  "environment": {
+    "runner": "GitHub Actions ubuntu-24.04",
+    "os": "Linux 6.17.0-1022-azure, glibc 2.39, x86_64",
+    "cpu": "AMD EPYC 7763 virtual machine, 4 online vCPUs",
+    "go_version": "go version go1.27.1 linux/amd64",
+    "go_settings": {
+      "GOARCH": "amd64",
+      "GOOS": "linux",
+      "GOTOOLCHAIN": "local",
+      "GOVERSION": "go1.27.1"
+    },
+    "goexperiment": "simd",
+    "gomaxprocs": 2,
+    "temporary_directory": "Dedicated workflow temporary directory outside the uploaded evidence directory; its host path is omitted.",
+    "temporary_filesystem": {
+      "type": "ext4",
+      "reported_type_by_stat": "ext2/ext3",
+      "block_size_bytes": 4096,
+      "volume_bytes_at_snapshot": 154894188544,
+      "used_bytes_at_snapshot": 64766517248,
+      "available_bytes_at_snapshot": 90110894080,
+      "use_percent_at_snapshot": 42,
+      "note": "One pre-run filesystem snapshot; not a benchmark-time observation or bound."
+    },
+    "timing_tool": "/usr/bin/time -v",
+    "locale": "LC_ALL=C"
+  },
+  "workload_and_timing": {
+    "rows_per_operation": 131072,
+    "batches_per_operation": 2048,
+    "rows_per_batch": 64,
+    "durable_collections": 3,
+    "collection_interpretation": "The three durable collections are not physical replicas.",
+    "path": "Local SQL ReplicatedApply through the checkpoint-group publication path.",
+    "acknowledgement_contract": "Each local apply completed through its group-backed publication path. The final group checkpoint certifies and folds the last cut inside the timed operation; this is not an RF3 acknowledgement or network result.",
+    "excluded": [
+      "Raft",
+      "network transport",
+      "proposal admission",
+      "RF3 runtime"
+    ],
+    "timed": [
+      "Per-batch row/value generation, mutation preparation, command assembly, apply, completion/publication checks.",
+      "Final full checkpoint and fold."
+    ],
+    "untimed": [
+      "Database/schema/bootstrap setup and benchmark fixture construction before b.ResetTimer.",
+      "Final full-row verification, post-run statistics, and disk footprint sampling."
+    ],
+    "disk_sampling": "Every 64 batches while the Go benchmark timer is stopped; reported peaks are sampled observations, not hard maxima.",
+    "rss": "GNU time maximum RSS is KiB for each entire process, including setup and final row oracle; diagnostic only, not a memory bound.",
+    "sample_plan": "Three alternating pairs per workload: baseline/candidate, candidate/baseline, baseline/candidate. One process per sample, -test.benchtime=1x -test.count=1."
+  },
+  "summary": {
+    "compact-shared-payload": {
+      "benchmark": "BenchmarkReplicatedApplyBatch64CompactSharedPayload",
+      "baseline": {
+        "pair_order_values_ns_per_op": [
+          8850669884.0,
+          8823801070.0,
+          8833277857.0
+        ],
+        "pair_order_values_wall_seconds": [
+          9.545802,
+          9.511153,
+          9.540375
+        ],
+        "pair_order_maximum_rss_kib": [
+          105876,
+          103716,
+          106244
+        ],
+        "median_ns_per_op": 8833277857.0,
+        "median_B_per_op": 308326976.0,
+        "median_allocs_per_op": 1326039.0,
+        "median_final_allocated_file_bytes": 42119168.0,
+        "median_final_apparent_file_bytes": 43254272.0,
+        "median_observed_peak_allocated_file_bytes": 42123264.0,
+        "median_observed_peak_apparent_file_bytes": 43254272.0,
+        "median_whole_process_maximum_rss_kib": 105876
+      },
+      "candidate": {
+        "pair_order_values_ns_per_op": [
+          9252888835.0,
+          9249118723.0,
+          9269831346.0
+        ],
+        "pair_order_values_wall_seconds": [
+          9.914584,
+          9.910165,
+          9.939425
+        ],
+        "pair_order_maximum_rss_kib": [
+          103684,
+          105884,
+          107952
+        ],
+        "median_ns_per_op": 9252888835.0,
+        "median_B_per_op": 189704968.0,
+        "median_allocs_per_op": 1172961.0,
+        "median_final_allocated_file_bytes": 37765120.0,
+        "median_final_apparent_file_bytes": 38322688.0,
+        "median_observed_peak_allocated_file_bytes": 37765120.0,
+        "median_observed_peak_apparent_file_bytes": 38322688.0,
+        "median_whole_process_maximum_rss_kib": 105884
+      },
+      "baseline_over_candidate_ratio_of_medians": 0.9546508138720117,
+      "paired_baseline_over_candidate_ratios": [
+        0.9565304459858455,
+        0.954015332083223,
+        0.9529059944344752
+      ],
+      "candidate_change_percent_vs_baseline": 4.750342792256634
+    },
+    "sequential-insert": {
+      "benchmark": "BenchmarkReplicatedApplyBatch64SequentialInsert",
+      "baseline": {
+        "pair_order_values_ns_per_op": [
+          10074139093.0,
+          9977874256.0,
+          10091109599.0
+        ],
+        "pair_order_values_wall_seconds": [
+          10.955383,
+          10.849902,
+          10.959758
+        ],
+        "pair_order_maximum_rss_kib": [
+          142580,
+          144380,
+          139260
+        ],
+        "median_ns_per_op": 10074139093.0,
+        "median_B_per_op": 500828552.0,
+        "median_allocs_per_op": 1995280.0,
+        "median_final_allocated_file_bytes": 72622080.0,
+        "median_final_apparent_file_bytes": 72962560.0,
+        "median_observed_peak_allocated_file_bytes": 72622080.0,
+        "median_observed_peak_apparent_file_bytes": 72962560.0,
+        "median_whole_process_maximum_rss_kib": 142580
+      },
+      "candidate": {
+        "pair_order_values_ns_per_op": [
+          6334164726.0,
+          6386310622.0,
+          6336657125.0
+        ],
+        "pair_order_values_wall_seconds": [
+          7.276111,
+          7.234043,
+          7.185117
+        ],
+        "pair_order_maximum_rss_kib": [
+          126404,
+          124084,
+          126800
+        ],
+        "median_ns_per_op": 6336657125.0,
+        "median_B_per_op": 222509712.0,
+        "median_allocs_per_op": 1326341.0,
+        "median_final_allocated_file_bytes": 62992384.0,
+        "median_final_apparent_file_bytes": 63431168.0,
+        "median_observed_peak_allocated_file_bytes": 62992384.0,
+        "median_observed_peak_apparent_file_bytes": 63431168.0,
+        "median_whole_process_maximum_rss_kib": 126404
+      },
+      "baseline_over_candidate_ratio_of_medians": 1.589819189246412,
+      "paired_baseline_over_candidate_ratios": [
+        1.5904447592984812,
+        1.562384739262061,
+        1.5924973373085891
+      ],
+      "candidate_change_percent_vs_baseline": -37.09976538438886
+    }
+  },
+  "artifact_integrity": {
+    "original_runs_json_sha256": "c034bc0e5cda2ce18874592407db51ef075e066c2625b9715b2b432714598a55",
+    "original_comparison_json_sha256": "22e28bc6287bae4c2a4e4d8539ddb30eb6f6d8a8d93210811f91c58077fa213c",
+    "baseline_binary_sha256": "600d1fded7613b7c6c69b0fb3d88e3d13052b814710054ca4db2064730a7415d",
+    "candidate_binary_sha256": "cff6f167905b109e2d59aa2d140ddbcd7c58ed49e83e5c22d0946320eae24efe",
+    "source_patches": {
+      "baseline_sha256": "e8f65729563fd478b88ae3db9994e7ac84c326048196b83f5d199100b1b72b95",
+      "candidate_sha256": "86968950b5ebc757cbc6aed2647af280d599a14aab98e20a220f80712ed64fd0"
+    },
+    "published_capture_rule": "Every published stdout/stderr record carries both the original artifact hash and the normalized public file hash; the only text normalization is replacement of the ephemeral binary path."
+  },
+  "reproduction": {
+    "build_steps": [
+      "git worktree add --detach ../vibedb-main f9a9627a513a1599bc00bdaf59f4eb93470d9fbf",
+      "git worktree add --detach ../vibedb-candidate afa3eeecb1d756b7732e2d510715913512d230a3",
+      "In both checkouts: git show 9a136523919e89187edd2bd70d8645caeb22c579:sql/driver/replicated_apply_batch64_bench_test.go > sql/driver/replicated_apply_batch64_bench_test.go",
+      "(cd ../vibedb-main && TMPDIR=<dedicated-temp-outside-evidence> GOEXPERIMENT=simd GOMAXPROCS=2 go test -c -o ../baseline-driver.test ./sql/driver)",
+      "(cd ../vibedb-candidate && TMPDIR=<dedicated-temp-outside-evidence> GOEXPERIMENT=simd GOMAXPROCS=2 go test -c -o ../candidate-driver.test ./sql/driver)",
+      "Run the one-transaction preflight in each binary with -test.run=^TestReplicatedApplyBatch64Preflight$ -test.count=1 -test.timeout=5m.",
+      "For every run, execute /usr/bin/time -v <binary> -test.run=^$ -test.bench=^<one workload name>$ -test.benchtime=1x -test.count=1 -test.benchmem -test.timeout=20m, with TMPDIR=<dedicated-temp-outside-evidence>, GOEXPERIMENT=simd, GOMAXPROCS=2, LC_ALL=C."
+    ],
+    "timed_run_argv": [
+      "/usr/bin/time",
+      "-v",
+      "<baseline-driver.test or candidate-driver.test>",
+      "-test.run=^$",
+      "-test.bench=^<single exact workload>$",
+      "-test.benchtime=1x",
+      "-test.count=1",
+      "-test.benchmem",
+      "-test.timeout=20m"
+    ],
+    "run_order_and_all_raw_metrics": "See whole-main-ubuntu-runs.json; each stdout/stderr link points to the normalized public capture copy."
+  }
+}
