@@ -1,0 +1,62 @@
+{
+  "captured_date": "2026-09-27",
+  "candidate_revision": "8fcae2eb91509116117f7568800487b2b2311ae2",
+  "baseline_revision": "0478cfad76eb0fd4dd783c50850c991e060d3099",
+  "baseline_binary_sha256": "bb609065d42fac3e2e04380f63ded753b5f1c0c4ecb49a7023489b8b6ec6fff7",
+  "candidate_binary_sha256": "31596540917497087a208286f4216c55302e2cf9013f65a42fbb0695f21e1297",
+  "baseline_description": "Frozen 0478 rightmost-tail candidate, before the cached marker identity change. This is not a main-branch binary.",
+  "source_sha256": {
+    "internal/storeio/txn_marker.go": "6b3b265134568685cb2c901252d8c7f484387bbbfd481ff33bacb0d1c7555712",
+    "internal/storeio/txn_marker_identity_cache_test.go": "e06a58964c6367f692893272207b2e9549e0f43340201daa1d53a9773f29f856",
+    "internal/storeio/txn_marker_identity_cache_bench_test.go": "aff790d3fb0e811f2e03c02021891a76ed1a68d066d9387c208c49a505f3979e",
+    "store/durable/store_file_primary_tail_fitting_test.go": "0572086a9461323404b65c4184b6814419ea3cf8ca21b48dc7e6a1e3b189a744",
+    "sql/driver/replicated_apply_batch64_bench_test.go": "6723b2c66c29910c89dbc51db515e59edb0f2266350caaa2cb48fff30db71b3a"
+  },
+  "benchmark_source_sha256": "6723b2c66c29910c89dbc51db515e59edb0f2266350caaa2cb48fff30db71b3a",
+  "marker_microbenchmark_source_sha256": "aff790d3fb0e811f2e03c02021891a76ed1a68d066d9387c208c49a505f3979e",
+  "platform": {
+    "goos": "darwin",
+    "goarch": "arm64",
+    "cpu": "Apple M4 Max"
+  },
+  "environment": {
+    "GOEXPERIMENT": "simd",
+    "build_wrapper": "project-env"
+  },
+  "build_command": "CODEX_AGENT_ID=qual-marker GOEXPERIMENT=simd project-env go test -c ./sql/driver -o candidate-driver.test",
+  "public_benchmark_commands": [
+    [
+      "project-env",
+      "./<baseline-or-candidate-driver.test>",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkReplicatedApplyBatch64SequentialInsert$",
+      "-test.benchtime=1x",
+      "-test.count=1",
+      "-test.benchmem",
+      "-test.timeout=20m"
+    ],
+    [
+      "project-env",
+      "./<baseline-or-candidate-driver.test>",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkReplicatedApplyBatch64CompactSharedPayload$",
+      "-test.benchtime=1x",
+      "-test.count=1",
+      "-test.benchmem",
+      "-test.timeout=20m"
+    ]
+  ],
+  "comparison": "Three alternating baseline/candidate pairs for each workload; all 12 runs passed the benchmark full-oracle checks.",
+  "limits": [
+    "This isolates the marker identity implementation against the frozen 0478 tail candidate; it is not a comparison with main.",
+    "The public measurements show no measurable throughput change.",
+    "Tail split charge values are bounded reservation accounting, not process RSS.",
+    "Observed file-space samples are diagnostics; allocated space may vary at filesystem allocation granularity."
+  ],
+  "focused_validation": {
+    "race": "PASS: internal/storeio and store/durable focused marker, pinned-directory, replaced-marker, and fitting-tail tests.",
+    "nosimd": "PASS: same focused packages and tests with GOEXPERIMENT=nosimd.",
+    "cross_compile": "PASS: internal/storeio and store/durable test binaries for windows/amd64 and linux/386.",
+    "initial_failure": "An initial focused storeio run found that RawConn.Control returned a closed-file error string not matching os.ErrClosed. EntryCurrent now joins os.ErrClosed with that concrete error; the final focused race/nosimd runs passed. The initial run output was not saved."
+  }
+}

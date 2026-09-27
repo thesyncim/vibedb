@@ -1,0 +1,12 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/thesyncim/vibedb/internal/storeio
+cpu: Apple M4 Max
+BenchmarkTxnMarkerEntryCurrent/cached-identity-16         	 1649792	       720.3 ns/op	     232 B/op	       3 allocs/op
+BenchmarkTxnMarkerEntryCurrent/cached-identity-16         	 1681454	       714.5 ns/op	     232 B/op	       3 allocs/op
+BenchmarkTxnMarkerEntryCurrent/cached-identity-16         	 1577400	       769.7 ns/op	     232 B/op	       3 allocs/op
+BenchmarkTxnMarkerEntryCurrent/descriptor-stat-control-16 	 1000000	      1169 ns/op	     440 B/op	       4 allocs/op
+BenchmarkTxnMarkerEntryCurrent/descriptor-stat-control-16 	 1000000	      1685 ns/op	     440 B/op	       4 allocs/op
+BenchmarkTxnMarkerEntryCurrent/descriptor-stat-control-16 	  656967	      1609 ns/op	     440 B/op	       4 allocs/op
+PASS
+ok  	github.com/thesyncim/vibedb/internal/storeio	10.098s

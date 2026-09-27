@@ -114,3 +114,44 @@ the exact arguments recorded in
 bound there by SHA-256; the baseline scaffold and source-overlay hashes are in
 [metadata](metadata.json). The [read control](read-runs.json) uses a separate frozen
 baseline binary and one matched 50× pair.
+
+## Follow-up: cached transaction-marker identity, 2026-09-27
+
+The marker-entry identity change at `8fcae2eb91509116117f7568800487b2b2311ae2`
+caches the marker descriptor's identity at open time. Each live-entry check
+then uses `RawConn.Control` to verify the descriptor is still open and compares
+a fresh lookup beneath the pinned directory with that cached identity. The
+marker format and public write benchmark source were unchanged.
+
+This follow-up compares the candidate against the frozen pre-change tail
+candidate at `0478cfad76eb0fd4dd783c50850c991e060d3099`. The baseline is a
+branch-candidate binary, not a whole-tree `main` build. Three alternating pairs
+ran the same 131,072-row workloads with 64-row applies, the three durable
+collections, full benchmark oracles, and final checkpoint/fold inside the timed
+operation. All twelve runs passed. The measured medians were:
+
+| Workload | Baseline 0478 | Cached identity | Baseline / candidate |
+| --- | ---: | ---: | ---: |
+| SequentialInsert | 3.514730 s | 3.511693 s | 1.0009× |
+| CompactSharedPayload | 5.270060 s | 5.286029 s | 0.9970× |
+
+The public results are flat and do not show a measurable application-level
+throughput gain. Logical certificate, commit, barrier, journal, and tail-charge
+counters matched. Per-run filesystem space observations are retained because
+allocated blocks can vary by filesystem allocation granularity.
+
+The isolated `EntryCurrent` microbenchmark did improve. Across three samples,
+cached identity measured a median of 720.3 ns/op, 232 B/op, and 3 allocations
+per operation. The descriptor-`Stat` control measured 1,609 ns/op, 440 B/op,
+and 4 allocations per operation. This is a local method-level result and does
+not imply an application speedup.
+
+Focused race and SIMD-disabled tests passed for `internal/storeio` and
+`store/durable`; test binaries compiled for Windows/amd64 and Linux/386. The
+first focused storeio run caught that a closed descriptor's `RawConn.Control`
+error did not match `os.ErrClosed`; the implementation now joins the closed-
+file sentinel with the concrete error, and the final focused suites pass. Exact
+source and binary hashes, commands, validation, and all twelve raw metrics are
+in [marker identity metadata](marker-identity-metadata.json) and
+[marker identity runs](marker-identity-runs.json). The raw local
+`EntryCurrent` samples are in [marker identity kernel output](marker-identity-kernel.txt).
