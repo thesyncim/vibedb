@@ -1,0 +1,203 @@
+{
+  "baseline": {
+    "binary_sha256": "31596540917497087a208286f4216c55302e2cf9013f65a42fbb0695f21e1297",
+    "commit": "8fcae2eb91509116117f7568800487b2b2311ae2",
+    "description": "Frozen branch candidate before fitting-tail render reuse; includes cached marker identity and the same benchmark source."
+  },
+  "benchmark": {
+    "all_12_runs_passed": true,
+    "command_argv_by_workload": {
+      "CompactSharedPayload": [
+        "<frozen-binary>",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkReplicatedApplyBatch64CompactSharedPayload$",
+        "-test.benchtime=1x",
+        "-test.count=1",
+        "-test.benchmem",
+        "-test.timeout=20m"
+      ],
+      "SequentialInsert": [
+        "<frozen-binary>",
+        "-test.run=^$",
+        "-test.bench=^BenchmarkReplicatedApplyBatch64SequentialInsert$",
+        "-test.benchtime=1x",
+        "-test.count=1",
+        "-test.benchmem",
+        "-test.timeout=20m"
+      ]
+    },
+    "dimensions": {
+      "alternating_pairs_per_workload": 3,
+      "rows": 131072,
+      "rows_per_apply": 64,
+      "workloads": [
+        "SequentialInsert",
+        "CompactSharedPayload"
+      ]
+    },
+    "interpretation": "Incremental comparison against the frozen 8fca candidate only. Do not multiply these ratios by earlier main-vs-tail ratios or interpret them as whole-application gains.",
+    "limitations": [
+      "Shared host with other applications active.",
+      "Three 1x repetitions per workload. CompactSharedPayload repetition 1 regressed from 6.911924292 s to 7.780973423 s; repetitions 2 and 3 improved, so the median does not show a uniform per-run result.",
+      "Apparent file sizes matched within each pair. SequentialInsert final allocated file bytes were 63,111,168 B in baseline repetitions 1 and 3 and 63,643,648 B in repetition 2; the candidate was 63,643,648 B in all three. This observed filesystem allocated-space difference has no confirmed causal attribution.",
+      "CompactSharedPayload final allocated bytes matched in all pairs. B/op and allocs/op also varied slightly; see every raw row.",
+      "No RF3/network/proposal-admission work; this does not establish a 10x or general application-throughput result."
+    ],
+    "paired_observations": {
+      "CompactSharedPayload": [
+        {
+          "baseline_allocated_file_growth_bytes": 532480.0,
+          "baseline_allocs_per_op": 1173547.0,
+          "baseline_b_per_op": 191019432.0,
+          "baseline_final_allocated_file_bytes": 37789696.0,
+          "baseline_final_apparent_file_bytes": 38322688.0,
+          "baseline_ns_op": 6911924292.0,
+          "candidate_allocated_file_growth_bytes": 532480.0,
+          "candidate_allocs_per_op": 1173104.0,
+          "candidate_b_per_op": 190304192.0,
+          "candidate_final_allocated_file_bytes": 37789696.0,
+          "candidate_final_apparent_file_bytes": 38322688.0,
+          "candidate_ns_op": 7780973423.0,
+          "repetition": 1
+        },
+        {
+          "baseline_allocated_file_growth_bytes": 532480.0,
+          "baseline_allocs_per_op": 1173386.0,
+          "baseline_b_per_op": 190828480.0,
+          "baseline_final_allocated_file_bytes": 37789696.0,
+          "baseline_final_apparent_file_bytes": 38322688.0,
+          "baseline_ns_op": 5504684371.0,
+          "candidate_allocated_file_growth_bytes": 532480.0,
+          "candidate_allocs_per_op": 1173107.0,
+          "candidate_b_per_op": 190319288.0,
+          "candidate_final_allocated_file_bytes": 37789696.0,
+          "candidate_final_apparent_file_bytes": 38322688.0,
+          "candidate_ns_op": 5077579791.0,
+          "repetition": 2
+        },
+        {
+          "baseline_allocated_file_growth_bytes": 532480.0,
+          "baseline_allocs_per_op": 1173469.0,
+          "baseline_b_per_op": 191001352.0,
+          "baseline_final_allocated_file_bytes": 37789696.0,
+          "baseline_final_apparent_file_bytes": 38322688.0,
+          "baseline_ns_op": 5552991666.0,
+          "candidate_allocated_file_growth_bytes": 532480.0,
+          "candidate_allocs_per_op": 1173201.0,
+          "candidate_b_per_op": 190477240.0,
+          "candidate_final_allocated_file_bytes": 37789696.0,
+          "candidate_final_apparent_file_bytes": 38322688.0,
+          "candidate_ns_op": 5016395706.0,
+          "repetition": 3
+        }
+      ],
+      "SequentialInsert": [
+        {
+          "baseline_allocated_file_growth_bytes": 25853952.0,
+          "baseline_allocs_per_op": 1326415.0,
+          "baseline_b_per_op": 223062024.0,
+          "baseline_final_allocated_file_bytes": 63111168.0,
+          "baseline_final_apparent_file_bytes": 63431168.0,
+          "baseline_ns_op": 3661460002.0,
+          "candidate_allocated_file_growth_bytes": 26386432.0,
+          "candidate_allocs_per_op": 1326985.0,
+          "candidate_b_per_op": 224102136.0,
+          "candidate_final_allocated_file_bytes": 63643648.0,
+          "candidate_final_apparent_file_bytes": 63431168.0,
+          "candidate_ns_op": 3517763165.0,
+          "repetition": 1
+        },
+        {
+          "baseline_allocated_file_growth_bytes": 26386432.0,
+          "baseline_allocs_per_op": 1326638.0,
+          "baseline_b_per_op": 223417120.0,
+          "baseline_final_allocated_file_bytes": 63643648.0,
+          "baseline_final_apparent_file_bytes": 63431168.0,
+          "baseline_ns_op": 3585944419.0,
+          "candidate_allocated_file_growth_bytes": 26386432.0,
+          "candidate_allocs_per_op": 1326513.0,
+          "candidate_b_per_op": 223236480.0,
+          "candidate_final_allocated_file_bytes": 63643648.0,
+          "candidate_final_apparent_file_bytes": 63431168.0,
+          "candidate_ns_op": 3518369455.0,
+          "repetition": 2
+        },
+        {
+          "baseline_allocated_file_growth_bytes": 25853952.0,
+          "baseline_allocs_per_op": 1326535.0,
+          "baseline_b_per_op": 223243112.0,
+          "baseline_final_allocated_file_bytes": 63111168.0,
+          "baseline_final_apparent_file_bytes": 63431168.0,
+          "baseline_ns_op": 3669279876.0,
+          "candidate_allocated_file_growth_bytes": 26386432.0,
+          "candidate_allocs_per_op": 1326726.0,
+          "candidate_b_per_op": 223589624.0,
+          "candidate_final_allocated_file_bytes": 63643648.0,
+          "candidate_final_apparent_file_bytes": 63431168.0,
+          "candidate_ns_op": 3618931045.0,
+          "repetition": 3
+        }
+      ]
+    },
+    "results": {
+      "CompactSharedPayload": {
+        "baseline_median_ns_op": 5552991666.0,
+        "candidate_median_ns_op": 5077579791.0,
+        "incremental_speedup": 1.0936296217033687,
+        "logical_counter_deltas": "none across all three paired repetitions",
+        "tail_charge_current_and_peak": "identical across all three paired repetitions"
+      },
+      "SequentialInsert": {
+        "baseline_median_ns_op": 3661460002.0,
+        "candidate_median_ns_op": 3518369455.0,
+        "incremental_speedup": 1.04066956265683,
+        "logical_counter_deltas": "none across all three paired repetitions",
+        "tail_charge_current_and_peak": "identical across all three paired repetitions"
+      }
+    },
+    "scope": "Fixed 131072-row SQL ReplicatedApply including final fold; three durable collections, no RF3/network/admission. Shared host; other applications are not stopped.",
+    "setup_and_oracles": "Corpus creation and final verification are outside the timer; all benchmark oracles passed."
+  },
+  "build": {
+    "baseline_binary_sha256": "31596540917497087a208286f4216c55302e2cf9013f65a42fbb0695f21e1297",
+    "candidate_binary_sha256": "39e3755efedc9486321cbc74b58aaebca0c9a8fdd128b583cc66c8c508546441",
+    "candidate_build_passed": true,
+    "command": [
+      "project-env",
+      "go",
+      "test",
+      "-c",
+      "./sql/driver",
+      "-o",
+      "candidate-driver.test"
+    ],
+    "goexperiment": "simd",
+    "platform": "darwin/arm64, Apple M4 Max",
+    "toolchain": "Go 1.27.0",
+    "wrapper_required": true
+  },
+  "candidate": {
+    "binary_sha256": "39e3755efedc9486321cbc74b58aaebca0c9a8fdd128b583cc66c8c508546441",
+    "description": "One carry boolean reuses validation from the already rendered source image only for an active rightmost tail strict append."
+  },
+  "candidate_commit": "873d4dac3d193cd407d683229e6224acdd115255",
+  "candidate_source_sha256": {
+    "sql/driver/replicated_apply_batch64_bench_test.go": "6723b2c66c29910c89dbc51db515e59edb0f2266350caaa2cb48fff30db71b3a",
+    "store/durable/store_file_primary_batch.go": "7e36377be8b0733aa5f51da92d283cbcbc97c0a9a4dd51f73ed6be69d31307b5",
+    "store/durable/store_file_primary_batch_tail.go": "528d06e83ef013bf35aded68732db18c298c62dd2a71ce5263542a25729c1ae8"
+  },
+  "date": "2026-09-27",
+  "profile": {
+    "baseline_finding": "primaryTailBatchBaseRows had 360 ms cumulative samples, 7.09% of 5.08 s sampled CPU, all in RenderRecordsWithScratch.",
+    "candidate_finding": "pprof reported no samples for primaryTailBatchBaseRows; it was not sample-visible in this profile.",
+    "file": "fitting-reuse-profile.txt",
+    "scope": "One shared-payload 1x CPU profile per binary, collected after benchmark pairs. Profiles include setup, validation/oracle, and timed work; profile durations are inclusive diagnostics, not comparative benchmark times."
+  },
+  "validation": {
+    "checkpoint_group_suite": "PASS, 30.440 s",
+    "focused_nosimd": "PASS",
+    "focused_race": "PASS",
+    "focused_tail_fitting_certification": "PASS",
+    "review": "Source review clear; candidate source is commit 873d4dac3."
+  }
+}

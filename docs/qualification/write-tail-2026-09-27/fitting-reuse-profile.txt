@@ -1,0 +1,28 @@
+Fitting-tail reuse profile evidence (2026-09-27)
+
+Scope: one shared-payload, 1x benchmark CPU profile per binary, collected
+sequentially after the paired benchmark runs. Each profile includes benchmark
+setup, verification/oracle work, and timed writes. Profile wall/sample totals are
+inclusive diagnostics and are not comparative throughput measurements.
+
+Baseline: frozen 8fca marker-identity candidate
+  Profile duration: 6.23 s; sampled CPU: 5.08 s.
+  primaryTailBatchBaseRows: 360 ms cumulative, 7.09% of sampled CPU.
+  The samples are entirely in compact-stripe RenderRecordsWithScratch.
+  Top sampled work also includes syscall.rawsyscalln (2.20 s flat, 43.31%),
+  conditional journal append (1.72 s cumulative, 33.86%), and compact-stripe
+  encoding (1.53 s cumulative, 30.12%).
+
+Candidate: fitting-tail reuse commit 873d4dac3
+  Profile duration: 5.84 s; sampled CPU: 4.59 s.
+  pprof reported no match for primaryTailBatchBaseRows; it was not
+  sample-visible in the fitting path in this profile. Other sampled work
+  includes syscall.rawsyscalln (2.02 s flat, 44.01%),
+  AppendPreparedConditionalBatch (1.38 s cumulative, 30.07%),
+  writeRecoveryJournalFull (1.37 s cumulative, 29.85%), and compact-stripe
+  encoding (1.16 s cumulative, 25.27%).
+
+The profiles support that the duplicate render was removed from sampled work in
+this run. The profiles include untimed work, have different sampled totals, and
+do not quantify application speedup. See fitting-reuse-metadata.json for hashes
+and fitting-reuse-runs.json for the paired fixed-work measurements.

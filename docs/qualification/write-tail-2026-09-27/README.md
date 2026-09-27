@@ -155,3 +155,51 @@ source and binary hashes, commands, validation, and all twelve raw metrics are
 in [marker identity metadata](marker-identity-metadata.json) and
 [marker identity runs](marker-identity-runs.json). The raw local
 `EntryCurrent` samples are in [marker identity kernel output](marker-identity-kernel.txt).
+
+## Follow-up: fitting-tail source-render reuse, 2026-09-27
+
+Commit 873d4dac3 carries append-only validation from the already rendered
+source image into the fitting-tail path. This removes the second source render
+from that path while preserving the split path and existing publication checks.
+The benchmark source, logical storage and certificate counters, and tail-charge
+measurements were unchanged.
+
+This is an incremental comparison against the frozen pre-change 8fcae2eb branch
+candidate, which already includes cached marker identity. It is not a fresh
+comparison against main. Three alternating 1x pairs per workload ran the same
+131,072-row, 64-row apply sequence. The timer covered batch application and
+the final checkpoint/fold; corpus setup and full benchmark oracle verification
+were outside the timer. The median times were:
+
+| Workload | Frozen 8fca | Fitting reuse | Incremental ratio |
+| --- | ---: | ---: | ---: |
+| SequentialInsert | 3.661 s | 3.518 s | 1.041x |
+| CompactSharedPayload | 5.553 s | 5.078 s | 1.094x |
+
+The per-pair observations include a noisy result: CompactSharedPayload
+repetition 1 was 6.911924292 s baseline and 7.780973423 s candidate, while
+repetitions 2 and 3 were faster on the candidate. The median is a small
+incremental result for these samples and does not show a uniform per-run gain.
+
+The profile included setup and oracle work. In the baseline profile,
+primaryTailBatchBaseRows accounted for 360 ms cumulative samples (7.09% of
+5.08 s sampled CPU), all in RenderRecordsWithScratch. The candidate profile had
+no samples for that helper; it was not sample-visible in that profile. These
+inclusive profiles show where the optimization was directed but do not measure
+comparative throughput by themselves.
+
+Apparent file size matched in every pair. For SequentialInsert, final allocated
+file bytes were 63,111,168 B on baseline repetitions 1 and 3 and 63,643,648 B
+on repetition 2; the candidate was 63,643,648 B in all three. Allocated growth
+was 25,853,952 B on baseline repetitions 1 and 3 and 26,386,432 B on repetition
+2; candidate growth was 26,386,432 B in all three. This filesystem allocated
+space difference is recorded as observed, with no confirmed causal attribution.
+CompactSharedPayload final allocated bytes matched at 37,789,696 B in every
+pair. B/op and allocs/op also varied slightly; the raw records retain each
+value. Logical storage, certificate, barrier, journal, and tail-charge counters
+matched across pairs.
+
+This is a small incremental gain on two fixed workloads, not an application-wide
+or 10x claim. See the [twelve raw measurements](fitting-reuse-runs.json),
+[source and binary metadata](fitting-reuse-metadata.json), and
+[profile notes](fitting-reuse-profile.txt).
