@@ -78,6 +78,16 @@ jobs:
           grep -Fqx "${test_name}" "${evidence}/test-list.txt"
           printf 'TMPDIR=%s VIBEDB_SEAMLESS_SCALE_E2E=1 VIBEDB_SEAMLESS_SCALE_EVIDENCE=%s go test -json -count=1 -timeout=35m -run %s ./internal/gatewayruntime\n' \
             "${test_root}" "${evidence}/qualification.tsv" "^${test_name}$" > "${evidence}/command.txt"
+          printf 'go test -race -count=20 -timeout=5m -run %s ./internal/gatewayruntime\n' \
+            '^TestWaitSeamlessScaleManifestGateway' > "${evidence}/readiness-race-command.txt"
+      - name: Race-check PostgreSQL startup readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -race -count=20 -timeout=5m \
+            -run '^TestWaitSeamlessScaleManifestGateway' \
+            ./internal/gatewayruntime \
+            | tee "${RUNNER_TEMP}/seamless-scale-in-out/readiness-race.txt"
       - name: Run strict seamless scale qualification
         shell: bash
         env:
