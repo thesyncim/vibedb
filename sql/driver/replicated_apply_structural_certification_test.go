@@ -2,6 +2,7 @@ package driver
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
@@ -66,6 +67,22 @@ func TestReplicatedApplyBatch64StructuralCertification(t *testing.T) {
 	const maxBatches = storeio.CompactPrimaryStripeMaxRows/batch64Rows + 1
 	keys := make([][]byte, batch64Rows*maxBatches)
 	values := make([][]byte, batch64Rows*maxBatches)
+	userOptions, err := durable.NormalizeOptions(durableOptions(userTable))
+	if err != nil {
+		t.Fatalf("normalize fixture user options: %v", err)
+	}
+	inlineLimit := userOptions.InlineValueBytes
+	if inlineLimit <= 0 {
+		t.Fatalf("fixture inline value limit = %d", inlineLimit)
+	}
+	// Keep this fixture on the physical structural path. Small inline values
+	// are eligible for volatile right-tail splitting, which this certification
+	// test does not measure. Overflow-backed values deliberately make that lane
+	// ineligible while preserving the replicated apply and certification path.
+	overflowPadding := strings.Repeat("x", inlineLimit+1)
+	physicalPathPayload := func(row int) string {
+		return replicatedApplyBatch64Payload(row) + overflowPadding
+	}
 	lanes := replicatedApplyBatch64Lanes()
 	var completions raftmodel.NormalApplyBatchCompletions
 
@@ -74,11 +91,17 @@ func TestReplicatedApplyBatch64StructuralCertification(t *testing.T) {
 		start := batch * batch64Rows
 		batchKeys := make([][]byte, batch64Rows)
 		batchValues := make([][]byte, batch64Rows)
-		if err := fillReplicatedApplyBatch64Rows(database, start, batchKeys, batchValues); err != nil {
+		if err := fillReplicatedApplyBatch64RowsWithPayload(
+			database, start, batchKeys, batchValues, physicalPathPayload,
+		); err != nil {
 			t.Fatalf("fill batch %d: %v", batch, err)
 		}
 		mutations := make([]replication.Mutation, batch64Rows)
 		for row := range mutations {
+			if len(batchValues[row]) <= inlineLimit {
+				t.Fatalf("batch %d row %d value length %d did not exceed inline limit %d",
+					batch, row, len(batchValues[row]), inlineLimit)
+			}
 			keys[start+row] = bytes.Clone(batchKeys[row])
 			canonical, err := vibejson.AppendCanonicalize(nil, batchValues[row])
 			if err != nil {
