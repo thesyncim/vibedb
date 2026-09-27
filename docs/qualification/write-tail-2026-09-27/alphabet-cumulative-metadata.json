@@ -1,0 +1,71 @@
+{
+  "schema": "vibedb.alphabet-union-evidence/1",
+  "date": "2026-09-27",
+  "status": "Shared-host performance diagnostic; latest cumulative medians are below the earlier 0478 comparison and below the requested 10x minimum.",
+  "main_derived_control": {
+    "binary": "vibedb-verify/write-scale/candidate2-pair/main-driver.test",
+    "binary_sha256": "6435ff51323e644064a995a8486b2820c4c4aaa9def41b70d8b3e41d48afee8b",
+    "base_main_commit": "f9a9627a513a1599bc00bdaf59f4eb93470d9fbf",
+    "diagnostic_scaffold_commit": "5a689170ae5b1a4aba533e2e3e683876c4896a60",
+    "storage_source_overlay": "Seven f9 main storage files; see metadata.json and README.md#reproduction for the published overlay provenance and build recipe.",
+    "benchmark_source_commit": "9a1365239",
+    "benchmark_source_sha256": "729aecb98499032f9e667a91d5e71a694e1470ae31ec93cb48a3faecef3ece27",
+    "benchmark_listing_verified": [
+      "BenchmarkReplicatedApplyBatch64SequentialInsert",
+      "BenchmarkReplicatedApplyBatch64CompactSharedPayload"
+    ]
+  },
+  "frozen_candidate": {
+    "binary": "vibedb-verify/write-scale/alphabet-union/candidate-driver.test",
+    "binary_sha256": "281abf63439f0d7c384bc6bedd9a51c65ecdd06560c5e6e43100c02650d181ac",
+    "production_commit": "72c3a30af5360e822d51213078ad1b097d304b50",
+    "alphabet_codec_source_sha256": "c7c3df1f1457387de4ac83e5be53811892730efedfe3d43f4bbd9cadea7678cb",
+    "benchmark_source_sha256": "6723b2c66c29910c89dbc51db515e59edb0f2266350caaa2cb48fff30db71b3a",
+    "benchmark_harness_delta": "four untimed tail-charge report metrics compared with the control harness; workload and timed path unchanged"
+  },
+  "environment": {
+    "host": "Apple M4 Max; macOS 26.3.1 (25D771280a)",
+    "go_toolchain": "go1.27.0-X:simd",
+    "goexperiment": "simd"
+  },
+  "timer_boundary": {
+    "timed": [
+      "Per-batch key/value generation, mutation construction, command assembly, apply, and completion/publication checks.",
+      "The final full-group checkpoint and fold."
+    ],
+    "untimed": [
+      "Database/schema/bootstrap and benchmark fixture construction before b.ResetTimer.",
+      "Post-append and post-fold statistics and file-space sampling.",
+      "The final full-row oracle verification."
+    ],
+    "detail": "fillRows runs after b.ResetTimer; the final group.Checkpoint is bracketed by StartTimer/StopTimer."
+  },
+  "scope": "131072 SQL ReplicatedApply rows; batch size 64; three durable collections; final full fold included; no RF3/network/admission; one shared host",
+  "benchmark_listing": "The frozen control binary was run with -test.list '^BenchmarkReplicatedApplyBatch64' and listed both benchmark functions.",
+  "benchmark_harness_comparison": "Control source 729aecb9 and candidate source 6723b2 differ by four candidate-only untimed tail-charge ReportMetric calls; timed workload code is unchanged.",
+  "reproduction_commands": {
+    "control_build_context": "In a clean 5a689170 diagnostic scaffold checkout after applying the seven f9a9627a storage files and 9a1365239 SQL benchmark overlay listed in README.md#reproduction.",
+    "control_build": "CODEX_AGENT_ID=cumulative-main-build GOEXPERIMENT=simd project-env go test -c ./sql/driver -o ./main-driver.test",
+    "candidate_checkout": "git worktree add --detach ../vibedb-candidate-72c 72c3a30af5360e822d51213078ad1b097d304b50; cd ../vibedb-candidate-72c",
+    "candidate_build": "CODEX_AGENT_ID=cumulative-72c-build GOEXPERIMENT=simd project-env go test -c ./sql/driver -o ./candidate-driver.test",
+    "one_process_per_workload": {
+      "SequentialInsert": {
+        "main_control": "CODEX_AGENT_ID=cumulative-main-sequential GOEXPERIMENT=simd project-env ./main-driver.test -test.run='^$' -test.bench='^BenchmarkReplicatedApplyBatch64SequentialInsert$' -test.benchtime=1x -test.count=1 -test.benchmem -test.timeout=20m",
+        "candidate_72c": "CODEX_AGENT_ID=cumulative-72c-sequential GOEXPERIMENT=simd project-env ./candidate-driver.test -test.run='^$' -test.bench='^BenchmarkReplicatedApplyBatch64SequentialInsert$' -test.benchtime=1x -test.count=1 -test.benchmem -test.timeout=20m"
+      },
+      "CompactSharedPayload": {
+        "main_control": "CODEX_AGENT_ID=cumulative-main-shared GOEXPERIMENT=simd project-env ./main-driver.test -test.run='^$' -test.bench='^BenchmarkReplicatedApplyBatch64CompactSharedPayload$' -test.benchtime=1x -test.count=1 -test.benchmem -test.timeout=20m",
+        "candidate_72c": "CODEX_AGENT_ID=cumulative-72c-shared GOEXPERIMENT=simd project-env ./candidate-driver.test -test.run='^$' -test.bench='^BenchmarkReplicatedApplyBatch64CompactSharedPayload$' -test.benchtime=1x -test.count=1 -test.benchmem -test.timeout=20m"
+      }
+    },
+    "three_pair_order_per_workload": [
+      "main_control, candidate_72c",
+      "candidate_72c, main_control",
+      "main_control, candidate_72c"
+    ]
+  },
+  "output_files": {
+    "raw_metrics_and_runs": "alphabet-cumulative-runs.json",
+    "profiles": "alphabet-profile-summary.json"
+  }
+}

@@ -1,0 +1,2854 @@
+{
+  "schema": "vibedb.alphabet-union-cumulative/1",
+  "comparison": "Fresh cumulative comparison of the f9-derived storage control against frozen 72c candidate.",
+  "scope": "131072 SQL ReplicatedApply rows; batch size 64; three durable collections; final full fold included; no RF3/network/admission; one shared host",
+  "timer_boundary": {
+    "timed": [
+      "Per-batch key/value generation, mutation construction, command assembly, apply, and completion/publication checks.",
+      "The final full-group checkpoint and fold."
+    ],
+    "untimed": [
+      "Database/schema/bootstrap and benchmark fixture construction before b.ResetTimer.",
+      "Post-append and post-fold statistics and file-space sampling.",
+      "The final full-row oracle verification."
+    ],
+    "detail": "fillRows runs after b.ResetTimer; the final group.Checkpoint is bracketed by StartTimer/StopTimer."
+  },
+  "ratio_definition": "Ratios are main-derived-control ns/op divided by candidate ns/op; values above 1 favor the candidate. Ratio-of-medians and median-paired-ratio are reported separately.",
+  "reproduction_commands": {
+    "main_control": {
+      "SequentialInsert": "CODEX_AGENT_ID=cumulative-main-sequential GOEXPERIMENT=simd project-env ./main-driver.test -test.run='^$' -test.bench='^BenchmarkReplicatedApplyBatch64SequentialInsert$' -test.benchtime=1x -test.count=1 -test.benchmem -test.timeout=20m",
+      "CompactSharedPayload": "CODEX_AGENT_ID=cumulative-main-shared GOEXPERIMENT=simd project-env ./main-driver.test -test.run='^$' -test.bench='^BenchmarkReplicatedApplyBatch64CompactSharedPayload$' -test.benchtime=1x -test.count=1 -test.benchmem -test.timeout=20m"
+    },
+    "candidate_72c": {
+      "SequentialInsert": "CODEX_AGENT_ID=cumulative-72c-sequential GOEXPERIMENT=simd project-env ./candidate-driver.test -test.run='^$' -test.bench='^BenchmarkReplicatedApplyBatch64SequentialInsert$' -test.benchtime=1x -test.count=1 -test.benchmem -test.timeout=20m",
+      "CompactSharedPayload": "CODEX_AGENT_ID=cumulative-72c-shared GOEXPERIMENT=simd project-env ./candidate-driver.test -test.run='^$' -test.bench='^BenchmarkReplicatedApplyBatch64CompactSharedPayload$' -test.benchtime=1x -test.count=1 -test.benchmem -test.timeout=20m"
+    },
+    "order_per_workload": [
+      "main_control, candidate_72c",
+      "candidate_72c, main_control",
+      "main_control, candidate_72c"
+    ],
+    "each_command_is_one_process": true
+  },
+  "control_provenance": {
+    "binary": "vibedb-verify/write-scale/candidate2-pair/main-driver.test",
+    "binary_sha256": "6435ff51323e644064a995a8486b2820c4c4aaa9def41b70d8b3e41d48afee8b",
+    "base_main_commit": "f9a9627a513a1599bc00bdaf59f4eb93470d9fbf",
+    "diagnostic_scaffold_commit": "5a689170ae5b1a4aba533e2e3e683876c4896a60",
+    "storage_source_overlay": "seven f9 main storage files; see candidate2-pair/manifest.json and main-overlay.json",
+    "benchmark_source_commit": "9a1365239",
+    "benchmark_source_sha256": "729aecb98499032f9e667a91d5e71a694e1470ae31ec93cb48a3faecef3ece27",
+    "benchmark_listing_verified": [
+      "BenchmarkReplicatedApplyBatch64SequentialInsert",
+      "BenchmarkReplicatedApplyBatch64CompactSharedPayload"
+    ]
+  },
+  "candidate_provenance": {
+    "binary": "vibedb-verify/write-scale/alphabet-union/candidate-driver.test",
+    "binary_sha256": "281abf63439f0d7c384bc6bedd9a51c65ecdd06560c5e6e43100c02650d181ac",
+    "production_commit": "72c3a30af5360e822d51213078ad1b097d304b50",
+    "alphabet_codec_source_sha256": "c7c3df1f1457387de4ac83e5be53811892730efedfe3d43f4bbd9cadea7678cb",
+    "benchmark_source_sha256": "6723b2c66c29910c89dbc51db515e59edb0f2266350caaa2cb48fff30db71b3a",
+    "benchmark_harness_delta": "four untimed tail-charge report metrics compared with the control harness; workload and timed path unchanged"
+  },
+  "environment": {
+    "goexperiment": "simd",
+    "agent_id": "luna-alphabet-cumulative",
+    "runner": "project-env",
+    "sample_order": "three alternating pairs per workload; pair order main-control/candidate, candidate/main, main-control/candidate",
+    "timing": "go test benchmark ns/op from frozen test binaries; wall seconds also recorded per process",
+    "host": "Apple M4 Max; macOS 26.3.1 (25D771280a)",
+    "go_toolchain": "go1.27.0-X:simd"
+  },
+  "runs": [
+    {
+      "lane": "main_control",
+      "workload": "SequentialInsert",
+      "repetition": 1,
+      "started_utc": "2026-09-27T08:31:13.803104+00:00",
+      "wall_seconds": 101.98325654199999,
+      "metrics": {
+        "ns/op": 94316476168.0,
+        "allocated-file-growth-B": 35414016.0,
+        "apparent-file-growth-B": 35717120.0,
+        "append-certificates": 512.0,
+        "append-leaf-splits": 511.0,
+        "append-physical-folds": 3.0,
+        "append-routing-retired-bytes": 13197312.0,
+        "append-routing-staged-bytes": 13303808.0,
+        "append-tablet-routing-rebuilds": 13.0,
+        "barrier-syncs": 2052.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 514.0,
+        "certificates": 513.0,
+        "committed-batches": 1024.0,
+        "device-bytes": 167862272.0,
+        "device-commits": 1024.0,
+        "final-allocated-file-B": 72671232.0,
+        "final-apparent-file-B": 72962560.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 135168.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 844.8,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 1539.0,
+        "leaf-splits": 511.0,
+        "observed-peak-allocated-file-B": 72671232.0,
+        "observed-peak-apparent-file-B": 72962560.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 0.0,
+        "physical-folds": 6.0,
+        "post-append-allocated-file-B": 72638464.0,
+        "post-append-apparent-file-B": 72897024.0,
+        "prepare-apply-ns/row": 718733.0,
+        "pressure-checkpoints": 0.0,
+        "relation-1-append-device-bytes": 167727104.0,
+        "relation-1-committed-batches": 1024.0,
+        "relation-1-device-bytes": 167862272.0,
+        "relation-1-device-commits": 1024.0,
+        "relation-1-final-fold-device-bytes": 135168.0,
+        "routing-retired-bytes": 13197312.0,
+        "routing-staged-bytes": 13303808.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 102400.0,
+        "system-committed-batches": 2.0,
+        "system-device-bytes": 204800.0,
+        "system-device-commits": 2.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 13.0,
+        "total-ns/row": 719577.0,
+        "B/op": 501923128.0,
+        "allocs/op": 1995684.0
+      }
+    },
+    {
+      "lane": "candidate_72c",
+      "workload": "SequentialInsert",
+      "repetition": 1,
+      "started_utc": "2026-09-27T08:32:55.788867+00:00",
+      "wall_seconds": 35.834766667,
+      "metrics": {
+        "ns/op": 32254980001.0,
+        "allocated-file-growth-B": 26025984.0,
+        "apparent-file-growth-B": 26185728.0,
+        "append-certificates": 18.0,
+        "append-leaf-splits": 2.0,
+        "append-physical-folds": 54.0,
+        "append-routing-retired-bytes": 49152.0,
+        "append-routing-staged-bytes": 65536.0,
+        "append-tablet-routing-rebuilds": 0.0,
+        "barrier-syncs": 76.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 20.0,
+        "certificates": 19.0,
+        "committed-batches": 21.0,
+        "device-bytes": 28471296.0,
+        "device-commits": 21.0,
+        "final-allocated-file-B": 63283200.0,
+        "final-apparent-file-B": 63431168.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 176128.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 607.3,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 57.0,
+        "leaf-splits": 2.0,
+        "observed-peak-allocated-file-B": 63283200.0,
+        "observed-peak-apparent-file-B": 63431168.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 15.0,
+        "physical-folds": 57.0,
+        "post-append-allocated-file-B": 63205376.0,
+        "post-append-apparent-file-B": 63431168.0,
+        "prepare-apply-ns/row": 245479.0,
+        "pressure-checkpoints": 2.0,
+        "relation-1-append-device-bytes": 28295168.0,
+        "relation-1-committed-batches": 21.0,
+        "relation-1-device-bytes": 28471296.0,
+        "relation-1-device-commits": 21.0,
+        "relation-1-final-fold-device-bytes": 176128.0,
+        "routing-retired-bytes": 49152.0,
+        "routing-staged-bytes": 65536.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 1843200.0,
+        "system-committed-batches": 19.0,
+        "system-device-bytes": 1945600.0,
+        "system-device-commits": 19.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 0.0,
+        "tail-split-current-charge-after-fold-bytes": 0.0,
+        "tail-split-current-charge-at-append-end-bytes": 61813.0,
+        "tail-split-peak-charge-after-fold-bytes": 5245093.0,
+        "tail-split-peak-charge-at-append-end-bytes": 5245093.0,
+        "total-ns/row": 246086.0,
+        "B/op": 223226208.0,
+        "allocs/op": 1326509.0
+      }
+    },
+    {
+      "lane": "candidate_72c",
+      "workload": "SequentialInsert",
+      "repetition": 2,
+      "started_utc": "2026-09-27T08:33:31.625073+00:00",
+      "wall_seconds": 9.804550374999991,
+      "metrics": {
+        "ns/op": 8544646040.0,
+        "allocated-file-growth-B": 26677248.0,
+        "apparent-file-growth-B": 26185728.0,
+        "append-certificates": 18.0,
+        "append-leaf-splits": 2.0,
+        "append-physical-folds": 54.0,
+        "append-routing-retired-bytes": 49152.0,
+        "append-routing-staged-bytes": 65536.0,
+        "append-tablet-routing-rebuilds": 0.0,
+        "barrier-syncs": 76.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 20.0,
+        "certificates": 19.0,
+        "committed-batches": 21.0,
+        "device-bytes": 28471296.0,
+        "device-commits": 21.0,
+        "final-allocated-file-B": 63934464.0,
+        "final-apparent-file-B": 63431168.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 176128.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 272.3,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 57.0,
+        "leaf-splits": 2.0,
+        "observed-peak-allocated-file-B": 63934464.0,
+        "observed-peak-apparent-file-B": 63431168.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 15.0,
+        "physical-folds": 57.0,
+        "post-append-allocated-file-B": 63856640.0,
+        "post-append-apparent-file-B": 63431168.0,
+        "prepare-apply-ns/row": 64918.0,
+        "pressure-checkpoints": 2.0,
+        "relation-1-append-device-bytes": 28295168.0,
+        "relation-1-committed-batches": 21.0,
+        "relation-1-device-bytes": 28471296.0,
+        "relation-1-device-commits": 21.0,
+        "relation-1-final-fold-device-bytes": 176128.0,
+        "routing-retired-bytes": 49152.0,
+        "routing-staged-bytes": 65536.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 1843200.0,
+        "system-committed-batches": 19.0,
+        "system-device-bytes": 1945600.0,
+        "system-device-commits": 19.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 0.0,
+        "tail-split-current-charge-after-fold-bytes": 0.0,
+        "tail-split-current-charge-at-append-end-bytes": 61813.0,
+        "tail-split-peak-charge-after-fold-bytes": 5245093.0,
+        "tail-split-peak-charge-at-append-end-bytes": 5245093.0,
+        "total-ns/row": 65190.0,
+        "B/op": 222884136.0,
+        "allocs/op": 1326320.0
+      }
+    },
+    {
+      "lane": "main_control",
+      "workload": "SequentialInsert",
+      "repetition": 2,
+      "started_utc": "2026-09-27T08:33:41.430369+00:00",
+      "wall_seconds": 34.29582883399999,
+      "metrics": {
+        "ns/op": 33055895834.0,
+        "allocated-file-growth-B": 35676160.0,
+        "apparent-file-growth-B": 35717120.0,
+        "append-certificates": 512.0,
+        "append-leaf-splits": 511.0,
+        "append-physical-folds": 3.0,
+        "append-routing-retired-bytes": 13197312.0,
+        "append-routing-staged-bytes": 13303808.0,
+        "append-tablet-routing-rebuilds": 13.0,
+        "barrier-syncs": 2052.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 514.0,
+        "certificates": 513.0,
+        "committed-batches": 1024.0,
+        "device-bytes": 167862272.0,
+        "device-commits": 1024.0,
+        "final-allocated-file-B": 72933376.0,
+        "final-apparent-file-B": 72962560.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 135168.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 288.2,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 1539.0,
+        "leaf-splits": 511.0,
+        "observed-peak-allocated-file-B": 72933376.0,
+        "observed-peak-apparent-file-B": 72962560.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 0.0,
+        "physical-folds": 6.0,
+        "post-append-allocated-file-B": 72900608.0,
+        "post-append-apparent-file-B": 72897024.0,
+        "prepare-apply-ns/row": 251908.0,
+        "pressure-checkpoints": 0.0,
+        "relation-1-append-device-bytes": 167727104.0,
+        "relation-1-committed-batches": 1024.0,
+        "relation-1-device-bytes": 167862272.0,
+        "relation-1-device-commits": 1024.0,
+        "relation-1-final-fold-device-bytes": 135168.0,
+        "routing-retired-bytes": 13197312.0,
+        "routing-staged-bytes": 13303808.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 102400.0,
+        "system-committed-batches": 2.0,
+        "system-device-bytes": 204800.0,
+        "system-device-commits": 2.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 13.0,
+        "total-ns/row": 252196.0,
+        "B/op": 501753808.0,
+        "allocs/op": 1995620.0
+      }
+    },
+    {
+      "lane": "main_control",
+      "workload": "SequentialInsert",
+      "repetition": 3,
+      "started_utc": "2026-09-27T08:34:15.727406+00:00",
+      "wall_seconds": 31.762382833000004,
+      "metrics": {
+        "ns/op": 30558281207.0,
+        "allocated-file-growth-B": 35741696.0,
+        "apparent-file-growth-B": 35717120.0,
+        "append-certificates": 512.0,
+        "append-leaf-splits": 511.0,
+        "append-physical-folds": 3.0,
+        "append-routing-retired-bytes": 13197312.0,
+        "append-routing-staged-bytes": 13303808.0,
+        "append-tablet-routing-rebuilds": 13.0,
+        "barrier-syncs": 2052.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 514.0,
+        "certificates": 513.0,
+        "committed-batches": 1024.0,
+        "device-bytes": 167862272.0,
+        "device-commits": 1024.0,
+        "final-allocated-file-B": 72998912.0,
+        "final-apparent-file-B": 72962560.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 135168.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 305.5,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 1539.0,
+        "leaf-splits": 511.0,
+        "observed-peak-allocated-file-B": 72998912.0,
+        "observed-peak-apparent-file-B": 72962560.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 0.0,
+        "physical-folds": 6.0,
+        "post-append-allocated-file-B": 72966144.0,
+        "post-append-apparent-file-B": 72897024.0,
+        "prepare-apply-ns/row": 232836.0,
+        "pressure-checkpoints": 0.0,
+        "relation-1-append-device-bytes": 167727104.0,
+        "relation-1-committed-batches": 1024.0,
+        "relation-1-device-bytes": 167862272.0,
+        "relation-1-device-commits": 1024.0,
+        "relation-1-final-fold-device-bytes": 135168.0,
+        "routing-retired-bytes": 13197312.0,
+        "routing-staged-bytes": 13303808.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 102400.0,
+        "system-committed-batches": 2.0,
+        "system-device-bytes": 204800.0,
+        "system-device-commits": 2.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 13.0,
+        "total-ns/row": 233141.0,
+        "B/op": 501768592.0,
+        "allocs/op": 1995662.0
+      }
+    },
+    {
+      "lane": "candidate_72c",
+      "workload": "SequentialInsert",
+      "repetition": 3,
+      "started_utc": "2026-09-27T08:34:47.490624+00:00",
+      "wall_seconds": 7.746336791999994,
+      "metrics": {
+        "ns/op": 6635902705.0,
+        "allocated-file-growth-B": 26677248.0,
+        "apparent-file-growth-B": 26185728.0,
+        "append-certificates": 18.0,
+        "append-leaf-splits": 2.0,
+        "append-physical-folds": 54.0,
+        "append-routing-retired-bytes": 49152.0,
+        "append-routing-staged-bytes": 65536.0,
+        "append-tablet-routing-rebuilds": 0.0,
+        "barrier-syncs": 76.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 20.0,
+        "certificates": 19.0,
+        "committed-batches": 21.0,
+        "device-bytes": 28471296.0,
+        "device-commits": 21.0,
+        "final-allocated-file-B": 63934464.0,
+        "final-apparent-file-B": 63431168.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 176128.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 316.0,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 57.0,
+        "leaf-splits": 2.0,
+        "observed-peak-allocated-file-B": 63934464.0,
+        "observed-peak-apparent-file-B": 63431168.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 15.0,
+        "physical-folds": 57.0,
+        "post-append-allocated-file-B": 63856640.0,
+        "post-append-apparent-file-B": 63431168.0,
+        "prepare-apply-ns/row": 50312.0,
+        "pressure-checkpoints": 2.0,
+        "relation-1-append-device-bytes": 28295168.0,
+        "relation-1-committed-batches": 21.0,
+        "relation-1-device-bytes": 28471296.0,
+        "relation-1-device-commits": 21.0,
+        "relation-1-final-fold-device-bytes": 176128.0,
+        "routing-retired-bytes": 49152.0,
+        "routing-staged-bytes": 65536.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 1843200.0,
+        "system-committed-batches": 19.0,
+        "system-device-bytes": 1945600.0,
+        "system-device-commits": 19.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 0.0,
+        "tail-split-current-charge-after-fold-bytes": 0.0,
+        "tail-split-current-charge-at-append-end-bytes": 61813.0,
+        "tail-split-peak-charge-after-fold-bytes": 5245093.0,
+        "tail-split-peak-charge-at-append-end-bytes": 5245093.0,
+        "total-ns/row": 50628.0,
+        "B/op": 223763952.0,
+        "allocs/op": 1326819.0
+      }
+    },
+    {
+      "lane": "main_control",
+      "workload": "CompactSharedPayload",
+      "repetition": 1,
+      "started_utc": "2026-09-27T08:34:55.237737+00:00",
+      "wall_seconds": 35.32111287499998,
+      "metrics": {
+        "ns/op": 34416353293.0,
+        "allocated-file-growth-B": 5230592.0,
+        "apparent-file-growth-B": 6008832.0,
+        "append-certificates": 628.0,
+        "append-leaf-splits": 627.0,
+        "append-physical-folds": 3.0,
+        "append-routing-retired-bytes": 15466496.0,
+        "append-routing-staged-bytes": 15499264.0,
+        "append-tablet-routing-rebuilds": 4.0,
+        "barrier-syncs": 2516.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 630.0,
+        "certificates": 629.0,
+        "committed-batches": 1256.0,
+        "device-bytes": 134651904.0,
+        "device-commits": 1256.0,
+        "final-allocated-file-B": 42487808.0,
+        "final-apparent-file-B": 43254272.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 98304.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 294.7,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 1887.0,
+        "leaf-splits": 627.0,
+        "observed-peak-allocated-file-B": 42491904.0,
+        "observed-peak-apparent-file-B": 43254272.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 0.0,
+        "physical-folds": 6.0,
+        "post-append-allocated-file-B": 42491904.0,
+        "post-append-apparent-file-B": 43188736.0,
+        "prepare-apply-ns/row": 262281.0,
+        "pressure-checkpoints": 0.0,
+        "relation-1-append-device-bytes": 134553600.0,
+        "relation-1-committed-batches": 1256.0,
+        "relation-1-device-bytes": 134651904.0,
+        "relation-1-device-commits": 1256.0,
+        "relation-1-final-fold-device-bytes": 98304.0,
+        "routing-retired-bytes": 15466496.0,
+        "routing-staged-bytes": 15499264.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 102400.0,
+        "system-committed-batches": 2.0,
+        "system-device-bytes": 204800.0,
+        "system-device-commits": 2.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 4.0,
+        "total-ns/row": 262576.0,
+        "B/op": 308938656.0,
+        "allocs/op": 1326276.0
+      }
+    },
+    {
+      "lane": "candidate_72c",
+      "workload": "CompactSharedPayload",
+      "repetition": 1,
+      "started_utc": "2026-09-27T08:35:30.559805+00:00",
+      "wall_seconds": 11.61110258399998,
+      "metrics": {
+        "ns/op": 10478738707.0,
+        "allocated-file-growth-B": 532480.0,
+        "apparent-file-growth-B": 1077248.0,
+        "append-certificates": 16.0,
+        "append-leaf-splits": 0.0,
+        "append-physical-folds": 48.0,
+        "append-routing-retired-bytes": 0.0,
+        "append-routing-staged-bytes": 0.0,
+        "append-tablet-routing-rebuilds": 0.0,
+        "barrier-syncs": 68.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 18.0,
+        "certificates": 17.0,
+        "committed-batches": 17.0,
+        "device-bytes": 2322432.0,
+        "device-commits": 17.0,
+        "final-allocated-file-B": 37789696.0,
+        "final-apparent-file-B": 38322688.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 106496.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 310.2,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 51.0,
+        "leaf-splits": 0.0,
+        "observed-peak-allocated-file-B": 37789696.0,
+        "observed-peak-apparent-file-B": 38322688.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 15.0,
+        "physical-folds": 51.0,
+        "post-append-allocated-file-B": 37789696.0,
+        "post-append-apparent-file-B": 38257152.0,
+        "prepare-apply-ns/row": 79636.0,
+        "pressure-checkpoints": 0.0,
+        "relation-1-append-device-bytes": 2215936.0,
+        "relation-1-committed-batches": 17.0,
+        "relation-1-device-bytes": 2322432.0,
+        "relation-1-device-commits": 17.0,
+        "relation-1-final-fold-device-bytes": 106496.0,
+        "routing-retired-bytes": 0.0,
+        "routing-staged-bytes": 0.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 1638400.0,
+        "system-committed-batches": 17.0,
+        "system-device-bytes": 1740800.0,
+        "system-device-commits": 17.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 0.0,
+        "tail-split-current-charge-after-fold-bytes": 0.0,
+        "tail-split-current-charge-at-append-end-bytes": 0.0,
+        "tail-split-peak-charge-after-fold-bytes": 3336517.0,
+        "tail-split-peak-charge-at-append-end-bytes": 3336517.0,
+        "total-ns/row": 79946.0,
+        "B/op": 191362472.0,
+        "allocs/op": 1173714.0
+      }
+    },
+    {
+      "lane": "candidate_72c",
+      "workload": "CompactSharedPayload",
+      "repetition": 2,
+      "started_utc": "2026-09-27T08:35:42.171718+00:00",
+      "wall_seconds": 12.138470292000022,
+      "metrics": {
+        "ns/op": 11303405997.0,
+        "allocated-file-growth-B": 532480.0,
+        "apparent-file-growth-B": 1077248.0,
+        "append-certificates": 16.0,
+        "append-leaf-splits": 0.0,
+        "append-physical-folds": 48.0,
+        "append-routing-retired-bytes": 0.0,
+        "append-routing-staged-bytes": 0.0,
+        "append-tablet-routing-rebuilds": 0.0,
+        "barrier-syncs": 68.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 18.0,
+        "certificates": 17.0,
+        "committed-batches": 17.0,
+        "device-bytes": 2322432.0,
+        "device-commits": 17.0,
+        "final-allocated-file-B": 37789696.0,
+        "final-apparent-file-B": 38322688.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 106496.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 329.7,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 51.0,
+        "leaf-splits": 0.0,
+        "observed-peak-allocated-file-B": 37789696.0,
+        "observed-peak-apparent-file-B": 38322688.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 15.0,
+        "physical-folds": 51.0,
+        "post-append-allocated-file-B": 37789696.0,
+        "post-append-apparent-file-B": 38257152.0,
+        "prepare-apply-ns/row": 85908.0,
+        "pressure-checkpoints": 0.0,
+        "relation-1-append-device-bytes": 2215936.0,
+        "relation-1-committed-batches": 17.0,
+        "relation-1-device-bytes": 2322432.0,
+        "relation-1-device-commits": 17.0,
+        "relation-1-final-fold-device-bytes": 106496.0,
+        "routing-retired-bytes": 0.0,
+        "routing-staged-bytes": 0.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 1638400.0,
+        "system-committed-batches": 17.0,
+        "system-device-bytes": 1740800.0,
+        "system-device-commits": 17.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 0.0,
+        "tail-split-current-charge-after-fold-bytes": 0.0,
+        "tail-split-current-charge-at-append-end-bytes": 0.0,
+        "tail-split-peak-charge-after-fold-bytes": 3336517.0,
+        "tail-split-peak-charge-at-append-end-bytes": 3336517.0,
+        "total-ns/row": 86238.0,
+        "B/op": 190837928.0,
+        "allocs/op": 1173426.0
+      }
+    },
+    {
+      "lane": "main_control",
+      "workload": "CompactSharedPayload",
+      "repetition": 2,
+      "started_utc": "2026-09-27T08:35:54.310837+00:00",
+      "wall_seconds": 33.38301658300003,
+      "metrics": {
+        "ns/op": 32707543830.0,
+        "allocated-file-growth-B": 5230592.0,
+        "apparent-file-growth-B": 6008832.0,
+        "append-certificates": 628.0,
+        "append-leaf-splits": 627.0,
+        "append-physical-folds": 3.0,
+        "append-routing-retired-bytes": 15466496.0,
+        "append-routing-staged-bytes": 15499264.0,
+        "append-tablet-routing-rebuilds": 4.0,
+        "barrier-syncs": 2516.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 630.0,
+        "certificates": 629.0,
+        "committed-batches": 1256.0,
+        "device-bytes": 134651904.0,
+        "device-commits": 1256.0,
+        "final-allocated-file-B": 42487808.0,
+        "final-apparent-file-B": 43254272.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 98304.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 240.3,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 1887.0,
+        "leaf-splits": 627.0,
+        "observed-peak-allocated-file-B": 42491904.0,
+        "observed-peak-apparent-file-B": 43254272.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 0.0,
+        "physical-folds": 6.0,
+        "post-append-allocated-file-B": 42491904.0,
+        "post-append-apparent-file-B": 43188736.0,
+        "prepare-apply-ns/row": 249298.0,
+        "pressure-checkpoints": 0.0,
+        "relation-1-append-device-bytes": 134553600.0,
+        "relation-1-committed-batches": 1256.0,
+        "relation-1-device-bytes": 134651904.0,
+        "relation-1-device-commits": 1256.0,
+        "relation-1-final-fold-device-bytes": 98304.0,
+        "routing-retired-bytes": 15466496.0,
+        "routing-staged-bytes": 15499264.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 102400.0,
+        "system-committed-batches": 2.0,
+        "system-device-bytes": 204800.0,
+        "system-device-commits": 2.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 4.0,
+        "total-ns/row": 249539.0,
+        "B/op": 308595648.0,
+        "allocs/op": 1326114.0
+      }
+    },
+    {
+      "lane": "main_control",
+      "workload": "CompactSharedPayload",
+      "repetition": 3,
+      "started_utc": "2026-09-27T08:36:27.694592+00:00",
+      "wall_seconds": 28.89063433399997,
+      "metrics": {
+        "ns/op": 28256255623.0,
+        "allocated-file-growth-B": 5230592.0,
+        "apparent-file-growth-B": 6008832.0,
+        "append-certificates": 628.0,
+        "append-leaf-splits": 627.0,
+        "append-physical-folds": 3.0,
+        "append-routing-retired-bytes": 15466496.0,
+        "append-routing-staged-bytes": 15499264.0,
+        "append-tablet-routing-rebuilds": 4.0,
+        "barrier-syncs": 2516.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 630.0,
+        "certificates": 629.0,
+        "committed-batches": 1256.0,
+        "device-bytes": 134651904.0,
+        "device-commits": 1256.0,
+        "final-allocated-file-B": 42487808.0,
+        "final-apparent-file-B": 43254272.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 98304.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 338.3,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 1887.0,
+        "leaf-splits": 627.0,
+        "observed-peak-allocated-file-B": 42491904.0,
+        "observed-peak-apparent-file-B": 43254272.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 0.0,
+        "physical-folds": 6.0,
+        "post-append-allocated-file-B": 42491904.0,
+        "post-append-apparent-file-B": 43188736.0,
+        "prepare-apply-ns/row": 215240.0,
+        "pressure-checkpoints": 0.0,
+        "relation-1-append-device-bytes": 134553600.0,
+        "relation-1-committed-batches": 1256.0,
+        "relation-1-device-bytes": 134651904.0,
+        "relation-1-device-commits": 1256.0,
+        "relation-1-final-fold-device-bytes": 98304.0,
+        "routing-retired-bytes": 15466496.0,
+        "routing-staged-bytes": 15499264.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 102400.0,
+        "system-committed-batches": 2.0,
+        "system-device-bytes": 204800.0,
+        "system-device-commits": 2.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 4.0,
+        "total-ns/row": 215578.0,
+        "B/op": 309097848.0,
+        "allocs/op": 1326330.0
+      }
+    },
+    {
+      "lane": "candidate_72c",
+      "workload": "CompactSharedPayload",
+      "repetition": 3,
+      "started_utc": "2026-09-27T08:36:56.585973+00:00",
+      "wall_seconds": 7.82559229200001,
+      "metrics": {
+        "ns/op": 6991031250.0,
+        "allocated-file-growth-B": 532480.0,
+        "apparent-file-growth-B": 1077248.0,
+        "append-certificates": 16.0,
+        "append-leaf-splits": 0.0,
+        "append-physical-folds": 48.0,
+        "append-routing-retired-bytes": 0.0,
+        "append-routing-staged-bytes": 0.0,
+        "append-tablet-routing-rebuilds": 0.0,
+        "barrier-syncs": 68.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 18.0,
+        "certificates": 17.0,
+        "committed-batches": 17.0,
+        "device-bytes": 2322432.0,
+        "device-commits": 17.0,
+        "final-allocated-file-B": 37789696.0,
+        "final-apparent-file-B": 38322688.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 106496.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 289.0,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 51.0,
+        "leaf-splits": 0.0,
+        "observed-peak-allocated-file-B": 37789696.0,
+        "observed-peak-apparent-file-B": 38322688.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 15.0,
+        "physical-folds": 51.0,
+        "post-append-allocated-file-B": 37789696.0,
+        "post-append-apparent-file-B": 38257152.0,
+        "prepare-apply-ns/row": 53048.0,
+        "pressure-checkpoints": 0.0,
+        "relation-1-append-device-bytes": 2215936.0,
+        "relation-1-committed-batches": 17.0,
+        "relation-1-device-bytes": 2322432.0,
+        "relation-1-device-commits": 17.0,
+        "relation-1-final-fold-device-bytes": 106496.0,
+        "routing-retired-bytes": 0.0,
+        "routing-staged-bytes": 0.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 1638400.0,
+        "system-committed-batches": 17.0,
+        "system-device-bytes": 1740800.0,
+        "system-device-commits": 17.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 0.0,
+        "tail-split-current-charge-after-fold-bytes": 0.0,
+        "tail-split-current-charge-at-append-end-bytes": 0.0,
+        "tail-split-peak-charge-after-fold-bytes": 3336517.0,
+        "tail-split-peak-charge-at-append-end-bytes": 3336517.0,
+        "total-ns/row": 53337.0,
+        "B/op": 190664064.0,
+        "allocs/op": 1173324.0
+      }
+    }
+  ],
+  "medians": {
+    "SequentialInsert": {
+      "main_control": {
+        "B/op": 501768592.0,
+        "allocated-file-growth-B": 35676160.0,
+        "allocs/op": 1995662.0,
+        "apparent-file-growth-B": 35717120.0,
+        "append-certificates": 512.0,
+        "append-leaf-splits": 511.0,
+        "append-physical-folds": 3.0,
+        "append-routing-retired-bytes": 13197312.0,
+        "append-routing-staged-bytes": 13303808.0,
+        "append-tablet-routing-rebuilds": 13.0,
+        "barrier-syncs": 2052.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 514.0,
+        "certificates": 513.0,
+        "committed-batches": 1024.0,
+        "device-bytes": 167862272.0,
+        "device-commits": 1024.0,
+        "final-allocated-file-B": 72933376.0,
+        "final-apparent-file-B": 72962560.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 135168.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 305.5,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 1539.0,
+        "leaf-splits": 511.0,
+        "ns/op": 33055895834.0,
+        "observed-peak-allocated-file-B": 72933376.0,
+        "observed-peak-apparent-file-B": 72962560.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 0.0,
+        "physical-folds": 6.0,
+        "post-append-allocated-file-B": 72900608.0,
+        "post-append-apparent-file-B": 72897024.0,
+        "prepare-apply-ns/row": 251908.0,
+        "pressure-checkpoints": 0.0,
+        "relation-1-append-device-bytes": 167727104.0,
+        "relation-1-committed-batches": 1024.0,
+        "relation-1-device-bytes": 167862272.0,
+        "relation-1-device-commits": 1024.0,
+        "relation-1-final-fold-device-bytes": 135168.0,
+        "routing-retired-bytes": 13197312.0,
+        "routing-staged-bytes": 13303808.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 102400.0,
+        "system-committed-batches": 2.0,
+        "system-device-bytes": 204800.0,
+        "system-device-commits": 2.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 13.0,
+        "total-ns/row": 252196.0
+      },
+      "candidate_72c": {
+        "B/op": 223226208.0,
+        "allocated-file-growth-B": 26677248.0,
+        "allocs/op": 1326509.0,
+        "apparent-file-growth-B": 26185728.0,
+        "append-certificates": 18.0,
+        "append-leaf-splits": 2.0,
+        "append-physical-folds": 54.0,
+        "append-routing-retired-bytes": 49152.0,
+        "append-routing-staged-bytes": 65536.0,
+        "append-tablet-routing-rebuilds": 0.0,
+        "barrier-syncs": 76.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 20.0,
+        "certificates": 19.0,
+        "committed-batches": 21.0,
+        "device-bytes": 28471296.0,
+        "device-commits": 21.0,
+        "final-allocated-file-B": 63934464.0,
+        "final-apparent-file-B": 63431168.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 176128.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 316.0,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 57.0,
+        "leaf-splits": 2.0,
+        "ns/op": 8544646040.0,
+        "observed-peak-allocated-file-B": 63934464.0,
+        "observed-peak-apparent-file-B": 63431168.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 15.0,
+        "physical-folds": 57.0,
+        "post-append-allocated-file-B": 63856640.0,
+        "post-append-apparent-file-B": 63431168.0,
+        "prepare-apply-ns/row": 64918.0,
+        "pressure-checkpoints": 2.0,
+        "relation-1-append-device-bytes": 28295168.0,
+        "relation-1-committed-batches": 21.0,
+        "relation-1-device-bytes": 28471296.0,
+        "relation-1-device-commits": 21.0,
+        "relation-1-final-fold-device-bytes": 176128.0,
+        "routing-retired-bytes": 49152.0,
+        "routing-staged-bytes": 65536.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 1843200.0,
+        "system-committed-batches": 19.0,
+        "system-device-bytes": 1945600.0,
+        "system-device-commits": 19.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 0.0,
+        "tail-split-current-charge-after-fold-bytes": 0.0,
+        "tail-split-current-charge-at-append-end-bytes": 61813.0,
+        "tail-split-peak-charge-after-fold-bytes": 5245093.0,
+        "tail-split-peak-charge-at-append-end-bytes": 5245093.0,
+        "total-ns/row": 65190.0
+      }
+    },
+    "CompactSharedPayload": {
+      "main_control": {
+        "B/op": 308938656.0,
+        "allocated-file-growth-B": 5230592.0,
+        "allocs/op": 1326276.0,
+        "apparent-file-growth-B": 6008832.0,
+        "append-certificates": 628.0,
+        "append-leaf-splits": 627.0,
+        "append-physical-folds": 3.0,
+        "append-routing-retired-bytes": 15466496.0,
+        "append-routing-staged-bytes": 15499264.0,
+        "append-tablet-routing-rebuilds": 4.0,
+        "barrier-syncs": 2516.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 630.0,
+        "certificates": 629.0,
+        "committed-batches": 1256.0,
+        "device-bytes": 134651904.0,
+        "device-commits": 1256.0,
+        "final-allocated-file-B": 42487808.0,
+        "final-apparent-file-B": 43254272.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 98304.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 294.7,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 1887.0,
+        "leaf-splits": 627.0,
+        "ns/op": 32707543830.0,
+        "observed-peak-allocated-file-B": 42491904.0,
+        "observed-peak-apparent-file-B": 43254272.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 0.0,
+        "physical-folds": 6.0,
+        "post-append-allocated-file-B": 42491904.0,
+        "post-append-apparent-file-B": 43188736.0,
+        "prepare-apply-ns/row": 249298.0,
+        "pressure-checkpoints": 0.0,
+        "relation-1-append-device-bytes": 134553600.0,
+        "relation-1-committed-batches": 1256.0,
+        "relation-1-device-bytes": 134651904.0,
+        "relation-1-device-commits": 1256.0,
+        "relation-1-final-fold-device-bytes": 98304.0,
+        "routing-retired-bytes": 15466496.0,
+        "routing-staged-bytes": 15499264.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 102400.0,
+        "system-committed-batches": 2.0,
+        "system-device-bytes": 204800.0,
+        "system-device-commits": 2.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 4.0,
+        "total-ns/row": 249539.0
+      },
+      "candidate_72c": {
+        "B/op": 190837928.0,
+        "allocated-file-growth-B": 532480.0,
+        "allocs/op": 1173426.0,
+        "apparent-file-growth-B": 1077248.0,
+        "append-certificates": 16.0,
+        "append-leaf-splits": 0.0,
+        "append-physical-folds": 48.0,
+        "append-routing-retired-bytes": 0.0,
+        "append-routing-staged-bytes": 0.0,
+        "append-tablet-routing-rebuilds": 0.0,
+        "barrier-syncs": 68.0,
+        "capture-append-device-bytes": 0.0,
+        "capture-committed-batches": 0.0,
+        "capture-device-bytes": 0.0,
+        "capture-device-commits": 0.0,
+        "capture-final-fold-device-bytes": 0.0,
+        "certificate-syncs": 18.0,
+        "certificates": 17.0,
+        "committed-batches": 17.0,
+        "device-bytes": 2322432.0,
+        "device-commits": 17.0,
+        "final-allocated-file-B": 37789696.0,
+        "final-apparent-file-B": 38322688.0,
+        "final-files": 8.0,
+        "final-fold-committed-batches": 1.0,
+        "final-fold-device-bytes": 106496.0,
+        "final-fold-device-commits": 1.0,
+        "final-fold-ns/row": 310.2,
+        "final-physical-folds": 3.0,
+        "fold-certificates": 1.0,
+        "journal-syncs": 51.0,
+        "leaf-splits": 0.0,
+        "ns/op": 10478738707.0,
+        "observed-peak-allocated-file-B": 37789696.0,
+        "observed-peak-apparent-file-B": 38322688.0,
+        "observed-peak-files": 8.0,
+        "observed-space-samples": 32.0,
+        "overlay-records-after-fold": 0.0,
+        "overlay-records-at-append-end": 0.0,
+        "periodic-checkpoints": 15.0,
+        "physical-folds": 51.0,
+        "post-append-allocated-file-B": 37789696.0,
+        "post-append-apparent-file-B": 38257152.0,
+        "prepare-apply-ns/row": 79636.0,
+        "pressure-checkpoints": 0.0,
+        "relation-1-append-device-bytes": 2215936.0,
+        "relation-1-committed-batches": 17.0,
+        "relation-1-device-bytes": 2322432.0,
+        "relation-1-device-commits": 17.0,
+        "relation-1-final-fold-device-bytes": 106496.0,
+        "routing-retired-bytes": 0.0,
+        "routing-staged-bytes": 0.0,
+        "rows": 131072.0,
+        "space-sample-interval-batches": 64.0,
+        "system-append-device-bytes": 1638400.0,
+        "system-committed-batches": 17.0,
+        "system-device-bytes": 1740800.0,
+        "system-device-commits": 17.0,
+        "system-final-fold-device-bytes": 102400.0,
+        "tablet-routing-rebuilds": 0.0,
+        "tail-split-current-charge-after-fold-bytes": 0.0,
+        "tail-split-current-charge-at-append-end-bytes": 0.0,
+        "tail-split-peak-charge-after-fold-bytes": 3336517.0,
+        "tail-split-peak-charge-at-append-end-bytes": 3336517.0,
+        "total-ns/row": 79946.0
+      }
+    }
+  },
+  "ranges": {
+    "SequentialInsert": {
+      "main_control": {
+        "B/op": {
+          "min": 501753808.0,
+          "max": 501923128.0
+        },
+        "allocated-file-growth-B": {
+          "min": 35414016.0,
+          "max": 35741696.0
+        },
+        "allocs/op": {
+          "min": 1995620.0,
+          "max": 1995684.0
+        },
+        "apparent-file-growth-B": {
+          "min": 35717120.0,
+          "max": 35717120.0
+        },
+        "append-certificates": {
+          "min": 512.0,
+          "max": 512.0
+        },
+        "append-leaf-splits": {
+          "min": 511.0,
+          "max": 511.0
+        },
+        "append-physical-folds": {
+          "min": 3.0,
+          "max": 3.0
+        },
+        "append-routing-retired-bytes": {
+          "min": 13197312.0,
+          "max": 13197312.0
+        },
+        "append-routing-staged-bytes": {
+          "min": 13303808.0,
+          "max": 13303808.0
+        },
+        "append-tablet-routing-rebuilds": {
+          "min": 13.0,
+          "max": 13.0
+        },
+        "barrier-syncs": {
+          "min": 2052.0,
+          "max": 2052.0
+        },
+        "capture-append-device-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-committed-batches": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-device-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-device-commits": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-final-fold-device-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "certificate-syncs": {
+          "min": 514.0,
+          "max": 514.0
+        },
+        "certificates": {
+          "min": 513.0,
+          "max": 513.0
+        },
+        "committed-batches": {
+          "min": 1024.0,
+          "max": 1024.0
+        },
+        "device-bytes": {
+          "min": 167862272.0,
+          "max": 167862272.0
+        },
+        "device-commits": {
+          "min": 1024.0,
+          "max": 1024.0
+        },
+        "final-allocated-file-B": {
+          "min": 72671232.0,
+          "max": 72998912.0
+        },
+        "final-apparent-file-B": {
+          "min": 72962560.0,
+          "max": 72962560.0
+        },
+        "final-files": {
+          "min": 8.0,
+          "max": 8.0
+        },
+        "final-fold-committed-batches": {
+          "min": 1.0,
+          "max": 1.0
+        },
+        "final-fold-device-bytes": {
+          "min": 135168.0,
+          "max": 135168.0
+        },
+        "final-fold-device-commits": {
+          "min": 1.0,
+          "max": 1.0
+        },
+        "final-fold-ns/row": {
+          "min": 288.2,
+          "max": 844.8
+        },
+        "final-physical-folds": {
+          "min": 3.0,
+          "max": 3.0
+        },
+        "fold-certificates": {
+          "min": 1.0,
+          "max": 1.0
+        },
+        "journal-syncs": {
+          "min": 1539.0,
+          "max": 1539.0
+        },
+        "leaf-splits": {
+          "min": 511.0,
+          "max": 511.0
+        },
+        "ns/op": {
+          "min": 30558281207.0,
+          "max": 94316476168.0
+        },
+        "observed-peak-allocated-file-B": {
+          "min": 72671232.0,
+          "max": 72998912.0
+        },
+        "observed-peak-apparent-file-B": {
+          "min": 72962560.0,
+          "max": 72962560.0
+        },
+        "observed-peak-files": {
+          "min": 8.0,
+          "max": 8.0
+        },
+        "observed-space-samples": {
+          "min": 32.0,
+          "max": 32.0
+        },
+        "overlay-records-after-fold": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "overlay-records-at-append-end": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "periodic-checkpoints": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "physical-folds": {
+          "min": 6.0,
+          "max": 6.0
+        },
+        "post-append-allocated-file-B": {
+          "min": 72638464.0,
+          "max": 72966144.0
+        },
+        "post-append-apparent-file-B": {
+          "min": 72897024.0,
+          "max": 72897024.0
+        },
+        "prepare-apply-ns/row": {
+          "min": 232836.0,
+          "max": 718733.0
+        },
+        "pressure-checkpoints": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "relation-1-append-device-bytes": {
+          "min": 167727104.0,
+          "max": 167727104.0
+        },
+        "relation-1-committed-batches": {
+          "min": 1024.0,
+          "max": 1024.0
+        },
+        "relation-1-device-bytes": {
+          "min": 167862272.0,
+          "max": 167862272.0
+        },
+        "relation-1-device-commits": {
+          "min": 1024.0,
+          "max": 1024.0
+        },
+        "relation-1-final-fold-device-bytes": {
+          "min": 135168.0,
+          "max": 135168.0
+        },
+        "routing-retired-bytes": {
+          "min": 13197312.0,
+          "max": 13197312.0
+        },
+        "routing-staged-bytes": {
+          "min": 13303808.0,
+          "max": 13303808.0
+        },
+        "rows": {
+          "min": 131072.0,
+          "max": 131072.0
+        },
+        "space-sample-interval-batches": {
+          "min": 64.0,
+          "max": 64.0
+        },
+        "system-append-device-bytes": {
+          "min": 102400.0,
+          "max": 102400.0
+        },
+        "system-committed-batches": {
+          "min": 2.0,
+          "max": 2.0
+        },
+        "system-device-bytes": {
+          "min": 204800.0,
+          "max": 204800.0
+        },
+        "system-device-commits": {
+          "min": 2.0,
+          "max": 2.0
+        },
+        "system-final-fold-device-bytes": {
+          "min": 102400.0,
+          "max": 102400.0
+        },
+        "tablet-routing-rebuilds": {
+          "min": 13.0,
+          "max": 13.0
+        },
+        "total-ns/row": {
+          "min": 233141.0,
+          "max": 719577.0
+        }
+      },
+      "candidate_72c": {
+        "B/op": {
+          "min": 222884136.0,
+          "max": 223763952.0
+        },
+        "allocated-file-growth-B": {
+          "min": 26025984.0,
+          "max": 26677248.0
+        },
+        "allocs/op": {
+          "min": 1326320.0,
+          "max": 1326819.0
+        },
+        "apparent-file-growth-B": {
+          "min": 26185728.0,
+          "max": 26185728.0
+        },
+        "append-certificates": {
+          "min": 18.0,
+          "max": 18.0
+        },
+        "append-leaf-splits": {
+          "min": 2.0,
+          "max": 2.0
+        },
+        "append-physical-folds": {
+          "min": 54.0,
+          "max": 54.0
+        },
+        "append-routing-retired-bytes": {
+          "min": 49152.0,
+          "max": 49152.0
+        },
+        "append-routing-staged-bytes": {
+          "min": 65536.0,
+          "max": 65536.0
+        },
+        "append-tablet-routing-rebuilds": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "barrier-syncs": {
+          "min": 76.0,
+          "max": 76.0
+        },
+        "capture-append-device-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-committed-batches": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-device-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-device-commits": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-final-fold-device-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "certificate-syncs": {
+          "min": 20.0,
+          "max": 20.0
+        },
+        "certificates": {
+          "min": 19.0,
+          "max": 19.0
+        },
+        "committed-batches": {
+          "min": 21.0,
+          "max": 21.0
+        },
+        "device-bytes": {
+          "min": 28471296.0,
+          "max": 28471296.0
+        },
+        "device-commits": {
+          "min": 21.0,
+          "max": 21.0
+        },
+        "final-allocated-file-B": {
+          "min": 63283200.0,
+          "max": 63934464.0
+        },
+        "final-apparent-file-B": {
+          "min": 63431168.0,
+          "max": 63431168.0
+        },
+        "final-files": {
+          "min": 8.0,
+          "max": 8.0
+        },
+        "final-fold-committed-batches": {
+          "min": 1.0,
+          "max": 1.0
+        },
+        "final-fold-device-bytes": {
+          "min": 176128.0,
+          "max": 176128.0
+        },
+        "final-fold-device-commits": {
+          "min": 1.0,
+          "max": 1.0
+        },
+        "final-fold-ns/row": {
+          "min": 272.3,
+          "max": 607.3
+        },
+        "final-physical-folds": {
+          "min": 3.0,
+          "max": 3.0
+        },
+        "fold-certificates": {
+          "min": 1.0,
+          "max": 1.0
+        },
+        "journal-syncs": {
+          "min": 57.0,
+          "max": 57.0
+        },
+        "leaf-splits": {
+          "min": 2.0,
+          "max": 2.0
+        },
+        "ns/op": {
+          "min": 6635902705.0,
+          "max": 32254980001.0
+        },
+        "observed-peak-allocated-file-B": {
+          "min": 63283200.0,
+          "max": 63934464.0
+        },
+        "observed-peak-apparent-file-B": {
+          "min": 63431168.0,
+          "max": 63431168.0
+        },
+        "observed-peak-files": {
+          "min": 8.0,
+          "max": 8.0
+        },
+        "observed-space-samples": {
+          "min": 32.0,
+          "max": 32.0
+        },
+        "overlay-records-after-fold": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "overlay-records-at-append-end": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "periodic-checkpoints": {
+          "min": 15.0,
+          "max": 15.0
+        },
+        "physical-folds": {
+          "min": 57.0,
+          "max": 57.0
+        },
+        "post-append-allocated-file-B": {
+          "min": 63205376.0,
+          "max": 63856640.0
+        },
+        "post-append-apparent-file-B": {
+          "min": 63431168.0,
+          "max": 63431168.0
+        },
+        "prepare-apply-ns/row": {
+          "min": 50312.0,
+          "max": 245479.0
+        },
+        "pressure-checkpoints": {
+          "min": 2.0,
+          "max": 2.0
+        },
+        "relation-1-append-device-bytes": {
+          "min": 28295168.0,
+          "max": 28295168.0
+        },
+        "relation-1-committed-batches": {
+          "min": 21.0,
+          "max": 21.0
+        },
+        "relation-1-device-bytes": {
+          "min": 28471296.0,
+          "max": 28471296.0
+        },
+        "relation-1-device-commits": {
+          "min": 21.0,
+          "max": 21.0
+        },
+        "relation-1-final-fold-device-bytes": {
+          "min": 176128.0,
+          "max": 176128.0
+        },
+        "routing-retired-bytes": {
+          "min": 49152.0,
+          "max": 49152.0
+        },
+        "routing-staged-bytes": {
+          "min": 65536.0,
+          "max": 65536.0
+        },
+        "rows": {
+          "min": 131072.0,
+          "max": 131072.0
+        },
+        "space-sample-interval-batches": {
+          "min": 64.0,
+          "max": 64.0
+        },
+        "system-append-device-bytes": {
+          "min": 1843200.0,
+          "max": 1843200.0
+        },
+        "system-committed-batches": {
+          "min": 19.0,
+          "max": 19.0
+        },
+        "system-device-bytes": {
+          "min": 1945600.0,
+          "max": 1945600.0
+        },
+        "system-device-commits": {
+          "min": 19.0,
+          "max": 19.0
+        },
+        "system-final-fold-device-bytes": {
+          "min": 102400.0,
+          "max": 102400.0
+        },
+        "tablet-routing-rebuilds": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "tail-split-current-charge-after-fold-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "tail-split-current-charge-at-append-end-bytes": {
+          "min": 61813.0,
+          "max": 61813.0
+        },
+        "tail-split-peak-charge-after-fold-bytes": {
+          "min": 5245093.0,
+          "max": 5245093.0
+        },
+        "tail-split-peak-charge-at-append-end-bytes": {
+          "min": 5245093.0,
+          "max": 5245093.0
+        },
+        "total-ns/row": {
+          "min": 50628.0,
+          "max": 246086.0
+        }
+      }
+    },
+    "CompactSharedPayload": {
+      "main_control": {
+        "B/op": {
+          "min": 308595648.0,
+          "max": 309097848.0
+        },
+        "allocated-file-growth-B": {
+          "min": 5230592.0,
+          "max": 5230592.0
+        },
+        "allocs/op": {
+          "min": 1326114.0,
+          "max": 1326330.0
+        },
+        "apparent-file-growth-B": {
+          "min": 6008832.0,
+          "max": 6008832.0
+        },
+        "append-certificates": {
+          "min": 628.0,
+          "max": 628.0
+        },
+        "append-leaf-splits": {
+          "min": 627.0,
+          "max": 627.0
+        },
+        "append-physical-folds": {
+          "min": 3.0,
+          "max": 3.0
+        },
+        "append-routing-retired-bytes": {
+          "min": 15466496.0,
+          "max": 15466496.0
+        },
+        "append-routing-staged-bytes": {
+          "min": 15499264.0,
+          "max": 15499264.0
+        },
+        "append-tablet-routing-rebuilds": {
+          "min": 4.0,
+          "max": 4.0
+        },
+        "barrier-syncs": {
+          "min": 2516.0,
+          "max": 2516.0
+        },
+        "capture-append-device-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-committed-batches": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-device-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-device-commits": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-final-fold-device-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "certificate-syncs": {
+          "min": 630.0,
+          "max": 630.0
+        },
+        "certificates": {
+          "min": 629.0,
+          "max": 629.0
+        },
+        "committed-batches": {
+          "min": 1256.0,
+          "max": 1256.0
+        },
+        "device-bytes": {
+          "min": 134651904.0,
+          "max": 134651904.0
+        },
+        "device-commits": {
+          "min": 1256.0,
+          "max": 1256.0
+        },
+        "final-allocated-file-B": {
+          "min": 42487808.0,
+          "max": 42487808.0
+        },
+        "final-apparent-file-B": {
+          "min": 43254272.0,
+          "max": 43254272.0
+        },
+        "final-files": {
+          "min": 8.0,
+          "max": 8.0
+        },
+        "final-fold-committed-batches": {
+          "min": 1.0,
+          "max": 1.0
+        },
+        "final-fold-device-bytes": {
+          "min": 98304.0,
+          "max": 98304.0
+        },
+        "final-fold-device-commits": {
+          "min": 1.0,
+          "max": 1.0
+        },
+        "final-fold-ns/row": {
+          "min": 240.3,
+          "max": 338.3
+        },
+        "final-physical-folds": {
+          "min": 3.0,
+          "max": 3.0
+        },
+        "fold-certificates": {
+          "min": 1.0,
+          "max": 1.0
+        },
+        "journal-syncs": {
+          "min": 1887.0,
+          "max": 1887.0
+        },
+        "leaf-splits": {
+          "min": 627.0,
+          "max": 627.0
+        },
+        "ns/op": {
+          "min": 28256255623.0,
+          "max": 34416353293.0
+        },
+        "observed-peak-allocated-file-B": {
+          "min": 42491904.0,
+          "max": 42491904.0
+        },
+        "observed-peak-apparent-file-B": {
+          "min": 43254272.0,
+          "max": 43254272.0
+        },
+        "observed-peak-files": {
+          "min": 8.0,
+          "max": 8.0
+        },
+        "observed-space-samples": {
+          "min": 32.0,
+          "max": 32.0
+        },
+        "overlay-records-after-fold": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "overlay-records-at-append-end": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "periodic-checkpoints": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "physical-folds": {
+          "min": 6.0,
+          "max": 6.0
+        },
+        "post-append-allocated-file-B": {
+          "min": 42491904.0,
+          "max": 42491904.0
+        },
+        "post-append-apparent-file-B": {
+          "min": 43188736.0,
+          "max": 43188736.0
+        },
+        "prepare-apply-ns/row": {
+          "min": 215240.0,
+          "max": 262281.0
+        },
+        "pressure-checkpoints": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "relation-1-append-device-bytes": {
+          "min": 134553600.0,
+          "max": 134553600.0
+        },
+        "relation-1-committed-batches": {
+          "min": 1256.0,
+          "max": 1256.0
+        },
+        "relation-1-device-bytes": {
+          "min": 134651904.0,
+          "max": 134651904.0
+        },
+        "relation-1-device-commits": {
+          "min": 1256.0,
+          "max": 1256.0
+        },
+        "relation-1-final-fold-device-bytes": {
+          "min": 98304.0,
+          "max": 98304.0
+        },
+        "routing-retired-bytes": {
+          "min": 15466496.0,
+          "max": 15466496.0
+        },
+        "routing-staged-bytes": {
+          "min": 15499264.0,
+          "max": 15499264.0
+        },
+        "rows": {
+          "min": 131072.0,
+          "max": 131072.0
+        },
+        "space-sample-interval-batches": {
+          "min": 64.0,
+          "max": 64.0
+        },
+        "system-append-device-bytes": {
+          "min": 102400.0,
+          "max": 102400.0
+        },
+        "system-committed-batches": {
+          "min": 2.0,
+          "max": 2.0
+        },
+        "system-device-bytes": {
+          "min": 204800.0,
+          "max": 204800.0
+        },
+        "system-device-commits": {
+          "min": 2.0,
+          "max": 2.0
+        },
+        "system-final-fold-device-bytes": {
+          "min": 102400.0,
+          "max": 102400.0
+        },
+        "tablet-routing-rebuilds": {
+          "min": 4.0,
+          "max": 4.0
+        },
+        "total-ns/row": {
+          "min": 215578.0,
+          "max": 262576.0
+        }
+      },
+      "candidate_72c": {
+        "B/op": {
+          "min": 190664064.0,
+          "max": 191362472.0
+        },
+        "allocated-file-growth-B": {
+          "min": 532480.0,
+          "max": 532480.0
+        },
+        "allocs/op": {
+          "min": 1173324.0,
+          "max": 1173714.0
+        },
+        "apparent-file-growth-B": {
+          "min": 1077248.0,
+          "max": 1077248.0
+        },
+        "append-certificates": {
+          "min": 16.0,
+          "max": 16.0
+        },
+        "append-leaf-splits": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "append-physical-folds": {
+          "min": 48.0,
+          "max": 48.0
+        },
+        "append-routing-retired-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "append-routing-staged-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "append-tablet-routing-rebuilds": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "barrier-syncs": {
+          "min": 68.0,
+          "max": 68.0
+        },
+        "capture-append-device-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-committed-batches": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-device-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-device-commits": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "capture-final-fold-device-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "certificate-syncs": {
+          "min": 18.0,
+          "max": 18.0
+        },
+        "certificates": {
+          "min": 17.0,
+          "max": 17.0
+        },
+        "committed-batches": {
+          "min": 17.0,
+          "max": 17.0
+        },
+        "device-bytes": {
+          "min": 2322432.0,
+          "max": 2322432.0
+        },
+        "device-commits": {
+          "min": 17.0,
+          "max": 17.0
+        },
+        "final-allocated-file-B": {
+          "min": 37789696.0,
+          "max": 37789696.0
+        },
+        "final-apparent-file-B": {
+          "min": 38322688.0,
+          "max": 38322688.0
+        },
+        "final-files": {
+          "min": 8.0,
+          "max": 8.0
+        },
+        "final-fold-committed-batches": {
+          "min": 1.0,
+          "max": 1.0
+        },
+        "final-fold-device-bytes": {
+          "min": 106496.0,
+          "max": 106496.0
+        },
+        "final-fold-device-commits": {
+          "min": 1.0,
+          "max": 1.0
+        },
+        "final-fold-ns/row": {
+          "min": 289.0,
+          "max": 329.7
+        },
+        "final-physical-folds": {
+          "min": 3.0,
+          "max": 3.0
+        },
+        "fold-certificates": {
+          "min": 1.0,
+          "max": 1.0
+        },
+        "journal-syncs": {
+          "min": 51.0,
+          "max": 51.0
+        },
+        "leaf-splits": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "ns/op": {
+          "min": 6991031250.0,
+          "max": 11303405997.0
+        },
+        "observed-peak-allocated-file-B": {
+          "min": 37789696.0,
+          "max": 37789696.0
+        },
+        "observed-peak-apparent-file-B": {
+          "min": 38322688.0,
+          "max": 38322688.0
+        },
+        "observed-peak-files": {
+          "min": 8.0,
+          "max": 8.0
+        },
+        "observed-space-samples": {
+          "min": 32.0,
+          "max": 32.0
+        },
+        "overlay-records-after-fold": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "overlay-records-at-append-end": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "periodic-checkpoints": {
+          "min": 15.0,
+          "max": 15.0
+        },
+        "physical-folds": {
+          "min": 51.0,
+          "max": 51.0
+        },
+        "post-append-allocated-file-B": {
+          "min": 37789696.0,
+          "max": 37789696.0
+        },
+        "post-append-apparent-file-B": {
+          "min": 38257152.0,
+          "max": 38257152.0
+        },
+        "prepare-apply-ns/row": {
+          "min": 53048.0,
+          "max": 85908.0
+        },
+        "pressure-checkpoints": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "relation-1-append-device-bytes": {
+          "min": 2215936.0,
+          "max": 2215936.0
+        },
+        "relation-1-committed-batches": {
+          "min": 17.0,
+          "max": 17.0
+        },
+        "relation-1-device-bytes": {
+          "min": 2322432.0,
+          "max": 2322432.0
+        },
+        "relation-1-device-commits": {
+          "min": 17.0,
+          "max": 17.0
+        },
+        "relation-1-final-fold-device-bytes": {
+          "min": 106496.0,
+          "max": 106496.0
+        },
+        "routing-retired-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "routing-staged-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "rows": {
+          "min": 131072.0,
+          "max": 131072.0
+        },
+        "space-sample-interval-batches": {
+          "min": 64.0,
+          "max": 64.0
+        },
+        "system-append-device-bytes": {
+          "min": 1638400.0,
+          "max": 1638400.0
+        },
+        "system-committed-batches": {
+          "min": 17.0,
+          "max": 17.0
+        },
+        "system-device-bytes": {
+          "min": 1740800.0,
+          "max": 1740800.0
+        },
+        "system-device-commits": {
+          "min": 17.0,
+          "max": 17.0
+        },
+        "system-final-fold-device-bytes": {
+          "min": 102400.0,
+          "max": 102400.0
+        },
+        "tablet-routing-rebuilds": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "tail-split-current-charge-after-fold-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "tail-split-current-charge-at-append-end-bytes": {
+          "min": 0.0,
+          "max": 0.0
+        },
+        "tail-split-peak-charge-after-fold-bytes": {
+          "min": 3336517.0,
+          "max": 3336517.0
+        },
+        "tail-split-peak-charge-at-append-end-bytes": {
+          "min": 3336517.0,
+          "max": 3336517.0
+        },
+        "total-ns/row": {
+          "min": 53337.0,
+          "max": 86238.0
+        }
+      }
+    }
+  },
+  "timing_ratios": {
+    "SequentialInsert": {
+      "baseline_over_candidate_ratio_of_medians": 3.8686091476762914,
+      "paired_baseline_over_candidate_ratios": {
+        "1": 2.9240903626378287,
+        "2": 3.8686091476762914,
+        "3": 4.604992352280126
+      },
+      "median_paired_baseline_over_candidate_ratio": 3.8686091476762914,
+      "min_paired_baseline_over_candidate_ratio": 2.9240903626378287,
+      "max_paired_baseline_over_candidate_ratio": 4.604992352280126
+    },
+    "CompactSharedPayload": {
+      "baseline_over_candidate_ratio_of_medians": 3.121324497589651,
+      "paired_baseline_over_candidate_ratios": {
+        "1": 3.284398462002799,
+        "2": 2.8936007287255543,
+        "3": 4.0417864850768614
+      },
+      "median_paired_baseline_over_candidate_ratio": 3.284398462002799,
+      "min_paired_baseline_over_candidate_ratio": 2.8936007287255543,
+      "max_paired_baseline_over_candidate_ratio": 4.0417864850768614
+    }
+  },
+  "counter_differences": {
+    "SequentialInsert": {
+      "allocated-file-growth-B": {
+        "main_control_median": 35676160.0,
+        "candidate_72c_median": 26677248.0,
+        "candidate_minus_main_control": -8998912.0
+      },
+      "apparent-file-growth-B": {
+        "main_control_median": 35717120.0,
+        "candidate_72c_median": 26185728.0,
+        "candidate_minus_main_control": -9531392.0
+      },
+      "append-certificates": {
+        "main_control_median": 512.0,
+        "candidate_72c_median": 18.0,
+        "candidate_minus_main_control": -494.0
+      },
+      "append-leaf-splits": {
+        "main_control_median": 511.0,
+        "candidate_72c_median": 2.0,
+        "candidate_minus_main_control": -509.0
+      },
+      "append-physical-folds": {
+        "main_control_median": 3.0,
+        "candidate_72c_median": 54.0,
+        "candidate_minus_main_control": 51.0
+      },
+      "append-routing-retired-bytes": {
+        "main_control_median": 13197312.0,
+        "candidate_72c_median": 49152.0,
+        "candidate_minus_main_control": -13148160.0
+      },
+      "append-routing-staged-bytes": {
+        "main_control_median": 13303808.0,
+        "candidate_72c_median": 65536.0,
+        "candidate_minus_main_control": -13238272.0
+      },
+      "append-tablet-routing-rebuilds": {
+        "main_control_median": 13.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": -13.0
+      },
+      "barrier-syncs": {
+        "main_control_median": 2052.0,
+        "candidate_72c_median": 76.0,
+        "candidate_minus_main_control": -1976.0
+      },
+      "capture-append-device-bytes": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "capture-committed-batches": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "capture-device-bytes": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "capture-device-commits": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "capture-final-fold-device-bytes": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "certificate-syncs": {
+        "main_control_median": 514.0,
+        "candidate_72c_median": 20.0,
+        "candidate_minus_main_control": -494.0
+      },
+      "certificates": {
+        "main_control_median": 513.0,
+        "candidate_72c_median": 19.0,
+        "candidate_minus_main_control": -494.0
+      },
+      "committed-batches": {
+        "main_control_median": 1024.0,
+        "candidate_72c_median": 21.0,
+        "candidate_minus_main_control": -1003.0
+      },
+      "device-bytes": {
+        "main_control_median": 167862272.0,
+        "candidate_72c_median": 28471296.0,
+        "candidate_minus_main_control": -139390976.0
+      },
+      "device-commits": {
+        "main_control_median": 1024.0,
+        "candidate_72c_median": 21.0,
+        "candidate_minus_main_control": -1003.0
+      },
+      "final-allocated-file-B": {
+        "main_control_median": 72933376.0,
+        "candidate_72c_median": 63934464.0,
+        "candidate_minus_main_control": -8998912.0
+      },
+      "final-apparent-file-B": {
+        "main_control_median": 72962560.0,
+        "candidate_72c_median": 63431168.0,
+        "candidate_minus_main_control": -9531392.0
+      },
+      "final-files": {
+        "main_control_median": 8.0,
+        "candidate_72c_median": 8.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "final-fold-committed-batches": {
+        "main_control_median": 1.0,
+        "candidate_72c_median": 1.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "final-fold-device-bytes": {
+        "main_control_median": 135168.0,
+        "candidate_72c_median": 176128.0,
+        "candidate_minus_main_control": 40960.0
+      },
+      "final-fold-device-commits": {
+        "main_control_median": 1.0,
+        "candidate_72c_median": 1.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "final-physical-folds": {
+        "main_control_median": 3.0,
+        "candidate_72c_median": 3.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "fold-certificates": {
+        "main_control_median": 1.0,
+        "candidate_72c_median": 1.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "journal-syncs": {
+        "main_control_median": 1539.0,
+        "candidate_72c_median": 57.0,
+        "candidate_minus_main_control": -1482.0
+      },
+      "leaf-splits": {
+        "main_control_median": 511.0,
+        "candidate_72c_median": 2.0,
+        "candidate_minus_main_control": -509.0
+      },
+      "observed-peak-allocated-file-B": {
+        "main_control_median": 72933376.0,
+        "candidate_72c_median": 63934464.0,
+        "candidate_minus_main_control": -8998912.0
+      },
+      "observed-peak-apparent-file-B": {
+        "main_control_median": 72962560.0,
+        "candidate_72c_median": 63431168.0,
+        "candidate_minus_main_control": -9531392.0
+      },
+      "observed-peak-files": {
+        "main_control_median": 8.0,
+        "candidate_72c_median": 8.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "observed-space-samples": {
+        "main_control_median": 32.0,
+        "candidate_72c_median": 32.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "overlay-records-after-fold": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "overlay-records-at-append-end": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "periodic-checkpoints": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 15.0,
+        "candidate_minus_main_control": 15.0
+      },
+      "physical-folds": {
+        "main_control_median": 6.0,
+        "candidate_72c_median": 57.0,
+        "candidate_minus_main_control": 51.0
+      },
+      "post-append-allocated-file-B": {
+        "main_control_median": 72900608.0,
+        "candidate_72c_median": 63856640.0,
+        "candidate_minus_main_control": -9043968.0
+      },
+      "post-append-apparent-file-B": {
+        "main_control_median": 72897024.0,
+        "candidate_72c_median": 63431168.0,
+        "candidate_minus_main_control": -9465856.0
+      },
+      "pressure-checkpoints": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 2.0,
+        "candidate_minus_main_control": 2.0
+      },
+      "relation-1-append-device-bytes": {
+        "main_control_median": 167727104.0,
+        "candidate_72c_median": 28295168.0,
+        "candidate_minus_main_control": -139431936.0
+      },
+      "relation-1-committed-batches": {
+        "main_control_median": 1024.0,
+        "candidate_72c_median": 21.0,
+        "candidate_minus_main_control": -1003.0
+      },
+      "relation-1-device-bytes": {
+        "main_control_median": 167862272.0,
+        "candidate_72c_median": 28471296.0,
+        "candidate_minus_main_control": -139390976.0
+      },
+      "relation-1-device-commits": {
+        "main_control_median": 1024.0,
+        "candidate_72c_median": 21.0,
+        "candidate_minus_main_control": -1003.0
+      },
+      "relation-1-final-fold-device-bytes": {
+        "main_control_median": 135168.0,
+        "candidate_72c_median": 176128.0,
+        "candidate_minus_main_control": 40960.0
+      },
+      "routing-retired-bytes": {
+        "main_control_median": 13197312.0,
+        "candidate_72c_median": 49152.0,
+        "candidate_minus_main_control": -13148160.0
+      },
+      "routing-staged-bytes": {
+        "main_control_median": 13303808.0,
+        "candidate_72c_median": 65536.0,
+        "candidate_minus_main_control": -13238272.0
+      },
+      "rows": {
+        "main_control_median": 131072.0,
+        "candidate_72c_median": 131072.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "space-sample-interval-batches": {
+        "main_control_median": 64.0,
+        "candidate_72c_median": 64.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "system-append-device-bytes": {
+        "main_control_median": 102400.0,
+        "candidate_72c_median": 1843200.0,
+        "candidate_minus_main_control": 1740800.0
+      },
+      "system-committed-batches": {
+        "main_control_median": 2.0,
+        "candidate_72c_median": 19.0,
+        "candidate_minus_main_control": 17.0
+      },
+      "system-device-bytes": {
+        "main_control_median": 204800.0,
+        "candidate_72c_median": 1945600.0,
+        "candidate_minus_main_control": 1740800.0
+      },
+      "system-device-commits": {
+        "main_control_median": 2.0,
+        "candidate_72c_median": 19.0,
+        "candidate_minus_main_control": 17.0
+      },
+      "system-final-fold-device-bytes": {
+        "main_control_median": 102400.0,
+        "candidate_72c_median": 102400.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "tablet-routing-rebuilds": {
+        "main_control_median": 13.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": -13.0
+      },
+      "tail-split-current-charge-after-fold-bytes": {
+        "main_control_median": null,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": null
+      },
+      "tail-split-current-charge-at-append-end-bytes": {
+        "main_control_median": null,
+        "candidate_72c_median": 61813.0,
+        "candidate_minus_main_control": null
+      },
+      "tail-split-peak-charge-after-fold-bytes": {
+        "main_control_median": null,
+        "candidate_72c_median": 5245093.0,
+        "candidate_minus_main_control": null
+      },
+      "tail-split-peak-charge-at-append-end-bytes": {
+        "main_control_median": null,
+        "candidate_72c_median": 5245093.0,
+        "candidate_minus_main_control": null
+      }
+    },
+    "CompactSharedPayload": {
+      "allocated-file-growth-B": {
+        "main_control_median": 5230592.0,
+        "candidate_72c_median": 532480.0,
+        "candidate_minus_main_control": -4698112.0
+      },
+      "apparent-file-growth-B": {
+        "main_control_median": 6008832.0,
+        "candidate_72c_median": 1077248.0,
+        "candidate_minus_main_control": -4931584.0
+      },
+      "append-certificates": {
+        "main_control_median": 628.0,
+        "candidate_72c_median": 16.0,
+        "candidate_minus_main_control": -612.0
+      },
+      "append-leaf-splits": {
+        "main_control_median": 627.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": -627.0
+      },
+      "append-physical-folds": {
+        "main_control_median": 3.0,
+        "candidate_72c_median": 48.0,
+        "candidate_minus_main_control": 45.0
+      },
+      "append-routing-retired-bytes": {
+        "main_control_median": 15466496.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": -15466496.0
+      },
+      "append-routing-staged-bytes": {
+        "main_control_median": 15499264.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": -15499264.0
+      },
+      "append-tablet-routing-rebuilds": {
+        "main_control_median": 4.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": -4.0
+      },
+      "barrier-syncs": {
+        "main_control_median": 2516.0,
+        "candidate_72c_median": 68.0,
+        "candidate_minus_main_control": -2448.0
+      },
+      "capture-append-device-bytes": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "capture-committed-batches": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "capture-device-bytes": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "capture-device-commits": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "capture-final-fold-device-bytes": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "certificate-syncs": {
+        "main_control_median": 630.0,
+        "candidate_72c_median": 18.0,
+        "candidate_minus_main_control": -612.0
+      },
+      "certificates": {
+        "main_control_median": 629.0,
+        "candidate_72c_median": 17.0,
+        "candidate_minus_main_control": -612.0
+      },
+      "committed-batches": {
+        "main_control_median": 1256.0,
+        "candidate_72c_median": 17.0,
+        "candidate_minus_main_control": -1239.0
+      },
+      "device-bytes": {
+        "main_control_median": 134651904.0,
+        "candidate_72c_median": 2322432.0,
+        "candidate_minus_main_control": -132329472.0
+      },
+      "device-commits": {
+        "main_control_median": 1256.0,
+        "candidate_72c_median": 17.0,
+        "candidate_minus_main_control": -1239.0
+      },
+      "final-allocated-file-B": {
+        "main_control_median": 42487808.0,
+        "candidate_72c_median": 37789696.0,
+        "candidate_minus_main_control": -4698112.0
+      },
+      "final-apparent-file-B": {
+        "main_control_median": 43254272.0,
+        "candidate_72c_median": 38322688.0,
+        "candidate_minus_main_control": -4931584.0
+      },
+      "final-files": {
+        "main_control_median": 8.0,
+        "candidate_72c_median": 8.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "final-fold-committed-batches": {
+        "main_control_median": 1.0,
+        "candidate_72c_median": 1.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "final-fold-device-bytes": {
+        "main_control_median": 98304.0,
+        "candidate_72c_median": 106496.0,
+        "candidate_minus_main_control": 8192.0
+      },
+      "final-fold-device-commits": {
+        "main_control_median": 1.0,
+        "candidate_72c_median": 1.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "final-physical-folds": {
+        "main_control_median": 3.0,
+        "candidate_72c_median": 3.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "fold-certificates": {
+        "main_control_median": 1.0,
+        "candidate_72c_median": 1.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "journal-syncs": {
+        "main_control_median": 1887.0,
+        "candidate_72c_median": 51.0,
+        "candidate_minus_main_control": -1836.0
+      },
+      "leaf-splits": {
+        "main_control_median": 627.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": -627.0
+      },
+      "observed-peak-allocated-file-B": {
+        "main_control_median": 42491904.0,
+        "candidate_72c_median": 37789696.0,
+        "candidate_minus_main_control": -4702208.0
+      },
+      "observed-peak-apparent-file-B": {
+        "main_control_median": 43254272.0,
+        "candidate_72c_median": 38322688.0,
+        "candidate_minus_main_control": -4931584.0
+      },
+      "observed-peak-files": {
+        "main_control_median": 8.0,
+        "candidate_72c_median": 8.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "observed-space-samples": {
+        "main_control_median": 32.0,
+        "candidate_72c_median": 32.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "overlay-records-after-fold": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "overlay-records-at-append-end": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "periodic-checkpoints": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 15.0,
+        "candidate_minus_main_control": 15.0
+      },
+      "physical-folds": {
+        "main_control_median": 6.0,
+        "candidate_72c_median": 51.0,
+        "candidate_minus_main_control": 45.0
+      },
+      "post-append-allocated-file-B": {
+        "main_control_median": 42491904.0,
+        "candidate_72c_median": 37789696.0,
+        "candidate_minus_main_control": -4702208.0
+      },
+      "post-append-apparent-file-B": {
+        "main_control_median": 43188736.0,
+        "candidate_72c_median": 38257152.0,
+        "candidate_minus_main_control": -4931584.0
+      },
+      "pressure-checkpoints": {
+        "main_control_median": 0.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "relation-1-append-device-bytes": {
+        "main_control_median": 134553600.0,
+        "candidate_72c_median": 2215936.0,
+        "candidate_minus_main_control": -132337664.0
+      },
+      "relation-1-committed-batches": {
+        "main_control_median": 1256.0,
+        "candidate_72c_median": 17.0,
+        "candidate_minus_main_control": -1239.0
+      },
+      "relation-1-device-bytes": {
+        "main_control_median": 134651904.0,
+        "candidate_72c_median": 2322432.0,
+        "candidate_minus_main_control": -132329472.0
+      },
+      "relation-1-device-commits": {
+        "main_control_median": 1256.0,
+        "candidate_72c_median": 17.0,
+        "candidate_minus_main_control": -1239.0
+      },
+      "relation-1-final-fold-device-bytes": {
+        "main_control_median": 98304.0,
+        "candidate_72c_median": 106496.0,
+        "candidate_minus_main_control": 8192.0
+      },
+      "routing-retired-bytes": {
+        "main_control_median": 15466496.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": -15466496.0
+      },
+      "routing-staged-bytes": {
+        "main_control_median": 15499264.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": -15499264.0
+      },
+      "rows": {
+        "main_control_median": 131072.0,
+        "candidate_72c_median": 131072.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "space-sample-interval-batches": {
+        "main_control_median": 64.0,
+        "candidate_72c_median": 64.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "system-append-device-bytes": {
+        "main_control_median": 102400.0,
+        "candidate_72c_median": 1638400.0,
+        "candidate_minus_main_control": 1536000.0
+      },
+      "system-committed-batches": {
+        "main_control_median": 2.0,
+        "candidate_72c_median": 17.0,
+        "candidate_minus_main_control": 15.0
+      },
+      "system-device-bytes": {
+        "main_control_median": 204800.0,
+        "candidate_72c_median": 1740800.0,
+        "candidate_minus_main_control": 1536000.0
+      },
+      "system-device-commits": {
+        "main_control_median": 2.0,
+        "candidate_72c_median": 17.0,
+        "candidate_minus_main_control": 15.0
+      },
+      "system-final-fold-device-bytes": {
+        "main_control_median": 102400.0,
+        "candidate_72c_median": 102400.0,
+        "candidate_minus_main_control": 0.0
+      },
+      "tablet-routing-rebuilds": {
+        "main_control_median": 4.0,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": -4.0
+      },
+      "tail-split-current-charge-after-fold-bytes": {
+        "main_control_median": null,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": null
+      },
+      "tail-split-current-charge-at-append-end-bytes": {
+        "main_control_median": null,
+        "candidate_72c_median": 0.0,
+        "candidate_minus_main_control": null
+      },
+      "tail-split-peak-charge-after-fold-bytes": {
+        "main_control_median": null,
+        "candidate_72c_median": 3336517.0,
+        "candidate_minus_main_control": null
+      },
+      "tail-split-peak-charge-at-append-end-bytes": {
+        "main_control_median": null,
+        "candidate_72c_median": 3336517.0,
+        "candidate_minus_main_control": null
+      }
+    }
+  },
+  "host_context": {
+    "snapshot_utc_approx": "2026-09-27T08:42Z",
+    "scope": "Post-run only; not time-aligned to individual samples.",
+    "vm_loadavg": [
+      9.26,
+      17.93,
+      17.39
+    ],
+    "process_count": 666,
+    "aggregate_reported_cpu_percent": 134.7,
+    "memory_free_percent": 81,
+    "physical_memory_bytes": 68719476736,
+    "kernel_release": "25.3.0",
+    "thermal_reading": "pmset -g thermlog returned no data",
+    "limitation": "This snapshot cannot establish host conditions during the benchmark samples and does not identify the cause of run-to-run timing spread."
+  }
+}

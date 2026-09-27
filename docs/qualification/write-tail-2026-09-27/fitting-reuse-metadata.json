@@ -156,7 +156,7 @@
       }
     },
     "scope": "Fixed 131072-row SQL ReplicatedApply including final fold; three durable collections, no RF3/network/admission. Shared host; other applications are not stopped.",
-    "setup_and_oracles": "Corpus creation and final verification are outside the timer; all benchmark oracles passed."
+    "setup_and_oracles": "Database/schema setup and final full-row oracle verification are outside the timer; per-batch key/value generation, mutation/command assembly, apply, and completion/publication checks are timed, as is the final checkpoint/fold. All benchmark oracles passed."
   },
   "build": {
     "baseline_binary_sha256": "31596540917497087a208286f4216c55302e2cf9013f65a42fbb0695f21e1297",
