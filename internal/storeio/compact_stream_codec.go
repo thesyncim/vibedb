@@ -86,6 +86,10 @@ type compactStreamScratch struct {
 	candidates      [8]compactStreamEncoding
 	data            [8][]byte
 	dict            [8][][]byte
+	dictSorted      [][]byte
+	dictRowIDs      []uint32
+	dictOrder       []uint32
+	dictRemap       []uint32
 	alphabet        [8][]byte
 	integers        []int64
 	dates           []int32
@@ -116,7 +120,9 @@ func (e compactStreamEncoding) appendBinary(dst []byte) ([]byte, error) {
 		return dst, ErrCommonPrimaryLeafFull
 	}
 	start := len(dst)
-	dst = append(dst, make([]byte, compactStreamHeader+2*len(e.dict))...)
+	headerLen := compactStreamHeader + 2*len(e.dict)
+	dst = slices.Grow(dst, headerLen+len(e.data))
+	dst = dst[:start+headerLen]
 	dst[start] = e.kind
 	dst[start+1] = e.width
 	binary.LittleEndian.PutUint16(dst[start+2:], uint16(len(e.dict)))
@@ -266,34 +272,42 @@ func (s *compactStreamScratch) encodeShapeWithRankContext(
 func (s *compactStreamScratch) measureDictionary(values [][]byte) int {
 	dictionary := slices.Grow(s.dict[0][:0], len(values))[:0]
 	s.dict[0] = dictionary
+	rowIDs := slices.Grow(s.dictRowIDs[:0], len(values))[:len(values)]
+	s.dictRowIDs = rowIDs
 	dictionaryBytes := 0
 	hashed := false
-	for _, value := range values {
+	for row, value := range values {
 		if hashed {
-			if _, found := s.dictionaryLookup(value); found {
-				continue
-			}
-		} else {
-			found := false
-			for _, existing := range dictionary {
-				if bytes.Equal(existing, value) {
-					found = true
-					break
-				}
-			}
+			id, found := s.dictionaryFindOrInsert(value, uint32(len(dictionary)))
+			rowIDs[row] = id
 			if found {
 				continue
 			}
+			dictionary = append(dictionary, value)
+			s.dict[0] = dictionary
+			dictionaryBytes += len(value)
+			continue
 		}
+		found := false
+		for id, existing := range dictionary {
+			if len(existing) == len(value) && bytes.Equal(existing, value) {
+				rowIDs[row] = uint32(id)
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+		id := uint32(len(dictionary))
 		dictionary = append(dictionary, value)
 		s.dict[0] = dictionary
+		rowIDs[row] = id
 		dictionaryBytes += len(value)
-		if hashed {
-			s.dictionaryInsert(value, uint32(len(dictionary)-1))
-		} else if len(dictionary) == compactDictionaryHashThreshold {
+		if len(dictionary) == compactDictionaryHashThreshold {
 			s.resetDictionaryTable(len(values))
-			for id, existing := range dictionary {
-				s.dictionaryInsert(existing, uint32(id))
+			for existingID, existing := range dictionary {
+				s.dictionaryInsert(existing, uint32(existingID))
 			}
 			hashed = true
 		}
@@ -305,31 +319,66 @@ func (s *compactStreamScratch) measureDictionary(values [][]byte) int {
 
 func (s *compactStreamScratch) finishDictionary(values [][]byte) compactStreamEncoding {
 	dictionary := s.dict[0]
-	slices.SortFunc(dictionary, bytes.Compare)
-	width := bits.Len(uint(max(0, len(dictionary)-1)))
+	nDict := len(dictionary)
+	width := bits.Len(uint(max(0, nDict-1)))
 	dataBytes := (len(values)*width + 7) / 8
 	data := slices.Grow(s.data[0][:0], dataBytes)[:dataBytes]
-	clear(data)
-	if len(dictionary) < compactDictionaryHashThreshold {
-		for row, value := range values {
-			id, found := slices.BinarySearchFunc(dictionary, value, bytes.Compare)
-			if !found {
-				panic("compact dictionary planner lost value")
+	if nDict <= 1 {
+		clear(data)
+		s.data[0] = data
+		return compactStreamEncoding{
+			kind: compactStreamDictionary, width: uint8(width), count: len(values),
+			data: data, dict: dictionary,
+		}
+	}
+	order := slices.Grow(s.dictOrder[:0], nDict)[:nDict]
+	for i := range order {
+		order[i] = uint32(i)
+	}
+	slices.SortFunc(order, func(a, b uint32) int {
+		return bytes.Compare(dictionary[a], dictionary[b])
+	})
+	sorted := slices.Grow(s.dictSorted[:0], nDict)[:nDict]
+	remap := slices.Grow(s.dictRemap[:0], nDict)[:nDict]
+	for newID, oldID := range order {
+		sorted[newID] = dictionary[oldID]
+		remap[oldID] = uint32(newID)
+	}
+	s.dictOrder, s.dictSorted, s.dictRemap = order, sorted, remap
+	copy(dictionary, sorted)
+	rowIDs := s.dictRowIDs[:len(values)]
+	var reservoir uint64
+	bufferedBits, packedAt := 0, 0
+	for _, oldID := range rowIDs {
+		reservoir |= uint64(remap[oldID]) << uint(bufferedBits)
+		bufferedBits += width
+		if bufferedBits >= 56 && packedAt+8 <= len(data) {
+			binary.LittleEndian.PutUint64(data[packedAt:], reservoir)
+			flushBytes := bufferedBits >> 3
+			packedAt += flushBytes
+			reservoir >>= uint(flushBytes << 3)
+			bufferedBits &= 7
+		} else {
+			for bufferedBits >= 8 {
+				data[packedAt] = byte(reservoir)
+				packedAt++
+				reservoir >>= 8
+				bufferedBits -= 8
 			}
-			compactPutBits(data, row*width, width, uint64(id))
 		}
-	} else {
-		s.resetDictionaryTable(len(dictionary))
-		for id, value := range dictionary {
-			s.dictionaryInsert(value, uint32(id))
-		}
-		for row, value := range values {
-			id, found := s.dictionaryLookup(value)
-			if !found {
-				panic("compact dictionary planner lost value")
-			}
-			compactPutBits(data, row*width, width, uint64(id))
-		}
+	}
+	for bufferedBits >= 8 {
+		data[packedAt] = byte(reservoir)
+		packedAt++
+		reservoir >>= 8
+		bufferedBits -= 8
+	}
+	if bufferedBits != 0 {
+		data[packedAt] = byte(reservoir)
+		packedAt++
+	}
+	if packedAt != dataBytes {
+		panic("compact dictionary bit-pack sizing drift")
 	}
 	s.data[0] = data
 	return compactStreamEncoding{
@@ -360,17 +409,20 @@ func (s *compactStreamScratch) resetDictionaryTable(entries int) {
 	}
 }
 
-func (s *compactStreamScratch) dictionaryLookup(value []byte) (uint32, bool) {
+func (s *compactStreamScratch) dictionaryFindOrInsert(value []byte, nextID uint32) (uint32, bool) {
 	mask := uint64(len(s.dictionaryTable) - 1)
 	at := maphash.Bytes(s.dictionarySeed, value) & mask
 	for s.dictionaryStamp[at] == s.dictionaryEpoch {
 		id := s.dictionaryTable[at]
-		if bytes.Equal(s.dict[0][id], value) {
+		existing := s.dict[0][id]
+		if len(existing) == len(value) && bytes.Equal(existing, value) {
 			return id, true
 		}
 		at = (at + 1) & mask
 	}
-	return 0, false
+	s.dictionaryTable[at] = nextID
+	s.dictionaryStamp[at] = s.dictionaryEpoch
+	return nextID, false
 }
 
 func (s *compactStreamScratch) dictionaryInsert(value []byte, id uint32) {
@@ -471,8 +523,14 @@ func (s *compactStreamScratch) measureAlphabetWithSpellings(
 	spellings [][]byte,
 	limit int,
 ) (compactAlphabetPlan, bool) {
+	if len(values) >= 2 && len(spellings) <= 1 {
+		return compactAlphabetPlan{}, false
+	}
 	blocks := (len(values) + compactStreamRestart - 1) / compactStreamRestart
-	prefix, suffix := compactSharedAffixes(values)
+	prefix, suffix := 0, 0
+	if len(values) >= 2 {
+		prefix, suffix = compactSharedAffixes(spellings)
+	}
 	var present [256]bool
 	count := 0
 	for _, value := range spellings {
@@ -481,10 +539,13 @@ func (s *compactStreamScratch) measureAlphabetWithSpellings(
 			if !present[b] {
 				present[b] = true
 				count++
+				if count > 64 {
+					return compactAlphabetPlan{}, false
+				}
 			}
 		}
 	}
-	if count == 0 || count > 64 {
+	if count == 0 {
 		return compactAlphabetPlan{}, false
 	}
 	width := bits.Len(uint(count - 1))
@@ -533,19 +594,27 @@ func compactSharedAffixes(values [][]byte) (prefix, suffix int) {
 	if len(values) < 2 {
 		return 0, 0
 	}
-	prefix = len(values[0])
+	first := values[0]
+	prefix = len(first)
 	for _, value := range values[1:] {
-		prefix = min(prefix, compactCommonPrefix(values[0], value))
+		if prefix == 0 {
+			break
+		}
+		limit := min(prefix, len(value))
+		prefix = compactCommonPrefix(first[:limit], value[:limit])
 	}
-	suffix = len(values[0]) - prefix
+	suffix = len(first) - prefix
 	for _, value := range values[1:] {
-		limit := min(len(values[0])-prefix, len(value)-prefix)
+		if suffix == 0 {
+			break
+		}
+		limit := min(suffix, len(value)-prefix)
 		shared := 0
 		for shared < limit &&
-			values[0][len(values[0])-1-shared] == value[len(value)-1-shared] {
+			first[len(first)-1-shared] == value[len(value)-1-shared] {
 			shared++
 		}
-		suffix = min(suffix, shared)
+		suffix = shared
 	}
 	return prefix, suffix
 }
@@ -581,8 +650,10 @@ func (s *compactStreamScratch) finishAlphabet(
 		lengthWidth := bits.Len(uint(hi - lo))
 		data = appendCompactUvarint(data, uint64(lo))
 		data = append(data, byte(lengthWidth))
+		lengthBytes := ((last-first)*lengthWidth + 7) / 8
 		lengthStart := len(data)
-		data = append(data, make([]byte, ((last-first)*lengthWidth+7)/8)...)
+		data = data[:lengthStart+lengthBytes]
+		clear(data[lengthStart:])
 		for row, value := range values[first:last] {
 			middle := len(value) - plan.prefix - plan.suffix
 			compactPutBits(
@@ -592,27 +663,112 @@ func (s *compactStreamScratch) finishAlphabet(
 		}
 		start := len(data)
 		packedBytes := (characters*width + 7) / 8
-		data = append(data, make([]byte, packedBytes)...)
+		data = data[:start+packedBytes]
 		if width != 0 {
 			// The reservoir is LSB-first and spans adjacent rows. Localizing it
 			// here resets packing only at the restart boundary above.
+			dst := data[start : start+packedBytes]
 			var reservoir uint64
 			bufferedBits, packedAt := 0, 0
-			for _, value := range values[first:last] {
-				middle := value[plan.prefix : len(value)-plan.suffix]
-				for _, b := range middle {
-					reservoir |= uint64(code[b]) << uint(bufferedBits)
-					bufferedBits += width
-					if bufferedBits >= 8 {
-						data[start+packedAt] = byte(reservoir)
+			if width == 6 {
+				for _, value := range values[first:last] {
+					middle := value[plan.prefix : len(value)-plan.suffix]
+					i := 0
+					for i+8 <= len(middle) && packedAt+8 <= len(dst) {
+						if bufferedBits >= 16 {
+							binary.LittleEndian.PutUint64(dst[packedAt:], reservoir)
+							flushBytes := bufferedBits >> 3
+							packedAt += flushBytes
+							reservoir >>= uint(flushBytes << 3)
+							bufferedBits &= 7
+							if packedAt+8 > len(dst) {
+								break
+							}
+						}
+						chunk := uint64(code[middle[i]]) |
+							uint64(code[middle[i+1]])<<6 |
+							uint64(code[middle[i+2]])<<12 |
+							uint64(code[middle[i+3]])<<18 |
+							uint64(code[middle[i+4]])<<24 |
+							uint64(code[middle[i+5]])<<30 |
+							uint64(code[middle[i+6]])<<36 |
+							uint64(code[middle[i+7]])<<42
+						reservoir |= chunk << uint(bufferedBits)
+						bufferedBits += 48
+						i += 8
+					}
+					for bufferedBits >= 8 {
+						dst[packedAt] = byte(reservoir)
 						packedAt++
 						reservoir >>= 8
 						bufferedBits -= 8
 					}
+					for ; i < len(middle); i++ {
+						reservoir |= uint64(code[middle[i]]) << uint(bufferedBits)
+						bufferedBits += 6
+						if bufferedBits >= 8 {
+							dst[packedAt] = byte(reservoir)
+							packedAt++
+							reservoir >>= 8
+							bufferedBits -= 8
+						}
+					}
+				}
+			} else {
+				w := uint(width)
+				step := 8 * width
+				for _, value := range values[first:last] {
+					middle := value[plan.prefix : len(value)-plan.suffix]
+					i := 0
+					for i+8 <= len(middle) && packedAt+8 <= len(dst) {
+						if bufferedBits >= 16 {
+							binary.LittleEndian.PutUint64(dst[packedAt:], reservoir)
+							flushBytes := bufferedBits >> 3
+							packedAt += flushBytes
+							reservoir >>= uint(flushBytes << 3)
+							bufferedBits &= 7
+							if packedAt+8 > len(dst) {
+								break
+							}
+						}
+						chunk := uint64(code[middle[i]]) |
+							uint64(code[middle[i+1]])<<w |
+							uint64(code[middle[i+2]])<<(2*w) |
+							uint64(code[middle[i+3]])<<(3*w) |
+							uint64(code[middle[i+4]])<<(4*w) |
+							uint64(code[middle[i+5]])<<(5*w) |
+							uint64(code[middle[i+6]])<<(6*w) |
+							uint64(code[middle[i+7]])<<(7*w)
+						reservoir |= chunk << uint(bufferedBits)
+						bufferedBits += step
+						i += 8
+					}
+					for bufferedBits >= 8 {
+						dst[packedAt] = byte(reservoir)
+						packedAt++
+						reservoir >>= 8
+						bufferedBits -= 8
+					}
+					for ; i < len(middle); i++ {
+						reservoir |= uint64(code[middle[i]]) << uint(bufferedBits)
+						bufferedBits += width
+						if bufferedBits >= 8 {
+							dst[packedAt] = byte(reservoir)
+							packedAt++
+							reservoir >>= 8
+							bufferedBits -= 8
+						}
+					}
 				}
 			}
+			for bufferedBits >= 8 {
+				dst[packedAt] = byte(reservoir)
+				packedAt++
+				reservoir >>= 8
+				bufferedBits -= 8
+			}
 			if bufferedBits != 0 {
-				data[start+packedAt] = byte(reservoir)
+				dst[packedAt] = byte(reservoir)
 				packedAt++
 			}
 			if packedAt != packedBytes {
@@ -923,6 +1079,36 @@ func (s *compactStreamScratch) encodePrefixIntShape(slot int, values [][]byte, r
 	return s.encodePrefixIntShapeWithRankContext(slot, values, ranks, leafRows, nil, nil)
 }
 
+func parseCompactPrefixIntDigits(digits []byte) (value uint64, canonical, ok bool) {
+	width := len(digits)
+	if width == 0 {
+		return 0, false, false
+	}
+	if width <= 18 {
+		for _, ch := range digits {
+			if ch < '0' || ch > '9' {
+				return 0, false, false
+			}
+			value = value*10 + uint64(ch-'0')
+		}
+	} else {
+		const maxInt64Prefix = uint64(1<<63-1) / 10
+		const maxInt64Remainder = uint64(1<<63-1) % 10
+		for _, ch := range digits {
+			if ch < '0' || ch > '9' {
+				return 0, false, false
+			}
+			n := uint64(ch - '0')
+			if value >= maxInt64Prefix &&
+				(value != maxInt64Prefix || n > maxInt64Remainder) {
+				return 0, false, false
+			}
+			value = value*10 + n
+		}
+	}
+	return value, width == 1 || digits[0] != '0', true
+}
+
 func (s *compactStreamScratch) encodePrefixIntShapeWithRankContext(
 	slot int,
 	values [][]byte,
@@ -939,15 +1125,23 @@ func (s *compactStreamScratch) encodePrefixIntShapeWithRankContext(
 	parsed := s.parsed
 	parsed[0] = first.value
 	allCanonical, fixedWidth := first.canonical, true
+	prefixLen, suffixLen := len(first.prefix), len(first.suffix)
+	minLen := prefixLen + suffixLen
 	for row := 1; row < len(values); row++ {
-		value, ok := parseCompactPrefixInt(values[row])
-		if !ok || !bytes.Equal(value.prefix, first.prefix) ||
-			!bytes.Equal(value.suffix, first.suffix) {
+		raw := values[row]
+		if len(raw) <= minLen ||
+			!bytes.Equal(raw[:prefixLen], first.prefix) ||
+			!bytes.Equal(raw[len(raw)-suffixLen:], first.suffix) {
 			return compactStreamEncoding{}, false
 		}
-		parsed[row] = value.value
-		allCanonical = allCanonical && value.canonical
-		fixedWidth = fixedWidth && value.width == first.width
+		digits := raw[prefixLen : len(raw)-suffixLen]
+		val, canonical, ok := parseCompactPrefixIntDigits(digits)
+		if !ok {
+			return compactStreamEncoding{}, false
+		}
+		parsed[row] = val
+		allCanonical = allCanonical && canonical
+		fixedWidth = fixedWidth && len(digits) == first.width
 	}
 	if !allCanonical && !fixedWidth {
 		return compactStreamEncoding{}, false

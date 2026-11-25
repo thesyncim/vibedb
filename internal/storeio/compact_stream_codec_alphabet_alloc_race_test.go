@@ -29,8 +29,8 @@ func TestCompactAlphabetRaceAllocationReferenceControl(t *testing.T) {
 		})
 		t.Logf("race allocation control cardinality=%d width=%d: reservoir=%v scalar=%v allocs/run",
 			cardinality, plan.width, optimizedAllocs, referenceAllocs)
-		if optimizedAllocs != referenceAllocs || optimizedBytes == 0 || referenceBytes == 0 {
-			t.Fatalf("cardinality=%d race allocations differ: reservoir=%v scalar=%v",
+		if optimizedAllocs != 0 || optimizedAllocs > referenceAllocs || optimizedBytes == 0 || referenceBytes == 0 {
+			t.Fatalf("cardinality=%d race allocations regressed: reservoir=%v scalar=%v",
 				cardinality, optimizedAllocs, referenceAllocs)
 		}
 	}
