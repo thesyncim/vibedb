@@ -147,6 +147,7 @@ func (reader *ReplicatedDataReader) readScatterBatchSnapshot(
 		return ReplicatedTableScatterReadResult{}, generation, ErrNoCatalog
 	}
 	groups := make([]replicatedScatterGroup, 0, min(len(request.Points), 64))
+	replicaBacking := make([]ReplicatedEndpoint, 0, min(len(request.Points), 64)*ServingReplicaCount)
 	requestBytes := uint64(4)
 	// One shared scratch pair serves every point: only a new group's route
 	// retains storage, via a private replica backing. Per-table prep and the
@@ -216,8 +217,15 @@ func (reader *ReplicatedDataReader) readScatterBatchSnapshot(
 				resolved = full
 				replicas = resolved.Route.Replicas
 			}
-			retained := make([]ReplicatedEndpoint, len(replicas))
-			copy(retained, replicas)
+			var retained []ReplicatedEndpoint
+			if len(replicaBacking)+len(replicas) <= cap(replicaBacking) {
+				start := len(replicaBacking)
+				replicaBacking = append(replicaBacking, replicas...)
+				retained = replicaBacking[start:len(replicaBacking):len(replicaBacking)]
+			} else {
+				retained = make([]ReplicatedEndpoint, len(replicas))
+				copy(retained, replicas)
+			}
 			route := resolved.Route
 			route.Replicas = retained
 			groupIndex = len(groups)
@@ -296,60 +304,92 @@ func (reader *ReplicatedDataReader) readScatterBatchSnapshot(
 		}
 	}()
 
-	scatterCtx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	var next atomic.Uint64
-	var retainedMu sync.Mutex
 	retainedPayload := uint64(0)
-	var workers sync.WaitGroup
-	workers.Add(workerCount)
-	for range workerCount {
-		go func() {
-			defer workers.Done()
-			for {
-				groupIndex := int(next.Add(1) - 1)
-				if groupIndex >= len(groups) {
-					return
-				}
-				group := &groups[groupIndex]
-				select {
-				case reader.scatterSlots <- struct{}{}:
-				case <-scatterCtx.Done():
-					group.err = context.Cause(scatterCtx)
-					continue
-				}
-				reader.observeReplicatedPressure(group.source, group.pressurePoints)
-				result, readErr := reader.executor.ReadPointBatch(
-					scatterCtx, group.route, ReplicatedBatchRead{
-						Points: group.points, MinimumApplied: 1,
-						MaxResultBytes: request.MaxResultBytes,
-					},
-				)
-				<-reader.scatterSlots
-				if readErr == nil {
-					payloadBytes := uint64(len(result.Packed)) - group.fixed
-					retainedMu.Lock()
-					if payloadBytes > payloadBound-retainedPayload {
-						readErr = ErrReplicatedReadAdmission
-					} else {
-						retainedPayload += payloadBytes
-						group.result = result
+	if len(groups) == 1 {
+		group := &groups[0]
+		select {
+		case reader.scatterSlots <- struct{}{}:
+		case <-ctx.Done():
+			return ReplicatedTableScatterReadResult{}, generation, context.Cause(ctx)
+		}
+		reader.observeReplicatedPressure(group.source, group.pressurePoints)
+		result, readErr := reader.executor.ReadPointBatch(
+			ctx, group.route, ReplicatedBatchRead{
+				Points: group.points, MinimumApplied: 1,
+				MaxResultBytes: request.MaxResultBytes,
+			},
+		)
+		<-reader.scatterSlots
+		if readErr != nil {
+			return ReplicatedTableScatterReadResult{}, generation, readErr
+		}
+		payloadBytes := uint64(len(result.Packed)) - group.fixed
+		if payloadBytes > payloadBound {
+			return ReplicatedTableScatterReadResult{}, generation, ErrReplicatedReadAdmission
+		}
+		retainedPayload = payloadBytes
+		group.result = result
+	} else {
+		scatterCtx, cancel := context.WithCancelCause(ctx)
+		defer cancel(nil)
+		var next atomic.Uint64
+		var retainedMu sync.Mutex
+		var workers sync.WaitGroup
+		workers.Add(workerCount)
+		for range workerCount {
+			go func() {
+				defer workers.Done()
+				for {
+					groupIndex := int(next.Add(1) - 1)
+					if groupIndex >= len(groups) {
+						return
 					}
-					retainedMu.Unlock()
+					group := &groups[groupIndex]
+					select {
+					case reader.scatterSlots <- struct{}{}:
+					case <-scatterCtx.Done():
+						group.err = context.Cause(scatterCtx)
+						continue
+					}
+					reader.observeReplicatedPressure(group.source, group.pressurePoints)
+					result, readErr := reader.executor.ReadPointBatch(
+						scatterCtx, group.route, ReplicatedBatchRead{
+							Points: group.points, MinimumApplied: 1,
+							MaxResultBytes: request.MaxResultBytes,
+						},
+					)
+					<-reader.scatterSlots
+					if readErr == nil {
+						payloadBytes := uint64(len(result.Packed)) - group.fixed
+						retainedMu.Lock()
+						if payloadBytes > payloadBound-retainedPayload {
+							readErr = ErrReplicatedReadAdmission
+						} else {
+							retainedPayload += payloadBytes
+							group.result = result
+						}
+						retainedMu.Unlock()
+					}
+					if readErr != nil {
+						group.err = readErr
+						cancel(readErr)
+					}
 				}
-				if readErr != nil {
-					group.err = readErr
-					cancel(readErr)
-				}
-			}
-		}()
-	}
-	workers.Wait()
-	if err := firstReplicatedScatterError(groups, ctx); err != nil {
-		return ReplicatedTableScatterReadResult{}, generation, err
+			}()
+		}
+		workers.Wait()
+		if err := firstReplicatedScatterError(groups, ctx); err != nil {
+			return ReplicatedTableScatterReadResult{}, generation, err
+		}
 	}
 
-	values := make([]replicatedScatterValue, len(request.Points))
+	var inlineValues [16]replicatedScatterValue
+	var values []replicatedScatterValue
+	if len(request.Points) <= len(inlineValues) {
+		values = inlineValues[:len(request.Points)]
+	} else {
+		values = make([]replicatedScatterValue, len(request.Points))
+	}
 	observations := make([]ReplicatedGroupReadObservation, len(groups))
 	for groupIndex := range groups {
 		group := &groups[groupIndex]
