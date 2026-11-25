@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync/atomic"
 	"syscall"
 )
 
@@ -193,10 +192,6 @@ type TxnMarker struct {
 	// paired with a collection through a retargeted path.
 	sourceDir     string
 	sourceDirInfo os.FileInfo
-	// verifiedDir caches one non-canonical directory spelling (e.g. /var vs
-	// /private/var on macOS) already proven to resolve to sourceDirInfo so
-	// MatchesFileDirectory can reuse the pinned root without reopening it.
-	verifiedDir atomic.Pointer[string]
 	header        TxnMarkerHeader
 	// cursor is the in-region byte offset of the next append.
 	cursor uint64
@@ -1411,34 +1406,27 @@ func (m *TxnMarker) MatchesFileDirectory(file *os.File) (bool, error) {
 	}
 	if m.root != nil {
 		fileName := file.Name()
-		fileDir := filepath.Dir(fileName)
-		cachedDir := ""
-		if p := m.verifiedDir.Load(); p != nil {
-			cachedDir = *p
+		dirInfo, err := os.Stat(filepath.Dir(fileName))
+		if err != nil {
+			return false, err
 		}
-		if fileDir == m.sourceDir ||
-			(cachedDir != "" && fileDir == cachedDir) ||
-			(m.path != "" && fileDir == filepath.Dir(m.path)) {
-			entryInfo, err := m.root.Lstat(filepath.Base(fileName))
-			if err == nil && entryInfo.Mode().IsRegular() {
-				fileInfo, statErr := file.Stat()
-				if statErr != nil {
-					return false, statErr
-				}
-				if os.SameFile(fileInfo, entryInfo) {
-					return true, nil
-				}
-			}
+		if !os.SameFile(m.sourceDirInfo, dirInfo) {
+			return false, nil
 		}
+		entryInfo, err := m.root.Lstat(filepath.Base(fileName))
+		if err != nil {
+			return false, err
+		}
+		if !entryInfo.Mode().IsRegular() {
+			return false, nil
+		}
+		fileInfo, err := file.Stat()
+		if err != nil {
+			return false, err
+		}
+		return os.SameFile(fileInfo, entryInfo), nil
 	}
-	matched, err := matchesTxnMarkerDirectory(m.sourceDirInfo, file)
-	if err == nil && matched && m.root != nil {
-		fileDir := filepath.Dir(file.Name())
-		if fileDir != m.sourceDir {
-			m.verifiedDir.Store(&fileDir)
-		}
-	}
-	return matched, err
+	return matchesTxnMarkerDirectory(m.sourceDirInfo, file)
 }
 
 // SameFile reports whether other is another live handle to this exact marker
