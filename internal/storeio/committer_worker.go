@@ -109,28 +109,64 @@ func (c *Committer) run(file *os.File, initialized chan<- committerInit, open de
 		}
 		c.groupScratch = c.groupScratch[:1]
 		c.groupScratch[0] = batch
-		c.commitScratch = c.commitScratch[:len(batch.pages)]
-		copy(c.commitScratch, batch.pages)
 		latest := batch
-		groupLimit := c.options.GroupLimit
 		if c.options.ManualCheckpoint {
-			groupLimit = cap(c.groupScratch)
-		}
-		for len(c.groupScratch) < groupLimit {
-			next, exists := c.peekBatch()
-			if !exists || next.materialized ||
-				(c.options.ManualCheckpoint && next.generation > checkpointTarget) ||
-				len(c.commitScratch)+len(next.pages) > cap(c.commitScratch) {
-				break
+			// Manual buffered publication coalesces older roots and superseded
+			// pages into the authorized checkpoint cut. Never split that cut
+			// across device commits: an intermediate batch's root buffer has
+			// already been returned to freeBuffers and its superseded pages
+			// have been dropped. Filter superseded descriptors inline and grow
+			// scratch if live pages in the cut exceed the initial buffer count.
+			c.commitScratch = c.commitScratch[:0]
+			for _, write := range batch.pages {
+				if write.pendingFlags&pendingWriteSuperseded == 0 {
+					c.commitScratch = append(c.commitScratch, write)
+				}
 			}
-			next, _ = c.nextBatch(false)
-			groupIndex := len(c.groupScratch)
-			c.groupScratch = c.groupScratch[:groupIndex+1]
-			c.groupScratch[groupIndex] = next
-			writeIndex := len(c.commitScratch)
-			c.commitScratch = c.commitScratch[:writeIndex+len(next.pages)]
-			copy(c.commitScratch[writeIndex:], next.pages)
-			latest = next
+			for {
+				next, exists := c.peekBatch()
+				if !exists || next.materialized || next.generation > checkpointTarget {
+					break
+				}
+				next, _ = c.nextBatch(false)
+				c.groupScratch = append(c.groupScratch, next)
+				for _, write := range next.pages {
+					if write.pendingFlags&pendingWriteSuperseded == 0 {
+						c.commitScratch = append(c.commitScratch, write)
+					}
+				}
+				latest = next
+			}
+		} else {
+			c.commitScratch = c.commitScratch[:len(batch.pages)]
+			copy(c.commitScratch, batch.pages)
+			groupLimit := c.options.GroupLimit
+			for len(c.groupScratch) < groupLimit {
+				next, exists := c.peekBatch()
+				if !exists || next.materialized ||
+					len(c.commitScratch)+len(next.pages) > cap(c.commitScratch) {
+					break
+				}
+				next, _ = c.nextBatch(false)
+				groupIndex := len(c.groupScratch)
+				c.groupScratch = c.groupScratch[:groupIndex+1]
+				c.groupScratch[groupIndex] = next
+				writeIndex := len(c.commitScratch)
+				c.commitScratch = c.commitScratch[:writeIndex+len(next.pages)]
+				copy(c.commitScratch[writeIndex:], next.pages)
+				latest = next
+			}
+		}
+		if latest.root.pendingFlags&pendingWriteSuperseded != 0 {
+			c.setFailure(fmt.Errorf(
+				"%w: cannot publish superseded root generation %d",
+				ErrInvalidWrite, latest.generation,
+			))
+			for _, grouped := range c.groupScratch {
+				c.release(grouped)
+			}
+			c.drainFailed()
+			return
 		}
 		// Manual buffered publication may have released checkpoint ownership
 		// for exact frame writes a later accepted generation proved unreachable.

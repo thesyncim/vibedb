@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"runtime"
 
 	"golang.org/x/sys/unix"
 )
@@ -62,8 +63,10 @@ func writeDataPages(
 			total += len(data)
 		}
 		if err := pwritevFull(int(file.Fd()), vectors[:count], pages[index].Offset, total); err != nil {
+			runtime.KeepAlive(file)
 			return err
 		}
+		runtime.KeepAlive(file)
 		clear(vectors[:count])
 		index += count
 	}

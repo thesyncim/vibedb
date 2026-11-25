@@ -3,7 +3,9 @@
 package storeio
 
 import (
+	"errors"
 	"os"
+	"runtime"
 
 	"golang.org/x/sys/unix"
 )
@@ -16,11 +18,18 @@ func dataSync(file *os.File) error { return file.Sync() }
 // filesystemSync implements the ordinary filesystem-strength checkpoint
 // boundary. CheckpointSyncFilesystem preallocates and writes existing page
 // extents, so fdatasync provides the required data ordering without forcing
-// unrelated inode metadata. Do not retry an error: Linux may discard the
-// dirty pages associated with a failed sync, and the committer must fail
-// closed instead.
+// unrelated inode metadata. Retry only EINTR: I/O errors may discard dirty
+// pages on Linux, so any other error must fail closed immediately.
 func filesystemSync(file *os.File) error {
-	return unix.Fdatasync(int(file.Fd()))
+	defer runtime.KeepAlive(file)
+	fd := int(file.Fd())
+	const maxEINTRRetries = 8
+	for retries := 0; ; retries++ {
+		err := unix.Fdatasync(fd)
+		if !errors.Is(err, unix.EINTR) || retries == maxEINTRRetries {
+			return err
+		}
+	}
 }
 
 func dataBarrier(file *os.File) error { return dataSync(file) }

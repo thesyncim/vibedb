@@ -5,9 +5,12 @@ package storeio
 import (
 	"errors"
 	"os"
+	"runtime"
 
 	"golang.org/x/sys/unix"
 )
+
+const darwinSyncMaxEINTRRetries = 8
 
 // dataSync is the acknowledgement boundary on Darwin. fsync only transfers
 // bytes from the host to the drive cache and explicitly does not guarantee
@@ -15,18 +18,25 @@ import (
 // that volatile cache. A durability mode must not silently weaken merely
 // because the stronger operation costs more.
 func dataSync(file *os.File) error {
-	_, err := unix.FcntlInt(file.Fd(), unix.F_FULLFSYNC, 0)
-	return err
+	defer runtime.KeepAlive(file)
+	fd := file.Fd()
+	for retries := 0; ; retries++ {
+		_, err := unix.FcntlInt(fd, unix.F_FULLFSYNC, 0)
+		if !errors.Is(err, unix.EINTR) || retries == darwinSyncMaxEINTRRetries {
+			return err
+		}
+	}
 }
 
 // filesystemSync implements the ordinary filesystem-strength checkpoint
 // boundary. os.File.Sync uses F_FULLFSYNC on Darwin, but ordinary mode must not
 // pay for that power-safe device-cache drain.
 func filesystemSync(file *os.File) error {
-	const maxEINTRRetries = 8
+	defer runtime.KeepAlive(file)
+	fd := int(file.Fd())
 	for retries := 0; ; retries++ {
-		err := unix.Fsync(int(file.Fd()))
-		if !errors.Is(err, unix.EINTR) || retries == maxEINTRRetries {
+		err := unix.Fsync(fd)
+		if !errors.Is(err, unix.EINTR) || retries == darwinSyncMaxEINTRRetries {
 			return err
 		}
 	}
@@ -41,7 +51,15 @@ func filesystemSync(file *os.File) error {
 // HFS and APFS implement the command. Preserve portable behavior on other
 // filesystems that reject it, but propagate descriptor and I/O failures.
 func dataBarrier(file *os.File) error {
-	_, err := unix.FcntlInt(file.Fd(), unix.F_BARRIERFSYNC, 0)
+	defer runtime.KeepAlive(file)
+	fd := file.Fd()
+	var err error
+	for retries := 0; ; retries++ {
+		_, err = unix.FcntlInt(fd, unix.F_BARRIERFSYNC, 0)
+		if !errors.Is(err, unix.EINTR) || retries == darwinSyncMaxEINTRRetries {
+			break
+		}
+	}
 	if err == nil {
 		return nil
 	}

@@ -574,8 +574,11 @@ func (e *Engine) MaintenanceRetryNeeded() bool {
 	if e.log == nil || e.log.metadata == nil {
 		return false
 	}
+	if e.maintenanceBusy {
+		return true
+	}
 	slot := e.log.metadata.slot
-	return e.maintenanceBusy || slot.HasPending || slot.ReclaimPhase != reclaimNone || slot.RetiredCheckpointCount != 0
+	return slot.HasPending || slot.ReclaimPhase != reclaimNone || slot.RetiredCheckpointCount != 0
 }
 
 // ReserveReaders fixes the maximum number of retained sealed descriptors.

@@ -82,6 +82,9 @@ func (n *Node) validatePipelinedMessage(message *pb.Message) error {
 		if message.Term == nil != (message.Vote == nil) || message.Term == nil != (message.Commit == nil) {
 			return errors.New("raftmodel: partial local append HardState")
 		}
+		if !raft.IsEmptySnap(message.GetSnapshot()) {
+			return &UnsupportedError{Feature: "in-band Ready snapshots in the immutable-base WAL kernel"}
+		}
 		if message.GetTerm() == math.MaxUint64 || message.GetCommit() == math.MaxUint64 ||
 			len(message.GetEntries()) > MaxMessageEntries ||
 			len(message.GetResponses()) > MaxPipelinedReadyMessages {

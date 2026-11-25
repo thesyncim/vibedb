@@ -261,14 +261,21 @@ func (e *Engine) beginReclaim() (*reclaimTicket, error) {
 	for i := range removed {
 		cutA.Retired[i] = retiredDescriptor{ID: removed[i].ID, Generation: removed[i].Generation, FileID: removed[i].FileID, Bytes: removed[i].Bytes, PreviousHash: removed[i].PreviousHash, Hash: removed[i].Hash}
 	}
-	if err = e.log.metadata.publish(cutA, &record); err != nil {
+	e.writeMu.Lock()
+	err = e.log.metadata.publish(cutA, &record)
+	if err == nil {
+		cutA = e.log.metadata.slot
+	} else {
+		e.log.poison(err)
+	}
+	e.writeMu.Unlock()
+	if err != nil {
 		cleanupUnpublishedCheckpoint(e.log.dir, checkpointA, checkpointAHash, e.authKey)
 		return nil, fmt.Errorf("reclaim cut A: %w", err)
 	}
 	if err = runReclaimHook(reclaimPreparedPublished); err != nil {
 		return nil, err
 	}
-	cutA = e.log.metadata.slot
 	checkpointBID := derivedCheckpointID(e.authKey, baseSlot.LogID, cutA.Generation+1, tail, catalogHash, anchor.ID, anchor.Generation, anchor.Hash, checkpointRoleReclaimB)
 	checkpointB := checkpointA
 	checkpointB.ID, checkpointB.Generation = checkpointBID, cutA.Generation+1
@@ -288,7 +295,13 @@ func (e *Engine) beginReclaim() (*reclaimTicket, error) {
 		cleanupUnpublishedCheckpoint(e.log.dir, checkpointB, checkpointBHash, e.authKey)
 		return nil, fmt.Errorf("reclaim cut B slot: %w", validateErr)
 	}
-	if err = e.log.metadata.publish(cutB, nil); err != nil {
+	e.writeMu.Lock()
+	err = e.log.metadata.publish(cutB, nil)
+	if err != nil {
+		e.log.poison(err)
+	}
+	e.writeMu.Unlock()
+	if err != nil {
 		cleanupUnpublishedCheckpoint(e.log.dir, checkpointB, checkpointBHash, e.authKey)
 		return nil, fmt.Errorf("reclaim cut B: %w", err)
 	}
