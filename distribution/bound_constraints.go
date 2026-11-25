@@ -104,12 +104,18 @@ func (b *ConstraintBuilder) AddEquality(v Scalar) error {
 // a *ShardValueError for any value that is not an encodable placement scalar.
 func (b *ConstraintBuilder) AddMembership(values []Scalar) error {
 	b.incoming.reset()
-	for i := range values {
-		if err := b.incoming.add(b.codec, values[i]); err != nil {
-			return err
+	if len(values) != 0 {
+		b.incoming.items = slices.Grow(b.incoming.items[:0], len(values))[:0]
+		if cap(b.incoming.arena) == 0 {
+			b.incoming.arena = make([]byte, 0, len(values)*16)
 		}
+		for i := range values {
+			if err := b.incoming.add(b.codec, values[i]); err != nil {
+				return err
+			}
+		}
+		b.incoming.sortDedup()
 	}
-	b.incoming.sortDedup()
 	b.mergePredicate()
 	return nil
 }
@@ -127,7 +133,7 @@ func (b *ConstraintBuilder) mergePredicate() {
 		return
 	}
 	if !b.haveFinite {
-		b.running.copyFrom(&b.incoming)
+		b.running, b.incoming = b.incoming, b.running
 		b.haveFinite = true
 	} else {
 		b.running.intersect(&b.incoming)
@@ -215,13 +221,6 @@ func (s *canonSet) sortDedup() {
 		}
 	}
 	s.items = s.items[:w]
-}
-
-// copyFrom replaces s with a byte-identical copy of other, reusing s's buffers.
-// Because the arena is copied verbatim, other's offsets stay valid against s.
-func (s *canonSet) copyFrom(other *canonSet) {
-	s.arena = append(s.arena[:0], other.arena...)
-	s.items = append(s.items[:0], other.items...)
 }
 
 // intersect keeps only the items whose canonical bytes also appear in other.
