@@ -1939,3 +1939,77 @@ func TestPreparedLocationReadZeroAlloc(t *testing.T) {
 		t.Fatalf("prepared ReadLocation allocations=%v want=0", allocs)
 	}
 }
+
+func TestFinishFrozenSealPreservesGrownSpareBuildCapacity(t *testing.T) {
+	e, err := CreateEngineAuthenticated(t.TempDir(), testLogID, [32]byte{1, 2, 3}, 4<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err := e.Reserve(4096, 64, 16); err != nil {
+		t.Fatal(err)
+	}
+	for gid := uint64(1); gid <= 7; gid++ {
+		if err := e.ReserveGroup(gid, 16); err != nil {
+			t.Fatalf("ReserveGroup(%d): %v", gid, err)
+		}
+	}
+	batches := make([]ReadyBatch, 7)
+	for i := range batches {
+		batches[i] = ReadyBatch{
+			GroupID: uint64(i + 1),
+			Entries: []Entry{{Index: 1, Term: 1, Data: []byte("before-rotate")}},
+		}
+	}
+	if err := e.PersistWave(Wave{ID: waveID(1), Batches: batches}); err != nil {
+		t.Fatalf("initial PersistWave: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	e.sealBuildHookTest = func() {
+		close(entered)
+		<-release
+	}
+	if err := e.Rotate(nil); err != nil {
+		t.Fatalf("first Rotate: %v", err)
+	}
+	<-entered
+
+	// Grow beyond the initial 8-slot build arena while the async seal of the
+	// 8-slot arena is still in flight.
+	for gid := uint64(8); gid <= 9; gid++ {
+		if err := e.ReserveGroup(gid, 16); err != nil {
+			close(release)
+			t.Fatalf("ReserveGroup(%d) during seal: %v", gid, err)
+		}
+	}
+	close(release)
+	if err := e.WaitSeal(); err != nil {
+		t.Fatalf("WaitSeal: %v", err)
+	}
+	e.sealBuildHookTest = nil
+
+	// Rotate again so the spareBuild from finishFrozenSeal becomes activeBuild.
+	if err := e.Rotate(nil); err != nil {
+		t.Fatalf("second Rotate: %v", err)
+	}
+	if err := e.WaitSeal(); err != nil {
+		t.Fatalf("second WaitSeal: %v", err)
+	}
+
+	allNine := make([]ReadyBatch, 9)
+	for i := range allNine {
+		idx := uint64(2)
+		if i >= 7 {
+			idx = 1
+		}
+		allNine[i] = ReadyBatch{
+			GroupID: uint64(i + 1),
+			Entries: []Entry{{Index: idx, Term: 1, Data: []byte("after-grow")}},
+		}
+	}
+	if err := e.PersistWave(Wave{ID: waveID(2), Batches: allNine}); err != nil {
+		t.Fatalf("PersistWave across 9 groups after seal completion: %v", err)
+	}
+}

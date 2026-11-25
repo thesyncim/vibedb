@@ -2629,7 +2629,14 @@ func (e *Engine) finishFrozenSeal(base metadataState, pending SegmentMeta, event
 	}
 	e.log.eventSpare = events[:0]
 	build.clear()
-	e.spareBuild = build
+	if e.spareBuild == nil || cap(e.spareBuild.groups) < cap(build.groups) {
+		e.spareBuild = build
+	}
+	if needed := min(len(e.groups), cap(e.log.events)); cap(e.spareBuild.groups) < needed {
+		e.spareBuild = &segmentBuildArena{
+			groups: make([]segmentGroupBuild, 0, entryArenaCapacity(needed, cap(e.log.events))),
+		}
+	}
 	return nil
 }
 
