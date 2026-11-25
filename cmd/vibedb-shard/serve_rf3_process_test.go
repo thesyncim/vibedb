@@ -647,18 +647,20 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rf4Addresses := append(append([]string(nil), servingAddresses...), target.NativeAddress)
+	rf4Nodes := append(append([]rafttransport.NodeID(nil), servingNodes...), targetNode)
 	leader, leaderState := rf3CommandFindLeaderWithProbeCommand(
-		t, servingAddresses, servingNodes, clientProfile, authorityIdentity.Node, group,
+		t, rf4Addresses, rf4Nodes, clientProfile, authorityIdentity.Node, group,
 		rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
 		promotedState.Fence.Command,
 	)
-	rf3CommandExecuteAction(t, actionClient, servingNodes[leader], replicaaction.Request{
+	rf3CommandExecuteAction(t, actionClient, rf4Nodes[leader], replicaaction.Request{
 		Operation: [32]byte{0x63}, Step: [32]byte{0x64}, Kind: replicaaction.OwnershipTransition,
 		Fence: rf3CommandServingFence(leaderState.Fence), SourceMember: 1, TargetMember: 4,
 		Command: ownership,
 	})
 	_, leaderState = rf3CommandFindLeaderWithProbeCommand(
-		t, servingAddresses, servingNodes, clientProfile, authorityIdentity.Node, group,
+		t, rf4Addresses, rf4Nodes, clientProfile, authorityIdentity.Node, group,
 		rf3CommandStoreIdentity(1).AllocationGeneration, authorityIdentity.Generation,
 		leaderState.Fence.Command,
 	)
@@ -1084,6 +1086,8 @@ func rf3CommandFindLeaderWithProbeCommand(
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	var lastState shardservice.ReplicatedMemberState
+	var lastErr error
 	for ctx.Err() == nil {
 		for index := range addresses {
 			var state shardservice.ReplicatedMemberState
@@ -1095,10 +1099,11 @@ func rf3CommandFindLeaderWithProbeCommand(
 			if err == nil && state.Fence.MemberID == state.LeaderID && state.Fence.Term != 0 {
 				return index, state
 			}
+			lastState, lastErr = state, err
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("RF3 leader unavailable: %v", ctx.Err())
+	t.Fatalf("RF3 leader unavailable: %v (lastState=%+v lastErr=%v)", ctx.Err(), lastState, lastErr)
 	return 0, shardservice.ReplicatedMemberState{}
 }
 
