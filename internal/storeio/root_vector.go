@@ -420,9 +420,15 @@ func rootVectorIdentityCommitment(members []RootVectorMember) [sha256.Size]byte 
 	return result
 }
 
+var (
+	rootVectorRootsDomain  = []byte("vibedb/exact-root-vector/roots/v1\x00")
+	rootVectorBankDomain   = []byte("vibedb/exact-root-vector/bank/v1\x00")
+	rootVectorChecksumZero [RootVectorBankChecksum]byte
+)
+
 func rootVectorRootsCommitment(vector RootVector) [sha256.Size]byte {
 	h := sha256.New()
-	_, _ = h.Write([]byte("vibedb/exact-root-vector/roots/v1\x00"))
+	_, _ = h.Write(rootVectorRootsDomain)
 	var scalar [8]byte
 	binary.LittleEndian.PutUint64(scalar[:], vector.Sequence)
 	_, _ = h.Write(scalar[:])
@@ -433,11 +439,11 @@ func rootVectorRootsCommitment(vector RootVector) [sha256.Size]byte {
 	_, _ = h.Write(vector.Cut.EntryDigest[:])
 	_, _ = h.Write(vector.Cut.Lineage[:])
 	_, _ = h.Write(vector.Cut.GroupID[:])
+	var image [RootVectorRootBytes]byte
 	for _, member := range vector.Members {
 		_, _ = h.Write(member.NameDigest[:])
 		_, _ = h.Write(member.StoreID[:])
 		_, _ = h.Write(member.JournalID[:])
-		var image [RootVectorRootBytes]byte
 		if _, err := EncodeInlineSuperblock(image[:], member.Root); err != nil {
 			// validateRootVector has already checked the root. A zero image here
 			// makes the commitment deterministic even if a future caller bypasses
@@ -447,19 +453,18 @@ func rootVectorRootsCommitment(vector RootVector) [sha256.Size]byte {
 		_, _ = h.Write(image[:])
 	}
 	var result [sha256.Size]byte
-	copy(result[:], h.Sum(nil))
+	h.Sum(result[:0])
 	return result
 }
 
 func rootVectorChecksum(bank []byte) [sha256.Size]byte {
 	h := sha256.New()
-	_, _ = h.Write([]byte("vibedb/exact-root-vector/bank/v1\x00"))
+	_, _ = h.Write(rootVectorBankDomain)
 	_, _ = h.Write(bank[:rootVectorChecksumOffset])
-	var zero [RootVectorBankChecksum]byte
-	_, _ = h.Write(zero[:])
+	_, _ = h.Write(rootVectorChecksumZero[:])
 	_, _ = h.Write(bank[rootVectorReservedOffset:])
 	var result [sha256.Size]byte
-	copy(result[:], h.Sum(nil))
+	h.Sum(result[:0])
 	return result
 }
 

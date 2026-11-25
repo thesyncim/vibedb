@@ -3088,10 +3088,11 @@ func indexTermLeafEqualitySlots(terms int) int {
 	return slots
 }
 
+var indexTermLeafChecksumZero [4]byte
+
 func indexTermLeafChecksum(encoded []byte) uint32 {
 	checksum := crc32.Update(0, indexTermLeafCRC, encoded[:28])
-	var zero [4]byte
-	checksum = crc32.Update(checksum, indexTermLeafCRC, zero[:])
+	checksum = crc32.Update(checksum, indexTermLeafCRC, indexTermLeafChecksumZero[:])
 	return crc32.Update(checksum, indexTermLeafCRC, encoded[32:])
 }
 
