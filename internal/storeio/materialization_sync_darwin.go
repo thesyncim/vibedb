@@ -5,6 +5,7 @@ package storeio
 import (
 	"errors"
 	"os"
+	"runtime"
 
 	"golang.org/x/sys/unix"
 )
@@ -16,7 +17,15 @@ import (
 // unsupported filesystem falls back to the stronger full flush rather than
 // weakening canonical-overwrite recovery.
 func materializationPhaseBarrier(file *os.File) error {
-	_, err := unix.FcntlInt(file.Fd(), unix.F_BARRIERFSYNC, 0)
+	defer runtime.KeepAlive(file)
+	fd := file.Fd()
+	var err error
+	for retries := 0; ; retries++ {
+		_, err = unix.FcntlInt(fd, unix.F_BARRIERFSYNC, 0)
+		if !errors.Is(err, unix.EINTR) || retries == darwinSyncMaxEINTRRetries {
+			break
+		}
+	}
 	if err == nil {
 		return nil
 	}
@@ -30,6 +39,12 @@ func materializationPhaseBarrier(file *os.File) error {
 // materializationSync is the final commit/recovery durability boundary on
 // Darwin. F_FULLFSYNC drains volatile drive caches before acknowledgement.
 func materializationSync(file *os.File) error {
-	_, err := unix.FcntlInt(file.Fd(), unix.F_FULLFSYNC, 0)
-	return err
+	defer runtime.KeepAlive(file)
+	fd := file.Fd()
+	for retries := 0; ; retries++ {
+		_, err := unix.FcntlInt(fd, unix.F_FULLFSYNC, 0)
+		if !errors.Is(err, unix.EINTR) || retries == darwinSyncMaxEINTRRetries {
+			return err
+		}
+	}
 }

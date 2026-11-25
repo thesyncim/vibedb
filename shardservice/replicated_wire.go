@@ -1609,8 +1609,7 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 			completion.ReplicaSetVersion <= response.State.Fence.Command.ReplicaSetVersion &&
 			completion.ActivePolicyGeneration == response.State.Fence.Command.ActivePolicyGeneration &&
 			completion.ProtectionEpoch == response.State.Fence.Command.ProtectionEpoch &&
-			completion.RoutingVersion == response.State.Fence.Command.RoutingVersion &&
-			completion.RouteGeneration == response.State.Fence.Command.RouteGeneration &&
+			replicatedCompletionRoutingMatches(completion, response.State.Fence.Command) &&
 			response.HasState && response.Refusal == ReplicatedRefusalNone &&
 			response.RequestDigest != ([sha256.Size]byte{}) &&
 			response.Outcome.Code == raftserve.OutcomeCompletion &&
@@ -1720,6 +1719,25 @@ func validReplicatedResponse(response *ReplicatedResponse) bool {
 	default:
 		return false
 	}
+}
+
+// replicatedCompletionRoutingMatches allows exact routing matches for every
+// group, plus retained catalog mutation completions settled after the catalog
+// advances its own RoutingVersion/RouteGeneration during self-placement
+// (matching raftservice.CatalogCommandReplayMatchesFence).
+func replicatedCompletionRoutingMatches(
+	completion replication.CompletionView,
+	command raftservice.CommandFence,
+) bool {
+	if completion.RoutingVersion == command.RoutingVersion &&
+		completion.RouteGeneration == command.RouteGeneration {
+		return true
+	}
+	return bytes.Equal(completion.Distribution, []byte("catalog")) &&
+		bytes.Equal(completion.Shard, []byte("controlplane")) &&
+		completion.ResultFormat == replicatedstate.ResultFormatMutation &&
+		completion.RoutingVersion <= command.RoutingVersion &&
+		completion.RouteGeneration <= command.RouteGeneration
 }
 
 // validReplicatedCompletionResult closes the wire result grammar over the

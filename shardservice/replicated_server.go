@@ -1493,7 +1493,7 @@ func replicatedCompletionInvalidReasons(
 		if completion.AllocationGeneration != response.State.Fence.AllocationGeneration {
 			reasons |= ReplicatedCompletionInvalidAllocationGeneration
 		}
-		if completion.ReplicaSetVersion != response.State.Fence.Command.ReplicaSetVersion {
+		if completion.ReplicaSetVersion > response.State.Fence.Command.ReplicaSetVersion {
 			reasons |= ReplicatedCompletionInvalidReplicaSetVersion
 		}
 		if completion.ActivePolicyGeneration != response.State.Fence.Command.ActivePolicyGeneration {
@@ -1502,11 +1502,13 @@ func replicatedCompletionInvalidReasons(
 		if completion.ProtectionEpoch != response.State.Fence.Command.ProtectionEpoch {
 			reasons |= ReplicatedCompletionInvalidProtectionEpoch
 		}
-		if completion.RoutingVersion != response.State.Fence.Command.RoutingVersion {
-			reasons |= ReplicatedCompletionInvalidRoutingVersion
-		}
-		if completion.RouteGeneration != response.State.Fence.Command.RouteGeneration {
-			reasons |= ReplicatedCompletionInvalidRouteGeneration
+		if !replicatedCompletionRoutingMatches(completion, response.State.Fence.Command) {
+			if completion.RoutingVersion != response.State.Fence.Command.RoutingVersion {
+				reasons |= ReplicatedCompletionInvalidRoutingVersion
+			}
+			if completion.RouteGeneration != response.State.Fence.Command.RouteGeneration {
+				reasons |= ReplicatedCompletionInvalidRouteGeneration
+			}
 		}
 	}
 	if response.Kind != ReplicatedCompletion {
