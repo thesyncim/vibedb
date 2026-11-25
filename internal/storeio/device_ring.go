@@ -125,17 +125,17 @@ func (d *ringDevice) Commit(pages []Write, root Write) error {
 			return first
 		}
 	}
-	if d.dsyncOff || d.powerSafe {
+	if d.dsyncOff {
 		return d.commitRootWithSync(root, len(pages) != 0)
 	}
 
 	if len(pages) != 0 {
-		if err := d.ring.PrepareDataSync(0, ringDataSyncTag, true); err != nil {
+		if err := d.prepareSync(ringDataSyncTag, true); err != nil {
 			return err
 		}
 	}
 	if err := d.ring.prepareWriteFixedDataSync(
-		0, int(root.Buffer), int(root.Length), root.Offset, ringRootTag, false,
+		0, int(root.Buffer), int(root.Length), root.Offset, ringRootTag, false, d.powerSafe,
 	); err != nil {
 		return err
 	}
@@ -223,7 +223,7 @@ func (d *ringDevice) commitRootWithSync(root Write, dataBarrier bool) error {
 }
 
 func (d *ringDevice) vectorCommitEligible(pages []Write, root Write) bool {
-	if d.dsyncOff || d.powerSafe || len(pages) == 0 ||
+	if d.dsyncOff || len(pages) == 0 ||
 		len(pages) > d.ring.vectorWriteCapacity() {
 		return false
 	}
@@ -255,19 +255,19 @@ func (d *ringDevice) commitVector(pages []Write, root Write) error {
 		dataLength = pages[0].Length
 		err = d.ring.prepareWriteFixedDataSync(
 			0, int(pages[0].Buffer), int(pages[0].Length),
-			pages[0].Offset, ringDataVectorTag, true,
+			pages[0].Offset, ringDataVectorTag, true, d.powerSafe,
 		)
 	} else {
 		dataLength, err = d.ring.prepareWriteVectorDataSync(
 			0, pages, d.bufferSize, d.frameArena, d.frameSize,
-			ringDataVectorTag, true,
+			ringDataVectorTag, true, d.powerSafe,
 		)
 	}
 	if err != nil {
 		return err
 	}
 	if err := d.ring.prepareWriteFixedDataSync(
-		0, int(root.Buffer), int(root.Length), root.Offset, ringRootTag, false,
+		0, int(root.Buffer), int(root.Length), root.Offset, ringRootTag, false, d.powerSafe,
 	); err != nil {
 		return err
 	}

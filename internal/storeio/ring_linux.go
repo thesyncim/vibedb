@@ -44,6 +44,7 @@ const (
 	ioUringOpWrite            = 23
 	ioUringFsyncDataSync      = 1 << 0
 	rwfDataSync               = 1 << 1
+	rwfSync                   = 1 << 2
 	ioSQEFixedFile            = 1 << 0
 	ioSQEIOLink               = 1 << 2
 	ioUringDefaultEntries     = 256
@@ -596,10 +597,15 @@ func (r *Ring) prepareWriteFixedDataSync(
 	offset int64,
 	userData uint64,
 	linked bool,
+	powerSafe bool,
 ) error {
+	op := uint32(rwfDataSync)
+	if powerSafe {
+		op = rwfSync
+	}
 	return r.prepareFixed(
 		ioUringOpWriteFixed, file, buffer, length, offset, userData, linked,
-		rwfDataSync,
+		op,
 	)
 }
 
@@ -614,6 +620,7 @@ func (r *Ring) prepareWriteVectorDataSync(
 	frameSize int,
 	userData uint64,
 	linked bool,
+	powerSafe bool,
 ) (uint32, error) {
 	if r.closed {
 		return 0, ErrClosed
@@ -664,6 +671,10 @@ func (r *Ring) prepareWriteVectorDataSync(
 	if linked {
 		flags |= ioSQEIOLink
 	}
+	op := uint32(rwfDataSync)
+	if powerSafe {
+		op = rwfSync
+	}
 	err := r.prepare(ioUringSQE{
 		Opcode:    ioUringOpWriteV,
 		Flags:     flags,
@@ -671,7 +682,7 @@ func (r *Ring) prepareWriteVectorDataSync(
 		Offset:    uint64(offset),
 		Address:   uint64(uintptr(unsafe.Pointer(&r.writeVectors[0]))),
 		Length:    uint32(len(writes)),
-		Operation: rwfDataSync,
+		Operation: op,
 	}, userData, -1, uint32(len(writes)))
 	if err != nil {
 		return 0, err

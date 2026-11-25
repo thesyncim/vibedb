@@ -24,12 +24,12 @@ func (*Ring) PrepareWriteFixed(int, int, int, int64, uint64, bool) error {
 	return ErrUnavailable
 }
 
-func (*Ring) prepareWriteFixedDataSync(int, int, int, int64, uint64, bool) error {
+func (*Ring) prepareWriteFixedDataSync(int, int, int, int64, uint64, bool, bool) error {
 	return ErrUnavailable
 }
 
 func (*Ring) prepareWriteVectorDataSync(
-	int, []Write, int, []byte, int, uint64, bool,
+	int, []Write, int, []byte, int, uint64, bool, bool,
 ) (uint32, error) {
 	return 0, ErrUnavailable
 }
