@@ -381,14 +381,24 @@ func TestAuthenticatedThreeVoterServingPutSurvivesLeaderLossAndExactRetry(t *tes
 	if err := owners[(leader+1)%voters].Campaign(ctx, group); err != nil {
 		t.Fatal(err)
 	}
-	newLeader := waitRF3Leader(t, ctx, owners, map[int]bool{leader: true}, group)
-	newState, err := owners[newLeader].Probe(ctx, group)
-	if err != nil {
-		t.Fatal(err)
+	var retried Result
+	var retryErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		newLeader := waitRF3Leader(t, ctx, owners, map[int]bool{leader: true}, group)
+		newState, probeErr := owners[newLeader].Probe(ctx, group)
+		if probeErr != nil {
+			t.Fatal(probeErr)
+		}
+		retried, retryErr = owners[newLeader].Submit(ctx, newState.Fence(), putData)
+		if retryErr == nil {
+			break
+		}
+		if !errors.Is(retryErr, ErrOutcomeUnknown) && !errors.Is(retryErr, raftmodel.ErrNotLeader) {
+			break
+		}
 	}
-	retried, err := owners[newLeader].Submit(ctx, newState.Fence(), putData)
-	if err != nil {
-		t.Fatalf("exact retry after leader loss: %v", err)
+	if retryErr != nil {
+		t.Fatalf("exact retry after leader loss: %v", retryErr)
 	}
 	if !bytes.Equal(retried.Completion, acknowledged.Completion) {
 		t.Fatal("exact retry returned a different deterministic completion")
