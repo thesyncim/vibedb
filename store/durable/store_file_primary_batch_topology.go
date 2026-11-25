@@ -469,13 +469,15 @@ func (c *Collection) planPrimaryBatchTopologyCuts(
 	// There is no current content for another dataset's cuts to subdivide, so a
 	// second complete planner pass could not refine the answer.
 	if len(current) == 0 {
-		unionKeys = make([][]byte, len(prospective))
+		unionKeys = slices.Grow(c.topologyUnionKeys[:0], len(prospective))[:len(prospective)]
 		for at := range prospective {
 			unionKeys[at] = prospective[at].Key
 		}
+		c.topologyUnionKeys = unionKeys
 		starts, planErr := planStarts(
-			make([]int, 0, len(prospective)), prospective,
+			slices.Grow(c.topologyStarts[:0], len(prospective))[:0], prospective,
 		)
+		c.topologyStarts = starts
 		if planErr != nil {
 			for at := range prospective {
 				_, singleErr := planStarts(nil, prospective[at:at+1])
@@ -488,10 +490,11 @@ func (c *Collection) planPrimaryBatchTopologyCuts(
 			}
 			return nil, nil, planErr
 		}
-		cuts = make([][]byte, 0, max(0, len(starts)-1))
+		cuts = slices.Grow(c.topologyCuts[:0], max(0, len(starts)-1))[:0]
 		for at := 1; at < len(starts); at++ {
 			cuts = append(cuts, prospective[starts[at]].Key)
 		}
+		c.topologyCuts = cuts
 		return cuts, unionKeys, nil
 	}
 
@@ -503,21 +506,42 @@ func (c *Collection) planPrimaryBatchTopologyCuts(
 	if keyCapacity == 0 || keyCapacity > maxInt/2 {
 		return nil, nil, storeio.ErrInvalidWrite
 	}
-	unionKeys = make([][]byte, 0, keyCapacity)
-	for at := range current {
-		unionKeys = append(unionKeys, current[at].Key)
+	unionKeys = slices.Grow(c.topologyUnionKeys[:0], keyCapacity)[:0]
+	for i, j := 0, 0; i < len(current) || j < len(prospective); {
+		var key []byte
+		switch {
+		case i == len(current):
+			key = prospective[j].Key
+			j++
+		case j == len(prospective):
+			key = current[i].Key
+			i++
+		default:
+			cmp := bytes.Compare(current[i].Key, prospective[j].Key)
+			switch {
+			case cmp < 0:
+				key = current[i].Key
+				i++
+			case cmp > 0:
+				key = prospective[j].Key
+				j++
+			default:
+				key = current[i].Key
+				i++
+				j++
+			}
+		}
+		if len(unionKeys) == 0 || !bytes.Equal(unionKeys[len(unionKeys)-1], key) {
+			unionKeys = append(unionKeys, key)
+		}
 	}
-	for at := range prospective {
-		unionKeys = append(unionKeys, prospective[at].Key)
-	}
-	slices.SortFunc(unionKeys, bytes.Compare)
-	unionKeys = slices.CompactFunc(unionKeys, bytes.Equal)
+	c.topologyUnionKeys = unionKeys
 	if len(unionKeys) == 0 {
 		return nil, nil, storeio.ErrInvalidWrite
 	}
 
-	starts := make([]int, 0, max(len(current), len(prospective)))
-	cuts = make([][]byte, 0)
+	starts := slices.Grow(c.topologyStarts[:0], max(len(current), len(prospective)))[:0]
+	cuts = c.topologyCuts[:0]
 	datasets := [...]struct {
 		rows        []storeio.CommonPrimaryLeafRecord
 		prospective bool
@@ -525,7 +549,7 @@ func (c *Collection) planPrimaryBatchTopologyCuts(
 		{rows: current},
 		{rows: prospective, prospective: true},
 	}
-	additions := make([][]byte, 0)
+	additions := c.topologyAdditions[:0]
 	for {
 		before := len(cuts)
 		additions = additions[:0]
@@ -540,6 +564,7 @@ func (c *Collection) planPrimaryBatchTopologyCuts(
 				}
 				if end > at {
 					starts, err = planStarts(starts[:0], dataset.rows[at:end])
+					c.topologyStarts = starts
 					if err != nil {
 						if dataset.prospective {
 							for rowAt := at; rowAt < end; rowAt++ {
@@ -583,6 +608,8 @@ func (c *Collection) planPrimaryBatchTopologyCuts(
 		}
 		slices.SortFunc(cuts, bytes.Compare)
 		cuts = slices.CompactFunc(cuts, bytes.Equal)
+		c.topologyCuts = cuts
+		c.topologyAdditions = additions
 		if len(cuts) == before {
 			break
 		}

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
@@ -216,7 +217,13 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 	if preimageMode == replicatedSQLCommittedLeaderPreimage && len(queries) != 1 {
 		return nil, true, errPreparedDirectFallback
 	}
-	statements := make([]replicatedSQLBoundStatement, len(queries))
+	var inlineStatements [4]replicatedSQLBoundStatement
+	var statements []replicatedSQLBoundStatement
+	if len(queries) <= len(inlineStatements) {
+		statements = inlineStatements[:len(queries)]
+	} else {
+		statements = make([]replicatedSQLBoundStatement, len(queries))
+	}
 	var expressionCancel query.CancelFlag
 	committedPreimageRead := false
 	if preimageMode == replicatedSQLCommittedLeaderPreimage {
@@ -404,10 +411,17 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 	// wrapper held exactly one ReplicatedTransactionTarget, so a second
 	// slice plus a final copy taxed every transaction for no reason.
 	targets = make([]ReplicatedTransactionTarget, 0, min(baseMutationCount, 8))
-	identities := make([]replicatedSQLMutationIdentity, 0, min(baseMutationCount, 256))
+	var inlineIdentities [8]replicatedSQLMutationIdentity
+	var identities []replicatedSQLMutationIdentity
+	if baseMutationCount <= len(inlineIdentities) {
+		identities = inlineIdentities[:0]
+	} else {
+		identities = make([]replicatedSQLMutationIdentity, 0, min(baseMutationCount, 256))
+	}
 	keyArena := make([]byte, 0, min(baseMutationCount, 256)*32)
 	var byGroup map[raftmember.GroupKey]int
-	var documentWorkspace GlobalIndexWorkspace
+	documentWorkspace := acquireReplicatedSQLDocumentWorkspace()
+	defer releaseReplicatedSQLDocumentWorkspace(documentWorkspace)
 	var mutationBytes uint64
 	var mutationCount uint64
 	// One shared resolve scratch pair serves every mutation: resolved routes
@@ -446,7 +460,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			}
 			if kind == replication.MutationPutPresent && len(document) != 0 {
 				replacement, replacementErr := replicatedSQLDocumentPrimaryScalar(
-					document, statement.bound.keyPointers, &documentWorkspace,
+					document, statement.bound.keyPointers, documentWorkspace,
 				)
 				if replacementErr != nil {
 					return nil, true, replacementErr
@@ -561,7 +575,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			}
 			if kind == replication.MutationPutPresent && !missingPartial {
 				replacement, replacementErr := replicatedSQLDocumentPrimaryScalar(
-					document, statement.bound.keyPointers, &documentWorkspace,
+					document, statement.bound.keyPointers, documentWorkspace,
 				)
 				if replacementErr != nil {
 					return nil, true, replacementErr
@@ -623,7 +637,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 			targetIndex, appendErr := appendReplicatedSQLMutation(
 				&targets, &byGroup, resolved.Route, bits,
 				distributedtxn.IntentScope{Start: uint32(bucket), End: uint32(bucket) + 1},
-				statement.profile.Relation, baseMutation,
+				statement.profile.Relation, baseMutation, min(baseMutationCount, replicatedstate.MaxDistinctMutations),
 			)
 			if appendErr != nil {
 				return nil, true, appendErr
@@ -691,7 +705,7 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 				}
 				indexTarget, indexErr := appendReplicatedSQLMutation(
 					&targets, &byGroup, indexRoute, index.bucketBits, index.scope,
-					indexProfile.Relation, indexMutation,
+					indexProfile.Relation, indexMutation, 1,
 				)
 				if indexErr != nil {
 					return nil, true, indexErr
@@ -1022,10 +1036,14 @@ func appendReplicatedSQLMutation(
 	scope distributedtxn.IntentScope,
 	relation replication.RelationID,
 	mutation replication.Mutation,
+	mutationHint int,
 ) (int, error) {
 	if targets == nil || byGroup == nil || relation == 0 || bucketBits == 0 ||
 		!distributedtxn.ValidateIntentScope(scope, bucketBits) {
 		return -1, ErrReplicatedSQLTransactionUnsupported
+	}
+	if mutationHint < 1 {
+		mutationHint = 1
 	}
 	targetIndex := replicatedSQLTargetIndex(*targets, *byGroup, route.Group)
 	if targetIndex < 0 {
@@ -1034,6 +1052,8 @@ func appendReplicatedSQLMutation(
 		route.Replicas = replicas
 		*targets = append(*targets, ReplicatedTransactionTarget{
 			Route: route, BucketBits: bucketBits,
+			Batches:      make([]replication.RelationMutationBatch, 0, 1),
+			IntentScopes: make([]distributedtxn.IntentScope, 0, mutationHint),
 		})
 		targetIndex = len(*targets) - 1
 		if *byGroup != nil {
@@ -1058,7 +1078,8 @@ func appendReplicatedSQLMutation(
 			return -1, ErrTransactionMutationLimit
 		}
 		builder.Batches = append(builder.Batches, replication.RelationMutationBatch{
-			Relation: relation,
+			Relation:  relation,
+			Mutations: make([]replication.Mutation, 0, mutationHint),
 		})
 		batchIndex = len(builder.Batches) - 1
 	}
@@ -1185,6 +1206,35 @@ func appendReplicatedSQLScalarKey(
 	}
 }
 
+var replicatedSQLDocumentWorkspacePool = sync.Pool{
+	New: func() any {
+		return &GlobalIndexWorkspace{
+			entries: make([]vibejson.IndexEntry, 0, 64),
+		}
+	},
+}
+
+func acquireReplicatedSQLDocumentWorkspace() *GlobalIndexWorkspace {
+	return replicatedSQLDocumentWorkspacePool.Get().(*GlobalIndexWorkspace)
+}
+
+func releaseReplicatedSQLDocumentWorkspace(workspace *GlobalIndexWorkspace) {
+	if workspace == nil {
+		return
+	}
+	if cap(workspace.entries) > 1024 {
+		workspace.entries = nil
+	} else {
+		workspace.entries = workspace.entries[:0]
+	}
+	if cap(workspace.decoded) > 4096 {
+		workspace.decoded = nil
+	} else {
+		workspace.decoded = workspace.decoded[:0]
+	}
+	replicatedSQLDocumentWorkspacePool.Put(workspace)
+}
+
 func replicatedSQLDocumentPrimaryScalar(
 	document []byte,
 	pointers []vibejson.CompiledPointer,
@@ -1193,16 +1243,22 @@ func replicatedSQLDocumentPrimaryScalar(
 	if len(document) == 0 || len(pointers) != 1 || workspace == nil {
 		return distribution.Scalar{}, ErrReplicatedSQLTransactionUnsupported
 	}
-	needed, err := vibejson.RequiredIndexEntries(document)
-	if err != nil {
-		return distribution.Scalar{}, ErrReplicatedSQLTransactionUnsupported
+	if cap(workspace.entries) == 0 {
+		workspace.entries = make([]vibejson.IndexEntry, 64)
 	}
-	if cap(workspace.entries) < needed {
-		workspace.entries = make([]vibejson.IndexEntry, needed)
-	} else {
-		workspace.entries = workspace.entries[:needed]
+	index, err := vibejson.BuildIndex(document, workspace.entries[:cap(workspace.entries)])
+	if errors.Is(err, jsondoc.ErrIndexFull) {
+		needed, reqErr := vibejson.RequiredIndexEntries(document)
+		if reqErr != nil {
+			return distribution.Scalar{}, ErrReplicatedSQLTransactionUnsupported
+		}
+		if cap(workspace.entries) < needed {
+			workspace.entries = make([]vibejson.IndexEntry, needed)
+		} else {
+			workspace.entries = workspace.entries[:needed]
+		}
+		index, err = vibejson.BuildIndex(document, workspace.entries)
 	}
-	index, err := vibejson.BuildIndex(document, workspace.entries)
 	if err != nil {
 		return distribution.Scalar{}, ErrReplicatedSQLTransactionUnsupported
 	}

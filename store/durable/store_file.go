@@ -566,6 +566,13 @@ type Collection struct {
 	// records borrow the source leaf page and are valid only while that page is
 	// leased inside the structural transaction.
 	structuralRows []storeio.CommonPrimaryLeafRecord
+	// topologyUnionKeys, topologyCuts, topologyAdditions, and topologyStarts are
+	// writer-lock-owned scratch reused by planPrimaryBatchTopologyCuts to avoid
+	// per-split heap allocations.
+	topologyUnionKeys [][]byte
+	topologyCuts      [][]byte
+	topologyAdditions [][]byte
+	topologyStarts    []int
 	// schemaIndexScratch is the writer-only IndexEntry arena reused to build the
 	// per-document index that schema enforcement validates. It is only touched
 	// when the collection carries a declared schema, so the common (schemaless)

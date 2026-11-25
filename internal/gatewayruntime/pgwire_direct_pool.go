@@ -267,8 +267,25 @@ func ownPostgresWriteQuery(q gateway.Query) (gateway.Query, error) {
 	owned := q
 	if len(q.Params) != 0 {
 		owned.Params = slices.Clone(q.Params)
+		totalBytes := 0
 		for index := range owned.Params {
-			owned.Params[index].Bytes = bytes.Clone(q.Params[index].Bytes)
+			totalBytes += len(owned.Params[index].Bytes)
+		}
+		var backing []byte
+		if totalBytes != 0 {
+			backing = make([]byte, totalBytes)
+		}
+		offset := 0
+		for index := range owned.Params {
+			src := owned.Params[index].Bytes
+			if len(src) != 0 {
+				end := offset + len(src)
+				copy(backing[offset:end], src)
+				owned.Params[index].Bytes = backing[offset:end:end]
+				offset = end
+			} else if src != nil {
+				owned.Params[index].Bytes = []byte{}
+			}
 		}
 	}
 	// ParamTypes is json:",omitempty" in the legacy journal. A present but
