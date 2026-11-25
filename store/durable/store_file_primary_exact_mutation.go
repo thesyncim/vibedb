@@ -6,6 +6,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // Exact-index posting maintenance for the ordered primary graph.
@@ -76,25 +77,44 @@ func (c *Collection) primaryExactBounds(
 	}
 }
 
+// exactBucketIndexContribution stores one physical index's per-term quadrant
+// masks for a single bucket without per-term map or per-row string allocations.
+// A bucket owns at most four quadrant tiles (bucket<<2 | q for q in 0..3).
+type exactBucketIndexContribution struct {
+	index    map[string]uint16
+	masks    [][4]uint64
+	keyArena []byte
+}
+
+func (c exactBucketIndexContribution) lookup(term string) ([4]uint64, bool) {
+	if id, ok := c.index[term]; ok {
+		return c.masks[id], true
+	}
+	return [4]uint64{}, false
+}
+
 // deriveBucketExactContribution visits the live rows of the rewritten leaf image
 // and returns, for the four tiles of bucket, the new live slot mask and, per
-// physical index, the canonical term -> tile -> bits the bucket now contributes.
+// physical index, the canonical term -> quadrant masks the bucket now contributes.
 // It is fold-side and rebase-side code — the common buffered mutation never
 // calls it on the ordinary buffered mutation path.
 func (c *Collection) deriveBucketExactContribution(
 	leafPage []byte, bucket storeio.BucketID,
 	bounds storeio.CommonPrimaryLeafBounds,
 ) (
-	bucketLive map[uint32]uint64,
-	byIndex []map[string]map[uint32]uint64,
+	bucketLive [4]uint64,
+	byIndex []exactBucketIndexContribution,
 	err error,
 ) {
 	indexes := c.options.indexes
-	byIndex = make([]map[string]map[uint32]uint64, len(indexes))
+	byIndex = make([]exactBucketIndexContribution, len(indexes))
 	for i := range byIndex {
-		byIndex[i] = make(map[string]map[uint32]uint64)
+		byIndex[i] = exactBucketIndexContribution{
+			index:    make(map[string]uint16, 16),
+			masks:    make([][4]uint64, 0, 16),
+			keyArena: make([]byte, 0, 256),
+		}
 	}
-	bucketLive = make(map[uint32]uint64, 4)
 	var components [store.MaxIndexColumns]storeio.IndexTermComponent
 	var canonical [storeio.IndexTermMaxKeyBytes]byte
 	_, err = storeio.VisitPrimaryLeafPostingRows(
@@ -118,9 +138,9 @@ func (c *Collection) deriveBucketExactContribution(
 				c.overflowValueScratch = resolved
 				raw = resolved
 			}
-			tileID := uint32(bucket)<<2 | uint32(slot>>6)
+			quadrant := slot >> 6
 			bit := uint64(1) << uint(slot&63)
-			bucketLive[tileID] |= bit
+			bucketLive[quadrant] |= bit
 			for indexID, exact := range indexes {
 				key, present, termErr := appendPrimaryExactDocumentTerm(
 					canonical[:0], components[:], exact, raw,
@@ -131,19 +151,25 @@ func (c *Collection) deriveBucketExactContribution(
 				if !present {
 					continue
 				}
-				identity := string(key)
-				tiles := byIndex[indexID][identity]
-				if tiles == nil {
-					tiles = make(map[uint32]uint64)
-					byIndex[indexID][identity] = tiles
+				contrib := &byIndex[indexID]
+				termID, exists := contrib.index[string(key)]
+				if !exists {
+					termID = uint16(len(contrib.masks))
+					start := len(contrib.keyArena)
+					contrib.keyArena = append(contrib.keyArena, key...)
+					stored := byteview.String(
+						contrib.keyArena[start:len(contrib.keyArena):len(contrib.keyArena)],
+					)
+					contrib.index[stored] = termID
+					contrib.masks = append(contrib.masks, [4]uint64{})
 				}
-				tiles[tileID] |= bit
+				contrib.masks[termID][quadrant] |= bit
 			}
 			return nil
 		},
 	)
 	if err != nil {
-		return nil, nil, err
+		return [4]uint64{}, nil, err
 	}
 	return bucketLive, byIndex, nil
 }
@@ -446,22 +472,28 @@ func (c *Collection) preparePrimaryExactRebase(
 	for quadrant := uint32(0); quadrant < 4; quadrant++ {
 		tileID := uint32(bucket)<<2 | quadrant
 		if !c.emitPrimaryExactTileRecord(
-			epoch, prepared, tileID, generation, bucketLive[tileID], true,
+			epoch, prepared, tileID, generation, bucketLive[quadrant], true,
 		) {
 			return false, nil
 		}
 	}
 	for indexID := range byIndex {
-		for term, tiles := range byIndex[indexID] {
-			termBytes := []byte(term)
+		contrib := &byIndex[indexID]
+		for term, termID := range contrib.index {
+			termBytes := byteview.Bytes(term)
 			chainHash := primaryExactTermChainHash(
 				storeio.IndexTermRouteHash(c.storeID, termBytes),
 				uint32(indexID),
 			)
-			for tileID, bits := range tiles {
+			masks := contrib.masks[termID]
+			for quadrant := uint32(0); quadrant < 4; quadrant++ {
+				if masks[quadrant] == 0 {
+					continue
+				}
+				tileID := uint32(bucket)<<2 | quadrant
 				if !c.emitPrimaryExactTermRecord(
 					epoch, prepared, chainHash, uint32(indexID), termBytes,
-					tileID, generation, bits,
+					tileID, generation, masks[quadrant],
 				) {
 					return false, nil
 				}
@@ -478,7 +510,7 @@ func (c *Collection) emitAbsoluteExactTermRecord(
 	epoch *primaryExactEpoch, prepared *primaryExactPrepared,
 	indexID int, term string, tileID uint32, generation, bits uint64,
 ) bool {
-	termBytes := []byte(term)
+	termBytes := byteview.Bytes(term)
 	chainHash := primaryExactTermChainHash(
 		storeio.IndexTermRouteHash(c.storeID, termBytes),
 		uint32(indexID),
@@ -492,7 +524,7 @@ func (c *Collection) emitAbsoluteExactTermRecord(
 // unionSortedExactDiffTerms lists every term present on either side of a
 // bucket-contribution diff in byte order, so diff emission is deterministic.
 func unionSortedExactDiffTerms(
-	finalTerms, baseTerms map[string]map[uint32]uint64,
+	finalTerms, baseTerms map[string]uint16,
 ) []string {
 	union := make([]string, 0, len(finalTerms)+len(baseTerms))
 	for term := range finalTerms {
@@ -501,24 +533,6 @@ func unionSortedExactDiffTerms(
 	for term := range baseTerms {
 		if _, ok := finalTerms[term]; !ok {
 			union = append(union, term)
-		}
-	}
-	slices.Sort(union)
-	return union
-}
-
-// unionSortedExactDiffTiles lists every tile present on either side of one
-// term's contribution in numeric order.
-func unionSortedExactDiffTiles(
-	finalTiles, baseTiles map[uint32]uint64,
-) []uint32 {
-	union := make([]uint32, 0, len(finalTiles)+len(baseTiles))
-	for tileID := range finalTiles {
-		union = append(union, tileID)
-	}
-	for tileID := range baseTiles {
-		if _, ok := finalTiles[tileID]; !ok {
-			union = append(union, tileID)
 		}
 	}
 	slices.Sort(union)
@@ -548,59 +562,58 @@ func (d *exactDiffCost) add(o exactDiffCost) {
 // base→final bucket change needs: one per changed live word and per changed
 // (term, tile) pair, with the union terms/tiles/bytes bounding new entries.
 func countExactContributionDiff(
-	baseLive, finalLive map[uint32]uint64,
-	baseByIndex, finalByIndex []map[string]map[uint32]uint64,
+	baseLive, finalLive [4]uint64,
+	baseByIndex, finalByIndex []exactBucketIndexContribution,
 ) exactDiffCost {
 	var cost exactDiffCost
-	seenTiles := make(map[uint32]struct{}, 8)
-	for tile, bits := range finalLive {
-		seenTiles[tile] = struct{}{}
-		if baseLive[tile] != bits {
-			cost.tileRecords++
+	for q := range 4 {
+		if finalLive[q] != 0 || baseLive[q] != 0 {
+			cost.tiles++
+			if finalLive[q] != baseLive[q] {
+				cost.tileRecords++
+			}
 		}
 	}
-	for tile := range baseLive {
-		if _, ok := finalLive[tile]; !ok {
-			seenTiles[tile] = struct{}{}
-			cost.tileRecords++
-		}
-	}
-	cost.tiles = len(seenTiles)
 	for indexID := range finalByIndex {
-		finalTerms := finalByIndex[indexID]
-		var baseTerms map[string]map[uint32]uint64
+		finalContrib := finalByIndex[indexID]
+		var baseContrib exactBucketIndexContribution
 		if indexID < len(baseByIndex) {
-			baseTerms = baseByIndex[indexID]
+			baseContrib = baseByIndex[indexID]
 		}
-		for term, finalTiles := range finalTerms {
+		for term, finalID := range finalContrib.index {
 			cost.terms++
 			cost.termBytes += len(term)
-			baseTiles := baseTerms[term]
-			for tile, bits := range finalTiles {
-				if baseTiles[tile] != bits {
-					cost.termRecords++
-				}
-			}
-			for tile := range baseTiles {
-				if _, ok := finalTiles[tile]; !ok {
+			finalMasks := finalContrib.masks[finalID]
+			baseMasks, _ := baseContrib.lookup(term)
+			for q := range 4 {
+				if finalMasks[q] != baseMasks[q] {
 					cost.termRecords++
 				}
 			}
 		}
-		for term, baseTiles := range baseTerms {
-			if _, ok := finalTerms[term]; ok {
+		for term, baseID := range baseContrib.index {
+			if _, ok := finalContrib.index[term]; ok {
 				continue
 			}
 			cost.terms++
 			cost.termBytes += len(term)
-			cost.termRecords += len(baseTiles)
+			for _, bits := range baseContrib.masks[baseID] {
+				if bits != 0 {
+					cost.termRecords++
+				}
+			}
 		}
 	}
 	for indexID := len(finalByIndex); indexID < len(baseByIndex); indexID++ {
-		for term, baseTiles := range baseByIndex[indexID] {
+		baseContrib := baseByIndex[indexID]
+		for term, baseID := range baseContrib.index {
 			cost.terms++
 			cost.termBytes += len(term)
-			cost.termRecords += len(baseTiles)
+			for _, bits := range baseContrib.masks[baseID] {
+				if bits != 0 {
+					cost.termRecords++
+				}
+			}
 		}
 	}
 	return cost
@@ -720,37 +733,38 @@ func (c *Collection) preparePrimaryExactBucketDiff(
 // pressure mid-emission.
 func (c *Collection) emitExactContributionDiff(
 	epoch *primaryExactEpoch, prepared *primaryExactPrepared,
-	baseLive map[uint32]uint64, baseByIndex []map[string]map[uint32]uint64,
-	finalLive map[uint32]uint64, finalByIndex []map[string]map[uint32]uint64,
+	baseLive [4]uint64, baseByIndex []exactBucketIndexContribution,
+	finalLive [4]uint64, finalByIndex []exactBucketIndexContribution,
 	bucket storeio.BucketID, generation uint64,
 ) bool {
 	for quadrant := uint32(0); quadrant < 4; quadrant++ {
-		tileID := uint32(bucket)<<2 | quadrant
-		if finalLive[tileID] == baseLive[tileID] {
+		if finalLive[quadrant] == baseLive[quadrant] {
 			continue
 		}
+		tileID := uint32(bucket)<<2 | quadrant
 		if !c.emitPrimaryExactTileRecord(
-			epoch, prepared, tileID, generation, finalLive[tileID], false,
+			epoch, prepared, tileID, generation, finalLive[quadrant], false,
 		) {
 			return false
 		}
 	}
 	for indexID := range finalByIndex {
-		finalTerms := finalByIndex[indexID]
-		var baseTerms map[string]map[uint32]uint64
+		finalContrib := finalByIndex[indexID]
+		var baseContrib exactBucketIndexContribution
 		if indexID < len(baseByIndex) {
-			baseTerms = baseByIndex[indexID]
+			baseContrib = baseByIndex[indexID]
 		}
-		for _, term := range unionSortedExactDiffTerms(finalTerms, baseTerms) {
-			finalTiles := finalTerms[term]
-			baseTiles := baseTerms[term]
-			for _, tileID := range unionSortedExactDiffTiles(finalTiles, baseTiles) {
-				if finalTiles[tileID] == baseTiles[tileID] {
+		for _, term := range unionSortedExactDiffTerms(finalContrib.index, baseContrib.index) {
+			finalMasks, _ := finalContrib.lookup(term)
+			baseMasks, _ := baseContrib.lookup(term)
+			for quadrant := uint32(0); quadrant < 4; quadrant++ {
+				if finalMasks[quadrant] == baseMasks[quadrant] {
 					continue
 				}
+				tileID := uint32(bucket)<<2 | quadrant
 				if !c.emitAbsoluteExactTermRecord(
 					epoch, prepared, indexID, term, tileID,
-					generation, finalTiles[tileID],
+					generation, finalMasks[quadrant],
 				) {
 					return false
 				}
@@ -761,8 +775,14 @@ func (c *Collection) emitExactContributionDiff(
 		if indexID < len(finalByIndex) {
 			continue
 		}
-		for term, baseTiles := range baseByIndex[indexID] {
-			for tileID := range baseTiles {
+		baseContrib := baseByIndex[indexID]
+		for term, baseID := range baseContrib.index {
+			masks := baseContrib.masks[baseID]
+			for quadrant := uint32(0); quadrant < 4; quadrant++ {
+				if masks[quadrant] == 0 {
+					continue
+				}
+				tileID := uint32(bucket)<<2 | quadrant
 				if !c.emitAbsoluteExactTermRecord(
 					epoch, prepared, indexID, term, tileID,
 					generation, 0,
@@ -1011,8 +1031,8 @@ func (c *Collection) preparePrimaryExactLeaf(
 // while a structural transaction re-encodes it: the bucket's new live tile masks
 // and, per physical index, its new canonical term -> tile -> bits.
 type structuralBucketContribution struct {
-	live    map[uint32]uint64
-	byIndex []map[string]map[uint32]uint64
+	live    [4]uint64
+	byIndex []exactBucketIndexContribution
 }
 
 // resetStructuralExactLocked clears the structural posting accumulators at the
@@ -1118,8 +1138,8 @@ func (c *Collection) prepareStructuralExactDirtyLocked(
 	slices.Sort(affected)
 	var cost exactDiffCost
 	for _, bucket := range affected {
-		var oldLive map[uint32]uint64
-		var oldByIndex []map[string]map[uint32]uint64
+		var oldLive [4]uint64
+		var oldByIndex []exactBucketIndexContribution
 		if old := c.structuralExactOld[bucket]; old != nil {
 			oldLive, oldByIndex = old.live, old.byIndex
 		} else if _, reencoded := c.structuralExactReencoded[bucket]; reencoded {
@@ -1130,8 +1150,8 @@ func (c *Collection) prepareStructuralExactDirtyLocked(
 			// postings the diff cannot see: keep the full rebuild.
 			return primaryExactPrepared{}, false, nil
 		}
-		var newLive map[uint32]uint64
-		var newByIndex []map[string]map[uint32]uint64
+		var newLive [4]uint64
+		var newByIndex []exactBucketIndexContribution
 		if new := c.structuralExactReencoded[bucket]; new != nil {
 			newLive, newByIndex = new.live, new.byIndex
 		}
@@ -1151,13 +1171,13 @@ func (c *Collection) prepareStructuralExactDirtyLocked(
 		return primaryExactPrepared{}, false, nil
 	}
 	for _, bucket := range affected {
-		var oldLive map[uint32]uint64
-		var oldByIndex []map[string]map[uint32]uint64
+		var oldLive [4]uint64
+		var oldByIndex []exactBucketIndexContribution
 		if old := c.structuralExactOld[bucket]; old != nil {
 			oldLive, oldByIndex = old.live, old.byIndex
 		}
-		var newLive map[uint32]uint64
-		var newByIndex []map[string]map[uint32]uint64
+		var newLive [4]uint64
+		var newByIndex []exactBucketIndexContribution
 		if new := c.structuralExactReencoded[bucket]; new != nil {
 			newLive, newByIndex = new.live, new.byIndex
 		}
