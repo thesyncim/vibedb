@@ -28,10 +28,16 @@ type onlineIndexBucket struct {
 	keyArena       []byte
 }
 
+type onlineIndexTermEntry struct {
+	key    string
+	termID uint16
+}
+
 type onlineIndexTermSource struct {
-	bucket storeio.BucketID
-	keys   []string
-	at     int
+	bucket    storeio.BucketID
+	entries   []onlineIndexTermEntry
+	termMasks [][4]uint64
+	at        int
 }
 
 type onlineIndexTermHeap struct {
@@ -42,8 +48,8 @@ type onlineIndexTermHeap struct {
 func (h *onlineIndexTermHeap) less(left, right int) bool {
 	a := &h.sources[h.order[left]]
 	b := &h.sources[h.order[right]]
-	aKey := a.keys[a.at]
-	bKey := b.keys[b.at]
+	aKey := a.entries[a.at].key
+	bKey := b.entries[b.at].key
 	return aKey < bKey || aKey == bKey && a.bucket < b.bucket
 }
 
@@ -87,10 +93,12 @@ func (h *onlineIndexTermHeap) pop() int {
 }
 
 type onlineIndexBuild struct {
-	exact    *store.ExactIndex
-	unique   bool
-	buckets  map[storeio.BucketID]onlineIndexBucket
-	nextRank int
+	exact           *store.ExactIndex
+	unique          bool
+	buckets         map[storeio.BucketID]onlineIndexBucket
+	nextRank        int
+	overflowScratch []byte
+	valueScratch    []byte
 }
 
 const onlineIndexRouteCheckBudget = 64
@@ -731,9 +739,13 @@ func (b *onlineIndexBuild) scanBucket(
 	var (
 		components [store.MaxIndexColumns]storeio.IndexTermComponent
 		canonical  [storeio.IndexTermMaxKeyBytes]byte
-		overflow   []byte
-		scratch    []byte
+		overflow   = b.overflowScratch[:0]
+		scratch    = b.valueScratch[:0]
 	)
+	defer func() {
+		b.overflowScratch = overflow[:0]
+		b.valueScratch = scratch[:0]
+	}()
 	bounds := c.primaryLeafBounds(state)
 	visit := func(slot uint8, raw []byte, outOfLine bool) error {
 		if outOfLine {
@@ -798,10 +810,17 @@ func (b *onlineIndexBuild) scanBucket(
 		var baseKey, baseValue []byte
 		baseOverflow := false
 		if baseRank < stripe.Len() {
-			var keyOK, valueOK bool
-			baseKey, keyOK = stripe.AppendKey(keyScratch[:0], baseRank)
+			var valueOK bool
+			if overlayAt < overlayCount {
+				var keyOK bool
+				baseKey, keyOK = stripe.AppendKey(keyScratch[:0], baseRank)
+				if !keyOK {
+					return onlineIndexBucket{},
+						storeio.ErrPrimaryExactIndexCorrupt
+				}
+			}
 			baseValue, baseOverflow, valueOK = stripe.AppendRawValue(scratch[:0], baseRank)
-			if !keyOK || !valueOK {
+			if !valueOK {
 				return onlineIndexBucket{},
 					storeio.ErrPrimaryExactIndexCorrupt
 			}
@@ -919,8 +938,9 @@ func (b *onlineIndexBuild) prepareResident(
 	if fresh == nil {
 		return primaryExactPrepared{}, storeio.ErrInvalidWrite
 	}
-	live := make(map[uint32]*[storeio.TermPostingTileChunks]uint64)
+	var live map[uint32]*[storeio.TermPostingTileChunks]uint64
 	if currentEpoch != nil && currentEpoch.live != nil {
+		live = make(map[uint32]*[storeio.TermPostingTileChunks]uint64, len(currentEpoch.live.slots))
 		for at := range currentEpoch.live.slots {
 			slot := &currentEpoch.live.slots[at]
 			if slot.mask != nil {
@@ -942,13 +962,25 @@ func (b *onlineIndexBuild) prepareResident(
 			}
 		}
 	} else {
+		liveCount := 0
+		for _, bucket := range b.buckets {
+			for _, bits := range bucket.live {
+				if bits != 0 {
+					liveCount++
+				}
+			}
+		}
+		live = make(map[uint32]*[storeio.TermPostingTileChunks]uint64, liveCount)
+		liveSlab := make([][storeio.TermPostingTileChunks]uint64, liveCount)
+		slabAt := 0
 		for bucketID, bucket := range b.buckets {
 			for quadrant, bits := range bucket.live {
 				if bits == 0 {
 					continue
 				}
 				tileID := uint32(bucketID)<<2 | uint32(quadrant)
-				mask := new([storeio.TermPostingTileChunks]uint64)
+				mask := &liveSlab[slabAt]
+				slabAt++
 				mask[0] = bits
 				live[tileID] = mask
 			}
@@ -1005,34 +1037,56 @@ func (c *Collection) buildOnlineIndexTerms(
 	buckets map[storeio.BucketID]onlineIndexBucket,
 	liveLookup storeio.IndexTermLeafLiveLookup,
 ) ([]storeio.IndexTermLeafTerm, error) {
-	heap := onlineIndexTermHeap{
-		sources: make([]onlineIndexTermSource, 0, len(buckets)),
-		order:   make([]int, 0, len(buckets)),
-	}
 	totalContributions := 0
 	totalPostings := 0
-	for bucketID, bucket := range buckets {
+	for _, bucket := range buckets {
 		if len(bucket.terms) == 0 {
 			continue
 		}
-		keys := make([]string, 0, len(bucket.terms))
-		for key := range bucket.terms {
-			keys = append(keys, key)
-			termID := bucket.terms[key]
-			if int(termID) >= len(bucket.termMasks) {
-				return nil, storeio.ErrPrimaryExactIndexCorrupt
-			}
-			for _, bits := range bucket.termMasks[termID] {
+		totalContributions += len(bucket.terms)
+		for _, masks := range bucket.termMasks {
+			for _, bits := range masks {
 				if bits != 0 {
 					totalPostings++
 				}
 			}
 		}
-		slices.Sort(keys)
-		totalContributions += len(keys)
+	}
+	if totalContributions == 0 {
+		return nil, nil
+	}
+	allEntries := make([]onlineIndexTermEntry, 0, totalContributions)
+	heap := onlineIndexTermHeap{
+		sources: make([]onlineIndexTermSource, 0, len(buckets)),
+		order:   make([]int, 0, len(buckets)),
+	}
+	for bucketID, bucket := range buckets {
+		if len(bucket.terms) == 0 {
+			continue
+		}
+		start := len(allEntries)
+		for key, termID := range bucket.terms {
+			if int(termID) >= len(bucket.termMasks) {
+				return nil, storeio.ErrPrimaryExactIndexCorrupt
+			}
+			allEntries = append(allEntries, onlineIndexTermEntry{
+				key:    key,
+				termID: termID,
+			})
+		}
+		entries := allEntries[start:len(allEntries):len(allEntries)]
+		slices.SortFunc(entries, func(a, b onlineIndexTermEntry) int {
+			if a.key < b.key {
+				return -1
+			}
+			if a.key > b.key {
+				return 1
+			}
+			return 0
+		})
 		sourceID := len(heap.sources)
 		heap.sources = append(heap.sources, onlineIndexTermSource{
-			bucket: bucketID, keys: keys,
+			bucket: bucketID, entries: entries, termMasks: bucket.termMasks,
 		})
 		heap.push(sourceID)
 	}
@@ -1052,15 +1106,10 @@ func (c *Collection) buildOnlineIndexTerms(
 	for len(heap.order) != 0 {
 		sourceID := heap.pop()
 		source := &heap.sources[sourceID]
-		key := source.keys[source.at]
+		key := source.entries[source.at].key
 		postingStart := len(allPostings)
 		for {
-			bucket := buckets[source.bucket]
-			termID, ok := bucket.terms[key]
-			if !ok || int(termID) >= len(bucket.termMasks) {
-				return nil, storeio.ErrPrimaryExactIndexCorrupt
-			}
-			masks := bucket.termMasks[termID]
+			masks := source.termMasks[source.entries[source.at].termID]
 			for quadrant, bits := range masks {
 				if bits == 0 {
 					continue
@@ -1083,14 +1132,14 @@ func (c *Collection) buildOnlineIndexTerms(
 				})
 			}
 			source.at++
-			if source.at < len(source.keys) {
+			if source.at < len(source.entries) {
 				heap.push(sourceID)
 			}
 			if len(heap.order) == 0 {
 				break
 			}
 			next := &heap.sources[heap.order[0]]
-			if next.keys[next.at] != key {
+			if next.entries[next.at].key != key {
 				break
 			}
 			sourceID = heap.pop()
@@ -1117,6 +1166,14 @@ func (c *Collection) buildOnlineIndexTerms(
 // therefore does not need a second term-to-posting map. SQL unique constraints
 // permit any number of rows when at least one compound component is NULL.
 func (b *onlineIndexBuild) validateUnique() error {
+	totalContributions := 0
+	for _, bucket := range b.buckets {
+		totalContributions += len(bucket.terms)
+	}
+	if totalContributions == 0 {
+		return nil
+	}
+	allEntries := make([]onlineIndexTermEntry, 0, totalContributions)
 	heap := onlineIndexTermHeap{
 		sources: make([]onlineIndexTermSource, 0, len(b.buckets)),
 		order:   make([]int, 0, len(b.buckets)),
@@ -1125,14 +1182,29 @@ func (b *onlineIndexBuild) validateUnique() error {
 		if len(bucket.terms) == 0 {
 			continue
 		}
-		keys := make([]string, 0, len(bucket.terms))
-		for key := range bucket.terms {
-			keys = append(keys, key)
+		start := len(allEntries)
+		for key, termID := range bucket.terms {
+			if int(termID) >= len(bucket.termMasks) {
+				return storeio.ErrPrimaryExactIndexCorrupt
+			}
+			allEntries = append(allEntries, onlineIndexTermEntry{
+				key:    key,
+				termID: termID,
+			})
 		}
-		slices.Sort(keys)
+		entries := allEntries[start:len(allEntries):len(allEntries)]
+		slices.SortFunc(entries, func(a, b onlineIndexTermEntry) int {
+			if a.key < b.key {
+				return -1
+			}
+			if a.key > b.key {
+				return 1
+			}
+			return 0
+		})
 		sourceID := len(heap.sources)
 		heap.sources = append(heap.sources, onlineIndexTermSource{
-			bucket: bucketID, keys: keys,
+			bucket: bucketID, entries: entries, termMasks: bucket.termMasks,
 		})
 		heap.push(sourceID)
 	}
@@ -1140,7 +1212,7 @@ func (b *onlineIndexBuild) validateUnique() error {
 	for len(heap.order) != 0 {
 		sourceID := heap.pop()
 		source := &heap.sources[sourceID]
-		key := source.keys[source.at]
+		key := source.entries[source.at].key
 		containsNull, valid := storeio.IndexTermKeyContainsNull(
 			byteview.Bytes(key),
 		)
@@ -1151,13 +1223,8 @@ func (b *onlineIndexBuild) validateUnique() error {
 		}
 		rows := 0
 		for {
-			bucket := b.buckets[source.bucket]
-			termID, ok := bucket.terms[key]
-			if !ok || int(termID) >= len(bucket.termMasks) {
-				return storeio.ErrPrimaryExactIndexCorrupt
-			}
 			if !containsNull && rows < 2 {
-				for _, bits := range bucket.termMasks[termID] {
+				for _, bits := range source.termMasks[source.entries[source.at].termID] {
 					rows += mathbits.OnesCount64(bits)
 					if rows > 1 {
 						break
@@ -1165,14 +1232,14 @@ func (b *onlineIndexBuild) validateUnique() error {
 				}
 			}
 			source.at++
-			if source.at < len(source.keys) {
+			if source.at < len(source.entries) {
 				heap.push(sourceID)
 			}
 			if len(heap.order) == 0 {
 				break
 			}
 			next := &heap.sources[heap.order[0]]
-			if next.keys[next.at] != key {
+			if next.entries[next.at].key != key {
 				break
 			}
 			sourceID = heap.pop()
