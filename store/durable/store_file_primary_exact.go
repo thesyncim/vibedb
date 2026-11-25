@@ -1193,25 +1193,35 @@ func buildPrimaryExactTerms(
 		return nil, nil
 	}
 	keys := make([]string, 0, len(terms))
-	for key := range terms {
+	totalPostings := 0
+	maxTiles := 0
+	for key, tileMap := range terms {
 		keys = append(keys, key)
+		totalPostings += len(tileMap)
+		if len(tileMap) > maxTiles {
+			maxTiles = len(tileMap)
+		}
 	}
 	slices.Sort(keys)
 	out := make([]storeio.IndexTermLeafTerm, len(keys))
+	postingSlab := make([]storeio.IndexTermLeafPosting, totalPostings)
+	tiles := make([]uint32, 0, maxTiles)
+	slabAt := 0
 	for termAt, key := range keys {
-		record, ok := storeio.OpenIndexTermKeyRecord(storeID, []byte(key))
+		record, ok := storeio.OpenIndexTermKeyRecord(storeID, byteview.Bytes(key))
 		if !ok {
 			return nil, fmt.Errorf(
 				"%w: canonical exact term", storeio.ErrInvalidWrite,
 			)
 		}
 		tileMap := terms[key]
-		tiles := make([]uint32, 0, len(tileMap))
+		tiles = tiles[:0]
 		for tileID := range tileMap {
 			tiles = append(tiles, tileID)
 		}
 		slices.Sort(tiles)
-		postings := make([]storeio.IndexTermLeafPosting, len(tiles))
+		postings := postingSlab[slabAt : slabAt+len(tiles) : slabAt+len(tiles)]
+		slabAt += len(tiles)
 		for postingAt, tileID := range tiles {
 			maskBits := tileMap[tileID]
 			liveMask := live[tileID]
@@ -1439,9 +1449,9 @@ func buildPrimaryExactIndexes(
 		mask[0] |= uint64(1) << uint(placement.Slot&63)
 	}
 
-	byIndex := make([]map[string]primaryExactTermPostings, len(indexes))
+	byIndex := make([]map[string]map[uint32]uint64, len(indexes))
 	for i := range byIndex {
-		byIndex[i] = make(map[string]primaryExactTermPostings)
+		byIndex[i] = make(map[string]map[uint32]uint64)
 	}
 	var components [store.MaxIndexColumns]storeio.IndexTermComponent
 	var canonical [storeio.IndexTermMaxKeyBytes]byte
@@ -1460,11 +1470,11 @@ func buildPrimaryExactIndexes(
 			if !present {
 				continue
 			}
-			identity := string(key)
-			postings := byIndex[indexID][identity]
+			indexTerms := byIndex[indexID]
+			postings := indexTerms[string(key)]
 			if postings == nil {
-				postings = make(primaryExactTermPostings)
-				byIndex[indexID][identity] = postings
+				postings = make(map[uint32]uint64)
+				indexTerms[string(key)] = postings
 			}
 			postings[tileID] |= bit
 		}
@@ -1474,11 +1484,7 @@ func buildPrimaryExactIndexes(
 	rootEntries := make([]storeio.PrimaryExactRootEntry, len(indexes))
 	var catalogPages []storeio.PageRef
 	for indexID := range indexes {
-		terms := make(map[string]map[uint32]uint64, len(byIndex[indexID]))
-		for key, postings := range byIndex[indexID] {
-			terms[key] = postings
-		}
-		ordered, err := buildPrimaryExactTerms(sink.StoreIdentity(), terms, live)
+		ordered, err := buildPrimaryExactTerms(sink.StoreIdentity(), byIndex[indexID], live)
 		if err != nil {
 			return storeio.PageRef{}, err
 		}

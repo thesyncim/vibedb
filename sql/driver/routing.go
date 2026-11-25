@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/query"
@@ -262,6 +263,12 @@ func matchPlacementColumn(path *sqlast.PathExpr, placementColumns []string) (int
 	return 0, false
 }
 
+var constraintBuilderPool = sync.Pool{
+	New: func() any {
+		return distribution.NewConstraintBuilder()
+	},
+}
+
 // Bind converts the discovered predicates to distribution.BoundConstraints for
 // one set of typed arguments. An ordinal with no narrowing predicate is
 // DomainUnknown; intersecting predicates that contradict yield DomainEmpty; and
@@ -272,13 +279,48 @@ func (p *ConstraintProgram) Bind(args []any) (distribution.BoundConstraints, err
 		return p.boolean.bind(args)
 	}
 	cons := make(distribution.BoundConstraints, len(p.slots))
-	builder := distribution.NewConstraintBuilder()
-	var scratch []distribution.Scalar
+	var builder *distribution.ConstraintBuilder
+	var inlineScratch [4]distribution.Scalar
+	scratch := inlineScratch[:0]
 	for i := range p.slots {
 		slot := &p.slots[i]
 		if len(slot.constraints) == 0 {
 			cons[i] = distribution.UnknownDomain()
 			continue
+		}
+		if len(slot.constraints) == 1 && !slot.constraints[0].unbindable && len(slot.constraints[0].operands) == 1 {
+			value, err := operandValue(slot.constraints[0].operands[0], args)
+			if err != nil {
+				if builder != nil {
+					builder.Reset()
+					constraintBuilderPool.Put(builder)
+				}
+				return nil, err
+			}
+			if value == nil {
+				cons[i] = distribution.EmptyDomain()
+				continue
+			}
+			scalar, ok, err := scalarFromValue(value)
+			if err != nil {
+				if builder != nil {
+					builder.Reset()
+					constraintBuilderPool.Put(builder)
+				}
+				return nil, err
+			}
+			if !ok {
+				cons[i] = distribution.UnknownDomain()
+				continue
+			}
+			cons[i] = distribution.ValueDomain{
+				Kind:   distribution.DomainFinite,
+				Values: []distribution.Scalar{scalar},
+			}
+			continue
+		}
+		if builder == nil {
+			builder = constraintBuilderPool.Get().(*distribution.ConstraintBuilder)
 		}
 		builder.Reset()
 		for _, c := range slot.constraints {
@@ -288,6 +330,8 @@ func (p *ConstraintProgram) Bind(args []any) (distribution.BoundConstraints, err
 			}
 			scalars, unbindable, err := bindOperandScalars(c.operands, args, scratch[:0])
 			if err != nil {
+				builder.Reset()
+				constraintBuilderPool.Put(builder)
 				return nil, err
 			}
 			scratch = scalars
@@ -296,10 +340,16 @@ func (p *ConstraintProgram) Bind(args []any) (distribution.BoundConstraints, err
 				continue
 			}
 			if err := builder.AddMembership(scalars); err != nil {
+				builder.Reset()
+				constraintBuilderPool.Put(builder)
 				return nil, err
 			}
 		}
 		cons[i] = builder.Domain()
+	}
+	if builder != nil {
+		builder.Reset()
+		constraintBuilderPool.Put(builder)
 	}
 	return cons, nil
 }
