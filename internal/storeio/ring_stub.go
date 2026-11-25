@@ -40,6 +40,7 @@ func (*Ring) prepareWriteBytes(int, []byte, int64, uint64, bool) error {
 
 func (*Ring) prepareReadArena(int, int, int, int64, uint64) error { return ErrUnavailable }
 
+func (*Ring) PrepareSync(int, uint64, bool) error     { return ErrUnavailable }
 func (*Ring) PrepareDataSync(int, uint64, bool) error { return ErrUnavailable }
 
 func (*Ring) SubmitAndWait(uint32) error { return ErrUnavailable }

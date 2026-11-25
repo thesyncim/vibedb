@@ -3103,15 +3103,16 @@ func encodeCheckpointGroupCertificate(c checkpointGroupCertificate) ([]byte, err
 	binary.LittleEndian.PutUint64(buf[72:80], c.seedApplied)
 	copy(buf[80:112], c.seedState[:])
 	copy(buf[112:144], c.seedMember[:])
-	membership := sha256.New()
 	for i, member := range c.members {
 		off := checkpointGroupHeaderBytes + i*checkpointGroupMemberBytes
 		copy(buf[off:off+32], member.nameDigest[:])
 		copy(buf[off+32:off+48], member.storeID[:])
 		copy(buf[off+48:off+64], member.journalID[:])
-		_, _ = membership.Write(buf[off : off+checkpointGroupMemberBytes])
 	}
-	copy(buf[144:168], membership.Sum(nil)[:24])
+	membershipSum := sha256.Sum256(
+		buf[checkpointGroupHeaderBytes : checkpointGroupHeaderBytes+len(c.members)*checkpointGroupMemberBytes],
+	)
+	copy(buf[144:168], membershipSum[:24])
 	binary.LittleEndian.PutUint64(
 		buf[checkpointGroupRetentionAppliedOffset:checkpointGroupRetentionCommitOffset],
 		c.retentionApplied,
@@ -3132,10 +3133,11 @@ func encodeCheckpointGroupCertificate(c checkpointGroupCertificate) ([]byte, err
 		buf[checkpointGroupMaxSpanWitnessLastOffset:checkpointGroupChecksumOffset],
 		c.maxSpanLast,
 	)
+	var sumBuf [sha256.Size]byte
 	h := sha256.New()
 	_, _ = h.Write(checkpointGroupDigestDomain)
 	_, _ = h.Write(buf[:checkpointGroupChecksumOffset])
-	copy(buf[checkpointGroupChecksumOffset:], h.Sum(nil))
+	copy(buf[checkpointGroupChecksumOffset:], h.Sum(sumBuf[:0]))
 	return buf, nil
 }
 

@@ -786,9 +786,20 @@ func (r *Ring) prepareFixed(
 	return nil
 }
 
+// PrepareSync appends a full file fsync barrier (including inode metadata)
+// for a registered file. linked makes failure cancel the immediately following
+// request.
+func (r *Ring) PrepareSync(file int, userData uint64, linked bool) error {
+	return r.prepareFsync(file, userData, linked, 0)
+}
+
 // PrepareDataSync appends a data-integrity barrier for a registered file.
 // linked makes failure cancel the immediately following request.
 func (r *Ring) PrepareDataSync(file int, userData uint64, linked bool) error {
+	return r.prepareFsync(file, userData, linked, ioUringFsyncDataSync)
+}
+
+func (r *Ring) prepareFsync(file int, userData uint64, linked bool, opFlags uint32) error {
 	if r.closed {
 		return ErrClosed
 	}
@@ -803,7 +814,7 @@ func (r *Ring) PrepareDataSync(file int, userData uint64, linked bool) error {
 		Opcode:    ioUringOpFsync,
 		Flags:     flags,
 		FD:        int32(file),
-		Operation: ioUringFsyncDataSync,
+		Operation: opFlags,
 	}, userData, -1, 0)
 }
 

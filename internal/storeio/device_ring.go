@@ -23,6 +23,7 @@ type ringDevice struct {
 	seen       []uint64
 	frameArena []byte
 	frameSize  int
+	powerSafe  bool
 	dsyncOff   bool
 	closed     bool
 }
@@ -45,7 +46,15 @@ func openRingDevice(file *os.File, options DeviceOptions) (*ringDevice, error) {
 		bufferSize: options.BufferSize,
 		buffers:    options.BufferCount,
 		seen:       make([]uint64, (options.BufferCount+63)/64),
+		powerSafe:  options.CheckpointSync == CheckpointSyncPowerSafe,
 	}, nil
+}
+
+func (d *ringDevice) prepareSync(userData uint64, linked bool) error {
+	if d.powerSafe {
+		return d.ring.PrepareSync(0, userData, linked)
+	}
+	return d.ring.PrepareDataSync(0, userData, linked)
 }
 
 func classifyRingSetupError(operation string, err error) error {
@@ -116,7 +125,7 @@ func (d *ringDevice) Commit(pages []Write, root Write) error {
 			return first
 		}
 	}
-	if d.dsyncOff {
+	if d.dsyncOff || d.powerSafe {
 		return d.commitRootWithSync(root, len(pages) != 0)
 	}
 
@@ -170,7 +179,7 @@ func (d *ringDevice) Commit(pages []Write, root Write) error {
 // linked root write, and final whole-file data sync sequence.
 func (d *ringDevice) commitRootWithSync(root Write, dataBarrier bool) error {
 	if dataBarrier {
-		if err := d.ring.PrepareDataSync(0, ringDataSyncTag, true); err != nil {
+		if err := d.prepareSync(ringDataSyncTag, true); err != nil {
 			return err
 		}
 	}
@@ -179,7 +188,7 @@ func (d *ringDevice) commitRootWithSync(root Write, dataBarrier bool) error {
 	); err != nil {
 		return err
 	}
-	if err := d.ring.PrepareDataSync(0, ringRootSyncTag, false); err != nil {
+	if err := d.prepareSync(ringRootSyncTag, false); err != nil {
 		return err
 	}
 	want := uint32(2)
@@ -214,7 +223,7 @@ func (d *ringDevice) commitRootWithSync(root Write, dataBarrier bool) error {
 }
 
 func (d *ringDevice) vectorCommitEligible(pages []Write, root Write) bool {
-	if d.dsyncOff || len(pages) == 0 ||
+	if d.dsyncOff || d.powerSafe || len(pages) == 0 ||
 		len(pages) > d.ring.vectorWriteCapacity() {
 		return false
 	}
@@ -472,9 +481,7 @@ func (d *ringDevice) materializationCombinedRootPhase(
 	if first != nil {
 		return true, false, first
 	}
-	if err := d.ring.PrepareDataSync(
-		0, ringDataSyncTag, false,
-	); err != nil {
+	if err := d.prepareSync(ringDataSyncTag, false); err != nil {
 		return true, false, err
 	}
 	if err := d.ring.SubmitAndWait(1); err != nil {
@@ -527,9 +534,7 @@ func (d *ringDevice) materializationPhase(writes []Write) error {
 	if first != nil {
 		return first
 	}
-	if err := d.ring.PrepareDataSync(
-		0, ringDataSyncTag, false,
-	); err != nil {
+	if err := d.prepareSync(ringDataSyncTag, false); err != nil {
 		return err
 	}
 	if err := d.ring.SubmitAndWait(1); err != nil {

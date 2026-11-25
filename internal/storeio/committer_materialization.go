@@ -654,10 +654,13 @@ func (c *Committer) commitMaterialized(device Device, batch *Batch) error {
 		callbacks.durable != nil {
 		callbacks.durable(batch.generation)
 	}
-	// Match the ordinary worker's physical-durable/callback-settled split.
-	c.settled.Store(batch.generation)
-	c.broadcast()
+	// Match the ordinary worker's physical-durable/callback-settled split:
+	// recycle staging buffers before waking Wait() so immediate admission sees
+	// the reclaimed capacity.
+	settledGeneration := batch.generation
 	c.release(batch)
+	c.settled.Store(settledGeneration)
+	c.broadcast()
 	return nil
 }
 
