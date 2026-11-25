@@ -157,18 +157,18 @@ func (c *Collection) setupPrimaryNativeFoldContexts() error {
 func (c *Collection) primaryNativeFoldContextEligible() bool {
 	return c != nil && c.buffered() && c.primaryUnifiedOverlay != nil &&
 		!c.options.OpaqueValues &&
-		c.options.Collection.Schema == nil && len(c.options.indexes) == 0
+		c.options.Collection.Schema == nil
 }
 
-// primaryNativeFoldEligible is the runtime use predicate. An online index
-// cutover may make a pool retained at construction ineligible later; recovery
-// replay likewise stays on the established serial fold. RecoveryJournal is not
-// a veto: preparation reads only the immutable compact base and overlay, while
-// allocation, staging, retirement, journal recycle, and whole-cut publication
-// remain on the exclusive writer goroutine.
+// primaryNativeFoldEligible is the runtime use predicate. Exact-index
+// maintenance is slot-preserving and folded separately after the primary leaf
+// loop, so PatchCompactPrimaryStripeReplacements (which preserves every row's
+// admitted PostingSlot and changes only replanned scalar streams) is safe for
+// indexed collections too. Online index builds and recovery replay stay on the
+// established serial fold.
 func (c *Collection) primaryNativeFoldEligible() bool {
 	return c != nil && len(c.primaryNativeFoldContexts) != 0 &&
-		c.primaryNativeFoldContextEligible() && c.primaryEpoch == nil &&
+		c.primaryNativeFoldContextEligible() &&
 		!c.onlineIndexBuild.Load() && !c.journalReplaying
 }
 

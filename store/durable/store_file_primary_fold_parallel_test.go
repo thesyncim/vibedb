@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibedb/store"
 )
 
 func primaryNativeFoldTestReplacement(t *testing.T, src []byte) []byte {
@@ -941,5 +942,52 @@ func TestFilePrimaryNativeFoldLaterWaveErrorAbortsAndRetries(t *testing.T) {
 	}
 	for _, index := range selected {
 		assertPrimaryRaw(t, collection, keys[index], updated[index], true)
+	}
+}
+
+func TestPrimaryNativeFoldIndexedCollectionPatchesAndPreservesExactIndex(t *testing.T) {
+	built, keys, values := buildRedundantPrimaryCorpus(t, 2_000)
+	options := Options{
+		Backend: BackendPortable, ResidentBytes: 32 << 20,
+		Durability: DurabilityBufferedVisible,
+		Indexes: []store.IndexDefinition{{
+			Name: "group", Paths: []string{"/group"},
+		}},
+	}
+	file := createPrimaryPointFile(
+		t, built, options, "indexed-native-fold.vibe",
+	)
+	defer file.Close()
+
+	collection, err := Open(file, options)
+	if err != nil {
+		t.Fatalf("open indexed collection: %v", err)
+	}
+	defer func() {
+		if closeErr := collection.Close(); closeErr != nil {
+			t.Errorf("close indexed collection: %v", closeErr)
+		}
+	}()
+	if !collection.primaryNativeFoldEligible() {
+		t.Fatalf("expected indexed collection to be native-fold eligible")
+	}
+
+	selected := primaryNativeFoldDistinctRows(t, collection, keys, 8)
+	updated := make([][]byte, len(selected))
+	for i, index := range selected {
+		updated[i] = primaryNativeFoldTestReplacement(t, values[index])
+		if _, err := collection.Put([]byte(keys[index]), updated[i]); err != nil {
+			t.Fatalf("put %s: %v", keys[index], err)
+		}
+	}
+	beforePatches := collection.Stats().PrimaryCompactColumnPatches
+	if err := collection.Flush(); err != nil {
+		t.Fatalf("flush indexed collection: %v", err)
+	}
+	if got := collection.Stats().PrimaryCompactColumnPatches - beforePatches; got == 0 {
+		t.Fatalf("expected compact column patches on indexed flush, got 0")
+	}
+	for i, index := range selected {
+		assertPrimaryRaw(t, collection, keys[index], updated[i], true)
 	}
 }

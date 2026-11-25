@@ -103,6 +103,22 @@ func NewNativeMapper(arity int) *NativeMapper {
 	return NewNativeMapperWithBucketBits(arity, DefaultVirtualBucketBits)
 }
 
+var nativeMapperTable = func() [KeyspaceWidth][MaxVirtualBucketBits - MinVirtualBucketBits + 1]NativeMapper {
+	var table [KeyspaceWidth][MaxVirtualBucketBits - MinVirtualBucketBits + 1]NativeMapper
+	for arity := 1; arity <= KeyspaceWidth; arity++ {
+		var prefixes PrefixSet
+		for l := 1; l <= arity; l++ {
+			prefixes |= 1 << uint(l)
+		}
+		for bits := MinVirtualBucketBits; bits <= MaxVirtualBucketBits; bits++ {
+			table[arity-1][bits-MinVirtualBucketBits] = NativeMapper{
+				arity: arity, prefixes: prefixes, bucketBits: uint8(bits),
+			}
+		}
+	}
+	return table
+}()
+
 // NewNativeMapperWithBucketBits returns the current native mapper with an
 // explicit virtual-bucket width. It panics for invalid static metadata; runtime
 // catalog construction validates the same bounds before calling it.
@@ -113,11 +129,7 @@ func NewNativeMapperWithBucketBits(arity int, bucketBits uint8) *NativeMapper {
 	if !ValidVirtualBucketBits(bucketBits) {
 		panic("distribution: NativeMapper virtual bucket bits must be in 8..24")
 	}
-	m := &NativeMapper{arity: arity, bucketBits: bucketBits}
-	for l := 1; l <= arity; l++ {
-		m.prefixes |= 1 << uint(l)
-	}
-	return m
+	return &nativeMapperTable[arity-1][bucketBits-MinVirtualBucketBits]
 }
 
 // Arity reports the component count of a full key.

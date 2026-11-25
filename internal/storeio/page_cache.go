@@ -1635,7 +1635,10 @@ func (c *PageCache) tryPinFrameReady(
 	}
 	if c.closing.Load() || frame.epoch.Load() != epoch ||
 		frame.state.Load() != uint32(pageCacheReady) || !matchFrameKey(frame, &key) {
-		frame.pins.Add(^uint32(0))
+		if frame.pins.Add(^uint32(0)) == 0 &&
+			frame.flags.Load()&pageCacheFrameDoomed != 0 {
+			c.releaseDoomedAny(index)
+		}
 		return false
 	}
 	// Pinned and stable. The install path publishes payloadLength and page
@@ -1863,6 +1866,28 @@ func (c *PageCache) releaseDoomed(index int, key pageCacheKey) {
 		// A racing reader can validate between the recheck and the reset;
 		// its abort is already guaranteed. On a transient report, keep the
 		// doomed frame: the next release retries on the same path.
+		if c.resetExtentLocked(index) {
+			c.cond.Broadcast()
+		}
+	}
+	frame.lock.Unlock()
+	c.mu.Unlock()
+}
+
+// releaseDoomedAny is the transient-abort counterpart to releaseDoomed: a
+// racing tryPinFrameReady that probed with a mismatched key can be the final
+// pins decrement (1 -> 0) after both the real holder's release and
+// MarkUnreachable observed pins != 0. Resetting any unpinned doomed frame at
+// index closes that stranding window.
+func (c *PageCache) releaseDoomedAny(index int) {
+	c.mu.Lock()
+	frame := &c.frames[index]
+	frame.lock.Lock()
+	drainFramePins(frame)
+	if frame.state.Load() == uint32(pageCacheReady) &&
+		frame.pins.Load() == 0 &&
+		frame.flags.Load()&pageCacheFrameWritePinned == 0 &&
+		frame.flags.Load()&pageCacheFrameDoomed != 0 {
 		if c.resetExtentLocked(index) {
 			c.cond.Broadcast()
 		}

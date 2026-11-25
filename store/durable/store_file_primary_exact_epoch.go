@@ -587,8 +587,8 @@ func (c *Collection) takePrimaryExactEpochLocked(indexCount int) *primaryExactEp
 // buffered mutations).
 type primaryExactBucketOverride struct {
 	bucket  storeio.BucketID
-	live    map[uint32]uint64
-	byIndex []map[string]map[uint32]uint64
+	live    [4]uint64
+	byIndex []exactBucketIndexContribution
 }
 
 // pendingTermHead resolves an entry's effective chain head when a prepared
@@ -696,8 +696,10 @@ func (c *Collection) resolvePrimaryExactState(
 			}
 		}
 	}
-	applyLiveOverride := func(bucketLive map[uint32]uint64) {
-		for tileID, bits := range bucketLive {
+	applyLiveOverride := func(bucket storeio.BucketID, bucketLive [4]uint64) {
+		for quadrant := uint32(0); quadrant < 4; quadrant++ {
+			bits := bucketLive[quadrant]
+			tileID := uint32(bucket)<<2 | quadrant
 			if bits == 0 {
 				delete(live, tileID)
 				continue
@@ -708,10 +710,10 @@ func (c *Collection) resolvePrimaryExactState(
 		}
 	}
 	if override != nil {
-		applyLiveOverride(override.live)
+		applyLiveOverride(override.bucket, override.live)
 	}
-	for _, contribution := range structural {
-		applyLiveOverride(contribution.live)
+	for bucket, contribution := range structural {
+		applyLiveOverride(bucket, contribution.live)
 	}
 
 	// Postings, per physical index: base first (skipping dropped tiles and
@@ -802,26 +804,30 @@ func (c *Collection) resolvePrimaryExactState(
 			}
 		}
 	}
-	applyTermOverride := func(contribution []map[string]map[uint32]uint64) {
+	applyTermOverride := func(bucket storeio.BucketID, contribution []exactBucketIndexContribution) {
 		for indexID := range contribution {
 			terms := byIndex[indexID]
-			for term, fresh := range contribution[indexID] {
+			contrib := &contribution[indexID]
+			for term, termID := range contrib.index {
+				masks := contrib.masks[termID]
 				tiles := terms[term]
 				if tiles == nil {
-					tiles = make(map[uint32]uint64, len(fresh))
+					tiles = make(map[uint32]uint64, 1)
 					terms[term] = tiles
 				}
-				for tileID, bits := range fresh {
-					tiles[tileID] |= bits
+				for quadrant := uint32(0); quadrant < 4; quadrant++ {
+					if masks[quadrant] != 0 {
+						tiles[uint32(bucket)<<2|quadrant] |= masks[quadrant]
+					}
 				}
 			}
 		}
 	}
 	if override != nil {
-		applyTermOverride(override.byIndex)
+		applyTermOverride(override.bucket, override.byIndex)
 	}
-	for _, contribution := range structural {
-		applyTermOverride(contribution.byIndex)
+	for bucket, contribution := range structural {
+		applyTermOverride(bucket, contribution.byIndex)
 	}
 	for indexID := range byIndex {
 		for term, tiles := range byIndex[indexID] {
