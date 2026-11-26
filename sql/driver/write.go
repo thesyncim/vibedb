@@ -511,11 +511,43 @@ func (d *database) createTableLockedContext(
 		primaryKeysMeta = pointers
 		tablePrimaries = primaries
 	}
+	schemaMetaVal := schemaMetaFrom(definition.Schema)
+	var checkSQLs []string
+	if ct := statement.Tree().CreateTable; ct != nil {
+		if schemaMetaVal != nil {
+			defaultByPath := make(map[string]string)
+			for _, col := range ct.Columns {
+				if col.HasDefault && col.DefaultSQL != "" && col.Path != nil {
+					defaultByPath[string(col.Path.AppendPointer(nil))] = col.DefaultSQL
+				}
+				if col.CheckSQL != "" {
+					checkSQLs = append(checkSQLs, col.CheckSQL)
+				}
+			}
+			for i := range schemaMetaVal.Fields {
+				if defSQL, ok := defaultByPath[schemaMetaVal.Fields[i].Path]; ok {
+					schemaMetaVal.Fields[i].DefaultSQL = defSQL
+				}
+			}
+		} else {
+			for _, col := range ct.Columns {
+				if col.CheckSQL != "" {
+					checkSQLs = append(checkSQLs, col.CheckSQL)
+				}
+			}
+		}
+		for _, chkSQL := range ct.CheckSQLs {
+			if chkSQL != "" {
+				checkSQLs = append(checkSQLs, chkSQL)
+			}
+		}
+	}
 	meta := &tableMeta{
 		PrimaryKey:  pointer,
 		PrimaryKeys: primaryKeysMeta,
-		Schema:      schemaMetaFrom(definition.Schema),
+		Schema:      schemaMetaVal,
 		Indexes:     uniqueIndexes,
+		Checks:      checkSQLs,
 		Storage:     storage,
 	}
 	candidate := &table{
@@ -1013,7 +1045,7 @@ func (c *conn) insertLocked(
 		}
 		document, key, err := resolveInsertRow(
 			statement, tree, &tree.Rows[i], args,
-			t.meta.PrimaryKey, t.primary, limits,
+			t.meta, t.primary, limits,
 		)
 		if err == nil && len(t.primaries) > 1 {
 			key, err = tableDocumentKey(t, document, limits.MaxKeyBytes)
@@ -1021,10 +1053,16 @@ func (c *conn) insertLocked(
 		if err != nil {
 			return nil, err
 		}
+		if err := validateCheckConstraints(t.meta, document); err != nil {
+			return nil, err
+		}
 		if tree.HasConflictAction() {
 			if err := validateDocument(
 				t.schema, document, limits.MaxDocumentBytes, &c.insertTape,
 			); err != nil {
+				return nil, err
+			}
+			if err := validateCheckConstraints(t.meta, document); err != nil {
 				return nil, err
 			}
 		}
@@ -1103,6 +1141,9 @@ func (c *conn) insertLocked(
 					t.schema, finalDocument, limits.MaxDocumentBytes,
 					&c.insertTape,
 				); err != nil {
+					return nil, err
+				}
+				if err := validateCheckConstraints(t.meta, finalDocument); err != nil {
 					return nil, err
 				}
 				// Keep UPDATE's shard-move error precedence even though primary-key
@@ -1670,7 +1711,7 @@ func resolveInsertRow(
 	insert *sqlast.InsertStmt,
 	row *sqlast.InsertRow,
 	args []any,
-	primaryKey string,
+	meta *tableMeta,
 	primary vibejson.CompiledPointer,
 	limits durable.Options,
 ) ([]byte, string, error) {
@@ -1692,11 +1733,15 @@ func resolveInsertRow(
 	if err != nil {
 		return nil, "", err
 	}
+	document, err = applyColumnDefaults(document, meta, limits.MaxDocumentBytes)
+	if err != nil {
+		return nil, "", err
+	}
 	if len(document) > limits.MaxDocumentBytes {
 		return nil, "", durable.ErrDocumentTooLarge
 	}
 	key, err := documentKey(
-		document, primaryKey, primary, limits.MaxKeyBytes,
+		document, meta.PrimaryKey, primary, limits.MaxKeyBytes,
 	)
 	return document, key, err
 }
@@ -2782,6 +2827,9 @@ func (c *conn) updateColumnsLockedReturning(
 			); err != nil {
 				return nil, err
 			}
+			if err := validateCheckConstraints(t.meta, document); err != nil {
+				return nil, err
+			}
 			if err := c.routeUpdate(statement, args, document); err != nil {
 				return nil, err
 			}
@@ -3083,6 +3131,9 @@ func (c *conn) updateFromJoinLockedReturning(
 			return nil, err
 		}
 		if err := validateDocument(t.schema, patched, limits.MaxDocumentBytes, &c.insertTape); err != nil {
+			return nil, err
+		}
+		if err := validateCheckConstraints(t.meta, patched); err != nil {
 			return nil, err
 		}
 		newKey, err := tableDocumentKey(t, patched, limits.MaxKeyBytes)

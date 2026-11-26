@@ -324,11 +324,19 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 				}
 				return nil, p.errfHere("an aggregate is not allowed in %s: rows are filtered before they are reduced; use HAVING", ctx)
 			}
-			arg, err := p.parseAggregateArgs(kind)
+			arg, distinctPos, _, err := p.parseAggregateArgsAllowDistinct(kind)
 			if err != nil {
 				return nil, err
 			}
 			agg, path = kind, arg
+			if distinctPos >= 0 {
+				node, tailErr := p.parseLeafTail(ctx, agg, path, leafPos)
+				if tailErr != nil {
+					return nil, tailErr
+				}
+				node.AggDistinct = true
+				return node, nil
+			}
 		case aggHeadOnly:
 			p2, err := p.continuePath(head, false)
 			if err != nil {

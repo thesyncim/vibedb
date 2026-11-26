@@ -42,6 +42,8 @@ const (
 	msgBindComplete    = '2'
 	msgCloseComplete   = '3'
 	msgCommandComplete = 'C'
+	msgCopyInResponse  = 'G'
+	msgCopyOutResponse = 'H'
 	msgDataRow         = 'D'
 	msgEmptyQuery      = 'I'
 	msgErrorResponse   = 'E'

@@ -179,7 +179,8 @@ func (p *postgresWriteStatement) execGeneralDeleteOrUpdate(
 		if !ok || setParamCount > len(params) {
 			return nil, ErrReplicatedSQLTransactionUnsupported
 		}
-		selectSQL := `SELECT "$doc" FROM ` + whereTail
+		targetRef := extractTargetAliasOrTable(strings.TrimSpace(p.text[len("UPDATE"):findTopLevelKeyword(strings.ToUpper(p.text), "SET")]), p.table)
+		selectSQL := `SELECT ` + targetRef + `."$doc" FROM ` + whereTail
 		filterParams := params[setParamCount:]
 		var filterParamTypes []shardservice.Param
 		_ = filterParamTypes
@@ -280,7 +281,29 @@ func buildSelectFromDelete(text, table string) string {
 	if tail == "" {
 		return `SELECT "$doc" FROM ` + quoteSQLIdentifier(table)
 	}
+	// Rewrite PostgreSQL DELETE FROM t [alias] USING u ... into
+	// SELECT <target>."$doc" FROM t [alias] CROSS JOIN u ...
+	if usingIdx := findTopLevelKeyword(strings.ToUpper(tail), "USING"); usingIdx >= 0 {
+		beforeUsing := strings.TrimSpace(tail[:usingIdx])
+		afterUsing := strings.TrimSpace(tail[usingIdx+len("USING"):])
+		targetRef := extractTargetAliasOrTable(strings.TrimSpace(beforeUsing[len("FROM"):]), table)
+		return `SELECT ` + targetRef + `."$doc" ` + beforeUsing + ` CROSS JOIN ` + afterUsing
+	}
 	return `SELECT "$doc" ` + tail
+}
+
+func extractTargetAliasOrTable(spec, fallback string) string {
+	fields := strings.Fields(spec)
+	if len(fields) == 0 {
+		return quoteSQLIdentifier(fallback)
+	}
+	if len(fields) >= 3 && strings.EqualFold(fields[1], "AS") {
+		return fields[2]
+	}
+	if len(fields) >= 2 {
+		return fields[1]
+	}
+	return fields[0]
 }
 
 func splitUpdateForGeneralRewrite(text, table string) (setPrefix, whereTail string, setParams int, ok bool) {
@@ -301,7 +324,7 @@ func splitUpdateForGeneralRewrite(text, table string) (setPrefix, whereTail stri
 	afterSet := trimmed[setIdx:]
 	upperAfterSet := strings.ToUpper(afterSet)
 	tailIdx := -1
-	for _, kw := range []string{"WHERE", "ORDER", "LIMIT"} {
+	for _, kw := range []string{"FROM", "WHERE", "ORDER", "LIMIT"} {
 		if idx := findTopLevelKeyword(upperAfterSet, kw); idx >= 0 && (tailIdx < 0 || idx < tailIdx) {
 			tailIdx = idx
 		}
@@ -311,7 +334,12 @@ func splitUpdateForGeneralRewrite(text, table string) (setPrefix, whereTail stri
 		whereTail = afterUpdate
 	} else {
 		setPrefix = strings.TrimSpace(trimmed[:setIdx+tailIdx])
-		whereTail = afterUpdate + " " + strings.TrimSpace(afterSet[tailIdx:])
+		tail := strings.TrimSpace(afterSet[tailIdx:])
+		if strings.HasPrefix(strings.ToUpper(tail), "FROM") && len(tail) > 4 && (tail[4] == ' ' || tail[4] == '\t' || tail[4] == '\n') {
+			whereTail = afterUpdate + " CROSS JOIN " + strings.TrimSpace(tail[4:])
+		} else {
+			whereTail = afterUpdate + " " + tail
+		}
 	}
 	setParams = countQuestionPlaceholders(setPrefix)
 	return setPrefix, whereTail, setParams, true

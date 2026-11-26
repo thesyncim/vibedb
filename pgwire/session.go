@@ -239,6 +239,8 @@ type prepared struct {
 	fixed *fixedResult
 	// set is the decoded SET or RESET.
 	set setCommand
+	// copy is the decoded COPY FROM STDIN / TO STDOUT command.
+	copy *copyCommand
 	// cols is the RowDescription, empty for a statement that returns no rows.
 	cols []column
 	// tag is the CommandComplete tag for a statement with no row count.
@@ -1342,6 +1344,14 @@ func (s *session) prepare(
 		}
 		p.tag = "DISCARD"
 		return p, nil
+
+	case kindCopy:
+		cmd, err := parseCopyCommand(text)
+		if err != nil {
+			return nil, err
+		}
+		p.copy = cmd
+		return p, nil
 	}
 
 	// A SELECT tries the compatibility shim before the stored-row front end.
@@ -1725,6 +1735,9 @@ func (s *session) execute(p *portal, limit int32) error {
 		_ = s.takeCancel()
 		s.w.commandComplete(stmt.tag)
 		return nil
+
+	case stmt.kind == kindCopy:
+		return s.executeCopy(stmt.copy)
 
 	case stmt.fixed != nil:
 		return s.executeFixed(p, limit)

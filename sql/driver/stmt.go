@@ -1192,6 +1192,9 @@ func (s *stmt) exec(ctx context.Context, args []any) (sqldriver.Result, error) {
 	if s.conn.open {
 		return nil, errors.New("vibedb: close the current rows before executing another statement on this connection")
 	}
+	if s.tree != nil && s.tree.Kind == sqlast.KindCreateTable && s.tree.CreateTable != nil && s.tree.CreateTable.AsQuery != nil {
+		return s.conn.execCreateTableAsSelect(ctx, s.tree.CreateTable, args)
+	}
 	if s.tree != nil && isSavepointKind(s.tree.Kind) {
 		if s.conn.tx == nil {
 			return nil, ErrNoTransaction

@@ -15,6 +15,9 @@ func (c *conn) validateSurfaceContext(
 ) error {
 	switch statement.Kind {
 	case sqlast.KindCreateTable:
+		if statement.CreateTable.AsQuery != nil {
+			return nil
+		}
 		if len(statement.CreateTable.PrimaryKey) == 0 || len(statement.CreateTable.PrimaryKey) > 4 {
 			return fmt.Errorf("vibedb: CREATE TABLE requires between 1 and 4 PRIMARY KEY JSON paths")
 		}
