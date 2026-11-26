@@ -152,6 +152,12 @@ func (lx *lexer) next() token {
 	case '.':
 		return token{kind: tokDot, pos: start}
 	case '?':
+		if lx.accept('|') {
+			return token{kind: tokJSONAnyKey, pos: start}
+		}
+		if lx.accept('&') {
+			return token{kind: tokJSONAllKeys, pos: start}
+		}
 		return token{kind: tokParam, pos: start}
 	case '=':
 		// `==>` is the full-text match operator; a bare `=` stays equality
@@ -180,6 +186,9 @@ func (lx *lexer) next() token {
 		}
 		if lx.accept('>') {
 			return token{kind: tokNe, pos: start}
+		}
+		if lx.accept('@') {
+			return token{kind: tokContainedBy, pos: start}
 		}
 		return token{kind: tokLt, pos: start}
 	case '>':

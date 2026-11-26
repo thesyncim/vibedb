@@ -90,7 +90,7 @@ func scalarStarts(tok token) bool {
 			return true
 		}
 		return tok.kw == kwTrue || tok.kw == kwFalse || tok.kw == kwNull ||
-			tok.kw == kwCase || tok.kw == kwCast
+			tok.kw == kwCase || tok.kw == kwCast || tokenTextEqual(tok, "ARRAY")
 	default:
 		return false
 	}
@@ -526,6 +526,39 @@ func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) 
 	}
 	if fnName, ok := builtinScalarFuncName(p.tok); ok {
 		return p.parseBuiltinScalarFunc(fnName, ctx)
+	}
+	if p.tok.kind == tokIdent && tokenTextEqual(p.tok, "ARRAY") {
+		head := p.tok
+		p.advance()
+		if p.tok.kind == tokLBracket {
+			p.advance() // '['
+			node := p.newScalar(ScalarFunc, head.pos)
+			node.Value = Operand{Kind: OperandString, Text: "jsonb_build_array", Pos: head.pos}
+			if p.tok.kind != tokRBracket {
+				for {
+					elem, err := p.parseScalarExpression(ctx)
+					if err != nil {
+						return nil, err
+					}
+					node.Whens = append(node.Whens, ScalarWhen{Result: elem, Pos: elem.Pos})
+					if p.tok.kind != tokComma {
+						break
+					}
+					p.advance()
+				}
+			}
+			if err := p.expect(tokRBracket, "']' after ARRAY[...] elements"); err != nil {
+				return nil, err
+			}
+			return node, nil
+		}
+		path, err := p.continuePath(head, ctx == scalarSelect)
+		if err != nil {
+			return nil, p.normalizeUpdateScalarPrimaryError(ctx, pos, err)
+		}
+		node := p.newScalar(ScalarPath, path.Pos)
+		node.Path = path
+		return node, nil
 	}
 	if target, supported, known := scalarTypedStringHead(p.tok); known {
 		head := p.tok

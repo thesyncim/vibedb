@@ -1036,6 +1036,10 @@ func (s *Statement) leafForm(e *sqlast.Expr, args []any) (leafForm, error) {
 		return s.likeForm(e, args)
 	case sqlast.ExprRegex:
 		return s.regexForm(e, args)
+	case sqlast.ExprJSONExists:
+		return s.jsonExistsForm(e, args)
+	case sqlast.ExprArrayQuant:
+		return s.arrayQuantForm(e, args)
 	case sqlast.ExprMatch:
 		return s.matchForm(e, args)
 	default:
@@ -1131,6 +1135,52 @@ func (s *Statement) regexForm(e *sqlast.Expr, args []any) (leafForm, error) {
 		pred = IRegex(s.spec(e.Path), pattern)
 	}
 	return leafForm{pred: pred, guard: isString(s.spec(e.Path))}, nil
+}
+
+func (s *Statement) jsonExistsForm(e *sqlast.Expr, args []any) (leafForm, error) {
+	if len(e.List) > 0 {
+		keys := make([]any, 0, len(e.List))
+		for _, op := range e.List {
+			if s.prepareMode && op.Kind == sqlast.OperandParam {
+				keys = append(keys, "")
+				continue
+			}
+			v, known, err := s.operand(op, args)
+			if err != nil {
+				return leafForm{}, err
+			}
+			if !known {
+				return leafForm{noTrue: true, noFalse: true}, nil
+			}
+			keys = append(keys, v)
+		}
+		return leafForm{pred: JSONExists(s.spec(e.Path), e.Insensitive, keys...), total: true}, nil
+	}
+	if s.prepareMode && e.Value.Kind == sqlast.OperandParam {
+		return leafForm{pred: JSONExists(s.spec(e.Path), false, ""), total: true}, nil
+	}
+	v, known, err := s.operand(e.Value, args)
+	if err != nil {
+		return leafForm{}, err
+	}
+	if !known {
+		return leafForm{noTrue: true, noFalse: true}, nil
+	}
+	return leafForm{pred: JSONExists(s.spec(e.Path), false, v), total: true}, nil
+}
+
+func (s *Statement) arrayQuantForm(e *sqlast.Expr, args []any) (leafForm, error) {
+	if s.prepareMode && e.Value.Kind == sqlast.OperandParam {
+		return leafForm{pred: ArrayQuant(s.spec(e.Path), Op(e.Op), e.Insensitive, ""), total: true}, nil
+	}
+	v, known, err := s.operand(e.Value, args)
+	if err != nil {
+		return leafForm{}, err
+	}
+	if !known {
+		return leafForm{noTrue: true, noFalse: true}, nil
+	}
+	return leafForm{pred: ArrayQuant(s.spec(e.Path), Op(e.Op), e.Insensitive, v), total: true}, nil
 }
 
 // matchForm lowers Path ==> 'tinql'. It mirrors likeForm: a parameterized

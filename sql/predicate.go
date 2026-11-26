@@ -456,7 +456,11 @@ func (p *Parser) parseScalarCondition(
 	if !ok {
 		return nil, p.errHere("expected a comparison operator or IS [NOT] NULL after a computed scalar expression")
 	}
+	opPos := p.tok.pos
 	p.advance()
+	if isArrayQuantifierToken(p.tok) {
+		return p.parseScalarArrayQuantTail(left, op, pos, opPos)
+	}
 	right, err := p.parseScalarExpression(scalarCtx)
 	if err != nil {
 		return nil, err
@@ -631,6 +635,12 @@ func (p *Parser) parseLeafTail(
 	if p.tok.kind == tokMatch {
 		return p.parseMatchTail(agg, path, pos, negated)
 	}
+	if p.tok.kind == tokParam {
+		return p.parseJSONKeyExistsTail(agg, path, pos)
+	}
+	if p.tok.kind == tokJSONAnyKey || p.tok.kind == tokJSONAllKeys {
+		return p.parseJSONMultiKeyExistsTail(agg, path, pos, p.tok.kind == tokJSONAllKeys)
+	}
 	if isRegexOp(p.tok.kind) {
 		return p.parsePathRegexTail(ctx, agg, path, pos)
 	}
@@ -640,6 +650,9 @@ func (p *Parser) parseLeafTail(
 	}
 	operatorPos := p.tok.pos
 	p.advance()
+	if isArrayQuantifierToken(p.tok) {
+		return p.parsePathArrayQuantTail(agg, path, op, pos, operatorPos)
+	}
 	pathComparison := ctx == ctxWhere || ctx == ctxJoin || p.inCaseTruth() ||
 		p.correlation != nil && p.correlation.capture != nil
 	if fnName, ok := builtinScalarFuncName(p.tok); ok {
@@ -878,6 +891,151 @@ func rewriteLikeEscapeToBackslash(pattern, esc string) string {
 
 func isRegexOp(k tokenKind) bool {
 	return k == tokRegexMatch || k == tokRegexIMatch || k == tokRegexNotMatch || k == tokRegexNotIMatch
+}
+
+func isArrayQuantifierToken(tok token) bool {
+	return tok.kind == tokIdent && (tokenTextEqual(tok, "ANY") || tokenTextEqual(tok, "SOME") || tokenTextEqual(tok, "ALL"))
+}
+
+func (p *Parser) parseJSONKeyExistsTail(agg AggKind, path *PathExpr, pos int) (*Expr, error) {
+	if agg != AggNone {
+		return nil, p.errHere("JSONB '?' does not apply to an aggregate result")
+	}
+	p.advance() // '?'
+	key, err := p.parseOperand()
+	if err != nil {
+		return nil, err
+	}
+	if key.Kind != OperandString && key.Kind != OperandParam {
+		return nil, p.errAt(key.Pos, "JSONB '?' key must be a string literal or placeholder")
+	}
+	e := p.exprs.one()
+	*e = Expr{Kind: ExprJSONExists, Column: -1, Path: path, Value: key, Pos: pos}
+	return e, nil
+}
+
+func (p *Parser) parseJSONMultiKeyExistsTail(agg AggKind, path *PathExpr, pos int, allKeys bool) (*Expr, error) {
+	if agg != AggNone {
+		return nil, p.errHere("JSONB '?|' / '?&' does not apply to an aggregate result")
+	}
+	p.advance() // '?|' or '?&'
+	var closeKind tokenKind
+	if p.tok.kind == tokIdent && tokenTextEqual(p.tok, "ARRAY") {
+		p.advance()
+		if err := p.expect(tokLBracket, "'[' after ARRAY"); err != nil {
+			return nil, err
+		}
+		closeKind = tokRBracket
+	} else if p.tok.kind == tokLParen {
+		p.advance()
+		closeKind = tokRParen
+	} else {
+		return nil, p.errHere("expected ARRAY[...] or (...) after JSONB '?|' / '?&'")
+	}
+	start := len(p.opScratch)
+	if p.tok.kind != closeKind {
+		for {
+			op, err := p.parseOperand()
+			if err != nil {
+				return nil, err
+			}
+			if op.Kind != OperandString && op.Kind != OperandParam {
+				return nil, p.errAt(op.Pos, "JSONB '?|' / '?&' keys must be strings or placeholders")
+			}
+			p.opScratch = append(p.opScratch, op)
+			if p.tok.kind != tokComma {
+				break
+			}
+			p.advance()
+		}
+	}
+	if err := p.expect(closeKind, "closing delimiter after JSONB key list"); err != nil {
+		return nil, err
+	}
+	list := p.ops.allocDirty(len(p.opScratch) - start)
+	copy(list, p.opScratch[start:])
+	p.opScratch = p.opScratch[:start]
+	e := p.exprs.one()
+	*e = Expr{Kind: ExprJSONExists, Insensitive: allKeys, Column: -1, Path: path, List: list, Pos: pos}
+	return e, nil
+}
+
+func (p *Parser) parseScalarArrayQuantTail(left *ScalarExpr, op CmpOp, pos, opPos int) (*Expr, error) {
+	isAll := tokenTextEqual(p.tok, "ALL")
+	p.advance() // ANY / SOME / ALL
+	if err := p.expect(tokLParen, "'(' after ANY/ALL"); err != nil {
+		return nil, err
+	}
+	arrPath, err := p.parsePath(false)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expect(tokRParen, "')' after ANY/ALL array"); err != nil {
+		return nil, err
+	}
+	if left.Kind != ScalarLiteral {
+		return nil, newFeatureNotSupportedError(p.lx.src, opPos, "ANY/ALL currently requires a literal or parameter on the left")
+	}
+	e := p.exprs.one()
+	*e = Expr{
+		Kind:        ExprArrayQuant,
+		Op:          op,
+		Insensitive: isAll,
+		Column:      -1,
+		Path:        arrPath,
+		Value:       left.Value,
+		Pos:         pos,
+	}
+	return e, nil
+}
+
+func (p *Parser) parsePathArrayQuantTail(agg AggKind, path *PathExpr, op CmpOp, pos, opPos int) (*Expr, error) {
+	isAll := tokenTextEqual(p.tok, "ALL")
+	p.advance() // ANY / SOME / ALL
+	if err := p.expect(tokLParen, "'(' after ANY/ALL"); err != nil {
+		return nil, err
+	}
+	if p.tok.kind == tokIdent && tokenTextEqual(p.tok, "ARRAY") {
+		p.advance()
+		if err := p.expect(tokLBracket, "'[' after ARRAY"); err != nil {
+			return nil, err
+		}
+		start := len(p.opScratch)
+		if p.tok.kind != tokRBracket {
+			for {
+				v, err := p.parseOperand()
+				if err != nil {
+					return nil, err
+				}
+				p.opScratch = append(p.opScratch, v)
+				if p.tok.kind != tokComma {
+					break
+				}
+				p.advance()
+			}
+		}
+		if err := p.expect(tokRBracket, "']' after ARRAY[...]"); err != nil {
+			return nil, err
+		}
+		if err := p.expect(tokRParen, "')' after ANY/ALL(...)"); err != nil {
+			return nil, err
+		}
+		list := p.ops.allocDirty(len(p.opScratch) - start)
+		copy(list, p.opScratch[start:])
+		p.opScratch = p.opScratch[:start]
+		if !isAll && op == OpEq {
+			e := p.exprs.one()
+			*e = Expr{Kind: ExprIn, Agg: agg, Column: -1, Path: path, List: list, Pos: pos}
+			return e, nil
+		}
+		if isAll && op == OpNe {
+			e := p.exprs.one()
+			*e = Expr{Kind: ExprIn, Negated: true, Agg: agg, Column: -1, Path: path, List: list, Pos: pos}
+			return e, nil
+		}
+		return nil, newFeatureNotSupportedError(p.lx.src, opPos, "only = ANY(ARRAY[...]) and <> ALL(ARRAY[...]) are supported on ARRAY literals")
+	}
+	return nil, newFeatureNotSupportedError(p.lx.src, opPos, "expected ARRAY[...] inside path <op> ANY/ALL(...)")
 }
 
 // parsePathRegexTail lowers Path ~ / ~* / !~ / !~* Pattern into a first-class
