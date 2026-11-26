@@ -87,15 +87,11 @@ type journalCommitGroup struct {
 	synced          uint64
 	syncedBytes     uint64
 	syncedMutations uint64
-	// syncing is true while a leader holds a sync in flight; arrivals queue and
-	// are taken by the next leader, so the device's own sync latency is the
-	// natural, self-tuning group window.
-	syncing bool
-	// syncCaptured distinguishes the coalescing window from the device barrier.
-	// Before capture, every deposited ticket belongs to the pending fence. After
-	// capture, syncingThrough is its immutable upper bound; later deposits belong
-	// to a possible following fence.
-	syncCaptured   bool
+	// syncState tracks the group leader's explicit lifecycle:
+	//   journalSyncIdle      -> no sync leader active
+	//   journalSyncLingering -> leader elected, in coalescing window before capture
+	//   journalSyncInFlight  -> device Sync in flight covering <= syncingThrough
+	syncState      journalSyncState
 	syncingThrough uint64
 	// failedSyncThrough and failedSync retain the exact per-ticket outcome of a
 	// failed device fence independently from the collection's first sticky
@@ -108,6 +104,14 @@ type journalCommitGroup struct {
 	// overrides a stronger per-ticket result.
 	failed error
 }
+
+type journalSyncState uint8
+
+const (
+	journalSyncIdle journalSyncState = iota
+	journalSyncLingering
+	journalSyncInFlight
+)
 
 // initJournalGroupLocked wires the sequencer to the paired journal. It is called
 // under c.writer from openRecoveryJournalLocked, before the collection is
@@ -124,8 +128,7 @@ func (c *Collection) initJournalGroupLocked() {
 	g.synced = 0
 	g.syncedBytes = 0
 	g.syncedMutations = 0
-	g.syncing = false
-	g.syncCaptured = false
+	g.syncState = journalSyncIdle
 	g.syncingThrough = 0
 	g.failedSyncThrough = 0
 	g.failedSync = nil
@@ -202,7 +205,8 @@ func (c *Collection) journalGroupAwait(target uint64) error {
 			// During coalescing the eventual capture still includes every current
 			// deposit. During Sync, only tickets at or below syncingThrough are
 			// covered. Do not let the fallback race ahead of that fence result.
-			if g.syncing && (!g.syncCaptured || target <= g.syncingThrough) {
+			if g.syncState == journalSyncLingering ||
+				(g.syncState == journalSyncInFlight && target <= g.syncingThrough) {
 				g.cond.Wait()
 				continue
 			}
@@ -210,13 +214,12 @@ func (c *Collection) journalGroupAwait(target uint64) error {
 			g.mu.Unlock()
 			return err
 		}
-		if g.syncing {
+		if g.syncState != journalSyncIdle {
 			g.cond.Wait()
 			continue
 		}
 		// Become the leader for one sync covering everything appended so far.
-		g.syncing = true
-		g.syncCaptured = false
+		g.syncState = journalSyncLingering
 		g.syncingThrough = 0
 		g.mu.Unlock()
 		if g.linger > 0 {
@@ -226,10 +229,20 @@ func (c *Collection) journalGroupAwait(target uint64) error {
 			time.Sleep(g.linger)
 		}
 		g.mu.Lock()
+		// A concurrent checkpoint recycle may have folded all deposited records
+		// or a concurrent append error may have poisoned the journal while this
+		// leader lingered. Never issue a device Sync after poison or with zero
+		// unsynced records.
+		if g.deposited <= g.synced || g.failed != nil {
+			g.syncState = journalSyncIdle
+			g.syncingThrough = 0
+			g.cond.Broadcast()
+			continue
+		}
 		captured := g.deposited
 		capturedBytes := g.depositedBytes
 		capturedMutations := g.depositedMutations
-		g.syncCaptured = true
+		g.syncState = journalSyncInFlight
 		g.syncingThrough = captured
 		groupSize := captured - g.synced
 		groupBytes := capturedBytes - g.syncedBytes
@@ -253,8 +266,7 @@ func (c *Collection) journalGroupAwait(target uint64) error {
 				g.failedSyncThrough = captured
 				g.failedSync = fence
 			}
-			g.syncing = false
-			g.syncCaptured = false
+			g.syncState = journalSyncIdle
 			g.syncingThrough = 0
 			g.cond.Broadcast()
 			// Loop under the mutex: a concurrent recycle may already have made
@@ -274,8 +286,7 @@ func (c *Collection) journalGroupAwait(target uint64) error {
 			}
 		}
 		g.mu.Lock()
-		g.syncing = false
-		g.syncCaptured = false
+		g.syncState = journalSyncIdle
 		g.syncingThrough = 0
 		if captured > g.synced {
 			g.synced = captured

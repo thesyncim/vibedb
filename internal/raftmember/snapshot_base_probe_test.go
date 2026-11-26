@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/raftmodel"
+	"github.com/thesyncim/vibedb/internal/raftstore"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
@@ -13,7 +14,10 @@ import (
 func TestPipelinedRuntimeProbesRetainedBaseAfterLostFollowerProgress(t *testing.T) {
 	identity := testWALIdentity(242)
 	local, peer := identity.MemberID, identity.MemberID+1
-	fixture := newRuntimeFixtureWithPipeline(t, 242, []uint64{local, peer}, testWALOptions(), true)
+	walOpts := testWALOptions()
+	walOpts.MaxFileBytes = 256 << 20
+	walOpts.MaxLiveBytes = 2 * raftstore.MinimumReadyLiveBytes
+	fixture := newRuntimeFixtureWithPipeline(t, 242, []uint64{local, peer}, walOpts, true)
 	owner := fixture.runtime
 	wake := make(chan struct{}, 1)
 	owner.SetPipelinedWake(func() {

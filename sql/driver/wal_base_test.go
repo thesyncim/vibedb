@@ -525,7 +525,7 @@ func TestReplicatedApplyCaptureWALBaseRejectsWorkspaceBeforeSeal(t *testing.T) {
 	if after := group.Stats(); after != before {
 		t.Fatalf("invalid workspace sealed a cut: before=%+v after=%+v", before, after)
 	}
-	if claim.walBaseCaptureActive {
+	if claim.walBaseState == walBaseCaptureActive {
 		t.Fatal("invalid workspace retained capture ownership")
 	}
 }
@@ -809,8 +809,8 @@ func TestReplicatedApplyCaptureWALBaseProgressesAcrossCheckpointChurn(t *testing
 	if err := claim.ValidateWALBasePreparation(result.preparation); err != nil {
 		t.Fatalf("validate pinned preparation after suffix: %v", err)
 	}
-	if scans.Load() != 1 || claim.walBaseCaptureActive {
-		t.Fatalf("capture cleanup = scans %d active %t", scans.Load(), claim.walBaseCaptureActive)
+	if scans.Load() != 1 || claim.walBaseState == walBaseCaptureActive {
+		t.Fatalf("capture cleanup = scans %d state %v", scans.Load(), claim.walBaseState)
 	}
 	if err := claim.ClaimRuntimeOwnership(database); err != nil {
 		t.Fatalf("retry ClaimRuntimeOwnership after capture: %v", err)

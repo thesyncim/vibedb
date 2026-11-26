@@ -301,10 +301,23 @@ type readDelivery struct {
 	generation          *ownerGeneration
 }
 
+const (
+	ownerGenStateShift = 62
+	ownerGenPinMask    = (uint64(1) << ownerGenStateShift) - 1
+
+	ownerGenActive          uint64 = 0 << ownerGenStateShift
+	ownerGenFenced          uint64 = 1 << ownerGenStateShift
+	ownerGenQuiescing       uint64 = 2 << ownerGenStateShift
+	ownerGenFencedQuiescing uint64 = 3 << ownerGenStateShift
+	ownerGenStateMask       uint64 = 3 << ownerGenStateShift
+)
+
+// ownerGeneration packs its 4-state lifecycle (Active, Fenced, Quiescing,
+// FencedQuiescing) in the top 2 bits and its active pin count in the low 62
+// bits of a single atomic.Uint64. This makes acquire/quiesce/fence/resume
+// single-word atomic transitions with zero spurious cross-atomic failures.
 type ownerGeneration struct {
-	pins             atomic.Int64
-	transitionFenced atomic.Bool
-	quiescing        atomic.Bool
+	state atomic.Uint64
 }
 
 // sharedReadBarrier freezes eligibility before ReadIndex is invoked. Only
@@ -317,38 +330,89 @@ type sharedReadBarrier struct {
 	term       uint64
 }
 
+func (generation *ownerGeneration) active() bool {
+	return generation != nil && generation.state.Load()&ownerGenStateMask == ownerGenActive
+}
+
+func (generation *ownerGeneration) isQuiescing() bool {
+	return generation != nil && generation.state.Load() >= ownerGenQuiescing
+}
+
+func (generation *ownerGeneration) pinCount() uint64 {
+	if generation == nil {
+		return 0
+	}
+	return generation.state.Load() & ownerGenPinMask
+}
+
 func (generation *ownerGeneration) acquire() bool {
-	if generation == nil || generation.transitionFenced.Load() || generation.quiescing.Load() {
+	if generation == nil {
 		return false
 	}
-	generation.pins.Add(1)
-	if generation.transitionFenced.Load() || generation.quiescing.Load() {
-		generation.pins.Add(-1)
-		return false
+	for {
+		cur := generation.state.Load()
+		if cur&ownerGenStateMask != ownerGenActive {
+			return false
+		}
+		if generation.state.CompareAndSwap(cur, cur+1) {
+			return true
+		}
 	}
-	return true
 }
 
 func (generation *ownerGeneration) release() {
 	if generation != nil {
-		generation.pins.Add(-1)
+		generation.state.Add(^uint64(0))
+	}
+}
+
+func (generation *ownerGeneration) fence() {
+	if generation == nil {
+		return
+	}
+	for {
+		cur := generation.state.Load()
+		state := cur & ownerGenStateMask
+		if state == ownerGenFenced || state == ownerGenFencedQuiescing {
+			return
+		}
+		nextState := ownerGenFenced
+		if state == ownerGenQuiescing {
+			nextState = ownerGenFencedQuiescing
+		}
+		if generation.state.CompareAndSwap(cur, nextState|(cur&ownerGenPinMask)) {
+			return
+		}
 	}
 }
 
 func (generation *ownerGeneration) quiesce() bool {
-	if generation == nil || !generation.quiescing.CompareAndSwap(false, true) {
+	if generation == nil {
 		return false
 	}
-	if generation.pins.Load() != 0 {
-		generation.quiescing.Store(false)
-		return false
+	for {
+		cur := generation.state.Load()
+		if cur&ownerGenPinMask != 0 {
+			return false
+		}
+		switch cur & ownerGenStateMask {
+		case ownerGenActive:
+			if generation.state.CompareAndSwap(cur, ownerGenQuiescing) {
+				return true
+			}
+		case ownerGenFenced:
+			if generation.state.CompareAndSwap(cur, ownerGenFencedQuiescing) {
+				return true
+			}
+		default:
+			return false
+		}
 	}
-	return true
 }
 
 func (generation *ownerGeneration) resume() {
 	if generation != nil {
-		generation.quiescing.Store(false)
+		generation.state.CompareAndSwap(ownerGenQuiescing, ownerGenActive)
 	}
 }
 
@@ -791,10 +855,17 @@ type Owner struct {
 	// a cancellation racing settlement can therefore only cause an extra pass.
 	transferCancelWake   atomic.Uint32
 	pendingTransferSweep int
-	started              bool
-	closed               bool
+	state                ownerLifecycleState
 	failure              error
 }
+
+type ownerLifecycleState uint8
+
+const (
+	ownerReady ownerLifecycleState = iota
+	ownerRunning
+	ownerClosed
+)
 
 // ownerHost is the complete narrow capability used by one serialized owner.
 // Both a standalone Host and a lane-scoped ExecutionLanes view satisfy it.
@@ -867,13 +938,20 @@ type configurationReplayAuthority interface {
 	) error
 }
 
+type ownerMemberState uint8
+
+const (
+	memberServing ownerMemberState = iota
+	memberProposalQuiesced
+	memberRetiring
+)
+
 type ownerMember struct {
 	identity          raftmember.RuntimeIdentity
 	command           CommandFence
 	read              ReadSource
 	recovery          TransactionRecoverySource
-	retiring          bool
-	proposalQuiesced  bool
+	state             ownerMemberState
 	generation        *ownerGeneration
 	permit            *servingFencePermit
 	pointReadSlot     *pointReadViewSlot
@@ -1155,11 +1233,11 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 		return ErrInvalidOwner
 	}
 	owner.mu.Lock()
-	if owner.started || owner.closed {
+	if owner.state != ownerReady {
 		owner.mu.Unlock()
 		return ErrOwnerClosed
 	}
-	owner.started = true
+	owner.state = ownerRunning
 	if owner.transferNotify == nil {
 		owner.transferNotify = make(chan struct{}, 1)
 	}
@@ -1650,19 +1728,19 @@ func (owner *Owner) handle(request ownerRequest) error {
 			// a catalog that still names the previous ownership cannot become
 			// an admitted unknown. The refusal is cleared once this proposal
 			// carries the applied epochs.
-			if member.proposalQuiesced {
-				member.proposalQuiesced = false
+			if member.state == memberProposalQuiesced {
+				member.state = memberServing
 				owner.storeOwnerMember(request.group, member)
 			}
 			reply.err = ErrServingFence
 			break
 		}
-		if member.proposalQuiesced && replication.IsDataAuthority(command.AuthorityClass) {
+		if member.state == memberProposalQuiesced && replication.IsDataAuthority(command.AuthorityClass) {
 			// Once the applied epochs have moved, a command that matches them
 			// is the post-publish write and must be admitted. Until then, user
 			// data stays out of the registry while topology still runs.
 			if owner.memberEpochsLagApplied(request.group, member.command) {
-				member.proposalQuiesced = false
+				member.state = memberServing
 				owner.storeOwnerMember(request.group, member)
 			} else {
 				reply.err = raftserve.ErrProposalRefused
@@ -1701,7 +1779,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 			(request.inbound.Message == nil) == (request.inbound.Authority == nil) {
 			reply.err = ErrInvalidOwner
 		} else if member, found := owner.members[request.group]; found &&
-			member.generation != nil && member.generation.quiescing.Load() {
+			member.generation.isQuiescing() {
 			// The authenticated transport has already transferred ownership.
 			// Deliberately discard ordinary Raft traffic while the committed
 			// schema transition drains the old runtime generation. Raft repairs
@@ -1891,7 +1969,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 			member.generation != request.authorityGeneration ||
 			member.permit != request.authorityPermit ||
 			!request.authorityPermit.valid(request.fence, request.authorityGeneration) ||
-			member.generation.transitionFenced.Load() || member.generation.quiescing.Load() ||
+			!member.generation.active() ||
 			!servingFenceMatchesIdentity(request.fence, member) {
 			reply.err = ErrServingFence
 			break
@@ -1950,7 +2028,7 @@ func (owner *Owner) handle(request ownerRequest) error {
 			reply.err = ErrServingFence
 			break
 		}
-		if member.generation == nil || member.generation.quiescing.Load() {
+		if member.generation == nil || member.generation.isQuiescing() {
 			reply.err = ErrServingFence
 			break
 		}
@@ -2120,11 +2198,11 @@ func (owner *Owner) quiesceSchemaGeneration(request ownerRequest) error {
 	// failed quiesce may resume the in-memory generation, but it must not revive
 	// a permit which was observed before this transition began.
 	owner.revokeServingFencePermit(request.group)
-	if !member.generation.quiescing.Load() {
+	if !member.generation.isQuiescing() {
 		if !member.generation.quiesce() {
 			return ErrServingFence
 		}
-	} else if member.generation.pins.Load() != 0 {
+	} else if member.generation.pinCount() != 0 {
 		return ErrServingFence
 	}
 	if err := owner.host.QuiesceSQLGeneration(request.group); err != nil {
@@ -2175,7 +2253,7 @@ func (owner *Owner) fenceCommittedSchemaGeneration(request ownerRequest) error {
 	// The committed schema fence changes serving eligibility even if the Host
 	// rejects the corresponding direct control; the old permit stays revoked.
 	owner.revokeServingFencePermit(request.group)
-	member.generation.transitionFenced.Store(true)
+	member.generation.fence()
 	if err = owner.host.FenceCommittedSchemaGeneration(request.group); err != nil {
 		return err
 	}
@@ -2186,7 +2264,7 @@ func (owner *Owner) fenceCommittedSchemaGeneration(request ownerRequest) error {
 func (owner *Owner) installSchemaGeneration(request ownerRequest) error {
 	member, found := owner.members[request.group]
 	if !found || request.database == nil || request.apply == nil ||
-		!member.generation.quiescing.Load() || member.generation.pins.Load() != 0 {
+		!member.generation.isQuiescing() || member.generation.pinCount() != 0 {
 		return ErrServingFence
 	}
 	binding := request.schemaSQL.Binding
@@ -2359,8 +2437,8 @@ func (owner *Owner) syncCommandFenceFromState(
 	if nextCommand != member.command {
 		owner.revokeServingFencePermit(group)
 	}
-	if member.proposalQuiesced && logicalMoved {
-		member.proposalQuiesced = false
+	if member.state == memberProposalQuiesced && logicalMoved {
+		member.state = memberServing
 	}
 	member.command = nextCommand
 	owner.storeOwnerMember(group, member)
@@ -2405,8 +2483,8 @@ func (owner *Owner) syncCommandFenceFromSnapshot(
 	if nextCommand != member.command {
 		owner.revokeServingFencePermit(group)
 	}
-	if member.proposalQuiesced && logicalMoved {
-		member.proposalQuiesced = false
+	if member.state == memberProposalQuiesced && logicalMoved {
+		member.state = memberServing
 	}
 	member.command = nextCommand
 	owner.storeOwnerMember(group, member)
@@ -2532,16 +2610,23 @@ func handoffProposalWaiter(
 	return raftserve.Waiter{}, ErrOutcomeUnknown
 }
 
-func servingFenceMatchesIdentity(
+func servingFenceMatchesMemberIdentity(
 	fence ServingFence,
 	member ownerMember,
 ) bool {
 	identity := member.identity
-	return !member.retiring && fence.Group == identity.Group &&
+	return fence.Group == identity.Group &&
 		fence.AllocationGeneration == identity.AllocationGeneration &&
 		fence.Command == member.command &&
 		fence.MemberID == identity.MemberID && fence.StoreID == identity.StoreID &&
 		fence.NodeIncarnation == identity.NodeIncarnation && fence.Term != 0
+}
+
+func servingFenceMatchesIdentity(
+	fence ServingFence,
+	member ownerMember,
+) bool {
+	return member.state != memberRetiring && servingFenceMatchesMemberIdentity(fence, member)
 }
 
 func (owner *Owner) applyOwnershipTransition(fence ServingFence, command []byte, drainExpired bool) error {
@@ -2566,12 +2651,12 @@ func (owner *Owner) applyOwnershipTransition(fence ServingFence, command []byte,
 		return &NotLeaderError{Status: status}
 	}
 	digest := sha256.Sum256(command)
-	member.proposalQuiesced = true
+	member.state = memberProposalQuiesced
 	owner.storeOwnerMember(fence.Group, member)
 	if pending := member.ownershipProposal; pending != nil &&
 		pending.term == status.Term && pending.command == fence.Command {
 		if pending.digest != digest {
-			member.proposalQuiesced = false
+			member.state = memberServing
 			owner.storeOwnerMember(fence.Group, member)
 			return ErrServingFence
 		}
@@ -2584,7 +2669,7 @@ func (owner *Owner) applyOwnershipTransition(fence ServingFence, command []byte,
 		return errProposalQuiesce
 	}
 	if err := owner.host.ProposeControl(fence.Group, command); err != nil {
-		member.proposalQuiesced = false
+		member.state = memberServing
 		owner.storeOwnerMember(fence.Group, member)
 		return err
 	}
@@ -2684,11 +2769,8 @@ func (owner *Owner) validateReplicaRetirement(request ownerRequest) error {
 	}
 	member = owner.members[request.group]
 	// A retry after ErrGroupBusy remains authorized by the exact latched member
-	// identity, but the retiring bit permanently fences data serving.
-	wasRetiring := member.retiring
-	member.retiring = false
-	validFence := servingFenceMatchesIdentity(request.fence, member)
-	member.retiring = wasRetiring
+	// identity, while memberRetiring permanently fences data serving.
+	validFence := servingFenceMatchesMemberIdentity(request.fence, member)
 	if !validFence || request.operation == ([32]byte{}) || request.step == ([32]byte{}) ||
 		request.sourceMember != member.identity.MemberID || request.targetMember == 0 ||
 		request.targetMember == request.sourceMember {
@@ -2713,7 +2795,7 @@ func (owner *Owner) retireReplica(request ownerRequest) error {
 	}
 	member := owner.members[request.group]
 	owner.revokeServingFencePermit(request.group)
-	member.retiring = true
+	member.state = memberRetiring
 	owner.storeOwnerMember(request.group, member)
 	if err := owner.host.Remove(request.group); err != nil {
 		return err
@@ -3390,8 +3472,8 @@ func (owner *Owner) stop(cause error) error {
 	// can no longer apply locally before Done becomes observable.
 	cause = errors.Join(cause, owner.host.Close())
 	owner.mu.Lock()
-	if !owner.closed {
-		owner.closed = true
+	if owner.state != ownerClosed {
+		owner.state = ownerClosed
 		owner.failure = cause
 		close(owner.done)
 	}
@@ -3889,7 +3971,7 @@ func pointReadFenceMatches(fence replicatedstate.SnapshotFence, serving ServingF
 func (owner *Owner) reservePendingRead(bytes int64) error {
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
-	if !owner.started || owner.closed {
+	if owner.state != ownerRunning {
 		return errors.Join(ErrOwnerClosed, owner.failure)
 	}
 	if owner.pendingReadItems == owner.limits.MaxPendingReadItems ||
@@ -3919,7 +4001,7 @@ func (owner *Owner) publish(request ownerRequest) error {
 	}
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
-	if !owner.started || owner.closed {
+	if owner.state != ownerRunning {
 		return errors.Join(ErrOwnerClosed, owner.failure)
 	}
 	if owner.ingressItems == owner.limits.MaxIngressItems ||
@@ -4173,7 +4255,7 @@ func (owner *Owner) reservePendingProposalForGroup(_ raftmember.GroupKey, bytes 
 	}
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
-	if !owner.started || owner.closed {
+	if owner.state != ownerRunning {
 		return errors.Join(ErrOwnerClosed, owner.failure)
 	}
 	if owner.pendingProposalItems == owner.limits.MaxPendingProposalItems ||
@@ -4572,7 +4654,7 @@ func (owner *Owner) Running() bool {
 		return false
 	}
 	owner.mu.Lock()
-	running := owner.started && !owner.closed
+	running := owner.state == ownerRunning
 	owner.mu.Unlock()
 	return running
 }

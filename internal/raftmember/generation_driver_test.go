@@ -224,11 +224,11 @@ func TestRuntimeWALGenerationBuildDoesNotBlockRaftProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(testAsyncDeadline)
-	for fixture.runtime.walGeneration.building && time.Now().Before(deadline) {
+	for fixture.runtime.walGeneration.state == walGenBuilding && time.Now().Before(deadline) {
 		fixture.runtime.tickWALGeneration()
 		runtime.Gosched()
 	}
-	if fixture.runtime.walGeneration.building || fixture.runtime.walGeneration.activationPending {
+	if fixture.runtime.walGeneration.state != walGenIdle {
 		t.Fatal("stale candidate was not consumed and discarded")
 	}
 	if _, err := fixture.wal.GenerationInfo(); !errors.Is(err, raftstore.ErrGenerationCandidate) {

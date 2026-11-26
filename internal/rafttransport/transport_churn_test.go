@@ -151,7 +151,7 @@ func TestQueueReclamationJoinsWorkerAndEncoderBeforeReuse(t *testing.T) {
 	transportTestEventually(t, func() bool {
 		transport.mu.Lock()
 		defer transport.mu.Unlock()
-		return old.retiring
+		return old.state.isRetiring()
 	})
 	transport.mu.Lock()
 	if transport.byNode[testNode(2)] != old || transport.byNode[testNode(4)] != nil {

@@ -164,7 +164,7 @@ func TestQueuedMembershipReadsLiveGrantAfterExactRevocation(t *testing.T) {
 		SourceMember:            1, TargetMember: 3, TargetNode: [16]byte{3}}
 	authority := &membershipTestAuthority{grant: grant, found: true}
 	owner := &Owner{
-		started: true, ingress: make(chan ownerRequest, 1),
+		state: ownerRunning, ingress: make(chan ownerRequest, 1),
 		limits: Limits{MaxIngressItems: 1, MaxIngressBytes: 1}, authority: authority,
 		members: map[raftmember.GroupKey]ownerMember{group: {}},
 	}

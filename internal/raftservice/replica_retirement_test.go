@@ -164,7 +164,7 @@ func TestOwnerProvenRetirementClosesSourceWithoutRemovalApply(t *testing.T) {
 			member.identity.RelationManifestDigest = member.command.RelationManifestDigest
 			owner.members[request.group] = member
 		}
-		if err := owner.validateReplicaRetirement(request); err != nil || host.removed || owner.members[request.group].retiring {
+		if err := owner.validateReplicaRetirement(request); err != nil || host.removed || owner.members[request.group].state == memberRetiring {
 			t.Fatalf("proof preflight staleSchema=%t removed=%t err=%v", staleSchema, host.removed, err)
 		}
 		// Service has now durably recorded RetirementAuthorized. Source Raft
@@ -219,7 +219,7 @@ func TestOwnerProvenRetirementRejectsForeignOrNewerLocalState(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			owner, host, request, authority := provenRetirementOwner(t)
 			test.change(owner, host, &request, authority)
-			if err := owner.retireReplica(request); err == nil || host.removed || len(owner.members) != 1 || owner.members[request.group].retiring {
+			if err := owner.retireReplica(request); err == nil || host.removed || len(owner.members) != 1 || owner.members[request.group].state == memberRetiring {
 				t.Fatalf("unsafe retirement removed=%t remaining=%d err=%v", host.removed, len(owner.members), err)
 			}
 		})

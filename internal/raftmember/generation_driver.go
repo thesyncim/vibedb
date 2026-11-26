@@ -20,19 +20,27 @@ type WALGenerationDriverOptions struct {
 	OnError       func(error)
 }
 
+type walGenerationDriverState uint8
+
+const (
+	walGenIdle walGenerationDriverState = iota
+	walGenBuilding
+	walGenActivationPending
+	walGenStopped
+)
+
 type walGenerationDriver struct {
-	interval          uint64
-	ticks             uint64
-	key               raftstore.Key
-	workspace         []byte
-	onError           func(error)
-	activationPending bool
-	building          bool
-	builder           *raftstore.GenerationBuilder
-	stop              chan struct{}
-	result            chan walGenerationBuildResult
-	worker            sync.WaitGroup
-	stopOnce          sync.Once
+	interval  uint64
+	ticks     uint64
+	key       raftstore.Key
+	workspace []byte
+	onError   func(error)
+	state     walGenerationDriverState
+	builder   *raftstore.GenerationBuilder
+	stop      chan struct{}
+	result    chan walGenerationBuildResult
+	worker    sync.WaitGroup
+	stopOnce  sync.Once
 }
 
 type walGenerationBuildResult struct {
@@ -99,11 +107,19 @@ func (runtime *Runtime) maintainWALAdmission(err error) error {
 		return err
 	}
 	driver := runtime.walGeneration
-	if driver.building {
+	switch driver.state {
+	case walGenStopped:
+		return err
+	case walGenActivationPending:
+		if commitErr := runtime.commitWALGeneration(driver); commitErr != nil {
+			return errors.Join(err, commitErr)
+		}
+		return runtime.wal.ReserveReady()
+	case walGenBuilding:
 		// No selection was published by this worker. Retire its potentially
 		// stale candidate before capturing the now-quiescent current cut.
 		result := <-driver.result
-		driver.building = false
+		driver.state = walGenIdle
 		driver.builder = nil
 		if result.builder != nil {
 			result.err = errors.Join(result.err, result.builder.Close())
@@ -115,12 +131,12 @@ func (runtime *Runtime) maintainWALAdmission(err error) error {
 	if buildErr := runtime.prepareWALGenerationBuildMode(driver, runtime.pipelined != nil); buildErr != nil {
 		return errors.Join(err, buildErr)
 	}
-	if !driver.building {
+	if driver.state != walGenBuilding {
 		// No newer certified base: do not hide a genuine capacity limit.
 		return err
 	}
 	result := <-driver.result
-	driver.building, driver.ticks = false, 0
+	driver.state, driver.ticks = walGenIdle, 0
 	driver.builder = nil
 	if publishErr := runtime.publishBuiltWALGenerationMode(driver, result, runtime.pipelined != nil); publishErr != nil {
 		return errors.Join(err, publishErr)
@@ -133,16 +149,18 @@ func (runtime *Runtime) tickWALGeneration() {
 	if driver == nil {
 		return
 	}
-	if driver.activationPending {
+	switch driver.state {
+	case walGenStopped:
+		return
+	case walGenActivationPending:
 		if err := runtime.commitWALGeneration(driver); err != nil && driver.onError != nil {
 			driver.onError(err)
 		}
 		return
-	}
-	if driver.building {
+	case walGenBuilding:
 		select {
 		case result := <-driver.result:
-			driver.building = false
+			driver.state = walGenIdle
 			driver.builder = nil
 			driver.ticks = 0
 			if err := runtime.publishBuiltWALGeneration(driver, result); err != nil && driver.onError != nil {
@@ -151,6 +169,7 @@ func (runtime *Runtime) tickWALGeneration() {
 		default:
 		}
 		return
+	case walGenIdle:
 	}
 	driver.ticks++
 	if driver.ticks < driver.interval {
@@ -212,7 +231,7 @@ func (runtime *Runtime) prepareWALGenerationBuildMode(driver *walGenerationDrive
 	if err != nil {
 		return err
 	}
-	driver.building = true
+	driver.state = walGenBuilding
 	driver.builder = builder
 	driver.worker.Add(1)
 	go func() {
@@ -269,11 +288,11 @@ func (runtime *Runtime) publishBuiltWALGenerationMode(driver *walGenerationDrive
 	if publishErr != nil {
 		_, _, servingErr := runtime.wal.InitialState()
 		if adoptErr == nil || errors.Is(servingErr, raftstore.ErrGenerationActivationPending) {
-			driver.activationPending = true
+			driver.state = walGenActivationPending
 		}
 		return errors.Join(publishErr, closeErr, adoptErr)
 	}
-	driver.activationPending = true
+	driver.state = walGenActivationPending
 	if adoptErr != nil {
 		return errors.Join(adoptErr, closeErr)
 	}
@@ -297,7 +316,7 @@ func (runtime *Runtime) commitWALGeneration(driver *walGenerationDriver) error {
 	if err := runtime.wal.CommitGenerationSelection(runtime.apply); err != nil {
 		return err
 	}
-	driver.activationPending = false
+	driver.state = walGenIdle
 	return nil
 }
 
@@ -318,7 +337,7 @@ func (driver *walGenerationDriver) stopAndWait() {
 	default:
 	}
 	driver.builder = nil
-	driver.building = false
+	driver.state = walGenStopped
 }
 
 // OpenBoundSQLWithApplyRecoveringGeneration is the production restart path.

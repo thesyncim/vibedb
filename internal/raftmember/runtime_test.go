@@ -139,7 +139,7 @@ func TestRuntimeQuiesceSQLGenerationRetainsRaftAndWAL(t *testing.T) {
 	if err := runtime.QuiesceSQLGeneration(); err != nil {
 		t.Fatal(err)
 	}
-	if !runtime.schemaGenerationQuiesced || runtime.apply != nil || runtime.database != nil ||
+	if runtime.state != runtimeSchemaQuiesced || runtime.apply != nil || runtime.database != nil ||
 		runtime.node == nil || runtime.wal == nil || runtime.walGeneration != nil ||
 		runtime.schemaWALResume == nil {
 		t.Fatalf("quiesced runtime apply=%p database=%p node=%p wal=%p",

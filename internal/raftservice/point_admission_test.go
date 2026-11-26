@@ -147,9 +147,9 @@ func TestExecutionOwnersPointAdmissionDenialIsTerminal(t *testing.T) {
 	if !errors.Is(err, ErrServingAuthorization) {
 		t.Fatalf("denied admission=%v, want ErrServingAuthorization", err)
 	}
-	if cut.owner != nil || fixture.owner.pendingReadItems != 0 || fixture.generation.pins.Load() != 0 {
+	if cut.owner != nil || fixture.owner.pendingReadItems != 0 || fixture.generation.pinCount() != 0 {
 		t.Fatalf("denied admission retained cut/resources: owner=%p reads=%d pins=%d",
-			cut.owner, fixture.owner.pendingReadItems, fixture.generation.pins.Load())
+			cut.owner, fixture.owner.pendingReadItems, fixture.generation.pinCount())
 	}
 	if got := len(fixture.owner.ingress); got != 0 {
 		t.Fatalf("denied admission queued %d owner requests", got)
@@ -217,9 +217,9 @@ func TestExecutionOwnersCanceledPointAdmissionReleasesBudget(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled admission=%v, want context.Canceled", err)
 	}
-	if fixture.owner.pendingReadItems != 0 || fixture.owner.pendingReadBytes != 0 || fixture.generation.pins.Load() != 0 {
+	if fixture.owner.pendingReadItems != 0 || fixture.owner.pendingReadBytes != 0 || fixture.generation.pinCount() != 0 {
 		t.Fatalf("canceled admission retained resources reads=%d/%d pins=%d",
-			fixture.owner.pendingReadItems, fixture.owner.pendingReadBytes, fixture.generation.pins.Load())
+			fixture.owner.pendingReadItems, fixture.owner.pendingReadBytes, fixture.generation.pinCount())
 	}
 }
 
@@ -237,9 +237,9 @@ func TestExecutionOwnersPointAdmissionRevocationDuringCaptureFailsClosed(t *test
 	if !errors.Is(err, ErrServingFence) {
 		t.Fatalf("revoked capture=%v, want ErrServingFence", err)
 	}
-	if cut.owner != nil || fixture.owner.pendingReadItems != 0 || fixture.generation.pins.Load() != 0 {
+	if cut.owner != nil || fixture.owner.pendingReadItems != 0 || fixture.generation.pinCount() != 0 {
 		t.Fatalf("revoked capture retained resources owner=%p reads=%d pins=%d",
-			cut.owner, fixture.owner.pendingReadItems, fixture.generation.pins.Load())
+			cut.owner, fixture.owner.pendingReadItems, fixture.generation.pinCount())
 	}
 	if fixture.slot.value.Load() != nil {
 		t.Fatal("revoked capture left point view published")

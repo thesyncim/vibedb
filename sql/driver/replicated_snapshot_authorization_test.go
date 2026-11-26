@@ -47,8 +47,20 @@ func TestReplicatedSnapshotAuthorizationFenceFollowsApplyAndFailsClosed(t *testi
 				claim.activationBasePending[0] = 1
 			}
 		}, ErrReplicatedApplyBasePending},
-		{"active WAL selection", func(set bool) { claim.walBaseSelectActive = set }, ErrReplicatedApplyBusy},
-		{"pending WAL selection", func(set bool) { claim.walBaseSelectPending = set }, ErrReplicatedApplyBusy},
+		{"active WAL selection", func(set bool) {
+			if set {
+				claim.walBaseState = walBaseSelectActive
+			} else {
+				claim.walBaseState = walBaseIdle
+			}
+		}, ErrReplicatedApplyBusy},
+		{"pending WAL selection", func(set bool) {
+			if set {
+				claim.walBaseState = walBaseSelectPending
+			} else {
+				claim.walBaseState = walBaseIdle
+			}
+		}, ErrReplicatedApplyBusy},
 	} {
 		t.Run(blocked.name, func(t *testing.T) {
 			blocked.set(true)

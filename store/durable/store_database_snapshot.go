@@ -707,7 +707,7 @@ func (d *Database) SnapshotInto(dst *DatabaseSnapshot) error {
 	// can grow mid-acquisition.
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	if d.closed {
+	if d.state != databaseOpen {
 		return ErrDatabaseClosed
 	}
 	if len(d.order) == 0 {

@@ -61,7 +61,7 @@ func TestExecutionOwnersPointBatchPreservesReadIndexAndLease(t *testing.T) {
 	if !ok {
 		t.Fatal("charge")
 	}
-	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
+	owner := &Owner{state: ownerRunning, ingress: make(chan ownerRequest, 1), limits: Limits{
 		MaxIngressItems: 1, MaxIngressBytes: int64(len(packed)),
 		MaxPendingReadItems: 1, MaxPendingReadBytes: charge,
 	}}

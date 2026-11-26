@@ -115,7 +115,7 @@ func (a *ReplicatedApply) CaptureWALBase(
 		core.mu.Unlock()
 		return nil, err
 	}
-	if a.walBaseCaptureActive {
+	if a.walBaseState != walBaseIdle {
 		core.mu.Unlock()
 		return nil, ErrReplicatedApplyBusy
 	}
@@ -163,13 +163,15 @@ func (a *ReplicatedApply) CaptureWALBase(
 		core.mu.Unlock()
 		return nil, errors.Join(ErrWALBasePreparation, closeErr)
 	}
-	a.walBaseCaptureActive = true
+	a.walBaseState = walBaseCaptureActive
 	core.mu.Unlock()
 
 	defer func() {
 		closeErr := cut.Close()
 		core.mu.Lock()
-		a.walBaseCaptureActive = false
+		if a.walBaseState == walBaseCaptureActive {
+			a.walBaseState = walBaseIdle
+		}
 		core.mu.Unlock()
 		if closeErr != nil {
 			resultErr = errors.Join(resultErr, closeErr)
@@ -335,7 +337,7 @@ func (a *ReplicatedApply) PublishWALGenerationSelection(
 		core.mu.Unlock()
 		return err
 	}
-	if a.walBaseCaptureActive || a.walBaseSelectActive || a.walBaseSelectPending {
+	if a.walBaseState != walBaseIdle {
 		core.mu.Unlock()
 		return ErrReplicatedApplyBusy
 	}
@@ -359,14 +361,15 @@ func (a *ReplicatedApply) PublishWALGenerationSelection(
 		core.mu.Unlock()
 		return ErrWALBasePreparation
 	}
-	a.walBaseSelectActive = true
+	a.walBaseState = walBaseSelectActive
 	core.mu.Unlock()
 	selectionIdentity, selectionErr := wal.PublishGenerationSelection(builder)
 	core.mu.Lock()
-	a.walBaseSelectActive = false
 	if selectionIdentity.Valid() {
-		a.walBaseSelectPending = true
+		a.walBaseState = walBaseSelectPending
 		a.walBasePending = selectionIdentity
+	} else {
+		a.walBaseState = walBaseIdle
 	}
 	core.mu.Unlock()
 	return selectionErr
@@ -412,7 +415,7 @@ func (a *ReplicatedApply) SettleGenerationActivation(
 	if a.activationBasePending != ([sha256.Size]byte{}) {
 		return ErrReplicatedApplyBasePending
 	}
-	if a.walBaseCaptureActive || a.walBaseSelectActive {
+	if a.walBaseState == walBaseCaptureActive || a.walBaseState == walBaseSelectActive {
 		return ErrReplicatedApplyBusy
 	}
 	group := core.checkpointGroup
@@ -422,7 +425,7 @@ func (a *ReplicatedApply) SettleGenerationActivation(
 		certificate.Manifest.State.Binding != replicatedStateBindingAt(*base, a.identity.Placement.Range) {
 		return ErrReplicatedApplyMismatch
 	}
-	if !a.walBaseSelectPending {
+	if a.walBaseState != walBaseSelectPending {
 		return ErrReplicatedApplyBusy
 	}
 	if !a.walBasePending.Matches(activation.Info) {
@@ -467,7 +470,7 @@ func (a *ReplicatedApply) LatchGenerationActivation(
 	if err := a.checkLocked(); err != nil {
 		return err
 	}
-	if a.walBaseCaptureActive || a.walBaseSelectActive {
+	if a.walBaseState == walBaseCaptureActive || a.walBaseState == walBaseSelectActive {
 		return ErrReplicatedApplyBusy
 	}
 	base := core.catalog.ReplicatedShardStore
@@ -477,13 +480,13 @@ func (a *ReplicatedApply) LatchGenerationActivation(
 		a.machine.Applied() != certificate.Manifest.State.Applied {
 		return ErrReplicatedApplyMismatch
 	}
-	if a.walBaseSelectPending {
+	if a.walBaseState == walBaseSelectPending {
 		if a.walBasePending.Matches(activation.Info) {
 			return nil
 		}
 		return ErrReplicatedApplyMismatch
 	}
-	a.walBaseSelectPending = true
+	a.walBaseState = walBaseSelectPending
 	a.walBasePending = raftstore.GenerationActivationIdentity{
 		FamilyID:            activation.Info.FamilyID,
 		Generation:          activation.Info.Generation,
@@ -528,12 +531,12 @@ func (a *ReplicatedApply) CompleteGenerationActivation(
 	}
 	core := a.database
 	core.mu.Lock()
-	if a.checkLocked() == nil && a.walBaseSelectPending && completion.Matches(
+	if a.checkLocked() == nil && a.walBaseState == walBaseSelectPending && completion.Matches(
 		a.walBasePending.FamilyID,
 		a.walBasePending.Generation,
 		a.walBasePending.BindingDigest,
 	) {
-		a.walBaseSelectPending = false
+		a.walBaseState = walBaseIdle
 		a.walBasePending = raftstore.GenerationActivationIdentity{}
 	}
 	core.mu.Unlock()

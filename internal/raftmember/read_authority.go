@@ -427,7 +427,7 @@ func (runtime *Runtime) ReadAuthorityEvidence() ReadAuthorityEvidence {
 	result.Identity = runtime.Identity()
 	state := runtime.authority
 	if state == nil {
-		if runtime.closed || runtime.stopping || runtime.node == nil || runtime.stableStore() == nil ||
+		if runtime.state.isStoppingOrClosed() || runtime.node == nil || runtime.stableStore() == nil ||
 			runtime.apply == nil || runtime.database == nil || runtime.failure != nil ||
 			runtime.node.Phase() == raftmodel.PhaseFailed {
 			result.Status = ReadAuthorityEvidenceUnavailable
@@ -467,7 +467,7 @@ func (runtime *Runtime) ReadAuthorityEvidence() ReadAuthorityEvidence {
 				(result.Promise.QuarantineUntil != 0 && now < result.Promise.QuarantineUntil)
 		}
 	}
-	servingUsable := !runtime.closed && !runtime.stopping && runtime.node != nil &&
+	servingUsable := !runtime.state.isStoppingOrClosed() && runtime.node != nil &&
 		runtime.stableStore() != nil && runtime.apply != nil && runtime.database != nil &&
 		runtime.failure == nil && runtime.node.Phase() != raftmodel.PhaseFailed
 	var observation raftauthority.AuthorityObservation

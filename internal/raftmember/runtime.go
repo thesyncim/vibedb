@@ -497,10 +497,21 @@ type Runtime struct {
 	authority                *runtimeAuthority
 	leaderTransfer           *leaderTransferState
 	leaderTransferSequence   uint64
-	failure                  error
-	stopping                 bool
-	closed                   bool
-	schemaGenerationQuiesced bool
+	failure                error
+	state                  runtimeLifecycleState
+}
+
+type runtimeLifecycleState uint8
+
+const (
+	runtimeActive runtimeLifecycleState = iota
+	runtimeSchemaQuiesced
+	runtimeStopping
+	runtimeClosed
+)
+
+func (s runtimeLifecycleState) isStoppingOrClosed() bool {
+	return s >= runtimeStopping
 }
 
 type runtimeStableStore interface {
@@ -788,7 +799,7 @@ func (runtime *Runtime) Identity() RuntimeIdentity {
 
 // Failure returns the stable terminal invariant failure, if any.
 func (runtime *Runtime) Failure() error {
-	if runtime == nil || runtime.closed || runtime.stopping || runtime.node == nil {
+	if runtime == nil || runtime.state.isStoppingOrClosed() || runtime.node == nil {
 		return ErrRuntimeClosed
 	}
 	if runtime.failure != nil {
@@ -811,7 +822,7 @@ func (runtime *Runtime) stableStore() runtimeStableStore {
 }
 
 func (runtime *Runtime) checkUsable() error {
-	if runtime == nil || runtime.closed || runtime.stopping || runtime.node == nil ||
+	if runtime == nil || runtime.state.isStoppingOrClosed() || runtime.node == nil ||
 		runtime.stableStore() == nil || runtime.apply == nil || runtime.database == nil {
 		return ErrRuntimeClosed
 	}
@@ -829,7 +840,7 @@ func (runtime *Runtime) checkUsable() error {
 // it does not inspect or mutate SQL state, so it remains valid while a Runtime
 // is temporarily quiesced for a schema-generation swap.
 func (runtime *Runtime) checkLeaderTransferUsable() error {
-	if runtime == nil || runtime.closed || runtime.stopping || runtime.node == nil ||
+	if runtime == nil || runtime.state.isStoppingOrClosed() || runtime.node == nil ||
 		runtime.stableStore() == nil {
 		return ErrRuntimeClosed
 	}
@@ -847,9 +858,8 @@ func (runtime *Runtime) checkLeaderTransferUsable() error {
 // generation. WAL, RawNode, member incarnation, and replication progress stay
 // owned by Runtime for an exact target-generation install.
 func (runtime *Runtime) QuiesceSQLGeneration() error {
-	if runtime == nil || runtime.closed || runtime.stopping || runtime.failure != nil ||
-		runtime.node == nil || runtime.stableStore() == nil || runtime.database == nil ||
-		runtime.schemaGenerationQuiesced {
+	if runtime == nil || runtime.state != runtimeActive || runtime.failure != nil ||
+		runtime.node == nil || runtime.stableStore() == nil || runtime.database == nil {
 		return ErrSchemaGenerationSwap
 	}
 	runtime.refreshLeaderTransfer()
@@ -893,7 +903,7 @@ func (runtime *Runtime) QuiesceSQLGeneration() error {
 		return errors.Join(ErrSchemaGenerationSwap, err)
 	}
 	runtime.database = nil
-	runtime.schemaGenerationQuiesced = true
+	runtime.state = runtimeSchemaQuiesced
 	return nil
 }
 
@@ -914,8 +924,8 @@ func (runtime *Runtime) InstallSQLGeneration(
 	expectedSQL sqldriver.ReplicatedShardStoreIdentity,
 	expectedApply sqldriver.ReplicatedApplyIdentity,
 ) error {
-	if runtime == nil || runtime.closed || runtime.stopping || runtime.failure != nil ||
-		!runtime.schemaGenerationQuiesced || runtime.node == nil || runtime.stableStore() == nil ||
+	if runtime == nil || runtime.state != runtimeSchemaQuiesced || runtime.failure != nil ||
+		runtime.node == nil || runtime.stableStore() == nil ||
 		runtime.apply != nil || runtime.database != nil || database == nil || apply == nil {
 		return ErrSchemaGenerationSwap
 	}
@@ -943,7 +953,7 @@ func (runtime *Runtime) InstallSQLGeneration(
 	runtime.database = database
 	runtime.apply = apply
 	runtime.identity.RelationManifestDigest = manifest
-	runtime.schemaGenerationQuiesced = false
+	runtime.state = runtimeActive
 	if runtime.schemaWALResume != nil {
 		runtime.walGeneration = newWALGenerationDriver(*runtime.schemaWALResume)
 		clear(runtime.schemaWALResume.Key.Material[:])
@@ -999,7 +1009,7 @@ func (runtime *Runtime) requireEmptyInputWindow() error {
 // admitted at least one normal proposal, and both coalescing bounds retain
 // room for another entry.
 func (runtime *Runtime) NormalProposalWindow() (open bool, remainingEntries int, remainingBytes int64) {
-	if runtime == nil || runtime.closed || runtime.stopping || runtime.failure != nil ||
+	if runtime == nil || runtime.state.isStoppingOrClosed() || runtime.failure != nil ||
 		runtime.node == nil || runtime.node.Phase() != raftmodel.PhaseIdle ||
 		runtime.proposalBatchEntries <= 0 {
 		return false, 0, 0
@@ -1501,7 +1511,7 @@ func (runtime *Runtime) matchesLeaderTransfer(
 // preparation or an admitted RawNode handoff. It is a serialized owner query
 // used by Host removal and diagnostics; it never performs a new transfer.
 func (runtime *Runtime) LeaderTransferPending() bool {
-	if runtime == nil || runtime.node == nil || runtime.closed || runtime.stopping {
+	if runtime == nil || runtime.node == nil || runtime.state.isStoppingOrClosed() {
 		return false
 	}
 	runtime.refreshLeaderTransfer()
@@ -1948,13 +1958,13 @@ func validateOrdinaryMessage(message *pb.Message) (int, error) {
 // Close monotonically retires the Runtime in apply, database, WAL order. A
 // failed stage remains owned and is retried by a later Close call.
 func (runtime *Runtime) Close() error {
-	if runtime == nil || runtime.closed {
+	if runtime == nil || runtime.state == runtimeClosed {
 		return nil
 	}
 	if _, pending := runtime.pendingAppliedResults(); pending && runtime.failure == nil {
 		return ErrResultSettlementPending
 	}
-	runtime.stopping = true
+	runtime.state = runtimeStopping
 	if runtime.configurationReplay != nil {
 		runtime.configurationReplay.closed.Store(true)
 	}
@@ -2005,6 +2015,6 @@ func (runtime *Runtime) Close() error {
 	}
 	runtime.stable = nil
 	runtime.nodePersistence = nil
-	runtime.closed = true
+	runtime.state = runtimeClosed
 	return checkpointErr
 }
