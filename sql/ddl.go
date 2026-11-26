@@ -157,6 +157,10 @@ type CreateTableStmt struct {
 	// IfNotExists records IF NOT EXISTS, which makes an existing collection a
 	// no-op rather than an error.
 	IfNotExists bool
+	// UniqueConstraints holds table-level UNIQUE (col, ...) constraints.
+	UniqueConstraints [][]*PathExpr
+	// CheckConstraints holds table-level CHECK (...) constraints.
+	CheckConstraints []*Expr
 	// Pos is the byte offset of the collection name, PrimaryKeyPos of the
 	// PRIMARY KEY clause.
 	Pos           int
@@ -184,6 +188,15 @@ type ColumnDef struct {
 	Required bool
 	// PrimaryKey records that this column carried a column-level PRIMARY KEY.
 	PrimaryKey bool
+	// Unique records that this column carried an inline UNIQUE constraint.
+	Unique bool
+	// HasDefault and DefaultExpr record a column-level DEFAULT expression.
+	HasDefault  bool
+	DefaultExpr *ScalarExpr
+	// CheckExpr records an inline CHECK (...) predicate.
+	CheckExpr *Expr
+	// References records an inline REFERENCES target table name.
+	References string
 	Pos        int
 
 	// explicitNull distinguishes a nullable column (the SQL default) from one

@@ -184,6 +184,12 @@ func (p *Parser) parseTableItems() error {
 	columns := p.cols[:0]
 	keys := p.keyPaths[:0]
 	for {
+		if tokenTextEqual(p.tok, "CONSTRAINT") {
+			p.advance()
+			if _, err := p.parseAliasName("a constraint name"); err != nil {
+				return err
+			}
+		}
 		if p.atKeyword(kwPrimary) {
 			pos := p.tok.pos
 			if len(keys) != 0 {
@@ -193,6 +199,22 @@ func (p *Parser) parseTableItems() error {
 			var err error
 			keys, err = p.parsePrimaryKeyList(keys)
 			if err != nil {
+				return err
+			}
+		} else if p.atKeyword(kwUnique) {
+			uPaths, err := p.parseColumnPathList("UNIQUE")
+			if err != nil {
+				return err
+			}
+			p.tbl.UniqueConstraints = append(p.tbl.UniqueConstraints, uPaths)
+		} else if tokenTextEqual(p.tok, "CHECK") {
+			chk, err := p.parseCheckConstraint()
+			if err != nil {
+				return err
+			}
+			p.tbl.CheckConstraints = append(p.tbl.CheckConstraints, chk)
+		} else if tokenTextEqual(p.tok, "FOREIGN") {
+			if err := p.parseForeignKeyConstraint(); err != nil {
 				return err
 			}
 		} else if err := p.rejectTableConstraint(); err != nil {
@@ -227,23 +249,132 @@ func (p *Parser) parseTableItems() error {
 	return p.expect(tokRParen, "')'")
 }
 
-// rejectTableConstraint names the table constraints SQL has and this engine has
-// no enforcement for, so each is refused where it was written rather than
-// parsed as a column named CHECK.
+// rejectTableConstraint rejects EXCLUDE constraints which have no counterpart.
 func (p *Parser) rejectTableConstraint() error {
-	switch {
-	case p.atKeyword(kwUnique):
-		return p.errHere("UNIQUE is not supported in CREATE TABLE; create the table first, then use CREATE UNIQUE INDEX")
-	}
 	if p.tok.kind != tokIdent {
 		return nil
 	}
 	var fold [maxTypeNameLen]byte
 	switch string(foldASCII(&fold, p.tok.text)) {
-	case "CONSTRAINT", "CHECK", "FOREIGN", "REFERENCES", "EXCLUDE":
+	case "EXCLUDE":
 		return p.errfHere("%s is not supported: the engine validates a document's shape against declared types and enforces nothing else", p.tok.text)
 	}
 	return nil
+}
+
+func (p *Parser) parseColumnPathList(clause string) ([]*PathExpr, error) {
+	p.advance() // keyword
+	if err := p.expect(tokLParen, "'(' after "+clause); err != nil {
+		return nil, err
+	}
+	var paths []*PathExpr
+	for {
+		path, err := p.parsePath(false)
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+		if len(paths) > maxIndexColumns {
+			return nil, p.errfAt(path.Pos, "%s may name at most %d paths", clause, maxIndexColumns)
+		}
+		if p.tok.kind != tokComma {
+			break
+		}
+		p.advance()
+	}
+	return paths, p.expect(tokRParen, "')'")
+}
+
+func (p *Parser) parseCheckConstraint() (*Expr, error) {
+	p.advance() // CHECK
+	if err := p.expect(tokLParen, "'(' after CHECK"); err != nil {
+		return nil, err
+	}
+	expr, err := p.parseExpr(ctxWhere)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expect(tokRParen, "')' after CHECK expression"); err != nil {
+		return nil, err
+	}
+	return expr, nil
+}
+
+func (p *Parser) parseForeignKeyConstraint() error {
+	p.advance() // FOREIGN
+	if err := p.expectKeyword(kwKey, "KEY after FOREIGN"); err != nil {
+		return err
+	}
+	if err := p.expect(tokLParen, "'(' after FOREIGN KEY"); err != nil {
+		return err
+	}
+	for {
+		if _, err := p.parsePath(false); err != nil {
+			return err
+		}
+		if p.tok.kind != tokComma {
+			break
+		}
+		p.advance()
+	}
+	if err := p.expect(tokRParen, "')'"); err != nil {
+		return err
+	}
+	if !tokenTextEqual(p.tok, "REFERENCES") {
+		return p.errHere("expected REFERENCES after FOREIGN KEY (...)")
+	}
+	_, err := p.parseReferencesClause()
+	return err
+}
+
+func (p *Parser) parseReferencesClause() (string, error) {
+	p.advance() // REFERENCES
+	refTable, _, err := p.parseCollectionName()
+	if err != nil {
+		return "", err
+	}
+	if p.tok.kind == tokLParen {
+		p.advance()
+		for {
+			if _, err := p.parsePath(false); err != nil {
+				return "", err
+			}
+			if p.tok.kind != tokComma {
+				break
+			}
+			p.advance()
+		}
+		if err := p.expect(tokRParen, "')'"); err != nil {
+			return "", err
+		}
+	}
+	for p.atKeyword(kwOn) {
+		p.advance() // ON
+		if p.atKeyword(kwDelete) || p.atKeyword(kwUpdate) {
+			p.advance()
+		} else {
+			return "", p.errHere("expected DELETE or UPDATE after ON in REFERENCES")
+		}
+		switch {
+		case tokenTextEqual(p.tok, "CASCADE"), tokenTextEqual(p.tok, "RESTRICT"):
+			p.advance()
+		case tokenTextEqual(p.tok, "NO"):
+			p.advance()
+			if !tokenTextEqual(p.tok, "ACTION") {
+				return "", p.errHere("expected ACTION after NO")
+			}
+			p.advance()
+		case p.atKeyword(kwSet):
+			p.advance()
+			if !p.atKeyword(kwNull) && !p.atKeyword(kwDefault) {
+				return "", p.errHere("expected NULL or DEFAULT after SET")
+			}
+			p.advance()
+		default:
+			return "", p.errHere("expected referential action (CASCADE, RESTRICT, NO ACTION, SET NULL, SET DEFAULT)")
+		}
+	}
+	return refTable, nil
 }
 
 func (p *Parser) parsePrimaryKeyList(dst []*PathExpr) ([]*PathExpr, error) {
@@ -341,9 +472,33 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 				return column, p.errAt(column.Pos, "a PRIMARY KEY cannot have the type NULL")
 			}
 		case p.atKeyword(kwDefault):
-			return column, p.errHere("DEFAULT is not supported: a default would have to be written into every document that omitted the field, and this store validates documents rather than completing them")
+			p.advance()
+			defExpr, err := p.parseScalarExpression(scalarSelect)
+			if err != nil {
+				return column, err
+			}
+			column.HasDefault = true
+			column.DefaultExpr = defExpr
 		case p.atKeyword(kwUnique):
-			return column, p.errHere("UNIQUE is not supported in CREATE TABLE; create the table first, then use CREATE UNIQUE INDEX")
+			p.advance()
+			column.Unique = true
+		case tokenTextEqual(p.tok, "CHECK"):
+			chk, err := p.parseCheckConstraint()
+			if err != nil {
+				return column, err
+			}
+			column.CheckExpr = chk
+		case tokenTextEqual(p.tok, "REFERENCES"):
+			ref, err := p.parseReferencesClause()
+			if err != nil {
+				return column, err
+			}
+			column.References = ref
+		case tokenTextEqual(p.tok, "CONSTRAINT"):
+			p.advance()
+			if _, err := p.parseAliasName("a constraint name"); err != nil {
+				return column, err
+			}
 		case p.atKeyword(kwCollate):
 			return column, p.errHere("COLLATE is not supported: strings compare by decoded content")
 		default:
