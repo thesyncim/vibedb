@@ -264,6 +264,9 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 			}
 			return DurableSQLRequestResult{}, fmt.Errorf("gateway: direct SQL execution: %w", directErr)
 		}
+		if direct.Result != nil && len(targets[0].ReturningDocs) > 0 {
+			direct.Result.ReturningDocs = targets[0].ReturningDocs
+		}
 		return direct.DurableSQLRequestResult, nil
 	}
 	if mode == DurableSQLDirectOnly {
@@ -312,7 +315,11 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 	if err != nil {
 		return DurableSQLRequestResult{}, fmt.Errorf("gateway: durable SQL execution (matching plan=%t): %w", begin.ProgramMatches, err)
 	}
-	return executor.result(key, outcome)
+	res, resErr := executor.result(key, outcome)
+	if resErr == nil && res.Result != nil && len(targets) > 0 && len(targets[0].ReturningDocs) > 0 {
+		res.Result.ReturningDocs = targets[0].ReturningDocs
+	}
+	return res, resErr
 }
 
 type directSQLRequestResult struct {
