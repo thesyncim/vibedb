@@ -140,10 +140,11 @@ func (l *ReplicatedReadLease) Abort(err error) error {
 func (l *ReplicatedReadLease) Close() error { return l.Release() }
 
 func (l *ReplicatedReadLease) live() error {
-	if l == nil || l.cache == nil || l.slot == nil {
+	if l == nil || l.cache == nil || l.slot == nil || l.generation == 0 {
 		return ErrReplicatedReadLeaseClosed
 	}
-	if l.cache.closedAtomic.Load() || l.slot.liveGen.Load() != l.generation || l.generation == 0 {
+	idx := l.slot.slotIdx
+	if l.cache.closedAtomic.Load() || l.cache.liveLease[idx].Load() != l || l.cache.liveGen[idx].Load() != l.generation {
 		return ErrReplicatedReadLeaseClosed
 	}
 	return nil
@@ -185,9 +186,9 @@ func (k replicatedReadReuseKey) equal(other replicatedReadReuseKey) bool {
 }
 
 type replicatedReadReuseSlot struct {
+	slotIdx      uint8
 	active       bool
 	generation   uint64
-	liveGen      atomic.Uint64
 	lease        *ReplicatedReadLease
 	key          replicatedReadReuseKey
 	reader       *ReplicatedReadSession
@@ -201,11 +202,13 @@ type replicatedReadReuseCache struct {
 	closed       bool
 	closedAtomic atomic.Bool
 	retained     int64
-	nextGen   uint64
-	hits      uint64
-	misses    uint64
-	evictions uint64
-	slots     [replicatedReadReuseSlotCount]replicatedReadReuseSlot
+	nextGen      uint64
+	hits         uint64
+	misses       uint64
+	evictions    uint64
+	liveGen      [replicatedReadReuseSlotCount]atomic.Uint64
+	liveLease    [replicatedReadReuseSlotCount]atomic.Pointer[ReplicatedReadLease]
+	slots        [replicatedReadReuseSlotCount]replicatedReadReuseSlot
 }
 
 type replicatedReadReuseStats struct {
@@ -242,8 +245,12 @@ func (a *ReplicatedApply) replicatedReadReuseCache() *replicatedReadReuseCache {
 	a.readReuseMu.Lock()
 	defer a.readReuseMu.Unlock()
 	if a.readReuse == nil {
-		a.readReuse = new(replicatedReadReuseCache)
-		a.readReuseAtomic.Store(a.readReuse)
+		cache := new(replicatedReadReuseCache)
+		for i := range cache.slots {
+			cache.slots[i].slotIdx = uint8(i)
+		}
+		a.readReuse = cache
+		a.readReuseAtomic.Store(cache)
 	}
 	return a.readReuse
 }
@@ -571,7 +578,8 @@ func (c *replicatedReadReuseCache) reserveInto(key replicatedReadReuseKey, dst *
 			}
 			*lease = ReplicatedReadLease{cache: c, slot: slot, generation: slot.generation}
 			slot.lease = lease
-			slot.liveGen.Store(slot.generation)
+			c.liveGen[slot.slotIdx].Store(slot.generation)
+			c.liveLease[slot.slotIdx].Store(lease)
 			c.mu.Unlock()
 			return slot, lease, nil
 		}
@@ -635,7 +643,8 @@ func (c *replicatedReadReuseCache) leaseForInto(slot *replicatedReadReuseSlot, d
 	}
 	*lease = ReplicatedReadLease{cache: c, slot: slot, generation: slot.generation}
 	slot.lease = lease
-	slot.liveGen.Store(slot.generation)
+	c.liveGen[slot.slotIdx].Store(slot.generation)
+	c.liveLease[slot.slotIdx].Store(lease)
 	return lease
 }
 
@@ -676,9 +685,11 @@ func (c *replicatedReadReuseCache) finish(
 	}
 	slot := lease.slot
 	gen := lease.generation
-	if !slot.liveGen.CompareAndSwap(gen, 0) {
+	idx := slot.slotIdx
+	if gen == 0 || c.liveGen[idx].Load() != gen || !c.liveLease[idx].CompareAndSwap(lease, nil) {
 		return ErrReplicatedReadLeaseClosed
 	}
+	c.liveGen[idx].Store(0)
 	lease.slot = nil
 	lease.cache = nil
 	settled := false
@@ -828,7 +839,8 @@ func (c *replicatedReadReuseCache) detachSlotLocked(
 	c.evictions++
 	slot.active = false
 	slot.generation = 0
-	slot.liveGen.Store(0)
+	c.liveGen[slot.slotIdx].Store(0)
+	c.liveLease[slot.slotIdx].Store(nil)
 	slot.lease = nil
 	slot.key = replicatedReadReuseKey{}
 	slot.reader = nil
