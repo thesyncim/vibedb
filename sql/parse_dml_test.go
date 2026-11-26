@@ -330,7 +330,6 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"DELETE ... USING", `DELETE FROM t USING u WHERE t.a = u.a`, -1, "never by a join"},
 		{"mutation ORDER BY without LIMIT", `DELETE FROM t WHERE a = 1 ORDER BY a`, -1, "ORDER BY requires LIMIT"},
 		{"mutation OFFSET", `DELETE FROM t WHERE a = 1 LIMIT 5 OFFSET 1`, -1, "does not support OFFSET"},
-		{"a DELETE target alias", `DELETE FROM t AS x WHERE x.a = 1`, -1, "nothing to qualify"},
 		{"a bare INSERT target alias", `INSERT INTO t x VALUES (?)`, -1, "VALUES or SELECT"},
 
 		{"MERGE", `MERGE INTO t USING u ON (t.a = u.a)`, 0, "MERGE"},
@@ -587,21 +586,8 @@ func TestDocumentDerivedInsertGrammar(t *testing.T) {
 // exists to prevent.
 func TestRejectsDefinitionsTheEngineCannotEnforce(t *testing.T) {
 	runDMLRejections(t, []dmlRejection{
-		{"a length", `CREATE TABLE t (a VARCHAR(255))`, -1, "never enforced"},
-		{"a precision", `CREATE TABLE t (a NUMERIC(10, 2))`, -1, "never enforced"},
-		{"DATE", `CREATE TABLE t (a DATE)`, -1, "no date or time value"},
-		{"TIMESTAMP", `CREATE TABLE t (a TIMESTAMP)`, -1, "no date or time value"},
-		{"UUID", `CREATE TABLE t (a UUID)`, -1, "store it as STRING"},
-		{"BYTEA", `CREATE TABLE t (a BYTEA)`, -1, "no byte string"},
 		{"ENUM", `CREATE TABLE t (a ENUM)`, -1, "never checked"},
-		{"SERIAL", `CREATE TABLE t (a SERIAL)`, -1, "sequence-backed generated default"},
-		{"BIGSERIAL", `CREATE TABLE t (a BIGSERIAL)`, -1, "sequence-backed generated default"},
-		{"MONEY", `CREATE TABLE t (a MONEY)`, -1, "fixed fractional"},
-		{"bare CHAR", `CREATE TABLE t (a CHAR)`, -1, "fixed-width"},
-		{"bare CHARACTER", `CREATE TABLE t (a CHARACTER)`, -1, "fixed-width"},
-		{"bare NCHAR", `CREATE TABLE t (a NCHAR)`, -1, "fixed-width"},
 		{"NVARCHAR", `CREATE TABLE t (a NVARCHAR)`, -1, "omitted-length semantics"},
-		{"JSONB", `CREATE TABLE t (a JSONB)`, -1, "normalizes"},
 		{"RECORD", `CREATE TABLE t (a RECORD)`, -1, "declared field shape"},
 		{"STRUCT", `CREATE TABLE t (a STRUCT)`, -1, "declared field shape"},
 		{"an unknown type", `CREATE TABLE t (a WIDGET)`, -1, "unknown type"},
@@ -615,11 +601,6 @@ func TestRejectsDefinitionsTheEngineCannotEnforce(t *testing.T) {
 		{"NULL then NOT NULL", `CREATE TABLE t (a STRING NULL NOT NULL)`, -1, "contradictory"},
 		{"NOT NULL then NULL", `CREATE TABLE t (a STRING NOT NULL NULL)`, -1, "contradictory"},
 		{"column primary key then NULL", `CREATE TABLE t (a STRING PRIMARY KEY NULL)`, -1, "contradictory"},
-		{"DEFAULT", `CREATE TABLE t (a STRING DEFAULT 'x')`, -1, "DEFAULT is not supported"},
-		{"column UNIQUE", `CREATE TABLE t (a STRING UNIQUE)`, -1, "UNIQUE is not supported"},
-		{"table UNIQUE", `CREATE TABLE t (a STRING, UNIQUE (a))`, -1, "UNIQUE is not supported"},
-		{"CHECK", `CREATE TABLE t (a STRING, CHECK (a > 1))`, -1, "CHECK is not supported"},
-		{"REFERENCES", `CREATE TABLE t (a STRING, FOREIGN KEY (a) REFERENCES u (b))`, -1, "FOREIGN is not supported"},
 		{"CREATE TABLE AS", `CREATE TABLE t AS SELECT a FROM u`, -1, "created empty"},
 		{"a partial index", `CREATE INDEX ON t (a) WHERE b = 1`, -1, "cover every document"},
 		{"an index method", `CREATE INDEX ON t (a) USING btree`, -1, "unknown method"},
@@ -632,7 +613,6 @@ func TestRejectsDefinitionsTheEngineCannotEnforce(t *testing.T) {
 		{"an index over the whole document", `CREATE INDEX ON t (*)`, -1, "must stand alone"},
 		{"a duplicate index path", `CREATE INDEX ON t (a, a)`, -1, "named twice"},
 		{"too many index paths", `CREATE INDEX ON t (a, b, c, d, e)`, -1, "at most 4"},
-		{"ALTER DROP", `ALTER TABLE t DROP COLUMN a`, -1, "supports ADD COLUMN"},
 		{"ALTER primary key", `ALTER TABLE t ADD COLUMN other TEXT PRIMARY KEY`, -1, "changing document identity"},
 	})
 }

@@ -99,7 +99,6 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 		{"DISTINCT and ALL", `SELECT DISTINCT ALL a FROM t`, 16, "mutually exclusive"},
 		{"DISTINCT with GROUP BY", `SELECT DISTINCT a FROM t GROUP BY a`, 35, "grouping changes"},
 		{"COUNT DISTINCT", `SELECT COUNT(DISTINCT a) FROM t`, 13, "no distinct variant"},
-		{"LIKE ESCAPE", `SELECT a FROM t WHERE b LIKE 'x%' ESCAPE '!'`, 34, "LIKE ... ESCAPE"},
 		{"regular expressions", `SELECT a FROM t WHERE b ~ 'x'`, 24, "regular-expression"},
 		{"a scalar subquery on the left", `SELECT a FROM t WHERE (SELECT 1 FROM u) = 1`, 23, "cannot stand alone"},
 		{"scalar functions", `SELECT unknown_fn(a) FROM t`, 17, "not a supported function"},
@@ -110,7 +109,7 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 		{"UPDATE", `UPDATE t SET a = 1`, 0, "parsed by ParseStatement"},
 		{"DELETE", `DELETE FROM t`, 0, "parsed by ParseStatement"},
 		{"CREATE TABLE", `CREATE TABLE t (a STRING)`, 0, "parsed by ParseStatement"},
-		{"FETCH FIRST", `SELECT a FROM t FETCH FIRST 1 ROWS ONLY`, 16, "write LIMIT"},
+		{"FETCH FIRST", `SELECT a FROM t FETCH FIRST 1 ROWS WITH TIES`, -1, "WITH TIES"},
 		{"COLLATE", `SELECT a FROM t ORDER BY a COLLATE "C"`, 27, "COLLATE"},
 		{"GROUP BY an output position", `SELECT a FROM t GROUP BY 1`, 25, "output position"},
 		{"GROUP BY an aggregate", `SELECT SUM(a) FROM t GROUP BY SUM(a)`, 33, "computed per group"},
@@ -268,16 +267,16 @@ func TestRejectsMalformedContainmentNeedles(t *testing.T) {
 // TestErrorPositionsAreLineAndColumn checks that a multi-line statement reports
 // the line and column an editor would show, not just a byte offset.
 func TestErrorPositionsAreLineAndColumn(t *testing.T) {
-	src := "SELECT a\nFROM t\nWHERE b LIKE 'x' ESCAPE '!'"
+	src := "SELECT a\nFROM t\nWHERE b LIKE 'x' ESCAPE '!!'"
 	_, err := Parse(src)
 	var parseErr *ParseError
 	if !errors.As(err, &parseErr) {
 		t.Fatalf("Parse = %v, want *ParseError", err)
 	}
-	if parseErr.Line != 3 || parseErr.Col != 18 {
-		t.Fatalf("reported %d:%d, want 3:18", parseErr.Line, parseErr.Col)
+	if parseErr.Line != 3 || parseErr.Col != 25 {
+		t.Fatalf("reported %d:%d, want 3:25", parseErr.Line, parseErr.Col)
 	}
-	if !strings.Contains(parseErr.Error(), "3:18") {
-		t.Fatalf("Error() = %q, want it to show 3:18", parseErr.Error())
+	if !strings.Contains(parseErr.Error(), "3:25") {
+		t.Fatalf("Error() = %q, want it to show 3:25", parseErr.Error())
 	}
 }

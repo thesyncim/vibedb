@@ -1378,7 +1378,7 @@ func (p *Parser) parseMutationTargetAlias(allowBare bool) (string, int, error) {
 		return alias, pos, err
 	}
 	if allowBare && (p.tok.kind == tokQuotedIdent ||
-		(p.tok.kind == tokIdent && !reserved(p.tok.kw))) {
+		(p.tok.kind == tokIdent && !reserved(p.tok.kw) && !p.atKeyword(kwReturning) && !p.atKeyword(kwUsing))) {
 		pos := p.tok.pos
 		alias, err := p.parseAliasName("an UPDATE target alias")
 		if err == nil && alias == DocumentColumn {

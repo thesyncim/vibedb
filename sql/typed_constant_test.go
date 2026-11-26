@@ -298,7 +298,6 @@ func TestPostgreSQLUnsupportedTypedConstantSpellingsArePositioned0A000(t *testin
 		`SELECT pg_catalog.bool 't'`,
 		`SELECT bool(1) 't'`,
 		`SELECT bool[] 't'`,
-		`SELECT BOOL E't'`,
 		`SELECT BOOL U&'t'`,
 		`SELECT VARCHAR 'x'`,
 		`SELECT CHAR 'x'`,

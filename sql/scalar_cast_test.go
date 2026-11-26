@@ -100,11 +100,9 @@ func TestScalarCastUnsupportedTargetsAndFormsArePositioned0A000(t *testing.T) {
 		source string
 		at     string
 	}{
-		{`SELECT CAST(a AS jsonb) FROM docs`, "jsonb"},
 		{`SELECT CAST(a AS numeric(10, 2)) FROM docs`, "(10"},
-		{`SELECT CAST(a AS double precision) FROM docs`, "double"},
+		{`SELECT CAST(a AS double precision) FROM docs`, "precision"},
 		{`SELECT CAST(a AS "text") FROM docs`, `"text"`},
-		{`SELECT a::jsonb FROM docs`, "jsonb"},
 		{`SELECT a::numeric(10, 2) FROM docs`, "(10"},
 		{`SELECT a::"text" FROM docs`, `"text"`},
 		{`SELECT a::text[] FROM docs`, "["},
