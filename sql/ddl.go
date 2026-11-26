@@ -206,14 +206,31 @@ type ColumnDef struct {
 	explicitNull bool
 }
 
-// An AlterTableStmt adds one declared column to an existing table. The bounded
-// form is deliberately additive: it can be built and validated against a
-// shadow copy, then published atomically without teaching the serving path
-// about transitional schemas.
+// AlterTableAction identifies the specific ALTER TABLE operation.
+type AlterTableAction uint8
+
+const (
+	AlterAddColumn AlterTableAction = iota
+	AlterDropColumn
+	AlterSetNotNull
+	AlterDropNotNull
+	AlterSetType
+	AlterSetDefault
+	AlterDropDefault
+	AlterRenameColumn
+	AlterRenameTable
+	AlterAddConstraint
+	AlterDropConstraint
+)
+
+// An AlterTableStmt alters an existing table's schema or metadata.
 type AlterTableStmt struct {
+	Action      AlterTableAction
 	Table       string
 	Column      ColumnDef
+	NewName     string
 	IfNotExists bool
+	IfExists    bool
 	Pos         int
 }
 

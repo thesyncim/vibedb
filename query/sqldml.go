@@ -1632,23 +1632,33 @@ func schemaTypeOf(t sqlast.JSONType) store.SchemaType {
 type AlterTableDefinition struct {
 	Table       string
 	Field       store.SchemaField
+	Action      sqlast.AlterTableAction
+	NewName     string
 	IfNotExists bool
+	IfExists    bool
 }
 
-// LowerAlterTable compiles ALTER TABLE ADD COLUMN into one store schema field.
+// LowerAlterTable compiles ALTER TABLE into its lowered action and schema field.
 func (d *DMLStatement) LowerAlterTable() (AlterTableDefinition, error) {
 	if d.kind != DDLAlterTable || d.tree.AlterTable == nil {
 		return AlterTableDefinition{}, fmt.Errorf("query: %s is not an ALTER TABLE", d.kind)
 	}
 	stmt := d.tree.AlterTable
-	return AlterTableDefinition{
-		Table: stmt.Table,
-		Field: store.SchemaField{
-			Path:  string(stmt.Column.Path.AppendPointer(nil)),
-			Types: schemaTypeOf(stmt.Column.Type), Required: stmt.Column.Required,
-		},
+	def := AlterTableDefinition{
+		Action:      stmt.Action,
+		Table:       stmt.Table,
+		NewName:     stmt.NewName,
 		IfNotExists: stmt.IfNotExists,
-	}, nil
+		IfExists:    stmt.IfExists,
+	}
+	if stmt.Column.Path != nil {
+		def.Field = store.SchemaField{
+			Path:     string(stmt.Column.Path.AppendPointer(nil)),
+			Types:    schemaTypeOf(stmt.Column.Type),
+			Required: stmt.Column.Required,
+		}
+	}
+	return def, nil
 }
 
 // An IndexDefinition is a lowered CREATE [UNIQUE] INDEX.

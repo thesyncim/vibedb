@@ -98,36 +98,222 @@ func (p *Parser) parseAlterTable() error {
 	p.alter = AlterTableStmt{}
 	p.advance() // ALTER
 	if !p.acceptKeyword(kwTable) {
-		return p.featureNotSupportedHere("ALTER supports TABLE ADD COLUMN in the bounded catalog subset")
+		return p.featureNotSupportedHere("ALTER supports TABLE in the bounded catalog subset")
+	}
+	if p.acceptKeyword(kwIf) {
+		if err := p.expectKeyword(kwExists, "EXISTS after IF"); err != nil {
+			return err
+		}
+		p.alter.IfExists = true
 	}
 	name, pos, err := p.parseCollectionName()
 	if err != nil {
 		return err
 	}
 	p.alter.Table, p.alter.Pos = name, pos
-	if !tokenTextEqual(p.tok, "ADD") {
-		return p.featureNotSupportedHere("ALTER TABLE supports ADD COLUMN; DROP, RENAME, TYPE, and constraint changes require distinct migration semantics")
-	}
-	p.advance()
-	if tokenTextEqual(p.tok, "COLUMN") {
-		p.advance()
-	}
-	exists, err := p.parseIfNotExists()
-	if err != nil {
-		return err
-	}
-	p.alter.IfNotExists = exists
 	p.out = &p.sel
 	*p.out = SelectStmt{}
 	p.beginFilter(name, pos)
-	column, err := p.parseColumnDef()
-	if err != nil {
+
+	switch {
+	case tokenTextEqual(p.tok, "ADD"):
+		p.advance()
+		if tokenTextEqual(p.tok, "CONSTRAINT") {
+			p.advance()
+			if _, err := p.parseAliasName("a constraint name"); err != nil {
+				return err
+			}
+			return p.parseAlterAddConstraint()
+		}
+		if p.atKeyword(kwUnique) || tokenTextEqual(p.tok, "CHECK") || tokenTextEqual(p.tok, "FOREIGN") {
+			return p.parseAlterAddConstraint()
+		}
+		if tokenTextEqual(p.tok, "COLUMN") {
+			p.advance()
+		}
+		exists, err := p.parseIfNotExists()
+		if err != nil {
+			return err
+		}
+		p.alter.Action = AlterAddColumn
+		p.alter.IfNotExists = exists
+		column, err := p.parseColumnDef()
+		if err != nil {
+			return err
+		}
+		if column.PrimaryKey {
+			return p.errAt(column.Pos, "ALTER TABLE cannot add a PRIMARY KEY: changing document identity requires a separately coordinated table migration")
+		}
+		p.alter.Column = column
+
+	case p.atKeyword(kwDrop):
+		p.advance()
+		if tokenTextEqual(p.tok, "CONSTRAINT") {
+			p.advance()
+			if p.acceptKeyword(kwIf) {
+				if err := p.expectKeyword(kwExists, "EXISTS after IF"); err != nil {
+					return err
+				}
+				p.alter.IfExists = true
+			}
+			cname, err := p.parseAliasName("a constraint name")
+			if err != nil {
+				return err
+			}
+			p.alter.Action = AlterDropConstraint
+			p.alter.NewName = cname
+			_ = p.acceptDropBehavior()
+			return p.expectEnd()
+		}
+		if tokenTextEqual(p.tok, "COLUMN") {
+			p.advance()
+		}
+		if p.acceptKeyword(kwIf) {
+			if err := p.expectKeyword(kwExists, "EXISTS after IF"); err != nil {
+				return err
+			}
+			p.alter.IfExists = true
+		}
+		colPos := p.tok.pos
+		path, err := p.parsePath(false)
+		if err != nil {
+			return err
+		}
+		if p.acceptDropBehavior() == dropCascade {
+			return p.featureNotSupportedHere("ALTER TABLE DROP COLUMN CASCADE is not supported")
+		}
+		p.alter.Action = AlterDropColumn
+		p.alter.Column = ColumnDef{Path: path, Pos: colPos}
+
+	case tokenTextEqual(p.tok, "ALTER"):
+		p.advance()
+		if tokenTextEqual(p.tok, "COLUMN") {
+			p.advance()
+		}
+		colPos := p.tok.pos
+		path, err := p.parsePath(false)
+		if err != nil {
+			return err
+		}
+		p.alter.Column = ColumnDef{Path: path, Pos: colPos}
+		switch {
+		case p.atKeyword(kwSet):
+			p.advance()
+			if p.atKeyword(kwNot) {
+				p.advance()
+				if err := p.expectKeyword(kwNull, "NULL after SET NOT"); err != nil {
+					return err
+				}
+				p.alter.Action = AlterSetNotNull
+			} else if p.atKeyword(kwDefault) {
+				p.advance()
+				defExpr, err := p.parseScalarExpression(scalarSelect)
+				if err != nil {
+					return err
+				}
+				p.alter.Action = AlterSetDefault
+				p.alter.Column.HasDefault = true
+				p.alter.Column.DefaultExpr = defExpr
+			} else if tokenTextEqual(p.tok, "DATA") {
+				p.advance()
+				if !tokenTextEqual(p.tok, "TYPE") {
+					return p.errHere("expected TYPE after SET DATA")
+				}
+				p.advance()
+				kind, err := p.parseColumnType()
+				if err != nil {
+					return err
+				}
+				p.alter.Action = AlterSetType
+				p.alter.Column.Type = kind
+			} else {
+				return p.errHere("expected NOT NULL, DEFAULT, or DATA TYPE after SET")
+			}
+		case p.atKeyword(kwDrop):
+			p.advance()
+			if p.atKeyword(kwNot) {
+				p.advance()
+				if err := p.expectKeyword(kwNull, "NULL after DROP NOT"); err != nil {
+					return err
+				}
+				p.alter.Action = AlterDropNotNull
+			} else if p.atKeyword(kwDefault) {
+				p.advance()
+				p.alter.Action = AlterDropDefault
+			} else {
+				return p.errHere("expected NOT NULL or DEFAULT after DROP")
+			}
+		case tokenTextEqual(p.tok, "TYPE"):
+			p.advance()
+			kind, err := p.parseColumnType()
+			if err != nil {
+				return err
+			}
+			p.alter.Action = AlterSetType
+			p.alter.Column.Type = kind
+		default:
+			return p.errHere("expected SET, DROP, or TYPE after ALTER COLUMN")
+		}
+
+	case tokenTextEqual(p.tok, "RENAME"):
+		p.advance()
+		if tokenTextEqual(p.tok, "TO") {
+			p.advance()
+			newTable, _, err := p.parseCollectionName()
+			if err != nil {
+				return err
+			}
+			p.alter.Action = AlterRenameTable
+			p.alter.NewName = newTable
+			return p.expectEnd()
+		}
+		if tokenTextEqual(p.tok, "COLUMN") {
+			p.advance()
+		}
+		colPos := p.tok.pos
+		path, err := p.parsePath(false)
+		if err != nil {
+			return err
+		}
+		if !tokenTextEqual(p.tok, "TO") {
+			return p.errHere("expected TO in RENAME COLUMN")
+		}
+		p.advance()
+		newCol, err := p.parseAliasName("a new column name")
+		if err != nil {
+			return err
+		}
+		p.alter.Action = AlterRenameColumn
+		p.alter.Column = ColumnDef{Path: path, Pos: colPos}
+		p.alter.NewName = newCol
+
+	default:
+		return p.featureNotSupportedHere("ALTER TABLE supports ADD, DROP, ALTER COLUMN, and RENAME")
+	}
+	if err := p.expectEnd(); err != nil {
 		return err
 	}
-	if column.PrimaryKey {
-		return p.errAt(column.Pos, "ALTER TABLE cannot add a PRIMARY KEY: changing document identity requires a separately coordinated table migration")
+	return p.resolvePaths()
+}
+
+func (p *Parser) parseAlterAddConstraint() error {
+	p.alter.Action = AlterAddConstraint
+	switch {
+	case p.atKeyword(kwUnique):
+		if _, err := p.parseColumnPathList("UNIQUE"); err != nil {
+			return err
+		}
+	case tokenTextEqual(p.tok, "CHECK"):
+		if _, err := p.parseCheckConstraint(); err != nil {
+			return err
+		}
+	case tokenTextEqual(p.tok, "FOREIGN"):
+		if err := p.parseForeignKeyConstraint(); err != nil {
+			return err
+		}
+	default:
+		return p.errHere("expected UNIQUE, CHECK, or FOREIGN KEY in ADD CONSTRAINT")
 	}
-	p.alter.Column = column
 	if err := p.expectEnd(); err != nil {
 		return err
 	}

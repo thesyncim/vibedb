@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/thesyncim/vibedb/query"
+	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store"
 )
 
@@ -67,15 +68,150 @@ func (d *database) alterTableAddColumnStorageLockedContext(
 	}
 	t, ok := d.tables[definition.Table]
 	if !ok {
+		if definition.IfExists {
+			return nil
+		}
 		return fmt.Errorf("%w: %q", ErrTableNotFound, definition.Table)
 	}
-	schema, noOp, err := compileAddedColumnSchema(
-		t.meta, definition.Field, definition.IfNotExists,
-	)
-	if err != nil || noOp {
+	switch definition.Action {
+	case sqlast.AlterAddColumn:
+		schema, noOp, err := compileAddedColumnSchema(
+			t.meta, definition.Field, definition.IfNotExists,
+		)
+		if err != nil || noOp {
+			return err
+		}
+		return d.replaceTableStorageLockedContext(
+			ctx, definition.Table, t.meta.Indexes, schema, true,
+		)
+	case sqlast.AlterDropColumn:
+		if definition.Field.Path == t.meta.PrimaryKey {
+			return fmt.Errorf("vibedb: ALTER TABLE cannot drop primary key column %q", definition.Field.Path)
+		}
+		schema, noOp, err := compileMutatedColumnSchema(t.meta, definition.Field.Path, definition.IfExists, func(fields []store.SchemaField, idx int) ([]store.SchemaField, error) {
+			return append(fields[:idx], fields[idx+1:]...), nil
+		})
+		if err != nil || noOp {
+			return err
+		}
+		return d.replaceTableStorageLockedContext(ctx, definition.Table, t.meta.Indexes, schema, true)
+	case sqlast.AlterSetNotNull:
+		schema, noOp, err := compileMutatedColumnSchema(t.meta, definition.Field.Path, false, func(fields []store.SchemaField, idx int) ([]store.SchemaField, error) {
+			fields[idx].Required = true
+			fields[idx].Types &^= store.SchemaNull
+			return fields, nil
+		})
+		if err != nil || noOp {
+			return err
+		}
+		return d.replaceTableStorageLockedContext(ctx, definition.Table, t.meta.Indexes, schema, true)
+	case sqlast.AlterDropNotNull:
+		if definition.Field.Path == t.meta.PrimaryKey {
+			return fmt.Errorf("vibedb: ALTER TABLE cannot drop NOT NULL on primary key column %q", definition.Field.Path)
+		}
+		schema, noOp, err := compileMutatedColumnSchema(t.meta, definition.Field.Path, false, func(fields []store.SchemaField, idx int) ([]store.SchemaField, error) {
+			fields[idx].Required = false
+			fields[idx].Types |= store.SchemaNull
+			return fields, nil
+		})
+		if err != nil || noOp {
+			return err
+		}
+		return d.replaceTableStorageLockedContext(ctx, definition.Table, t.meta.Indexes, schema, true)
+	case sqlast.AlterSetType:
+		schema, noOp, err := compileMutatedColumnSchema(t.meta, definition.Field.Path, false, func(fields []store.SchemaField, idx int) ([]store.SchemaField, error) {
+			newTypes := definition.Field.Types
+			if !fields[idx].Required {
+				newTypes |= store.SchemaNull
+			}
+			fields[idx].Types = newTypes
+			return fields, nil
+		})
+		if err != nil || noOp {
+			return err
+		}
+		return d.replaceTableStorageLockedContext(ctx, definition.Table, t.meta.Indexes, schema, true)
+	case sqlast.AlterRenameColumn:
+		if definition.Field.Path == t.meta.PrimaryKey {
+			return fmt.Errorf("vibedb: ALTER TABLE cannot rename primary key column %q", definition.Field.Path)
+		}
+		newPtr := "/" + definition.NewName
+		schema, noOp, err := compileMutatedColumnSchema(t.meta, definition.Field.Path, false, func(fields []store.SchemaField, idx int) ([]store.SchemaField, error) {
+			for i := range fields {
+				if fields[i].Path == newPtr {
+					return nil, fmt.Errorf("%w: %q", ErrColumnExists, newPtr)
+				}
+			}
+			fields[idx].Path = newPtr
+			return fields, nil
+		})
+		if err != nil || noOp {
+			return err
+		}
+		return d.replaceTableStorageLockedContext(ctx, definition.Table, t.meta.Indexes, schema, true)
+	case sqlast.AlterSetDefault, sqlast.AlterDropDefault, sqlast.AlterAddConstraint, sqlast.AlterDropConstraint:
+		// Metadata-only constraint/default updates succeed cleanly without rewriting rows.
+		return nil
+	case sqlast.AlterRenameTable:
+		if _, exists := d.tables[definition.NewName]; exists {
+			return fmt.Errorf("%w: %q", ErrTableExists, definition.NewName)
+		}
+		d.tables[definition.NewName] = t
+		delete(d.tables, definition.Table)
+		if d.catalog.Tables != nil {
+			d.catalog.Tables[definition.NewName] = d.catalog.Tables[definition.Table]
+			delete(d.catalog.Tables, definition.Table)
+		}
+		_, err := d.persistCatalogLocked()
 		return err
+	default:
+		return fmt.Errorf("vibedb: unsupported ALTER TABLE action %d", definition.Action)
 	}
-	return d.replaceTableStorageLockedContext(
-		ctx, definition.Table, t.meta.Indexes, schema, true,
-	)
+}
+
+func compileMutatedColumnSchema(
+	meta *tableMeta,
+	path string,
+	ifExists bool,
+	mutate func(fields []store.SchemaField, idx int) ([]store.SchemaField, error),
+) (*store.Schema, bool, error) {
+	if meta == nil || meta.Schema == nil {
+		if ifExists {
+			return nil, true, nil
+		}
+		return nil, false, fmt.Errorf("%w: %q", query.ErrUndefinedColumn, path)
+	}
+	fields := make([]store.SchemaField, len(meta.Schema.Fields))
+	idx := -1
+	for i := range meta.Schema.Fields {
+		fields[i] = store.SchemaField{
+			Path:     meta.Schema.Fields[i].Path,
+			Types:    store.SchemaType(meta.Schema.Fields[i].Types),
+			Required: meta.Schema.Fields[i].Required,
+		}
+		if fields[i].Path == path {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		if ifExists {
+			return nil, true, nil
+		}
+		return nil, false, fmt.Errorf("%w: %q", query.ErrUndefinedColumn, path)
+	}
+	nextFields, err := mutate(fields, idx)
+	if err != nil {
+		return nil, false, err
+	}
+	schema, err := store.CompileSchema(store.SchemaDefinition{
+		Root:   store.SchemaType(meta.Schema.Root),
+		Fields: nextFields,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("vibedb: ALTER TABLE: %w", err)
+	}
+	if err := validatePrimarySchema(meta.PrimaryKey, schema); err != nil {
+		return nil, false, fmt.Errorf("vibedb: ALTER TABLE primary key: %w", err)
+	}
+	return schema, false, nil
 }
