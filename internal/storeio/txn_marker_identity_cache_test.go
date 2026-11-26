@@ -263,3 +263,50 @@ func TestTxnMarkerEntryCurrentRejectsClosedAndNilManagers(t *testing.T) {
 		t.Fatalf("closed marker EntryCurrent = %t, %v; want false, ErrInvalidWrite", current, err)
 	}
 }
+
+func TestTxnMarkerMatchesFileDirectoryPinnedRoot(t *testing.T) {
+	marker, markerPath := createTestTxnMarker(t, 8*TxnMarkerMinSectorSize)
+	t.Cleanup(func() { _ = marker.Close() })
+	dir := filepath.Dir(markerPath)
+
+	localPath := filepath.Join(dir, "coll.vibe")
+	localFile, err := os.OpenFile(localPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = localFile.Close() })
+
+	// First check populates verifiedDir if dir is non-canonical; second check
+	// exercises the pinned-root fast path.
+	for attempt := range 2 {
+		matched, matchErr := marker.MatchesFileDirectory(localFile)
+		if matchErr != nil || !matched {
+			t.Fatalf("attempt %d local MatchesFileDirectory = %t, %v; want true, nil", attempt, matched, matchErr)
+		}
+	}
+
+	// Foreign directory file must be rejected even with the same basename.
+	foreignPath := filepath.Join(t.TempDir(), "coll.vibe")
+	foreignFile, err := os.OpenFile(foreignPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = foreignFile.Close() })
+	if matched, matchErr := marker.MatchesFileDirectory(foreignFile); matchErr != nil || matched {
+		t.Fatalf("foreign MatchesFileDirectory = %t, %v; want false, nil", matched, matchErr)
+	}
+
+	// Replacing the entry in the marker directory must fail closed on the
+	// pinned-root fast path.
+	if err := os.Remove(localPath); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := os.OpenFile(localPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = replacement.Close()
+	if matched, matchErr := marker.MatchesFileDirectory(localFile); matchErr != nil || matched {
+		t.Fatalf("replaced entry MatchesFileDirectory = %t, %v; want false, nil", matched, matchErr)
+	}
+}

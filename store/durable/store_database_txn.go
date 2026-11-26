@@ -430,23 +430,26 @@ func (l *TxnLog) validateCollectionsLocked(ordered []NamedCollection) error {
 			)
 		}
 	}
-	collections := make([]*Collection, len(ordered))
-	nameOf := make(map[*Collection]string, len(ordered))
-	for i := range ordered {
-		collections[i] = ordered[i].Collection
-		nameOf[ordered[i].Collection] = ordered[i].Name
+	var stackOrder [8]NamedCollection
+	var members []NamedCollection
+	if len(ordered) <= len(stackOrder) {
+		members = stackOrder[:len(ordered)]
+	} else {
+		members = make([]NamedCollection, len(ordered))
 	}
-	sortCollectionSnapshotOrder(collections)
-	for _, collection := range collections {
-		collection.writer.Lock()
+	copy(members, ordered)
+	sortNamedCollectionSnapshotOrder(members)
+	for i := range members {
+		members[i].Collection.writer.Lock()
 	}
 	defer func() {
-		for i := len(collections) - 1; i >= 0; i-- {
-			collections[i].writer.Unlock()
+		for i := len(members) - 1; i >= 0; i-- {
+			members[i].Collection.writer.Unlock()
 		}
 	}()
-	for _, collection := range collections {
-		name := nameOf[collection]
+	for i := range members {
+		collection := members[i].Collection
+		name := members[i].Name
 		if collection.closed {
 			return fmt.Errorf("%w: closed collection %q", ErrTxnCollection, name)
 		}

@@ -305,9 +305,10 @@ type checkpointGroupCertificate struct {
 type CheckpointGroup struct {
 	mu sync.Mutex
 
-	log      *TxnLog
-	members  []checkpointGroupMember
-	byName   map[string]*Collection
+	log          *TxnLog
+	members      []checkpointGroupMember
+	namedMembers []NamedCollection
+	byName       map[string]*Collection
 	opts     CheckpointGroupOptions
 	file     *os.File
 	fileInfo os.FileInfo
@@ -368,6 +369,9 @@ type checkpointGroupBatchWorkspace struct {
 	writeBackings []writeBatchWorkspace
 	batches       []*WriteBatch
 	dirty         []NamedCollection
+	order         []NamedCollection
+	staged        []stagedPrimaryBatch
+	targets       []storeio.TxnCollectionRef
 }
 
 func (workspace *checkpointGroupBatchWorkspace) prepare(
@@ -1180,7 +1184,8 @@ func checkpointGroupFromCertificateLocked(
 		byName[member.name] = member.collection
 	}
 	group := &CheckpointGroup{
-		log: log, members: members, byName: byName, opts: options,
+		log: log, members: members, namedMembers: checkpointNamedMembers(members),
+		byName: byName, opts: options,
 		file: file, fileInfo: info, sequence: certificate.sequence,
 		txnBase: certificate.txnBase, markerEpoch: certificate.markerEpoch,
 		markerID: certificate.markerID, txn: certificate.txnHighWater,
@@ -1425,7 +1430,7 @@ func (g *CheckpointGroup) qualifyLog(log *TxnLog) error {
 		}
 	}
 	log.regMu.Unlock()
-	if err := log.validateCollectionsLocked(checkpointNamedMembers(g.members)); err != nil {
+	if err := log.validateCollectionsLocked(g.namedMembers); err != nil {
 		return err
 	}
 	return validateCheckpointGroupDirectoryMembership(log, g.members)
@@ -1903,7 +1908,7 @@ func (g *CheckpointGroup) commitTransitionLocked(
 	if log.checkpointGroup != g {
 		return ErrCheckpointGroupOwned
 	}
-	if err := log.validateCollectionsLocked(checkpointNamedMembers(g.members)); err != nil {
+	if err := log.validateCollectionsLocked(g.namedMembers); err != nil {
 		return err
 	}
 	if log.poison != nil {
@@ -1918,23 +1923,27 @@ func (g *CheckpointGroup) commitTransitionLocked(
 		return fmt.Errorf("%w: transaction marker sequence lineage", ErrCheckpointGroupCorrupt)
 	}
 
-	order := make([]*Collection, len(dirty))
-	nameOf := make(map[*Collection]string, len(dirty))
-	for i := range dirty {
-		order[i] = dirty[i].Collection
-		nameOf[dirty[i].Collection] = dirty[i].Name
+	if cap(g.batch.order) < len(dirty) {
+		g.batch.order = make([]NamedCollection, len(dirty))
+	} else {
+		g.batch.order = g.batch.order[:len(dirty)]
 	}
-	sortCollectionSnapshotOrder(order)
-	for _, c := range order {
-		c.writer.Lock()
+	order := g.batch.order
+	copy(order, dirty)
+	sortNamedCollectionSnapshotOrder(order)
+	for i := range order {
+		order[i].Collection.writer.Lock()
 	}
 	defer func() {
 		for i := len(order) - 1; i >= 0; i-- {
-			order[i].writer.Unlock()
+			order[i].Collection.writer.Unlock()
 		}
+		clear(order)
+		g.batch.order = g.batch.order[:0]
 	}()
 
-	for _, c := range order {
+	for i := range order {
+		c := order[i].Collection
 		if c.checkpointGroup.Load() != g || c.closed {
 			return ErrCheckpointGroupOwned
 		}
@@ -1942,31 +1951,45 @@ func (g *CheckpointGroup) commitTransitionLocked(
 	if err := canonicalizePrimaryTransactionBatches(dirty, byName, limits); err != nil {
 		return err
 	}
-	staged := make([]stagedPrimaryBatch, len(order))
+	if cap(g.batch.staged) < len(order) {
+		g.batch.staged = make([]stagedPrimaryBatch, len(order))
+	} else {
+		g.batch.staged = g.batch.staged[:len(order)]
+		clear(g.batch.staged)
+	}
+	staged := g.batch.staged
 	stagedLive := 0
 	defer func() {
-		if err == nil {
-			return
+		if err != nil {
+			for i := stagedLive - 1; i >= 0; i-- {
+				order[i].Collection.unwindStagedPrimaryBatch(&staged[i])
+			}
 		}
-		for i := stagedLive - 1; i >= 0; i-- {
-			order[i].unwindStagedPrimaryBatch(&staged[i])
-		}
+		clear(staged)
+		g.batch.staged = g.batch.staged[:0]
 	}()
-	for i, c := range order {
-		st, stageErr := c.stagePrimaryBatchConditionalLocked(byName[nameOf[c]])
+	for i := range order {
+		c := order[i].Collection
+		st, stageErr := c.stagePrimaryBatchConditionalLocked(byName[order[i].Name])
 		if stageErr != nil {
 			return stageErr
 		}
 		if !st.live {
-			return fmt.Errorf("%w: staged empty member %q", ErrTxnCollection, nameOf[c])
+			return fmt.Errorf("%w: staged empty member %q", ErrTxnCollection, order[i].Name)
 		}
 		staged[i] = st
 		stagedLive = i + 1
 	}
 
 	header := log.marker.Header()
-	targets := make([]storeio.TxnCollectionRef, len(order))
-	for i, c := range order {
+	if cap(g.batch.targets) < len(order) {
+		g.batch.targets = make([]storeio.TxnCollectionRef, len(order))
+	} else {
+		g.batch.targets = g.batch.targets[:len(order)]
+	}
+	targets := g.batch.targets
+	for i := range order {
+		c := order[i].Collection
 		if prepErr := c.preparePrimaryBatchConditionalLocked(
 			&staged[i], header.MarkerID, header.Epoch, txnID, false,
 		); prepErr != nil {
@@ -2007,10 +2030,11 @@ func (g *CheckpointGroup) commitTransitionLocked(
 		}
 	}
 
-	for _, c := range order {
-		c.snapshotGate.Lock()
+	for i := range order {
+		order[i].Collection.snapshotGate.Lock()
 	}
-	for i, c := range order {
+	for i := range order {
+		c := order[i].Collection
 		c.batchPrimaryAdmitted = c.batchPrimaryAdmitted[:0]
 		c.publishPrimaryBatchGateHeld(staged[i])
 		staged[i].live = false
@@ -2021,7 +2045,7 @@ func (g *CheckpointGroup) commitTransitionLocked(
 	g.visibleTxn.Store(txnID)
 	g.visibleApplied.Store(applied)
 	for i := len(order) - 1; i >= 0; i-- {
-		order[i].snapshotGate.Unlock()
+		order[i].Collection.snapshotGate.Unlock()
 	}
 	stagedLive = 0
 	return nil

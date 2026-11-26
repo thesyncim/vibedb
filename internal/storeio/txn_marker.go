@@ -1404,6 +1404,28 @@ func (m *TxnMarker) MatchesFileDirectory(file *os.File) (bool, error) {
 	if m == nil || m.sourceDirInfo == nil || file == nil {
 		return false, ErrInvalidWrite
 	}
+	if m.root != nil {
+		fileName := file.Name()
+		dirInfo, err := os.Stat(filepath.Dir(fileName))
+		if err != nil {
+			return false, err
+		}
+		if !os.SameFile(m.sourceDirInfo, dirInfo) {
+			return false, nil
+		}
+		entryInfo, err := m.root.Lstat(filepath.Base(fileName))
+		if err != nil {
+			return false, err
+		}
+		if !entryInfo.Mode().IsRegular() {
+			return false, nil
+		}
+		fileInfo, err := file.Stat()
+		if err != nil {
+			return false, err
+		}
+		return os.SameFile(fileInfo, entryInfo), nil
+	}
 	return matchesTxnMarkerDirectory(m.sourceDirInfo, file)
 }
 

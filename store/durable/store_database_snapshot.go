@@ -56,6 +56,23 @@ func sortCollectionSnapshotOrder(collections []*Collection) {
 	})
 }
 
+func sortNamedCollectionSnapshotOrder(ordered []NamedCollection) {
+	for i := range ordered {
+		ordered[i].Collection.snapshotOrderID()
+	}
+	slices.SortFunc(ordered, func(a, b NamedCollection) int {
+		left, right := a.Collection.snapshotOrder.Load(), b.Collection.snapshotOrder.Load()
+		switch {
+		case left < right:
+			return -1
+		case left > right:
+			return 1
+		default:
+			return 0
+		}
+	})
+}
+
 // snapshotCutHold is the writer-and-gate hold seized across a no-skew database
 // cut. It records how much of the cut [seizeSnapshotCut] acquired so [release]
 // can undo exactly that much in LIFO order, whether the cut completed or a

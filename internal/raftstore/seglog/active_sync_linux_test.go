@@ -4,6 +4,7 @@ package seglog
 
 import (
 	"encoding/binary"
+	"math"
 	"testing"
 )
 
@@ -26,16 +27,29 @@ func TestPersistWaveRealFdatasyncZeroAlloc(t *testing.T) {
 	if err = e.PersistWave(wave); err != nil {
 		t.Fatal(err)
 	}
+	// A slow fdatasync syscall (>10ms) on a loaded CI runner can trigger a
+	// one-time sysmon thread handoff (newm) in global MemStats. Taking the
+	// minimum over up to 3 windows still catches any real per-call allocation
+	// while filtering one-off runtime thread creation.
 	var runErr error
 	n := uint64(1)
-	allocs := testing.AllocsPerRun(5, func() {
-		n++
-		binary.LittleEndian.PutUint64(wave.ID[:8], n)
-		entries[0].Index = n
-		runErr = e.PersistWave(wave)
-	})
-	if runErr != nil {
-		t.Fatal(runErr)
+	allocs := math.MaxFloat64
+	for range 3 {
+		got := testing.AllocsPerRun(5, func() {
+			n++
+			binary.LittleEndian.PutUint64(wave.ID[:8], n)
+			entries[0].Index = n
+			runErr = e.PersistWave(wave)
+		})
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		if got < allocs {
+			allocs = got
+		}
+		if allocs == 0 {
+			break
+		}
 	}
 	if allocs != 0 {
 		t.Fatalf("real-fdatasync PersistWave allocations=%v want=0", allocs)
