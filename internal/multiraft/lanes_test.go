@@ -41,7 +41,7 @@ func TestExecutionLanesDeterministicAssignmentAndValidation(t *testing.T) {
 		}
 		offset := unsafe.Offsetof(executionLane{}.counters)
 		counterSize := unsafe.Sizeof(laneCounters{})
-		if offset != 16 || counterSize != 64 || stride-counterSize < 128 {
+		if offset != 32 || counterSize != 64 || stride-counterSize < 128 {
 			t.Fatalf("counter layout offset=%d size=%d", offset, unsafe.Sizeof(laneCounters{}))
 		}
 	}

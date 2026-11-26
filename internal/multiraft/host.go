@@ -1188,6 +1188,64 @@ func (host *Host) tryValidateReadAuthorityToken(
 	return provider.ValidateReadAuthorityToken(token)
 }
 
+type readOnlyStatusRuntime interface {
+	StatusReadOnly() (raftmember.RuntimeStatus, bool, error)
+}
+
+type readOnlyValidateAuthorityRuntime interface {
+	ValidateReadAuthorityTokenReadOnly(raftauthority.AuthorityToken) error
+}
+
+type readOnlyPointAuthorityRuntime interface {
+	ReadPointAuthorityTokenReadOnly() (raftauthority.AuthorityToken, bool, error)
+}
+
+// tryValidateReadAuthorityTokenReadOnly validates token while ExecutionLane
+// holds a shared read lock (TryRLock). handled is false when the underlying
+// runtime does not support the concurrent read-only edge or has a pending
+// leader-transfer refresh that requires the exclusive lane lock.
+func (host *Host) tryValidateReadAuthorityTokenReadOnly(
+	key raftmember.GroupKey,
+	memberID, nodeIncarnation, term uint64,
+	token raftauthority.AuthorityToken,
+) (handled bool, err error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return true, err
+	}
+	if group.memberID != memberID || group.runtime == nil {
+		return true, raftmodel.ErrNotLeader
+	}
+	identity := group.sourceOwner
+	if identity.Group != key || identity.MemberID != memberID ||
+		identity.NodeIncarnation != nodeIncarnation {
+		return true, raftmodel.ErrNotLeader
+	}
+	statusReader, ok := group.runtime.(readOnlyStatusRuntime)
+	if !ok {
+		return false, nil
+	}
+	validator, ok := group.runtime.(readOnlyValidateAuthorityRuntime)
+	if !ok {
+		return false, nil
+	}
+	status, statusOK, err := statusReader.StatusReadOnly()
+	if err != nil {
+		return true, err
+	}
+	if !statusOK {
+		return false, nil
+	}
+	if status.MemberID != memberID || status.LeaderID != memberID || status.Term != term {
+		return true, raftmodel.ErrNotLeader
+	}
+	if token.Group != raftauthorityGroup(key) || token.Term != term ||
+		token.Holder != memberID || token.HolderIncarnation != nodeIncarnation {
+		return true, raftauthority.ErrObservationStale
+	}
+	return true, validator.ValidateReadAuthorityTokenReadOnly(token)
+}
+
 // PointReadAdmission is the detached result of one warm point-read attempt.
 // Identity and Status come from the same Runtime turn that supplied Token;
 // callers must keep using the serving permit and final token validation before
@@ -1256,6 +1314,59 @@ func (host *Host) tryReadPointAdmission(
 	}
 	result.AuthorityRoundAttempt = host.offerPointReadAuthority(group)
 	return true, true, result, nil
+}
+
+// tryReadPointAdmissionReadOnly performs steady-state warm point-read
+// admission while ExecutionLane holds a shared read lock (TryRLock). handled is
+// false whenever the runtime needs an exclusive mutation edge (token renewal
+// lead window, expired/missing token, pending outbound authority, pending
+// leader transfer, or a test stub without read-only support).
+func (host *Host) tryReadPointAdmissionReadOnly(
+	key raftmember.GroupKey,
+	expected raftmember.RuntimeIdentity,
+	term uint64,
+	authorize pointReadAdmissionCheck,
+) (handled, admitted, authorized bool, result PointReadAdmission, err error) {
+	group, err := host.lookup(key)
+	if err != nil {
+		return true, false, false, PointReadAdmission{}, err
+	}
+	if group.runtime == nil || group.identity != expected || group.memberID != expected.MemberID {
+		return true, false, false, PointReadAdmission{}, raftmodel.ErrNotLeader
+	}
+	statusReader, ok := group.runtime.(readOnlyStatusRuntime)
+	if !ok {
+		return false, false, false, PointReadAdmission{}, nil
+	}
+	tokenReader, ok := group.runtime.(readOnlyPointAuthorityRuntime)
+	if !ok {
+		return false, false, false, PointReadAdmission{}, nil
+	}
+	status, statusOK, err := statusReader.StatusReadOnly()
+	if err != nil {
+		return true, false, false, PointReadAdmission{}, err
+	}
+	if !statusOK {
+		return false, false, false, PointReadAdmission{}, nil
+	}
+	if status.MemberID != expected.MemberID || status.LeaderID != expected.MemberID ||
+		status.Term != term {
+		return true, false, false, PointReadAdmission{Identity: group.identity, Status: status}, raftmodel.ErrNotLeader
+	}
+	token, needsExclusive, tokenErr := tokenReader.ReadPointAuthorityTokenReadOnly()
+	if needsExclusive {
+		return false, false, false, PointReadAdmission{}, nil
+	}
+	if tokenErr != nil || token.Group != raftauthorityGroup(key) ||
+		token.Term != status.Term || token.Holder != expected.MemberID ||
+		token.HolderIncarnation != expected.NodeIncarnation {
+		return true, false, false, PointReadAdmission{}, nil
+	}
+	result = PointReadAdmission{Identity: group.identity, Status: status, Token: token}
+	if authorize != nil && !authorize(group.identity, status, token) {
+		return true, true, false, result, nil
+	}
+	return true, true, true, result, nil
 }
 
 // offerPointReadAuthority gives a warm read the same bounded renewal

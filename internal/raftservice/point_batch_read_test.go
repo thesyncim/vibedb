@@ -90,7 +90,7 @@ func TestExecutionOwnersPointBatchPreservesReadIndexAndLease(t *testing.T) {
 	if result, lease, err := owners.ReadPointBatch(t.Context(), request); !errors.Is(err, ErrServingFence) || lease != nil || result.Data != nil {
 		t.Fatalf("wrong generation escaped: %+v/%v", result, err)
 	}
-	if owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 {
+	if owner.pendingReadItems.Load() != 0 || owner.pendingReadBytes.Load() != 0 {
 		t.Fatal("failed generation read leaked response reservation")
 	}
 }

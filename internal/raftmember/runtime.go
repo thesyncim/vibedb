@@ -1332,6 +1332,31 @@ func (runtime *Runtime) Status() (RuntimeStatus, error) {
 	}, nil
 }
 
+// StatusReadOnly returns the same detached status as Status without mutating
+// Runtime state. ok is false when a leader transfer guard is present and must
+// be refreshed under the exclusive owner lock.
+func (runtime *Runtime) StatusReadOnly() (RuntimeStatus, bool, error) {
+	if err := runtime.checkUsable(); err != nil {
+		return RuntimeStatus{}, true, err
+	}
+	if runtime.leaderTransfer != nil {
+		return RuntimeStatus{}, false, nil
+	}
+	status := runtime.node.Status()
+	publishedApplied := runtime.node.PublishedApplied()
+	checkpointApplied := runtime.apply.CheckpointAppliedIndex()
+	if status.Applied > publishedApplied || publishedApplied > status.GetCommit() ||
+		checkpointApplied > publishedApplied {
+		return RuntimeStatus{}, false, nil
+	}
+	return RuntimeStatus{
+		MemberID: status.ID, LeaderID: status.Lead, Term: status.GetTerm(),
+		Commit: status.GetCommit(), Applied: publishedApplied,
+		CheckpointApplied: checkpointApplied,
+		LeadTransferee:    status.LeadTransferee, RaftState: status.RaftState,
+	}, true, nil
+}
+
 // CommitMetrics returns the cumulative core-authority counters. Runtime and
 // Node share the same serialized owner, so this adds no synchronization or
 // allocation to the Raft hot path.

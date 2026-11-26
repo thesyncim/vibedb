@@ -902,8 +902,9 @@ type Owner struct {
 	ingressBytes          int64
 	pendingProposalItems  int
 	pendingProposalBytes  int64
-	pendingReadItems      int
-	pendingReadBytes      int64
+	pendingReadItems      atomic.Int64
+	pendingReadBytes      atomic.Int64
+	stateAtomic           atomic.Uint32
 	readSequence          uint64
 	readAdmissionSequence uint64 // guarded by mu, including owner-lane snapshots
 	pendingReads          map[[16]byte]*readDelivery
@@ -1310,6 +1311,7 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 		return ErrOwnerClosed
 	}
 	owner.state = ownerRunning
+	owner.stateAtomic.Store(uint32(ownerRunning))
 	if owner.transferNotify == nil {
 		owner.transferNotify = make(chan struct{}, 1)
 	}
@@ -3566,6 +3568,7 @@ func (owner *Owner) stop(cause error) error {
 	owner.mu.Lock()
 	if owner.state != ownerClosed {
 		owner.state = ownerClosed
+		owner.stateAtomic.Store(uint32(ownerClosed))
 		owner.failure = cause
 		close(owner.done)
 	}
@@ -4066,25 +4069,39 @@ func pointReadFenceMatches(fence replicatedstate.SnapshotFence, serving ServingF
 }
 
 func (owner *Owner) reservePendingRead(bytes int64) error {
-	owner.mu.Lock()
-	defer owner.mu.Unlock()
-	if owner.state != ownerRunning {
-		return errors.Join(ErrOwnerClosed, owner.failure)
+	if owner.stateAtomic.Load() != uint32(ownerRunning) {
+		owner.mu.Lock()
+		defer owner.mu.Unlock()
+		if owner.state != ownerRunning {
+			return errors.Join(ErrOwnerClosed, owner.failure)
+		}
 	}
-	if owner.pendingReadItems == owner.limits.MaxPendingReadItems ||
-		bytes > owner.limits.MaxPendingReadBytes-owner.pendingReadBytes {
-		return ErrPendingReadsFull
+	maxItems := int64(owner.limits.MaxPendingReadItems)
+	for {
+		cur := owner.pendingReadItems.Load()
+		if cur >= maxItems {
+			return ErrPendingReadsFull
+		}
+		if owner.pendingReadItems.CompareAndSwap(cur, cur+1) {
+			break
+		}
 	}
-	owner.pendingReadItems++
-	owner.pendingReadBytes += bytes
-	return nil
+	maxBytes := owner.limits.MaxPendingReadBytes
+	for {
+		cur := owner.pendingReadBytes.Load()
+		if bytes > maxBytes-cur {
+			owner.pendingReadItems.Add(-1)
+			return ErrPendingReadsFull
+		}
+		if owner.pendingReadBytes.CompareAndSwap(cur, cur+bytes) {
+			return nil
+		}
+	}
 }
 
 func (owner *Owner) releasePendingRead(bytes int64) {
-	owner.mu.Lock()
-	owner.pendingReadItems--
-	owner.pendingReadBytes -= bytes
-	owner.mu.Unlock()
+	owner.pendingReadBytes.Add(-bytes)
+	owner.pendingReadItems.Add(-1)
 }
 
 // publish reserves and enqueues atomically under the lifecycle mutex. Because
