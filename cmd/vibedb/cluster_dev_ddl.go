@@ -128,8 +128,27 @@ func startDevDDLAt(ctx context.Context, cluster devClusterManifest, binary strin
 				return
 			}
 			fmt.Fprintf(os.Stdout, "development DDL prepared table=%q; loading three members\n", name)
-			for _, child := range children {
-				if err := child.command.Process.Signal(syscall.SIGHUP); err != nil {
+			// Signal follower nodes first so they register the group before the
+			// primary PG frontend node (children[0]) loads and campaigns locally.
+			if len(children) > 1 {
+				for _, child := range children[1:] {
+					if err := child.command.Process.Signal(syscall.SIGHUP); err != nil {
+						http.Error(w, err.Error(), http.StatusServiceUnavailable)
+						return
+					}
+				}
+				select {
+				case <-ctx.Done():
+					http.Error(w, ctx.Err().Error(), http.StatusServiceUnavailable)
+					return
+				case <-time.After(30 * time.Millisecond):
+				}
+				if err := children[0].command.Process.Signal(syscall.SIGHUP); err != nil {
+					http.Error(w, err.Error(), http.StatusServiceUnavailable)
+					return
+				}
+			} else if len(children) == 1 {
+				if err := children[0].command.Process.Signal(syscall.SIGHUP); err != nil {
 					http.Error(w, err.Error(), http.StatusServiceUnavailable)
 					return
 				}

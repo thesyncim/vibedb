@@ -597,6 +597,12 @@ func (round *AuthorityRound) Expired() (bool, error) {
 	return now >= round.usableUntil, nil
 }
 
+// ExpiredAt reports whether the holder deadline has elapsed at a caller-sampled
+// monotonic timestamp from the same authority clock.
+func (round *AuthorityRound) ExpiredAt(now time.Duration) bool {
+	return round == nil || round.invalidated || now >= round.usableUntil
+}
+
 // Token returns a serving authority only while the round is complete, current,
 // and within the holder's conservative deadline.
 func (round *AuthorityRound) Token(observation AuthorityObservation) (AuthorityToken, error) {
@@ -609,6 +615,18 @@ func (round *AuthorityRound) Token(observation AuthorityObservation) (AuthorityT
 	now, err := round.clock.Now()
 	if err != nil {
 		return AuthorityToken{}, err
+	}
+	return round.TokenAt(now, observation)
+}
+
+// TokenAt returns a serving authority at a caller-sampled monotonic timestamp
+// from the same authority clock, avoiding redundant clock reads on the hot path.
+func (round *AuthorityRound) TokenAt(now time.Duration, observation AuthorityObservation) (AuthorityToken, error) {
+	if round == nil || round.invalidated {
+		return AuthorityToken{}, ErrRoundInvalidated
+	}
+	if !round.complete {
+		return AuthorityToken{}, ErrNotQuorum
 	}
 	if now >= round.usableUntil {
 		return AuthorityToken{}, ErrRoundExpired

@@ -35,6 +35,7 @@ type postgresWriteStatement struct {
 	compiled                  *query.DMLStatement
 	returning                 *query.Statement
 	paramTypes                []driver.ParamType
+	catalogGeneration         uint64
 	closed                    bool
 }
 
@@ -150,6 +151,10 @@ func (s *postgresSession) prepareWrite(
 		}
 		return nil, err
 	}
+	var catalogGeneration uint64
+	if snapshot := s.backend.Executor.catalog.Current(); snapshot != nil {
+		catalogGeneration = snapshot.Generation()
+	}
 	p := &postgresWriteStatement{
 		session: s, text: strings.Clone(text), kind: parsed.Kind,
 		table:                     strings.Clone(parsed.Table()),
@@ -157,9 +162,10 @@ func (s *postgresSession) prepareWrite(
 		insertColumns:             insertColumns,
 		insertOnConflictDoNothing: insertOnConflictDoNothing,
 		params:                    parsed.Params(), compiled: compiled,
-		returning:  returningStmt,
-		documents:  documents,
-		paramTypes: resolvedParameterTypes,
+		returning:         returningStmt,
+		documents:         documents,
+		paramTypes:        resolvedParameterTypes,
+		catalogGeneration: catalogGeneration,
 	}
 	s.statements[p] = struct{}{}
 	return p, nil
@@ -390,6 +396,15 @@ func (p *postgresWriteStatement) ParamTypeTargetDefault(i int) bool {
 	return p != nil && p.compiled != nil &&
 		p.compiled.ParameterTypeTargetDefault(i)
 }
+func (p *postgresWriteStatement) ReusableForParse() bool {
+	if p == nil || p.closed || p.session == nil ||
+		p.session.state == driver.SessionClosed ||
+		p.session.state == driver.SessionFailedTransaction {
+		return false
+	}
+	snapshot := p.session.backend.Executor.catalog.Current()
+	return snapshot != nil && snapshot.Generation() == p.catalogGeneration
+}
 func (p *postgresWriteStatement) Columns() []string {
 	if p.returning != nil {
 		return p.returning.Columns()
@@ -402,7 +417,57 @@ func (p *postgresWriteStatement) AppendSchema(dst []query.OutputColumn) []query.
 	}
 	return dst
 }
+func (s *postgresSession) takeCachedWrite(
+	text string,
+	parameterTypes []driver.ParamType,
+) *postgresWriteStatement {
+	if len(parameterTypes) != 0 {
+		return nil
+	}
+	cache := &s.writeCache
+	if cache.text == "" || cache.text != text {
+		return nil
+	}
+	snapshot := s.backend.Executor.catalog.Current()
+	if snapshot == nil || snapshot.Generation() != cache.catalogGeneration {
+		return nil
+	}
+	statement := &postgresWriteStatement{
+		session:           s,
+		text:              cache.text,
+		kind:              cache.kind,
+		table:             cache.table,
+		params:            cache.params,
+		catalogGeneration: cache.catalogGeneration,
+	}
+	*cache = postgresWriteCache{}
+	s.statements[statement] = struct{}{}
+	return statement
+}
+
+func (s *postgresSession) retainWrite(statement *postgresWriteStatement) {
+	if s == nil || s.state == driver.SessionClosed || statement == nil ||
+		statement.text == "" || statement.compiled != nil || statement.returning != nil ||
+		statement.documents != nil || statement.paramTypes != nil ||
+		statement.insertSelectSQL != "" || statement.insertColumns != nil ||
+		statement.insertOnConflictDoNothing ||
+		len(statement.text) > maxPostgresReadCacheSQLBytes ||
+		statement.params > maxPostgresReadCacheParameters {
+		return
+	}
+	s.writeCache = postgresWriteCache{
+		text:              statement.text,
+		kind:              statement.kind,
+		table:             statement.table,
+		params:            statement.params,
+		catalogGeneration: statement.catalogGeneration,
+	}
+}
+
 func (p *postgresWriteStatement) Close() error {
+	if !p.closed && p.session != nil {
+		p.session.retainWrite(p)
+	}
 	p.closed = true
 	p.text = ""
 	p.documents = nil

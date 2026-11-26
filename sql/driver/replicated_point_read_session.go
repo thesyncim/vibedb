@@ -167,6 +167,17 @@ func (a *ReplicatedApply) pointReadSessionLayoutLocked(
 	raw []byte,
 	proof *replicatedPointSessionProof,
 ) (transactionTableLayout, *table, ReplicatedShardRelationIdentity, error) {
+	return a.pointReadSessionLayoutCheckedLocked(relation, primaryPath, key, found, raw, proof, false)
+}
+
+func (a *ReplicatedApply) pointReadSessionLayoutCheckedLocked(
+	relation replication.RelationID,
+	primaryPath, key []byte,
+	found bool,
+	raw []byte,
+	proof *replicatedPointSessionProof,
+	trustedPoint bool,
+) (transactionTableLayout, *table, ReplicatedShardRelationIdentity, error) {
 	base := a.database.catalog.ReplicatedShardStore
 	if base == nil {
 		return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{},
@@ -253,6 +264,9 @@ func (a *ReplicatedApply) pointReadSessionLayoutLocked(
 	if found && (len(raw) == 0 || len(raw) > descriptor.Limits.MaxDocumentBytes) {
 		return transactionTableLayout{}, nil, ReplicatedShardRelationIdentity{},
 			fmt.Errorf("%w: point value exceeds the live relation bound", ErrReplicatedApplyMismatch)
+	}
+	if trustedPoint {
+		return layout, table, descriptor, nil
 	}
 
 	// Re-run the same exact key, schema, and owned-range proof used by apply.

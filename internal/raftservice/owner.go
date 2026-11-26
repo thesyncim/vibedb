@@ -1432,7 +1432,7 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 				!concurrentProposalsUntil.IsZero() && len(collector.requests) < 8 && !collector.full() {
 				now := time.Now()
 				if now.Before(concurrentProposalsUntil) {
-					deadline := now.Add(650 * time.Microsecond)
+					deadline := now.Add(180 * time.Microsecond)
 					for len(collector.requests) < 8 && !collector.full() && !barrierPresent && drainErr == nil {
 						remaining := deadline.Sub(time.Now())
 						if remaining <= 0 {
@@ -1778,7 +1778,7 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 				!concurrentProposalsUntil.IsZero() && len(collector.requests) < 8 && !collector.full() {
 				now := time.Now()
 				if now.Before(concurrentProposalsUntil) {
-					deadline := now.Add(650 * time.Microsecond)
+					deadline := now.Add(180 * time.Microsecond)
 					for len(collector.requests) < 8 && !collector.full() && !barrierPresent && drainErr == nil {
 						remaining := deadline.Sub(time.Now())
 						if remaining <= 0 {

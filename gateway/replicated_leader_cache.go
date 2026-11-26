@@ -172,6 +172,25 @@ func (cache *replicatedLeaderHintCache) publish(
 	if set == nil {
 		return
 	}
+	// Steady-state reads hit an unchanged leader hint; check under RLock first
+	// so concurrent readers do not serialize on an exclusive write lock.
+	set.mu.RLock()
+	for way := uint8(0); way < set.ways; way++ {
+		entry := &set.entries[way]
+		if entry.matches(key) {
+			unchanged := entry.catalogIncarnation == next.catalogIncarnation &&
+				entry.catalogReplicaSet == next.catalogReplicaSet &&
+				sameReplicatedEndpoint(entry.endpoint, next.endpoint) &&
+				entry.state == next.state
+			set.mu.RUnlock()
+			if unchanged {
+				return
+			}
+			goto writeHint
+		}
+	}
+	set.mu.RUnlock()
+writeHint:
 	set.mu.Lock()
 	for way := uint8(0); way < set.ways; way++ {
 		entry := &set.entries[way]

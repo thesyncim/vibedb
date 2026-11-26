@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
@@ -174,8 +175,9 @@ type ReplicatedApply struct {
 	// readReuse owns a fixed, per-apply set of prepared-only replicated SQL
 	// slots. It is deliberately independent of catalog/session locks: closing
 	// the claim first rejects new leases, then retires idle slots.
-	readReuseMu sync.Mutex
-	readReuse   *replicatedReadReuseCache
+	readReuseMu     sync.Mutex
+	readReuse       *replicatedReadReuseCache
+	readReuseAtomic atomic.Pointer[replicatedReadReuseCache]
 	// exclusiveConnector is set only by a no-copy child-stage handoff. It keeps
 	// SQL sessions fenced until raftmember atomically retires the connector or
 	// the apply claim is explicitly closed.
@@ -480,6 +482,8 @@ func replicatedCaptureDurableOptions(limits ReplicatedShardStoreLimits) durable.
 		Durability: durable.DurabilitySync, OpaqueValues: true,
 		MaxKeyBytes: limits.MaxKeyBytes, MaxDocumentBytes: limits.MaxDocumentBytes,
 		MaxBatchDocuments: limits.MaxBatchDocuments, MaxBatchBytes: limits.MaxBatchBytes,
+		SealedRecoveryJournalBytes: replicatedCaptureRecoveryJournalBytes(limits),
+		PortableSealedCapacity:     true,
 	}
 }
 

@@ -30,9 +30,9 @@ const (
 	nodeCheckpointDir   = "checkpoints"
 	nodeMetaHeaderBytes = 48
 
-	DefaultNodeSegmentBytes       = 24 << 20
-	DefaultNodeMaxWaveBytes       = 20 << 20
-	DefaultNodeMaxSegmentEvents   = 32 << 10
+	DefaultNodeSegmentBytes       = 10 << 20
+	DefaultNodeMaxWaveBytes       = 8 << 20
+	DefaultNodeMaxSegmentEvents   = 16 << 10
 	DefaultNodeRecentWaves        = 4 << 10
 	DefaultNodeMaxEntriesPerGroup = raftmodel.MaxMessageEntries
 	DefaultNodeReaderSlots        = 4

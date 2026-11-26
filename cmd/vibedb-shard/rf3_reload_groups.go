@@ -377,6 +377,40 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 			wal: item.recoveryLog(), base: item.base.Clone(), applyID: item.applyIdentity, apply: item.apply}
 		schemas.mu.Unlock()
 		current.Groups = append(current.groupBundles(), bundle)
+		if current.Gateway != nil && current.Gateway.PGListenAddress != "" && identity.MemberID == 1 {
+			// Prefer electing the replica co-located with the primary PG frontend
+			// on initial table load once startup read-authority quarantine clears,
+			// so local fused reads/writes avoid a remote hop. Normal Raft elections
+			// still take over if this replica is unavailable.
+			go func(group raftmember.GroupKey, rt *raftmember.Runtime) {
+				campaignCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				defer cancel()
+				for {
+					ev := rt.ReadAuthorityEvidence()
+					if ev.ObservationAvailable && ev.Observation.Leader != 0 {
+						return
+					}
+					if ev.Clock.Initialized && ev.Promise.QuarantineUntil != 0 && ev.Clock.Sample < ev.Promise.QuarantineUntil {
+						wait := 50 * time.Millisecond
+						if rem := ev.Promise.QuarantineUntil - ev.Clock.Sample + 15*time.Millisecond; rem < wait {
+							wait = rem
+						}
+						select {
+						case <-campaignCtx.Done():
+							return
+						case <-time.After(wait):
+						}
+						continue
+					}
+					_ = peer.Owners().Campaign(campaignCtx, group)
+					select {
+					case <-campaignCtx.Done():
+						return
+					case <-time.After(50 * time.Millisecond):
+					}
+				}
+			}(identity.Group, runtime)
+		}
 		fmt.Fprintf(os.Stderr, "RF3 prepared group loaded table=%q group=%x member=%d\n", item.base.UserTable, identity.Group.GroupID, identity.MemberID)
 	}
 	return nil

@@ -287,7 +287,7 @@ func (e *Executor) queryWithProfileValidation(
 		attemptContext := opctx
 		var nativeAttempt *replicatedSQLAttempt
 		if _, native := e.client.(*ReplicatedSQLTransport); native {
-			nativeAttempt = &replicatedSQLAttempt{snapshot: snap}
+			nativeAttempt = &replicatedSQLAttempt{snapshot: snap, skipObservations: preparedParams >= 0}
 			attemptContext = context.WithValue(opctx, replicatedSQLSnapshotKey{}, nativeAttempt)
 		}
 		var cache *preparedQueryExecution

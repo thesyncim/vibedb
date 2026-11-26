@@ -909,6 +909,19 @@ func executeFencedSQLPointBudget(
 		AggregateBytes: budget.workingBytes,
 	}
 	if reusable, ok := source.(interface {
+		AcquireReplicatedTrustedPointReadInto(context.Context, replication.RelationID, []byte,
+			replicatedstate.PointReadResult, []byte, string, []sqldriver.ParamType, bool, query.ExecOptions, *sqldriver.ReplicatedReadLease) error
+	}); ok && point.Fence.Applied != 0 && point.Fence.RelationManifestDigest != ([32]byte{}) {
+		err := reusable.AcquireReplicatedTrustedPointReadInto(ctx, primary.Relation, primary.Keys[0],
+			point, primary.PrimaryPath, req.SQL, req.ParamTypes, req.PartialAggregate, options, &frame.point)
+		if err == nil {
+			return executeFencedSQLLease(ctx, &frame.point, req, budget, flag, &frame.cursor, semanticDirect)
+		}
+		if !errors.Is(err, sqldriver.ErrReplicatedReadReuseUnsupported) {
+			return fencedSQLResult{}, err
+		}
+	}
+	if reusable, ok := source.(interface {
 		AcquireReplicatedPointReadInto(context.Context, replication.RelationID, []byte, bool,
 			[]byte, []byte, string, []sqldriver.ParamType, bool, query.ExecOptions, *sqldriver.ReplicatedReadLease) error
 	}); ok {
@@ -1034,19 +1047,16 @@ func (budget *replicatedFrameByteBudget) sqlLimit() int64 {
 // acquiring waitMu. Failed reservations never retain partial capacity.
 func (budget *replicatedFrameByteBudget) tryReserveSQL(bytes int64) bool {
 	limit := budget.sqlLimit()
-	for {
-		used := budget.sqlUsed.Load()
-		if used < 0 || bytes > limit-used {
-			return false
-		}
-		if budget.sqlUsed.CompareAndSwap(used, used+bytes) {
-			if budget.reserve(bytes) {
-				return true
-			}
-			budget.sqlUsed.Add(-bytes)
-			return false
+	if bytes <= 0 || bytes > limit {
+		return false
+	}
+	if next := budget.sqlUsed.Add(bytes); next >= bytes && next <= limit {
+		if budget.reserve(bytes) {
+			return true
 		}
 	}
+	budget.sqlUsed.Add(-bytes)
+	return false
 }
 
 func (budget *replicatedFrameByteBudget) releaseSQL(bytes int64) {

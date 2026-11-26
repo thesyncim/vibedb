@@ -320,8 +320,11 @@ const (
 
 type replicatedFrameByteBudget struct {
 	limit   int64
+	_       [56]byte
 	used    atomic.Int64
+	_       [56]byte
 	sqlUsed atomic.Int64 // subset of used; lock-free when waiters == 0
+	_       [56]byte
 	waiters atomic.Int32
 	waitMu  sync.Mutex
 	changed chan struct{}
@@ -331,15 +334,11 @@ func (budget *replicatedFrameByteBudget) reserve(bytes int64) bool {
 	if budget == nil || bytes <= 0 || bytes > budget.limit {
 		return false
 	}
-	for {
-		used := budget.used.Load()
-		if used < 0 || bytes > budget.limit-used {
-			return false
-		}
-		if budget.used.CompareAndSwap(used, used+bytes) {
-			return true
-		}
+	if next := budget.used.Add(bytes); next >= bytes && next <= budget.limit {
+		return true
 	}
+	budget.used.Add(-bytes)
+	return false
 }
 
 func (budget *replicatedFrameByteBudget) release(bytes int64) {

@@ -78,6 +78,14 @@ func canonicalReplicatedLedgerApplySidecars() ReplicatedApplySidecarProfile {
 	return ReplicatedApplySidecarProfile{SystemRecoveryJournalBytes: 16838144}
 }
 
+func replicatedCaptureRecoveryJournalBytes(limits ReplicatedShardStoreLimits) uint64 {
+	return uint64(storeio.RecoveryBatchRecordPaddedSizeForPayload(
+		storeio.RecoveryJournalMinSectorSize,
+		limits.MaxBatchDocuments,
+		limits.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize,
+	))
+}
+
 func canonicalReplicatedApplySidecarsForLimits(limits ReplicatedShardStoreLimits) ReplicatedApplySidecarProfile {
 	if limits.MaxDocumentBytes == requestledger.MaxCommandBytes {
 		legacy := canonicalReplicatedLedgerApplySidecars()
