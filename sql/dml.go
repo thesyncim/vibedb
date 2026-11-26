@@ -313,7 +313,11 @@ type InsertRow struct {
 	// Values holds either the one whole-document operand of VALUES (?) or the
 	// flat field operands corresponding to InsertStmt.Columns.
 	Values []Operand
-	Pos    int
+	// Exprs holds optional scalar expressions for flat VALUES entries when an
+	// entry is computed (e.g. NOW(), GEN_RANDOM_UUID(), ARRAY[...], 1 + 2).
+	// Nil when every entry in the row is a direct literal or placeholder.
+	Exprs []*ScalarExpr
+	Pos   int
 }
 
 // An UpdateStmt is one parsed UPDATE. A statement either replaces the whole

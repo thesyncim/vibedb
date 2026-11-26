@@ -990,11 +990,49 @@ func (p *Parser) parseInsertRow() (InsertRow, error) {
 				p.advance()
 				continue
 			}
-			value, err := p.parseOperand()
+			if p.tok.kind == tokString || p.tok.kind == tokNumber || p.tok.kind == tokParam ||
+				p.atKeyword(kwTrue) || p.atKeyword(kwFalse) {
+				value, err := p.parseOperand()
+				if err != nil {
+					return row, err
+				}
+				if scalarContinues(p.tok) {
+					lit := p.newScalar(ScalarLiteral, value.Pos)
+					lit.Value = value
+					expr, err := p.continueScalarExpression(lit, scalarSelect)
+					if err != nil {
+						return row, err
+					}
+					if row.Exprs == nil {
+						row.Exprs = make([]*ScalarExpr, len(p.ins.Columns))
+					}
+					row.Exprs[i] = expr
+					values[i] = Operand{Kind: OperandExpression, Pos: value.Pos}
+				} else {
+					values[i] = value
+				}
+				continue
+			}
+			expr, err := p.parseScalarExpression(scalarSelect)
 			if err != nil {
 				return row, err
 			}
-			values[i] = value
+			switch expr.Kind {
+			case ScalarLiteral:
+				values[i] = expr.Value
+			case ScalarNull:
+				values[i] = Operand{Kind: OperandNull, Pos: expr.Pos}
+			default:
+				if value, ok := directTypedConstantOperand(expr); ok {
+					values[i] = value
+					continue
+				}
+				if row.Exprs == nil {
+					row.Exprs = make([]*ScalarExpr, len(p.ins.Columns))
+				}
+				row.Exprs[i] = expr
+				values[i] = Operand{Kind: OperandExpression, Pos: expr.Pos}
+			}
 		}
 		if p.tok.kind == tokComma {
 			return row, p.errfHere("the VALUES row has more values than its %d-column list", len(p.ins.Columns))
