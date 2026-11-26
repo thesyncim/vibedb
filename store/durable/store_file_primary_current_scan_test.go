@@ -302,6 +302,38 @@ func TestBufferedUnifiedRangeRawCurrentBufferUnindexed256Insert(t *testing.T) {
 	assertBufferedCurrentScan(t, collection, oracle)
 }
 
+func TestBufferedUnifiedUnindexed256InsertAndBaseMutationsNoSlotCollision(t *testing.T) {
+	fixture := openConcurrentPrimaryTestFixture(
+		t, storeio.CommonPrimaryLeafWideSlots, concurrentPrimaryTestOptions(),
+	)
+	collection := fixture.collection
+	oracle := bufferedCurrentScanOracle(fixture)
+	// Insert new keys into the 256-row unindexed leaf, then mutate and delete
+	// every base row in the same overlay window before flushing so every base
+	// slot 0..255 is exercised against overlay-allocated insert slots.
+	for i := range 32 {
+		key := fmt.Sprintf("primary-key-%09d-inserted", i*7)
+		putBufferedCurrentScanRow(
+			t, collection, oracle, key,
+			[]byte(fmt.Sprintf(`{"scan":"unindexed-256-insert","i":%d}`, i)), true,
+		)
+	}
+	for i := range 64 {
+		putBufferedCurrentScanRow(
+			t, collection, oracle, fixture.keys[i],
+			[]byte(fmt.Sprintf(`{"scan":"unindexed-256-replace","i":%d}`, i)), false,
+		)
+	}
+	for i := 64; i < len(fixture.keys); i++ {
+		deleteBufferedCurrentScanRow(t, collection, oracle, fixture.keys[i])
+	}
+	assertBufferedCurrentScan(t, collection, oracle)
+	if err := collection.Flush(); err != nil {
+		t.Fatalf("Flush after 256-row unindexed mixed overlay: %v", err)
+	}
+	assertBufferedCurrentScan(t, collection, oracle)
+}
+
 func TestBufferedUnifiedRangeRawCurrentBufferPinsGenerationDuringScan(t *testing.T) {
 	fixture := openConcurrentPrimaryTestFixture(
 		t, 250, concurrentPrimaryTestOptions(),
