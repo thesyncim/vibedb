@@ -32,6 +32,9 @@ type PostgreSQLBackend struct {
 	// DDL is a cold, coordinated schema operation. It must return success only
 	// after the serving catalog is durable; it is never a replica-local Exec.
 	DDL func(context.Context, serviceauthz.Authority, string) error
+
+	viewsOnce sync.Once
+	views     *distributedViewRegistry
 }
 
 func (b *PostgreSQLBackend) NewSession(ctx context.Context, identity pgwire.SessionIdentity) (pgwire.BackendSession, error) {
@@ -307,6 +310,16 @@ func (s *postgresSession) prepare(
 	}
 	if parsed.Kind != sqlast.KindSelect {
 		return s.prepareWrite(ctx, text, &parsed, queryParameterTypes)
+	}
+	if s.backend != nil {
+		if expanded, changed := s.backend.viewRegistry().expandViewSQL(text); changed {
+			var expandedParsed sqlast.Statement
+			var expandedParser sqlast.Parser
+			if expErr := expandedParser.ParseStatement(&expandedParsed, expanded); expErr == nil && expandedParsed.Kind == sqlast.KindSelect {
+				text = expanded
+				parsed = expandedParsed
+			}
+		}
 	}
 	tree := parsed.Select
 	var compiled *query.Statement

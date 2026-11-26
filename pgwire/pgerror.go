@@ -93,11 +93,15 @@ type pgError struct {
 	// one that ends it. The distinction is not cosmetic: a client that reads
 	// FATAL stops waiting for ReadyForQuery, and a client that reads ERROR
 	// waits for it. Sending the wrong one hangs the client.
-	severity string
-	code     string
-	message  string
-	detail   string
-	hint     string
+	severity   string
+	code       string
+	message    string
+	detail     string
+	hint       string
+	schema     string
+	table      string
+	column     string
+	constraint string
 	// cause retains the typed runtime error behind a protocol classification.
 	// ErrorResponse serialization deliberately exposes only the fields above,
 	// while in-process adapters and tests can still use errors.Is/errors.As to
@@ -268,6 +272,22 @@ func (w *writer) errorResponse(e *pgError) {
 	if e.position > 0 {
 		w.byte('P')
 		w.str(strconv.Itoa(e.position))
+	}
+	if e.schema != "" {
+		w.byte('s')
+		w.str(truncateErrorField(e.schema))
+	}
+	if e.table != "" {
+		w.byte('t')
+		w.str(truncateErrorField(e.table))
+	}
+	if e.column != "" {
+		w.byte('c')
+		w.str(truncateErrorField(e.column))
+	}
+	if e.constraint != "" {
+		w.byte('n')
+		w.str(truncateErrorField(e.constraint))
 	}
 	w.byte(0)
 	w.end()

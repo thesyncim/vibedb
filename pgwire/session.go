@@ -113,6 +113,8 @@ type session struct {
 	catalogOIDs          []catalogOIDEntry
 	nextCatalogOID       uint32
 	transactionIsolation sqldriver.IsolationLevel
+	txSavedParams        map[string]string
+	txLocalParams        map[string]string
 
 	// msg is the decoded frontend message, reused so a session that serves a
 	// million messages allocates one set of parameter slices.
@@ -1702,16 +1704,9 @@ func (s *session) execute(p *portal, limit int32) error {
 	}
 	switch {
 	case stmt.kind == kindSet || stmt.kind == kindReset:
-		if s.sql != nil && s.sql.State() != sqldriver.SessionIdle {
-			return newError(sqlstateFeatureNotSupported,
-				"SET and RESET inside a transaction are not supported")
-		}
 		if err := s.applySet(stmt.set); err != nil {
 			return err
 		}
-		// SET has no transactional undo in this adapter. A cancel observed
-		// before it is handled above; one racing after the assignment is
-		// consumed while the successful outcome is reported.
 		_ = s.takeCancel()
 		s.w.commandComplete(stmt.tag)
 		return nil
@@ -1760,9 +1755,26 @@ func (s *session) executeTransaction(stmt *prepared) error {
 	tag := stmt.tag
 	switch stmt.kind {
 	case kindBegin:
-		err = s.sql.Begin(s.operationContext(), stmt.txOptions)
+		txOpts := stmt.txOptions
+		if txOpts.Isolation == sqldriver.IsolationDefault {
+			switch strings.ToLower(strings.TrimSpace(strings.Trim(s.params["default_transaction_isolation"], "'\""))) {
+			case "repeatable read":
+				txOpts.Isolation = sqldriver.IsolationRepeatableRead
+			case "serializable":
+				txOpts.Isolation = sqldriver.IsolationSerializable
+			case "read committed":
+				txOpts.Isolation = sqldriver.IsolationReadCommitted
+			}
+		}
+		if !txOpts.ReadOnly {
+			switch strings.ToLower(strings.TrimSpace(strings.Trim(s.params["default_transaction_read_only"], "'\""))) {
+			case "on", "true", "1", "yes":
+				txOpts.ReadOnly = true
+			}
+		}
+		err = s.sql.Begin(s.operationContext(), txOpts)
 		if err == nil {
-			s.transactionIsolation = stmt.txOptions.Isolation
+			s.transactionIsolation = txOpts.Isolation
 		}
 	case kindCommit:
 		s.closeRuntimePortals()
@@ -1773,11 +1785,15 @@ func (s *session) executeTransaction(stmt *prepared) error {
 			// error. The runtime has already discarded every staged write.
 			err = nil
 			tag = "ROLLBACK"
+			s.restoreTxParams(true)
+		} else if err == nil {
+			s.restoreTxParams(false)
 		}
 		s.implicitExtended = false
 	case kindRollback:
 		s.closeRuntimePortals()
 		err = s.sql.Rollback(s.operationContext())
+		s.restoreTxParams(true)
 		s.implicitExtended = false
 	}
 	pendingCancel := s.takeCancel()
@@ -2208,8 +2224,10 @@ func (s *session) discardAll() {
 // applySet assigns or resets a run-time parameter, announcing the change when
 // the parameter is one clients cache.
 func (s *session) applySet(cmd setCommand) error {
+	inTx := s.sql != nil && s.sql.State() != sqldriver.SessionIdle
 	if cmd.all {
 		for name, p := range parameters {
+			s.saveTxParam(name, inTx, cmd.local)
 			s.setParameter(name, p, p.initial)
 		}
 		return nil
@@ -2226,8 +2244,49 @@ func (s *session) applySet(cmd setCommand) error {
 			return newError(sqlstateInvalidParameterValue, err.Error())
 		}
 	}
+	s.saveTxParam(canonical, inTx, cmd.local)
 	s.setParameter(canonical, p, value)
 	return nil
+}
+
+func (s *session) saveTxParam(name string, inTx, local bool) {
+	if !inTx {
+		return
+	}
+	if s.txSavedParams == nil {
+		s.txSavedParams = make(map[string]string)
+	}
+	if _, exists := s.txSavedParams[name]; !exists {
+		s.txSavedParams[name] = s.params[name]
+	}
+	if local {
+		if s.txLocalParams == nil {
+			s.txLocalParams = make(map[string]string)
+		}
+		if _, exists := s.txLocalParams[name]; !exists {
+			s.txLocalParams[name] = s.params[name]
+		}
+	} else if s.txLocalParams != nil {
+		delete(s.txLocalParams, name)
+	}
+}
+
+func (s *session) restoreTxParams(rollback bool) {
+	if rollback {
+		for name, prev := range s.txSavedParams {
+			if p, ok := parameters[name]; ok {
+				s.setParameter(name, p, prev)
+			}
+		}
+	} else {
+		for name, prev := range s.txLocalParams {
+			if p, ok := parameters[name]; ok {
+				s.setParameter(name, p, prev)
+			}
+		}
+	}
+	clear(s.txSavedParams)
+	clear(s.txLocalParams)
 }
 
 func (s *session) setParameter(name string, p *parameter, value string) {

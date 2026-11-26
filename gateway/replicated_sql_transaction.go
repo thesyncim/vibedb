@@ -395,9 +395,10 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 	// Size the hot vectors from the exact, already-bounded base mutation count.
 	// This avoids logarithmic slice growth for one wide VALUES/IN statement
 	// without eagerly reserving its potential global-index side effects.
+	returning := len(queries) == 1 && statements[0].prepared != nil && statements[0].prepared.statement.ReturnsRows()
 	baseMutationCount := 0
 	for statementIndex := range statements {
-		count, countErr := replicatedSQLMutationInputCount(&statements[statementIndex])
+		count, countErr := replicatedSQLMutationInputCountWithReturning(&statements[statementIndex], returning)
 		if countErr != nil {
 			return nil, true, countErr
 		}
@@ -437,9 +438,10 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 	var txnReuse ReplicatedRoute
 	txnHaveReuse := false
 
+	var returningDocs [][]byte
 	for statementIndex := range statements {
 		statement := &statements[statementIndex]
-		inputCount, err := replicatedSQLMutationInputCount(statement)
+		inputCount, err := replicatedSQLMutationInputCountWithReturning(statement, returning)
 		if err != nil {
 			return nil, true, err
 		}
@@ -634,6 +636,58 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 				baseMutation.ExpectedValueDigest = replication.Digest(sha256.Sum256(oldDocument))
 				baseMutation.Kind = replication.MutationPutDigestEqual
 			}
+			if returning {
+				switch statement.bound.kind {
+				case sqlast.KindInsert:
+					returningDocs = append(returningDocs, bytes.Clone(document))
+				case sqlast.KindUpdate:
+					if len(statement.bound.updateAssignments) == 0 && oldDocument == nil {
+						if data == nil {
+							return nil, true, ErrReplicatedSQLTransactionUnsupported
+						}
+						var found bool
+						oldDocument, found, err = readReplicatedSQLDocument(
+							data, ctx, resolved.Route, statement.profile, ownedKey,
+						)
+						if err != nil {
+							return nil, true, err
+						}
+						if !found {
+							document = []byte("{}")
+							missingPartial = true
+						}
+					}
+					if !missingPartial {
+						returningDocs = append(returningDocs, bytes.Clone(document))
+						if len(oldDocument) != 0 && baseMutation.Kind == replication.MutationPutPresent {
+							baseMutation.ExpectedValueLength = uint64(len(oldDocument))
+							baseMutation.ExpectedValueDigest = replication.Digest(sha256.Sum256(oldDocument))
+							baseMutation.Kind = replication.MutationPutDigestEqual
+						}
+					}
+				case sqlast.KindDelete:
+					if oldDocument == nil {
+						if data == nil {
+							return nil, true, ErrReplicatedSQLTransactionUnsupported
+						}
+						var found bool
+						oldDocument, found, err = readReplicatedSQLDocument(
+							data, ctx, resolved.Route, statement.profile, ownedKey,
+						)
+						if err != nil {
+							return nil, true, err
+						}
+						if found {
+							returningDocs = append(returningDocs, bytes.Clone(oldDocument))
+							baseMutation.ExpectedValueLength = uint64(len(oldDocument))
+							baseMutation.ExpectedValueDigest = replication.Digest(sha256.Sum256(oldDocument))
+							baseMutation.Kind = replication.MutationDeleteDigestEqual
+						}
+					} else {
+						returningDocs = append(returningDocs, bytes.Clone(oldDocument))
+					}
+				}
+			}
 			targetIndex, appendErr := appendReplicatedSQLMutation(
 				&targets, &byGroup, resolved.Route, bits,
 				distributedtxn.IntentScope{Start: uint32(bucket), End: uint32(bucket) + 1},
@@ -757,6 +811,9 @@ func (executor *Executor) planReplicatedSQLTransactionWithDataMode(
 	if committedPreimageRead && !preparedDirectFullRowGuard(targets) {
 		return nil, true, errPreparedDirectFallback
 	}
+	if returning && len(targets) > 0 && len(returningDocs) > 0 {
+		targets[0].ReturningDocs = returningDocs
+	}
 	return targets, true, nil
 }
 
@@ -773,6 +830,13 @@ func replicatedSQLConflictActionPosition(insert *sqlast.InsertStmt) int {
 func replicatedSQLMutationInputCount(
 	statement *replicatedSQLBoundStatement,
 ) (int, error) {
+	return replicatedSQLMutationInputCountWithReturning(statement, false)
+}
+
+func replicatedSQLMutationInputCountWithReturning(
+	statement *replicatedSQLBoundStatement,
+	allowReturning bool,
+) (int, error) {
 	if statement == nil || statement.prepared == nil || statement.bound == nil ||
 		statement.profile.Relation == 0 {
 		return 0, ErrReplicatedSQLTransactionUnsupported
@@ -781,7 +845,8 @@ func replicatedSQLMutationInputCount(
 	switch prepared.statement.Kind {
 	case sqlast.KindInsert:
 		insert := prepared.statement.Insert
-		if insert == nil || insert.Source != nil || insert.Returning != nil ||
+		if insert == nil || insert.Source != nil ||
+			(insert.Returning != nil && (!allowReturning || insert.OnConflictDoNothing || insert.OnConflictUpdate != nil)) ||
 			insert.OnConflictUpdate != nil && (!replicatedConflictActionSupported(insert.OnConflictUpdate) || len(prepared.writeGlobalIndexes) != 0) || len(insert.Rows) == 0 ||
 			len(bound.rowKeys) != len(insert.Rows) ||
 			len(bound.globalIndexes) != len(insert.Rows)*len(prepared.writeGlobalIndexes) {
@@ -804,7 +869,7 @@ func replicatedSQLMutationInputCount(
 		return len(insert.Rows), nil
 	case sqlast.KindUpdate:
 		update := prepared.statement.Update
-		if update == nil || update.Returning != nil || len(update.OrderBy) != 0 ||
+		if update == nil || (update.Returning != nil && !allowReturning) || len(update.OrderBy) != 0 ||
 			update.Limit != nil || !replicatedSQLExactPrimaryFilter(
 			update.Filter, statement.profile.PrimaryKey,
 		) || len(bound.updateDoc) == 0 && len(bound.updateAssignments) == 0 {
@@ -816,7 +881,7 @@ func replicatedSQLMutationInputCount(
 		return 1, nil
 	case sqlast.KindDelete:
 		deleteStatement := prepared.statement.Delete
-		if deleteStatement == nil || deleteStatement.Returning != nil ||
+		if deleteStatement == nil || (deleteStatement.Returning != nil && !allowReturning) ||
 			len(deleteStatement.OrderBy) != 0 || deleteStatement.Limit != nil ||
 			deleteStatement.All || !replicatedSQLFinitePrimaryFilter(
 			deleteStatement.Filter, statement.profile.PrimaryKey,

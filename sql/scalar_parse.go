@@ -86,6 +86,9 @@ func scalarStarts(tok token) bool {
 		if _, ok := conditionalScalarOp(tok); ok {
 			return true
 		}
+		if _, ok := builtinScalarFuncName(tok); ok {
+			return true
+		}
 		return tok.kw == kwTrue || tok.kw == kwFalse || tok.kw == kwNull ||
 			tok.kw == kwCase || tok.kw == kwCast
 	default:
@@ -520,6 +523,9 @@ func (p *Parser) parseScalarPrimary(ctx scalarExprContext) (*ScalarExpr, error) 
 	pos := p.tok.pos
 	if op, ok := conditionalScalarOp(p.tok); ok {
 		return p.parseConditionalScalar(op, ctx)
+	}
+	if fnName, ok := builtinScalarFuncName(p.tok); ok {
+		return p.parseBuiltinScalarFunc(fnName, ctx)
 	}
 	if target, supported, known := scalarTypedStringHead(p.tok); known {
 		head := p.tok

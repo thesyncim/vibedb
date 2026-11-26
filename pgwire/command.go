@@ -981,19 +981,104 @@ var parameters = map[string]*parameter{
 		initial: "hex",
 		why:     "no column this server produces is a bytea",
 	},
+	"statement_timeout": {
+		initial: "0", check: requireDurationGUC,
+		why: "enforced per statement via session context timeout when > 0",
+	},
+	"lock_timeout": {
+		initial: "0", check: requireDurationGUC,
+		why: "accepted for client/ORM compatibility; non-blocking MVCC reads do not acquire row locks",
+	},
+	"idle_in_transaction_session_timeout": {
+		initial: "0", check: requireDurationGUC,
+		why: "accepted for client/ORM startup and pooler compatibility",
+	},
+	"default_transaction_isolation": {
+		initial: "read committed", check: requireIsolationGUC,
+		why: "applied to BEGIN statements that do not specify an explicit isolation level",
+	},
+	"default_transaction_read_only": {
+		initial: "off", check: requireBoolGUC,
+		why: "applied to BEGIN statements that do not specify READ ONLY or READ WRITE",
+	},
+	"client_min_messages": {
+		initial: "notice",
+		why:     "advisory client message severity threshold",
+	},
+	"synchronous_commit": {
+		initial: "on",
+		why:     "durable sync-journal commit profile is active",
+	},
+	"work_mem": {
+		initial: "64MB",
+		why:     "advisory workspace memory setting",
+	},
+	"server_encoding": {
+		initial: "UTF8", check: requireEncoding,
+		why: "this server always uses UTF-8 encoding",
+	},
+	"integer_datetimes": {
+		initial: "on", check: requireOn,
+		why: "standard PostgreSQL integer datetimes flag",
+	},
 }
 
 // refusalHints gives a longer answer for the parameters clients most often try
 // to set and this server refuses.
 var refusalHints = map[string]string{
-	"statement_timeout":                   "CancelRequest is supported, but this server has no SQL-configurable per-statement timer",
-	"lock_timeout":                        "there is no SQL lock manager; internal catalog ownership is not governed by PostgreSQL lock_timeout",
-	"idle_in_transaction_session_timeout": "there is no autonomous session timer for expiring an idle transaction",
-	"default_transaction_isolation":       "transactions default to READ COMMITTED; choose another level explicitly on BEGIN",
-	"default_transaction_read_only":       "choose READ ONLY or READ WRITE explicitly on BEGIN",
-	"transaction_isolation":               "choose READ COMMITTED, REPEATABLE READ, or SERIALIZABLE explicitly on BEGIN",
-	"role":                                "there is no role system",
-	"session_authorization":               "there is no role system",
+	"transaction_isolation": "choose READ COMMITTED, REPEATABLE READ, or SERIALIZABLE explicitly on BEGIN",
+	"role":                  "there is no role system",
+	"session_authorization": "there is no role system",
+}
+
+func requireDurationGUC(v string) error {
+	_, err := parsePGDurationMillis(v)
+	return err
+}
+
+func parsePGDurationMillis(v string) (int64, error) {
+	s := strings.TrimSpace(strings.Trim(v, "'\""))
+	if s == "" {
+		return 0, fmt.Errorf("invalid duration value %q", v)
+	}
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(s, "ms"):
+		s = strings.TrimSpace(s[:len(s)-2])
+	case strings.HasSuffix(s, "min"):
+		mult = 60 * 1000
+		s = strings.TrimSpace(s[:len(s)-3])
+	case strings.HasSuffix(s, "s"):
+		mult = 1000
+		s = strings.TrimSpace(s[:len(s)-1])
+	case strings.HasSuffix(s, "h"):
+		mult = 3600 * 1000
+		s = strings.TrimSpace(s[:len(s)-1])
+	case strings.HasSuffix(s, "d"):
+		mult = 86400 * 1000
+		s = strings.TrimSpace(s[:len(s)-1])
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid duration value %q", v)
+	}
+	return n * mult, nil
+}
+
+func requireIsolationGUC(v string) error {
+	switch strings.ToLower(strings.TrimSpace(strings.Trim(v, "'\""))) {
+	case "read committed", "repeatable read", "serializable":
+		return nil
+	}
+	return fmt.Errorf("unsupported default_transaction_isolation %q", v)
+}
+
+func requireBoolGUC(v string) error {
+	switch strings.ToLower(strings.TrimSpace(strings.Trim(v, "'\""))) {
+	case "on", "off", "true", "false", "1", "0", "yes", "no":
+		return nil
+	}
+	return fmt.Errorf("invalid boolean parameter value %q", v)
 }
 
 func requireEncoding(v string) error {
@@ -1044,6 +1129,8 @@ func unsupportedParameter(name string) *pgError {
 type setCommand struct {
 	name  string
 	value string
+	// local marks SET LOCAL, whose value reverts at transaction end.
+	local bool
 	// reset marks SET name = DEFAULT and RESET name, which restore the initial
 	// value rather than assigning one.
 	reset bool
@@ -1071,8 +1158,12 @@ func parseSetCancelable(
 		}
 	}()
 	s.word() // SET
+	local := false
 	switch next := s.peekWord(); {
-	case strings.EqualFold(next, "SESSION"), strings.EqualFold(next, "LOCAL"):
+	case strings.EqualFold(next, "SESSION"):
+		s.word()
+	case strings.EqualFold(next, "LOCAL"):
+		local = true
 		s.word()
 	}
 	name := s.word()
@@ -1088,13 +1179,13 @@ func parseSetCancelable(
 			return setCommand{}, newError(sqlstateSyntaxError, "SET TIME ZONE requires a value")
 		}
 		if strings.EqualFold(value, "DEFAULT") {
-			return setCommand{name: "TimeZone", reset: true}, nil
+			return setCommand{name: "TimeZone", local: local, reset: true}, nil
 		}
 		value, err = unquoteCancelable(value, check)
 		if err != nil {
 			return setCommand{}, err
 		}
-		return setCommand{name: "TimeZone", value: value}, nil
+		return setCommand{name: "TimeZone", value: value, local: local}, nil
 	}
 	if strings.EqualFold(name, "NAMES") {
 		value, ok := s.rest()
@@ -1102,13 +1193,13 @@ func parseSetCancelable(
 			return setCommand{}, newError(sqlstateSyntaxError, "SET NAMES requires a value")
 		}
 		if strings.EqualFold(value, "DEFAULT") {
-			return setCommand{name: "client_encoding", reset: true}, nil
+			return setCommand{name: "client_encoding", local: local, reset: true}, nil
 		}
 		value, err = unquoteCancelable(value, check)
 		if err != nil {
 			return setCommand{}, err
 		}
-		return setCommand{name: "client_encoding", value: value}, nil
+		return setCommand{name: "client_encoding", value: value, local: local}, nil
 	}
 	if !s.symbol('=') {
 		if !strings.EqualFold(s.peekWord(), "TO") {
@@ -1122,13 +1213,13 @@ func parseSetCancelable(
 		return setCommand{}, newError(sqlstateSyntaxError, "SET requires a value")
 	}
 	if strings.EqualFold(value, "DEFAULT") {
-		return setCommand{name: name, reset: true}, nil
+		return setCommand{name: name, local: local, reset: true}, nil
 	}
 	value, err = unquoteCancelable(value, check)
 	if err != nil {
 		return setCommand{}, err
 	}
-	return setCommand{name: name, value: value}, nil
+	return setCommand{name: name, value: value, local: local}, nil
 }
 
 // parseReset decodes "RESET name" and "RESET ALL".

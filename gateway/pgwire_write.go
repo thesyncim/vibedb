@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	driver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
@@ -22,14 +23,18 @@ func (p *postgresStatement) Exec(context.Context, []any) (driver.Result, error) 
 }
 
 type postgresWriteStatement struct {
-	session    *postgresSession
-	text       string
-	kind       sqlast.Kind
-	params     int
-	documents  map[int]int
-	compiled   *query.DMLStatement
-	paramTypes []driver.ParamType
-	closed     bool
+	session                   *postgresSession
+	text                      string
+	kind                      sqlast.Kind
+	table                     string
+	insertSelectSQL           string
+	insertOnConflictDoNothing bool
+	params                    int
+	documents                 map[int]int
+	compiled                  *query.DMLStatement
+	returning                 *query.Statement
+	paramTypes                []driver.ParamType
+	closed                    bool
 }
 
 // RetainedBytes accounts the one backend-owned allocation that an ordinary
@@ -39,7 +44,7 @@ type postgresWriteStatement struct {
 // type sidecar. Any future path that adds one of those fields must return
 // false, preserving pgwire's conservative prepared-shape charge.
 func (p *postgresWriteStatement) RetainedBytes() (bytes int, ok bool) {
-	if p == nil || p.closed || p.compiled != nil || p.documents != nil || p.paramTypes != nil {
+	if p == nil || p.closed || p.compiled != nil || p.returning != nil || p.documents != nil || p.paramTypes != nil {
 		return 0, false
 	}
 	if len(p.text) > int(^uint(0)>>1)-int(unsafe.Sizeof(*p)) {
@@ -60,17 +65,39 @@ func (s *postgresSession) prepareWrite(
 	if s.backend.Write == nil {
 		return nil, driver.ErrReadOnlyTransaction
 	}
-	if parsed.Kind != sqlast.KindInsert && parsed.Kind != sqlast.KindUpdate && parsed.Kind != sqlast.KindDelete || parsed.ReturnsRows() {
-		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL supports INSERT, UPDATE and DELETE without RETURNING")
+	if parsed.Kind != sqlast.KindInsert && parsed.Kind != sqlast.KindUpdate && parsed.Kind != sqlast.KindDelete {
+		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL supports INSERT, UPDATE and DELETE")
 	}
+	if parsed.Kind == sqlast.KindInsert && parsed.ReturnsRows() &&
+		(parsed.Insert.OnConflictDoNothing || parsed.Insert.OnConflictUpdate != nil) {
+		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL ON CONFLICT with RETURNING is not supported")
+	}
+	var insertSelectSQL string
+	var insertOnConflictDoNothing bool
 	if parsed.Kind == sqlast.KindInsert && parsed.Insert.Source != nil {
-		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL INSERT requires VALUES")
+		if parsed.Insert.OnConflictUpdate != nil {
+			return nil, sqlast.NewFeatureNotSupportedError(text, 0, "INSERT ... SELECT with ON CONFLICT DO UPDATE is not supported")
+		}
+		var extractErr error
+		insertSelectSQL, extractErr = extractInsertSelectSource(text, parsed.Insert)
+		if extractErr != nil {
+			return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL INSERT ... SELECT source could not be extracted")
+		}
+		insertOnConflictDoNothing = parsed.Insert.OnConflictDoNothing
 	}
 	if parsed.Kind == sqlast.KindInsert && !replicatedConflictActionSupported(parsed.Insert.OnConflictUpdate) {
 		return nil, sqlast.NewFeatureNotSupportedError(
 			text, replicatedSQLConflictActionPosition(parsed.Insert),
 			"RF3 PostgreSQL ON CONFLICT requires branch-aware replicated writes",
 		)
+	}
+	var returningStmt *query.Statement
+	if parsed.ReturnsRows() {
+		var retErr error
+		returningStmt, retErr = query.PrepareParsedStatement(text, statementReturningSelect(parsed))
+		if retErr != nil {
+			return nil, retErr
+		}
 	}
 	documents := postgresWriteDocumentParameters(parsed)
 	parameterTypes = postgresScalarDMLParameterTypes(parameterTypes, documents)
@@ -83,6 +110,9 @@ func (s *postgresSession) prepareWrite(
 			text, parsed, parameterTypes,
 		)
 		if err != nil {
+			if returningStmt != nil {
+				returningStmt.Release()
+			}
 			return nil, err
 		}
 		resolvedParameterTypes = postgresDMLParameterTypes(compiled, documents)
@@ -93,20 +123,58 @@ func (s *postgresSession) prepareWrite(
 	}
 	// The catalog prepare below compiles routing only and never analyzes scalar
 	// input types. The typed DML compile above is the sole semantic authority.
-	if _, err := s.backend.Executor.validateCatalogPrepare(ctx, text); err != nil {
+	if insertSelectSQL != "" {
+		if _, _, err := s.backend.Executor.prepareCatalogWithRefresh(ctx, insertSelectSQL); err != nil {
+			if compiled != nil {
+				compiled.Release()
+			}
+			if returningStmt != nil {
+				returningStmt.Release()
+			}
+			return nil, err
+		}
+	} else if _, err := s.backend.Executor.validateCatalogPrepare(ctx, text); err != nil {
 		if compiled != nil {
 			compiled.Release()
+		}
+		if returningStmt != nil {
+			returningStmt.Release()
 		}
 		return nil, err
 	}
 	p := &postgresWriteStatement{
 		session: s, text: strings.Clone(text), kind: parsed.Kind,
-		params: parsed.Params(), compiled: compiled,
+		table:                     strings.Clone(parsed.Table()),
+		insertSelectSQL:           insertSelectSQL,
+		insertOnConflictDoNothing: insertOnConflictDoNothing,
+		params:                    parsed.Params(), compiled: compiled,
+		returning:  returningStmt,
 		documents:  documents,
 		paramTypes: resolvedParameterTypes,
 	}
 	s.statements[p] = struct{}{}
 	return p, nil
+}
+
+func statementReturningSelect(parsed *sqlast.Statement) *sqlast.SelectStmt {
+	if parsed == nil {
+		return nil
+	}
+	switch parsed.Kind {
+	case sqlast.KindInsert:
+		if parsed.Insert != nil {
+			return parsed.Insert.Returning
+		}
+	case sqlast.KindUpdate:
+		if parsed.Update != nil {
+			return parsed.Update.Returning
+		}
+	case sqlast.KindDelete:
+		if parsed.Delete != nil {
+			return parsed.Delete.Returning
+		}
+	}
+	return nil
 }
 
 func postgresWriteDocumentParameters(parsed *sqlast.Statement) map[int]int {
@@ -279,7 +347,7 @@ func postgresScalarHasParameter(expr *sqlast.ScalarExpr) bool {
 }
 
 func (p *postgresWriteStatement) Kind() sqlast.Kind { return p.kind }
-func (p *postgresWriteStatement) ReturnsRows() bool { return false }
+func (p *postgresWriteStatement) ReturnsRows() bool { return p.returning != nil }
 func (p *postgresWriteStatement) NumParams() int    { return p.params }
 func (p *postgresWriteStatement) ParamKind(i int) driver.ParamKind {
 	if i < 0 || i >= p.params {
@@ -313,8 +381,16 @@ func (p *postgresWriteStatement) ParamTypeTargetDefault(i int) bool {
 	return p != nil && p.compiled != nil &&
 		p.compiled.ParameterTypeTargetDefault(i)
 }
-func (p *postgresWriteStatement) Columns() []string { return nil }
+func (p *postgresWriteStatement) Columns() []string {
+	if p.returning != nil {
+		return p.returning.Columns()
+	}
+	return nil
+}
 func (p *postgresWriteStatement) AppendSchema(dst []query.OutputColumn) []query.OutputColumn {
+	if p.returning != nil {
+		return p.returning.AppendSchema(dst)
+	}
 	return dst
 }
 func (p *postgresWriteStatement) Close() error {
@@ -326,36 +402,78 @@ func (p *postgresWriteStatement) Close() error {
 		p.compiled.Release()
 		p.compiled = nil
 	}
+	if p.returning != nil {
+		p.returning.Release()
+		p.returning = nil
+	}
 	delete(p.session.statements, p)
 	return nil
 }
-func (p *postgresWriteStatement) QueryInto(context.Context, []any, *pgwire.BackendRows) error {
-	return fmt.Errorf("gateway: mutation returns no rows")
+func (p *postgresWriteStatement) QueryInto(ctx context.Context, args []any, rows *pgwire.BackendRows) error {
+	if p.returning == nil {
+		return fmt.Errorf("gateway: mutation returns no rows")
+	}
+	result, err := p.execWrite(ctx, args)
+	if err != nil {
+		return err
+	}
+	var db store.Database
+	col, err := db.CreateCollection(p.table, store.Options{})
+	if err != nil {
+		return err
+	}
+	for i, doc := range result.ReturningDocs {
+		if _, err := col.Put(fmt.Sprintf("%08d", i), doc); err != nil {
+			return err
+		}
+	}
+	s := p.session
+	exec := &query.Exec{Options: query.ExecOptions{
+		Cancel: s.flag, ResultRows: s.rows, ResultBytes: s.bytes, IntermediateBytes: s.intermediate,
+	}}
+	cursor, err := p.returning.RunInto(exec, query.FromDatabase(db.Snapshot(), p.table), nil)
+	if err != nil {
+		exec.Release()
+		return err
+	}
+	if err := rows.SetMaterialized(cursor, func() error { exec.Release(); return nil }); err != nil {
+		exec.Release()
+		return err
+	}
+	return nil
 }
 
 func (p *postgresWriteStatement) Exec(ctx context.Context, args []any) (driver.Result, error) {
+	result, err := p.execWrite(ctx, args)
+	if err != nil {
+		return driver.Result{}, err
+	}
+	return driver.Result{RowsAffected: result.RowsAffected}, nil
+}
+
+func (p *postgresWriteStatement) execWrite(ctx context.Context, args []any) (*Result, error) {
 	s := p.session
 	if p.closed || s.state == driver.SessionClosed {
-		return driver.Result{}, driver.ErrSessionClosed
+		return nil, driver.ErrSessionClosed
 	}
 	if s.state == driver.SessionFailedTransaction {
-		return driver.Result{}, driver.ErrTransactionFailed
+		return nil, driver.ErrTransactionFailed
 	}
 	if s.state != driver.SessionIdle {
-		return driver.Result{}, sqlast.NewFeatureNotSupportedError(p.text, 0, "distributed writes require auto-commit mode")
+		return nil, sqlast.NewFeatureNotSupportedError(p.text, 0, "distributed writes require auto-commit mode")
 	}
 	if len(args) != p.params {
-		return driver.Result{}, ErrPlanParameters
+		return nil, ErrPlanParameters
 	}
 	if s.flag.Canceled() {
-		return driver.Result{}, query.ErrCanceled
+		return nil, query.ErrCanceled
 	}
 	params := make([]shardservice.Param, len(args))
 	for i, value := range args {
 		var err error
 		params[i], err = postgresWriteParam(value, p.ParamKind(i) == driver.ParamDocument)
 		if err != nil {
-			return driver.Result{}, err
+			return nil, err
 		}
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -368,27 +486,41 @@ func (p *postgresWriteStatement) Exec(ctx context.Context, args []any) (driver.R
 	defer func() { s.cancelMu.Lock(); s.cancel = nil; s.cancelMu.Unlock(); cancel() }()
 	ctx, err := serviceauthz.WithAuthority(ctx, s.authority)
 	if err != nil {
-		return driver.Result{}, err
+		return nil, err
+	}
+	if p.insertSelectSQL != "" {
+		result, err := p.execInsertSelect(ctx, params)
+		if err != nil {
+			return nil, err
+		}
+		if result == nil || result.Kind != shardservice.ResponseCompletion {
+			return nil, ErrDurableSQLRequest
+		}
+		return result, nil
 	}
 	result, err := s.backend.Write(ctx, s.authority, Query{
 		SQL: p.text, Params: params, ParamTypes: p.paramTypes, Class: ClassBatch,
 	})
+	if errors.Is(err, ErrReplicatedSQLTransactionUnsupported) &&
+		(p.kind == sqlast.KindDelete || p.kind == sqlast.KindUpdate) {
+		result, err = p.execGeneralDeleteOrUpdate(ctx, params)
+	}
 	if errors.Is(err, durable.ErrCommitOutcomeUnknown) {
-		return driver.Result{}, err
+		return nil, err
 	}
 	if errors.Is(err, ErrDurableSQLAborted) {
-		return driver.Result{}, errors.Join(driver.ErrTransactionConflict, err)
+		return nil, errors.Join(driver.ErrTransactionConflict, err)
 	}
 	if errors.Is(err, ErrReplicatedSQLTransactionUnsupported) {
-		return driver.Result{}, sqlast.NewFeatureNotSupportedError(p.text, 0, "RF3 writes require INSERT VALUES (optional primary-key ON CONFLICT without global indexes), primary-key UPDATE, or primary-key equality/IN DELETE without RETURNING")
+		return nil, sqlast.NewFeatureNotSupportedError(p.text, 0, "RF3 writes require INSERT VALUES (optional primary-key ON CONFLICT without global indexes), primary-key UPDATE, or primary-key equality/IN DELETE")
 	}
 	if err != nil {
-		return driver.Result{}, err
+		return nil, err
 	}
 	if result == nil || result.Kind != shardservice.ResponseCompletion {
-		return driver.Result{}, ErrDurableSQLRequest
+		return nil, ErrDurableSQLRequest
 	}
-	return driver.Result{RowsAffected: result.RowsAffected}, nil
+	return result, nil
 }
 
 func postgresDMLParameterTypes(

@@ -72,6 +72,7 @@ const (
 	// the program (scoreSlot), since SCORE() binds exactly one ==> node.
 	// Appended last so existing node numbering never shifts.
 	statementScalarScore
+	statementScalarFunc
 )
 
 type statementScalarNode struct {
@@ -89,6 +90,8 @@ type statementScalarNode struct {
 	bound            scalar
 	known            bool
 	representation   OutputRepresentation
+	funcName         string
+	funcArgs         []int32
 }
 
 type statementScalarDependencySpec struct {
@@ -687,6 +690,19 @@ func (r *statementScalar) compileExpr(s *Statement, expr *sqlast.ScalarExpr) (in
 		r.nodes = append(r.nodes, statementScalarNode{
 			kind: statementScalarScore, dependency: -1, left: -1, right: -1, pos: expr.Pos,
 		})
+	case sqlast.ScalarFunc:
+		argNodes := make([]int32, len(expr.Whens))
+		for i := range expr.Whens {
+			compiledArg, err := r.compileExpr(s, expr.Whens[i].Result)
+			if err != nil {
+				return 0, err
+			}
+			argNodes[i] = compiledArg
+		}
+		r.nodes = append(r.nodes, statementScalarNode{
+			kind: statementScalarFunc, dependency: -1, left: -1, right: -1,
+			pos: expr.Pos, funcName: expr.Value.Text, funcArgs: argNodes,
+		})
 	default:
 		return 0, fmt.Errorf("query: invalid scalar expression kind %d", expr.Kind)
 	}
@@ -1025,6 +1041,8 @@ func (r *statementScalar) nodeType(root int32) ValueType {
 		return r.conditionals[node.conditionalIndex].domain.schemaType()
 	case statementScalarScore:
 		return TypeNumber
+	case statementScalarFunc:
+		return builtinScalarFuncValueType(node.funcName)
 	default:
 		return TypeAny
 	}
@@ -1075,6 +1093,8 @@ func (r *statementScalar) nodeRepresentation(root int32) OutputRepresentation {
 		return r.conditionals[node.conditionalIndex].domain.representation()
 	case statementScalarScore:
 		return OutputSQLNumber
+	case statementScalarFunc:
+		return builtinScalarFuncRepresentation(node.funcName)
 	default:
 		return OutputJSON
 	}
@@ -1110,6 +1130,12 @@ func (r *statementScalar) evalNodes(
 		case statementScalarScore:
 			var err error
 			value, err = r.evalScore(result, row, node, arena)
+			if err != nil {
+				return err
+			}
+		case statementScalarFunc:
+			var err error
+			value, err = r.evalFunc(node, arena)
 			if err != nil {
 				return err
 			}

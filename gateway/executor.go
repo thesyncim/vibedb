@@ -163,9 +163,10 @@ type Result struct {
 	// Observations records independent RF3 group cuts, not a global MVCC timestamp.
 	Observations []ReplicatedGroupReadObservation
 	Kind         shardservice.ResponseKind
-	Columns      []shardservice.Column
-	Rows         [][]shardservice.Cell
-	RowsAffected int64
+	Columns       []shardservice.Column
+	Rows          [][]shardservice.Cell
+	ReturningDocs [][]byte
+	RowsAffected  int64
 	// TransactionID is nonzero for an RF3 multi-group write. It lets the shipped
 	// boundary report a typed durable identity rather than reducing recovery
 	// state to an error string.

@@ -1212,6 +1212,9 @@ func typedConstantOutputName(expr *ScalarExpr) string {
 	if expr != nil && expr.Kind == ScalarScore {
 		return "score"
 	}
+	if expr != nil && expr.Kind == ScalarFunc && expr.Value.Text != "" {
+		return expr.Value.Text
+	}
 	if expr != nil && expr.Kind == ScalarBinary && expr.Op.Conditional() {
 		switch expr.Op {
 		case ScalarCoalesce:

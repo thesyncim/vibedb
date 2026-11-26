@@ -17,10 +17,11 @@ var (
 // mutation. Relation IDs are authenticated by Route.Command's schema
 // generation; SQL text and relation names never enter this boundary.
 type ReplicatedTransactionTarget struct {
-	Route        ReplicatedRoute
-	Batches      []replication.RelationMutationBatch
-	BucketBits   uint8
-	IntentScopes []distributedtxn.IntentScope
+	Route         ReplicatedRoute
+	Batches       []replication.RelationMutationBatch
+	BucketBits    uint8
+	IntentScopes  []distributedtxn.IntentScope
+	ReturningDocs [][]byte
 }
 
 // ReplicatedTransactionResult is the compact committed result shared by the
