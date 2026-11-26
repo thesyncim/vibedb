@@ -22,6 +22,9 @@ const (
 	// are numbered; a statement with no (or more than one) ==> predicate
 	// fails at prepare with a positioned error, never a silent zero.
 	ScalarScore
+	// ScalarFunc is a built-in PostgreSQL scalar function call (LOWER, UPPER,
+	// LENGTH, ABS, ROUND, NOW, GEN_RANDOM_UUID, JSONB_TYPEOF, etc.).
+	ScalarFunc
 )
 
 // ScalarOp is an arithmetic, sign, concatenation, or conditional operation.

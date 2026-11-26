@@ -171,6 +171,22 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 		}
 		return p.parseScalarCondition(ctx, left, pos)
 	}
+	if fnName, ok := builtinScalarFuncName(p.tok); ok {
+		pos := p.tok.pos
+		left, err := p.parseBuiltinScalarFunc(fnName, scalarContextForPredicate(ctx))
+		if err != nil {
+			return nil, err
+		}
+		if left.Kind == ScalarPath && !scalarContinues(p.tok) {
+			if p.inCaseTruth() && caseTruthTerminator(p.tok) {
+				node := p.exprs.one()
+				*node = Expr{Kind: ExprScalarTruth, Column: -1, ScalarLeft: left, Pos: pos}
+				return node, nil
+			}
+			return p.parseLeafTail(ctx, AggNone, left.Path, pos)
+		}
+		return p.parseScalarCondition(ctx, left, pos)
+	}
 	if _, _, known := scalarTypedStringHead(p.tok); known {
 		return p.parseTypedHeadPrimary(ctx)
 	}
@@ -602,6 +618,37 @@ func (p *Parser) parseLeafTail(
 	p.advance()
 	pathComparison := ctx == ctxWhere || ctx == ctxJoin || p.inCaseTruth() ||
 		p.correlation != nil && p.correlation.capture != nil
+	if fnName, ok := builtinScalarFuncName(p.tok); ok {
+		scalarCtx := scalarContextForPredicate(ctx)
+		right, err := p.parseBuiltinScalarFunc(fnName, scalarCtx)
+		if err != nil {
+			return nil, err
+		}
+		if right.Kind == ScalarPath && !scalarContinues(p.tok) {
+			if !pathComparison {
+				return nil, p.errHere("expected a literal or '?' on the right side of the comparison")
+			}
+			e := p.exprs.one()
+			*e = Expr{
+				Kind: ExprCompare, Op: op, Agg: agg, Column: -1,
+				Path: path, RightPath: right.Path, Value: Operand{Pos: operatorPos}, Pos: pos,
+			}
+			return e, nil
+		}
+		right, err = p.continueScalarExpression(right, scalarCtx)
+		if err != nil {
+			return nil, err
+		}
+		e := p.exprs.one()
+		*e = Expr{
+			Kind: ExprScalarCompare, Op: op, Column: -1,
+			ScalarLeft:  p.scalarFromColumn(ResultColumn{Agg: agg, Path: path, Pos: pos}),
+			ScalarRight: right,
+			Value:       Operand{Pos: operatorPos},
+			Pos:         pos,
+		}
+		return e, nil
+	}
 	if function, ok := conditionalScalarOp(p.tok); ok {
 		scalarCtx := scalarContextForPredicate(ctx)
 		right, err := p.parseConditionalScalar(function, scalarCtx)
