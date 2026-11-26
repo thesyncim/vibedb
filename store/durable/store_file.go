@@ -4,6 +4,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/internal/storemem"
@@ -418,6 +419,10 @@ type Collection struct {
 	// harness can gate p-max without a full histogram allocation.
 	primaryLeafSplits               atomic.Uint64
 	primaryEmptyReclaims            atomic.Uint64
+	primaryLeafMerges               atomic.Uint64
+	primaryUnderfilledKeys          [primaryLeafMergeBudgetPerFold][]byte
+	primaryUnderfilledCount         int
+	primaryStructuralActive         bool
 	primaryMacroSplits              atomic.Uint64
 	primaryTabletRoutingRebuilds    atomic.Uint64
 	primaryCatalogLeafSplits        atomic.Uint64
@@ -446,9 +451,13 @@ type Collection struct {
 	holePunchPendingCursor    storeio.PunchableExtentCursor
 	holePunchAbsorbedCursor   uint64
 	holePunchCandidateSource  uint8
-	holePunchDisabled         bool
-	holePunchGeneration       uint64
-	holePunchCompletionVictim uint32
+	holePunchDisabled          bool
+	holePunchGeneration        uint64
+	holePunchConsecutiveErrors uint32
+	holePunchBackoffUntil      time.Time
+	holePunchBaseBackoff       time.Duration
+	holePunchNowFn             func() time.Time
+	holePunchCompletionVictim  uint32
 	holePunchCompletions      [fileStoreHolePunchCompletionSlots]storeio.FreeExtent
 	holePunchPartials         [fileStoreHolePunchSourceCount]fileStoreHolePunchPartial
 	// Tests may replace the platform helper per collection. Nil selects the
@@ -900,10 +909,11 @@ type Stats struct {
 	// PrimaryEmptyLeaves counts routed leaves currently empty (made empty and
 	// not yet refilled or reclaimed). The counter is rebuilt from zero on Open.
 	PrimaryEmptyLeaves uint64
-	// PrimaryLeafSplits and PrimaryEmptyReclaims count the bounded structural
-	// transactions performed this session.
+	// PrimaryLeafSplits, PrimaryEmptyReclaims, and PrimaryLeafMerges count the
+	// bounded structural transactions performed this session.
 	PrimaryLeafSplits    uint64
 	PrimaryEmptyReclaims uint64
+	PrimaryLeafMerges    uint64
 	// PrimaryMacroSplits counts bounded sibling-tablet publications performed
 	// after exhausting one tablet's 4096 stable local identities.
 	PrimaryMacroSplits uint64

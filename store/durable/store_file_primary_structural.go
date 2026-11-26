@@ -22,7 +22,18 @@ const (
 	// slack, so one split makes room; the small bound only guards a pathological
 	// placement cycle rather than looping forever.
 	primaryStructuralRetryLimit = 16
+
+	// primaryLeafMergeBudgetPerFold bounds opportunistic inline sibling leaf
+	// merges performed at the end of one fold/checkpoint so delete bursts
+	// reclaim sparse leaves incrementally on the write path without stalling.
+	primaryLeafMergeBudgetPerFold = 2
+
+	// primaryLeafMergeMaxExtent limits merge candidates to leaves at or below
+	// 8 KiB so large active leaves are never considered underfilled.
+	primaryLeafMergeMaxExtent = 8 << 10
 )
+
+var errPrimaryLeafMergeAborted = errors.New("vibedb: primary leaf merge skipped")
 
 // ErrPrimaryMacroSplitRequired reports that sibling publication cannot proceed
 // because the tablet identity namespace or selected catalog node is exhausted.
@@ -37,6 +48,7 @@ const (
 	structuralSplit primaryStructuralKind = iota
 	structuralEmptyReclaim
 	structuralMacroSplit
+	structuralMerge
 )
 
 // structuralLeaf is one enumerated current leaf of a tablet: its stable
@@ -93,6 +105,8 @@ func (c *Collection) recordStructuralLatency(
 		updateMaxU64(&c.primaryEmptyReclaimMaxNS, ns)
 	case structuralMacroSplit:
 		c.primaryMacroSplits.Add(1)
+	case structuralMerge:
+		c.primaryLeafMerges.Add(1)
 	}
 }
 
@@ -102,6 +116,9 @@ func (c *Collection) recordStructuralLatency(
 // hook the split path requires; flushing all pending parents is a safe superset.
 func (c *Collection) flushPendingForStructural() error {
 	if c.deferredCanonicalLane() {
+		prev := c.primaryStructuralActive
+		c.primaryStructuralActive = true
+		defer func() { c.primaryStructuralActive = prev }()
 		// Full checkpoint (materialize + device flush), for two reasons. First, the
 		// structural transaction rebuilds the tablet from the published graph and
 		// then rebuilds the resident router from it, so every acknowledged canonical
@@ -1809,4 +1826,239 @@ func (c *Collection) removeEmptyPrimaryLeafForKey(key []byte) (err error) {
 		generation = after.root.Generation
 	}
 	return nil
+}
+
+// primaryLeafIsUnderfilled reports whether a non-empty compact leaf that just
+// shrank from deletes is below 37.5% payload utilization in the smallest (4 KiB)
+// extent class, so two adjacent underfilled leaves combine into one <=75%-full
+// 4 KiB leaf and strictly save physical space.
+func primaryLeafIsUnderfilled(rows, payloadBytes, extentBytes int) bool {
+	if rows <= 0 || extentBytes <= 0 || extentBytes > primaryLeafMergeMaxExtent {
+		return false
+	}
+	return payloadBytes*8 <= extentBytes*3
+}
+
+func (c *Collection) recordUnderfilledPrimaryLeafLocked(key []byte) {
+	if len(key) == 0 || c.primaryUnderfilledCount >= primaryLeafMergeBudgetPerFold {
+		return
+	}
+	slot := c.primaryUnderfilledCount
+	c.primaryUnderfilledKeys[slot] = append(c.primaryUnderfilledKeys[slot][:0], key...)
+	c.primaryUnderfilledCount++
+}
+
+// mergeUnderfilledPrimaryLeavesLocked performs at most
+// primaryLeafMergeBudgetPerFold opportunistic inline sibling merges for leaves
+// that just shrank below the underfill threshold during the preceding fold.
+// Errors are best-effort: a skipped or failed merge leaves the already-durable
+// fold intact.
+func (c *Collection) mergeUnderfilledPrimaryLeavesLocked() {
+	count := c.primaryUnderfilledCount
+	c.primaryUnderfilledCount = 0
+	if count == 0 || c.closed {
+		return
+	}
+	prev := c.primaryStructuralActive
+	c.primaryStructuralActive = true
+	defer func() { c.primaryStructuralActive = prev }()
+	for i := 0; i < count; i++ {
+		key := c.primaryUnderfilledKeys[i]
+		if len(key) == 0 {
+			continue
+		}
+		_, _ = c.structuralMergeUnderfilledPrimaryLeaf(key)
+	}
+}
+
+// structuralMergeUnderfilledPrimaryLeaf merges the underfilled leaf routed by
+// keyBytes with its smaller adjacent sibling in the same tablet when the
+// combined rows fit cleanly into one leaf with strictly smaller physical extent
+// than the two separate leaves. The caller holds writer and has already
+// materialized and flushed the overlay.
+func (c *Collection) structuralMergeUnderfilledPrimaryLeaf(
+	keyBytes []byte,
+) (bool, error) {
+	state := c.state.Load()
+	if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
+		return false, ErrClosed
+	}
+	route, err := c.currentPrimaryResidentRoute(state, keyBytes)
+	if err != nil {
+		return false, nil
+	}
+	var path filePrimaryMutationPath
+	if err := c.acquirePrimaryRoutingPath(
+		&path, state, keyBytes, route,
+	); err != nil {
+		return false, err
+	}
+	defer path.Release()
+	current, err := c.enumerateTabletLeaves(&path.tablet)
+	if err != nil {
+		return false, err
+	}
+	if len(current) < 2 {
+		return false, nil
+	}
+	sourceIndex := structuralIndexOfBucket(current, route.Bucket)
+	if sourceIndex < 0 {
+		return false, storeio.ErrSegmentedTabletRouterCorrupt
+	}
+
+	// Pick the smaller adjacent sibling in the same tablet.
+	leftIdx, rightIdx := -1, -1
+	if sourceIndex > 0 && sourceIndex+1 < len(current) {
+		if current[sourceIndex-1].ref.Length <= current[sourceIndex+1].ref.Length {
+			leftIdx, rightIdx = sourceIndex-1, sourceIndex
+		} else {
+			leftIdx, rightIdx = sourceIndex, sourceIndex+1
+		}
+	} else if sourceIndex > 0 {
+		leftIdx, rightIdx = sourceIndex-1, sourceIndex
+	} else {
+		leftIdx, rightIdx = sourceIndex, sourceIndex+1
+	}
+
+	left := current[leftIdx]
+	right := current[rightIdx]
+	leftLease, err := c.cache.Acquire(left.ref)
+	if err != nil {
+		return false, err
+	}
+	defer leftLease.Release()
+	rightLease, err := c.cache.Acquire(right.ref)
+	if err != nil {
+		return false, err
+	}
+	defer rightLease.Release()
+
+	leftStripe, leftOK := storeio.AdmittedCompactPrimaryStripe(
+		leftLease.Page(), c.storeID, left.bucket,
+	)
+	rightStripe, rightOK := storeio.AdmittedCompactPrimaryStripe(
+		rightLease.Page(), c.storeID, right.bucket,
+	)
+	if !leftOK || !rightOK {
+		return false, nil
+	}
+	leftRowsCount := leftStripe.Len()
+	rightRowsCount := rightStripe.Len()
+	if leftRowsCount == 0 || rightRowsCount == 0 ||
+		leftRowsCount+rightRowsCount > storeio.CommonPrimaryLeafWideSlots {
+		return false, nil
+	}
+	leftPayload := int(leftLease.Header().PayloadLength)
+	rightPayload := int(rightLease.Header().PayloadLength)
+	if !primaryLeafIsUnderfilled(leftRowsCount, leftPayload, int(left.ref.Length)) &&
+		!primaryLeafIsUnderfilled(rightRowsCount, rightPayload, int(right.ref.Length)) {
+		return false, nil
+	}
+	// Combined payload must stay comfortably below the max leaf extent (< 75%)
+	// so we never merge two leaves only to trigger an immediate split.
+	if leftPayload+rightPayload > (storeio.CommonPrimaryLeafMaxExtentBytes*3)/4 {
+		return false, nil
+	}
+
+	generation := state.root.Generation + 1
+	commitErr := c.commitPrimaryStructural(
+		state, &path, structuralMerge,
+		func(tx *storeio.WriteTransaction) (
+			[]storeio.SegmentedTabletRouterLeaf, []storeio.PageRef,
+			*primaryLocalizedLeafSplit, error,
+		) {
+			if c.primaryExactActive() {
+				if err := c.captureStructuralOldLocked(
+					left.bucket, leftLease.Page(),
+					storeio.CommonPrimaryLeafBounds{
+						FileEnd:           tx.FileEnd(),
+						NextLogicalID:     tx.NextLogicalID(),
+						AllocationQuantum: uint32(c.options.PageSize),
+					},
+				); err != nil {
+					return nil, nil, nil, err
+				}
+				c.structuralExactOldReady = true
+				c.structuralRepairPostingsHook([]storeio.BucketID{right.bucket})
+			}
+
+			leftRows, renderErr := leftStripe.RenderRecordsWithScratch(
+				c.primaryLeafMutationScratch,
+			)
+			if renderErr != nil {
+				return nil, nil, nil, renderErr
+			}
+			// Copy leftRows' keys and inline values out of c.primaryLeafMutationScratch
+			// before reusing the scratch to render rightStripe.
+			leftBytes := 0
+			for i := range leftRows {
+				leftBytes += len(leftRows[i].Key)
+				if !leftRows[i].Value.IsOverflow() {
+					leftBytes += len(leftRows[i].Value.Inline)
+				}
+			}
+			leftArena := make([]byte, 0, leftBytes)
+			mergedRows := make(
+				[]storeio.CommonPrimaryLeafRecord, 0, leftRowsCount+rightRowsCount,
+			)
+			for i := range leftRows {
+				rec := leftRows[i]
+				kStart := len(leftArena)
+				leftArena = append(leftArena, rec.Key...)
+				rec.Key = leftArena[kStart:len(leftArena):len(leftArena)]
+				if !rec.Value.IsOverflow() {
+					vStart := len(leftArena)
+					leftArena = append(leftArena, rec.Value.Inline...)
+					rec.Value.Inline = leftArena[vStart:len(leftArena):len(leftArena)]
+				}
+				mergedRows = append(mergedRows, rec)
+			}
+			rightRows, renderErr := rightStripe.RenderRecordsWithScratch(
+				c.primaryLeafMutationScratch,
+			)
+			if renderErr != nil {
+				return nil, nil, nil, renderErr
+			}
+			mergedRows = append(mergedRows, rightRows...)
+
+			mergedRef, encErr := c.encodeStructuralLeaf(
+				tx, generation, left.bucket, mergedRows,
+			)
+			if encErr != nil {
+				if errors.Is(encErr, storeio.ErrCommonPrimaryLeafFull) {
+					return nil, nil, nil, errPrimaryLeafMergeAborted
+				}
+				return nil, nil, nil, encErr
+			}
+			// Only commit the merge when it strictly saves physical extent bytes.
+			if uint64(mergedRef.Length) >= uint64(left.ref.Length)+uint64(right.ref.Length) {
+				return nil, nil, nil, errPrimaryLeafMergeAborted
+			}
+
+			final := make(
+				[]storeio.SegmentedTabletRouterLeaf, 0, len(current)-1,
+			)
+			for at := range current {
+				if at == rightIdx {
+					continue
+				}
+				ref := current[at].ref
+				if at == leftIdx {
+					ref = mergedRef
+				}
+				final = append(final, storeio.SegmentedTabletRouterLeaf{
+					LocalID: current[at].localID, Fence: current[at].fence,
+					Ref: ref, Zone: current[at].zone,
+				})
+			}
+			return final, []storeio.PageRef{left.ref, right.ref}, nil, nil
+		},
+	)
+	if errors.Is(commitErr, errPrimaryLeafMergeAborted) {
+		return false, nil
+	}
+	if commitErr != nil {
+		return false, commitErr
+	}
+	return true, nil
 }

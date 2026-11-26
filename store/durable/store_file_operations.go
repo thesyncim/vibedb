@@ -938,6 +938,7 @@ func (c *Collection) Stats() Stats {
 		PrimaryEmptyLeaves:                    c.primaryEmptyLeaves.Load(),
 		PrimaryLeafSplits:                     c.primaryLeafSplits.Load(),
 		PrimaryEmptyReclaims:                  c.primaryEmptyReclaims.Load(),
+		PrimaryLeafMerges:                     c.primaryLeafMerges.Load(),
 		PrimaryMacroSplits:                    c.primaryMacroSplits.Load(),
 		PrimaryTabletRoutingRebuilds:          c.primaryTabletRoutingRebuilds.Load(),
 		PrimaryCatalogLeafSplits:              c.primaryCatalogLeafSplits.Load(),

@@ -476,8 +476,33 @@ func encodeCompactPrimaryStripePayload(
 	return page, nil
 }
 
+// compactPrimaryStripeExtentClass quantizes a compact leaf's required byte size
+// into coarse power-of-two size classes (4, 8, 16, 32, 64 KiB). Power-of-two
+// classes eliminate the 11 intermediate odd 4-KiB multiples (12, 20, 24, 28,
+// 36, 40, 44, 48, 52, 56, 60 KiB) whose retired holes cannot be reused cleanly
+// by adjacent growths on the write path, preventing permanent free-list
+// fragmentation while keeping 4 KiB-multiple on-disk compatibility intact.
+func compactPrimaryStripeExtentClass(need int) int {
+	if need <= 4<<10 {
+		return 4 << 10
+	}
+	if need <= 8<<10 {
+		return 8 << 10
+	}
+	if need <= 16<<10 {
+		return 16 << 10
+	}
+	if need <= 32<<10 {
+		return 32 << 10
+	}
+	if need <= CommonPrimaryLeafMaxExtentBytes {
+		return CommonPrimaryLeafMaxExtentBytes
+	}
+	return (need + int(physicalPageQuantum) - 1) &^ (int(physicalPageQuantum) - 1)
+}
+
 // EncodeBestCompactPrimaryStripe encodes a complete mutation/checkpoint row
-// set at its smallest 4 KiB-rounded extent.
+// set at its smallest coarse power-of-two extent class (4/8/16/32/64 KiB).
 func EncodeBestCompactPrimaryStripe(
 	dst []byte,
 	header CommonPrimaryLeafHeader,
@@ -493,7 +518,7 @@ func EncodeBestCompactPrimaryStripe(
 		return nil, err
 	}
 	need := PageHeaderSize + len(payload) + PageTrailerSize
-	extent := (need + int(physicalPageQuantum) - 1) &^ (int(physicalPageQuantum) - 1)
+	extent := compactPrimaryStripeExtentClass(need)
 	if extent > CommonPrimaryLeafMaxExtentBytes {
 		return nil, ErrCommonPrimaryLeafFull
 	}
@@ -1031,7 +1056,7 @@ func (v *CompactPrimaryStripeView) PatchCompactPrimaryStripeReplacements(
 	}
 	newPayloadBytes := len(v.payload) + delta
 	need := PageHeaderSize + newPayloadBytes + PageTrailerSize
-	extent := (need + int(physicalPageQuantum) - 1) &^ (int(physicalPageQuantum) - 1)
+	extent := compactPrimaryStripeExtentClass(need)
 	if newPayloadBytes < compactPrimaryHeaderBytes ||
 		extent > CommonPrimaryLeafMaxExtentBytes || extent > len(dst) {
 		return nil, false, nil

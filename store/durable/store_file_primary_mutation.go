@@ -1961,6 +1961,7 @@ func (c *Collection) materializePrimaryParentsLocked(
 	if err := c.checkpointGroupPhysicalFence(); err != nil {
 		return err
 	}
+	c.primaryUnderfilledCount = 0
 	overlayPending := c.primaryUnifiedOverlay.hasPending()
 	if overlayPending {
 		started := time.Now()
@@ -2377,6 +2378,13 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 				if renderErr == nil {
 					copy(page.Bytes(), image)
 					renderErr = page.Stage()
+				}
+				if renderErr == nil && len(records) > 0 && len(records) < stripe.Len() &&
+					c.primaryUnderfilledCount < primaryLeafMergeBudgetPerFold {
+					if hdr, _, hdrErr := storeio.OpenPage(image); hdrErr == nil &&
+						primaryLeafIsUnderfilled(len(records), int(hdr.PayloadLength), len(image)) {
+						c.recordUnderfilledPrimaryLeafLocked(records[0].Key)
+					}
 				}
 				lease.Release()
 				if renderErr != nil {

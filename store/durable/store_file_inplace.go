@@ -10,7 +10,13 @@ func (c *Collection) checkpointBufferedLocked() error {
 	if err := c.materializePrimaryParentsLocked(primaryMaterializationCheckpoint); err != nil {
 		return err
 	}
-	return c.flushBufferedPublishedLocked()
+	if err := c.flushBufferedPublishedLocked(); err != nil {
+		return err
+	}
+	if !c.closed && !c.primaryStructuralActive && c.checkpointGroup.Load() == nil && c.primaryUnderfilledCount > 0 {
+		c.mergeUnderfilledPrimaryLeavesLocked()
+	}
+	return nil
 }
 
 // flushBufferedPublishedLocked advances an already-published deferred cut to
