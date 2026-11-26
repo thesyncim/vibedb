@@ -438,6 +438,14 @@ func (p *Parser) parseScalarCondition(
 		}
 		return node, nil
 	}
+	if isRegexOp(p.tok.kind) {
+		return p.parseRegexTail(scalarCtx, left, pos)
+	}
+	if p.atKeyword(kwSimilar) || (p.atKeyword(kwNot) && p.peekKeyword(kwSimilar)) {
+		neg := p.acceptKeyword(kwNot)
+		p.advance() // SIMILAR
+		return p.parseSimilarToTail(scalarCtx, left, pos, neg)
+	}
 	op, ok := comparisonOp(p.tok.kind)
 	if !ok {
 		return nil, p.errHere("expected a comparison operator or IS [NOT] NULL after a computed scalar expression")
@@ -602,7 +610,9 @@ func (p *Parser) parseLeafTail(
 		p.advance()
 		return p.parseLikeTail(agg, path, pos, negated, insensitive)
 	case p.atKeyword(kwSimilar):
-		return nil, p.errHere("SIMILAR TO is not supported: the engine has no pattern operator")
+		p.advance()
+		left := p.scalarFromColumn(ResultColumn{Agg: agg, Path: path, Pos: pos})
+		return p.parseSimilarToTail(scalarContextForPredicate(ctx), left, pos, negated)
 	case negated:
 		// NOT ==> parses below beside @>; anything else after NOT is
 		// refused with the keyword list.
@@ -615,6 +625,10 @@ func (p *Parser) parseLeafTail(
 	}
 	if p.tok.kind == tokMatch {
 		return p.parseMatchTail(agg, path, pos, negated)
+	}
+	if isRegexOp(p.tok.kind) {
+		left := p.scalarFromColumn(ResultColumn{Agg: agg, Path: path, Pos: pos})
+		return p.parseRegexTail(scalarContextForPredicate(ctx), left, pos)
 	}
 	op, ok := comparisonOp(p.tok.kind)
 	if !ok {
@@ -855,6 +869,142 @@ func rewriteLikeEscapeToBackslash(pattern, esc string) string {
 		}
 		out = append(out, r)
 	}
+	return string(out)
+}
+
+func isRegexOp(k tokenKind) bool {
+	return k == tokRegexMatch || k == tokRegexIMatch || k == tokRegexNotMatch || k == tokRegexNotIMatch
+}
+
+func (p *Parser) peekKeyword(kw keyword) bool {
+	savedTok := p.tok
+	savedLx := p.lx
+	p.advance()
+	match := p.atKeyword(kw)
+	p.tok = savedTok
+	p.lx = savedLx
+	return match
+}
+
+func (p *Parser) parseRegexTail(scalarCtx scalarExprContext, left *ScalarExpr, pos int) (*Expr, error) {
+	opKind := p.tok.kind
+	opPos := p.tok.pos
+	p.advance()
+	pattern, err := p.parseScalarExpression(scalarCtx)
+	if err != nil {
+		return nil, err
+	}
+	insensitive := opKind == tokRegexIMatch || opKind == tokRegexNotIMatch
+	negated := opKind == tokRegexNotMatch || opKind == tokRegexNotIMatch
+	return p.buildRegexpLikePredicate(left, pattern, insensitive, negated, pos, opPos), nil
+}
+
+func (p *Parser) parseSimilarToTail(scalarCtx scalarExprContext, left *ScalarExpr, pos int, negated bool) (*Expr, error) {
+	if !tokenTextEqual(p.tok, "TO") {
+		return nil, p.errHere("expected TO after SIMILAR")
+	}
+	opPos := p.tok.pos
+	p.advance() // TO
+	patOp, err := p.parseOperand()
+	if err != nil {
+		return nil, err
+	}
+	if patOp.Kind != OperandString {
+		return nil, p.errAt(patOp.Pos, "SIMILAR TO pattern must be a string literal")
+	}
+	esc := ""
+	if p.atKeyword(kwEscape) {
+		p.advance()
+		escOp, err := p.parseOperand()
+		if err != nil {
+			return nil, err
+		}
+		if escOp.Kind != OperandString || len([]rune(escOp.Text)) > 1 {
+			return nil, p.errAt(escOp.Pos, "ESCAPE string must be empty or one character")
+		}
+		esc = escOp.Text
+	}
+	regexStr := similarToRegex(patOp.Text, esc)
+	patExpr := p.newScalar(ScalarLiteral, patOp.Pos)
+	patExpr.Value = Operand{Kind: OperandString, Text: regexStr, Pos: patOp.Pos}
+	return p.buildRegexpLikePredicate(left, patExpr, false, negated, pos, opPos), nil
+}
+
+func (p *Parser) buildRegexpLikePredicate(
+	left, pattern *ScalarExpr,
+	insensitive, negated bool,
+	pos, opPos int,
+) *Expr {
+	fn := p.newScalar(ScalarFunc, opPos)
+	fn.Value = Operand{Kind: OperandString, Text: "regexp_like", Pos: opPos}
+	fn.Whens = append(fn.Whens, ScalarWhen{Result: left, Pos: left.Pos})
+	fn.Whens = append(fn.Whens, ScalarWhen{Result: pattern, Pos: pattern.Pos})
+	if insensitive {
+		flags := p.newScalar(ScalarLiteral, opPos)
+		flags.Value = Operand{Kind: OperandString, Text: "i", Pos: opPos}
+		fn.Whens = append(fn.Whens, ScalarWhen{Result: flags, Pos: opPos})
+	}
+	target := p.newScalar(ScalarLiteral, opPos)
+	target.Value = Operand{Kind: OperandBool, Bool: !negated, Pos: opPos}
+	node := p.exprs.one()
+	*node = Expr{
+		Kind:        ExprScalarCompare,
+		Op:          OpEq,
+		Column:      -1,
+		ScalarLeft:  fn,
+		ScalarRight: target,
+		Pos:         pos,
+	}
+	return node
+}
+
+// similarToRegex converts a SQL:1999 / PostgreSQL SIMILAR TO pattern into a
+// full-string Go RE2 regular expression.
+func similarToRegex(pattern, esc string) string {
+	var escRune rune
+	hasEsc := false
+	for _, r := range esc {
+		escRune = r
+		hasEsc = true
+		break
+	}
+	runes := []rune(pattern)
+	out := make([]rune, 0, len(runes)+8)
+	out = append(out, '^', '(', '?', ':')
+	inBracket := false
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if hasEsc && r == escRune && i+1 < len(runes) {
+			i++
+			out = append(out, '\\', runes[i])
+			continue
+		}
+		if r == '[' {
+			inBracket = true
+			out = append(out, r)
+			continue
+		}
+		if r == ']' && inBracket {
+			inBracket = false
+			out = append(out, r)
+			continue
+		}
+		if !inBracket {
+			switch r {
+			case '%':
+				out = append(out, '.', '*')
+				continue
+			case '_':
+				out = append(out, '.')
+				continue
+			case '.', '^', '$':
+				out = append(out, '\\', r)
+				continue
+			}
+		}
+		out = append(out, r)
+	}
+	out = append(out, ')', '$')
 	return string(out)
 }
 
