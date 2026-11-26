@@ -1087,7 +1087,7 @@ func TestErrorClassification(t *testing.T) {
 	}{
 		{`SELECT name FROM nosuch`, sqlstateUndefinedTable},
 		{`SELECT FROM users`, sqlstateSyntaxError},
-		{`SELECT name FROM users WHERE name LIKE 'a%' ESCAPE '!'`, sqlstateSyntaxError},
+		{`SELECT name FROM users WHERE name LIKE 'a%' BOGUS '!'`, sqlstateSyntaxError},
 		{`INSERT INTO users VALUES (1)`, sqlstateSyntaxError},
 		{`CREATE TABLE t (a int)`, sqlstateInternalError},
 		{`COPY users TO STDOUT`, sqlstateFeatureNotSupported},
@@ -1150,7 +1150,7 @@ func TestUnsupportedSQLTaxonomyMatchesDatabaseSQL(t *testing.T) {
 
 func TestASyntaxErrorCarriesAPosition(t *testing.T) {
 	c := connect(t)
-	sql := `SELECT name FROM users WHERE name LIKE 'a%' ESCAPE '!'`
+	sql := `SELECT name FROM users WHERE name LIKE 'a%' BOGUS '!'`
 	fs := expectError(t, c.query(sql), sqlstateSyntaxError)
 	pos, err := strconv.Atoi(fs['P'])
 	if err != nil {
@@ -1160,18 +1160,18 @@ func TestASyntaxErrorCarriesAPosition(t *testing.T) {
 	if pos < 1 || pos > len(sql)+1 {
 		t.Fatalf("position %d is outside the statement", pos)
 	}
-	if !strings.HasPrefix(sql[pos-1:], "ESCAPE") {
-		t.Fatalf("position %d points at %q, want the ESCAPE keyword", pos, sql[pos-1:])
+	if !strings.HasPrefix(sql[pos-1:], "BOGUS") {
+		t.Fatalf("position %d points at %q, want the BOGUS token", pos, sql[pos-1:])
 	}
-	if !strings.Contains(fs['M'], "ESCAPE") {
-		t.Errorf("the message does not name the refused construct: %q", fs['M'])
+	if !strings.Contains(fs['M'], "unexpected") {
+		t.Errorf("the message does not describe the refused construct: %q", fs['M'])
 	}
 }
 
 func TestAPositionCountsCharactersNotBytes(t *testing.T) {
 	// A non-ASCII quoted identifier before the failure makes byte and character
 	// offsets disagree; the protocol's P field counts characters.
-	sql := `SELECT "é" FROM users WHERE "é" LIKE 'x' ESCAPE '!'`
+	sql := `SELECT "é" FROM users WHERE "é" LIKE 'x' BOGUS '!'`
 	_, err := sqlast.Parse(sql)
 	if err == nil {
 		t.Fatal("expected the statement to be refused")
@@ -1181,8 +1181,8 @@ func TestAPositionCountsCharactersNotBytes(t *testing.T) {
 	if pg.position < 1 || pg.position > len(runes)+1 {
 		t.Fatalf("position %d is outside the statement's %d characters", pg.position, len(runes))
 	}
-	if !strings.HasPrefix(string(runes[pg.position-1:]), "ESCAPE") {
-		t.Fatalf("character position %d points at %q, want ESCAPE",
+	if !strings.HasPrefix(string(runes[pg.position-1:]), "BOGUS") {
+		t.Fatalf("character position %d points at %q, want BOGUS",
 			pg.position, string(runes[pg.position-1:]))
 	}
 }
@@ -2631,15 +2631,15 @@ func TestMixingPlaceholderSpellingsIsRefused(t *testing.T) {
 func TestTheRewritePreservesErrorPositions(t *testing.T) {
 	// "$12" is three bytes and "?" is one, so a rewrite that shortened the text
 	// would report a position two bytes short of the offending token.
-	sql := `SELECT id FROM users WHERE age = $12 AND name LIKE 'x' ESCAPE '!'`
+	sql := `SELECT id FROM users WHERE age = $12 AND name LIKE 'x' BOGUS '!'`
 	c := connect(t)
 	fs := expectError(t, c.query(sql), sqlstateSyntaxError)
 	pos, err := strconv.Atoi(fs['P'])
 	if err != nil {
 		t.Fatalf("no position on the error: %q", fs['P'])
 	}
-	if !strings.HasPrefix(sql[pos-1:], "ESCAPE") {
-		t.Fatalf("position %d points at %q in the original statement, want ESCAPE",
+	if !strings.HasPrefix(sql[pos-1:], "BOGUS") {
+		t.Fatalf("position %d points at %q in the original statement, want BOGUS",
 			pos, sql[pos-1:])
 	}
 }
