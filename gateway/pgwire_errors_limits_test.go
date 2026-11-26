@@ -38,8 +38,20 @@ func TestPostgresSessionTypedErrorsAndUnlimitedLimits(t *testing.T) {
 		t.Fatalf("nested Begin = %v, want ErrTransactionActive", err)
 	}
 
-	var unsupported *sqlast.FeatureNotSupportedError
-	if err := session.Savepoint(context.Background(), "sp1"); !errors.As(err, &unsupported) {
-		t.Fatalf("Savepoint = %v, want *sql.FeatureNotSupportedError", err)
+	if err := session.Savepoint(context.Background(), "sp1"); err != nil {
+		t.Fatalf("Savepoint in active tx failed: %v", err)
 	}
+	if err := session.RollbackTo(context.Background(), "sp1"); err != nil {
+		t.Fatalf("RollbackTo in active tx failed: %v", err)
+	}
+	if err := session.ReleaseSavepoint(context.Background(), "sp1"); err != nil {
+		t.Fatalf("ReleaseSavepoint in active tx failed: %v", err)
+	}
+	if err := session.Rollback(context.Background()); err != nil {
+		t.Fatalf("Rollback failed: %v", err)
+	}
+	if err := session.Savepoint(context.Background(), "sp_idle"); !errors.Is(err, driver.ErrNoTransaction) {
+		t.Fatalf("Savepoint when idle = %v, want ErrNoTransaction", err)
+	}
+	_ = sqlast.KindSelect
 }
