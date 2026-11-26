@@ -934,6 +934,10 @@ func (s *Statement) AppendSchema(dst []OutputColumn) []OutputColumn {
 				col.Reduction = ReductionMin
 			case sqlast.AggMax:
 				col.Reduction = ReductionMax
+			case sqlast.AggStringAgg:
+				col.Type = TypeString
+			case sqlast.AggBoolAnd, sqlast.AggBoolOr:
+				col.Type = TypeBool
 			}
 			dst = append(dst, col)
 		}

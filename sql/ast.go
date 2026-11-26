@@ -63,6 +63,10 @@ type SelectStmt struct {
 	// GroupBy holds the grouping keys, or nil.
 	GroupBy []*PathExpr
 
+	// GroupByScalars holds computed scalar GROUP BY expressions (e.g.
+	// GROUP BY COALESCE(n, 0)), or nil when all grouping keys are plain paths.
+	GroupByScalars []*ScalarExpr
+
 	// Having is the post-aggregation filter, or nil.
 	//
 	// The parser binds every HAVING leaf to a column already in the SELECT list
@@ -380,6 +384,11 @@ const (
 	AggAvg
 	AggMin
 	AggMax
+	AggStringAgg
+	AggArrayAgg
+	AggJsonAgg
+	AggBoolAnd
+	AggBoolOr
 )
 
 // String answers the aggregate's SQL spelling, or "" for AggNone.
@@ -395,6 +404,16 @@ func (a AggKind) String() string {
 		return "MIN"
 	case AggMax:
 		return "MAX"
+	case AggStringAgg:
+		return "STRING_AGG"
+	case AggArrayAgg:
+		return "ARRAY_AGG"
+	case AggJsonAgg:
+		return "JSON_AGG"
+	case AggBoolAnd:
+		return "BOOL_AND"
+	case AggBoolOr:
+		return "BOOL_OR"
 	}
 	return ""
 }
@@ -407,6 +426,8 @@ type ResultColumn struct {
 	AggDistinct bool
 	// AggFilter records an optional FILTER (WHERE ...) predicate on an aggregate.
 	AggFilter *Expr
+	// AggSeparator records the delimiter literal for STRING_AGG(x, sep).
+	AggSeparator string
 	// Path is the projected or aggregated path. It is nil only for COUNT(*),
 	// which reads no path at all. A Path with no segments is the whole
 	// document — what '*' and 'alias.*' parse to.
