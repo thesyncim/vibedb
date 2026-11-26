@@ -1654,6 +1654,27 @@ func (j *statementRelationJoin) evalJoinExpr(
 			return triFalse, fmt.Errorf("query: invalid LIKE pattern: %w", err)
 		}
 		value = boolTri(cell.kind == kindString && likeMatch(lit.sval, cell.sval, expr.Insensitive))
+	case sqlast.ExprRegex:
+		lit, known, err := j.joinOperand(expr.Value, args)
+		if err != nil {
+			return triFalse, err
+		}
+		if !known || cell.kind == kindNull {
+			value = triUnknown
+			break
+		}
+		if lit.kind != kindString {
+			return triFalse, fmt.Errorf("query: ON regex pattern must be a string")
+		}
+		flags := ""
+		if expr.Insensitive {
+			flags = "i"
+		}
+		re, err := cachedPGRegexp(lit.sval, flags)
+		if err != nil {
+			return triFalse, fmt.Errorf("query: invalid regex pattern: %w", err)
+		}
+		value = boolTri(cell.kind == kindString && re.MatchString(cell.sval))
 	case sqlast.ExprContains:
 		if cell.kind == kindNull {
 			value = triUnknown

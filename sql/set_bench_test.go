@@ -6,11 +6,11 @@ import (
 )
 
 func TestSelectStmtColdSidecarFootprint(t *testing.T) {
-	// SelectStmt is exactly its historical ordinary metadata plus one pointer
-	// each for cold set and correlation state. Both stay nil on an ordinary
+	// SelectStmt is its historical ordinary metadata plus one pointer each for
+	// cold set, correlation, and extensions state. All stay nil on an ordinary
 	// query; pinning words catches accidental inline metadata growth while
 	// remaining meaningful on amd64 and 386.
-	const words = 25
+	const words = 26
 	if got, want := unsafe.Sizeof(SelectStmt{}), uintptr(words)*unsafe.Sizeof(uintptr(0)); got != want {
 		t.Fatalf("SelectStmt footprint = %d bytes (%d pointer words), want %d bytes (%d words)",
 			got, got/unsafe.Sizeof(uintptr(0)), want, words)

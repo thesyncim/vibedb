@@ -279,7 +279,7 @@ func (p *Parser) validate() error {
 	if err := p.validateJoins(); err != nil {
 		return err
 	}
-	grouped := len(p.out.GroupBy) > 0 || len(p.out.GroupByScalars) > 0
+	grouped := len(p.out.GroupBy) > 0 || len(p.out.GroupByScalarExprs()) > 0
 	aggregates, projections := 0, 0
 	firstProjection := -1
 	if _, hasAggregate := predicateScalarDependencyKinds(p.out.Having); hasAggregate {
@@ -751,7 +751,7 @@ func (p *Parser) isGroupKey(path *PathExpr) bool {
 // isGroupScalar reports whether expr structurally matches one of the
 // GROUP BY scalar expressions.
 func (p *Parser) isGroupScalar(expr *ScalarExpr) bool {
-	for _, key := range p.out.GroupByScalars {
+	for _, key := range p.out.GroupByScalarExprs() {
 		if SameScalarExpr(key, expr) {
 			return true
 		}

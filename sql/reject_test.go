@@ -98,7 +98,6 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 	runRejections(t, []rejection{
 		{"DISTINCT and ALL", `SELECT DISTINCT ALL a FROM t`, 16, "mutually exclusive"},
 		{"DISTINCT with GROUP BY", `SELECT DISTINCT a FROM t GROUP BY a`, 35, "grouping changes"},
-		{"regular expressions", `SELECT a FROM t WHERE b ~ 'x'`, 24, "regular-expression"},
 		{"a scalar subquery on the left", `SELECT a FROM t WHERE (SELECT 1 FROM u) = 1`, 23, "cannot stand alone"},
 		{"scalar functions", `SELECT unknown_fn(a) FROM t`, 17, "not a supported function"},
 		// Parse is the SELECT-only entry point. These three are statements the
@@ -110,7 +109,6 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 		{"CREATE TABLE", `CREATE TABLE t (a STRING)`, 0, "parsed by ParseStatement"},
 		{"FETCH FIRST", `SELECT a FROM t FETCH FIRST 1 ROWS WITH TIES`, -1, "WITH TIES"},
 		{"COLLATE", `SELECT a FROM t ORDER BY a COLLATE "C"`, 27, "COLLATE"},
-		{"GROUP BY an output position", `SELECT a FROM t GROUP BY 1`, 25, "output position"},
 		{"GROUP BY an aggregate", `SELECT SUM(a) FROM t GROUP BY SUM(a)`, 33, "computed per group"},
 	})
 }

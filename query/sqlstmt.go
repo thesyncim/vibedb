@@ -438,7 +438,7 @@ func prepareTreeInCorrelationContext(
 	if len(unknownModes) != 0 {
 		mode = unknownModes[0]
 	}
-	if len(tree.DistinctOn) > 0 {
+	if len(tree.DistinctOnPaths()) > 0 {
 		return prepareDistinctOnStatement(src, tree, subqueryLimit, ctes, argBase, correlation, parameterTypes)
 	}
 	if hasExtendedAggregate(tree) {

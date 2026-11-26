@@ -1034,6 +1034,8 @@ func (s *Statement) leafForm(e *sqlast.Expr, args []any) (leafForm, error) {
 		return leafForm{pred: Contains(spec, e.Value.Text), total: true}, nil
 	case sqlast.ExprLike:
 		return s.likeForm(e, args)
+	case sqlast.ExprRegex:
+		return s.regexForm(e, args)
 	case sqlast.ExprMatch:
 		return s.matchForm(e, args)
 	default:
@@ -1093,6 +1095,40 @@ func (s *Statement) likeForm(e *sqlast.Expr, args []any) (leafForm, error) {
 	pred := Like(s.spec(e.Path), pattern)
 	if e.Insensitive {
 		pred = ILike(s.spec(e.Path), pattern)
+	}
+	return leafForm{pred: pred, guard: isString(s.spec(e.Path))}, nil
+}
+
+func (s *Statement) regexForm(e *sqlast.Expr, args []any) (leafForm, error) {
+	if s.prepareMode && e.Value.Kind == sqlast.OperandParam {
+		pred := Regex(s.spec(e.Path), "")
+		if e.Insensitive {
+			pred = IRegex(s.spec(e.Path), "")
+		}
+		return leafForm{pred: pred, guard: isString(s.spec(e.Path))}, nil
+	}
+	value, known, err := s.operand(e.Value, args)
+	if err != nil {
+		return leafForm{}, err
+	}
+	if !known {
+		return leafForm{noTrue: true, noFalse: true}, nil
+	}
+	var pattern string
+	switch v := value.(type) {
+	case *string:
+		pattern = *v
+	case string:
+		pattern = v
+	default:
+		return leafForm{}, fmt.Errorf(
+			"%w: regex pattern must be a string, got %T",
+			ErrParameterType, value,
+		)
+	}
+	pred := Regex(s.spec(e.Path), pattern)
+	if e.Insensitive {
+		pred = IRegex(s.spec(e.Path), pattern)
 	}
 	return leafForm{pred: pred, guard: isString(s.spec(e.Path))}, nil
 }

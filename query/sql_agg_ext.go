@@ -44,7 +44,7 @@ func hasExtendedAggregate(tree *sqlast.SelectStmt) bool {
 	if tree == nil {
 		return false
 	}
-	if len(tree.GroupByScalars) > 0 {
+	if len(tree.GroupByScalarExprs()) > 0 {
 		return true
 	}
 	for i := range tree.Columns {
@@ -65,9 +65,10 @@ func prepareExtendedAggregateStatement(
 	correlation *lateralPrepareFrame,
 	parameterTypes []ParameterType,
 ) (*Statement, error) {
+	groupByScalars := tree.GroupByScalarExprs()
 	inputTree := *tree
 	inputTree.GroupBy = nil
-	inputTree.GroupByScalars = nil
+	inputTree.Extensions = nil
 	inputTree.Having = nil
 	inputTree.OrderBy = nil
 	inputTree.Limit = nil
@@ -76,7 +77,7 @@ func prepareExtendedAggregateStatement(
 	inputTree.Columns = nil
 
 	ext := &statementExtAgg{
-		grouped: len(tree.GroupBy) > 0 || len(tree.GroupByScalars) > 0,
+		grouped: len(tree.GroupBy) > 0 || len(groupByScalars) > 0,
 		limit:   tree.Limit,
 		offset:  tree.Offset,
 	}
@@ -91,7 +92,7 @@ func prepareExtendedAggregateStatement(
 		ext.groupCols = append(ext.groupCols, idx)
 	}
 	scalarGroupBase := len(tree.GroupBy)
-	for _, gscalar := range tree.GroupByScalars {
+	for _, gscalar := range groupByScalars {
 		idx := len(inputTree.Columns)
 		inputTree.Columns = append(inputTree.Columns, sqlast.ResultColumn{
 			Scalar: gscalar,
@@ -130,7 +131,7 @@ func prepareExtendedAggregateStatement(
 			spec.isGroupKey = true
 			spec.groupKeyIdx = -1
 			if col.Scalar != nil {
-				for gi, gscalar := range tree.GroupByScalars {
+				for gi, gscalar := range groupByScalars {
 					if sqlast.SameScalarExpr(col.Scalar, gscalar) {
 						spec.groupKeyIdx = scalarGroupBase + gi
 						spec.inputCol = ext.groupCols[scalarGroupBase+gi]

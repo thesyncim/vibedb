@@ -25,16 +25,17 @@ func prepareDistinctOnStatement(
 	correlation *lateralPrepareFrame,
 	parameterTypes []ParameterType,
 ) (*Statement, error) {
+	distinctOn := tree.DistinctOnPaths()
 	inputTree := *tree
-	inputTree.DistinctOn = nil
+	inputTree.Extensions = nil
 	inputTree.Distinct = false
 	inputTree.Limit = nil
 	inputTree.Offset = nil
 	inputTree.Columns = append([]sqlast.ResultColumn(nil), tree.Columns...)
 
 	visibleCount := len(tree.Columns)
-	onIndices := make([]int, len(tree.DistinctOn))
-	for i, onPath := range tree.DistinctOn {
+	onIndices := make([]int, len(distinctOn))
+	for i, onPath := range distinctOn {
 		found := -1
 		for ci := range tree.Columns {
 			c := &tree.Columns[ci]

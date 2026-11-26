@@ -441,10 +441,16 @@ func (p *Parser) parseScalarCondition(
 	if isRegexOp(p.tok.kind) {
 		return p.parseRegexTail(scalarCtx, left, pos)
 	}
-	if p.atKeyword(kwSimilar) || (p.atKeyword(kwNot) && p.peekKeyword(kwSimilar)) {
-		neg := p.acceptKeyword(kwNot)
+	if p.atKeyword(kwSimilar) {
 		p.advance() // SIMILAR
-		return p.parseSimilarToTail(scalarCtx, left, pos, neg)
+		return p.parseSimilarToTail(scalarCtx, left, pos, false)
+	}
+	if p.acceptKeyword(kwNot) {
+		if p.atKeyword(kwSimilar) {
+			p.advance() // SIMILAR
+			return p.parseSimilarToTail(scalarCtx, left, pos, true)
+		}
+		return nil, p.errHere("expected SIMILAR TO after NOT on a computed scalar expression")
 	}
 	op, ok := comparisonOp(p.tok.kind)
 	if !ok {
@@ -611,8 +617,7 @@ func (p *Parser) parseLeafTail(
 		return p.parseLikeTail(agg, path, pos, negated, insensitive)
 	case p.atKeyword(kwSimilar):
 		p.advance()
-		left := p.scalarFromColumn(ResultColumn{Agg: agg, Path: path, Pos: pos})
-		return p.parseSimilarToTail(scalarContextForPredicate(ctx), left, pos, negated)
+		return p.parsePathSimilarToTail(agg, path, pos, negated)
 	case negated:
 		// NOT ==> parses below beside @>; anything else after NOT is
 		// refused with the keyword list.
@@ -627,8 +632,7 @@ func (p *Parser) parseLeafTail(
 		return p.parseMatchTail(agg, path, pos, negated)
 	}
 	if isRegexOp(p.tok.kind) {
-		left := p.scalarFromColumn(ResultColumn{Agg: agg, Path: path, Pos: pos})
-		return p.parseRegexTail(scalarContextForPredicate(ctx), left, pos)
+		return p.parsePathRegexTail(ctx, agg, path, pos)
 	}
 	op, ok := comparisonOp(p.tok.kind)
 	if !ok {
@@ -876,14 +880,83 @@ func isRegexOp(k tokenKind) bool {
 	return k == tokRegexMatch || k == tokRegexIMatch || k == tokRegexNotMatch || k == tokRegexNotIMatch
 }
 
-func (p *Parser) peekKeyword(kw keyword) bool {
-	savedTok := p.tok
-	savedLx := p.lx
+// parsePathRegexTail lowers Path ~ / ~* / !~ / !~* Pattern into a first-class
+// ExprRegex node when Pattern is a string literal or placeholder so the query
+// engine compiles the regex once at prepare time with zero per-row allocation.
+// Computed RHS expressions fall back to the scalar REGEXP_LIKE path.
+func (p *Parser) parsePathRegexTail(ctx exprContext, agg AggKind, path *PathExpr, pos int) (*Expr, error) {
+	opKind := p.tok.kind
+	opPos := p.tok.pos
+	insensitive := opKind == tokRegexIMatch || opKind == tokRegexNotIMatch
+	negated := opKind == tokRegexNotMatch || opKind == tokRegexNotIMatch
 	p.advance()
-	match := p.atKeyword(kw)
-	p.tok = savedTok
-	p.lx = savedLx
-	return match
+	if agg == AggNone && (p.tok.kind == tokString || p.tok.kind == tokParam) {
+		value, err := p.parseOperand()
+		if err != nil {
+			return nil, err
+		}
+		if !scalarContinues(p.tok) {
+			e := p.exprs.one()
+			*e = Expr{
+				Kind: ExprRegex, Negated: negated, Insensitive: insensitive,
+				Column: -1, Path: path, Value: value, Pos: pos,
+			}
+			return e, nil
+		}
+		// Computed RHS starting with a string/param (e.g. w ~ '^' || prefix).
+		lit := p.newScalar(ScalarLiteral, value.Pos)
+		lit.Value = value
+		pattern, err := p.continueScalarExpression(lit, scalarContextForPredicate(ctx))
+		if err != nil {
+			return nil, err
+		}
+		left := p.scalarFromColumn(ResultColumn{Path: path, Pos: pos})
+		return p.buildRegexpLikePredicate(left, pattern, insensitive, negated, pos, opPos), nil
+	}
+	pattern, err := p.parseScalarExpression(scalarContextForPredicate(ctx))
+	if err != nil {
+		return nil, err
+	}
+	left := p.scalarFromColumn(ResultColumn{Agg: agg, Path: path, Pos: pos})
+	return p.buildRegexpLikePredicate(left, pattern, insensitive, negated, pos, opPos), nil
+}
+
+// parsePathSimilarToTail lowers Path [NOT] SIMILAR TO 'pat' [ESCAPE 'e'] into
+// a first-class ExprRegex node compiled once at prepare time.
+func (p *Parser) parsePathSimilarToTail(agg AggKind, path *PathExpr, pos int, negated bool) (*Expr, error) {
+	if agg != AggNone {
+		return nil, p.errHere("SIMILAR TO does not apply to an aggregate result")
+	}
+	if !tokenTextEqual(p.tok, "TO") {
+		return nil, p.errHere("expected TO after SIMILAR")
+	}
+	p.advance() // TO
+	patOp, err := p.parseOperand()
+	if err != nil {
+		return nil, err
+	}
+	if patOp.Kind != OperandString {
+		return nil, p.errAt(patOp.Pos, "SIMILAR TO pattern must be a string literal")
+	}
+	esc := ""
+	if p.atKeyword(kwEscape) {
+		p.advance()
+		escOp, err := p.parseOperand()
+		if err != nil {
+			return nil, err
+		}
+		if escOp.Kind != OperandString || len([]rune(escOp.Text)) > 1 {
+			return nil, p.errAt(escOp.Pos, "ESCAPE string must be empty or one character")
+		}
+		esc = escOp.Text
+	}
+	patOp.Text = similarToRegex(patOp.Text, esc)
+	e := p.exprs.one()
+	*e = Expr{
+		Kind: ExprRegex, Negated: negated,
+		Column: -1, Path: path, Value: patOp, Pos: pos,
+	}
+	return e, nil
 }
 
 func (p *Parser) parseRegexTail(scalarCtx scalarExprContext, left *ScalarExpr, pos int) (*Expr, error) {

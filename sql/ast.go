@@ -43,9 +43,8 @@ type SelectStmt struct {
 	// lowers the non-aggregate form to GROUP BY over the projection paths so the
 	// existing spill-aware grouping engine supplies equality and bounded memory.
 	Distinct bool
-	// DistinctOn holds PostgreSQL DISTINCT ON (path, ...) expressions.
-	DistinctOn []*PathExpr
-	// LockMode records an optional FOR UPDATE / FOR SHARE locking clause.
+	// LockMode, SkipLocked, and NoWait pack into Distinct's trailing padding
+	// bytes, adding zero bytes to SelectStmt.
 	LockMode   RowLockMode
 	SkipLocked bool
 	NoWait     bool
@@ -62,10 +61,6 @@ type SelectStmt struct {
 
 	// GroupBy holds the grouping keys, or nil.
 	GroupBy []*PathExpr
-
-	// GroupByScalars holds computed scalar GROUP BY expressions (e.g.
-	// GROUP BY COALESCE(n, 0)), or nil when all grouping keys are plain paths.
-	GroupByScalars []*ScalarExpr
 
 	// Having is the post-aggregation filter, or nil.
 	//
@@ -122,6 +117,34 @@ type SelectStmt struct {
 	// and query-expression tail. A consumer MUST branch on Set before lowering
 	// any ordinary fields. Ignoring it would execute only the first operand.
 	Set *SetExpression
+
+	// Extensions is the cold sidecar for optional PostgreSQL SELECT clauses
+	// (DISTINCT ON, computed GROUP BY scalar keys, etc.). It stays nil on
+	// ordinary queries so SelectStmt retains a compact fixed footprint.
+	Extensions *SelectExtensions
+}
+
+// SelectExtensions holds cold optional SELECT clauses that are absent from
+// ordinary queries. Owned by the Parser's reusable slab for zero warm allocs.
+type SelectExtensions struct {
+	DistinctOn     []*PathExpr
+	GroupByScalars []*ScalarExpr
+}
+
+// DistinctOnPaths returns the DISTINCT ON key paths, or nil when absent.
+func (s *SelectStmt) DistinctOnPaths() []*PathExpr {
+	if s == nil || s.Extensions == nil {
+		return nil
+	}
+	return s.Extensions.DistinctOn
+}
+
+// GroupByScalarExprs returns the computed scalar GROUP BY keys, or nil.
+func (s *SelectStmt) GroupByScalarExprs() []*ScalarExpr {
+	if s == nil || s.Extensions == nil {
+		return nil
+	}
+	return s.Extensions.GroupByScalars
 }
 
 // A WithClause owns the common table expressions declared for one SELECT. Its
@@ -746,6 +769,9 @@ const (
 	// or a placeholder; the query lowerer executes SQL's '%' and '_' pattern
 	// operators and the optional backslash escape.
 	ExprLike
+	// ExprRegex is Path ~ / ~* / !~ / !~* Value (and SIMILAR TO lowered to a
+	// full-string RE2 pattern). Compiled once at query prepare time.
+	ExprRegex
 	// ExprMatch is Path [NOT] ==> Value, full-text match. Value must be a
 	// string literal or a placeholder holding TINQL; the query lowerer
 	// resolves it against the collection's tin index for the path.
