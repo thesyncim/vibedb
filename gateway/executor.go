@@ -381,10 +381,7 @@ func (e *Executor) queryWithProfileValidation(
 				cache.planning = entry.planning
 			}
 		}
-		if useGlobalIndexRead(bound) {
-			if nativeAttempt != nil {
-				return nil, ErrReplicatedSQLPlanUnsupported
-			}
+		if nativeAttempt == nil && useGlobalIndexRead(bound) {
 			execution, indexErr := e.queryGlobalIndex(attemptContext, &q, bound, profile)
 			if indexErr == nil {
 				kind := execution.routeKind
@@ -425,6 +422,11 @@ func (e *Executor) queryWithProfileValidation(
 			return nil, indexErr
 		}
 		pl, err := e.routeContextCached(opctx, snap, &q, bound, profile, cache)
+		if err == nil && nativeAttempt != nil && pl.repartition {
+			releasePlan(pl)
+			pl = nil
+			err = ErrDistributedPlanUnsupported
+		}
 		if errors.Is(err, ErrDistributedPlanUnsupported) {
 			res, coordinatorErr := e.queryCoordinator(attemptContext, snap, q, prepared, profile, args)
 			if coordinatorErr == nil {
