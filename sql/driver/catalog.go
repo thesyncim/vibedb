@@ -69,6 +69,7 @@ type viewMeta struct {
 
 type tableMeta struct {
 	PrimaryKey                 string      `json:"primary_key"`
+	PrimaryKeys                []string    `json:"primary_keys,omitempty"`
 	Schema                     *schemaMeta `json:"schema,omitempty"`
 	Indexes                    []indexMeta `json:"indexes,omitempty"`
 	Storage                    string      `json:"storage,omitempty"`
@@ -106,6 +107,7 @@ type table struct {
 	meta       *tableMeta
 	schema     *store.Schema
 	primary    vibejson.CompiledPointer
+	primaries  []vibejson.CompiledPointer
 	file       *os.File
 	collection *durable.Collection
 	conflicts  txConflictClock
@@ -603,6 +605,17 @@ func openDatabaseWithShardStorePolicy(
 				"vibedb: SQL catalog table %q primary key %q: %w",
 				name, meta.PrimaryKey, primaryErr)
 		}
+		var primaries []vibejson.CompiledPointer
+		if len(meta.PrimaryKeys) > 1 {
+			primaries = make([]vibejson.CompiledPointer, len(meta.PrimaryKeys))
+			for i, pkPtr := range meta.PrimaryKeys {
+				cp, cpErr := vibejson.CompilePointer(pkPtr)
+				if cpErr != nil || len(cp.Tokens) == 0 {
+					return nil, fmt.Errorf("vibedb: SQL catalog table %q primary key %q: %v", name, pkPtr, cpErr)
+				}
+				primaries[i] = cp
+			}
+		}
 		schema, schemaErr := compileSchemaMeta(meta.Schema)
 		if schemaErr != nil {
 			return nil, fmt.Errorf("vibedb: SQL catalog table %q schema: %w", name, schemaErr)
@@ -619,7 +632,7 @@ func openDatabaseWithShardStorePolicy(
 				return nil, fmt.Errorf("vibedb: SQL catalog table %q index %q: %w", name, index.Name, indexErr)
 			}
 		}
-		t := &table{meta: meta, schema: schema, primary: primary}
+		t := &table{meta: meta, schema: schema, primary: primary, primaries: primaries}
 		if optionsErr := durable.ValidateOptions(durableOptions(t)); optionsErr != nil {
 			return nil, fmt.Errorf(
 				"vibedb: SQL catalog table %q durable definition: %w",

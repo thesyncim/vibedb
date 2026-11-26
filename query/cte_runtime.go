@@ -758,6 +758,9 @@ func (s *Statement) resolveRelationColumnAt(source int, name string) (int, error
 		}
 	}
 	if matches != 1 {
+		if matches == 0 && len(binding.names) == 1 && (binding.names[0] == "*" || binding.names[0] == "$doc") {
+			return 0, nil
+		}
 		return -1, &RelationColumnError{
 			Relation: s.tree.From[source].Alias,
 			Column:   name,

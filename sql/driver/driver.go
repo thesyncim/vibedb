@@ -610,6 +610,11 @@ func (c *conn) prepareContextMode(
 	if isSavepointKind(tree.Kind) {
 		return s, nil
 	}
+	if tree.Kind == sqlast.KindSelect && hasMutationCTE(tree.Select) {
+		s.text = strings.Clone(src)
+		s.mutationCTE = true
+		return s, nil
+	}
 	if err := c.validateViewStatementContext(ctx, src, tree); err != nil {
 		return nil, err
 	}
@@ -665,7 +670,7 @@ func (c *conn) prepareContextMode(
 				} else {
 					t = c.db.tables[s.query.Collection()]
 				}
-				if t != nil {
+				if t != nil && len(t.primaries) <= 1 {
 					drivingPredicate := s.query.DrivingPredicate()
 					s.primaryRange = compilePrimaryRangeProgram(
 						drivingPredicate, t.meta.PrimaryKey,

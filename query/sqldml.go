@@ -145,9 +145,10 @@ func (k DMLKind) String() string {
 // [Statement] is: it holds the filter statement whose compiler is rewound on
 // every bind. A connection pool gives each connection its own.
 type DMLStatement struct {
-	text string
-	kind DMLKind
-	tree *sqlast.Statement
+	text       string
+	kind       DMLKind
+	tree       *sqlast.Statement
+	joinFilter *Statement
 
 	// filter is the SELECT this statement's row selection is, or nil when the
 	// statement needs no predicate evaluation — an INSERT, a DELETE with no
@@ -334,18 +335,30 @@ func PrepareParsedDMLWithParameterTypes(
 		}
 	case sqlast.KindUpdate:
 		d.kind = DMLUpdate
-		if err := d.prepareFilter(
-			src, tree.Update.Filter, false, parameterTypes,
-		); err != nil {
-			return nil, err
-		}
-		if err := d.prepareUpdateExpressions(src, parameterTypes); err != nil {
-			d.Release()
-			return nil, err
+		if tree.Update.Filter != nil && len(tree.Update.Filter.From) > 1 {
+			if err := d.prepareUpdateFromJoin(src, tree.Update, parameterTypes); err != nil {
+				d.Release()
+				return nil, err
+			}
+		} else {
+			if err := d.prepareFilter(
+				src, tree.Update.Filter, false, parameterTypes,
+			); err != nil {
+				return nil, err
+			}
+			if err := d.prepareUpdateExpressions(src, parameterTypes); err != nil {
+				d.Release()
+				return nil, err
+			}
 		}
 	case sqlast.KindDelete:
 		d.kind = DMLDelete
-		if err := d.prepareFilter(
+		if tree.Delete.Filter != nil && len(tree.Delete.Filter.From) > 1 {
+			if err := d.prepareDeleteUsingJoin(src, tree.Delete, parameterTypes); err != nil {
+				d.Release()
+				return nil, err
+			}
+		} else if err := d.prepareFilter(
 			src, tree.Delete.Filter, tree.Delete.All, parameterTypes,
 		); err != nil {
 			return nil, err
@@ -424,6 +437,69 @@ func (d *DMLStatement) prepareFilter(
 		return err
 	}
 	d.filter = filter
+	return nil
+}
+
+// JoinFilter returns the compiled multi-table SELECT statement for UPDATE ... FROM
+// or DELETE ... USING, or nil for single-table mutations.
+func (d *DMLStatement) JoinFilter() *Statement {
+	if d == nil {
+		return nil
+	}
+	return d.joinFilter
+}
+
+func (d *DMLStatement) prepareDeleteUsingJoin(
+	src string,
+	del *sqlast.DeleteStmt,
+	parameterTypes []ParameterType,
+) error {
+	proj := *del.Filter
+	proj.Columns = []sqlast.ResultColumn{{
+		Path: &sqlast.PathExpr{Source: 0, Pos: del.Pos},
+		Pos:  del.Pos,
+	}}
+	stmt, err := prepareTreeWithParameterTypes(src, &proj, parameterTypes)
+	if err != nil {
+		return err
+	}
+	d.joinFilter = stmt
+	return nil
+}
+
+func (d *DMLStatement) prepareUpdateFromJoin(
+	src string,
+	upd *sqlast.UpdateStmt,
+	parameterTypes []ParameterType,
+) error {
+	proj := *upd.Filter
+	cols := make([]sqlast.ResultColumn, 0, 1+len(upd.Assignments))
+	cols = append(cols, sqlast.ResultColumn{
+		Path: &sqlast.PathExpr{Source: 0, Pos: upd.Pos},
+		Pos:  upd.Pos,
+	})
+	for i := range upd.Assignments {
+		a := &upd.Assignments[i]
+		if a.Expr != nil {
+			cols = append(cols, sqlast.ResultColumn{Scalar: a.Expr, Pos: a.Pos})
+		} else if a.Value.Kind == sqlast.OperandNull {
+			cols = append(cols, sqlast.ResultColumn{
+				Scalar: &sqlast.ScalarExpr{Kind: sqlast.ScalarNull, Pos: a.Pos},
+				Pos:    a.Pos,
+			})
+		} else {
+			cols = append(cols, sqlast.ResultColumn{
+				Scalar: &sqlast.ScalarExpr{Kind: sqlast.ScalarLiteral, Value: a.Value, Pos: a.Pos},
+				Pos:    a.Pos,
+			})
+		}
+	}
+	proj.Columns = cols
+	stmt, err := prepareTreeWithParameterTypes(src, &proj, parameterTypes)
+	if err != nil {
+		return err
+	}
+	d.joinFilter = stmt
 	return nil
 }
 
@@ -1189,6 +1265,7 @@ func (d *DMLStatement) Release() {
 		return
 	}
 	d.filter.Release()
+	d.joinFilter.Release()
 	d.source.Release()
 	if d.assignmentExpressions != nil {
 		d.assignmentExpressions.statement.Release()

@@ -53,11 +53,57 @@ func (p *Parser) parseWithClause() error {
 			return err
 		}
 		switch {
-		case p.atKeyword(kwInsert), p.atKeyword(kwUpdate), p.atKeyword(kwDelete), p.atKeyword(kwMerge):
+		case p.atKeyword(kwMerge):
 			return newFeatureNotSupportedError(
 				p.lx.src, p.tok.pos,
-				"data-modifying common table expression bodies are not supported; use a SELECT body",
+				"MERGE in a common table expression body is not supported",
 			)
+		case p.atKeyword(kwInsert), p.atKeyword(kwUpdate), p.atKeyword(kwDelete):
+			bodyStart := p.tok.pos
+			bodyEnd, err := p.skipBalancedParenBody()
+			if err != nil {
+				return err
+			}
+			bodySQL := p.lx.src[bodyStart:bodyEnd]
+			var sub Parser
+			var dml Statement
+			if err := sub.ParseStatement(&dml, bodySQL); err != nil {
+				return err
+			}
+			var retStmt *SelectStmt
+			switch dml.Kind {
+			case KindInsert:
+				retStmt = dml.Insert.Returning
+			case KindUpdate:
+				retStmt = dml.Update.Returning
+			case KindDelete:
+				retStmt = dml.Delete.Returning
+			}
+			stub := &SelectStmt{}
+			if retStmt != nil {
+				stub.Columns = append([]ResultColumn(nil), retStmt.Columns...)
+			}
+			columnPositions := p.ints.allocDirty(len(aliasPos))
+			copy(columnPositions, aliasPos)
+			p.cteScratch = append(p.cteScratch, CommonTableExpr{
+				Name: name, Columns: columns, ColumnPos: columnPositions,
+				Query:           stub,
+				MutationSQL:     bodySQL,
+				MutationStart:   bodyStart,
+				MutationEnd:     bodyEnd,
+				Materialization: materialization,
+				Pos:             namePos, HintPos: hintPos,
+			})
+			if len(p.cteScratch) > maxClauseItems {
+				return p.errfAt(namePos,
+					"a WITH clause may hold at most %d common table expressions", maxClauseItems)
+			}
+			p.activeCTEs.defs = p.cteScratch
+			if p.tok.kind != tokComma {
+				goto withDone
+			}
+			p.advance()
+			continue
 		case !p.atKeyword(kwSelect) && !p.atKeyword(kwWith) && p.tok.kind != tokLParen:
 			return p.errHere("expected SELECT, WITH ... SELECT, or a parenthesized query expression in a common table expression body")
 		}
@@ -114,6 +160,7 @@ func (p *Parser) parseWithClause() error {
 		}
 		p.advance()
 	}
+withDone:
 
 	definitions := p.ctes.allocDirty(len(p.cteScratch))
 	copy(definitions, p.cteScratch)
@@ -150,6 +197,30 @@ func cteOutputArityKnown(query *SelectStmt) bool {
 		}
 	}
 	return true
+}
+
+// skipBalancedParenBody advances past the tokens of a parenthesized DML CTE
+// body until the matching ')' is consumed, returning the byte offset of ')'.
+func (p *Parser) skipBalancedParenBody() (int, error) {
+	depth := 1
+	for {
+		switch p.tok.kind {
+		case tokEOF:
+			return 0, p.errHere("unclosed '(' in common table expression body")
+		case tokError:
+			return 0, p.errHere(p.tok.text)
+		case tokLParen:
+			depth++
+		case tokRParen:
+			depth--
+			if depth == 0 {
+				endPos := p.tok.pos
+				p.advance() // consume ')'
+				return endPos, nil
+			}
+		}
+		p.advance()
+	}
 }
 
 func (p *Parser) parseCTEName() (string, int, error) {

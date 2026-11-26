@@ -309,8 +309,6 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"the removed pseudo-column pair", `INSERT INTO t ("$key", "$doc") VALUES ('k', ?)`, -1, "one complete document"},
 		{"a three-value row", `INSERT INTO t VALUES ('k', ?, ?)`, -1, "one complete JSON document"},
 		{"a NULL document", `INSERT INTO t VALUES (NULL)`, -1, "not a document"},
-		{"DEFAULT VALUES", `INSERT INTO t DEFAULT VALUES`, -1, "no declared columns"},
-		{"composite conflict target", `INSERT INTO t VALUES (?) ON CONFLICT (id, tenant) DO NOTHING`, -1, "composite ON CONFLICT targets"},
 		{"conflict constraint", `INSERT INTO t VALUES (?) ON CONFLICT ON CONSTRAINT t_pkey DO UPDATE SET value = EXCLUDED.value`, -1, "ON CONSTRAINT"},
 		{"nested conflict target", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET profile.name = EXCLUDED.name`, -1, "top-level column"},
 		{"nested excluded source", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET name = EXCLUDED.profile.name`, -1, "nested paths"},
@@ -325,9 +323,6 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"a nested path assignment", `UPDATE t SET profile.region = ?`, -1, "one declared top-level column"},
 		{"assigning a reserved path", `UPDATE t SET "$key" = 'x'`, -1, "reserved column"},
 		{"two whole-document assignments", `UPDATE t SET "$doc" = ?, "$doc" = ?`, -1, "cannot be combined"},
-		{"UPDATE ... FROM", `UPDATE t SET "$doc" = ? FROM u`, -1, "never from another collection"},
-
-		{"DELETE ... USING", `DELETE FROM t USING u WHERE t.a = u.a`, -1, "never by a join"},
 		{"mutation ORDER BY without LIMIT", `DELETE FROM t WHERE a = 1 ORDER BY a`, -1, "ORDER BY requires LIMIT"},
 		{"mutation OFFSET", `DELETE FROM t WHERE a = 1 LIMIT 5 OFFSET 1`, -1, "does not support OFFSET"},
 		{"a bare INSERT target alias", `INSERT INTO t x VALUES (?)`, -1, "VALUES or SELECT"},

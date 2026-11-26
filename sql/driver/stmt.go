@@ -35,6 +35,7 @@ type stmt struct {
 	serialPointSafe    bool
 	serialMutationSafe bool
 	catalogJoin        bool
+	mutationCTE        bool
 	params             int
 	paramKinds         []ParamKind
 	// paramTypes is absent for the ordinary schemaless path. It is allocated
@@ -236,6 +237,13 @@ func (s *stmt) Query(values []sqldriver.Value) (sqldriver.Rows, error) {
 	if s.closed {
 		return nil, errors.New("vibedb: statement is closed")
 	}
+	if s.mutationCTE {
+		named := make([]sqldriver.NamedValue, len(values))
+		for i, v := range values {
+			named[i] = sqldriver.NamedValue{Ordinal: i + 1, Value: v}
+		}
+		return s.conn.queryMutationCTE(backgroundContext, s.text, s.tree.Select, named)
+	}
 	if s.query == nil {
 		return nil, fmt.Errorf("vibedb: %s returns no rows; use Exec", s.tree.Kind)
 	}
@@ -258,6 +266,9 @@ func (s *stmt) QueryContext(
 ) (rowset sqldriver.Rows, err error) {
 	if s.closed {
 		return nil, errors.New("vibedb: statement is closed")
+	}
+	if s.mutationCTE {
+		return s.conn.queryMutationCTE(ctx, s.text, s.tree.Select, values)
 	}
 	if s.query == nil {
 		return nil, fmt.Errorf("vibedb: %s returns no rows; use Exec", s.tree.Kind)

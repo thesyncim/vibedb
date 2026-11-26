@@ -254,7 +254,17 @@ func (p *Parser) parseInsert() error {
 			return err
 		}
 	case p.atKeyword(kwDefault):
-		return p.errHere("INSERT ... DEFAULT VALUES is not supported: a schemaless document has no declared columns and therefore no defaults")
+		defPos := p.tok.pos
+		p.advance() // DEFAULT
+		if err := p.expectKeyword(kwValues, "VALUES after DEFAULT"); err != nil {
+			return err
+		}
+		val := p.ops.allocDirty(1)
+		val[0] = Operand{Kind: OperandJSON, Text: "{}", Pos: defPos}
+		rows := p.rows[:0]
+		rows = append(rows, InsertRow{Values: val, Pos: defPos})
+		p.rows = rows
+		p.ins.Rows = rows
 	default:
 		if err := p.expectKeyword(kwValues, "VALUES or SELECT"); err != nil {
 			return err
@@ -292,13 +302,20 @@ func (p *Parser) parseInsert() error {
 			if len(path.Segments) != 1 || path.Segments[0].IsIndex {
 				return p.featureNotSupportedHere("ON CONFLICT targets must name one unqualified primary-key column")
 			}
-			if p.tok.kind == tokComma {
-				return p.featureNotSupportedHere("composite ON CONFLICT targets require composite primary-key support")
+			targets := []*PathExpr{path}
+			for p.tok.kind == tokComma {
+				p.advance()
+				nextPath, err := p.parsePath(false)
+				if err != nil {
+					return err
+				}
+				targets = append(targets, nextPath)
 			}
 			if err := p.expect(tokRParen, "')' after ON CONFLICT target"); err != nil {
 				return err
 			}
 			p.ins.ConflictTarget = path
+			p.ins.ConflictTargets = targets
 		}
 		if p.atKeyword(kwOn) {
 			return p.featureNotSupportedHere("ON CONFLICT ON CONSTRAINT is not supported; the document-derived primary key is the only conflict target")
@@ -461,6 +478,7 @@ func (p *Parser) parseConflictAssignment() (
 		)
 	}
 	column := path.Segments[0].Key
+	p.pending = p.pending[:lhsPendingBase]
 	if column == DocumentColumn || column == "$key" {
 		return Operand{}, false, UpdateAssignment{}, p.errfAt(
 			path.Pos, "ON CONFLICT SET %s = ... names a reserved column", path.Spec(),
@@ -1133,8 +1151,10 @@ func (p *Parser) parseUpdate() error {
 		}
 		p.upd.Assignments = p.updateAssignments
 	}
-	if p.atKeyword(kwFrom) {
-		return p.errHere("UPDATE ... FROM is not supported: the value written comes from the statement, never from another collection")
+	if p.acceptKeyword(kwFrom) {
+		if err := p.parseDMLJoinTables(); err != nil {
+			return err
+		}
 	}
 	if err := p.parseDMLWhere("UPDATE", name, alias); err != nil {
 		return err
@@ -1181,6 +1201,7 @@ func (p *Parser) parseAssignment() (Operand, bool, UpdateAssignment, error) {
 		return Operand{}, false, UpdateAssignment{}, p.errfAt(path.Pos, "SET %s = ... must name one declared top-level column", path.Spec())
 	}
 	column := path.Segments[0].Key
+	p.pending = p.pending[:lhsPendingBase]
 	if column == DocumentColumn || column == "$key" {
 		return Operand{}, false, UpdateAssignment{}, p.errfAt(path.Pos, "SET %s = ... names a reserved column", path.Spec())
 	}
@@ -1231,8 +1252,10 @@ func (p *Parser) parseDelete() error {
 	}
 	p.setHiddenMutationTarget(name, alias)
 	p.beginMutationFilter(name, alias, pos)
-	if p.atKeyword(kwUsing) {
-		return p.errHere("DELETE ... USING is not supported: the rows to delete are chosen by a condition on the collection itself, never by a join")
+	if p.acceptKeyword(kwUsing) {
+		if err := p.parseDMLJoinTables(); err != nil {
+			return err
+		}
 	}
 	whereAt := p.tok.pos
 	if err := p.parseDMLWhere("DELETE", name, alias); err != nil {
@@ -1288,6 +1311,29 @@ func (p *Parser) saveFilter() {
 	p.out.From = p.filterFrom
 	p.out.GroupBy = p.filterGroupBy
 	p.out.OrderBy = p.filterOrderBy
+}
+
+// parseDMLJoinTables parses the comma-separated relation list after UPDATE ... FROM
+// or DELETE ... USING, attaching each additional relation as a CROSS JOIN on the
+// synthetic mutation filter SELECT so path resolution and join execution are shared.
+func (p *Parser) parseDMLJoinTables() error {
+	for {
+		ref, err := p.parseTableRef(JoinCross)
+		if err != nil {
+			return err
+		}
+		for i := range p.from {
+			if p.from[i].Alias == ref.Alias {
+				return p.errfAt(ref.Pos, "table name %q specified more than once", ref.Alias)
+			}
+		}
+		p.from = append(p.from, ref)
+		p.out.From = p.from
+		if p.tok.kind != tokComma {
+			return nil
+		}
+		p.advance()
+	}
 }
 
 // parseMutationReturning parses the projection over documents selected by an

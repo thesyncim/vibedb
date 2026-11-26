@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	sqldriver "database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -445,23 +446,31 @@ func (d *database) createTableLockedContext(
 		return nil, fmt.Errorf("vibedb: CREATE TABLE %q: %w",
 			definition.Name, err)
 	}
-	if len(definition.PrimaryKey) != 1 {
-		return nil, fmt.Errorf("vibedb: CREATE TABLE requires exactly one PRIMARY KEY JSON path")
+	if len(definition.PrimaryKey) == 0 || len(definition.PrimaryKey) > 4 {
+		return nil, fmt.Errorf("vibedb: CREATE TABLE requires between 1 and 4 PRIMARY KEY JSON paths")
 	}
-	path := statement.Tree().CreateTable.PrimaryKey[0]
-	pointer := string(path.AppendPointer(nil))
+	pkPaths := statement.Tree().CreateTable.PrimaryKey
+	pointers := make([]string, len(pkPaths))
+	primaries := make([]vibejson.CompiledPointer, len(pkPaths))
+	for i, path := range pkPaths {
+		ptr := string(path.AppendPointer(nil))
+		pointers[i] = ptr
+		compiled, cpErr := vibejson.CompilePointer(ptr)
+		if cpErr != nil {
+			return nil, fmt.Errorf("vibedb: compile primary-key path %q: %w", ptr, cpErr)
+		}
+		primaries[i] = compiled
+		if err := validatePrimarySchema(ptr, definition.Schema); err != nil {
+			return nil, fmt.Errorf(
+				"vibedb: CREATE TABLE %q primary key: %w",
+				definition.Name, err,
+			)
+		}
+	}
+	pointer := pointers[0]
+	primary := primaries[0]
 	if err := d.cluster.validatePlacementLocality(definition.Name, pointer); err != nil {
 		return nil, err
-	}
-	primary, err := vibejson.CompilePointer(pointer)
-	if err != nil {
-		return nil, fmt.Errorf("vibedb: compile primary-key path %q: %w", pointer, err)
-	}
-	if err := validatePrimarySchema(pointer, definition.Schema); err != nil {
-		return nil, fmt.Errorf(
-			"vibedb: CREATE TABLE %q primary key: %w",
-			definition.Name, err,
-		)
 	}
 	storage, err := d.newStorageIdentityLocked()
 	if err != nil {
@@ -496,14 +505,21 @@ func (d *database) createTableLockedContext(
 			addUnique(paths)
 		}
 	}
+	var primaryKeysMeta []string
+	var tablePrimaries []vibejson.CompiledPointer
+	if len(pointers) > 1 {
+		primaryKeysMeta = pointers
+		tablePrimaries = primaries
+	}
 	meta := &tableMeta{
-		PrimaryKey: pointer,
-		Schema:     schemaMetaFrom(definition.Schema),
-		Indexes:    uniqueIndexes,
-		Storage:    storage,
+		PrimaryKey:  pointer,
+		PrimaryKeys: primaryKeysMeta,
+		Schema:      schemaMetaFrom(definition.Schema),
+		Indexes:     uniqueIndexes,
+		Storage:     storage,
 	}
 	candidate := &table{
-		meta: meta, schema: definition.Schema, primary: primary,
+		meta: meta, schema: definition.Schema, primary: primary, primaries: tablePrimaries,
 	}
 	if err := durable.ValidateOptions(durableOptions(candidate)); err != nil {
 		return nil, fmt.Errorf(
@@ -999,6 +1015,9 @@ func (c *conn) insertLocked(
 			statement, tree, &tree.Rows[i], args,
 			t.meta.PrimaryKey, t.primary, limits,
 		)
+		if err == nil && len(t.primaries) > 1 {
+			key, err = tableDocumentKey(t, document, limits.MaxKeyBytes)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1095,10 +1114,7 @@ func (c *conn) insertLocked(
 				); err != nil {
 					return nil, err
 				}
-				finalKey, err := documentKey(
-					finalDocument, t.meta.PrimaryKey, t.primary,
-					limits.MaxKeyBytes,
-				)
+				finalKey, err := tableDocumentKey(t, finalDocument, limits.MaxKeyBytes)
 				if err != nil {
 					return nil, err
 				}
@@ -1287,9 +1303,8 @@ func (c *conn) insertSelectLocked(
 		keyStart := len(c.insertKeyRaw)
 		var key string
 		var keyCharge int64
-		c.insertKeyRaw, key, keyCharge, err = appendDocumentKeyBudgeted(
-			c.insertKeyRaw, document, t.meta.PrimaryKey,
-			t.primary, limits.MaxKeyBytes, &intermediate,
+		c.insertKeyRaw, key, keyCharge, err = appendTableDocumentKeyBudgeted(
+			c.insertKeyRaw, document, t, limits.MaxKeyBytes, &intermediate,
 		)
 		if err != nil {
 			c.pointRaw = conflictScratch
@@ -2162,6 +2177,43 @@ func operandValueWithUTF8(
 	return nil, errors.New("vibedb: flat INSERT values must be JSON scalars or placeholders")
 }
 
+func tableDocumentKey(t *table, document []byte, maxKeyBytes int) (string, error) {
+	if len(t.primaries) <= 1 {
+		return documentKey(document, t.meta.PrimaryKey, t.primary, maxKeyBytes)
+	}
+	var buf []byte
+	for i, cp := range t.primaries {
+		part, err := documentKey(document, t.meta.PrimaryKeys[i], cp, maxKeyBytes)
+		if err != nil {
+			return "", err
+		}
+		if len(buf)+len(part) > maxKeyBytes {
+			return "", durable.ErrKeyTooLarge
+		}
+		buf = append(buf, part...)
+	}
+	return string(buf), nil
+}
+
+func appendTableDocumentKeyBudgeted(
+	dst []byte,
+	document []byte,
+	t *table,
+	maxKeyBytes int,
+	budget *insertSelectIntermediateBudget,
+) ([]byte, string, int64, error) {
+	if len(t.primaries) <= 1 {
+		return appendDocumentKeyBudgeted(dst, document, t.meta.PrimaryKey, t.primary, maxKeyBytes, budget)
+	}
+	key, err := tableDocumentKey(t, document, maxKeyBytes)
+	if err != nil {
+		return dst, "", 0, err
+	}
+	start := len(dst)
+	dst = append(dst, key...)
+	return dst, string(dst[start:]), int64(len(key)), nil
+}
+
 func documentKey(
 	document []byte,
 	pointer string,
@@ -2475,9 +2527,7 @@ func (c *conn) updateLockedReturning(
 	if err != nil {
 		return nil, err
 	}
-	newKey, err := documentKey(
-		document, t.meta.PrimaryKey, t.primary, limits.MaxKeyBytes,
-	)
+	newKey, err := tableDocumentKey(t, document, limits.MaxKeyBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -2583,6 +2633,9 @@ func (c *conn) updateColumnsLockedReturning(
 	// additionally proves that the assignment did not move its shard key.
 	if err := c.routeDelete(statement, args); err != nil {
 		return nil, err
+	}
+	if jf := statement.JoinFilter(); jf != nil {
+		return c.updateFromJoinLockedReturning(ctx, statement, jf, args, t, assignments, limits, returning, returned)
 	}
 	keys, err := c.matchingKeysLocked(
 		ctx, statement, args, t, limits, 0,
@@ -2733,7 +2786,12 @@ func (c *conn) deleteLockedReturning(
 	if err := c.routeDelete(statement, args); err != nil {
 		return nil, err
 	}
-	keys, err := c.matchingKeysLocked(ctx, statement, args, t, limits, 0)
+	var keys []string
+	if jf := statement.JoinFilter(); jf != nil {
+		keys, err = c.matchingJoinKeysLocked(ctx, statement.Tree().Delete.Filter, jf, args, t, limits)
+	} else {
+		keys, err = c.matchingKeysLocked(ctx, statement, args, t, limits, 0)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -2820,6 +2878,176 @@ func (c *conn) loadReturningDocuments(t *table, keys []string) error {
 	return nil
 }
 
+func (c *conn) runJoinFilterLocked(
+	ctx context.Context,
+	filterTree *sqlast.SelectStmt,
+	jf *query.Statement,
+	args []any,
+) (query.Cursor, error) {
+	deps := make([]physicalDependency, 0, len(filterTree.From))
+	for _, ref := range filterTree.From {
+		if ref.Kind == sqlast.RelationCollection {
+			deps = append(deps, physicalDependency{name: ref.Name, pos: ref.Pos})
+		}
+	}
+	clear(c.joinCatalog)
+	collections := c.joinCatalog[:0]
+	for _, dep := range deps {
+		tbl := c.db.tables[dep.name]
+		if tbl == nil {
+			c.releaseJoinCatalog(collections)
+			return query.Cursor{}, missingTableDependency(dep.name, dep.pos, false)
+		}
+		collections = append(collections, durable.NamedCollection{
+			Name: dep.name, Collection: tbl.collection,
+		})
+	}
+	if err := durable.SnapshotCollectionsIntoContext(ctx, &c.joinSnapshot, collections); err != nil {
+		c.releaseJoinCatalog(collections)
+		return query.Cursor{}, err
+	}
+	c.releaseJoinCatalog(collections)
+	var (
+		cursor query.Cursor
+		err    error
+	)
+	if jf.UsesDirectCatalogExecution() {
+		cursor, err = jf.RunInto(&c.exec, query.FromFileDatabase(c.joinSnapshot, jf.Collection()), args)
+	} else {
+		var src query.Source
+		src, err = c.materializeDurableJoinSource(ctx, &c.joinSnapshot, jf.Collection(), deps)
+		if err == nil {
+			cursor, err = jf.RunInto(&c.exec, src, args)
+		}
+	}
+	closeErr := c.joinSnapshot.Close()
+	if err != nil || closeErr != nil {
+		return query.Cursor{}, errors.Join(err, closeErr)
+	}
+	return cursor, nil
+}
+
+func (c *conn) matchingJoinKeysLocked(
+	ctx context.Context,
+	filterTree *sqlast.SelectStmt,
+	jf *query.Statement,
+	args []any,
+	t *table,
+	limits durable.Options,
+) ([]string, error) {
+	cursor, err := c.runJoinFilterLocked(ctx, filterTree, jf, args)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	var keys []string
+	for cursor.Next() {
+		doc := cursor.Cell(0).Payload()
+		key, err := tableDocumentKey(t, doc, limits.MaxKeyBytes)
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	return keys, nil
+}
+
+func (c *conn) updateFromJoinLockedReturning(
+	ctx context.Context,
+	statement *query.DMLStatement,
+	jf *query.Statement,
+	args []any,
+	t *table,
+	assignments []sqlast.UpdateAssignment,
+	limits durable.Options,
+	returning *query.Statement,
+	returned *query.Cursor,
+) (sqldriver.Result, error) {
+	cursor, err := c.runJoinFilterLocked(ctx, statement.Tree().Update.Filter, jf, args)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	var seeds []seedDocument
+	var keys []string
+	for cursor.Next() {
+		oldDoc := cursor.Cell(0).Payload()
+		key, err := tableDocumentKey(t, oldDoc, limits.MaxKeyBytes)
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		var docMap map[string]json.RawMessage
+		if err := json.Unmarshal(oldDoc, &docMap); err != nil {
+			return nil, err
+		}
+		for i, a := range assignments {
+			cell := cursor.Cell(1 + i)
+			val := cell.JSON()
+			if cell.IsNull() || len(val) == 0 {
+				val = []byte("null")
+			}
+			docMap[a.Column] = json.RawMessage(append([]byte(nil), val...))
+		}
+		patched, err := json.Marshal(docMap)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateDocument(t.schema, patched, limits.MaxDocumentBytes, &c.insertTape); err != nil {
+			return nil, err
+		}
+		newKey, err := tableDocumentKey(t, patched, limits.MaxKeyBytes)
+		if err != nil {
+			return nil, err
+		}
+		if newKey != key {
+			return nil, fmt.Errorf("%w: replacement key %q does not match selected key %q", ErrUpdatePrimaryKey, newKey, key)
+		}
+		keys = append(keys, key)
+		seeds = append(seeds, seedDocument{key: key, document: patched})
+	}
+	if tableHasUniqueIndexes(t) && len(seeds) > 0 {
+		if err := validateTableUniquePostimages(ctx, t, seeds, keys); err != nil {
+			return nil, err
+		}
+	}
+	if returning != nil {
+		if returned == nil {
+			return nil, errors.New("vibedb: internal RETURNING cursor is nil")
+		}
+		c.pointDocs.Reset()
+		for _, sd := range seeds {
+			if _, err := c.pointDocs.Append(sd.document); err != nil {
+				return nil, err
+			}
+		}
+		retCur, err := returning.RunInto(&c.exec, query.FromSegment(&c.pointDocs), nil)
+		if err != nil {
+			return nil, err
+		}
+		*returned = retCur
+	}
+	if t.collection == nil || len(seeds) == 0 {
+		return result{affected: int64(len(seeds))}, nil
+	}
+	beforeGeneration := t.collection.Generation()
+	mutationErr := putSeedsAtomic(t.collection, seeds)
+	if collectionMutationPublished(t.collection, beforeGeneration, mutationErr) {
+		t.conflicts.recordSeeds(seeds)
+	}
+	if mutationErr != nil {
+		return nil, mutationErr
+	}
+	return result{affected: int64(len(seeds))}, nil
+}
+
 func (c *conn) matchingKeysLocked(
 	ctx context.Context,
 	statement *query.DMLStatement,
@@ -2854,10 +3082,14 @@ func (c *conn) matchingKeysLocked(
 			where = statement.Tree().Delete.Filter.Where
 		}
 	}
-	keys, point, err := primaryPredicateKeys(
-		where, t.meta.PrimaryKey, args, c.pointKeys,
-		limits.MaxKeyBytes)
-	c.pointKeys = keys
+	var keys []string
+	var point bool
+	if len(t.primaries) <= 1 {
+		keys, point, err = primaryPredicateKeys(
+			where, t.meta.PrimaryKey, args, c.pointKeys,
+			limits.MaxKeyBytes)
+		c.pointKeys = keys
+	}
 	if point || err != nil {
 		if err != nil {
 			return nil, err

@@ -440,7 +440,11 @@ func (s *Statement) renderDerived(path *sqlast.PathExpr, local bool) string {
 	}
 	start := len(s.specBuf)
 	s.specBuf = append(s.specBuf, binding.ordinalSpec[ordinal]...)
-	for _, segment := range path.Segments[1:] {
+	segStart := 1
+	if len(binding.names) == 1 && (binding.names[0] == "*" || binding.names[0] == "$doc") && path.Segments[0].Key != binding.names[0] {
+		segStart = 0
+	}
+	for _, segment := range path.Segments[segStart:] {
 		s.specBuf = append(s.specBuf, '/')
 		if segment.IsIndex {
 			s.specBuf = strconv.AppendInt(s.specBuf, int64(segment.Index), 10)
