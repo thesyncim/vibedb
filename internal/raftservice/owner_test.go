@@ -487,8 +487,8 @@ func TestPointReadResponseBudgetSaturatesAcrossLiveGrowthBoundaryLeases(t *testi
 		nextLease.Release()
 	}
 	<-authorized
-	if owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 {
-		t.Fatalf("pending reads=%d bytes=%d", owner.pendingReadItems, owner.pendingReadBytes)
+	if owner.pendingReadItems.Load() != 0 || owner.pendingReadBytes.Load() != 0 {
+		t.Fatalf("pending reads=%d bytes=%d", owner.pendingReadItems.Load(), owner.pendingReadBytes.Load())
 	}
 }
 
@@ -513,8 +513,8 @@ func TestPointReadLeaseKeepsConcurrentResponseBudgetCharged(t *testing.T) {
 		t.Fatalf("reservation after release=%v", err)
 	}
 	owner.releasePendingRead(charge)
-	if owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 {
-		t.Fatalf("pending reads=%d bytes=%d", owner.pendingReadItems, owner.pendingReadBytes)
+	if owner.pendingReadItems.Load() != 0 || owner.pendingReadBytes.Load() != 0 {
+		t.Fatalf("pending reads=%d bytes=%d", owner.pendingReadItems.Load(), owner.pendingReadBytes.Load())
 	}
 }
 
@@ -994,8 +994,8 @@ func TestOwnerDefersLinearizableReadAcrossAsyncReadyBoundary(t *testing.T) {
 	default:
 	}
 	owner.mu.Lock()
-	if owner.ingressItems != 1 || owner.pendingReadItems != 1 {
-		t.Fatalf("retained charges ingress=%d reads=%d", owner.ingressItems, owner.pendingReadItems)
+	if owner.ingressItems != 1 || owner.pendingReadItems.Load() != 1 {
+		t.Fatalf("retained charges ingress=%d reads=%d", owner.ingressItems, owner.pendingReadItems.Load())
 	}
 	owner.mu.Unlock()
 
@@ -1018,8 +1018,8 @@ func TestOwnerDefersLinearizableReadAcrossAsyncReadyBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner.mu.Lock()
-	if owner.ingressItems != 0 || owner.pendingReadItems != 0 {
-		t.Fatalf("released charges ingress=%d reads=%d", owner.ingressItems, owner.pendingReadItems)
+	if owner.ingressItems != 0 || owner.pendingReadItems.Load() != 0 {
+		t.Fatalf("released charges ingress=%d reads=%d", owner.ingressItems, owner.pendingReadItems.Load())
 	}
 	owner.mu.Unlock()
 	cancel()
@@ -1057,11 +1057,11 @@ func TestOwnerStopSettlesDeferredReadAndReleasesCharges(t *testing.T) {
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
 	if owner.ingressItems != 0 || owner.ingressBytes != 0 ||
-		owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 ||
+		owner.pendingReadItems.Load() != 0 || owner.pendingReadBytes.Load() != 0 ||
 		len(owner.pendingReads) != 0 {
 		t.Fatalf("retained accounting ingress=%d/%d reads=%d/%d barriers=%d",
-			owner.ingressItems, owner.ingressBytes, owner.pendingReadItems,
-			owner.pendingReadBytes, len(owner.pendingReads))
+			owner.ingressItems, owner.ingressBytes, owner.pendingReadItems.Load(),
+			owner.pendingReadBytes.Load(), len(owner.pendingReads))
 	}
 }
 
@@ -1282,11 +1282,11 @@ func TestOwnerCollectorFlushFailureSettlesDetachedDeferredRead(t *testing.T) {
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
 	if owner.ingressItems != 0 || owner.ingressBytes != 0 ||
-		owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 ||
+		owner.pendingReadItems.Load() != 0 || owner.pendingReadBytes.Load() != 0 ||
 		len(owner.pendingReads) != 0 {
 		t.Fatalf("retained accounting ingress=%d/%d reads=%d/%d barriers=%d",
-			owner.ingressItems, owner.ingressBytes, owner.pendingReadItems,
-			owner.pendingReadBytes, len(owner.pendingReads))
+			owner.ingressItems, owner.ingressBytes, owner.pendingReadItems.Load(),
+			owner.pendingReadBytes.Load(), len(owner.pendingReads))
 	}
 }
 

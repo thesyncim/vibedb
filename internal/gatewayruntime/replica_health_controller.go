@@ -418,6 +418,12 @@ func startGatewayReplicaControllers(
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		if sessionStarter, ok := revisions.(interface {
+			BeginHealthSession(context.Context) func()
+		}); ok {
+			closeSession := sessionStarter.BeginHealthSession(ctx)
+			defer closeSession()
+		}
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {

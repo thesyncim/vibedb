@@ -17,9 +17,41 @@ import (
 // catalog order, bounding sockets and temporary storage independently of
 // cluster size.
 type gatewayReplicaHealthRevisionController struct {
-	catalog      gatewayReplicaCatalogReader
-	observations gatewayReplicaHealthObservationClient
-	authority    gateway.ReplicaHealthRevisionAuthority
+	catalog           gatewayReplicaCatalogReader
+	observations      gatewayReplicaHealthObservationClient
+	authority         gateway.ReplicaHealthRevisionAuthority
+	sessionCtx        context.Context
+	sessionRound      *replicacontrol.HealthRound
+	sessionGeneration uint64
+}
+
+// BeginHealthSession opens one persistent HealthRound shared across RunPass
+// ticks for the lifetime of ctx, eliminating per-tick mTLS handshakes while
+// keeping standalone RunPass calls in tests self-contained. When catalog
+// generation changes (membership/scale transitions), RunPass rotates the
+// session round so retired nodes do not retain cached HealthRound slots.
+func (controller *gatewayReplicaHealthRevisionController) BeginHealthSession(ctx context.Context) func() {
+	if controller == nil || ctx == nil {
+		return func() {}
+	}
+	source, ok := controller.observations.(interface {
+		BeginHealthRound(context.Context) *replicacontrol.HealthRound
+	})
+	if !ok {
+		return func() {}
+	}
+	controller.sessionCtx = ctx
+	controller.sessionRound = source.BeginHealthRound(ctx)
+	controller.sessionGeneration = 0
+	return func() {
+		round := controller.sessionRound
+		controller.sessionRound = nil
+		controller.sessionCtx = nil
+		controller.sessionGeneration = 0
+		if round != nil {
+			_ = round.Close()
+		}
+	}
 }
 
 type gatewayReplicaHealthRevisionPass struct {
@@ -54,7 +86,23 @@ func (controller *gatewayReplicaHealthRevisionController) RunPass(
 	if err != nil || catalog == nil {
 		return gatewayReplicaHealthRevisionPass{}, errors.Join(err, errGatewayReplicaHealth)
 	}
-	if source, ok := controller.observations.(interface {
+	if controller.sessionRound != nil {
+		gen := catalog.Generation()
+		if controller.sessionGeneration == 0 {
+			controller.sessionGeneration = gen
+		} else if controller.sessionGeneration != gen {
+			if source, ok := controller.observations.(interface {
+				BeginHealthRound(context.Context) *replicacontrol.HealthRound
+			}); ok && controller.sessionCtx != nil {
+				_ = controller.sessionRound.Close()
+				controller.sessionRound = source.BeginHealthRound(controller.sessionCtx)
+				controller.sessionGeneration = gen
+			}
+		}
+		scoped := *controller
+		scoped.observations = controller.sessionRound
+		controller = &scoped
+	} else if source, ok := controller.observations.(interface {
 		BeginHealthRound(context.Context) *replicacontrol.HealthRound
 	}); ok {
 		round := source.BeginHealthRound(ctx)

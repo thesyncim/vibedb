@@ -464,6 +464,16 @@ func (n *Node) CurrentTermCommitted() bool {
 	return n != nil && n.currentTermCommit
 }
 
+// CurrentTermCommittedReadOnly returns the same conservative proof as
+// CurrentTermCommitted without mutating Node state, so concurrent read-only
+// observers under a shared lane read lock remain race-free.
+func (n *Node) CurrentTermCommittedReadOnly() bool {
+	if n == nil || n.raw == nil {
+		return false
+	}
+	return n.raw.BasicStatus().GetTerm() == n.observedTerm && n.currentTermCommit
+}
+
 // PendingConfiguration reports whether a configuration proposal has entered
 // RawNode but has not yet reached ordered application. It is a local gate for
 // the optional authority protocol and is deliberately conservative across
@@ -480,6 +490,15 @@ func (n *Node) PendingConfiguration() bool {
 	// lets an already-established authority survive normal apply lag while the
 	// read owner still checks its requested publication index before serving.
 	return n.pendingConfChange || n.pendingDurableLast != 0
+}
+
+// PendingConfigurationReadOnly returns the same conservative gate as
+// PendingConfiguration without mutating Node state.
+func (n *Node) PendingConfigurationReadOnly() bool {
+	if n == nil {
+		return false
+	}
+	return n.pendingConfChange || (n.pendingDurableLast != 0 && n.published.Applied < n.pendingDurableLast)
 }
 
 // Failure returns the terminal apply failure, if any.
