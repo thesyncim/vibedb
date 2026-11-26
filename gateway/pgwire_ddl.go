@@ -7,8 +7,10 @@ import (
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/pgwire"
 	"github.com/thesyncim/vibedb/query"
+	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	driver "github.com/thesyncim/vibedb/sql/driver"
+	"github.com/thesyncim/vibejson"
 )
 
 func postgresDDLKind(kind sqlast.Kind) bool {
@@ -106,5 +108,126 @@ func (p *postgresDDLStatement) Exec(ctx context.Context, args []any) (driver.Res
 		}
 		return driver.Result{}, nil
 	}
+	if p.kind == sqlast.KindCreateTable {
+		var parser sqlast.Parser
+		var parsed sqlast.Statement
+		if err := parser.ParseStatement(&parsed, p.text); err == nil &&
+			parsed.CreateTable != nil && parsed.CreateTable.AsQuery != nil {
+			return p.execCreateTableAsSelect(ctx, parsed.CreateTable)
+		}
+	}
 	return driver.Result{}, s.backend.DDL(ctx, s.authority, p.text)
+}
+
+func (p *postgresDDLStatement) execCreateTableAsSelect(
+	ctx context.Context,
+	ct *sqlast.CreateTableStmt,
+) (driver.Result, error) {
+	s := p.session
+	if s.backend.Executor == nil || s.backend.DDL == nil || s.backend.Write == nil {
+		return driver.Result{}, sqlast.NewFeatureNotSupportedError(p.text, 0, "distributed CREATE TABLE AS SELECT requires executor, DDL, and write backends")
+	}
+	sourceRes, err := s.backend.Executor.Query(ctx, Query{
+		SQL: ct.AsQuerySQL, Class: ClassBatch,
+	})
+	if err != nil {
+		return driver.Result{}, err
+	}
+	if len(sourceRes.Columns) == 0 {
+		return driver.Result{}, ErrMalformedRequest
+	}
+	pkIdx := 0
+	for i, col := range sourceRes.Columns {
+		if strings.EqualFold(col.Name, "id") {
+			pkIdx = i
+			break
+		}
+	}
+	pkType := "TEXT"
+	for _, row := range sourceRes.Rows {
+		if pkIdx < len(row) && !row[pkIdx].Null && len(row[pkIdx].Bytes) > 0 {
+			b := row[pkIdx].Bytes
+			if b[0] == '"' {
+				pkType = "TEXT"
+			} else if string(b) == "true" || string(b) == "false" {
+				pkType = "BOOLEAN"
+			} else {
+				pkType = "DOUBLE PRECISION"
+				if !strings.ContainsAny(string(b), ".eE") {
+					pkType = "INTEGER"
+				}
+			}
+			break
+		}
+	}
+	var createSQL strings.Builder
+	createSQL.WriteString("CREATE TABLE ")
+	if ct.IfNotExists {
+		createSQL.WriteString("IF NOT EXISTS ")
+	}
+	createSQL.WriteString(quoteSQLIdentifier(ct.Table))
+	createSQL.WriteString(" (")
+	for i, col := range sourceRes.Columns {
+		if i > 0 {
+			createSQL.WriteString(", ")
+		}
+		createSQL.WriteString(quoteSQLIdentifier(col.Name))
+		if i == pkIdx {
+			createSQL.WriteString(" ")
+			createSQL.WriteString(pkType)
+			createSQL.WriteString(" PRIMARY KEY")
+		} else {
+			createSQL.WriteString(" ANY")
+		}
+	}
+	createSQL.WriteByte(')')
+	if err := s.backend.DDL(ctx, s.authority, createSQL.String()); err != nil {
+		return driver.Result{}, err
+	}
+	if len(sourceRes.Rows) == 0 {
+		return driver.Result{}, nil
+	}
+	var insSQL strings.Builder
+	insSQL.WriteString("INSERT INTO ")
+	insSQL.WriteString(quoteSQLIdentifier(ct.Table))
+	insSQL.WriteString(" VALUES ")
+	docParams := make([]shardservice.Param, 0, len(sourceRes.Rows))
+	for i, row := range sourceRes.Rows {
+		if i > 0 {
+			insSQL.WriteString(", ")
+		}
+		insSQL.WriteString("(?)")
+		var docBuf []byte
+		docBuf = append(docBuf, '{')
+		for ci, col := range sourceRes.Columns {
+			if ci > 0 {
+				docBuf = append(docBuf, ',')
+			}
+			colName := col.Name
+			keyBytes, err := vibejson.Marshal(&colName)
+			if err != nil {
+				return driver.Result{}, err
+			}
+			docBuf = append(docBuf, keyBytes...)
+			docBuf = append(docBuf, ':')
+			if ci >= len(row) || row[ci].Null {
+				docBuf = append(docBuf, "null"...)
+			} else {
+				docBuf = append(docBuf, row[ci].Bytes...)
+			}
+		}
+		docBuf = append(docBuf, '}')
+		docParams = append(docParams, shardservice.DocumentParam(string(docBuf)))
+	}
+	res, err := s.backend.Write(ctx, s.authority, Query{
+		SQL: insSQL.String(), Params: docParams, Class: ClassBatch,
+	})
+	if err != nil {
+		return driver.Result{}, err
+	}
+	var affected int64
+	if res != nil {
+		affected = res.RowsAffected
+	}
+	return driver.Result{RowsAffected: affected}, nil
 }

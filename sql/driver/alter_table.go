@@ -149,8 +149,46 @@ func (d *database) alterTableAddColumnStorageLockedContext(
 			return err
 		}
 		return d.replaceTableStorageLockedContext(ctx, definition.Table, t.meta.Indexes, schema, true)
-	case sqlast.AlterSetDefault, sqlast.AlterDropDefault, sqlast.AlterAddConstraint, sqlast.AlterDropConstraint:
-		// Metadata-only constraint/default updates succeed cleanly without rewriting rows.
+	case sqlast.AlterSetDefault:
+		if alt := statement.Tree().AlterTable; alt != nil && t.meta != nil && t.meta.Schema != nil && alt.Column.Path != nil {
+			ptr := string(alt.Column.Path.AppendPointer(nil))
+			for i := range t.meta.Schema.Fields {
+				if t.meta.Schema.Fields[i].Path == ptr {
+					t.meta.Schema.Fields[i].DefaultSQL = alt.Column.DefaultSQL
+					if _, err := d.persistCatalogLocked(); err != nil {
+						return err
+					}
+					d.advanceLayoutEpochLocked()
+					return nil
+				}
+			}
+		}
+		return nil
+	case sqlast.AlterDropDefault:
+		if alt := statement.Tree().AlterTable; alt != nil && t.meta != nil && t.meta.Schema != nil && alt.Column.Path != nil {
+			ptr := string(alt.Column.Path.AppendPointer(nil))
+			for i := range t.meta.Schema.Fields {
+				if t.meta.Schema.Fields[i].Path == ptr {
+					t.meta.Schema.Fields[i].DefaultSQL = ""
+					if _, err := d.persistCatalogLocked(); err != nil {
+						return err
+					}
+					d.advanceLayoutEpochLocked()
+					return nil
+				}
+			}
+		}
+		return nil
+	case sqlast.AlterAddConstraint:
+		if alt := statement.Tree().AlterTable; alt != nil && t.meta != nil && alt.Column.CheckSQL != "" {
+			t.meta.Checks = append(t.meta.Checks, alt.Column.CheckSQL)
+			if _, err := d.persistCatalogLocked(); err != nil {
+				return err
+			}
+			d.advanceLayoutEpochLocked()
+		}
+		return nil
+	case sqlast.AlterDropConstraint:
 		return nil
 	case sqlast.AlterRenameTable:
 		if _, exists := d.tables[definition.NewName]; exists {

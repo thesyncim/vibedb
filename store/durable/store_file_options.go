@@ -325,7 +325,12 @@ type Options struct {
 	// alignment is device-specific and is rejected rather than risking a
 	// sticky EINVAL after publication.
 	MaterializationDamageGranule int
-	MaxSnapshotLeases            int
+	MaxSnapshotLeases int
+	// MaxSnapshotGenerationLag optionally caps how many generations the oldest
+	// active snapshot may lag behind the current published root before new
+	// Snapshot/SnapshotInto calls fail fast with ErrSnapshotLagExceeded. Zero
+	// disables the guardrail (default).
+	MaxSnapshotGenerationLag uint64
 	// MaxRetiredExtents bounds the copy-on-write extents held back from reuse
 	// because some reader might still dereference them. Zero selects 65,536.
 	//

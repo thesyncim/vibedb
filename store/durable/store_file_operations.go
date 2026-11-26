@@ -264,6 +264,27 @@ func (w *IndexWorkspace) Release() {
 }
 
 // Snapshot acquires an explicit generation lease.
+// ErrSnapshotLagExceeded reports that the oldest active snapshot lags behind
+// the current published generation by more than Options.MaxSnapshotGenerationLag.
+var ErrSnapshotLagExceeded = errors.New("vibedb: oldest active snapshot exceeds MaxSnapshotGenerationLag")
+
+// SnapshotLagExceeded reports whether an active snapshot currently exceeds
+// Options.MaxSnapshotGenerationLag. Returns false when the guardrail is unset.
+func (c *Collection) SnapshotLagExceeded() bool {
+	if c == nil || c.options.MaxSnapshotGenerationLag == 0 {
+		return false
+	}
+	state := c.state.Load()
+	if state == nil {
+		return false
+	}
+	leases := c.leases.Stats(state.root.Generation)
+	if leases.Active == 0 || state.root.Generation <= leases.MinimumGeneration {
+		return false
+	}
+	return state.root.Generation-leases.MinimumGeneration > c.options.MaxSnapshotGenerationLag
+}
+
 func (c *Collection) Snapshot() (*Snapshot, error) {
 	snapshot := new(Snapshot)
 	if err := c.SnapshotInto(snapshot); err != nil {
@@ -289,6 +310,9 @@ func (c *Collection) SnapshotInto(dst *Snapshot) error {
 	// generation. Check the source only after releasing dst's prior lease.
 	if c == nil {
 		return ErrClosed
+	}
+	if c.SnapshotLagExceeded() {
+		return ErrSnapshotLagExceeded
 	}
 	// Close's sync.Once is per binding. Reset it only after the prior binding is
 	// completely released and before this single consumer publishes a new one.

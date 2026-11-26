@@ -209,13 +209,18 @@ func (p *Parser) parseAlterTable() error {
 				p.alter.Action = AlterSetNotNull
 			} else if p.atKeyword(kwDefault) {
 				p.advance()
+				defStart := p.tok.pos
 				defExpr, err := p.parseScalarExpression(scalarSelect)
 				if err != nil {
 					return err
 				}
+				defEnd := p.tok.pos
 				p.alter.Action = AlterSetDefault
 				p.alter.Column.HasDefault = true
 				p.alter.Column.DefaultExpr = defExpr
+				if defStart >= 0 && defEnd >= defStart && defEnd <= len(p.lx.src) {
+					p.alter.Column.DefaultSQL = strings.TrimSpace(p.lx.src[defStart:defEnd])
+				}
 			} else if tokenTextEqual(p.tok, "DATA") {
 				p.advance()
 				if !tokenTextEqual(p.tok, "TYPE") {
@@ -306,9 +311,12 @@ func (p *Parser) parseAlterAddConstraint() error {
 			return err
 		}
 	case tokenTextEqual(p.tok, "CHECK"):
-		if _, _, err := p.parseCheckConstraint(); err != nil {
+		chk, chkSQL, err := p.parseCheckConstraint()
+		if err != nil {
 			return err
 		}
+		p.alter.Column.CheckExpr = chk
+		p.alter.Column.CheckSQL = chkSQL
 	case tokenTextEqual(p.tok, "FOREIGN"):
 		if err := p.parseForeignKeyConstraint(); err != nil {
 			return err

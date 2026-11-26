@@ -450,19 +450,23 @@ ROLLBACK TO restores and retains the named savepoint and drops newer ones.
 
 ## Unsupported SQL families
 
-Unsupported families include MERGE, REPLACE, COPY, GRANT/REVOKE, COMMENT, VACUUM,
+Unsupported families include MERGE, REPLACE, file-path COPY (`COPY ... FROM/TO 'file'`), GRANT/REVOKE, COMMENT, VACUUM,
 ANALYZE, REINDEX, CLUSTER, PREPARE/EXECUTE/DEALLOCATE, DECLARE/FETCH/MOVE,
-LISTEN/NOTIFY/UNLISTEN, LOCK, CALL, and DO. PostgreSQL extensions, catalogs, procedures,
-triggers, policies, sequences, materialized views, and replication are outside this dialect.
+LISTEN/NOTIFY/UNLISTEN, LOCK, CALL, and DO. PostgreSQL extensions, procedures,
+triggers, policies, sequences, materialized views, and logical replication are outside this dialect.
+
+## Supported PostgreSQL extensions
+
+- **Wire COPY**: `COPY table [(cols)] FROM STDIN` and `COPY table|(SELECT ...) TO STDOUT` (text & CSV formats, `HEADER`, `DELIMITER`, `NULL`, `QUOTE`, atomic `CopyFail` rollback).
+- **DDL & Constraints**: composite `PRIMARY KEY` (up to 4 columns) with composite `ON CONFLICT (c1, c2, ...)`, `UNIQUE` constraints, column `DEFAULT` expressions, column & table `CHECK (...)` constraints (`23514`), `ALTER TABLE` (`ADD`/`DROP`/`RENAME`/`SET TYPE`/`SET NOT NULL`/`DROP NOT NULL`/`SET DEFAULT`/`DROP DEFAULT`/`ADD CONSTRAINT CHECK`/`RENAME TO`), `CREATE TABLE [IF NOT EXISTS] ... AS SELECT` (CTAS), and `CREATE INDEX` options (`WHERE`, expression, `INCLUDE`, `DESC`/`NULLS`).
+- **DML**: `UPDATE ... FROM`, `DELETE ... USING`, data-modifying CTEs (`WITH ... AS (INSERT/UPDATE/DELETE RETURNING) SELECT`), `INSERT ... DEFAULT VALUES`, scalar expressions in `INSERT ... VALUES (...)`, `INSERT ... SELECT`, and `RETURNING` across local and RF3 distributed backends.
+- **Queries & Aggregates**: `DISTINCT ON (...)`, `COUNT/SUM/AVG/MIN/MAX(DISTINCT x)`, `AGG(...) FILTER (WHERE ...)`, `STRING_AGG`, `ARRAY_AGG`, `JSON_AGG`/`JSONB_AGG`, `BOOL_AND`/`EVERY`, `BOOL_OR`, expression/ordinal/alias `GROUP BY`, `HAVING` on extended aggregates, regex (`~`, `~*`, `!~`, `!~*`, `SIMILAR TO`), JSONB operators (`?`, `?|`, `?&`, `jsonb_set`), `ARRAY[...]` / `ANY` / `ALL` / `UNNEST`, row-value comparisons, `TIMESTAMP`/`NOW() + INTERVAL` arithmetic, `SELECT ... FOR UPDATE/SHARE`, and queryable `information_schema` / `pg_catalog` virtual tables.
 
 ## Limitations
 
 - The dialect is bounded by design: shapes the lowerer cannot prove are
   rejected at prepare time rather than executed slowly.
-- Only one executable primary-key path per table; no DEFAULT, CHECK, foreign
-  keys, sequences, or generated columns.
-- No general scalar-function catalog, timestamp or array types, collations,
-  aggregate DISTINCT, or aggregate FILTER.
+- Foreign keys, sequences, generated columns, and collations are not enforced.
 - DDL is not transactional and changes one object per statement.
 - Views are not materialized and cannot be replaced in place.
 
