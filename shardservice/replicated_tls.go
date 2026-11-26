@@ -20,8 +20,9 @@ type ReplicatedServerTLS struct {
 	tls               *rafttransport.PeerTLS
 	allow             map[rafttransport.NodeID]struct{}
 	generation        uint64
+	generationAtomic  atomic.Uint64
 	active            map[net.Conn]uint64
-	localActive       map[*replicatedLocalCall]struct{}
+	localBindings     map[*replicatedLocalBinding]struct{}
 	authenticated     atomic.Uint64
 	authRejected      atomic.Uint64
 	handshakeRejected atomic.Uint64
@@ -38,7 +39,13 @@ func NewReplicatedServerTLS(profile *rafttransport.PeerTLS, allowed []rafttransp
 	if profile == nil || profile.LocalIdentity().Node == (rafttransport.NodeID{}) || err != nil {
 		return nil, ErrReplicatedAuthentication
 	}
-	return &ReplicatedServerTLS{tls: profile, allow: allow, generation: 1, active: make(map[net.Conn]uint64), localActive: make(map[*replicatedLocalCall]struct{})}, nil
+	capability := &ReplicatedServerTLS{
+		tls: profile, allow: allow, generation: 1,
+		active:        make(map[net.Conn]uint64),
+		localBindings: make(map[*replicatedLocalBinding]struct{}),
+	}
+	capability.generationAtomic.Store(1)
+	return capability, nil
 }
 
 func replicatedGatewayAllowlist(nodes []rafttransport.NodeID) (map[rafttransport.NodeID]struct{}, error) {
@@ -100,8 +107,9 @@ func (capability *ReplicatedServerTLS) release(connection net.Conn) {
 
 func (capability *ReplicatedServerTLS) closeActive() {
 	capability.mu.Lock()
-	for call := range capability.localActive {
-		call.cancel()
+	for binding := range capability.localBindings {
+		binding.cancel()
+		delete(capability.localBindings, binding)
 	}
 	for connection := range capability.active {
 		_ = connection.Close()
@@ -125,8 +133,10 @@ func (capability *ReplicatedServerTLS) Rotate(profile *rafttransport.PeerTLS, al
 	}
 	capability.tls, capability.allow = profile, allow
 	capability.generation++
-	for call := range capability.localActive {
-		call.cancel()
+	capability.generationAtomic.Store(capability.generation)
+	for binding := range capability.localBindings {
+		binding.cancel()
+		delete(capability.localBindings, binding)
 	}
 	for connection := range capability.active {
 		_ = connection.Close()

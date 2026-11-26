@@ -10,6 +10,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/raftserve"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/query"
 	"github.com/thesyncim/vibedb/shardservice"
 )
 
@@ -41,20 +42,25 @@ func (a *replicatedSQLAttempt) resultObservations() []ReplicatedGroupReadObserva
 type ReplicatedSQLTransport struct{ Executor *ReplicatedExecutor }
 
 func (transport *ReplicatedSQLTransport) Do(ctx context.Context, _ string, req *shardservice.ShardRequest) (*shardservice.ShardResponse, error) {
+	resp, _, err := transport.DoTyped(ctx, "", req)
+	return resp, err
+}
+
+func (transport *ReplicatedSQLTransport) DoTyped(ctx context.Context, _ string, req *shardservice.ShardRequest) (*shardservice.ShardResponse, []query.Cell, error) {
 	if transport == nil || transport.Executor == nil || req == nil || ctx == nil {
-		return nil, ErrReplicatedRoute
+		return nil, nil, ErrReplicatedRoute
 	}
 	attempt, ok := ctx.Value(replicatedSQLSnapshotKey{}).(*replicatedSQLAttempt)
 	if !ok {
-		return nil, ErrNoCatalog
+		return nil, nil, ErrNoCatalog
 	}
 	var endpoints [ServingReplicaCount]ReplicatedEndpoint
 	route, ok := attempt.snapshot.ResolveReplicatedRoute(req.Distribution, req.Shard, endpoints[:0])
 	if !ok || route.AllocationGeneration != uint64(req.AllocationGeneration) ||
 		route.Command.RoutingVersion != uint64(req.RoutingVersion) || route.Command.OwnershipEpoch != uint64(req.OwnershipEpoch) {
-		return nil, ErrStaleGeneration
+		return nil, nil, ErrStaleGeneration
 	}
-	return transport.Executor.QuerySQL(ctx, route, req)
+	return transport.Executor.QuerySQLTyped(ctx, route, req)
 }
 
 // DoBatches splits a fully admitted bounded native result into the existing
@@ -131,8 +137,13 @@ func putReplicatedCall(call *shardservice.ReplicatedCall) {
 }
 
 func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route ReplicatedRoute, req *shardservice.ShardRequest) (*shardservice.ShardResponse, error) {
+	resp, _, err := executor.QuerySQLTyped(ctx, route, req)
+	return resp, err
+}
+
+func (executor *ReplicatedExecutor) QuerySQLTyped(ctx context.Context, route ReplicatedRoute, req *shardservice.ShardRequest) (*shardservice.ShardResponse, []query.Cell, error) {
 	if executor == nil || executor.client == nil || ctx == nil || req == nil || !validReplicatedRoute(route) {
-		return nil, ErrReplicatedRoute
+		return nil, nil, ErrReplicatedRoute
 	}
 	route.membershipStable = true
 	// The shell is plan-owned, used synchronously, and scrubbed on release,
@@ -142,9 +153,9 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 		req.Authority = authority
 	}
 	if size, err := shardservice.RequestFrameBytes(req); err != nil {
-		return nil, err
+		return nil, nil, err
 	} else if size > shardservice.MaxReplicatedSQLRequestBytes {
-		return nil, ErrResultLimit
+		return nil, nil, ErrResultLimit
 	}
 	// The call shell comes from a pool and is built once: attempts are
 	// sequential and restamp only the per-attempt fence in place. The pool
@@ -163,13 +174,13 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 	var joined error
 	for attempt := 0; attempt < executor.maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		endpoint, state, err := executor.discoverLeader(ctx, route, preferred, serviceauthz.CapabilityDataRead)
 		if err != nil {
 			joined = errors.Join(joined, err)
 			if terminalReplicatedDiscoveryError(err) {
-				return nil, joined
+				return nil, nil, joined
 			}
 			preferred = 0
 			continue
@@ -183,11 +194,11 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 			continue
 		}
 		if reply == nil {
-			return nil, ErrReplicatedRoute
+			return nil, nil, ErrReplicatedRoute
 		}
 		response := &reply.Response
 		if validReplicatedUnauthorizedWithoutState(response) {
-			return nil, &ReplicatedRefusalError{Code: response.Refusal}
+			return nil, nil, &ReplicatedRefusalError{Code: response.Refusal}
 		}
 		if validReplicatedUnavailableWithoutState(response) {
 			executor.leaderHints.invalidate(route, endpoint, state)
@@ -197,7 +208,7 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 		}
 		if !validReplicatedResponseState(response) || response.State.Fence.Group != route.Group ||
 			response.State.Fence.AllocationGeneration != route.AllocationGeneration || !replicatedObservedCommandMatches(route, response.State.Fence.Command) {
-			return nil, ErrStaleGeneration
+			return nil, nil, ErrStaleGeneration
 		}
 		switch response.Kind {
 		case shardservice.ReplicatedQueryResult:
@@ -205,14 +216,14 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 				response.Outcome != (raftserve.Outcome{}) || len(response.Completion) != 0 ||
 				response.ReadApplied == 0 || response.ReadApplied > response.State.Applied ||
 				(len(response.Value) != 0 && (len(response.Value) < 5 || len(response.Value) > shardservice.MaxReplicatedSQLResultBytes)) || reply.SQL == nil {
-				return nil, ErrReplicatedRoute
+				return nil, nil, ErrReplicatedRoute
 			}
 			result := reply.SQL
 			if result.Kind != shardservice.ResponseRows && result.Kind != shardservice.ResponseError {
-				return nil, ErrReplicatedRoute
+				return nil, nil, ErrReplicatedRoute
 			}
 			if result.Kind == shardservice.ResponseError {
-				return nil, shardError(result)
+				return nil, nil, shardError(result)
 			}
 			if execution, ok := ctx.Value(replicatedSQLSnapshotKey{}).(*replicatedSQLAttempt); ok {
 				execution.mu.Lock()
@@ -220,25 +231,25 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 				execution.mu.Unlock()
 			}
 			executor.leaderHints.publish(route, endpoint, response.State)
-			return result, nil
+			return result, reply.TypedCells, nil
 		case shardservice.ReplicatedNotLeader:
 			if !validReplicatedNonterminalResponse(response) {
-				return nil, ErrReplicatedRoute
+				return nil, nil, ErrReplicatedRoute
 			}
 			executor.leaderHints.invalidate(route, endpoint, state)
 			preferred = response.State.LeaderID
 		case shardservice.ReplicatedRefusal:
 			if !validReplicatedReadRefusal(response, response.Refusal) {
-				return nil, ErrReplicatedRoute
+				return nil, nil, ErrReplicatedRoute
 			}
 			if response.Refusal != shardservice.ReplicatedRefusalStaleFence {
-				return nil, &ReplicatedRefusalError{Code: response.Refusal}
+				return nil, nil, &ReplicatedRefusalError{Code: response.Refusal}
 			}
 			executor.leaderHints.invalidate(route, endpoint, state)
 			preferred = response.State.LeaderID
 		default:
-			return nil, ErrReplicatedRoute
+			return nil, nil, ErrReplicatedRoute
 		}
 	}
-	return nil, errors.Join(ErrReplicatedLeader, joined)
+	return nil, nil, errors.Join(ErrReplicatedLeader, joined)
 }

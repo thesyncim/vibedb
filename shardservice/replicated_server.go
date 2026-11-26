@@ -230,8 +230,13 @@ func (server *ReplicatedServer) BindLocalGatewayPeerTLS(
 		return ErrReplicatedAuthentication
 	}
 	if old != nil {
+		delete(storageTLS.localBindings, old)
 		old.cancel()
 	}
+	if storageTLS.localBindings == nil {
+		storageTLS.localBindings = make(map[*replicatedLocalBinding]struct{})
+	}
+	storageTLS.localBindings[binding] = struct{}{}
 	return nil
 }
 
@@ -315,9 +320,9 @@ const (
 type replicatedFrameByteBudget struct {
 	limit   int64
 	used    atomic.Int64
+	sqlUsed atomic.Int64 // subset of used; lock-free when waiters == 0
 	waiters atomic.Int32
 	waitMu  sync.Mutex
-	sqlUsed int64 // protected by waitMu; subset of used
 	changed chan struct{}
 }
 

@@ -279,6 +279,18 @@ func resultCellOwnedBytes(cell Cell) int64 {
 	return bytes
 }
 
+// OwnedCellBytes returns the private byte footprint required to detach cell
+// into an owned arena via OwnCellInto.
+func OwnedCellBytes(cell Cell) int64 {
+	return resultCellOwnedBytes(cell)
+}
+
+// OwnCellInto copies the variable-width parts of cell into arena and returns
+// an immutable detached Cell independent of its source cursor or page cache.
+func OwnCellInto(arena []byte, cell Cell) (Cell, []byte) {
+	return ownResultCellInto(arena, cell)
+}
+
 // ownResultCellInto copies the variable-width parts of cell into data and
 // rederives a clean string's text view from the copied JSON spelling. The
 // returned cell is independent of the source page/workspace; immutable JSON

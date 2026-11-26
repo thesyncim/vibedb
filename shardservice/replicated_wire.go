@@ -20,6 +20,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/query"
 )
 
 const (
@@ -335,7 +336,9 @@ type ReplicatedResponse struct {
 	// sqlResult is populated only for an in-process semantic query. It is kept
 	// out of the wire grammar; remote callers receive Value encoded by the
 	// authenticated adapter instead.
-	sqlResult *ShardResponse
+	sqlResult  *ShardResponse
+	typedCells []query.Cell
+	sqlOwned   bool
 }
 
 // EncodeReplicatedRequest emits one canonical native request frame with a
