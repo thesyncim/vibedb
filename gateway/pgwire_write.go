@@ -501,7 +501,8 @@ func (p *postgresWriteStatement) execWrite(ctx context.Context, args []any) (*Re
 	result, err := s.backend.Write(ctx, s.authority, Query{
 		SQL: p.text, Params: params, ParamTypes: p.paramTypes, Class: ClassBatch,
 	})
-	if errors.Is(err, ErrReplicatedSQLTransactionUnsupported) &&
+	if !errors.Is(err, durable.ErrCommitOutcomeUnknown) &&
+		errors.Is(err, ErrReplicatedSQLTransactionUnsupported) &&
 		(p.kind == sqlast.KindDelete || p.kind == sqlast.KindUpdate) {
 		result, err = p.execGeneralDeleteOrUpdate(ctx, params)
 	}

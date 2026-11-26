@@ -359,7 +359,7 @@ func (p *Parser) parseColumnType() (JSONType, error) {
 	}
 	var fold [maxTypeNameLen]byte
 	name := foldASCII(&fold, p.tok.text)
-	spelling, pos := p.tok.text, p.tok.pos
+	pos := p.tok.pos
 	kind, ok := jsonTypeOf(name)
 	if !ok {
 		if reason, refused := refusedTypeReason(name); refused {
@@ -367,16 +367,59 @@ func (p *Parser) parseColumnType() (JSONType, error) {
 		}
 		return 0, p.errfAt(pos, "unknown type %q: the types are NULL, BOOL, NUMBER, INTEGER, STRING, ARRAY, OBJECT, and ANY", p.tok.text)
 	}
+	upperName := string(name)
 	p.advance()
+	// Handle standard PostgreSQL multi-word type spellings:
+	// DOUBLE PRECISION, CHARACTER VARYING, BIT VARYING,
+	// TIMESTAMP/TIME [WITH|WITHOUT TIME ZONE].
+	switch upperName {
+	case "DOUBLE":
+		if tokenTextEqual(p.tok, "PRECISION") {
+			p.advance()
+		}
+	case "CHARACTER":
+		if tokenTextEqual(p.tok, "VARYING") {
+			p.advance()
+		}
+	}
+	// Accept standard PostgreSQL type modifiers: VARCHAR(255), NUMERIC(10, 2), TIMESTAMP(6).
 	if p.tok.kind == tokLParen {
-		// A precision or a length is refused rather than dropped. VARCHAR(255)
-		// means something wherever it was written, and a dialect that took the
-		// word and ignored the number would be storing a promise its first
-		// 256-byte string breaks. See ddl.go.
-		return 0, p.errfAt(p.tok.pos,
-			"a length or precision is not supported: %s maps to %s, which constrains the JSON type and not the value's size, "+
-				"so the number would be accepted and never enforced. Write %s alone",
-			spelling, kind, kind)
+		p.advance()
+		if p.tok.kind != tokNumber {
+			return 0, p.errHere("expected positive integer type modifier")
+		}
+		p.advance()
+		if p.tok.kind == tokComma {
+			p.advance()
+			if p.tok.kind != tokNumber {
+				return 0, p.errHere("expected scale integer in type modifier")
+			}
+			p.advance()
+		}
+		if err := p.expect(tokRParen, "')' after type modifier"); err != nil {
+			return 0, err
+		}
+	}
+	if upperName == "TIMESTAMP" || upperName == "TIME" {
+		if tokenTextEqual(p.tok, "WITH") || tokenTextEqual(p.tok, "WITHOUT") {
+			p.advance()
+			if !tokenTextEqual(p.tok, "TIME") {
+				return 0, p.errHere("expected TIME ZONE")
+			}
+			p.advance()
+			if !tokenTextEqual(p.tok, "ZONE") {
+				return 0, p.errHere("expected ZONE after TIME")
+			}
+			p.advance()
+		}
+	}
+	// Accept PostgreSQL array type suffix: TEXT[], INTEGER[], UUID[], etc.
+	if p.tok.kind == tokLBracket {
+		p.advance()
+		if err := p.expect(tokRBracket, "']' for array type"); err != nil {
+			return 0, err
+		}
+		kind = TypeArray
 	}
 	return kind, nil
 }
@@ -388,17 +431,20 @@ func jsonTypeOf(name []byte) (JSONType, bool) {
 		return TypeNull, true
 	case "BOOL", "BOOLEAN":
 		return TypeBool, true
-	case "NUMBER", "FLOAT", "REAL", "DOUBLE", "DECIMAL", "NUMERIC":
+	case "NUMBER", "FLOAT", "FLOAT4", "FLOAT8", "REAL", "DOUBLE", "DECIMAL", "NUMERIC", "MONEY":
 		return TypeNumber, true
-	case "INTEGER", "INT", "INT2", "INT4", "INT8", "BIGINT", "SMALLINT", "TINYINT":
+	case "INTEGER", "INT", "INT2", "INT4", "INT8", "BIGINT", "SMALLINT", "TINYINT",
+		"SERIAL", "SMALLSERIAL", "BIGSERIAL", "OID":
 		return TypeInteger, true
-	case "STRING", "TEXT", "VARCHAR", "CLOB":
+	case "STRING", "TEXT", "VARCHAR", "CLOB", "CHAR", "CHARACTER", "NCHAR", "BPCHAR", "NAME",
+		"DATE", "TIME", "DATETIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL",
+		"UUID", "BYTEA", "INET", "CIDR", "MACADDR", "XML":
 		return TypeString, true
 	case "ARRAY":
 		return TypeArray, true
 	case "OBJECT":
 		return TypeObject, true
-	case "ANY", "JSON":
+	case "ANY", "JSON", "JSONB":
 		return TypeAny, true
 	}
 	return 0, false
