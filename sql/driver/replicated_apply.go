@@ -137,6 +137,23 @@ type ReplicatedApplyCapacityProfile struct {
 // ReplicatedApply is the opaque, singleton trusted apply claim over one bound
 // SQL root. Its implementation deliberately does not expose the underlying
 // durable collections, transaction log, or replicated-state Machine.
+type replicatedApplyAttemptState uint8
+
+const (
+	replicatedAttemptIdle replicatedApplyAttemptState = iota
+	replicatedAttemptSingle
+	replicatedAttemptBatch
+)
+
+type replicatedWALBaseState uint8
+
+const (
+	walBaseIdle replicatedWALBaseState = iota
+	walBaseCaptureActive
+	walBaseSelectActive
+	walBaseSelectPending
+)
+
 type ReplicatedApply struct {
 	owner                   *dbConnector
 	database                *database
@@ -146,16 +163,13 @@ type ReplicatedApply struct {
 	rangeSplitCapture       *rangesplit.SourceCapture
 	schemaCapture           *schemachange.SourceCapture
 	closed                  bool
+	attemptState            replicatedApplyAttemptState
+	walBaseState            replicatedWALBaseState
 	attemptGeneration       uint64
-	attemptActive           bool
-	attemptBatch            bool
 	attemptKeys             replicatedAttemptBinaryKeys
 	batchCompletionBatches  uint64
 	batchCompletionEntries  uint64
 	batchCompletionComplete uint64
-	walBaseCaptureActive    bool
-	walBaseSelectActive     bool
-	walBaseSelectPending    bool
 	walBasePending          raftstore.GenerationActivationIdentity
 	// readReuse owns a fixed, per-apply set of prepared-only replicated SQL
 	// slots. It is deliberately independent of catalog/session locks: closing
@@ -1450,11 +1464,11 @@ func (a *ReplicatedApply) observeMutationAttempt(
 	// the in-process outcome uncertain. A checkpoint-group decision failure can
 	// report the same uncertainty without changing either collection signal, so
 	// its explicit outcome-unknown classification also advances conservatively.
-	if !a.attemptActive ||
+	if a.attemptState == replicatedAttemptIdle ||
 		(a.table.collection.Generation() == a.attemptGeneration &&
 			a.table.collection.PersistenceError() == nil &&
 			!errors.Is(updateErr, durable.ErrCommitOutcomeUnknown) &&
-			!(a.attemptBatch && updateErr == nil)) {
+			!(a.attemptState == replicatedAttemptBatch && updateErr == nil)) {
 		return
 	}
 	if a.table.conflicts.recordWriteIfNoActive() {
@@ -1474,7 +1488,7 @@ func (a *ReplicatedApply) checkLocked() error {
 }
 
 func (a *ReplicatedApply) checkActivationBaseLocked() error {
-	if a.walBaseSelectActive || a.walBaseSelectPending {
+	if a.walBaseState >= walBaseSelectActive {
 		return ErrReplicatedApplyBusy
 	}
 	if a.activationBasePending != ([sha256.Size]byte{}) {
@@ -1570,7 +1584,7 @@ func (a *ReplicatedApply) ClaimRuntimeOwnership(database *Database) error {
 	if core.replicatedApplyClaim != a {
 		return ErrReplicatedApplyClosed
 	}
-	if a.walBaseCaptureActive || a.walBaseSelectActive || a.walBaseSelectPending {
+	if a.walBaseState != walBaseIdle {
 		return ErrReplicatedApplyBusy
 	}
 	connector.closed = true
@@ -1604,7 +1618,7 @@ func (a *ReplicatedApply) Close() error {
 		core.mu.Unlock()
 		return ErrReplicatedApplyClosed
 	}
-	if a.walBaseCaptureActive || a.walBaseSelectActive {
+	if a.walBaseState == walBaseCaptureActive || a.walBaseState == walBaseSelectActive {
 		core.mu.Unlock()
 		return ErrReplicatedApplyBusy
 	}
@@ -1616,7 +1630,7 @@ func (a *ReplicatedApply) Close() error {
 		core.mu.Unlock()
 		return err
 	}
-	if a.walBaseSelectPending {
+	if a.walBaseState == walBaseSelectPending {
 		connector.closed = true
 	}
 	a.closed = true
@@ -1978,7 +1992,7 @@ func (a *ReplicatedApply) applyNormal(
 		return raftmodel.Publication{}, nil, err
 	}
 	a.attemptGeneration = a.table.collection.Generation()
-	a.attemptActive = true
+	a.attemptState = replicatedAttemptSingle
 	var publication raftmodel.Publication
 	var completion []byte
 	var err error
@@ -1987,7 +2001,7 @@ func (a *ReplicatedApply) applyNormal(
 	} else {
 		publication, err = a.machine.ApplyNormal(meta, data)
 	}
-	a.attemptActive = false
+	a.attemptState = replicatedAttemptIdle
 	a.attemptGeneration = 0
 	return publication, completion, err
 }
@@ -2013,11 +2027,9 @@ func (a *ReplicatedApply) ApplyNormalBatch(
 		return 0, raftmodel.Publication{}, err
 	}
 	a.attemptGeneration = a.table.collection.Generation()
-	a.attemptActive = true
-	a.attemptBatch = true
+	a.attemptState = replicatedAttemptBatch
 	applied, publication, err := a.machine.ApplyNormalBatch(entries, dataChainWitnesses)
-	a.attemptBatch = false
-	a.attemptActive = false
+	a.attemptState = replicatedAttemptIdle
 	a.attemptGeneration = 0
 	return applied, publication, err
 }
@@ -2046,8 +2058,7 @@ func (a *ReplicatedApply) ApplyNormalBatchWithCompletions(
 		return 0, raftmodel.Publication{}, err
 	}
 	a.attemptGeneration = a.table.collection.Generation()
-	a.attemptActive = true
-	a.attemptBatch = true
+	a.attemptState = replicatedAttemptBatch
 	applied, publication, err := a.machine.ApplyNormalBatchWithCompletions(
 		entries, dataChainWitnesses, completions,
 	)
@@ -2070,8 +2081,7 @@ func (a *ReplicatedApply) ApplyNormalBatchWithCompletions(
 			a.batchCompletionComplete++
 		}
 	}
-	a.attemptBatch = false
-	a.attemptActive = false
+	a.attemptState = replicatedAttemptIdle
 	a.attemptGeneration = 0
 	return applied, publication, err
 }
@@ -2126,7 +2136,7 @@ func (a *ReplicatedApply) InstallSnapshot(
 	if err := a.checkLocked(); err != nil {
 		return raftmodel.Publication{}, err
 	}
-	if a.walBaseSelectActive || a.walBaseSelectPending {
+	if a.walBaseState >= walBaseSelectActive {
 		return raftmodel.Publication{}, ErrReplicatedApplyBusy
 	}
 	pending := a.activationBasePending

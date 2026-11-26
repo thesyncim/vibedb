@@ -108,7 +108,7 @@ func TestQuiesceSchemaGenerationCancellationWaitsForClosedSource(t *testing.T) {
 				if err := <-done; err != nil {
 					t.Fatalf("lost completed source quiesce: %v", err)
 				}
-				if !host.quiesced || !owner.members[fence.Group].generation.quiescing.Load() {
+				if !host.quiesced || !owner.members[fence.Group].generation.isQuiescing() {
 					t.Fatal("successful quiesce left the source active")
 				}
 			})

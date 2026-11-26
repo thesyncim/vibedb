@@ -232,7 +232,7 @@ func newOwnerSubmitAdmissionRig(t *testing.T) ownerSubmitAdmissionRig {
 		_ = registry.Close()
 	})
 	owner.mu.Lock()
-	owner.started = true
+	owner.state = ownerRunning
 	close(owner.ready)
 	owner.mu.Unlock()
 	return ownerSubmitAdmissionRig{

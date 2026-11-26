@@ -70,7 +70,7 @@ func TestRouteGateReadUsesQuorumFloorAndHoldsBoundedLease(t *testing.T) {
 		Status: routegate.Status{Epoch: 17},
 	}}
 	charge, _ := pointReadResponseCharge(routegate.StatusBytes)
-	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{MaxIngressItems: 1, MaxIngressBytes: 16, MaxPendingReadItems: 1, MaxPendingReadBytes: charge}}
+	owner := &Owner{state: ownerRunning, ingress: make(chan ownerRequest, 1), limits: Limits{MaxIngressItems: 1, MaxIngressBytes: 16, MaxPendingReadItems: 1, MaxPendingReadBytes: charge}}
 	authorize := func() {
 		r := <-owner.ingress
 		if r.kind != requestReadRouteGate {

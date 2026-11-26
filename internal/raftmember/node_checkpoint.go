@@ -256,6 +256,15 @@ func (c *NodeCheckpointCoordinator) Close() error {
 	return c.MaintenanceError()
 }
 
+type nodeCheckpointPhase uint8
+
+const (
+	nodeCheckpointIdle nodeCheckpointPhase = iota
+	nodeCheckpointBuilding
+	nodeCheckpointPending
+	nodeCheckpointSubmitted
+)
+
 type nodeCheckpointDriver struct {
 	coordinator *NodeCheckpointCoordinator
 	interval    uint64
@@ -263,9 +272,7 @@ type nodeCheckpointDriver struct {
 	onError     func(error)
 	task        nodeCheckpointTask
 	result      nodeCheckpointBuildResult
-	building    bool
-	pending     bool
-	submitted   bool
+	phase       nodeCheckpointPhase
 }
 
 // ConfigureNodeCheckpointing attaches one Runtime to the node-wide checkpoint
@@ -293,13 +300,13 @@ func (runtime *Runtime) driveNodeCheckpoint(advanceClock bool) error {
 	if driver == nil {
 		return nil
 	}
-	if driver.submitted {
+	switch driver.phase {
+	case nodeCheckpointSubmitted:
 		_, done, err := runtime.nodePersistence.pollCheckpoint()
 		if !done {
 			return nil
 		}
-		driver.submitted = false
-		driver.pending = false
+		driver.phase = nodeCheckpointIdle
 		driver.result = nodeCheckpointBuildResult{}
 		if err != nil {
 			if driver.onError != nil {
@@ -307,33 +314,31 @@ func (runtime *Runtime) driveNodeCheckpoint(advanceClock bool) error {
 			}
 			return err
 		}
-	}
-	if driver.building {
+	case nodeCheckpointBuilding:
 		select {
 		case driver.result = <-driver.task.result:
-			driver.building = false
-			driver.pending = true
+			driver.phase = nodeCheckpointPending
 		default:
 			return nil
 		}
 	}
-	if driver.pending {
+	if driver.phase == nodeCheckpointPending {
 		result := &driver.result
 		if result.err != nil {
 			runtime.reportNodeCheckpointError(result.err)
-			driver.pending = false
+			driver.phase = nodeCheckpointIdle
 			driver.result = nodeCheckpointBuildResult{}
 			return nil
 		}
 		if result.preparation == nil || result.snapshot == nil {
 			runtime.reportNodeCheckpointError(sqldriver.ErrWALBasePreparation)
-			driver.pending = false
+			driver.phase = nodeCheckpointIdle
 			driver.result = nodeCheckpointBuildResult{}
 			return nil
 		}
 		if err := runtime.apply.ValidateWALBasePreparation(result.preparation); err != nil {
 			runtime.reportNodeCheckpointError(err)
-			driver.pending = false
+			driver.phase = nodeCheckpointIdle
 			driver.result = nodeCheckpointBuildResult{}
 			return nil
 		}
@@ -345,7 +350,7 @@ func (runtime *Runtime) driveNodeCheckpoint(advanceClock bool) error {
 			return sqldriver.ErrWALBasePreparation
 		}
 		if result.snapshot.GetMetadata().GetIndex() <= base.GetMetadata().GetIndex() {
-			driver.pending = false
+			driver.phase = nodeCheckpointIdle
 			driver.result = nodeCheckpointBuildResult{}
 			return nil
 		}
@@ -355,7 +360,7 @@ func (runtime *Runtime) driveNodeCheckpoint(advanceClock bool) error {
 			}
 			return err
 		}
-		driver.submitted = true
+		driver.phase = nodeCheckpointSubmitted
 		return nil
 	}
 	if !advanceClock {
@@ -389,7 +394,7 @@ func (runtime *Runtime) driveNodeCheckpoint(advanceClock bool) error {
 		runtime.reportNodeCheckpointError(err)
 		return nil
 	}
-	driver.building = true
+	driver.phase = nodeCheckpointBuilding
 	return nil
 }
 
@@ -404,15 +409,13 @@ func (driver *nodeCheckpointDriver) stopAndWait(persistence *NodeRuntimePersiste
 		return nil
 	}
 	var err error
-	if driver.building {
+	switch driver.phase {
+	case nodeCheckpointBuilding:
 		driver.result = <-driver.task.result
-		driver.building = false
-	}
-	if driver.submitted {
+	case nodeCheckpointSubmitted:
 		_, err = persistence.waitCheckpoint()
-		driver.submitted = false
 	}
-	driver.pending = false
+	driver.phase = nodeCheckpointIdle
 	driver.result = nodeCheckpointBuildResult{}
 	driver.task.apply = nil
 	return err

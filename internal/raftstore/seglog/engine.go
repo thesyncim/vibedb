@@ -136,14 +136,21 @@ type engineGroup struct {
 	latestWaveDigest    [32]byte
 	latestWaveSequence  uint64
 }
+type segmentReaderState uint8
+
+const (
+	segmentReaderEmpty segmentReaderState = iota
+	segmentReaderAccepting
+	segmentReaderDetached
+)
+
 type segmentReader struct {
 	id         uint64
 	generation uint64
 	file       *os.File
 	routes     *LazyRouteReader
 	leases     atomic.Uint32
-	accepting  bool
-	detached   bool
+	state      segmentReaderState
 }
 
 // ReadLease pins one cached segment reader across a Lookup/Read gap. It is a
@@ -307,7 +314,7 @@ func (e *Engine) closeReaderLocked(reader *segmentReader) error {
 	if reader == nil {
 		return nil
 	}
-	reader.accepting = false
+	reader.state = segmentReaderEmpty
 	if reader.file == nil {
 		reader.routes = nil
 		return nil
@@ -315,7 +322,6 @@ func (e *Engine) closeReaderLocked(reader *segmentReader) error {
 	err := reader.file.Close()
 	reader.file = nil
 	reader.routes = nil
-	reader.detached = false
 	return err
 }
 
@@ -326,8 +332,17 @@ func (e *Engine) releaseReaderLease(reader *segmentReader) {
 	if reader.leases.Add(^uint32(0)) == 0 {
 		e.readerMu.Lock()
 		e.ensureReaderCondLocked()
-		if reader.detached {
+		if reader.state == segmentReaderDetached {
 			_ = e.closeReaderLocked(reader)
+			for i, candidate := range e.detachedReaders {
+				if candidate == reader {
+					last := len(e.detachedReaders) - 1
+					e.detachedReaders[i] = e.detachedReaders[last]
+					e.detachedReaders[last] = nil
+					e.detachedReaders = e.detachedReaders[:last]
+					break
+				}
+			}
 		}
 		e.readerCond.Broadcast()
 		e.readerMu.Unlock()
@@ -369,7 +384,7 @@ func (e *Engine) acquireReaderLocked(segmentID uint64) (*segmentReader, ReadLeas
 
 func (e *Engine) acquireReaderRefLocked(segmentID uint64) (*segmentReader, bool) {
 	for _, reader := range e.readers {
-		if reader == nil || reader.id != segmentID || reader.file == nil || !reader.accepting {
+		if reader == nil || reader.id != segmentID || reader.file == nil || reader.state != segmentReaderAccepting {
 			continue
 		}
 		reader.leases.Add(1)
@@ -382,9 +397,8 @@ func (e *Engine) detachReaderLocked(reader *segmentReader) error {
 	if reader == nil || reader.file == nil {
 		return nil
 	}
-	reader.accepting = false
 	if reader.leases.Load() != 0 {
-		reader.detached = true
+		reader.state = segmentReaderDetached
 		e.detachedReaders = append(e.detachedReaders, reader)
 		return nil
 	}
@@ -498,13 +512,13 @@ func (e *Engine) Close() error {
 	e.readerMu.Lock()
 	e.ensureReaderCondLocked()
 	for _, reader := range e.readers {
-		if reader != nil {
-			reader.accepting = false
+		if reader != nil && reader.state == segmentReaderAccepting {
+			reader.state = segmentReaderEmpty
 		}
 	}
 	for _, reader := range e.detachedReaders {
-		if reader != nil {
-			reader.accepting = false
+		if reader != nil && reader.state == segmentReaderAccepting {
+			reader.state = segmentReaderEmpty
 		}
 	}
 	for e.readersHaveLeasesLocked() {
@@ -660,7 +674,7 @@ func (e *Engine) prepareSegmentLocked(segmentID uint64) error {
 		return ErrBounds
 	}
 	for _, reader := range e.readers {
-		if reader != nil && reader.id == segmentID && reader.file != nil && reader.accepting {
+		if reader != nil && reader.id == segmentID && reader.file != nil && reader.state == segmentReaderAccepting {
 			return nil
 		}
 	}
@@ -684,7 +698,7 @@ func (e *Engine) prepareSegmentLocked(segmentID uint64) error {
 		_ = f.Close()
 		return err
 	}
-	e.readers[slot] = &segmentReader{id: segmentID, generation: segmentID, file: f, routes: routes, accepting: true}
+	e.readers[slot] = &segmentReader{id: segmentID, generation: segmentID, file: f, routes: routes, state: segmentReaderAccepting}
 	return nil
 }
 

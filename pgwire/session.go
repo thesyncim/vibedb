@@ -275,6 +275,15 @@ func (p *prepared) release() {
 // invalidates it rather than allocating one executor per portal. Resumption
 // after invalidation returns 55000; silently reading overwritten result storage
 // is never an option.
+type portalState uint8
+
+const (
+	portalBound portalState = iota
+	portalActiveRuntime
+	portalInvalidated
+	portalExhausted
+)
+
 type portal struct {
 	session *session
 	name    string
@@ -309,14 +318,11 @@ type portal struct {
 	// session-wide portal bound.
 	retainedBytes int
 
-	// started marks a portal that has begun executing; row is the next fixed
-	// row to send.
-	started       bool
-	exhausted     bool
+	// state tracks the portal's explicit execution lifecycle; row is the next
+	// row ordinal sent.
+	state         portalState
 	row           int
 	runtime       BackendRows
-	runtimeOpen   bool
-	invalidated   bool
 	discoveryRows *fixedResult
 }
 
@@ -334,11 +340,10 @@ type boundValueSlot struct {
 
 func (p *portal) release() {
 	p.discoveryRows = nil
-	if p.runtimeOpen {
+	if p.state == portalActiveRuntime {
 		_ = p.runtime.Close()
-		p.runtimeOpen = false
+		p.state = portalBound
 	}
-	p.started = false
 }
 
 // resetForBind returns an existing portal object to its just-created state
@@ -350,9 +355,8 @@ func (p *portal) resetForBind(name string, stmt *prepared) {
 	p.name = name
 	p.stmt = stmt
 	p.retainedBytes = 0
-	p.exhausted = false
+	p.state = portalBound
 	p.row = 0
-	p.invalidated = false
 }
 
 func (p *portal) operationContext() context.Context {
@@ -1826,7 +1830,7 @@ func (s *session) executeSavepoint(stmt *prepared) error {
 
 func (s *session) executeRuntimeExec(p *portal) error {
 	kind := p.stmt.runtime.Kind()
-	if p.exhausted {
+	if p.state == portalExhausted {
 		s.w.commandComplete(runtimeCommandTag(kind, 0))
 		return nil
 	}
@@ -1851,8 +1855,7 @@ func (s *session) executeRuntimeExec(p *portal) error {
 		// racing with the acknowledgement is consumed but cannot truthfully
 		// turn that durable success into a 57014 failure.
 	}
-	p.started = true
-	p.exhausted = true
+	p.state = portalExhausted
 	s.w.commandComplete(runtimeCommandTag(kind, result.RowsAffected))
 	return nil
 }
@@ -1915,7 +1918,7 @@ func (s *session) executeRuntimeExecAsync(p *portal) (handled bool, err error) {
 	// ordinary synchronous executeRuntimeExec, though, is about to write a
 	// CommandComplete directly — exactly the write answerOrDefer would drain
 	// for, so it must drain here for the same reason.
-	if p.exhausted {
+	if p.state == portalExhausted {
 		if err := s.drainDirectPendingIfAny(); err != nil {
 			return true, err
 		}
@@ -1972,8 +1975,7 @@ func (s *session) executeRuntimeExecAsync(p *portal) (handled bool, err error) {
 			return
 		}
 	}()
-	p.started = true
-	p.exhausted = true
+	p.state = portalExhausted
 	s.directPending = append(s.directPending, pending)
 	return true, nil
 }
@@ -2064,19 +2066,17 @@ func runtimeKindIsDDL(kind sqlast.Kind) bool {
 
 func (s *session) executeRuntimeQuery(p *portal, limit int32) error {
 	kind := p.stmt.runtime.Kind()
-	if p.exhausted {
+	switch p.state {
+	case portalExhausted:
 		if kind == sqlast.KindSelect {
 			s.w.commandComplete(commandTag(0))
 		} else {
 			s.w.commandComplete(runtimeCommandTag(kind, 0))
 		}
 		return nil
-	}
-	if p.invalidated {
-		p.exhausted = true
+	case portalInvalidated:
 		return invalidatedPortalError()
-	}
-	if !p.started {
+	case portalBound:
 		if s.takeCancel() {
 			return queryCanceled()
 		}
@@ -2091,6 +2091,8 @@ func (s *session) executeRuntimeQuery(p *portal, limit int32) error {
 			cancelPortal(p)
 			return queryCanceled()
 		}
+	case portalActiveRuntime:
+		// Resuming a suspended runtime portal.
 	}
 
 	sent := 0
@@ -2119,12 +2121,10 @@ func (s *session) executeRuntimeQuery(p *portal, limit int32) error {
 		cancelPortal(p)
 		return queryCanceled()
 	}
-	p.exhausted = true
+	p.state = portalExhausted
 	if err := p.runtime.Close(); err != nil {
-		p.runtimeOpen = false
 		return asPGErrorIn(err, p.stmt.sql)
 	}
-	p.runtimeOpen = false
 	if kind == sqlast.KindSelect {
 		s.w.commandComplete(commandTag(p.row))
 	} else {
@@ -2138,24 +2138,21 @@ func (s *session) startRuntime(p *portal) error {
 	if err := p.stmt.runtime.QueryInto(p.operationContext(), p.args, &p.runtime); err != nil {
 		return err
 	}
-	p.runtimeOpen = true
 	if err := checkDataRows(p.runtime.Snapshot(), p.stmt.cols, p.formats); err != nil {
 		_ = p.runtime.Close()
-		p.runtimeOpen = false
 		return err
 	}
-	p.started = true
+	p.state = portalActiveRuntime
 	return nil
 }
 
 func (s *session) invalidateRuntimePortals(current *portal) {
 	for _, candidate := range s.portals {
-		if candidate == current || !candidate.runtimeOpen {
+		if candidate == current || candidate.state != portalActiveRuntime {
 			continue
 		}
 		_ = candidate.runtime.Close()
-		candidate.runtimeOpen = false
-		candidate.invalidated = true
+		candidate.state = portalInvalidated
 	}
 }
 
@@ -2306,5 +2303,5 @@ func queryCanceled() *pgError {
 
 func cancelPortal(p *portal) {
 	p.release()
-	p.exhausted = true
+	p.state = portalExhausted
 }

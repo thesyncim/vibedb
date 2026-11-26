@@ -22,8 +22,7 @@ func (permit *servingFencePermit) valid(
 ) bool {
 	return permit != nil && permit.revoked.Load() == 0 &&
 		permit.fence == fence && permit.generation == generation &&
-		generation != nil && !generation.transitionFenced.Load() &&
-		!generation.quiescing.Load()
+		generation.active()
 }
 
 func (permit *servingFencePermit) revoke() {
@@ -47,7 +46,7 @@ func (owner *Owner) ensureServingFencePermit(
 	if !found || member.generation == nil {
 		return nil
 	}
-	if member.generation.transitionFenced.Load() || member.generation.quiescing.Load() {
+	if !member.generation.active() {
 		return nil
 	}
 	fence := group.Fence()
@@ -123,7 +122,7 @@ func (owner *Owner) storeOwnerMember(group raftmember.GroupKey, next ownerMember
 		}
 		sameEpoch := current.identity == next.identity &&
 			current.command == next.command &&
-			current.generation == next.generation && current.retiring == next.retiring
+			current.generation == next.generation && current.state == next.state
 		if sameEpoch {
 			// A stale local ownerMember copy must not restore a capability
 			// which an earlier explicit revoke cleared from the map.

@@ -117,14 +117,31 @@ const (
 // stores a cleaned absolute directory with existing symlink components
 // resolved. That directory must not be renamed or replaced before Close:
 // recovery journals are intentionally paired by stable primary pathname, and
+type databaseCloseState uint8
+
+const (
+	databaseOpen databaseCloseState = iota
+	databaseClosing
+	databaseClosed
+)
+
+type databaseEntryState uint8
+
+const (
+	entryLive databaseEntryState = iota
+	entryClosed
+	entryDeleting
+	entryDeletingClosed
+	entryPrimaryRemoved
+)
+
 // txn.vtm is paired by the same directory.
 type Database struct {
 	dir      string
 	fileMode os.FileMode
 
 	mu          sync.RWMutex
-	closed      bool
-	closeDone   bool
+	state       databaseCloseState
 	closeErr    error
 	collections map[string]*databaseEntry
 
@@ -144,13 +161,18 @@ type databaseEntry struct {
 	filename   string
 	collection *Collection
 	file       *os.File
-	// deleting keeps a successfully closed entry in the map until both its
-	// primary and journal removals have crossed their directory fences. It is
-	// hidden from reads/snapshots but makes a failed Drop retryable by name.
-	deleting       bool
-	primaryRemoved bool
-	closeDone      bool
-	closeErr       error
+	// state tracks the entry's monotonic close/drop lifecycle so a failed Drop
+	// remains retryable by name without violating primary-before-journal order.
+	state    databaseEntryState
+	closeErr error
+}
+
+func (e *databaseEntry) isDeleting() bool {
+	return e.state >= entryDeleting
+}
+
+func (e *databaseEntry) isCloseDone() bool {
+	return e.state == entryClosed || e.state >= entryDeletingClosed
 }
 
 // DatabaseOptions configure a Database itself, as opposed to the collections in
@@ -464,7 +486,7 @@ func (d *Database) CreateCollection(name string, options Options) (*Collection, 
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.closed {
+	if d.state != databaseOpen {
 		return nil, ErrDatabaseClosed
 	}
 	if log := lookupDatabaseTxnLog(d); log != nil && log.checkpointGroupMutationFenced() {
@@ -515,12 +537,12 @@ func (d *Database) Collection(name string) (*Collection, bool) {
 		return nil, false
 	}
 	d.mu.RLock()
-	if d.closed {
+	if d.state != databaseOpen {
 		d.mu.RUnlock()
 		return nil, false
 	}
 	entry, ok := d.collections[name]
-	if ok && entry.deleting {
+	if ok && entry.isDeleting() {
 		ok = false
 	}
 	d.mu.RUnlock()
@@ -564,7 +586,7 @@ func (d *Database) DropCollection(name string) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.closed {
+	if d.state != databaseOpen {
 		return ErrDatabaseClosed
 	}
 	if log := lookupDatabaseTxnLog(d); log != nil && log.checkpointGroupMutationFenced() {
@@ -574,19 +596,23 @@ func (d *Database) DropCollection(name string) error {
 	if !ok {
 		return nil
 	}
-	if !entry.deleting {
+	if !entry.isDeleting() {
 		if err := d.retireCollectionBeforeDrop(entry); err != nil {
 			return err
 		}
-		entry.deleting = true
+		if entry.state == entryClosed {
+			entry.state = entryDeletingClosed
+		} else {
+			entry.state = entryDeleting
+		}
 		d.reorder()
 	}
 	closeErr := entry.close()
-	if !entry.closeDone {
+	if !entry.isCloseDone() {
 		return closeErr
 	}
 	primary := filepath.Join(d.dir, entry.filename)
-	if !entry.primaryRemoved {
+	if entry.state != entryPrimaryRemoved {
 		if err := os.Remove(primary); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return errors.Join(closeErr, err)
 		}
@@ -597,7 +623,7 @@ func (d *Database) DropCollection(name string) error {
 			return errors.Join(closeErr,
 				fmt.Errorf("vibedb: persist dropped collection: %w", err))
 		}
-		entry.primaryRemoved = true
+		entry.state = entryPrimaryRemoved
 	}
 	journal := RecoveryJournalPath(primary)
 	if err := os.Remove(journal); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -675,14 +701,14 @@ func (d *Database) Close() error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.closeDone {
+	if d.state == databaseClosed {
 		return d.closeErr
 	}
 	if log := lookupDatabaseTxnLog(d); log != nil && log.checkpointGroupOwned() {
 		return ErrCheckpointGroupOwned
 	}
-	if !d.closed {
-		d.closed = true
+	if d.state == databaseOpen {
+		d.state = databaseClosing
 		// Admission and catalog visibility end at the first attempt, but entry
 		// ownership does not. Unfinished entries remain in collections so a
 		// later Close can resume their low-level teardown state machine.
@@ -698,7 +724,7 @@ func (d *Database) Close() error {
 	var retryable error
 	for _, entry := range d.collections {
 		err := entry.close()
-		if !entry.closeDone {
+		if !entry.isCloseDone() {
 			retryable = errors.Join(retryable, err)
 			continue
 		}
@@ -708,7 +734,7 @@ func (d *Database) Close() error {
 		return errors.Join(d.closeErr, retryable)
 	}
 	d.collections = nil
-	d.closeDone = true
+	d.state = databaseClosed
 	return d.closeErr
 }
 
@@ -721,7 +747,7 @@ func (d *Database) CloseCompleted() bool {
 		return true
 	}
 	d.mu.RLock()
-	done := d.closeDone
+	done := d.state == databaseClosed
 	d.mu.RUnlock()
 	return done
 }
@@ -738,7 +764,7 @@ func (d *Database) rememberCloseError(err error) {
 }
 
 func (e *databaseEntry) close() error {
-	if e.closeDone {
+	if e.isCloseDone() {
 		return e.closeErr
 	}
 	collectionErr := e.collection.Close()
@@ -750,7 +776,11 @@ func (e *databaseEntry) close() error {
 	// descriptor close, so cache the joined terminal result and let catalog Drop
 	// continue removing the paired namespace.
 	e.closeErr = errors.Join(collectionErr, e.file.Close())
-	e.closeDone = true
+	if e.state == entryDeleting {
+		e.state = entryDeletingClosed
+	} else {
+		e.state = entryClosed
+	}
 	return e.closeErr
 }
 
@@ -842,7 +872,7 @@ func (d *Database) reorder() {
 	d.order = d.order[:0]
 	d.snapshotOrder = d.snapshotOrder[:0]
 	for _, entry := range d.collections {
-		if entry.deleting {
+		if entry.isDeleting() {
 			continue
 		}
 		d.order = append(d.order, entry)

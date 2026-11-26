@@ -366,7 +366,7 @@ func TestRuntimeUnclassifiedSettlementFailureIsTerminal(t *testing.T) {
 	if err := runtime.Close(); err != nil {
 		t.Fatalf("terminal settlement close = %v", err)
 	}
-	if !runtime.closed || runtime.node != nil || runtime.apply != nil ||
+	if runtime.state != runtimeClosed || runtime.node != nil || runtime.apply != nil ||
 		runtime.database != nil || runtime.wal != nil {
 		t.Fatalf("terminal settlement retained resources: %+v", runtime)
 	}

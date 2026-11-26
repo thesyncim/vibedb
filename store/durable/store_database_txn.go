@@ -1323,7 +1323,7 @@ func (d *Database) Update(fn func(*DatabaseBatch) error) error {
 	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	if d.closed {
+	if d.state != databaseOpen {
 		return ErrDatabaseClosed
 	}
 	log, err := ensureDatabaseTxnLog(d)

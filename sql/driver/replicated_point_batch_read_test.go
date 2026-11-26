@@ -68,8 +68,8 @@ func TestReplicatedPointBatchReadUsesCoherentCutAndActivationFences(t *testing.T
 		{"foreign-claim", func() { core.replicatedApplyClaim = nil }, func() { core.replicatedApplyClaim = apply }, ErrReplicatedApplyClosed},
 		{"closed-database", func() { core.closed = true }, func() { core.closed = false }, ErrReplicatedApplyClosed},
 		{"activation", func() { apply.activationBasePending[0] = 1 }, func() { apply.activationBasePending = [32]byte{} }, ErrReplicatedApplyBasePending},
-		{"wal-active", func() { apply.walBaseSelectActive = true }, func() { apply.walBaseSelectActive = false }, ErrReplicatedApplyBusy},
-		{"wal-pending", func() { apply.walBaseSelectPending = true }, func() { apply.walBaseSelectPending = false }, ErrReplicatedApplyBusy},
+		{"wal-active", func() { apply.walBaseState = walBaseSelectActive }, func() { apply.walBaseState = walBaseIdle }, ErrReplicatedApplyBusy},
+		{"wal-pending", func() { apply.walBaseState = walBaseSelectPending }, func() { apply.walBaseState = walBaseIdle }, ErrReplicatedApplyBusy},
 	} {
 		t.Run(test.name, func(t *testing.T) { test.set(); defer test.reset(); assertFailure(t, packed, floor, 4096, test.want) })
 	}

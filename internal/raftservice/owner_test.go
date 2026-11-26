@@ -48,7 +48,9 @@ func TestOwnerDropsTransferredPeerTrafficOnlyWhileSchemaGenerationQuiesces(t *te
 	if err := deliver(); err != nil || host.adopted != 1 {
 		t.Fatalf("active inbound err=%v adopted=%d", err, host.adopted)
 	}
-	generation.quiescing.Store(true)
+	if !generation.quiesce() {
+		t.Fatal("active generation failed to quiesce")
+	}
 	if err := deliver(); err != nil || host.adopted != 1 {
 		t.Fatalf("quiescing inbound err=%v adopted=%d", err, host.adopted)
 	}
@@ -57,30 +59,42 @@ func TestOwnerDropsTransferredPeerTrafficOnlyWhileSchemaGenerationQuiesces(t *te
 func newDeliveryTestOwner() *Owner {
 	return &Owner{
 		limits:  Limits{MaxIngressItems: 1, MaxIngressBytes: 1},
-		ingress: make(chan ownerRequest, 1), started: true,
+		ingress: make(chan ownerRequest, 1), state: ownerRunning,
 	}
 }
 
 func TestOwnerGenerationPinsFenceQuiesceRace(t *testing.T) {
 	generation := &ownerGeneration{}
-	if !generation.acquire() || generation.pins.Load() != 1 {
+	if !generation.acquire() || generation.pinCount() != 1 {
 		t.Fatal("first generation pin refused")
 	}
 	if generation.quiesce() {
 		t.Fatal("generation quiesced with a live pin")
 	}
-	generation.quiescing.Store(true)
-	if generation.acquire() || generation.pins.Load() != 1 {
-		t.Fatal("quiescing generation admitted a new pin")
+	generation.fence()
+	if generation.acquire() || generation.pinCount() != 1 {
+		t.Fatal("fenced generation admitted a new pin")
 	}
 	generation.release()
-	if generation.pins.Load() != 0 {
-		t.Fatalf("pins after release=%d", generation.pins.Load())
+	if generation.pinCount() != 0 {
+		t.Fatalf("pins after release=%d", generation.pinCount())
+	}
+	if !generation.quiesce() || generation.pinCount() != 0 {
+		t.Fatal("fenced generation with zero pins failed to quiesce")
 	}
 	generation.resume()
-	if !generation.quiesce() || generation.pins.Load() != 0 {
-		t.Fatal("drained generation did not quiesce")
+	if generation.acquire() {
+		t.Fatal("resume unfenced a fenced generation")
 	}
+	unpinned := &ownerGeneration{}
+	if !unpinned.quiesce() || !unpinned.isQuiescing() || unpinned.acquire() {
+		t.Fatal("active unpinned generation did not quiesce")
+	}
+	unpinned.resume()
+	if !unpinned.acquire() {
+		t.Fatal("resumed active generation refused pin")
+	}
+	unpinned.release()
 }
 
 func TestOwnerProposalDeliveryCancellationWinsBeforeOwnerHandoff(t *testing.T) {
@@ -201,7 +215,7 @@ func TestCommittedSchemaFenceSettlesAlreadyActivatedTarget(t *testing.T) {
 }
 
 func TestProposeSchemaTransitionDetachesBoundedCommand(t *testing.T) {
-	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
+	owner := &Owner{state: ownerRunning, ingress: make(chan ownerRequest, 1), limits: Limits{
 		MaxIngressItems: 1, MaxIngressBytes: replicatedstate.MaxSchemaTransitionBytes,
 	}}
 	command := []byte{1, 2, 3}
@@ -228,7 +242,7 @@ func TestProposeSchemaTransitionDetachesBoundedCommand(t *testing.T) {
 }
 
 func TestObserveSchemaTransitionDetachesBoundedCommand(t *testing.T) {
-	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
+	owner := &Owner{state: ownerRunning, ingress: make(chan ownerRequest, 1), limits: Limits{
 		MaxIngressItems: 1, MaxIngressBytes: replicatedstate.MaxSchemaTransitionBytes,
 	}}
 	group := peerServerTestGroup()
@@ -365,7 +379,7 @@ func TestOwnerPointReadBatchUsesOneLinearAuthorization(t *testing.T) {
 	if !ok {
 		t.Fatal("charge")
 	}
-	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
+	owner := &Owner{state: ownerRunning, ingress: make(chan ownerRequest, 1), limits: Limits{
 		MaxIngressItems: 1, MaxIngressBytes: int64(len(packed)),
 		MaxPendingReadItems: 1, MaxPendingReadBytes: charge,
 	}}
@@ -429,7 +443,7 @@ func TestPointReadResponseBudgetSaturatesAcrossLiveGrowthBoundaryLeases(t *testi
 			ReplicaSetVersion: serving.Command.ReplicaSetVersion, Applied: 9},
 		Found: true, Value: make([]byte, maximum),
 	}}
-	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
+	owner := &Owner{state: ownerRunning, ingress: make(chan ownerRequest, 1), limits: Limits{
 		MaxIngressItems: 1, MaxIngressBytes: 16,
 		MaxPendingReadItems: 2, MaxPendingReadBytes: charge,
 	}}
@@ -482,7 +496,7 @@ func TestPointReadLeaseKeepsConcurrentResponseBudgetCharged(t *testing.T) {
 	if !ok || charge <= 2*(4<<20)+8_211 {
 		t.Fatalf("resident response charge=%d ok=%t", charge, ok)
 	}
-	owner := &Owner{started: true, limits: Limits{
+	owner := &Owner{state: ownerRunning, limits: Limits{
 		MaxPendingReadItems: 1, MaxPendingReadBytes: charge,
 	}}
 	if err := owner.reservePendingRead(charge); err != nil {
@@ -744,7 +758,7 @@ func TestOwnerRejectsBeforeSerializedHostLaneStarts(t *testing.T) {
 func TestOwnerPendingProposalBudgetIsIndependentAndReclaimable(t *testing.T) {
 	owner := &Owner{
 		limits:  Limits{MaxPendingProposalItems: 2, MaxPendingProposalBytes: 7},
-		started: true,
+		state: ownerRunning,
 	}
 	if err := owner.reservePendingProposal(4); err != nil {
 		t.Fatal(err)
@@ -774,7 +788,7 @@ func TestOwnerPendingProposalBudgetIsIndependentAndReclaimable(t *testing.T) {
 		t.Fatalf("released accounting = %d/%d",
 			owner.pendingProposalItems, owner.pendingProposalBytes)
 	}
-	owner.closed = true
+	owner.state = ownerClosed
 	if err := owner.reservePendingProposal(1); !errors.Is(err, ErrOwnerClosed) {
 		t.Fatalf("closed reserve = %v", err)
 	}

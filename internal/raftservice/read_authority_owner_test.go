@@ -197,7 +197,7 @@ func newReadAuthorityOwnerFixture(t testing.TB) readAuthorityOwnerFixture {
 	host := &authorityTestHost{status: status, token: readAuthorityTestToken(group)}
 	generation := &ownerGeneration{}
 	metrics := new(ProgressMetrics)
-	owner := &Owner{host: host, started: true, ingress: make(chan ownerRequest, 4),
+	owner := &Owner{host: host, state: ownerRunning, ingress: make(chan ownerRequest, 4),
 		members: map[raftmember.GroupKey]ownerMember{group: {
 			identity: raftmember.RuntimeIdentity{Group: group, AllocationGeneration: 3,
 				MemberID: 2, StoreID: [16]byte{3}, NodeIncarnation: 4,
@@ -408,9 +408,9 @@ func TestOwnerQuiesceFailedPinsRevokesServingPermitBeforeTransition(t *testing.T
 	if !errors.Is(err, ErrServingFence) {
 		t.Fatalf("quiesce with live pin = %v, want ErrServingFence", err)
 	}
-	if fixture.generation.pins.Load() != 1 || fixture.generation.quiescing.Load() {
+	if fixture.generation.pinCount() != 1 || fixture.generation.isQuiescing() {
 		t.Fatalf("failed quiesce changed generation state: pins=%d quiescing=%v",
-			fixture.generation.pins.Load(), fixture.generation.quiescing.Load())
+			fixture.generation.pinCount(), fixture.generation.isQuiescing())
 	}
 	if old.valid(fixture.fence, fixture.generation) ||
 		fixture.owner.members[fixture.group].permit != nil {
@@ -578,9 +578,9 @@ func TestOwnerPointReadAuthorityFastPathUsesCommitFloorAndSkipsReadIndex(t *test
 		t.Fatalf("authority metrics=%+v", got)
 	}
 	if fixture.owner.pendingReadItems != 0 || fixture.owner.pendingReadBytes != 0 ||
-		fixture.generation.pins.Load() != 0 {
+		fixture.generation.pinCount() != 0 {
 		t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems,
-			fixture.owner.pendingReadBytes, fixture.generation.pins.Load())
+			fixture.owner.pendingReadBytes, fixture.generation.pinCount())
 	}
 }
 
@@ -644,9 +644,9 @@ func TestOwnerLinearizablePointCutAuthorityPathSkipsReadIndex(t *testing.T) {
 		t.Fatalf("authority metrics=%+v", got)
 	}
 	if fixture.owner.pendingReadItems != 0 || fixture.owner.pendingReadBytes != 0 ||
-		fixture.generation.pins.Load() != 0 {
+		fixture.generation.pinCount() != 0 {
 		t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems,
-			fixture.owner.pendingReadBytes, fixture.generation.pins.Load())
+			fixture.owner.pendingReadBytes, fixture.generation.pinCount())
 	}
 }
 
@@ -685,9 +685,9 @@ func TestOwnerLinearizablePointCutRetriesAfterAuthorityValidation(t *testing.T) 
 		t.Fatalf("authority metrics=%+v", got)
 	}
 	if fixture.owner.pendingReadItems != 0 || fixture.owner.pendingReadBytes != 0 ||
-		fixture.generation.pins.Load() != 0 {
+		fixture.generation.pinCount() != 0 {
 		t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems,
-			fixture.owner.pendingReadBytes, fixture.generation.pins.Load())
+			fixture.owner.pendingReadBytes, fixture.generation.pinCount())
 	}
 }
 
@@ -701,7 +701,7 @@ func TestOwnerLinearizablePointCutRejectsGenerationFenceChanges(t *testing.T) {
 		wantCalls       int
 	}{
 		{name: "transition fenced", mutate: func(fixture readAuthorityOwnerFixture) {
-			fixture.generation.transitionFenced.Store(true)
+			fixture.generation.fence()
 		}, wantErr: ErrServingFence, wantReadIndexes: 1, wantCalls: 1},
 		{name: "command fence changed", mutate: func(fixture readAuthorityOwnerFixture) {
 			member := fixture.owner.members[fixture.group]
@@ -751,10 +751,10 @@ func TestOwnerLinearizablePointCutRejectsGenerationFenceChanges(t *testing.T) {
 			}
 			currentGeneration := fixture.owner.members[fixture.group].generation
 			if fixture.owner.pendingReadItems != 0 || fixture.owner.pendingReadBytes != 0 ||
-				fixture.generation.pins.Load() != 0 || currentGeneration == nil ||
-				currentGeneration.pins.Load() != 0 {
+				fixture.generation.pinCount() != 0 || currentGeneration == nil ||
+				currentGeneration.pinCount() != 0 {
 				t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems,
-					fixture.owner.pendingReadBytes, fixture.generation.pins.Load())
+					fixture.owner.pendingReadBytes, fixture.generation.pinCount())
 			}
 		})
 	}
@@ -788,9 +788,9 @@ func TestOwnerPointReadAuthorityExpiryFallsBackToReadIndexOnce(t *testing.T) {
 		t.Fatalf("authority metrics=%+v", got)
 	}
 	if fixture.owner.pendingReadItems != 0 || fixture.owner.pendingReadBytes != 0 ||
-		fixture.generation.pins.Load() != 0 {
+		fixture.generation.pinCount() != 0 {
 		t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems,
-			fixture.owner.pendingReadBytes, fixture.generation.pins.Load())
+			fixture.owner.pendingReadBytes, fixture.generation.pinCount())
 	}
 }
 
@@ -833,9 +833,9 @@ func TestOwnerPointBatchAuthorityFastPathFinalValidationAndCancelCleanup(t *test
 	readIndexes = fixture.host.readIndexes
 	fixture.host.mu.Unlock()
 	if validations != 1 || readIndexes != 0 || fixture.owner.pendingReadItems != 0 ||
-		fixture.owner.pendingReadBytes != 0 || fixture.generation.pins.Load() != 0 {
+		fixture.owner.pendingReadBytes != 0 || fixture.generation.pinCount() != 0 {
 		t.Fatalf("canceled cleanup validations=%d readIndexes=%d reads=%d/%d pins=%d",
 			validations, readIndexes, fixture.owner.pendingReadItems, fixture.owner.pendingReadBytes,
-			fixture.generation.pins.Load())
+			fixture.generation.pinCount())
 	}
 }

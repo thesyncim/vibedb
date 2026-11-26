@@ -55,7 +55,7 @@ func newSharedBarrierFixture(t testing.TB) *sharedBarrierFixture {
 	}}
 	owner := &Owner{
 		host:    host,
-		started: true, ingress: make(chan ownerRequest, 16), done: make(chan struct{}),
+		state: ownerRunning, ingress: make(chan ownerRequest, 16), done: make(chan struct{}),
 		members: map[raftmember.GroupKey]ownerMember{group: {
 			identity:   raftmember.RuntimeIdentity{Group: group, AllocationGeneration: 1, MemberID: 1, StoreID: [16]byte{1}, NodeIncarnation: 1},
 			command:    command,
@@ -247,7 +247,7 @@ func TestSharedReadBarrierKeepsIndividualFloors(t *testing.T) {
 	f.settleAll(t, nil)
 	settleDeliveryReply(t, first, 9)
 	settleDeliveryReply(t, second, 15)
-	if f.generation.pins.Load() != 0 {
+	if f.generation.pinCount() != 0 {
 		t.Fatal("generation pins leaked")
 	}
 }
@@ -292,7 +292,7 @@ func TestSharedReadBarrierRetainsCanceledWaiterBudget(t *testing.T) {
 				t.Fatal("abandoned delivery was replied to")
 			default:
 			}
-			if len(f.owner.pendingReads) != 0 || len(f.owner.sharedBarrierWaiters) != 0 || len(f.owner.inflightBarrier) != 0 || f.owner.sharedReadWaiterCount != 0 || f.generation.pins.Load() != 0 {
+			if len(f.owner.pendingReads) != 0 || len(f.owner.sharedBarrierWaiters) != 0 || len(f.owner.inflightBarrier) != 0 || f.owner.sharedReadWaiterCount != 0 || f.generation.pinCount() != 0 {
 				t.Fatal("barrier retained state after settlement")
 			}
 		})

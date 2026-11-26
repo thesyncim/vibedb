@@ -174,25 +174,33 @@ func (d *Database) ResumeReplicatedSnapshotActivation(
 // replica while one authenticated snapshot artifact is written directly into
 // its final hidden and dense relation collections. Artifact memory is bounded by the
 // replicated-state verifier; no complete artifact copy is retained here.
+type replicatedSnapshotStageState uint8
+
+const (
+	snapshotStageReceiving replicatedSnapshotStageState = iota
+	snapshotStageCandidateProved
+	snapshotStageInstalled
+	snapshotStageActivated
+	snapshotStageClosed
+)
+
 type ReplicatedSnapshotStage struct {
 	mu sync.Mutex
 
-	owner             *dbConnector
-	database          *database
-	table             *table
-	base              ReplicatedShardStoreIdentity
-	identity          ReplicatedApplyIdentity
-	expected          replicatedstate.SnapshotArtifactManifest
-	stage             *replicatedstate.SnapshotArtifactStage
-	candidateProved   bool
-	seedEnvelope      []byte
-	seedKey           []byte
-	claim             *ReplicatedApply
-	machine           *replicatedstate.Machine
-	snapshotInstalled bool
-	snapshotBase      *pb.Snapshot
-	activation        ReplicatedChildActivation
-	closed            bool
+	owner        *dbConnector
+	database     *database
+	table        *table
+	base         ReplicatedShardStoreIdentity
+	identity     ReplicatedApplyIdentity
+	expected     replicatedstate.SnapshotArtifactManifest
+	stage        *replicatedstate.SnapshotArtifactStage
+	seedEnvelope []byte
+	seedKey      []byte
+	claim        *ReplicatedApply
+	machine      *replicatedstate.Machine
+	snapshotBase *pb.Snapshot
+	activation   ReplicatedChildActivation
+	state        replicatedSnapshotStageState
 }
 
 // OpenReplicatedSnapshotStage creates or resumes the sole non-serving snapshot
@@ -383,7 +391,7 @@ func (s *ReplicatedSnapshotStage) Offset() uint64 {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.stage == nil {
+	if s.state >= snapshotStageActivated || s.stage == nil {
 		return 0
 	}
 	return s.stage.Offset()
@@ -398,7 +406,7 @@ func (s *ReplicatedSnapshotStage) Receive(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.stage == nil {
+	if s.state != snapshotStageReceiving || s.stage == nil {
 		return replicatedstate.SnapshotArtifactManifest{}, ErrReplicatedSnapshotStageClosed
 	}
 	return s.stage.Receive(r, persist)
@@ -416,10 +424,13 @@ func (s *ReplicatedSnapshotStage) Activate(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed && s.activation.Apply != nil {
+	switch s.state {
+	case snapshotStageActivated:
 		return ownedReplicatedSnapshotActivation(s.activation), nil
+	case snapshotStageClosed:
+		return ReplicatedChildActivation{}, ErrReplicatedSnapshotStageClosed
 	}
-	if s.closed || s.stage == nil || s.owner == nil || s.database == nil {
+	if s.stage == nil || s.owner == nil || s.database == nil {
 		return ReplicatedChildActivation{}, ErrReplicatedSnapshotStageClosed
 	}
 	connector, core := s.owner, s.database
@@ -446,7 +457,7 @@ func (s *ReplicatedSnapshotStage) Activate(
 			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, buildErr)
 		}
 	}
-	if !s.candidateProved && core.checkpointGroup == nil {
+	if s.state < snapshotStageCandidateProved && core.checkpointGroup == nil {
 		candidateOptions := replicatedSnapshotLedgerOptions(s.identity, replicatedstate.Options{
 			TxnLimits: s.identity.TxnLimits, MaxSessions: s.identity.MaxSessions,
 			RetryWindow: s.identity.RetryWindow,
@@ -465,15 +476,15 @@ func (s *ReplicatedSnapshotStage) Activate(
 		}
 		s.seedEnvelope = s.stage.AppendSeedEnvelope(s.seedEnvelope[:0])
 		s.seedKey = s.stage.AppendSeedKey(s.seedKey[:0])
-		s.candidateProved = true
-	} else if !s.candidateProved {
+		s.state = snapshotStageCandidateProved
+	} else if s.state < snapshotStageCandidateProved {
 		s.seedKey, s.seedEnvelope, err = s.stage.AppendRecoveredSeed(
 			nil, nil, core.checkpointGroup, replicatedstate.SystemCollectionName,
 		)
 		if err != nil || !core.checkpointGroup.Owns(members) {
 			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 		}
-		s.candidateProved = true
+		s.state = snapshotStageCandidateProved
 	}
 	if len(s.seedEnvelope) == 0 || len(s.seedKey) == 0 {
 		return ReplicatedChildActivation{}, ErrReplicatedSnapshotStageProof
@@ -500,7 +511,7 @@ func (s *ReplicatedSnapshotStage) Activate(
 			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 		}
 	}
-	if !s.snapshotInstalled && core.checkpointGroup.SeedActivationPending() {
+	if s.state < snapshotStageInstalled && core.checkpointGroup.SeedActivationPending() {
 		if err = core.checkpointGroup.Seed(seed, members[0], s.identity.TxnLimits, s.seedKey); err != nil {
 			return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 		}
@@ -546,7 +557,7 @@ func (s *ReplicatedSnapshotStage) Activate(
 		publication.ReplicaSetVersion != s.expected.State.ReplicaSetVersion {
 		return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 	}
-	s.snapshotInstalled = true
+	s.state = snapshotStageInstalled
 	if err = replicatedSnapshotStageFault(replicatedSnapshotStageAfterSnapshotInstall); err != nil {
 		return ReplicatedChildActivation{}, errors.Join(ErrReplicatedSnapshotStageProof, err)
 	}
@@ -562,7 +573,7 @@ func (s *ReplicatedSnapshotStage) Activate(
 	result := ReplicatedChildActivation{Apply: s.claim, ApplyIdentity: s.identity,
 		SnapshotBase: s.snapshotBase, ArtifactManifest: s.expected}
 	s.activation = ownedReplicatedSnapshotActivation(result)
-	s.closed, s.stage = true, nil
+	s.state, s.stage = snapshotStageActivated, nil
 	return ownedReplicatedSnapshotActivation(result), nil
 }
 
@@ -582,12 +593,12 @@ func (s *ReplicatedSnapshotStage) Close() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.state >= snapshotStageActivated {
 		return nil
 	}
 	connector, core := s.owner, s.database
 	if connector == nil || core == nil {
-		s.closed = true
+		s.state = snapshotStageClosed
 		return nil
 	}
 	connector.mu.Lock()
@@ -599,7 +610,7 @@ func (s *ReplicatedSnapshotStage) Close() error {
 	}
 	core.replicatedSnapshotStageClaim = nil
 	connector.exclusive = false
-	s.closed, s.stage = true, nil
+	s.state, s.stage = snapshotStageClosed, nil
 	core.mu.Unlock()
 	connector.mu.Unlock()
 	return connector.release()

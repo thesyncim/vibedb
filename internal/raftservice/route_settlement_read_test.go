@@ -85,7 +85,7 @@ func TestRouteReleaseReceiptReadUsesExactCommandAndQuorumFloor(t *testing.T) {
 		t.Fatal("receipt response charge overflow")
 	}
 	owner := &Owner{
-		started: true,
+		state: ownerRunning,
 		ingress: make(chan ownerRequest, 1),
 		limits:  Limits{MaxIngressItems: 1, MaxIngressBytes: int64(len(command)), MaxPendingReadItems: 1, MaxPendingReadBytes: charge},
 	}

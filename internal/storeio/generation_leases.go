@@ -50,16 +50,23 @@ type GenerationLeaseStats struct {
 	MinimumGeneration uint64
 }
 
+type generationLeaseState uint8
+
+const (
+	leasesOpen generationLeaseState = iota
+	leasesClosing
+	leasesClosed
+)
+
 // GenerationLeases owns a fixed snapshot table. Explicit leases make page
 // lifetime independent of Go GC timing and let copy-on-write reclamation prove
 // that no reader can still dereference a retired extent.
 type GenerationLeases struct {
-	mu      sync.Mutex
-	slots   []generationLeaseSlot
-	free    []uint32
-	next    uint64
-	closing bool
-	closed  bool
+	mu    sync.Mutex
+	slots []generationLeaseSlot
+	free  []uint32
+	next  uint64
+	state generationLeaseState
 }
 
 // NewGenerationLeases allocates the complete fixed lease table.
@@ -105,7 +112,7 @@ func (l *GenerationLeases) Acquire(generation uint64) (GenerationLease, error) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.closing || l.closed {
+	if l.state != leasesOpen {
 		return GenerationLease{}, ErrGenerationLeasesClosed
 	}
 	if len(l.free) == 0 {
@@ -196,7 +203,9 @@ func (l *GenerationLeases) BeginClose() {
 		return
 	}
 	l.mu.Lock()
-	l.closing = true
+	if l.state == leasesOpen {
+		l.state = leasesClosing
+	}
 	l.mu.Unlock()
 }
 
@@ -206,7 +215,7 @@ func (l *GenerationLeases) Closing() bool {
 		return true
 	}
 	l.mu.Lock()
-	closing := l.closing || l.closed
+	closing := l.state != leasesOpen
 	l.mu.Unlock()
 	return closing
 }
@@ -219,14 +228,14 @@ func (l *GenerationLeases) Close() error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.closed {
+	if l.state == leasesClosed {
 		return nil
 	}
-	l.closing = true
+	l.state = leasesClosing
 	if len(l.free) != len(l.slots) {
 		return ErrLeasesActive
 	}
-	l.closed = true
+	l.state = leasesClosed
 	return nil
 }
 

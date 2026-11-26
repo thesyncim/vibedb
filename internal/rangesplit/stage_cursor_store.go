@@ -14,21 +14,28 @@ import (
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
 
+type cursorStoreState uint8
+
+const (
+	cursorStoreEmpty cursorStoreState = iota
+	cursorStoreLoaded
+	cursorStoreUncertain
+	cursorStoreClosed
+)
+
 // ChildStageCursorStore owns one crash-durable atomically replaced cursor and
 // one advisory writer lease in a pinned directory namespace.
 type ChildStageCursorStore struct {
 	mu sync.Mutex
 
-	root      *os.Root
-	base      string
-	lockFile  *os.File
-	raw       [childStageCursorBytes]byte
-	cursor    ChildStageCursor
-	codec     ChildStageCursorWorkspace
-	has       bool
-	closed    bool
-	uncertain bool
-	syncRoot  func(*os.Root) error
+	root     *os.Root
+	base     string
+	lockFile *os.File
+	raw      [childStageCursorBytes]byte
+	cursor   ChildStageCursor
+	codec    ChildStageCursorWorkspace
+	state    cursorStoreState
+	syncRoot func(*os.Root) error
 }
 
 // OpenChildStageCursorStore opens or creates the writer lease for path and
@@ -78,16 +85,18 @@ func (s *ChildStageCursorStore) Load(dst []byte) ([]byte, bool, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	switch s.state {
+	case cursorStoreClosed:
+		return dst, false, ErrChildStage
+	case cursorStoreUncertain:
+		return dst, false, ErrChildStageOutcomeUnknown
+	case cursorStoreEmpty:
+		return dst, false, nil
+	case cursorStoreLoaded:
+		return append(dst, s.raw[:]...), true, nil
+	default:
 		return dst, false, ErrChildStage
 	}
-	if s.uncertain {
-		return dst, false, ErrChildStageOutcomeUnknown
-	}
-	if !s.has {
-		return dst, false, nil
-	}
-	return append(dst, s.raw[:]...), true, nil
 }
 
 // Persist atomically advances the cursor. Exact retries are idempotent. A
@@ -98,20 +107,20 @@ func (s *ChildStageCursorStore) Persist(raw []byte) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	switch s.state {
+	case cursorStoreClosed:
 		return ErrChildStage
-	}
-	if s.uncertain {
+	case cursorStoreUncertain:
 		return ErrChildStageOutcomeUnknown
 	}
 	next, err := decodeChildStageCursor(raw, &s.codec)
 	if err != nil {
 		return err
 	}
-	if s.has && bytes.Equal(raw, s.raw[:]) {
+	if s.state == cursorStoreLoaded && bytes.Equal(raw, s.raw[:]) {
 		return nil
 	}
-	if s.has && !validChildStageCursorAdvance(s.cursor, next) {
+	if s.state == cursorStoreLoaded && !validChildStageCursorAdvance(s.cursor, next) {
 		return fmt.Errorf("%w: cursor does not monotonically advance", ErrChildStage)
 	}
 	temporary, err := s.createTemporary()
@@ -137,17 +146,17 @@ func (s *ChildStageCursorStore) Persist(raw []byte) error {
 		return err
 	}
 	if err := replaceChildStageCursorEntry(s.root, temporaryBase, s.base); err != nil {
-		s.uncertain = true
+		s.state = cursorStoreUncertain
 		return errors.Join(ErrChildStageOutcomeUnknown, err)
 	}
 	renamed = true
 	if err := s.syncRoot(s.root); err != nil {
-		s.uncertain = true
+		s.state = cursorStoreUncertain
 		return errors.Join(ErrChildStageOutcomeUnknown, err)
 	}
 	copy(s.raw[:], raw)
 	s.cursor = next
-	s.has = true
+	s.state = cursorStoreLoaded
 	return nil
 }
 
@@ -181,7 +190,7 @@ func (s *ChildStageCursorStore) readCurrent() error {
 		return errors.Join(ErrChildStageOutcomeUnknown, err)
 	}
 	s.cursor = cursor
-	s.has = true
+	s.state = cursorStoreLoaded
 	return nil
 }
 
@@ -210,10 +219,10 @@ func (s *ChildStageCursorStore) Close() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.state == cursorStoreClosed {
 		return nil
 	}
-	s.closed = true
+	s.state = cursorStoreClosed
 	err := errors.Join(storeio.UnlockWriter(s.lockFile), s.lockFile.Close(), s.root.Close())
 	s.lockFile = nil
 	s.root = nil

@@ -59,14 +59,17 @@ func TestReplicatedExecutionPinReadUsesPublicationAndActivationFences(t *testing
 	}
 	apply.activationBasePending = [32]byte{}
 	for _, active := range []bool{true, false} {
-		apply.walBaseSelectActive = active
-		apply.walBaseSelectPending = !active
+		if active {
+			apply.walBaseState = walBaseSelectActive
+		} else {
+			apply.walBaseState = walBaseSelectPending
+		}
 		got, err = apply.ExecutionPinRead(pin, 1)
 		if !errors.Is(err, ErrReplicatedApplyBusy) || got != (replicatedstate.ExecutionPinReadResult{}) {
 			t.Fatalf("WAL selection read=%+v/%v", got, err)
 		}
 	}
-	apply.walBaseSelectActive, apply.walBaseSelectPending = false, false
+	apply.walBaseState = walBaseIdle
 	if err = apply.Close(); err != nil {
 		t.Fatal(err)
 	}

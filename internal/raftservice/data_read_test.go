@@ -138,8 +138,8 @@ func TestLinearizablePointReadCutUsesOneLeaderBarrierAndPinsGeneration(t *testin
 		CheckpointApplied: minimumApplied,
 	}}
 	generation := &ownerGeneration{}
-	generation.pins.Store(1)
-	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
+	generation.acquire()
+	owner := &Owner{state: ownerRunning, ingress: make(chan ownerRequest, 1), limits: Limits{
 		MaxIngressItems: 1, MaxIngressBytes: 1,
 		MaxPendingReadItems: 1, MaxPendingReadBytes: 1,
 	}}
@@ -172,9 +172,9 @@ func TestLinearizablePointReadCutUsesOneLeaderBarrierAndPinsGeneration(t *testin
 	if cut.State() != acceptedState {
 		t.Fatalf("cut state=%+v, want accepted state=%+v", cut.State(), acceptedState)
 	}
-	if owner.pendingReadItems != 1 || owner.pendingReadBytes != 1 || generation.pins.Load() != 1 {
+	if owner.pendingReadItems != 1 || owner.pendingReadBytes != 1 || generation.pinCount() != 1 {
 		t.Fatalf("retained cut accounting items=%d bytes=%d pins=%d",
-			owner.pendingReadItems, owner.pendingReadBytes, generation.pins.Load())
+			owner.pendingReadItems, owner.pendingReadBytes, generation.pinCount())
 	}
 
 	result, readErr := cut.PointReadInto(t.Context(), 1, []byte("key"), 64, []byte("prefix"))
@@ -186,10 +186,10 @@ func TestLinearizablePointReadCutUsesOneLeaderBarrierAndPinsGeneration(t *testin
 		t.Fatalf("source call=%+v", source)
 	}
 
-	if err := cut.Close(); err != nil || cut.Source() != nil || cut.State() != (ServingState{}) || generation.pins.Load() != 0 ||
+	if err := cut.Close(); err != nil || cut.Source() != nil || cut.State() != (ServingState{}) || generation.pinCount() != 0 ||
 		owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 {
 		t.Fatalf("close err=%v source=%v pins=%d pending=%d/%d", err, cut.Source(),
-			generation.pins.Load(), owner.pendingReadItems, owner.pendingReadBytes)
+			generation.pinCount(), owner.pendingReadItems, owner.pendingReadBytes)
 	}
 	if err := cut.Close(); err != nil {
 		t.Fatalf("idempotent close: %v", err)
@@ -246,8 +246,8 @@ func TestExecutionOwnersForwardLinearizablePointReadAndCancellation(t *testing.T
 		Fence: testLinearizablePointSnapshotFence(serving, 23), Value: []byte("value"),
 	}}
 	generation := &ownerGeneration{}
-	generation.pins.Store(1)
-	owner := &Owner{started: true, ingress: make(chan ownerRequest, 1), limits: Limits{
+	generation.acquire()
+	owner := &Owner{state: ownerRunning, ingress: make(chan ownerRequest, 1), limits: Limits{
 		MaxIngressItems: 1, MaxIngressBytes: 1,
 		MaxPendingReadItems: 1, MaxPendingReadBytes: 1,
 	}}

@@ -306,16 +306,29 @@ func (cache *boundedFrameBufferCache) stats() (
 	return ownedFrames, ownedBytes, freeFrames, closed
 }
 
+type ordinaryPeerState uint8
+
+const (
+	peerReady ordinaryPeerState = iota
+	peerRunning
+	peerRetiringUnstarted
+	peerRetiringRunning
+)
+
+func (s ordinaryPeerState) isRetiring() bool {
+	return s >= peerRetiringUnstarted
+}
+
 type ordinaryPeer struct {
 	node   NodeID
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
-	// started is protected by OrdinaryTransport.mu.  It distinguishes a
-	// ready queue (whose done channel has no worker owner) from a running
-	// worker, so retirement can join without ever double-closing done.
-	started  bool
-	retiring bool
+	// state is protected by OrdinaryTransport.mu. It distinguishes a ready
+	// queue (whose done channel has no worker owner) from a running worker, and
+	// preserves that distinction across retirement so releaseRetiredPeer never
+	// deadlocks or double-closes done.
+	state ordinaryPeerState
 
 	queue []outboundFrame
 	head  int
@@ -586,7 +599,7 @@ func (transport *OrdinaryTransport) AddPeer(node NodeID) error {
 	transport.reclaimUnusedPeers(node)
 	transport.mu.Lock()
 	if existing := transport.byNode[node]; existing != nil {
-		if existing.retiring {
+		if existing.state.isRetiring() {
 			transport.mu.Unlock()
 			return ErrBackpressure
 		}
@@ -685,8 +698,12 @@ func (transport *OrdinaryTransport) reclaimUnusedPeers(keep NodeID) {
 	transport.registry.dynamicMu.Lock()
 	transport.mu.Lock()
 	for _, peer := range transport.peers {
-		if peer.node != keep && !peer.retiring && !transport.registry.peerReplicates(peer.node) {
-			peer.retiring = true
+		if peer.node != keep && !peer.state.isRetiring() && !transport.registry.peerReplicates(peer.node) {
+			if peer.state == peerRunning {
+				peer.state = peerRetiringRunning
+			} else {
+				peer.state = peerRetiringUnstarted
+			}
 			retired = append(retired, peer)
 		}
 	}
@@ -703,13 +720,13 @@ func (transport *OrdinaryTransport) reclaimUnusedPeers(keep NodeID) {
 func (transport *OrdinaryTransport) releaseRetiredPeer(peer *ordinaryPeer) {
 	peer.cancel()
 	transport.mu.Lock()
-	connection, started := peer.connection, peer.started
+	connection, state := peer.connection, peer.state
 	transport.mu.Unlock()
 	if connection != nil {
 		_ = connection.Close()
 	}
 	peer.notify()
-	if started {
+	if state == peerRetiringRunning {
 		<-peer.done
 	} else {
 		close(peer.done)
@@ -767,10 +784,10 @@ func (transport *OrdinaryTransport) peerCapacityAvailableLocked() bool {
 }
 
 func (transport *OrdinaryTransport) startPeerLocked(peer *ordinaryPeer) {
-	if peer == nil || peer.started || peer.retiring {
+	if peer == nil || peer.state != peerReady {
 		return
 	}
-	peer.started = true
+	peer.state = peerRunning
 	transport.workerWG.Add(1)
 	go func() {
 		defer transport.workerWG.Done()
@@ -814,14 +831,18 @@ func (transport *OrdinaryTransport) RetirePeerWithProof(proof PeerRetirementProo
 			// is still safe; there is no worker or pending frame to join.
 			return nil
 		}
-		if peer.retiring {
+		if peer.state.isRetiring() {
 			return ErrPeerConflict
 		}
 		if peer.count != 0 || peer.reservedFrames != 0 || peer.bytes != 0 || peer.reservedBytes != 0 ||
 			peer.inFlightFrames != 0 || peer.inFlightBytes != 0 {
 			return ErrPeerBusy
 		}
-		peer.retiring = true
+		if peer.state == peerRunning {
+			peer.state = peerRetiringRunning
+		} else {
+			peer.state = peerRetiringUnstarted
+		}
 		return nil
 	})
 	if err != nil {
@@ -918,7 +939,7 @@ func (transport *OrdinaryTransport) reserveOutbound(
 		}
 	}
 	closed := transport.state.Load() != transportRunning || context.Cause(transport.ctx) != nil
-	if closed || peer.retiring ||
+	if closed || peer.state.isRetiring() ||
 		peer.count+peer.reservedFrames >= len(peer.queue) ||
 		frameBytes > transport.queueLimits.PerPeerBytes-peer.bytes-peer.reservedBytes ||
 		transport.globalFrames >= transport.queueLimits.GlobalFrames ||
@@ -966,7 +987,7 @@ func (transport *OrdinaryTransport) publishReservation(
 		transport.reservations.Broadcast()
 	}
 	closed := transport.state.Load() != transportRunning || context.Cause(transport.ctx) != nil
-	if closed || peer.retiring {
+	if closed || peer.state.isRetiring() {
 		if transport.globalFrames <= 0 || transport.globalBytes < frameBytes {
 			transport.mu.Unlock()
 			transport.cancel(ErrInvalidTransport)

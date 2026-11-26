@@ -154,6 +154,17 @@ type Options struct {
 	OnError func(err error)
 }
 
+type serverLifecycleState uint8
+
+const (
+	serverRunning serverLifecycleState = iota
+	// serverDraining closes only listener admission while existing sockets and
+	// sessions remain alive until peers disconnect or Close is called.
+	serverDraining
+	serverAdmissionDrained
+	serverClosed
+)
+
 // A Server is an experimental PostgreSQL wire-protocol endpoint supporting a documented SQL subset over one database.
 type Server struct {
 	// Cold-path metadata identities are shared by IDE discovery connections.
@@ -166,20 +177,14 @@ type Server struct {
 	backend          Backend
 	opts             Options
 
-	mu        sync.Mutex
-	sessions  map[int32]*session
-	conns     map[net.Conn]struct{}
-	listeners map[net.Listener]struct{}
-	closed    bool
-	// draining closes only listener admission. Existing sockets and sessions
-	// remain owned by the server until their peers disconnect or Close is
-	// called. This is deliberately separate from closed: a retiring frontend
-	// must keep an idle SQL session (and the runtime that owns it) alive.
-	draining         bool
-	admissionDrained bool
-	drainRevision    uint64
-	nextPID          int32
-	live             int
+	mu            sync.Mutex
+	sessions      map[int32]*session
+	conns         map[net.Conn]struct{}
+	listeners     map[net.Listener]struct{}
+	state         serverLifecycleState
+	drainRevision uint64
+	nextPID       int32
+	live          int
 
 	// wg tracks in-flight sessions so Close can wait for them. Waiting is what
 	// makes Close a usable shutdown: a caller that closes the server and then
@@ -303,22 +308,27 @@ func (s *Server) Serve(l net.Listener) error {
 	}
 	if !s.addListener(l) {
 		_ = l.Close()
-		if s.isDraining() {
+		switch s.lifecycleState() {
+		case serverClosed:
+			return ErrServerClosed
+		case serverDraining, serverAdmissionDrained:
 			return ErrServerDraining
+		default:
+			return ErrServerClosed
 		}
-		return ErrServerClosed
 	}
 	defer s.removeListener(l)
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			if s.isClosed() {
+			switch s.lifecycleState() {
+			case serverClosed:
 				return ErrServerClosed
-			}
-			if s.isDraining() {
+			case serverDraining, serverAdmissionDrained:
 				return ErrServerDraining
+			default:
+				return err
 			}
-			return err
 		}
 		if !s.admitConnection(conn) {
 			_ = conn.Close()
@@ -374,8 +384,8 @@ func (s *Server) BeginDrain() AdmissionDrainState {
 		return AdmissionDrainState{}
 	}
 	s.mu.Lock()
-	if !s.closed && !s.draining {
-		s.draining = true
+	if s.state == serverRunning {
+		s.state = serverDraining
 		s.drainRevision++
 	}
 	listeners := make([]net.Listener, 0, len(s.listeners))
@@ -390,8 +400,8 @@ func (s *Server) BeginDrain() AdmissionDrainState {
 	// issued. The accept loops observe draining and return ErrServerDraining;
 	// no new connection can pass admitConnection after the first locked cut.
 	s.mu.Lock()
-	if s.draining {
-		s.admissionDrained = true
+	if s.state == serverDraining {
+		s.state = serverAdmissionDrained
 	}
 	state := s.admissionStateLocked()
 	s.mu.Unlock()
@@ -400,8 +410,8 @@ func (s *Server) BeginDrain() AdmissionDrainState {
 
 func (s *Server) admissionStateLocked() AdmissionDrainState {
 	return AdmissionDrainState{
-		Draining:          s.draining,
-		AdmissionDrained:  s.admissionDrained,
+		Draining:          s.state >= serverDraining,
+		AdmissionDrained:  s.state >= serverAdmissionDrained,
 		ActiveConnections: uint32(len(s.conns)),
 		ActiveSessions:    uint32(len(s.sessions)),
 		Revision:          s.drainRevision,
@@ -461,14 +471,12 @@ func (s *Server) serveConn(conn net.Conn) error {
 // any lock inversion with the unregister defers each exiting session runs.
 func (s *Server) Close() error {
 	s.mu.Lock()
-	if s.closed {
+	if s.state == serverClosed {
 		s.mu.Unlock()
 		s.wg.Wait()
 		return nil
 	}
-	s.closed = true
-	s.draining = true
-	s.admissionDrained = true
+	s.state = serverClosed
 	listeners := make([]net.Listener, 0, len(s.listeners))
 	for l := range s.listeners {
 		listeners = append(listeners, l)
@@ -507,7 +515,7 @@ func (s *Server) Close() error {
 func (s *Server) admitConnection(conn net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.draining {
+	if s.state != serverRunning {
 		return false
 	}
 	if s.opts.MaxConnections != UnlimitedConnections &&
@@ -528,22 +536,16 @@ func (s *Server) releaseConnection(conn net.Conn) {
 	s.mu.Unlock()
 }
 
-func (s *Server) isClosed() bool {
+func (s *Server) lifecycleState() serverLifecycleState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.closed
-}
-
-func (s *Server) isDraining() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.draining
+	return s.state
 }
 
 func (s *Server) addListener(l net.Listener) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.draining {
+	if s.state != serverRunning {
 		return false
 	}
 	s.listeners[l] = struct{}{}
@@ -562,7 +564,7 @@ func (s *Server) removeListener(l net.Listener) {
 func (s *Server) register(sess *session) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.state == serverClosed {
 		return false
 	}
 	if s.opts.MaxConnections > 0 && s.live >= s.opts.MaxConnections {

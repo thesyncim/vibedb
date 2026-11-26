@@ -669,10 +669,10 @@ func TestDurableDatabaseCloseRetainsOwnershipUntilSnapshotRelease(t *testing.T) 
 		_ = snapshot.Close()
 		t.Fatalf("first Database.Close = %v, want %v", first, storeio.ErrLeasesActive)
 	}
-	if db.CloseCompleted() || !db.closed || db.collections == nil || entry.closeDone {
+	if db.CloseCompleted() || db.state != databaseClosing || db.collections == nil || entry.isCloseDone() {
 		_ = snapshot.Close()
-		t.Fatalf("incomplete database close = completed %v closed %v collections nil %v entry done %v",
-			db.CloseCompleted(), db.closed, db.collections == nil, entry.closeDone)
+		t.Fatalf("incomplete database close = completed %v state %v collections nil %v entry done %v",
+			db.CloseCompleted(), db.state, db.collections == nil, entry.isCloseDone())
 	}
 	if _, err := entry.file.Stat(); err != nil {
 		_ = snapshot.Close()
@@ -693,9 +693,9 @@ func TestDurableDatabaseCloseRetainsOwnershipUntilSnapshotRelease(t *testing.T) 
 	if second != nil {
 		t.Fatalf("retry Database.Close = %v", second)
 	}
-	if !db.CloseCompleted() || db.collections != nil || !entry.closeDone {
+	if !db.CloseCompleted() || db.collections != nil || !entry.isCloseDone() {
 		t.Fatalf("completed database close = completed %v collections nil %v entry done %v",
-			db.CloseCompleted(), db.collections == nil, entry.closeDone)
+			db.CloseCompleted(), db.collections == nil, entry.isCloseDone())
 	}
 	if _, err := entry.file.Stat(); err == nil {
 		t.Fatal("owner descriptor remained open after completed teardown")

@@ -295,11 +295,11 @@ func TestReplicaActionFencesOwnershipAndRetirementExactly(t *testing.T) {
 	member := ownerMember{identity: raftmember.RuntimeIdentity{Group: group,
 		AllocationGeneration: fence.AllocationGeneration, MemberID: fence.MemberID,
 		StoreID: fence.StoreID, NodeIncarnation: fence.NodeIncarnation,
-		RelationManifestDigest: fence.Command.RelationManifestDigest}, command: fence.Command, retiring: true}
+		RelationManifestDigest: fence.Command.RelationManifestDigest}, command: fence.Command, state: memberRetiring}
 	if servingFenceMatchesIdentity(fence, member) {
 		t.Fatal("retiring member served")
 	}
-	member.retiring = false
+	member.state = memberServing
 	owner := &Owner{members: map[raftmember.GroupKey]ownerMember{group: member}}
 	if err := owner.syncCommandFenceFromState(group, ReplicaObservation{
 		Publication: raftmodel.Publication{ReplicaSetVersion: 8}, State: state,
