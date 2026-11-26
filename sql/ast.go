@@ -43,7 +43,8 @@ type SelectStmt struct {
 	// lowers the non-aggregate form to GROUP BY over the projection paths so the
 	// existing spill-aware grouping engine supplies equality and bounded memory.
 	Distinct bool
-	// LockMode records an optional FOR UPDATE / FOR SHARE locking clause.
+	// LockMode, SkipLocked, and NoWait pack into Distinct's trailing padding
+	// bytes, adding zero bytes to SelectStmt.
 	LockMode   RowLockMode
 	SkipLocked bool
 	NoWait     bool
@@ -116,6 +117,34 @@ type SelectStmt struct {
 	// and query-expression tail. A consumer MUST branch on Set before lowering
 	// any ordinary fields. Ignoring it would execute only the first operand.
 	Set *SetExpression
+
+	// Extensions is the cold sidecar for optional PostgreSQL SELECT clauses
+	// (DISTINCT ON, computed GROUP BY scalar keys, etc.). It stays nil on
+	// ordinary queries so SelectStmt retains a compact fixed footprint.
+	Extensions *SelectExtensions
+}
+
+// SelectExtensions holds cold optional SELECT clauses that are absent from
+// ordinary queries. Owned by the Parser's reusable slab for zero warm allocs.
+type SelectExtensions struct {
+	DistinctOn     []*PathExpr
+	GroupByScalars []*ScalarExpr
+}
+
+// DistinctOnPaths returns the DISTINCT ON key paths, or nil when absent.
+func (s *SelectStmt) DistinctOnPaths() []*PathExpr {
+	if s == nil || s.Extensions == nil {
+		return nil
+	}
+	return s.Extensions.DistinctOn
+}
+
+// GroupByScalarExprs returns the computed scalar GROUP BY keys, or nil.
+func (s *SelectStmt) GroupByScalarExprs() []*ScalarExpr {
+	if s == nil || s.Extensions == nil {
+		return nil
+	}
+	return s.Extensions.GroupByScalars
 }
 
 // A WithClause owns the common table expressions declared for one SELECT. Its
@@ -378,6 +407,11 @@ const (
 	AggAvg
 	AggMin
 	AggMax
+	AggStringAgg
+	AggArrayAgg
+	AggJsonAgg
+	AggBoolAnd
+	AggBoolOr
 )
 
 // String answers the aggregate's SQL spelling, or "" for AggNone.
@@ -393,6 +427,16 @@ func (a AggKind) String() string {
 		return "MIN"
 	case AggMax:
 		return "MAX"
+	case AggStringAgg:
+		return "STRING_AGG"
+	case AggArrayAgg:
+		return "ARRAY_AGG"
+	case AggJsonAgg:
+		return "JSON_AGG"
+	case AggBoolAnd:
+		return "BOOL_AND"
+	case AggBoolOr:
+		return "BOOL_OR"
 	}
 	return ""
 }
@@ -401,6 +445,12 @@ func (a AggKind) String() string {
 type ResultColumn struct {
 	// Agg is the reduction, or AggNone for a projection.
 	Agg AggKind
+	// AggDistinct records COUNT(DISTINCT x), SUM(DISTINCT x), etc.
+	AggDistinct bool
+	// AggFilter records an optional FILTER (WHERE ...) predicate on an aggregate.
+	AggFilter *Expr
+	// AggSeparator records the delimiter literal for STRING_AGG(x, sep).
+	AggSeparator string
 	// Path is the projected or aggregated path. It is nil only for COUNT(*),
 	// which reads no path at all. A Path with no segments is the whole
 	// document — what '*' and 'alias.*' parse to.
@@ -719,6 +769,9 @@ const (
 	// or a placeholder; the query lowerer executes SQL's '%' and '_' pattern
 	// operators and the optional backslash escape.
 	ExprLike
+	// ExprRegex is Path ~ / ~* / !~ / !~* Value (and SIMILAR TO lowered to a
+	// full-string RE2 pattern). Compiled once at query prepare time.
+	ExprRegex
 	// ExprMatch is Path [NOT] ==> Value, full-text match. Value must be a
 	// string literal or a placeholder holding TINQL; the query lowerer
 	// resolves it against the collection's tin index for the path.

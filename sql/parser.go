@@ -123,6 +123,7 @@ type Parser struct {
 	// the synthetic SELECT an UPDATE or a DELETE selects its rows with; see
 	// parse_dml.go.
 	sel              SelectStmt
+	selectExt        SelectExtensions
 	with             WithClause
 	returning        SelectStmt
 	ins              InsertStmt
@@ -519,6 +520,8 @@ func (p *Parser) reset(src string) {
 	p.opScratch = p.opScratch[:0]
 	p.pending = p.pending[:0]
 	p.returning = SelectStmt{}
+	p.selectExt.DistinctOn = p.selectExt.DistinctOn[:0]
+	p.selectExt.GroupByScalars = p.selectExt.GroupByScalars[:0]
 	p.conflict = InsertConflictUpdate{}
 	p.with = WithClause{}
 	p.filterColumns = p.filterColumns[:0]
@@ -754,6 +757,31 @@ func (p *Parser) parseStatement() error {
 		return err
 	}
 	p.out.Distinct = p.acceptKeyword(kwDistinct)
+	if p.out.Distinct && p.acceptKeyword(kwOn) {
+		if err := p.expect(tokLParen, "'(' after DISTINCT ON"); err != nil {
+			return err
+		}
+		var onPaths []*PathExpr
+		for {
+			path, err := p.parsePath(false)
+			if err != nil {
+				return err
+			}
+			onPaths = append(onPaths, path)
+			if len(onPaths) > maxClauseItems {
+				return p.errfAt(path.Pos, "DISTINCT ON accepts at most %d paths", maxClauseItems)
+			}
+			if p.tok.kind != tokComma {
+				break
+			}
+			p.advance()
+		}
+		if err := p.expect(tokRParen, "')' after DISTINCT ON paths"); err != nil {
+			return err
+		}
+		p.extensions().DistinctOn = append(p.extensions().DistinctOn[:0], onPaths...)
+		p.out.Distinct = false
+	}
 	if p.out.Distinct && p.atKeyword(kwAll) {
 		return p.errHere("SELECT DISTINCT and SELECT ALL are mutually exclusive")
 	}
@@ -960,6 +988,20 @@ func (p *Parser) tryAggregate() (AggKind, token, aggState) {
 	}
 	agg, ok := aggregateOf(p.tok.kw)
 	if !ok {
+		switch {
+		case tokenTextEqual(p.tok, "STRING_AGG"):
+			agg, ok = AggStringAgg, true
+		case tokenTextEqual(p.tok, "ARRAY_AGG"):
+			agg, ok = AggArrayAgg, true
+		case tokenTextEqual(p.tok, "JSON_AGG"), tokenTextEqual(p.tok, "JSONB_AGG"):
+			agg, ok = AggJsonAgg, true
+		case tokenTextEqual(p.tok, "BOOL_AND"), tokenTextEqual(p.tok, "EVERY"):
+			agg, ok = AggBoolAnd, true
+		case tokenTextEqual(p.tok, "BOOL_OR"):
+			agg, ok = AggBoolOr, true
+		}
+	}
+	if !ok {
 		return AggNone, token{}, aggNothing
 	}
 	head := p.tok
@@ -1073,9 +1115,26 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 		default:
 			switch agg, head, state := p.tryAggregate(); state {
 			case aggCall:
-				path, distinctPos, err := p.parseAggregateArgsAllowDistinct(agg)
+				path, distinctPos, aggSep, err := p.parseAggregateArgsAllowDistinct(agg)
 				if err != nil {
 					return col, err
+				}
+				var aggFilter *Expr
+				if tokenTextEqual(p.tok, "FILTER") {
+					p.advance() // FILTER
+					if err := p.expect(tokLParen, "'(' after FILTER"); err != nil {
+						return col, err
+					}
+					if err := p.expectKeyword(kwWhere, "WHERE inside FILTER (...)"); err != nil {
+						return col, err
+					}
+					aggFilter, err = p.parseExpr(ctxWhere)
+					if err != nil {
+						return col, err
+					}
+					if err := p.expect(tokRParen, "')' after FILTER (WHERE ...)"); err != nil {
+						return col, err
+					}
 				}
 				if p.atKeyword(kwOver) {
 					window, err := p.parseWindowOver(windowAggregateKind(agg), path, col.Pos)
@@ -1085,10 +1144,10 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 					window.Distinct = distinctPos >= 0
 					col.Window = window
 				} else {
-					if distinctPos >= 0 {
-						return col, p.errfAt(distinctPos, "%s(DISTINCT ...) is not supported: the engine's reductions have no distinct variant", agg)
-					}
 					col.Agg, col.Path = agg, path
+					col.AggDistinct = distinctPos >= 0
+					col.AggFilter = aggFilter
+					col.AggSeparator = aggSep
 				}
 			case aggHeadOnly:
 				path, err := p.continuePath(head, true)
@@ -1286,7 +1345,7 @@ func (p *Parser) parseSelectPath() (*PathExpr, error) {
 // parseAggregateArgs parses an aggregate's argument list. The current token is
 // '('.
 func (p *Parser) parseAggregateArgs(agg AggKind) (*PathExpr, error) {
-	path, distinctPos, err := p.parseAggregateArgsAllowDistinct(agg)
+	path, distinctPos, _, err := p.parseAggregateArgsAllowDistinct(agg)
 	if err != nil {
 		return nil, err
 	}
@@ -1296,7 +1355,7 @@ func (p *Parser) parseAggregateArgs(agg AggKind) (*PathExpr, error) {
 	return path, nil
 }
 
-func (p *Parser) parseAggregateArgsAllowDistinct(agg AggKind) (*PathExpr, int, error) {
+func (p *Parser) parseAggregateArgsAllowDistinct(agg AggKind) (*PathExpr, int, string, error) {
 	p.advance() // '('
 	distinctPos := -1
 	if p.atKeyword(kwDistinct) {
@@ -1305,25 +1364,35 @@ func (p *Parser) parseAggregateArgsAllowDistinct(agg AggKind) (*PathExpr, int, e
 	}
 	if agg == AggCount && p.tok.kind == tokStar {
 		if distinctPos >= 0 {
-			return nil, -1, p.errfAt(distinctPos, "COUNT(DISTINCT *) is not valid SQL")
+			return nil, -1, "", p.errfAt(distinctPos, "COUNT(DISTINCT *) is not valid SQL")
 		}
 		p.advance()
 		if err := p.expect(tokRParen, "')'"); err != nil {
-			return nil, -1, err
+			return nil, -1, "", err
 		}
-		return nil, -1, nil // COUNT(*) reads no path
+		return nil, -1, "", nil // COUNT(*) reads no path
 	}
 	path, err := p.parsePath(false)
 	if err != nil {
-		return nil, -1, err
+		return nil, -1, "", err
 	}
-	if p.tok.kind == tokComma {
-		return nil, -1, p.errfHere("%s takes exactly one path", agg)
+	var sep string
+	if agg == AggStringAgg {
+		if err := p.expect(tokComma, "',' before STRING_AGG separator"); err != nil {
+			return nil, -1, "", err
+		}
+		if p.tok.kind != tokString {
+			return nil, -1, "", p.errHere("STRING_AGG separator must be a string literal")
+		}
+		sep = p.tok.text
+		p.advance()
+	} else if p.tok.kind == tokComma {
+		return nil, -1, "", p.errfHere("%s takes exactly one path", agg)
 	}
 	if err := p.expect(tokRParen, "')'"); err != nil {
-		return nil, -1, err
+		return nil, -1, "", err
 	}
-	return path, distinctPos, nil
+	return path, distinctPos, sep, nil
 }
 
 // parseColumnAlias follows PostgreSQL's target_el grammar: AS accepts any
@@ -2778,6 +2847,15 @@ func (p *Parser) parseJoinCond() (*JoinCond, error) {
 
 // --- GROUP BY, ORDER BY, LIMIT ---------------------------------------------
 
+func (p *Parser) extensions() *SelectExtensions {
+	if p.out.Extensions == nil {
+		p.selectExt.DistinctOn = p.selectExt.DistinctOn[:0]
+		p.selectExt.GroupByScalars = p.selectExt.GroupByScalars[:0]
+		p.out.Extensions = &p.selectExt
+	}
+	return p.out.Extensions
+}
+
 func (p *Parser) parseGroupBy() error {
 	if !p.acceptKeyword(kwGroup) {
 		return nil
@@ -2785,18 +2863,97 @@ func (p *Parser) parseGroupBy() error {
 	if err := p.expectKeyword(kwBy, "BY after GROUP"); err != nil {
 		return err
 	}
+	totalKeys := 0
 	for {
-		if p.tok.kind == tokNumber {
-			return p.errHere("GROUP BY does not accept an output position; name the path")
+		pos := p.tok.pos
+		switch {
+		case p.tok.kind == tokNumber:
+			text := p.tok.text
+			position, err := strconv.ParseUint(text, 10, 63)
+			if err != nil || position == 0 || int(position) > len(p.columns) {
+				return p.errfAt(pos, "GROUP BY position %s is not in select list", text)
+			}
+			col := &p.columns[position-1]
+			if col.Agg != AggNone || col.Window != nil {
+				return p.errAt(pos, "GROUP BY cannot group by an aggregate: an aggregate is computed per group, not per row")
+			}
+			p.advance()
+			if col.Scalar != nil {
+				if _, hasAgg := scalarDependencyKinds(col.Scalar); hasAgg {
+					return p.errAt(pos, "GROUP BY cannot group by an aggregate: an aggregate is computed per group, not per row")
+				}
+				ext := p.extensions()
+				ext.GroupByScalars = append(ext.GroupByScalars, col.Scalar)
+			} else if col.Path != nil {
+				p.groupBy = append(p.groupBy, col.Path)
+			}
+			totalKeys++
+		case p.startsComputedGroupKey():
+			expr, err := p.parseScalarExpression(scalarSelect)
+			if err != nil {
+				return err
+			}
+			if _, hasAgg := scalarDependencyKinds(expr); hasAgg {
+				return p.errAt(pos, "GROUP BY cannot group by an aggregate: an aggregate is computed per group, not per row")
+			}
+			if expr.Kind == ScalarPath && expr.Path != nil {
+				p.groupBy = append(p.groupBy, expr.Path)
+			} else {
+				ext := p.extensions()
+				ext.GroupByScalars = append(ext.GroupByScalars, expr)
+			}
+			totalKeys++
+		default:
+			path, err := p.parseKeyPath(
+				"GROUP BY cannot group by an aggregate: an aggregate is computed per group, not per row")
+			if err != nil {
+				return err
+			}
+			if scalarContinues(p.tok) {
+				left := p.scalarFromColumn(ResultColumn{Path: path, Pos: pos})
+				expr, err := p.continueScalarExpression(left, scalarSelect)
+				if err != nil {
+					return err
+				}
+				if _, hasAgg := scalarDependencyKinds(expr); hasAgg {
+					return p.errAt(pos, "GROUP BY cannot group by an aggregate: an aggregate is computed per group, not per row")
+				}
+				ext := p.extensions()
+				ext.GroupByScalars = append(ext.GroupByScalars, expr)
+			} else if len(path.Segments) == 1 && path.Segments[0].Key != "" {
+				// If a single unqualified name matches a SELECT alias for a
+				// computed scalar or path, resolve it without backtracking.
+				matched := false
+				name := path.Segments[0].Key
+				for i := range p.columns {
+					col := &p.columns[i]
+					if col.Alias != "" && col.Alias == name && col.Agg == AggNone && col.Window == nil {
+						if col.Scalar != nil {
+							if _, hasAgg := scalarDependencyKinds(col.Scalar); hasAgg {
+								return p.errAt(pos, "GROUP BY cannot group by an aggregate: an aggregate is computed per group, not per row")
+							}
+							ext := p.extensions()
+							ext.GroupByScalars = append(ext.GroupByScalars, col.Scalar)
+							matched = true
+							break
+						}
+						if col.Path != nil {
+							p.groupBy = append(p.groupBy, col.Path)
+							matched = true
+							break
+						}
+					}
+				}
+				if !matched {
+					p.groupBy = append(p.groupBy, path)
+				}
+			} else {
+				p.groupBy = append(p.groupBy, path)
+			}
+			totalKeys++
 		}
-		path, err := p.parseKeyPath(
-			"GROUP BY cannot group by an aggregate: an aggregate is computed per group, not per row")
-		if err != nil {
-			return err
-		}
-		p.groupBy = append(p.groupBy, path)
-		if len(p.groupBy) > maxClauseItems {
-			return p.errfAt(path.Pos, "GROUP BY may hold at most %d keys", maxClauseItems)
+		if totalKeys > maxClauseItems {
+			return p.errfAt(pos, "GROUP BY may hold at most %d keys", maxClauseItems)
 		}
 		if p.tok.kind != tokComma {
 			p.out.GroupBy = p.groupBy
@@ -2804,6 +2961,24 @@ func (p *Parser) parseGroupBy() error {
 		}
 		p.advance()
 	}
+}
+
+func (p *Parser) startsComputedGroupKey() bool {
+	switch p.tok.kind {
+	case tokLParen, tokString, tokParam, tokPlus, tokMinus:
+		return true
+	case tokIdent:
+		if p.atKeyword(kwCase) || p.atKeyword(kwCast) || p.atKeyword(kwTrue) || p.atKeyword(kwFalse) || p.atKeyword(kwNull) {
+			return true
+		}
+		if _, ok := conditionalScalarOp(p.tok); ok {
+			return true
+		}
+		if _, ok := builtinScalarFuncName(p.tok); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Parser) parseOrderBy(allowOutputPosition bool) error {

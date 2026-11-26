@@ -3,6 +3,7 @@ package query
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"slices"
 	"strconv"
 	"unicode"
@@ -83,6 +84,9 @@ const (
 	predMarkRef
 	// predLike matches a string column against a SQL LIKE pattern.
 	predLike
+	// predRegex matches a string column against a compiled RE2 regular expression
+	// (~, ~*, !~, !~*, and SIMILAR TO). Compiled once at prepare time.
+	predRegex
 	// predIsString is an internal SQL three-valued-logic guard for LIKE. It is
 	// not exported because the builder surface has no general JSON type tests.
 	predIsString
@@ -185,6 +189,16 @@ func Like(path, pattern string) Predicate {
 // characters. Wildcards and escapes retain the same meaning as Like.
 func ILike(path, pattern string) Predicate {
 	return Predicate{kind: predLike, path: path, pattern: pattern, insensitive: true}
+}
+
+// Regex tests whether the string at path matches a POSIX/RE2 regular expression.
+func Regex(path, pattern string) Predicate {
+	return Predicate{kind: predRegex, path: path, pattern: pattern}
+}
+
+// IRegex is Regex with case-insensitive matching (~*).
+func IRegex(path, pattern string) Predicate {
+	return Predicate{kind: predRegex, path: path, pattern: pattern, insensitive: true}
 }
 
 // Match tests whether the string at path satisfies a TINQL full-text query,
@@ -422,6 +436,7 @@ type compiledPredicate struct {
 	lit         scalar
 	needle      vibejson.Index
 	pattern     string
+	re          *regexp.Regexp
 	insensitive bool
 	probe       postProbe
 	boundPath   string
@@ -588,6 +603,25 @@ func (c *compiler) compilePredicate(p Predicate, reg *pathRegistry) (*compiledPr
 		*cp = compiledPredicate{
 			kind: predLike, col: col,
 			pattern: c.internString(p.pattern), insensitive: p.insensitive,
+		}
+		return cp, nil
+	case predRegex:
+		col, err := c.addPath(reg, p.path)
+		if err != nil {
+			return nil, err
+		}
+		flags := ""
+		if p.insensitive {
+			flags = "i"
+		}
+		re, err := cachedPGRegexp(p.pattern, flags)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidPattern, err)
+		}
+		cp := c.nodes.one()
+		*cp = compiledPredicate{
+			kind: predRegex, col: col,
+			pattern: c.internString(p.pattern), re: re, insensitive: p.insensitive,
 		}
 		return cp, nil
 	case predMatch:
@@ -1078,6 +1112,9 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int, s *evalScratch) bool 
 	case predLike:
 		cell := cols[p.col][row]
 		return cell.kind == kindString && likeMatch(p.pattern, cell.sval, p.insensitive)
+	case predRegex:
+		cell := cols[p.col][row]
+		return cell.kind == kindString && p.re != nil && p.re.MatchString(cell.sval)
 	case predMatch:
 		return evalMatch(s, p, cols, row)
 	case predInBound:

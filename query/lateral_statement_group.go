@@ -198,7 +198,7 @@ func (c *lateralClone) compileHaving(
 		}
 		return node, nil
 	case sqlast.ExprCompare, sqlast.ExprIn, sqlast.ExprBetween, sqlast.ExprIsNull:
-	case sqlast.ExprIsMissing, sqlast.ExprContains, sqlast.ExprLike:
+	case sqlast.ExprIsMissing, sqlast.ExprContains, sqlast.ExprLike, sqlast.ExprRegex:
 		return nil, sqlast.NewFeatureNotSupportedError(
 			c.text, expr.Pos,
 			"this HAVING operator cannot be evaluated after correlated LATERAL reduction without changing its semantics",

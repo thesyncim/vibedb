@@ -168,7 +168,10 @@ func (lx *lexer) next() token {
 			return token{kind: tokNe, pos: start}
 		}
 		if lx.accept('~') {
-			return errorToken(start, "regular-expression matching is not supported")
+			if lx.accept('*') {
+				return token{kind: tokRegexNotIMatch, pos: start}
+			}
+			return token{kind: tokRegexNotMatch, pos: start}
 		}
 		return errorToken(start, "expected '=' after '!'")
 	case '<':
@@ -204,7 +207,10 @@ func (lx *lexer) next() token {
 	case '^', '&', '#':
 		return errorToken(start, "bitwise operators are not supported")
 	case '~':
-		return errorToken(start, "regular-expression matching is not supported")
+		if lx.accept('*') {
+			return token{kind: tokRegexIMatch, pos: start}
+		}
+		return token{kind: tokRegexMatch, pos: start}
 	}
 	return errfToken(start, "unexpected character %q", string(rune(c)))
 }

@@ -279,7 +279,7 @@ func (p *Parser) validate() error {
 	if err := p.validateJoins(); err != nil {
 		return err
 	}
-	grouped := len(p.out.GroupBy) > 0
+	grouped := len(p.out.GroupBy) > 0 || len(p.out.GroupByScalarExprs()) > 0
 	aggregates, projections := 0, 0
 	firstProjection := -1
 	if _, hasAggregate := predicateScalarDependencyKinds(p.out.Having); hasAggregate {
@@ -321,6 +321,9 @@ func (p *Parser) validate() error {
 		for i := range p.out.Columns {
 			column := &p.out.Columns[i]
 			if column.Scalar != nil {
+				if p.isGroupScalar(column.Scalar) {
+					continue
+				}
 				if path := firstUngroupedScalarPath(p, column.Scalar); path != nil {
 					return p.errfAt(path.Pos,
 						"scalar expression reads path %q, which is not a GROUP BY key",
@@ -743,6 +746,53 @@ func (p *Parser) isGroupKey(path *PathExpr) bool {
 		}
 	}
 	return false
+}
+
+// isGroupScalar reports whether expr structurally matches one of the
+// GROUP BY scalar expressions.
+func (p *Parser) isGroupScalar(expr *ScalarExpr) bool {
+	for _, key := range p.out.GroupByScalarExprs() {
+		if SameScalarExpr(key, expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// SameScalarExpr compares two scalar expression ASTs structurally (ignoring
+// source byte positions).
+func SameScalarExpr(a, b *ScalarExpr) bool {
+	if a == b {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	if a.Kind != b.Kind || a.Op != b.Op || a.Agg != b.Agg || a.Cast != b.Cast {
+		return false
+	}
+	if a.Value.Kind != b.Value.Kind || a.Value.Text != b.Value.Text ||
+		a.Value.Bool != b.Value.Bool || a.Value.Ordinal != b.Value.Ordinal {
+		return false
+	}
+	if (a.Path == nil) != (b.Path == nil) {
+		return false
+	}
+	if a.Path != nil && !sameSpec(a.Path, b.Path) {
+		return false
+	}
+	if !SameScalarExpr(a.Left, b.Left) || !SameScalarExpr(a.Right, b.Right) || !SameScalarExpr(a.Else, b.Else) {
+		return false
+	}
+	if len(a.Whens) != len(b.Whens) {
+		return false
+	}
+	for i := range a.Whens {
+		if !SameScalarExpr(a.Whens[i].Match, b.Whens[i].Match) || !SameScalarExpr(a.Whens[i].Result, b.Whens[i].Result) {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *Parser) sameResolvedPath(left, right *PathExpr) bool {

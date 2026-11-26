@@ -466,9 +466,39 @@ func (d *database) createTableLockedContext(
 	if err != nil {
 		return nil, err
 	}
+	var uniqueIndexes []indexMeta
+	if ct := statement.Tree().CreateTable; ct != nil {
+		idxOrdinal := 0
+		addUnique := func(paths []string) {
+			if len(paths) == 0 || (len(paths) == 1 && paths[0] == pointer) {
+				return
+			}
+			idxOrdinal++
+			uniqueIndexes = append(uniqueIndexes, indexMeta{
+				Name:   fmt.Sprintf("%s_uq_%d", definition.Name, idxOrdinal),
+				Paths:  paths,
+				Unique: true,
+			})
+		}
+		for _, col := range ct.Columns {
+			if col.Unique && col.Path != nil {
+				addUnique([]string{string(col.Path.AppendPointer(nil))})
+			}
+		}
+		for _, uq := range ct.UniqueConstraints {
+			paths := make([]string, 0, len(uq))
+			for _, p := range uq {
+				if p != nil {
+					paths = append(paths, string(p.AppendPointer(nil)))
+				}
+			}
+			addUnique(paths)
+		}
+	}
 	meta := &tableMeta{
 		PrimaryKey: pointer,
 		Schema:     schemaMetaFrom(definition.Schema),
+		Indexes:    uniqueIndexes,
 		Storage:    storage,
 	}
 	candidate := &table{

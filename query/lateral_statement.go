@@ -736,7 +736,7 @@ func (c *lateralClone) compileGate(expr *sqlast.Expr) (lateralGateExpr, error) {
 		}
 		return gate, nil
 	case sqlast.ExprCompare, sqlast.ExprIn, sqlast.ExprBetween,
-		sqlast.ExprIsNull, sqlast.ExprIsMissing, sqlast.ExprLike:
+		sqlast.ExprIsNull, sqlast.ExprIsMissing, sqlast.ExprLike, sqlast.ExprRegex:
 	case sqlast.ExprContains:
 		return lateralGateExpr{}, sqlast.NewFeatureNotSupportedError(
 			c.text, expr.Path.Pos,
@@ -1039,6 +1039,30 @@ func (l *statementLateral) evalGate(
 		}
 		value = boolTri(cell.kind == kindString &&
 			likeMatch(literal.sval, cell.sval, gate.insensitive))
+	case sqlast.ExprRegex:
+		literal, known, err := join.joinOperand(gate.value, l.args)
+		if err != nil {
+			return triFalse, err
+		}
+		if !known || cell.kind == kindNull {
+			value = triUnknown
+			break
+		}
+		if literal.kind != kindString {
+			return triFalse, fmt.Errorf(
+				"%w: LATERAL gate regex pattern must be a string",
+				ErrParameterType,
+			)
+		}
+		flags := ""
+		if gate.insensitive {
+			flags = "i"
+		}
+		re, err := cachedPGRegexp(literal.sval, flags)
+		if err != nil {
+			return triFalse, fmt.Errorf("query: invalid LATERAL gate regex pattern: %w", err)
+		}
+		value = boolTri(cell.kind == kindString && re.MatchString(cell.sval))
 	default:
 		return triFalse, fmt.Errorf("query: unsupported prepared LATERAL gate kind %d", gate.kind)
 	}

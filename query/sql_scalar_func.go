@@ -1004,17 +1004,7 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 }
 
 func compilePGRegexp(pat, flags string) (*regexp.Regexp, error) {
-	prefix := ""
-	if strings.ContainsRune(flags, 'i') {
-		prefix += "(?i)"
-	}
-	if strings.ContainsRune(flags, 'm') || strings.ContainsRune(flags, 'n') {
-		prefix += "(?m)"
-	}
-	if strings.ContainsRune(flags, 's') {
-		prefix += "(?s)"
-	}
-	return regexp.Compile(prefix + pat)
+	return cachedPGRegexp(pat, flags)
 }
 
 func stripJSONNulls(v any) any {

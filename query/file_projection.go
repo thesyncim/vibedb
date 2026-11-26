@@ -41,7 +41,7 @@ func fileProjectionPredicateEligible(p *compiledPredicate) bool {
 	}
 	switch p.kind {
 	case predCmp, predCmpBound, predCmpPath,
-		predCorrelationKnown, predIn, predLike, predExists,
+		predCorrelationKnown, predIn, predLike, predRegex, predExists,
 		predIsNull, predIsString:
 		return true
 	case predAnd, predOr, predNot:

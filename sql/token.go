@@ -38,8 +38,12 @@ const (
 	tokPercent
 	tokConcat      // ||
 	tokDoubleColon // ::, PostgreSQL's left-chaining postfix cast operator
-	tokJSONArrow   // ->, constant JSON path segment
-	tokJSONText    // ->>, terminal JSON path segment returned as text
+	tokJSONArrow      // ->, constant JSON path segment
+	tokJSONText       // ->>, terminal JSON path segment returned as text
+	tokRegexMatch     // ~
+	tokRegexIMatch    // ~*
+	tokRegexNotMatch  // !~
+	tokRegexNotIMatch // !~*
 )
 
 // A token is one lexeme. text is a slice of the source for identifiers,
