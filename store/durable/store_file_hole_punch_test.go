@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibejson"
@@ -130,8 +131,11 @@ func TestFileStoreForegroundHolePunchSurvivesCrashReopen(t *testing.T) {
 	if len(punched) == 0 {
 		t.Fatal("churn produced no foreground hole-punch candidates")
 	}
-	if attempts != 2 {
-		t.Fatalf("hole-punch attempts = %d, want one success then one failure", attempts)
+	if attempts < 2 {
+		t.Fatalf("hole-punch attempts = %d, want at least one success and one transient failure", attempts)
+	}
+	if collection.holePunchDisabled {
+		t.Fatal("transient hole-punch failure permanently disabled reclamation")
 	}
 	stats := collection.Stats()
 	var punchedBytes uint64
@@ -1092,8 +1096,12 @@ func TestFileStoreHolePunchSchedulerOptionalFailuresDoNotPoison(t *testing.T) {
 		}
 	})
 
-	t.Run("error disables once", func(t *testing.T) {
-		collection := &Collection{}
+	t.Run("transient error backs off and recovers", func(t *testing.T) {
+		now := time.Unix(1_700_000_000, 0)
+		collection := &Collection{
+			holePunchBaseBackoff: 100 * time.Millisecond,
+			holePunchNowFn:       func() time.Time { return now },
+		}
 		injected := errors.New("injected hole-punch failure")
 		calls := 0
 		collection.holePunch = func(*os.File, uint64, uint64) (bool, error) {
@@ -1101,24 +1109,36 @@ func TestFileStoreHolePunchSchedulerOptionalFailuresDoNotPoison(t *testing.T) {
 			return true, injected
 		}
 		collection.punchFileStoreExtent(ranges[0])
-		if calls != 1 || !collection.holePunchDisabled ||
+		if calls != 1 || collection.holePunchDisabled ||
+			!collection.holePunchInBackoff() ||
 			collection.holePunchErrors.Load() != 1 ||
 			collection.holePunchRanges.Load() != 0 {
 			t.Fatalf(
-				"error state: calls=%d disabled=%v errors=%d successes=%d",
-				calls, collection.holePunchDisabled,
+				"error state: calls=%d disabled=%v inBackoff=%v errors=%d successes=%d",
+				calls, collection.holePunchDisabled, collection.holePunchInBackoff(),
 				collection.holePunchErrors.Load(),
 				collection.holePunchRanges.Load(),
 			)
 		}
+		// While within backoff window, further attempts are skipped with no syscall.
 		collection.holePunch = func(*os.File, uint64, uint64) (bool, error) {
 			calls++
 			return true, nil
 		}
 		collection.punchFileStoreExtent(ranges[0])
 		if calls != 1 || collection.holePunchRanges.Load() != 0 {
-			t.Fatalf("disabled error state: calls=%d successes=%d",
+			t.Fatalf("backoff skipped state: calls=%d successes=%d",
 				calls, collection.holePunchRanges.Load())
+		}
+		// Once backoff elapses, the next write-path call retries and recovers.
+		now = now.Add(150 * time.Millisecond)
+		collection.punchFileStoreExtent(ranges[0])
+		if calls != 2 || collection.holePunchRanges.Load() != 1 ||
+			collection.holePunchConsecutiveErrors != 0 ||
+			collection.holePunchInBackoff() {
+			t.Fatalf("recovered state: calls=%d successes=%d errs=%d inBackoff=%v",
+				calls, collection.holePunchRanges.Load(),
+				collection.holePunchConsecutiveErrors, collection.holePunchInBackoff())
 		}
 	})
 }
@@ -1256,19 +1276,28 @@ func TestFileStoreHolePunchFailureIsOptionalAtFlush(t *testing.T) {
 			if err := collection.Flush(); err != nil {
 				t.Fatalf("Flush after optional failure: %v", err)
 			}
-			if calls != callsAfterFailure || !collection.holePunchDisabled {
-				t.Fatalf(
-					"disabled retry state: calls=%d before=%d disabled=%v",
-					calls, callsAfterFailure, collection.holePunchDisabled,
-				)
-			}
-			if test.unsupported && collection.holePunchUnsupported.Load() != 1 {
-				t.Fatalf("unsupported count = %d, want 1",
-					collection.holePunchUnsupported.Load())
-			}
-			if !test.unsupported && collection.holePunchErrors.Load() != 1 {
-				t.Fatalf("error count = %d, want 1",
-					collection.holePunchErrors.Load())
+			if test.unsupported {
+				if calls != callsAfterFailure || !collection.holePunchDisabled {
+					t.Fatalf(
+						"unsupported disable state: calls=%d before=%d disabled=%v",
+						calls, callsAfterFailure, collection.holePunchDisabled,
+					)
+				}
+				if collection.holePunchUnsupported.Load() != 1 {
+					t.Fatalf("unsupported count = %d, want 1",
+						collection.holePunchUnsupported.Load())
+				}
+			} else {
+				if calls != callsAfterFailure || collection.holePunchDisabled || !collection.holePunchInBackoff() {
+					t.Fatalf(
+						"transient backoff state: calls=%d before=%d disabled=%v inBackoff=%v",
+						calls, callsAfterFailure, collection.holePunchDisabled, collection.holePunchInBackoff(),
+					)
+				}
+				if collection.holePunchErrors.Load() != 1 {
+					t.Fatalf("error count = %d, want 1",
+						collection.holePunchErrors.Load())
+				}
 			}
 			// Close takes the same bounded foreground path and must remain
 			// best-effort under the injected failure too.

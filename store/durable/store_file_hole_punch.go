@@ -3,6 +3,7 @@ package durable
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 )
@@ -229,19 +230,57 @@ func (c *Collection) rewindHolePunchReusable(offset uint64) {
 	}
 }
 
+// Transient platform hole-punch errors (e.g. temporary EAGAIN/EIO) back off
+// exponentially on the write path instead of permanently disabling space
+// reclamation for the lifetime of the collection. Unsupported filesystems
+// (!supported / ENOTSUP) still disable permanently.
+const (
+	fileStoreHolePunchMinBackoff = 100 * time.Millisecond
+	fileStoreHolePunchMaxBackoff = 30 * time.Second
+)
+
+func (c *Collection) holePunchNow() time.Time {
+	if c != nil && c.holePunchNowFn != nil {
+		return c.holePunchNowFn()
+	}
+	return time.Now()
+}
+
+func (c *Collection) holePunchInBackoff() bool {
+	return c != nil && !c.holePunchBackoffUntil.IsZero() &&
+		c.holePunchNow().Before(c.holePunchBackoffUntil)
+}
+
+func (c *Collection) recordHolePunchTransientError() {
+	c.holePunchConsecutiveErrors++
+	base := c.holePunchBaseBackoff
+	if base <= 0 {
+		base = fileStoreHolePunchMinBackoff
+	}
+	shift := min(c.holePunchConsecutiveErrors-1, 9)
+	backoff := base << shift
+	if backoff <= 0 || backoff > fileStoreHolePunchMaxBackoff {
+		backoff = fileStoreHolePunchMaxBackoff
+	}
+	c.holePunchBackoffUntil = c.holePunchNow().Add(backoff)
+}
+
 // punchNewPhysicalGenerationLocked grants exactly one bounded scheduler pass
 // to each newly authoritative physical generation. Journal-only Flushes never
 // call it; repeated Wait/Flush completion for the same root is a scalar no-op.
 func (c *Collection) punchNewPhysicalGenerationLocked(generation uint64) error {
 	if c == nil || generation == 0 || c.holePunchDisabled ||
+		c.holePunchInBackoff() ||
 		generation <= c.holePunchGeneration {
 		return nil
 	}
 	authority, err := c.punchDurableFreeExtentsBatchLocked()
-	if err == nil && authority > c.holePunchGeneration {
+	if err == nil && authority > c.holePunchGeneration && !c.holePunchInBackoff() {
 		// Record the exact coherent generation the planner sampled, not a prior or
 		// subsequent atomic observation. The durability callback does not take
 		// writer and may otherwise advance between those two observations.
+		// Leave holePunchGeneration unadvanced when a transient error triggered
+		// backoff so the next flush after backoff retries this generation.
 		c.holePunchGeneration = authority
 	}
 	return err
@@ -260,7 +299,7 @@ func (c *Collection) punchDurableFreeExtentsLocked() error {
 
 func (c *Collection) punchDurableFreeExtentsBatchLocked() (uint64, error) {
 	if c == nil || c.file == nil || c.committer == nil || c.reclaimer == nil ||
-		c.holePunchDisabled || cap(c.freeImageScratch) == 0 {
+		c.holePunchDisabled || c.holePunchInBackoff() || cap(c.freeImageScratch) == 0 {
 		return 0, nil
 	}
 	if c.freeImageScratchInUse {
@@ -877,7 +916,7 @@ func (c *Collection) punchFileStoreExtent(extent storeio.FreeExtent) bool {
 func (c *Collection) punchFileStoreConstituents(
 	extent storeio.FreeExtent, constituents []storeio.FreeExtent,
 ) bool {
-	if c == nil || c.holePunchDisabled {
+	if c == nil || c.holePunchDisabled || c.holePunchInBackoff() {
 		return false
 	}
 	punch := c.holePunch
@@ -894,9 +933,11 @@ func (c *Collection) punchFileStoreConstituents(
 	if punchErr != nil {
 		c.holePunchErrors.Add(1)
 		c.holePunchSkippedRanges.Add(1)
-		c.holePunchDisabled = true
+		c.recordHolePunchTransientError()
 		return false
 	}
+	c.holePunchConsecutiveErrors = 0
+	c.holePunchBackoffUntil = time.Time{}
 	c.holePunchRanges.Add(1)
 	c.holePunchBytes.Add(extent.Length)
 	for _, constituent := range constituents {
