@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -133,7 +134,7 @@ func TestPipelinedWALPressureDrainsUncapturedReady(t *testing.T) {
 	options.MaxFileBytes = 256 << 20
 	options.MaxLiveBytes = 2 * raftstore.MinimumReadyLiveBytes
 	fixture := newRuntimeFixtureWithPipeline(t, 243, nil, options, true)
-	drain := func() {
+	drain := func(stopWhenFull bool) {
 		t.Helper()
 		var workspace ReadyWorkspace
 		deadline := time.Now().Add(testAsyncDeadline)
@@ -144,6 +145,11 @@ func TestPipelinedWALPressureDrainsUncapturedReady(t *testing.T) {
 			result, err := fixture.runtime.DriveReady(&workspace, func(OutboundMessage) error { return nil }, settleTestApplied)
 			if err != nil && !errors.Is(err, raftstore.ErrFull) {
 				t.Fatalf("pipelined pressure drain: %v", err)
+			}
+			if stopWhenFull && errors.Is(err, raftstore.ErrFull) &&
+				fixture.runtime.pipelined.quiescent() &&
+				fixture.runtime.node.Phase() == raftmodel.PhaseIdle {
+				return
 			}
 			if fixture.runtime.walGenerationQuiescent() {
 				return
@@ -156,16 +162,16 @@ func TestPipelinedWALPressureDrainsUncapturedReady(t *testing.T) {
 		t.Fatalf("pipelined pressure drain stalled: phase=%v pipeline=%s ready=%t err=%v",
 			fixture.runtime.node.Phase(), fixture.runtime.pipelined, ready, readyErr)
 	}
-	drain()
+	drain(false)
 	if err := fixture.runtime.Campaign(); err != nil {
 		t.Fatal(err)
 	}
-	drain()
+	drain(false)
 	open := testApplySessionOpen(fixture.base)
 	if err := fixture.runtime.Propose(open); err != nil {
 		t.Fatal(err)
 	}
-	drain()
+	drain(false)
 	lookup, err := fixture.apply.LookupCompletion(open)
 	if err != nil {
 		t.Fatal(err)
@@ -177,7 +183,10 @@ func TestPipelinedWALPressureDrainsUncapturedReady(t *testing.T) {
 	key, document := generationDriverMutation(t, 2)
 	command := testApplyCommand(fixture.base, completion.ClientEpoch, 2, key, document)
 	// Fill the WAL with maintenance disabled, stopping at the settled cut
-	// before an idle DriveReady can run admission maintenance.
+	// before an idle DriveReady can run admission maintenance. In pipelined
+	// mode one proposal can emit two Ready appends (entries + commit); if the
+	// first Ready exhausts the WAL while maintenance is still disabled, stop
+	// once the pipeline is quiescent at the full WAL cut.
 	for i := 0; ; i++ {
 		if err := fixture.wal.ReserveReady(); errors.Is(err, raftstore.ErrFull) {
 			break
@@ -187,7 +196,7 @@ func TestPipelinedWALPressureDrainsUncapturedReady(t *testing.T) {
 		if err := fixture.runtime.Propose(command); err != nil {
 			t.Fatal(err)
 		}
-		drain()
+		drain(true)
 	}
 	if err := fixture.runtime.ConfigureWALGeneration(WALGenerationDriverOptions{IntervalTicks: 12000, Key: fixture.walKey}); err != nil {
 		t.Fatal(err)
@@ -200,12 +209,12 @@ func TestPipelinedWALPressureDrainsUncapturedReady(t *testing.T) {
 		t.Fatalf("expected uncaptured Ready at settled full WAL: ready=%t err=%v", ready, err)
 	}
 	fixture.runtime.pipelined.admission = 0
-	drain()
+	drain(false)
 	for i := 0; i < 50; i++ {
 		if err := fixture.runtime.Propose(command); err != nil {
 			t.Fatalf("proposal %d: %v", i, err)
 		}
-		drain()
+		drain(false)
 	}
 	info, err := fixture.wal.GenerationInfo()
 	if err != nil || info.Generation < 2 {

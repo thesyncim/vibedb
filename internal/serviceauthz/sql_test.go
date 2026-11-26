@@ -66,6 +66,8 @@ func TestSQLCapabilityRequiresCompleteParsedSemantics(t *testing.T) {
 		"WITH changed AS (DELETE FROM docs RETURNING id) SELECT id FROM changed",
 		`WITH changed AS (UPDATE docs SET "$doc" = ? RETURNING id) SELECT id FROM changed`,
 		"WITH changed AS (INSERT INTO docs VALUES (?) RETURNING id) SELECT id FROM changed",
+		"SELECT * FROM (WITH changed AS (DELETE FROM docs RETURNING id) SELECT id FROM changed) sub",
+		"SELECT * FROM docs WHERE EXISTS (WITH changed AS (DELETE FROM docs RETURNING id) SELECT id FROM changed)",
 		"SELECT * FROM docs UNKNOWN CLAUSE",
 		"SELECT * FROM docs /* comment */ DELETE FROM docs",
 		"RENAME TABLE docs TO old_docs",
