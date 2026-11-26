@@ -1096,7 +1096,7 @@ func TestErrorClassification(t *testing.T) {
 			`SELECT id FROM users UNION ALL SELECT id FROM x` +
 			`) SEARCH DEPTH FIRST BY id SET ord SELECT id FROM x`, sqlstateFeatureNotSupported},
 		{`banana`, sqlstateSyntaxError},
-		{`SET statement_timeout = 100`, sqlstateFeatureNotSupported},
+		{`SET role = admin`, sqlstateFeatureNotSupported},
 		{`SET search_path = private`, sqlstateInvalidParameterValue},
 		{`SHOW nonexistent_setting`, sqlstateUndefinedObject},
 	}
