@@ -67,6 +67,7 @@ const (
 	kindReset
 	kindShow
 	kindDiscard
+	kindCopy
 	// kindUnknown is a leading token that is not a statement keyword at all,
 	// which is a syntax error rather than a missing feature.
 	kindUnknown
@@ -79,7 +80,6 @@ const (
 var unsupportedStatements = map[string]string{
 	"MERGE":   "MERGE is not in the bounded mutation subset; use explicit INSERT, UPDATE, or DELETE",
 	"REPLACE": "REPLACE is not supported; INSERT into an existing key is refused, and deliberate overwrites use UPDATE",
-	"COPY":    "COPY is not supported: this server implements the simple and extended query protocols and not the copy subprotocol",
 
 	"GRANT":   "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
 	"REVOKE":  "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
@@ -172,6 +172,8 @@ func classifyCancelable(
 		return kindShow, "", nil
 	case strings.EqualFold(word, "DISCARD"):
 		return kindDiscard, "", nil
+	case strings.EqualFold(word, "COPY"):
+		return kindCopy, "", nil
 	}
 	// Preserve the protocol taxonomy for callers that inspect classification,
 	// while still handing the statement to the shared SQL front end. That front

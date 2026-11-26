@@ -73,6 +73,7 @@ type tableMeta struct {
 	PrimaryKeys                []string    `json:"primary_keys,omitempty"`
 	Schema                     *schemaMeta `json:"schema,omitempty"`
 	Indexes                    []indexMeta `json:"indexes,omitempty"`
+	Checks                     []string    `json:"checks,omitempty"`
 	Storage                    string      `json:"storage,omitempty"`
 	Materialized               bool        `json:"materialized,omitempty"`
 	SealedRecoveryJournalBytes uint64      `json:"sealed_recovery_journal_bytes,omitempty"`
@@ -84,9 +85,10 @@ type schemaMeta struct {
 }
 
 type schemaFieldMeta struct {
-	Path     string `json:"path"`
-	Types    uint16 `json:"types"`
-	Required bool   `json:"required,omitempty"`
+	Path       string `json:"path"`
+	Types      uint16 `json:"types"`
+	Required   bool   `json:"required,omitempty"`
+	DefaultSQL string `json:"default_sql,omitempty"`
 }
 
 type indexMeta struct {

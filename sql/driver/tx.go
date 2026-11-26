@@ -1300,11 +1300,18 @@ func (t *tx) execMutationCore(
 					return nil, err
 				}
 			}
+			var txTableMeta *tableMeta
+			if tbl := t.conn.db.tables[tree.Table]; tbl != nil {
+				txTableMeta = tbl.meta
+			}
 			document, key, err := resolveInsertRow(
 				statement, tree, &tree.Rows[i], args,
-				state.primaryKey, state.primary, limits,
+				txTableMeta, state.primary, limits,
 			)
 			if err != nil {
+				return nil, err
+			}
+			if err := validateCheckConstraints(txTableMeta, document); err != nil {
 				return nil, err
 			}
 			if err := validateDocument(

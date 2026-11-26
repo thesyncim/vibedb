@@ -451,7 +451,8 @@ func asPGErrorAcyclic(err error) (mapped *pgError) {
 	case errors.Is(err, sqldriver.ErrDuplicatePrimaryKey),
 		errors.Is(err, sqldriver.ErrUniqueConstraint):
 		return newError(sqlstateUniqueViolation, err.Error())
-	case errors.Is(err, store.ErrSchemaViolation):
+	case errors.Is(err, store.ErrSchemaViolation),
+		errors.Is(err, sqldriver.ErrCheckViolation):
 		return newError(sqlstateCheckViolation, err.Error())
 	case errors.Is(err, store.ErrSchemaDefinition),
 		errors.Is(err, store.ErrIndexDefinition):

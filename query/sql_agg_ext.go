@@ -20,6 +20,7 @@ type extAggColumnSpec struct {
 	filterCol   int // >= 0 if FILTER (WHERE ...) is attached
 	isGroupKey  bool
 	groupKeyIdx int
+	hidden      bool // true for HAVING-only aggregate/group-key dependencies
 }
 
 type extAggOrderSpec struct {
@@ -29,15 +30,33 @@ type extAggOrderSpec struct {
 }
 
 type statementExtAgg struct {
-	input     *Statement
-	grouped   bool
-	groupCols []int
-	specs     []extAggColumnSpec
-	names     []string
-	orderBy   []extAggOrderSpec
-	limit     *sqlast.Operand
-	offset    *sqlast.Operand
-	result    Result
+	input         *Statement
+	grouped       bool
+	groupCols     []int
+	specs         []extAggColumnSpec
+	visibleCount  int
+	names         []string
+	having        *sqlast.Expr
+	havingColMap  map[*sqlast.Expr]int
+	orderBy       []extAggOrderSpec
+	limit         *sqlast.Operand
+	offset        *sqlast.Operand
+	result        Result
+}
+
+func exprHasExtendedAgg(e *sqlast.Expr) bool {
+	if e == nil {
+		return false
+	}
+	if e.AggDistinct || e.Agg > sqlast.AggMax {
+		return true
+	}
+	for _, kid := range e.Kids {
+		if exprHasExtendedAgg(kid) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasExtendedAggregate(tree *sqlast.SelectStmt) bool {
@@ -45,6 +64,9 @@ func hasExtendedAggregate(tree *sqlast.SelectStmt) bool {
 		return false
 	}
 	if len(tree.GroupByScalarExprs()) > 0 {
+		return true
+	}
+	if exprHasExtendedAgg(tree.Having) {
 		return true
 	}
 	for i := range tree.Columns {
@@ -78,6 +100,7 @@ func prepareExtendedAggregateStatement(
 
 	ext := &statementExtAgg{
 		grouped: len(tree.GroupBy) > 0 || len(groupByScalars) > 0,
+		having:  tree.Having,
 		limit:   tree.Limit,
 		offset:  tree.Offset,
 	}
@@ -181,6 +204,70 @@ func prepareExtendedAggregateStatement(
 			}
 		}
 		ext.specs = append(ext.specs, spec)
+	}
+	ext.visibleCount = len(ext.specs)
+
+	// 2b. Collect any hidden aggregate or group-key dependencies from HAVING.
+	if ext.having != nil {
+		ext.havingColMap = make(map[*sqlast.Expr]int)
+		var collectHaving func(e *sqlast.Expr)
+		collectHaving = func(e *sqlast.Expr) {
+			if e == nil {
+				return
+			}
+			switch e.Kind {
+			case sqlast.ExprAnd, sqlast.ExprOr, sqlast.ExprNot:
+				for _, kid := range e.Kids {
+					collectHaving(kid)
+				}
+				return
+			}
+			if e.Column >= 0 && e.Column < len(ext.specs) &&
+				(!e.AggDistinct || ext.specs[e.Column].distinct) {
+				ext.havingColMap[e] = e.Column
+				return
+			}
+			if e.Agg != sqlast.AggNone {
+				// Add hidden aggregate spec.
+				inputCol := -1
+				if e.Path != nil {
+					inputCol = len(inputTree.Columns)
+					inputTree.Columns = append(inputTree.Columns, sqlast.ResultColumn{
+						Path: e.Path,
+						Pos:  e.Pos,
+					})
+				}
+				idx := len(ext.specs)
+				ext.specs = append(ext.specs, extAggColumnSpec{
+					agg:       e.Agg,
+					distinct:  e.AggDistinct,
+					inputCol:  inputCol,
+					filterCol: -1,
+					hidden:    true,
+				})
+				ext.havingColMap[e] = idx
+				return
+			}
+			if e.Path != nil {
+				// Match group-by key path.
+				spec := e.Path.Spec()
+				for gIdx, gpath := range tree.GroupBy {
+					if gpath.Spec() == spec {
+						idx := len(ext.specs)
+						ext.specs = append(ext.specs, extAggColumnSpec{
+							isGroupKey:  true,
+							groupKeyIdx: gIdx,
+							inputCol:    -1,
+							filterCol:   -1,
+							hidden:      true,
+						})
+						ext.havingColMap[e] = idx
+						return
+					}
+				}
+			}
+		}
+		collectHaving(ext.having)
 	}
 
 	// 3. Resolve ORDER BY terms against output columns.
@@ -388,9 +475,9 @@ func (s *Statement) runExtAggInto(e *Exec, src Source, args []any) (Cursor, erro
 		order = append(order, "")
 	}
 
-	// Build finalized rows so we can sort/slice cleanly.
-	rows := make([][]Cell, len(order))
-	for r, gkey := range order {
+	// Build finalized rows so we can filter HAVING and sort/slice cleanly.
+	rows := make([][]Cell, 0, len(order))
+	for _, gkey := range order {
 		entry := groups[gkey]
 		row := make([]Cell, len(ext.specs))
 		for i, sp := range ext.specs {
@@ -468,7 +555,10 @@ func (s *Statement) runExtAggInto(e *Exec, src Source, args []any) (Cursor, erro
 				}
 			}
 		}
-		rows[r] = row
+		if ext.having != nil && !evalExtAggHaving(ext.having, row, ext.havingColMap, args) {
+			continue
+		}
+		rows = append(rows, row)
 	}
 
 	if len(ext.orderBy) > 0 {
@@ -521,8 +611,13 @@ func (s *Statement) runExtAggInto(e *Exec, src Source, args []any) (Cursor, erro
 
 	out := &ext.result
 	out.RowCount = len(rows)
-	out.Columns = make([]ResultColumn, len(ext.specs))
-	for i, sp := range ext.specs {
+	vis := ext.visibleCount
+	if vis == 0 {
+		vis = len(ext.specs)
+	}
+	out.Columns = make([]ResultColumn, vis)
+	for i := range vis {
+		sp := ext.specs[i]
 		cells := make([]Cell, len(rows))
 		for r, row := range rows {
 			cells[r] = row[i]
@@ -533,6 +628,138 @@ func (s *Statement) runExtAggInto(e *Exec, src Source, args []any) (Cursor, erro
 		}
 	}
 	return NewResultCursor(out)
+}
+
+func evalExtAggHaving(e *sqlast.Expr, row []Cell, colMap map[*sqlast.Expr]int, args []any) bool {
+	if e == nil {
+		return true
+	}
+	switch e.Kind {
+	case sqlast.ExprAnd:
+		for _, kid := range e.Kids {
+			if !evalExtAggHaving(kid, row, colMap, args) {
+				return false
+			}
+		}
+		return true
+	case sqlast.ExprOr:
+		for _, kid := range e.Kids {
+			if evalExtAggHaving(kid, row, colMap, args) {
+				return true
+			}
+		}
+		return false
+	case sqlast.ExprNot:
+		if len(e.Kids) == 1 {
+			return !evalExtAggHaving(e.Kids[0], row, colMap, args)
+		}
+		return false
+	}
+	colIdx, ok := colMap[e]
+	if !ok || colIdx < 0 || colIdx >= len(row) {
+		return false
+	}
+	left := row[colIdx]
+	switch e.Kind {
+	case sqlast.ExprIsNull:
+		if e.Negated {
+			return !left.IsNull()
+		}
+		return left.IsNull()
+	case sqlast.ExprCompare:
+		if left.IsNull() {
+			return false
+		}
+		right, rok := operandToExtAggCell(e.Value, args)
+		if !rok || right.IsNull() {
+			return false
+		}
+		cmp := compareExtAggCells(left, right)
+		switch e.Op {
+		case sqlast.OpEq:
+			return cmp == 0
+		case sqlast.OpNe:
+			return cmp != 0
+		case sqlast.OpLt:
+			return cmp < 0
+		case sqlast.OpLe:
+			return cmp <= 0
+		case sqlast.OpGt:
+			return cmp > 0
+		case sqlast.OpGe:
+			return cmp >= 0
+		}
+	case sqlast.ExprBetween:
+		if left.IsNull() || len(e.List) < 2 {
+			return false
+		}
+		lo, lok := operandToExtAggCell(e.List[0], args)
+		hi, hok := operandToExtAggCell(e.List[1], args)
+		if !lok || !hok || lo.IsNull() || hi.IsNull() {
+			return false
+		}
+		in := compareExtAggCells(left, lo) >= 0 && compareExtAggCells(left, hi) <= 0
+		if e.Negated {
+			return !in
+		}
+		return in
+	case sqlast.ExprIn:
+		if left.IsNull() {
+			return false
+		}
+		matched := false
+		for _, op := range e.List {
+			v, vok := operandToExtAggCell(op, args)
+			if vok && !v.IsNull() && compareExtAggCells(left, v) == 0 {
+				matched = true
+				break
+			}
+		}
+		if e.Negated {
+			return !matched
+		}
+		return matched
+	}
+	return false
+}
+
+func operandToExtAggCell(op sqlast.Operand, args []any) (Cell, bool) {
+	switch op.Kind {
+	case sqlast.OperandNull:
+		return NullCell(), true
+	case sqlast.OperandNumber:
+		c, err := ParseJSONCell([]byte(op.Text))
+		return c, err == nil
+	case sqlast.OperandBool:
+		if op.Bool {
+			c, err := ParseJSONCell([]byte("true"))
+			return c, err == nil
+		}
+		c, err := ParseJSONCell([]byte("false"))
+		return c, err == nil
+	case sqlast.OperandString:
+		b, err := json.Marshal(op.Text)
+		if err != nil {
+			return Cell{}, false
+		}
+		c, err := ParseJSONCell(b)
+		return c, err == nil
+	case sqlast.OperandParam:
+		if op.Ordinal < 0 || op.Ordinal >= len(args) {
+			return Cell{}, false
+		}
+		v := args[op.Ordinal]
+		if v == nil {
+			return NullCell(), true
+		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			return Cell{}, false
+		}
+		c, err := ParseJSONCell(b)
+		return c, err == nil
+	}
+	return Cell{}, false
 }
 
 func resolveExtAggIntOperand(op *sqlast.Operand, args []any) (int, error) {

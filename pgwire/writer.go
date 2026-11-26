@@ -157,6 +157,37 @@ func (w *writer) commandComplete(tag string) {
 	w.end()
 }
 
+func (w *writer) copyInResponse(overallFormat byte, colCount int) {
+	w.begin(msgCopyInResponse)
+	w.byte(overallFormat)
+	w.int16(colCount)
+	for range colCount {
+		w.int16(int(overallFormat))
+	}
+	w.end()
+}
+
+func (w *writer) copyOutResponse(overallFormat byte, colCount int) {
+	w.begin(msgCopyOutResponse)
+	w.byte(overallFormat)
+	w.int16(colCount)
+	for range colCount {
+		w.int16(int(overallFormat))
+	}
+	w.end()
+}
+
+func (w *writer) copyData(data []byte) {
+	w.begin(msgCopyData)
+	w.raw(data)
+	w.end()
+}
+
+func (w *writer) copyDone() {
+	w.begin(msgCopyDone)
+	w.end()
+}
+
 func (w *writer) emptyQueryResponse() {
 	w.begin(msgEmptyQuery)
 	w.end()

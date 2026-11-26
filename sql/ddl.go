@@ -161,6 +161,10 @@ type CreateTableStmt struct {
 	UniqueConstraints [][]*PathExpr
 	// CheckConstraints holds table-level CHECK (...) constraints.
 	CheckConstraints []*Expr
+	CheckSQLs        []string
+	// AsQuery holds the source SELECT for CREATE TABLE [IF NOT EXISTS] name AS SELECT ...
+	AsQuery    *SelectStmt
+	AsQuerySQL string
 	// Pos is the byte offset of the collection name, PrimaryKeyPos of the
 	// PRIMARY KEY clause.
 	Pos           int
@@ -193,8 +197,10 @@ type ColumnDef struct {
 	// HasDefault and DefaultExpr record a column-level DEFAULT expression.
 	HasDefault  bool
 	DefaultExpr *ScalarExpr
+	DefaultSQL  string
 	// CheckExpr records an inline CHECK (...) predicate.
 	CheckExpr *Expr
+	CheckSQL  string
 	// References records an inline REFERENCES target table name.
 	References string
 	Pos        int

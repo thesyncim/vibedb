@@ -1,5 +1,7 @@
 package sql
 
+import "strings"
+
 // Parsing CREATE TABLE, CREATE INDEX, and bounded ALTER TABLE.
 //
 // The grammar:
@@ -304,7 +306,7 @@ func (p *Parser) parseAlterAddConstraint() error {
 			return err
 		}
 	case tokenTextEqual(p.tok, "CHECK"):
-		if _, err := p.parseCheckConstraint(); err != nil {
+		if _, _, err := p.parseCheckConstraint(); err != nil {
 			return err
 		}
 	case tokenTextEqual(p.tok, "FOREIGN"):
@@ -342,7 +344,16 @@ func (p *Parser) parseCreateTable() error {
 	}
 	p.tbl.Table, p.tbl.Pos = name, pos
 	if p.atKeyword(kwAs) {
-		return p.errHere("CREATE TABLE ... AS SELECT is not supported: the engine has nowhere to send a plan's rows, so a table is created empty and filled with INSERT")
+		p.advance() // AS
+		qPos := p.tok.pos
+		p.out = &p.sel
+		*p.out = SelectStmt{}
+		if err := p.parseStatement(); err != nil {
+			return err
+		}
+		p.tbl.AsQuery = &p.sel
+		p.tbl.AsQuerySQL = p.internString(normalizedViewQuery(p.lx.src[qPos:]))
+		return nil
 	}
 	if err := p.rejectAlias(); err != nil {
 		return err
@@ -394,11 +405,12 @@ func (p *Parser) parseTableItems() error {
 			}
 			p.tbl.UniqueConstraints = append(p.tbl.UniqueConstraints, uPaths)
 		} else if tokenTextEqual(p.tok, "CHECK") {
-			chk, err := p.parseCheckConstraint()
+			chk, chkSQL, err := p.parseCheckConstraint()
 			if err != nil {
 				return err
 			}
 			p.tbl.CheckConstraints = append(p.tbl.CheckConstraints, chk)
+			p.tbl.CheckSQLs = append(p.tbl.CheckSQLs, chkSQL)
 		} else if tokenTextEqual(p.tok, "FOREIGN") {
 			if err := p.parseForeignKeyConstraint(); err != nil {
 				return err
@@ -471,19 +483,25 @@ func (p *Parser) parseColumnPathList(clause string) ([]*PathExpr, error) {
 	return paths, p.expect(tokRParen, "')'")
 }
 
-func (p *Parser) parseCheckConstraint() (*Expr, error) {
+func (p *Parser) parseCheckConstraint() (*Expr, string, error) {
 	p.advance() // CHECK
 	if err := p.expect(tokLParen, "'(' after CHECK"); err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	start := p.tok.pos
 	expr, err := p.parseExpr(ctxWhere)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	end := p.tok.pos
 	if err := p.expect(tokRParen, "')' after CHECK expression"); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return expr, nil
+	var sqlText string
+	if start >= 0 && end >= start && end <= len(p.lx.src) {
+		sqlText = strings.TrimSpace(p.lx.src[start:end])
+	}
+	return expr, sqlText, nil
 }
 
 func (p *Parser) parseForeignKeyConstraint() error {
@@ -659,21 +677,27 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 			}
 		case p.atKeyword(kwDefault):
 			p.advance()
+			defStart := p.tok.pos
 			defExpr, err := p.parseScalarExpression(scalarSelect)
 			if err != nil {
 				return column, err
 			}
+			defEnd := p.tok.pos
 			column.HasDefault = true
 			column.DefaultExpr = defExpr
+			if defStart >= 0 && defEnd >= defStart && defEnd <= len(p.lx.src) {
+				column.DefaultSQL = strings.TrimSpace(p.lx.src[defStart:defEnd])
+			}
 		case p.atKeyword(kwUnique):
 			p.advance()
 			column.Unique = true
 		case tokenTextEqual(p.tok, "CHECK"):
-			chk, err := p.parseCheckConstraint()
+			chk, chkSQL, err := p.parseCheckConstraint()
 			if err != nil {
 				return column, err
 			}
 			column.CheckExpr = chk
+			column.CheckSQL = chkSQL
 		case tokenTextEqual(p.tok, "REFERENCES"):
 			ref, err := p.parseReferencesClause()
 			if err != nil {

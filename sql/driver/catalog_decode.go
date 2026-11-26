@@ -53,10 +53,10 @@ var catalogVibeEncoder = func() vibejson.Encoder[catalogFileVibe] {
 
 var (
 	catalogRootFields        = vibejson.MakeFieldSet("version", "tables", "views", "shard_store", "shard_store_fence", "replicated_shard_store", "replicated_apply", "replicated_child_apply")
-	tableMetaFields          = vibejson.MakeFieldSet("primary_key", "schema", "indexes", "storage", "materialized", "sealed_recovery_journal_bytes", "primary_keys")
+	tableMetaFields          = vibejson.MakeFieldSet("primary_key", "schema", "indexes", "storage", "materialized", "sealed_recovery_journal_bytes", "primary_keys", "checks")
 	viewMetaFields           = vibejson.MakeFieldSet("query", "columns", "outputs", "view_dependencies", "table_dependencies")
 	schemaMetaFields         = vibejson.MakeFieldSet("root", "fields")
-	schemaFieldFields        = vibejson.MakeFieldSet("path", "types", "required")
+	schemaFieldFields        = vibejson.MakeFieldSet("path", "types", "required", "default_sql")
 	indexMetaFields          = vibejson.MakeFieldSet("name", "paths", "unique")
 	shardStoreIdentityFields = vibejson.MakeFieldSet("distribution", "shard", "allocation_generation", "log_id")
 	shardStoreFenceFields    = vibejson.MakeFieldSet("ownership_epoch", "routing_version")
@@ -385,6 +385,10 @@ func appendTableMeta(w vibejson.TrustedAppender, m tableMeta) vibejson.TrustedAp
 	if m.SealedRecoveryJournalBytes != 0 {
 		w = w.RawUnchecked(`,"sealed_recovery_journal_bytes":`).Uint(m.SealedRecoveryJournalBytes)
 	}
+	if len(m.Checks) != 0 {
+		w = w.RawUnchecked(`,"checks":`)
+		w = appendStringArray(w, m.Checks)
+	}
 	return w.RawByteUnchecked('}')
 }
 
@@ -418,6 +422,9 @@ func appendSchemaMeta(w vibejson.TrustedAppender, m schemaMeta) vibejson.Trusted
 			w = w.RawUnchecked(`{"path":`).String(f.Path).RawUnchecked(`,"types":`).Uint(uint64(f.Types))
 			if f.Required {
 				w = w.RawUnchecked(`,"required":true`)
+			}
+			if f.DefaultSQL != "" {
+				w = w.RawUnchecked(`,"default_sql":`).String(f.DefaultSQL)
 			}
 			w = w.RawByteUnchecked('}')
 		}
@@ -657,6 +664,8 @@ func decodeTableMetaVibe(c *vibejson.DecodeCursor, dst *tableMeta) error {
 			err = c.Uint(&decoded.SealedRecoveryJournalBytes)
 		case 6:
 			err = decodeStringListVibe(c, &decoded.PrimaryKeys, 4, "primary keys")
+		case 7:
+			err = decodeStringListVibe(c, &decoded.Checks, 64, "check constraints")
 		}
 		if err != nil {
 			return err
@@ -801,6 +810,8 @@ func decodeSchemaFieldVibe(c *vibejson.DecodeCursor, dst *schemaFieldMeta) error
 			err = c.Uint(&decoded.Types)
 		case 2:
 			err = c.Bool(&decoded.Required)
+		case 3:
+			err = decodeBoundedCatalogString(c, &decoded.DefaultSQL, maxCatalogBytes, "schema field default")
 		}
 		if err != nil {
 			return err

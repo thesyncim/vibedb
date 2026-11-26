@@ -596,7 +596,6 @@ func TestRejectsDefinitionsTheEngineCannotEnforce(t *testing.T) {
 		{"NULL then NOT NULL", `CREATE TABLE t (a STRING NULL NOT NULL)`, -1, "contradictory"},
 		{"NOT NULL then NULL", `CREATE TABLE t (a STRING NOT NULL NULL)`, -1, "contradictory"},
 		{"column primary key then NULL", `CREATE TABLE t (a STRING PRIMARY KEY NULL)`, -1, "contradictory"},
-		{"CREATE TABLE AS", `CREATE TABLE t AS SELECT a FROM u`, -1, "created empty"},
 		{"an index method", `CREATE INDEX ON t (a) USING btree`, -1, "unknown method"},
 		{"a unique index method", `CREATE UNIQUE INDEX ON t (a) USING btree`, -1, "unknown method"},
 		{"a unique index collation", `CREATE UNIQUE INDEX ON t (a COLLATE c)`, -1, "COLLATE is not supported"},

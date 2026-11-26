@@ -1090,7 +1090,7 @@ func TestErrorClassification(t *testing.T) {
 		{`SELECT name FROM users WHERE name LIKE 'a%' BOGUS '!'`, sqlstateSyntaxError},
 		{`INSERT INTO users VALUES (1)`, sqlstateSyntaxError},
 		{`CREATE TABLE t (a int)`, sqlstateInternalError},
-		{`COPY users TO STDOUT`, sqlstateFeatureNotSupported},
+		{`COPY users TO '/tmp/x'`, sqlstateFeatureNotSupported},
 		{`DECLARE c CURSOR FOR SELECT 1`, sqlstateFeatureNotSupported},
 		{`WITH RECURSIVE x(id) AS (` +
 			`SELECT id FROM users UNION ALL SELECT id FROM x` +
@@ -1117,6 +1117,12 @@ func TestUnsupportedSQLTaxonomyMatchesDatabaseSQL(t *testing.T) {
 		t.Run(tc.ID, func(t *testing.T) {
 			text := tc.Statement
 			reason := tc.ReasonContains
+			if tc.ID == "copy" {
+				// COPY ... FROM STDIN and COPY ... TO STDOUT are supported in pgwire;
+				// file-path COPY remains refused with 0A000.
+				expectError(t, c.query(`COPY docs TO '/tmp/out'`), sqlstateFeatureNotSupported)
+				return
+			}
 			if tc.ID == "cte" {
 				// Ordinary and bounded recursive CTE execution are supported.
 				// Keep this cross-adapter taxonomy case on a valid standard

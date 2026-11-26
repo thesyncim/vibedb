@@ -861,7 +861,8 @@ type Expr struct {
 	// Agg is the reduction applied to Path in a HAVING leaf, and AggNone
 	// everywhere else. WHERE and ON never carry one: the engine filters rows
 	// before it reduces them, so an aggregate in WHERE has nothing to read.
-	Agg AggKind
+	Agg         AggKind
+	AggDistinct bool
 	// Column is the [SelectStmt.Columns] index a HAVING leaf reads, or -1
 	// when the aggregate or GROUP BY key needs a hidden reduction column.
 	// It is -1 everywhere outside HAVING. Hidden dependencies are part of the
