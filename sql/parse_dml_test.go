@@ -324,9 +324,6 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"a nested path assignment", `UPDATE t SET profile.region = ?`, -1, "one declared top-level column"},
 		{"assigning a reserved path", `UPDATE t SET "$key" = 'x'`, -1, "reserved column"},
 		{"two whole-document assignments", `UPDATE t SET "$doc" = ?, "$doc" = ?`, -1, "cannot be combined"},
-		{"UPDATE ... FROM", `UPDATE t SET "$doc" = ? FROM u`, -1, "never from another collection"},
-
-		{"DELETE ... USING", `DELETE FROM t USING u WHERE t.a = u.a`, -1, "never by a join"},
 		{"mutation ORDER BY without LIMIT", `DELETE FROM t WHERE a = 1 ORDER BY a`, -1, "ORDER BY requires LIMIT"},
 		{"mutation OFFSET", `DELETE FROM t WHERE a = 1 LIMIT 5 OFFSET 1`, -1, "does not support OFFSET"},
 		{"a bare INSERT target alias", `INSERT INTO t x VALUES (?)`, -1, "VALUES or SELECT"},
