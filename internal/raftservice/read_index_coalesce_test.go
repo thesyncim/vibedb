@@ -71,11 +71,11 @@ func newSharedBarrierFixture(t testing.TB) *sharedBarrierFixture {
 
 func (fixture *sharedBarrierFixture) queue(t *testing.T, force bool) ownerRequest {
 	t.Helper()
-	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	delivery := &readDelivery{reply: newOwnerReplySlot()}
 	request := ownerRequest{
 		kind:  requestReadLinear,
 		group: fixture.group,
-		reply: make(chan ownerReply, 1),
+		reply: newOwnerReplySlot(),
 		read: readRequest{
 			fence: fixture.fence, minimumApplied: 1,
 			delivery: delivery, forceReadIndex: force,
@@ -117,7 +117,8 @@ func (fixture *sharedBarrierFixture) settleAll(t *testing.T, err error) {
 func settleDeliveryReply(t *testing.T, delivery *readDelivery, wantMinimum uint64) {
 	t.Helper()
 	select {
-	case reply := <-delivery.reply:
+	case <-delivery.reply.done:
+		reply := delivery.reply.reply
 		if reply.read.generation != nil {
 			defer reply.read.generation.release()
 		}
@@ -210,7 +211,8 @@ func TestSharedReadBarrierErrorFansOut(t *testing.T) {
 	fixture.owner.finishReadOutcomes([]raftmodel.ReadOutcome{outcome})
 	for index, delivery := range []*readDelivery{primary, waiter} {
 		select {
-		case reply := <-delivery.reply:
+		case <-delivery.reply.done:
+			reply := delivery.reply.reply
 			if reply.err == nil {
 				t.Fatalf("waiter %d missing barrier error", index)
 			}
@@ -267,7 +269,7 @@ func TestSharedReadBarrierRetainsCanceledWaiterBudget(t *testing.T) {
 				t.Fatal(err)
 			}
 			f.owner.release(c.bytes)
-			reply := <-rejected.reply
+			reply := rejected.reply.recv()
 			if !errors.Is(reply.err, ErrIngressFull) {
 				t.Fatalf("retained waiter escaped bound: %v", reply.err)
 			}
@@ -276,7 +278,7 @@ func TestSharedReadBarrierRetainsCanceledWaiterBudget(t *testing.T) {
 			}
 			if stop {
 				f.owner.stop(errTestSharedBarrier)
-				if reply := <-first.reply; !errors.Is(reply.err, ErrOwnerClosed) {
+				if reply := first.reply.recv(); !errors.Is(reply.err, ErrOwnerClosed) {
 					t.Fatal(reply.err)
 				}
 			} else {
@@ -288,7 +290,7 @@ func TestSharedReadBarrierRetainsCanceledWaiterBudget(t *testing.T) {
 				settleDeliveryReply(t, next, 9)
 			}
 			select {
-			case <-abandoned.reply:
+			case <-abandoned.reply.done:
 				t.Fatal("abandoned delivery was replied to")
 			default:
 			}
@@ -302,7 +304,7 @@ func TestSharedReadBarrierRetainsCanceledWaiterBudget(t *testing.T) {
 func TestSharedReadBarrierAdmissionSequenceDoesNotWrap(t *testing.T) {
 	f := newSharedBarrierFixture(t)
 	f.owner.readAdmissionSequence = ^uint64(0)
-	d := &readDelivery{reply: make(chan ownerReply, 1)}
+	d := &readDelivery{reply: newOwnerReplySlot()}
 	if err := f.owner.publish(ownerRequest{reply: d.reply, read: readRequest{delivery: d}}); !errors.Is(err, ErrIngressFull) {
 		t.Fatal(err)
 	}

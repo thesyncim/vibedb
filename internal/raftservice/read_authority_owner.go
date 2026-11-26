@@ -132,7 +132,7 @@ func (owner *Owner) validateReadAuthority(
 	}
 	request := ownerRequest{
 		kind: requestReadAuthorityValidate, group: fence.Group, fence: fence,
-		reply: make(chan ownerReply, 1), authorityToken: token,
+		authorityToken: token,
 		authorityGeneration: generation, authorityPermit: permit,
 	}
 	_, err := owner.enqueue(ctx, request)
@@ -183,7 +183,7 @@ func (owner *Owner) recordAuthorityHit(group raftmember.GroupKey) {
 func (owner *Owner) enqueuePointRead(
 	ctx context.Context, request PointReadRequest, key []byte, forceReadIndex bool,
 ) (ownerReply, error) {
-	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	delivery := owner.acquireReadDelivery()
 	return owner.enqueueRead(ctx, ownerRequest{
 		kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
 		bytes: int64(cap(key)), read: readRequest{
@@ -199,7 +199,7 @@ func (owner *Owner) enqueuePointRead(
 func (owner *Owner) enqueuePointBatchRead(
 	ctx context.Context, request PointReadBatchRequest, packed []byte, forceReadIndex bool,
 ) (ownerReply, error) {
-	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	delivery := owner.acquireReadDelivery()
 	return owner.enqueueRead(ctx, ownerRequest{
 		kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
 		bytes: int64(cap(packed)), read: readRequest{

@@ -1782,6 +1782,10 @@ func decodeBorrowedRequest(r io.Reader, req *ShardRequest) error {
 	if err != nil {
 		return err
 	}
+	return decodeRequestBody(body, req)
+}
+
+func decodeRequestBody(body []byte, req *ShardRequest) error {
 	d := deccur{b: body}
 	if d.u8() != wireVersion {
 		return errBadVersion
@@ -2198,6 +2202,11 @@ func DecodeResponse(r io.Reader) (*ShardResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	return decodeResponseBody(body)
+}
+
+func decodeResponseBody(body []byte) (*ShardResponse, error) {
+	var err error
 	d := deccur{b: body}
 	if d.u8() != wireVersion {
 		return nil, errBadVersion

@@ -185,13 +185,83 @@ type transferDelivery struct {
 	state atomic.Uint32
 }
 
+type ownerReplySlot struct {
+	done  chan struct{}
+	reply ownerReply
+}
+
+func newOwnerReplySlot() *ownerReplySlot {
+	return &ownerReplySlot{done: make(chan struct{}, 1)}
+}
+
+func (owner *Owner) acquireReplySlot() *ownerReplySlot {
+	if owner != nil {
+		if pooled := owner.replySlotPool.Get(); pooled != nil {
+			return pooled.(*ownerReplySlot)
+		}
+	}
+	return newOwnerReplySlot()
+}
+
+func (owner *Owner) releaseReplySlot(slot *ownerReplySlot) {
+	if owner == nil || slot == nil {
+		return
+	}
+	slot.reply = ownerReply{}
+	select {
+	case <-slot.done:
+	default:
+	}
+	owner.replySlotPool.Put(slot)
+}
+
+func (slot *ownerReplySlot) send(reply ownerReply) {
+	if slot == nil {
+		return
+	}
+	slot.reply = reply
+	slot.done <- struct{}{}
+}
+
+func (slot *ownerReplySlot) recv() ownerReply {
+	<-slot.done
+	return slot.reply
+}
+
+func (owner *Owner) acquireReadDelivery() *readDelivery {
+	if owner != nil {
+		if pooled := owner.readDeliveryPool.Get(); pooled != nil {
+			delivery := pooled.(*readDelivery)
+			delivery.state.Store(readDeliveryPending)
+			return delivery
+		}
+	}
+	return &readDelivery{reply: newOwnerReplySlot()}
+}
+
+func (owner *Owner) releaseReadDelivery(delivery *readDelivery) {
+	if owner == nil || delivery == nil {
+		return
+	}
+	reply := delivery.reply
+	if reply != nil {
+		reply.reply = ownerReply{}
+		select {
+		case <-reply.done:
+		default:
+		}
+	}
+	*delivery = readDelivery{reply: reply}
+	owner.readDeliveryPool.Put(delivery)
+}
+
 type ownerRequest struct {
 	kind                  requestKind
 	group                 raftmember.GroupKey
 	data                  []byte
 	fence                 ServingFence
 	inbound               rafttransport.Inbound
-	reply                 chan ownerReply
+	reply                 *ownerReplySlot
 	bytes                 int64
 	async                 bool
 	delivery              *proposalDelivery
@@ -286,7 +356,7 @@ type readDelivery struct {
 	// Assigned under owner.mu before publication; zero means not shareable.
 	admission           uint64
 	state               atomic.Uint32
-	reply               chan ownerReply
+	reply               *ownerReplySlot
 	context             [16]byte
 	contextSet          bool
 	serving             ServingState
@@ -857,6 +927,8 @@ type Owner struct {
 	pendingTransferSweep int
 	state                ownerLifecycleState
 	failure              error
+	replySlotPool        sync.Pool
+	readDeliveryPool     sync.Pool
 }
 
 type ownerLifecycleState uint8
@@ -1281,7 +1353,7 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 	}
 	failCollected := func(cause error) {
 		for _, request := range collector.requests {
-			request.reply <- ownerReply{err: cause}
+			request.reply.send(ownerReply{err: cause})
 			owner.release(request.bytes)
 		}
 		collector.reset()
@@ -1290,7 +1362,7 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 		for index, request := range collector.requests {
 			if err := handleRequest(request); err != nil {
 				for _, retained := range collector.requests[index+1:] {
-					retained.reply <- ownerReply{err: errors.Join(ErrOwnerClosed, err)}
+					retained.reply.send(ownerReply{err: errors.Join(ErrOwnerClosed, err)})
 					owner.release(retained.bytes)
 				}
 				collector.reset()
@@ -1404,8 +1476,8 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 			reply := ownerReply{err: errors.Join(ErrOwnerClosed, runErr)}
 			if ingressBarrier.read.delivery != nil {
 				owner.settleReadDelivery(ingressBarrier.read.delivery, reply)
-			} else if ingressBarrier.reply != nil {
-				ingressBarrier.reply <- reply
+			} else {
+				ingressBarrier.reply.send(reply)
 			}
 			owner.release(ingressBarrier.bytes)
 			ingressBarrier = ownerRequest{}
@@ -1948,13 +2020,9 @@ func (owner *Owner) handle(request ownerRequest) error {
 	case requestValidateReplicaRetirement:
 		reply.err = owner.validateReplicaRetirement(request)
 	case requestInstallExecutionGroup:
-		reply.err = request.registryChange(func(publish func()) error {
-			return owner.installExecutionGroupNow(request.install, request.pointReadSlot, publish)
-		})
+		reply.err = owner.handleInstallExecutionGroup(request.registryChange, request.install, request.pointReadSlot)
 	case requestRemoveExecutionGroup:
-		reply.err = request.registryChange(func(withdraw func()) error {
-			return owner.removeExecutionGroupNow(request.group, request.install.Identity, withdraw)
-		})
+		reply.err = owner.handleRemoveExecutionGroup(request.registryChange, request.group, request.install.Identity)
 	case requestObserveSchemaTransition:
 		_, reply.committed, reply.err = owner.host.ObserveSchemaTransition(
 			request.group, request.data,
@@ -2159,9 +2227,29 @@ func (owner *Owner) handle(request ownerRequest) error {
 			reply.read.generation.release()
 		}
 	} else {
-		request.reply <- reply
+		request.reply.send(reply)
 	}
 	return reply.err
+}
+
+func (owner *Owner) handleInstallExecutionGroup(
+	change func(func(func()) error) error,
+	install ExecutionGroup,
+	pointReadSlot *pointReadViewSlot,
+) error {
+	return change(func(publish func()) error {
+		return owner.installExecutionGroupNow(install, pointReadSlot, publish)
+	})
+}
+
+func (owner *Owner) handleRemoveExecutionGroup(
+	change func(func(func()) error) error,
+	group raftmember.GroupKey,
+	identity raftmember.RuntimeIdentity,
+) error {
+	return change(func(withdraw func()) error {
+		return owner.removeExecutionGroupNow(group, identity, withdraw)
+	})
 }
 
 func (owner *Owner) quiesceSchemaGeneration(request ownerRequest) error {
@@ -2320,14 +2408,16 @@ func (owner *Owner) installExecutionGroup(group ExecutionGroup, pointReadSlot *p
 	if pointReadSlot == nil {
 		return ErrInvalidOwner
 	}
-	reply := make(chan ownerReply, 1)
+	reply := owner.acquireReplySlot()
 	if err := owner.publish(ownerRequest{
 		kind: requestInstallExecutionGroup, group: group.Identity.Group,
 		install: group, pointReadSlot: pointReadSlot, registryChange: change, reply: reply,
 	}); err != nil {
+		owner.releaseReplySlot(reply)
 		return err
 	}
-	result := <-reply
+	result := reply.recv()
+	owner.releaseReplySlot(reply)
 	return result.err
 }
 
@@ -2357,14 +2447,16 @@ func (owner *Owner) removeExecutionGroup(identity raftmember.RuntimeIdentity, ch
 	if owner == nil || group == (raftmember.GroupKey{}) || change == nil {
 		return ErrInvalidOwner
 	}
-	reply := make(chan ownerReply, 1)
+	reply := owner.acquireReplySlot()
 	if err := owner.publish(ownerRequest{
 		kind: requestRemoveExecutionGroup, group: group,
 		install: ExecutionGroup{Identity: identity}, registryChange: change, reply: reply,
 	}); err != nil {
+		owner.releaseReplySlot(reply)
 		return err
 	}
-	result := <-reply
+	result := reply.recv()
+	owner.releaseReplySlot(reply)
 	return result.err
 }
 
@@ -2541,13 +2633,13 @@ func (owner *Owner) finishReadOutcomes(outcomes []raftmodel.ReadOutcome) {
 			continue
 		}
 		delete(owner.pendingReads, key)
+		group := delivery.serving.Identity.Group
 		owner.settleReadBarrierDelivery(delivery, outcome)
 		for _, waiter := range owner.sharedBarrierWaiters[key] {
 			owner.settleReadBarrierDelivery(waiter, outcome)
 		}
 		owner.sharedReadWaiterCount -= len(owner.sharedBarrierWaiters[key])
 		delete(owner.sharedBarrierWaiters, key)
-		group := delivery.serving.Identity.Group
 		if shared, ok := owner.inflightBarrier[group]; ok && shared.context == key {
 			delete(owner.inflightBarrier, group)
 		}
@@ -2591,7 +2683,7 @@ func (owner *Owner) settleReadBarrierDelivery(delivery *readDelivery, outcome ra
 
 func (owner *Owner) settleReadDelivery(delivery *readDelivery, reply ownerReply) bool {
 	if delivery != nil && delivery.state.CompareAndSwap(readDeliveryPending, readDeliveryReady) {
-		delivery.reply <- reply
+		delivery.reply.send(reply)
 		return true
 	}
 	return false
@@ -3063,7 +3155,7 @@ func (owner *Owner) beginLeaderTransfer(request ownerRequest) error {
 	if request.transferDelivery.state.Load() != transferDeliveryPending {
 		// The caller won the pre-admission cancellation CAS while this request
 		// was still in ingress. No Runtime mutation is allowed.
-		request.reply <- ownerReply{err: errors.Join(errOwnerTransferCanceled, context.Canceled)}
+		request.reply.send(ownerReply{err: errors.Join(errOwnerTransferCanceled, context.Canceled)})
 		return nil
 	}
 	if owner.pendingTransfers == nil {
@@ -3090,7 +3182,7 @@ func (owner *Owner) beginLeaderTransfer(request ownerRequest) error {
 	if request.transferDelivery.state.Load() != transferDeliveryPending {
 		// Cancellation can race the cleanup above. Recheck before the first
 		// operation that may revoke Runtime authority for this request.
-		request.reply <- ownerReply{err: errors.Join(errOwnerTransferCanceled, context.Canceled)}
+		request.reply.send(ownerReply{err: errors.Join(errOwnerTransferCanceled, context.Canceled)})
 		return nil
 	}
 	preparedRequest, guard, prepareErr := owner.prepareLeaderTransferRequest(request)
@@ -3203,7 +3295,7 @@ func (owner *Owner) settlePendingLeaderTransfer(
 		delete(owner.pendingTransfers, key)
 		owner.untrackPendingLeaderTransfer(key)
 	}
-	pending.request.reply <- ownerReply{err: err}
+	pending.request.reply.send(ownerReply{err: err})
 	owner.release(pending.request.bytes)
 }
 
@@ -3357,7 +3449,7 @@ func (owner *Owner) finishPendingLeaderTransfers(cause error) {
 			if wasCanceled {
 				replyErr = errors.Join(errOwnerTransferCanceled, cause)
 			}
-			pending.request.reply <- ownerReply{err: replyErr}
+			pending.request.reply.send(ownerReply{err: replyErr})
 		}
 		owner.release(pending.request.bytes)
 	}
@@ -3481,13 +3573,13 @@ func (owner *Owner) stop(cause error) error {
 	closedErr := ownerReply{err: errors.Join(ErrOwnerClosed, cause)}
 	for key, delivery := range owner.pendingReads {
 		delete(owner.pendingReads, key)
+		group := delivery.serving.Identity.Group
 		owner.settleReadDelivery(delivery, closedErr)
 		for _, waiter := range owner.sharedBarrierWaiters[key] {
 			owner.settleReadDelivery(waiter, closedErr)
 		}
 		owner.sharedReadWaiterCount -= len(owner.sharedBarrierWaiters[key])
 		delete(owner.sharedBarrierWaiters, key)
-		group := delivery.serving.Identity.Group
 		if shared, ok := owner.inflightBarrier[group]; ok && shared.context == key {
 			delete(owner.inflightBarrier, group)
 		}
@@ -3495,7 +3587,7 @@ func (owner *Owner) stop(cause error) error {
 	for {
 		select {
 		case request := <-owner.ingress:
-			request.reply <- ownerReply{err: errors.Join(ErrOwnerClosed, cause)}
+			request.reply.send(ownerReply{err: errors.Join(ErrOwnerClosed, cause)})
 			owner.release(request.bytes)
 		default:
 			return cause
@@ -3536,7 +3628,7 @@ func (owner *Owner) ReadPoint(
 	copy(key, request.Key)
 	if !request.Linearizable {
 		reply, err := owner.enqueue(ctx, ownerRequest{
-			kind: requestReadFollower, group: request.Fence.Group, reply: make(chan ownerReply, 1),
+			kind: requestReadFollower, group: request.Fence.Group,
 			bytes: int64(cap(key)), read: readRequest{
 				fence: request.Fence, minimumApplied: request.MinimumApplied,
 				authorize: request.Authorize,
@@ -3722,7 +3814,7 @@ func (owner *Owner) ReadTransaction(
 			owner.releasePendingRead(responseCharge)
 		}
 	}()
-	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	delivery := owner.acquireReadDelivery()
 	reply, err := owner.enqueueRead(ctx, ownerRequest{
 		kind: requestReadTransaction, group: request.Fence.Group, reply: delivery.reply,
 		read: readRequest{
@@ -3795,7 +3887,7 @@ func (owner *Owner) ReadRequestLedger(
 			owner.releasePendingRead(responseCharge)
 		}
 	}()
-	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	delivery := owner.acquireReadDelivery()
 	reply, err := owner.enqueueRead(ctx, ownerRequest{
 		kind: requestReadRequestLedger, group: request.Fence.Group, reply: delivery.reply,
 		read: readRequest{
@@ -3852,7 +3944,7 @@ func (owner *Owner) ReadExecutionPin(
 			owner.releasePendingRead(responseCharge)
 		}
 	}()
-	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	delivery := owner.acquireReadDelivery()
 	reply, err := owner.enqueueRead(ctx, ownerRequest{
 		kind: requestReadExecutionPin, group: request.Fence.Group, reply: delivery.reply,
 		read: readRequest{
@@ -3897,7 +3989,7 @@ func (owner *Owner) ReadLinearizableSnapshot(ctx context.Context,
 			owner.releasePendingRead(1)
 		}
 	}()
-	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	delivery := owner.acquireReadDelivery()
 	reply, err := owner.enqueueRead(ctx, ownerRequest{
 		kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
 		read: readRequest{fence: request.Fence, delivery: delivery},
@@ -3933,19 +4025,24 @@ func (owner *Owner) enqueueRead(
 	delivery *readDelivery,
 ) (ownerReply, error) {
 	if cause := context.Cause(ctx); cause != nil {
+		owner.releaseReadDelivery(delivery)
 		return ownerReply{}, cause
 	}
 	if err := owner.publish(request); err != nil {
+		owner.releaseReadDelivery(delivery)
 		return ownerReply{}, err
 	}
 	select {
-	case reply := <-delivery.reply:
+	case <-delivery.reply.done:
+		reply := delivery.reply.reply
+		owner.releaseReadDelivery(delivery)
 		return reply, reply.err
 	case <-ctx.Done():
 		if delivery.state.CompareAndSwap(readDeliveryPending, readDeliveryAbandoned) {
 			return ownerReply{}, context.Cause(ctx)
 		}
-		reply := <-delivery.reply
+		reply := delivery.reply.recv()
+		owner.releaseReadDelivery(delivery)
 		return reply, reply.err
 	}
 }
@@ -3996,7 +4093,7 @@ func (owner *Owner) releasePendingRead(bytes int64) {
 // after the final drain and waiting forever for a reply.
 func (owner *Owner) publish(request ownerRequest) error {
 	bytes := request.bytes
-	if owner == nil || request.reply == nil || bytes < 0 || bytes > owner.limits.MaxIngressBytes {
+	if owner == nil || (!request.async && request.reply == nil) || bytes < 0 || bytes > owner.limits.MaxIngressBytes {
 		return ErrIngressFull
 	}
 	owner.mu.Lock()
@@ -4054,11 +4151,14 @@ func (owner *Owner) enqueueDefinite(ctx context.Context, request ownerRequest) e
 	if cause := context.Cause(ctx); cause != nil {
 		return cause
 	}
-	request.reply = make(chan ownerReply, 1)
+	slot := owner.acquireReplySlot()
+	request.reply = slot
 	if err := owner.publish(request); err != nil {
+		owner.releaseReplySlot(slot)
 		return err
 	}
-	result := <-request.reply
+	result := slot.recv()
+	owner.releaseReplySlot(slot)
 	return result.err
 }
 
@@ -4069,13 +4169,25 @@ func (owner *Owner) enqueue(ctx context.Context, request ownerRequest) (ownerRep
 	if cause := context.Cause(ctx); cause != nil {
 		return ownerReply{}, cause
 	}
+	pooled := false
+	if request.reply == nil {
+		request.reply = owner.acquireReplySlot()
+		pooled = true
+	}
 	if err := owner.publish(request); err != nil {
+		if pooled {
+			owner.releaseReplySlot(request.reply)
+		}
 		return ownerReply{}, err
 	}
 	if request.delivery == nil {
 		if request.transferDelivery != nil {
 			select {
-			case reply := <-request.reply:
+			case <-request.reply.done:
+				reply := request.reply.reply
+				if pooled {
+					owner.releaseReplySlot(request.reply)
+				}
 				return reply, reply.err
 			case <-ctx.Done():
 				if request.transferDelivery.state.CompareAndSwap(
@@ -4088,24 +4200,39 @@ func (owner *Owner) enqueue(ctx context.Context, request ownerRequest) (ownerRep
 				}
 				// Dispatching is one-way. The owner completes the synchronous
 				// Host admission before publishing this buffered result.
-				reply := <-request.reply
+				reply := request.reply.recv()
+				if pooled {
+					owner.releaseReplySlot(request.reply)
+				}
 				return reply, reply.err
 			}
 		}
 		select {
-		case reply := <-request.reply:
+		case <-request.reply.done:
+			reply := request.reply.reply
+			if pooled {
+				owner.releaseReplySlot(request.reply)
+			}
 			return reply, reply.err
 		case <-ctx.Done():
 			return ownerReply{}, context.Cause(ctx)
 		}
 	}
 	select {
-	case reply := <-request.reply:
+	case <-request.reply.done:
+		reply := request.reply.reply
+		if pooled {
+			owner.releaseReplySlot(request.reply)
+		}
 		return reply, reply.err
 	default:
 	}
 	select {
-	case reply := <-request.reply:
+	case <-request.reply.done:
+		reply := request.reply.reply
+		if pooled {
+			owner.releaseReplySlot(request.reply)
+		}
 		return reply, reply.err
 	case <-ctx.Done():
 		if request.delivery.state.CompareAndSwap(
@@ -4115,7 +4242,10 @@ func (owner *Owner) enqueue(ctx context.Context, request ownerRequest) (ownerRep
 		}
 		// Owner won the handoff CAS and publishes to the buffered channel
 		// immediately afterward. This receive cannot wait on Raft or storage.
-		reply := <-request.reply
+		reply := request.reply.recv()
+		if pooled {
+			owner.releaseReplySlot(request.reply)
+		}
 		return reply, reply.err
 	}
 }
@@ -4193,7 +4323,7 @@ func (owner *Owner) submit(
 	admissionRegion := trace.StartRegion(ctx, "raft.proposal.admission")
 	reply, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestProposal, group: fence.Group, fence: fence, data: owned,
-		reply: make(chan ownerReply, 1), bytes: int64(cap(owned)),
+		bytes: int64(cap(owned)),
 		delivery: delivery, authorize: authorize,
 	})
 	admissionRegion.End()
@@ -4294,7 +4424,7 @@ func (owner *Owner) HandleInbound(ctx context.Context, inbound rafttransport.Inb
 	}
 	_, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestInbound, group: inbound.Group, inbound: inbound,
-		reply: make(chan ownerReply, 1), bytes: int64(size),
+		bytes: int64(size),
 	})
 	return err
 }
@@ -4317,7 +4447,7 @@ func (owner *Owner) TryInbound(inbound rafttransport.Inbound) error {
 	}
 	request := ownerRequest{
 		kind: requestInbound, group: inbound.Group, inbound: inbound,
-		reply: make(chan ownerReply, 1), bytes: int64(size), async: true,
+		bytes: int64(size), async: true,
 	}
 	return owner.publish(request)
 }
@@ -4325,7 +4455,7 @@ func (owner *Owner) TryInbound(inbound rafttransport.Inbound) error {
 // Campaign requests an election through the serialized lane.
 func (owner *Owner) Campaign(ctx context.Context, group raftmember.GroupKey) error {
 	_, err := owner.enqueue(ctx, ownerRequest{
-		kind: requestCampaign, group: group, reply: make(chan ownerReply, 1),
+		kind: requestCampaign, group: group,
 	})
 	return err
 }
@@ -4347,7 +4477,7 @@ func (owner *Owner) ApplyMembership(ctx context.Context, request MembershipReque
 	}
 	_, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestMembership, group: request.Fence.Group,
-		membership: request, reply: make(chan ownerReply, 1), transferDelivery: delivery,
+		membership: request, transferDelivery: delivery,
 	})
 	if err != nil && context.Cause(ctx) != nil && !errors.Is(err, errOwnerTransferCanceled) {
 		return errors.Join(ErrOutcomeUnknown, err)
@@ -4379,10 +4509,9 @@ func (owner *Owner) ProposeOwnershipTransition(
 	copy(owned, command)
 	var err error
 	for attempt := 0; attempt < 64; attempt++ {
-		reply := make(chan ownerReply, 1)
 		_, err = owner.enqueue(ctx, ownerRequest{
 			kind: requestOwnershipTransition, group: fence.Group, fence: fence,
-			data: owned, reply: reply, bytes: int64(len(owned)),
+			data: owned, bytes: int64(len(owned)),
 			ownershipDrainExpired: attempt >= 16,
 		})
 		if !errors.Is(err, errProposalQuiesce) {
@@ -4423,7 +4552,7 @@ func (owner *Owner) ProposeSchemaTransition(
 	copy(owned, command)
 	_, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestSchemaTransition, group: fence.Group, fence: fence,
-		data: owned, reply: make(chan ownerReply, 1), bytes: int64(len(owned)),
+		data: owned, bytes: int64(len(owned)),
 	})
 	if err != nil && context.Cause(ctx) != nil {
 		return errors.Join(ErrOutcomeUnknown, err)
@@ -4447,7 +4576,7 @@ func (owner *Owner) ObserveSchemaTransition(
 	copy(owned, command)
 	reply, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestObserveSchemaTransition, group: group, data: owned,
-		bytes: int64(len(owned)), reply: make(chan ownerReply, 1),
+		bytes: int64(len(owned)),
 	})
 	return reply.committed, err
 }
@@ -4499,7 +4628,7 @@ func (owner *Owner) FenceCommittedSchemaGeneration(
 	}
 	owned := append([]byte(nil), command...)
 	_, err := owner.enqueue(ctx, ownerRequest{kind: requestFenceCommittedSchemaGeneration,
-		group: group, data: owned, bytes: int64(len(owned)), reply: make(chan ownerReply, 1)})
+		group: group, data: owned, bytes: int64(len(owned))})
 	return err
 }
 
@@ -4551,7 +4680,7 @@ func (owner *Owner) RetireReplicaSource(
 	_, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestReplicaRetirement, group: request.Fence.Group, fence: request.Fence,
 		operation: request.Operation, step: request.Step, sourceMember: request.SourceMember,
-		targetMember: request.TargetMember, retirementProof: proof, retirementAuthorized: request.Authorized, reply: make(chan ownerReply, 1),
+		targetMember: request.TargetMember, retirementProof: proof, retirementAuthorized: request.Authorized,
 	})
 	if err != nil && context.Cause(ctx) != nil {
 		return errors.Join(ErrOutcomeUnknown, err)
@@ -4562,7 +4691,7 @@ func (owner *Owner) RetireReplicaSource(
 // Status reads detached Raft status through the serialized lane.
 func (owner *Owner) Probe(ctx context.Context, group raftmember.GroupKey) (ServingState, error) {
 	reply, err := owner.enqueue(ctx, ownerRequest{
-		kind: requestStatus, group: group, reply: make(chan ownerReply, 1),
+		kind: requestStatus, group: group,
 	})
 	return reply.state, err
 }
@@ -4581,7 +4710,6 @@ func (owner *Owner) ObserveReplica(
 	}
 	reply, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestReplicaObservation, group: group, targetMember: targetMember,
-		reply: make(chan ownerReply, 1),
 	})
 	return reply.observation, err
 }
@@ -4599,7 +4727,6 @@ func (owner *Owner) ObserveReplicaHealth(
 	}
 	reply, err := owner.enqueue(ctx, ownerRequest{
 		kind: requestReplicaHealthObservation, group: group, targetMember: targetMember,
-		reply: make(chan ownerReply, 1),
 	})
 	return reply.health, err
 }

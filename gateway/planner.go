@@ -355,47 +355,55 @@ func (s *Snapshot) Prepare(ctx context.Context, sqlText string) (*PreparedPlan, 
 // metadata. args use the gateway's closed runtime scalar vocabulary. Exact
 // wire numbers arrive as vibejson.RawValue.
 func (p *PreparedPlan) Bind(args []any) (*BoundPlan, error) {
-	if p == nil || p.constraints == nil || p.manifest == nil {
-		return nil, &PlanError{Reason: "incomplete prepared plan", cause: ErrDistributedPlanUnsupported}
+	bound := &BoundPlan{}
+	if err := p.BindInto(args, bound); err != nil {
+		return nil, err
+	}
+	return bound, nil
+}
+
+func (p *PreparedPlan) BindInto(args []any, dst *BoundPlan) error {
+	if p == nil || p.constraints == nil || p.manifest == nil || dst == nil {
+		return &PlanError{Reason: "incomplete prepared plan", cause: ErrDistributedPlanUnsupported}
 	}
 	if len(args) != p.params {
-		return nil, &PlanError{
+		return &PlanError{
 			Table:  p.table,
 			Reason: fmt.Sprintf("got %d parameters, want %d", len(args), p.params),
 			cause:  ErrPlanParameters,
 		}
 	}
 	if err := validateGatewayBindArgs(args); err != nil {
-		return nil, err
+		return err
 	}
 	constraints, err := p.constraints.Bind(args)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrPlanParameters, err)
+		return fmt.Errorf("%w: %w", ErrPlanParameters, err)
 	}
 	var statConstraints distribution.BoundConstraints
 	if p.statConstraints != nil {
 		statConstraints, err = p.statConstraints.Bind(args)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrPlanParameters, err)
+			return fmt.Errorf("%w: %w", ErrPlanParameters, err)
 		}
 	}
 	limit, err := bindPlanLimit(p.limit, args)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	offset, err := bindPlanOperand(p.offset, args, "OFFSET")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	var globalIndex *boundGlobalIndexRead
 	var globalEmpty bool
 	if !boundConstraintsSinglePoint(constraints, p.spec.Arity) {
 		globalIndex, globalEmpty, err = p.bindGlobalIndexRead(args)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return &BoundPlan{
+	*dst = BoundPlan{
 		generation: p.generation, table: p.table,
 		tables:          p.tables,
 		statConstraints: statConstraints, statPaths: p.statPaths, groupPaths: p.groupPaths, groupLocal: p.groupLocal,
@@ -406,7 +414,8 @@ func (p *PreparedPlan) Bind(args []any) (*BoundPlan, error) {
 		globalIndex: globalIndex, globalEmpty: globalEmpty,
 		spec: p.spec, manifest: p.manifest,
 		alwaysReason: p.alwaysReason, emptyReason: p.emptyReason, multiReason: p.multiReason,
-	}, nil
+	}
+	return nil
 }
 
 func validateGatewayBindArgs(args []any) error {

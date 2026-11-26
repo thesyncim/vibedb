@@ -37,10 +37,10 @@ func TestOwnerDropsTransferredPeerTrafficOnlyWhileSchemaGenerationQuiesces(t *te
 		group: {generation: generation},
 	}}
 	deliver := func() error {
-		reply := make(chan ownerReply, 1)
+		reply := newOwnerReplySlot()
 		err := owner.handle(ownerRequest{kind: requestInbound, group: group,
 			inbound: rafttransport.Inbound{Group: group, Message: &pb.Message{}}, reply: reply})
-		if got := (<-reply).err; !errors.Is(got, err) {
+		if got := reply.recv().err; !errors.Is(got, err) {
 			t.Fatalf("reply=%v handle=%v", got, err)
 		}
 		return err
@@ -101,7 +101,7 @@ func TestOwnerProposalDeliveryCancellationWinsBeforeOwnerHandoff(t *testing.T) {
 	owner := newDeliveryTestOwner()
 	ctx, cancel := context.WithCancel(context.Background())
 	delivery := &proposalDelivery{}
-	reply := make(chan ownerReply, 1)
+	reply := newOwnerReplySlot()
 	done := make(chan error, 1)
 	go func() {
 		_, err := owner.enqueue(ctx, ownerRequest{
@@ -230,7 +230,7 @@ func TestProposeSchemaTransitionDetachesBoundedCommand(t *testing.T) {
 		t.Fatalf("request kind=%d data=%v len/cap=%d/%d",
 			request.kind, request.data, len(request.data), cap(request.data))
 	}
-	request.reply <- ownerReply{}
+	request.reply.send(ownerReply{})
 	owner.release(request.bytes)
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -263,7 +263,7 @@ func TestObserveSchemaTransitionDetachesBoundedCommand(t *testing.T) {
 		t.Fatalf("request kind=%d group=%+v data=%v len/cap=%d/%d",
 			request.kind, request.group, request.data, len(request.data), cap(request.data))
 	}
-	request.reply <- ownerReply{committed: true}
+	request.reply.send(ownerReply{committed: true})
 	owner.release(request.bytes)
 	got := <-done
 	if got.err != nil || !got.committed {
@@ -276,14 +276,15 @@ func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *test
 	var contextKey [16]byte
 	contextKey[0], contextKey[15] = 3, 9
 	source := &ownerTestReadSource{}
-	delivery := &readDelivery{reply: make(chan ownerReply, 1), source: source,
+	delivery := &readDelivery{reply: newOwnerReplySlot(), source: source,
 		minimumApplied: 23, generation: &ownerGeneration{}}
 	owner.pendingReads[contextKey] = delivery
 	owner.finishReadOutcomes([]raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
 		Context: contextKey[:], Index: 17,
 	}}})
 	select {
-	case reply := <-delivery.reply:
+	case <-delivery.reply.done:
+		reply := delivery.reply.reply
 		if reply.err != nil || reply.read.minimumApplied != 23 || reply.read.source != source {
 			t.Fatalf("reply=%+v", reply)
 		}
@@ -294,24 +295,24 @@ func TestOwnerReadOutcomeSettlesExactFixedContextAndCancellationCleansUp(t *test
 		t.Fatal("settled read retained")
 	}
 
-	barrierDelivery := &readDelivery{reply: make(chan ownerReply, 1), source: source,
+	barrierDelivery := &readDelivery{reply: newOwnerReplySlot(), source: source,
 		minimumApplied: 11, generation: &ownerGeneration{}}
 	owner.pendingReads[contextKey] = barrierDelivery
 	owner.finishReadOutcomes([]raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
 		Context: contextKey[:], Index: 19,
 	}}})
-	if reply := <-barrierDelivery.reply; reply.err != nil ||
+	if reply := barrierDelivery.reply.recv(); reply.err != nil ||
 		reply.read.minimumApplied != 19 || reply.read.source != source {
 		t.Fatalf("barrier-ahead reply=%+v", reply)
 	}
 
-	abandoned := &readDelivery{reply: make(chan ownerReply, 1)}
+	abandoned := &readDelivery{reply: newOwnerReplySlot()}
 	abandoned.state.Store(readDeliveryAbandoned)
 	owner.pendingReads[contextKey] = abandoned
 	owner.finishReadOutcomes([]raftmodel.ReadOutcome{{Barrier: raftmodel.ReadBarrier{
 		Context: contextKey[:], Index: 18,
 	}}})
-	if len(owner.pendingReads) != 0 || len(abandoned.reply) != 0 {
+	if len(owner.pendingReads) != 0 || len(abandoned.reply.done) != 0 {
 		t.Fatal("canceled read was retained or redelivered")
 	}
 }
@@ -390,9 +391,9 @@ func TestOwnerPointReadBatchUsesOneLinearAuthorization(t *testing.T) {
 		if request.kind != requestReadLinear {
 			t.Errorf("request kind=%d", request.kind)
 		}
-		request.reply <- ownerReply{read: readAuthorization{
+		request.reply.send(ownerReply{read: readAuthorization{
 			source: source, minimumApplied: 19,
-		}}
+		}})
 		owner.release(request.bytes)
 	}()
 	result, lease, err := owner.ReadPointBatch(context.Background(), PointReadBatchRequest{
@@ -450,9 +451,9 @@ func TestPointReadResponseBudgetSaturatesAcrossLiveGrowthBoundaryLeases(t *testi
 	authorized := make(chan struct{})
 	authorize := func() {
 		request := <-owner.ingress
-		request.reply <- ownerReply{read: readAuthorization{
+		request.reply.send(ownerReply{read: readAuthorization{
 			source: source, minimumApplied: request.read.minimumApplied,
-		}}
+		}})
 		owner.release(request.bytes)
 		authorized <- struct{}{}
 	}
@@ -611,7 +612,7 @@ func TestOwnerProposalDeliveryHandoffWinsBeforeCancellation(t *testing.T) {
 	owner := newDeliveryTestOwner()
 	ctx, cancel := context.WithCancel(context.Background())
 	delivery := &proposalDelivery{}
-	reply := make(chan ownerReply, 1)
+	reply := newOwnerReplySlot()
 	done := make(chan error, 1)
 	go func() {
 		_, err := owner.enqueue(ctx, ownerRequest{
@@ -624,7 +625,7 @@ func TestOwnerProposalDeliveryHandoffWinsBeforeCancellation(t *testing.T) {
 		t.Fatal("owner did not acquire pending delivery")
 	}
 	cancel()
-	reply <- ownerReply{}
+	reply.send(ownerReply{})
 	if err := <-done; err != nil {
 		t.Fatalf("ready delivery = %v", err)
 	}
@@ -1241,7 +1242,7 @@ func TestOwnerCollectorFlushFailureSettlesDetachedDeferredRead(t *testing.T) {
 	<-owner.ready
 	<-host.firstRunEntered
 
-	proposalReply := make(chan ownerReply, 1)
+	proposalReply := newOwnerReplySlot()
 	proposal := proposalPrefixCommand(t, group, 1)
 	if err := owner.publish(ownerRequest{
 		kind: requestProposal, group: group,
@@ -1255,7 +1256,7 @@ func TestOwnerCollectorFlushFailureSettlesDetachedDeferredRead(t *testing.T) {
 	if err := owner.reservePendingRead(1); err != nil {
 		t.Fatal(err)
 	}
-	readDelivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	readDelivery := &readDelivery{reply: newOwnerReplySlot()}
 	if err := owner.publish(ownerRequest{
 		kind: requestReadLinear, group: group, reply: readDelivery.reply,
 		read: readRequest{
@@ -1270,10 +1271,10 @@ func TestOwnerCollectorFlushFailureSettlesDetachedDeferredRead(t *testing.T) {
 	if runErr := <-runDone; !errors.Is(runErr, errDeferredReadCollectorFlush) {
 		t.Fatalf("owner exit=%v", runErr)
 	}
-	if reply := <-proposalReply; !errors.Is(reply.err, errDeferredReadCollectorFlush) {
+	if reply := proposalReply.recv(); !errors.Is(reply.err, errDeferredReadCollectorFlush) {
 		t.Fatalf("proposal reply=%v", reply.err)
 	}
-	if reply := <-readDelivery.reply; !errors.Is(reply.err, ErrOwnerClosed) ||
+	if reply := readDelivery.reply.recv(); !errors.Is(reply.err, ErrOwnerClosed) ||
 		!errors.Is(reply.err, errDeferredReadCollectorFlush) {
 		t.Fatalf("read reply=%v", reply.err)
 	}
@@ -1398,7 +1399,7 @@ func TestOwnerQueuesSameGroupPrefixBeforeNextHostRunOne(t *testing.T) {
 	<-owner.ready
 	<-host.firstRunEntered
 
-	replies := [2]chan ownerReply{make(chan ownerReply, 1), make(chan ownerReply, 1)}
+	replies := [2]*ownerReplySlot{newOwnerReplySlot(), newOwnerReplySlot()}
 	for index := range replies {
 		data := proposalPrefixCommand(t, group, uint64(index+1))
 		if err := owner.publish(ownerRequest{
@@ -1415,7 +1416,7 @@ func TestOwnerQueuesSameGroupPrefixBeforeNextHostRunOne(t *testing.T) {
 		t.Fatalf("Host.RunOne saw %d queued proposals, want %d", queued, len(replies))
 	}
 	for _, reply := range replies {
-		result := <-reply
+		result := reply.recv()
 		if result.err != nil {
 			t.Fatal(result.err)
 		}
@@ -1469,7 +1470,7 @@ func TestOwnerAdmitsBoundedIngressBetweenSuccessfulHostTurns(t *testing.T) {
 	<-owner.ready
 	<-host.firstRunEntered
 
-	replies := [3]chan ownerReply{make(chan ownerReply, 1), make(chan ownerReply, 1), make(chan ownerReply, 1)}
+	replies := [3]*ownerReplySlot{newOwnerReplySlot(), newOwnerReplySlot(), newOwnerReplySlot()}
 	for index := range replies {
 		data := proposalPrefixCommand(t, group, uint64(index+1))
 		if err := owner.publish(ownerRequest{
@@ -1486,7 +1487,7 @@ func TestOwnerAdmitsBoundedIngressBetweenSuccessfulHostTurns(t *testing.T) {
 		t.Fatalf("next Host turn saw %d admitted proposals, want %d", queued, len(replies))
 	}
 	for _, reply := range replies {
-		result := <-reply
+		result := reply.recv()
 		if result.err != nil {
 			t.Fatal(result.err)
 		}
@@ -1520,7 +1521,7 @@ func TestOwnerRetainsControlBarrierUntilReadyIsDrained(t *testing.T) {
 	go func() { runDone <- owner.Run(ctx) }()
 	<-owner.ready
 	<-host.firstRunEntered
-	campaignReply := make(chan ownerReply, 1)
+	campaignReply := newOwnerReplySlot()
 	if err := owner.publish(ownerRequest{kind: requestCampaign,
 		group: raftmember.GroupKey{GroupID: [16]byte{1}}, reply: campaignReply}); err != nil {
 		t.Fatal(err)
@@ -1529,7 +1530,7 @@ func TestOwnerRetainsControlBarrierUntilReadyIsDrained(t *testing.T) {
 	if run := <-host.campaignRun; run != 4 {
 		t.Fatalf("campaign ran after Host turn %d, want idle probe after capture and persist", run)
 	}
-	if reply := <-campaignReply; reply.err != nil {
+	if reply := campaignReply.recv(); reply.err != nil {
 		t.Fatal(reply.err)
 	}
 	cancel()
@@ -1546,7 +1547,7 @@ func TestProposalIngressCollectorDrainsAlreadyQueuedSameGroupPrefix(t *testing.T
 	request := func(sequence byte) ownerRequest {
 		return ownerRequest{
 			kind: requestProposal, group: group, data: []byte{sequence},
-			reply: make(chan ownerReply, 1), bytes: 1,
+			reply: newOwnerReplySlot(), bytes: 1,
 		}
 	}
 	collector := newProposalIngressCollector(4)

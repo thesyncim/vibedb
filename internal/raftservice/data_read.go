@@ -271,7 +271,7 @@ func (owner *Owner) ReadLinearizableDataInto(
 			owner.releasePendingRead(1)
 		}
 	}()
-	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	delivery := owner.acquireReadDelivery()
 	reply, err := owner.enqueueRead(ctx, ownerRequest{
 		kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
 		read: readRequest{fence: request.Fence, delivery: delivery, authorize: request.Authorize},
@@ -347,7 +347,7 @@ func (owner *Owner) readLinearizablePointInto(
 			owner.releasePendingRead(1)
 		}
 	}()
-	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	delivery := owner.acquireReadDelivery()
 	reply, err := owner.enqueueRead(ctx, ownerRequest{
 		kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
 		read: readRequest{

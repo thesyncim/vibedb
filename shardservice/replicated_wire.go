@@ -103,7 +103,18 @@ func DecodeReplicatedSQLRequest(frame []byte) (*ShardRequest, error) {
 	if !validReplicatedSQLFrame(frame, tagRequest, MaxReplicatedSQLRequestBytes) {
 		return nil, ErrReplicatedWire
 	}
-	return DecodeRequest(bytes.NewReader(frame))
+	req := &ShardRequest{}
+	if err := decodeRequestBody(frame[5:], req); err != nil {
+		return nil, err
+	}
+	return req, nil
+}
+
+func decodeReplicatedSQLRequestInto(frame []byte, req *ShardRequest) error {
+	if !validReplicatedSQLFrame(frame, tagRequest, MaxReplicatedSQLRequestBytes) {
+		return ErrReplicatedWire
+	}
+	return decodeRequestBody(frame[5:], req)
 }
 
 // DecodeReplicatedSQLResponse bounds nested SQL result allocation by the exact
@@ -112,7 +123,7 @@ func DecodeReplicatedSQLResponse(frame []byte) (*ShardResponse, error) {
 	if !validReplicatedSQLFrame(frame, tagResponse, MaxReplicatedSQLResultBytes) {
 		return nil, ErrReplicatedWire
 	}
-	return DecodeResponse(bytes.NewReader(frame))
+	return decodeResponseBody(frame[5:])
 }
 
 func validReplicatedSQLFrame(frame []byte, tag byte, limit int) bool {

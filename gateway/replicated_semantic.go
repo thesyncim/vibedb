@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/frontenddrain"
@@ -276,19 +277,41 @@ func doRemoteReplicatedCall(
 	return doRemoteReplicatedCallMeasured(ctx, client, endpoint, call, nil)
 }
 
+var replicatedRequestPool = sync.Pool{
+	New: func() any {
+		return &shardservice.ReplicatedRequest{}
+	},
+}
+
 func doRemoteReplicatedCallMeasured(ctx context.Context, client ReplicatedRoundTripper, endpoint ReplicatedEndpoint, call *shardservice.ReplicatedCall, stats *ReplicatedNodeClient) (*shardservice.ReplicatedReply, error) {
 	if client == nil || ctx == nil || call == nil {
 		return nil, ErrReplicatedRoute
 	}
-	request, err := semanticCallToWire(call)
-	if err != nil {
-		return nil, err
+	_, poolable := client.(*AuthenticatedReplicatedClient)
+	var request *shardservice.ReplicatedRequest
+	if poolable {
+		request = replicatedRequestPool.Get().(*shardservice.ReplicatedRequest)
+		if err := semanticCallToWireInto(call, request); err != nil {
+			*request = shardservice.ReplicatedRequest{}
+			replicatedRequestPool.Put(request)
+			return nil, err
+		}
+	} else {
+		var err error
+		request, err = semanticCallToWire(call)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if stats != nil && call.SQL != nil {
 		stats.sqlRequestEncodings.Add(1)
 		stats.sqlRequestEncodedBytes.Add(uint64(len(request.Query)))
 	}
 	response, err := client.DoReplicated(ctx, endpoint, request)
+	if poolable {
+		*request = shardservice.ReplicatedRequest{}
+		replicatedRequestPool.Put(request)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -296,29 +319,37 @@ func doRemoteReplicatedCallMeasured(ctx context.Context, client ReplicatedRoundT
 }
 
 func semanticCallToWire(call *shardservice.ReplicatedCall) (*shardservice.ReplicatedRequest, error) {
-	if err := shardservice.ValidateReplicatedCall(call); err != nil {
+	request := &shardservice.ReplicatedRequest{}
+	if err := semanticCallToWireInto(call, request); err != nil {
 		return nil, err
+	}
+	return request, nil
+}
+
+func semanticCallToWireInto(call *shardservice.ReplicatedCall, dst *shardservice.ReplicatedRequest) error {
+	if err := shardservice.ValidateReplicatedCall(call); err != nil {
+		return err
 	}
 	// The copy is load-bearing: callers retain (and the fused path lends)
 	// the envelope, and a pinned test rejects any mutation of it, so the
 	// encoded query stamps a private copy even though attempts are
 	// sequential.
-	request := call.Request
+	*dst = call.Request
 	if call.SQL == nil {
-		return &request, nil
+		return nil
 	}
 	// One exact allocation replaces the buffer growth chain plus the
 	// discarded one-shot encoder arena; the bound check below is the same
 	// limit the two-pass version enforced after encoding.
 	query, err := shardservice.EncodeRequestBytes(call.SQL)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if len(query) > shardservice.MaxReplicatedSQLRequestBytes {
-		return nil, ErrResultLimit
+		return ErrResultLimit
 	}
-	request.Query = query
-	return &request, nil
+	dst.Query = query
+	return nil
 }
 
 func semanticReplyFromWire(response *shardservice.ReplicatedResponse) (*shardservice.ReplicatedReply, error) {

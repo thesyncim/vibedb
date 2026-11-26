@@ -20,7 +20,8 @@ func TestSharedReadBarrierRejectsPreInvocationQuorumEvidence(t *testing.T) {
 	f.owner.finishReadOutcomes([]raftmodel.ReadOutcome{old})
 	settleDeliveryReply(t, first, 9)
 	select {
-	case reply := <-late.reply:
+	case <-late.reply.done:
+		reply := late.reply.reply
 		if reply.read.generation != nil {
 			defer reply.read.generation.release()
 		}

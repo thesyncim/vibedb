@@ -156,7 +156,7 @@ func TestInstallSchemaGenerationCancellationWaitsForOwnershipOutcome(t *testing.
 				case "adopted":
 					// Model the owner completion boundary independently of SQL
 					// storage: the same pointers have become runtime-owned.
-					request.reply <- ownerReply{}
+					request.reply.send(ownerReply{})
 					owner.release(request.bytes)
 				case "refused":
 					want = ErrServingFence

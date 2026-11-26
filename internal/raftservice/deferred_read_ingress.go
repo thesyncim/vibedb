@@ -33,7 +33,7 @@ type deferredReadRequest struct {
 	kind  requestKind
 	group raftmember.GroupKey
 	read  readRequest
-	reply chan ownerReply
+	reply *ownerReplySlot
 	bytes int64
 	async bool
 }

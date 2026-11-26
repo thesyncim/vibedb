@@ -261,7 +261,8 @@ func (e *Executor) queryWithProfileValidation(
 	}
 	opctx, cancel := tightenTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
-	args, err := queryRuntimeArgs(q.Params)
+	var argsBuf [8]any
+	args, err := queryRuntimeArgsInto(q.Params, argsBuf[:0])
 	if err != nil {
 		return nil, err
 	}
@@ -342,10 +343,11 @@ func (e *Executor) queryWithProfileValidation(
 			}
 			return nil, coordinatorErr
 		}
-		bound, err := prepared.Bind(args)
-		if err != nil {
+		var boundPlan BoundPlan
+		if err := prepared.BindInto(args, &boundPlan); err != nil {
 			return nil, err
 		}
+		bound := &boundPlan
 		if shared {
 			// Preload the working copy with the shared physical plan for
 			// this generation. routeContextCached still re-routes every
@@ -430,7 +432,7 @@ func (e *Executor) queryWithProfileValidation(
 		// The routed shells were borrowed for this dispatch alone; the
 		// dispatch below joins every fan-out worker before returning, so
 		// they are dead on every exit after this point.
-		defer releaseShardCalls(pl.calls)
+		defer releasePlan(pl)
 		e.observePressureCalls(pl.calls)
 		e.metrics.observeRoute(pl.kind, len(pl.calls), pl.scatter)
 
@@ -479,7 +481,8 @@ func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
 	profile := e.profileFor(q.Class)
 	opctx, cancel := tightenTimeout(ctx, profile.GlobalDeadline)
 	defer cancel()
-	args, err := queryRuntimeArgs(q.Params)
+	var argsBuf [8]any
+	args, err := queryRuntimeArgsInto(q.Params, argsBuf[:0])
 	if err != nil {
 		return nil, err
 	}
@@ -793,7 +796,8 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 	if err := validateTypedQuery(ctx, &q); err != nil {
 		return nil, err
 	}
-	args, err := queryRuntimeArgs(q.Params)
+	var argsBuf [8]any
+	args, err := queryRuntimeArgsInto(q.Params, argsBuf[:0])
 	if err != nil {
 		return nil, err
 	}
@@ -904,10 +908,19 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 }
 
 func queryRuntimeArgs(params []shardservice.Param) ([]any, error) {
+	return queryRuntimeArgsInto(params, nil)
+}
+
+func queryRuntimeArgsInto(params []shardservice.Param, dst []any) ([]any, error) {
 	if len(params) == 0 {
 		return nil, nil
 	}
-	args := make([]any, len(params))
+	var args []any
+	if cap(dst) >= len(params) {
+		args = dst[:len(params)]
+	} else {
+		args = make([]any, len(params))
+	}
 	for i := range params {
 		if !params[i].Valid() {
 			return nil, fmt.Errorf("%w: parameter %d has invalid kind %d",
