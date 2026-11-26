@@ -618,101 +618,115 @@ func (a *rf3SchemaActivator) activate(
 				return readErr
 			}
 		}
-		var adopted []byte
-		var adoptedIndex uint64
-		if !found {
-			var built bool
-			var sourceErr error
-			preparedApplied, built, sourceErr = state.apply.ReplicatedSchemaDDLSourceApplied(raw)
-			if sourceErr != nil || !built {
-				return errors.Join(sourceErr, schemainstall.ErrConflict)
-			}
-			preCommandApplied = state.apply.Applied()
-			// Every member proposes its own transition, but Raft may apply a
-			// peer's before this member persists one. That committed
-			// transition is what this member's machine executed, so adopt it
-			// at its own index instead of rejecting it as foreign suffix.
-			committedIndex, committed, hasCommitted, scanErr := rf3SchemaCommittedTransition(
-				state.wal, preparedApplied, preCommandApplied, request, authorization)
-			if scanErr != nil {
-				return scanErr
-			}
-			if hasCommitted {
-				preCommandApplied = committedIndex - 1
-				adopted = committed
-				adoptedIndex = committedIndex
-			}
-			emptySuffix = preCommandApplied > preparedApplied
-			if emptySuffix {
-				if err := rf3SchemaReplayNeutralSuffix(state.wal, preparedApplied, preCommandApplied, request.Operation, request.Group); err != nil {
-					return err
+		for attempt := 0; attempt < 2; attempt++ {
+			var adopted []byte
+			var adoptedIndex uint64
+			if !found {
+				var built bool
+				var sourceErr error
+				preparedApplied, built, sourceErr = state.apply.ReplicatedSchemaDDLSourceApplied(raw)
+				if sourceErr != nil || !built {
+					return errors.Join(sourceErr, schemainstall.ErrConflict)
+				}
+				preCommandApplied = state.apply.Applied()
+				// Every member proposes its own transition, but Raft may apply a
+				// peer's before this member persists one. That committed
+				// transition is what this member's machine executed, so adopt it
+				// at its own index instead of rejecting it as foreign suffix.
+				committedIndex, committed, hasCommitted, scanErr := rf3SchemaCommittedTransition(
+					state.wal, preparedApplied, preCommandApplied, request, authorization)
+				if scanErr != nil {
+					return scanErr
+				}
+				if hasCommitted {
+					preCommandApplied = committedIndex - 1
+					adopted = committed
+					adoptedIndex = committedIndex
+				}
+				emptySuffix = preCommandApplied > preparedApplied
+				if emptySuffix {
+					if err := rf3SchemaReplayNeutralSuffix(state.wal, preparedApplied, preCommandApplied, request.Operation, request.Group); err != nil {
+						return err
+					}
 				}
 			}
-		}
-		command, err = rf3SchemaActivationCommand(request, authorization, persisted, found, func() ([]byte, error) {
-			if adopted != nil {
-				proof, recoverErr := state.apply.RecoverPreparedReplicatedSchemaTargetAfterEmptySuffix(
-					raw, request.Operation,
-				)
+			command, err = rf3SchemaActivationCommand(request, authorization, persisted, found, func() ([]byte, error) {
+				if adopted != nil {
+					proof, recoverErr := state.apply.RecoverPreparedReplicatedSchemaTargetAfterEmptySuffix(
+						raw, request.Operation,
+					)
+					if recoverErr != nil || validateRF3SchemaTarget(request, proof.Catalog, proof.ApplyContract) != nil {
+						return nil, errors.Join(recoverErr, schemainstall.ErrConflict)
+					}
+					authority := rf3SchemaTransitionAuthority(
+						request, authorization, authorizationDigest, [32]byte{},
+					)
+					return state.apply.AppendReplicatedSchemaTransitionAlias(
+						nil, proof, authority, adopted, adoptedIndex,
+					)
+				}
+				var proof sqldriver.ReplicatedSchemaTargetProof
+				var recoverErr error
+				if state.verified != nil && emptySuffix {
+					proof, recoverErr = state.verified.ResumePreparedAfterEmptySuffix(
+						ctx, state.apply, raw, request.Operation, preCommandApplied,
+					)
+				} else if state.verified != nil {
+					proof, recoverErr = state.verified.ResumePrepared(ctx, state.apply, raw, request.Operation)
+				} else if emptySuffix {
+					proof, recoverErr = state.apply.RecoverPreparedReplicatedSchemaTargetAfterEmptySuffix(raw, request.Operation)
+				} else {
+					proof, recoverErr = state.apply.RecoverPreparedReplicatedSchemaTarget(raw, request.Operation)
+				}
 				if recoverErr != nil || validateRF3SchemaTarget(request, proof.Catalog, proof.ApplyContract) != nil {
 					return nil, errors.Join(recoverErr, schemainstall.ErrConflict)
 				}
-				authority := rf3SchemaTransitionAuthority(
-					request, authorization, authorizationDigest, [32]byte{},
-				)
-				return state.apply.AppendReplicatedSchemaTransitionAlias(
-					nil, proof, authority, adopted, adoptedIndex,
-				)
-			}
-			var proof sqldriver.ReplicatedSchemaTargetProof
-			var recoverErr error
-			if state.verified != nil && emptySuffix {
-				proof, recoverErr = state.verified.ResumePreparedAfterEmptySuffix(
-					ctx, state.apply, raw, request.Operation, preCommandApplied,
-				)
-			} else if state.verified != nil {
-				proof, recoverErr = state.verified.ResumePrepared(ctx, state.apply, raw, request.Operation)
-			} else if emptySuffix {
-				proof, recoverErr = state.apply.RecoverPreparedReplicatedSchemaTargetAfterEmptySuffix(raw, request.Operation)
-			} else {
-				proof, recoverErr = state.apply.RecoverPreparedReplicatedSchemaTarget(raw, request.Operation)
-			}
-			if recoverErr != nil || validateRF3SchemaTarget(request, proof.Catalog, proof.ApplyContract) != nil {
-				return nil, errors.Join(recoverErr, schemainstall.ErrConflict)
-			}
-			cas, casErr := state.apply.ReplicatedSchemaCatalogCASDigest(proof, request.Operation, authorizationDigest)
-			if casErr != nil {
-				return nil, casErr
-			}
-			authority := rf3SchemaTransitionAuthority(request, authorization, authorizationDigest, cas)
-			var fresh []byte
-			var appendErr error
-			if emptySuffix {
-				fresh, appendErr = state.apply.AppendReplicatedSchemaTransitionAfterEmptySuffix(
-					nil, proof, authority, preCommandApplied,
-				)
-			} else {
-				fresh, appendErr = state.apply.AppendReplicatedSchemaTransition(nil, proof, authority)
-			}
-			if appendErr != nil {
-				return nil, appendErr
-			}
-			return fresh, nil
-		})
-		if err != nil {
-			return fmt.Errorf("schema activation recover command: %w", err)
-		}
-		if !found {
-			if emptySuffix {
-				err = state.apply.PersistReplicatedSchemaTransitionAfterEmptySuffix(
-					command, preparedApplied, preCommandApplied,
-				)
-			} else {
-				err = state.apply.PersistReplicatedSchemaTransition(command)
-			}
+				cas, casErr := state.apply.ReplicatedSchemaCatalogCASDigest(proof, request.Operation, authorizationDigest)
+				if casErr != nil {
+					return nil, casErr
+				}
+				authority := rf3SchemaTransitionAuthority(request, authorization, authorizationDigest, cas)
+				var fresh []byte
+				var appendErr error
+				if emptySuffix {
+					fresh, appendErr = state.apply.AppendReplicatedSchemaTransitionAfterEmptySuffix(
+						nil, proof, authority, preCommandApplied,
+					)
+				} else {
+					fresh, appendErr = state.apply.AppendReplicatedSchemaTransition(nil, proof, authority)
+				}
+				if appendErr != nil {
+					return nil, appendErr
+				}
+				return fresh, nil
+			})
 			if err != nil {
-				return fmt.Errorf("schema activation persist command: %w", err)
+				// Parallel Commit() across replicas can apply a peer's committed
+				// schema transition (or a neutral Raft entry) after preCommandApplied
+				// was sampled above, causing exact-cut recovery to fail. Re-scan
+				// once against the advanced applied index so we adopt the peer's
+				// committed transition instead of failing with a false conflict.
+				if attempt == 0 && !found && adopted == nil && state.apply.Applied() > preCommandApplied {
+					continue
+				}
+				return fmt.Errorf("schema activation recover command: %w", err)
 			}
+			if !found {
+				if emptySuffix {
+					err = state.apply.PersistReplicatedSchemaTransitionAfterEmptySuffix(
+						command, preparedApplied, preCommandApplied,
+					)
+				} else {
+					err = state.apply.PersistReplicatedSchemaTransition(command)
+				}
+				if err != nil {
+					if attempt == 0 && adopted == nil && state.apply.Applied() > preCommandApplied {
+						continue
+					}
+					return fmt.Errorf("schema activation persist command: %w", err)
+				}
+			}
+			break
 		}
 		if err = settleRF3SchemaCommitWithAlias(ctx, a.owners, request.Group, command, func() (bool, error) {
 			applied := state.apply.Applied()
