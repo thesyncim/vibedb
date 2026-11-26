@@ -34,7 +34,7 @@ func BenchmarkOwnerReadBarrier(b *testing.B) {
 			b.ResetTimer()
 			for range b.N {
 				for i := range requests {
-					d := &readDelivery{reply: make(chan ownerReply, 1)}
+					d := f.owner.acquireReadDelivery()
 					r := ownerRequest{kind: requestReadLinear, group: f.group, reply: d.reply, read: readRequest{fence: f.fence, minimumApplied: 1, delivery: d}}
 					if err := f.owner.publish(r); err != nil {
 						b.Fatal(err)
@@ -49,7 +49,8 @@ func BenchmarkOwnerReadBarrier(b *testing.B) {
 				}
 				f.owner.finishReadOutcomes(outcome)
 				for _, r := range requests {
-					reply := <-r.read.delivery.reply
+					reply := r.read.delivery.reply.recv()
+					f.owner.releaseReadDelivery(r.read.delivery)
 					if reply.err != nil {
 						b.Fatal(reply.err)
 					}

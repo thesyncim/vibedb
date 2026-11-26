@@ -168,8 +168,7 @@ func (owner *Owner) ValidateReplicaRetirement(ctx context.Context, request Repli
 	}
 	_, err := owner.enqueue(ctx, ownerRequest{kind: requestValidateReplicaRetirement,
 		group: request.Fence.Group, fence: request.Fence, operation: request.Operation, step: request.Step,
-		sourceMember: request.SourceMember, targetMember: request.TargetMember, retirementProof: proof,
-		reply: make(chan ownerReply, 1)})
+		sourceMember: request.SourceMember, targetMember: request.TargetMember, retirementProof: proof})
 	return err
 }
 

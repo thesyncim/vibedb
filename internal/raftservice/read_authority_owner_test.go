@@ -221,6 +221,10 @@ func newReadAuthorityOwnerFixture(t testing.TB) readAuthorityOwnerFixture {
 				// fixture only needs to keep servicing a possible bounded retry.
 			}
 			if request.kind == requestReadLinear && request.read.delivery != nil {
+				if len(owner.pendingReads) == 0 {
+					handled <- struct{}{}
+					continue
+				}
 				if _, pending := owner.pendingReads[request.read.delivery.context]; !pending {
 					handled <- struct{}{}
 					continue

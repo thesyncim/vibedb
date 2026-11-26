@@ -148,10 +148,10 @@ func TestLinearizablePointReadCutUsesOneLeaderBarrierAndPinsGeneration(t *testin
 		request := <-owner.ingress
 		requestSeen <- request
 		owner.release(request.bytes)
-		request.reply <- ownerReply{read: readAuthorization{
+		request.reply.send(ownerReply{read: readAuthorization{
 			source: source, minimumApplied: minimumApplied, generation: generation,
 			state: acceptedState,
-		}}
+		}})
 	}()
 
 	var cut LinearizablePointReadCut
@@ -258,9 +258,9 @@ func TestExecutionOwnersForwardLinearizablePointReadAndCancellation(t *testing.T
 	go func() {
 		request := <-owner.ingress
 		owner.release(request.bytes)
-		request.reply <- ownerReply{read: readAuthorization{
+		request.reply.send(ownerReply{read: readAuthorization{
 			source: source, minimumApplied: 23, generation: generation,
-		}}
+		}})
 	}()
 	var cut LinearizablePointReadCut
 	if err := owners.ReadLinearizablePointInto(t.Context(), LinearizablePointReadRequest{

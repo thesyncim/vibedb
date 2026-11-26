@@ -81,7 +81,7 @@ func (owner *Owner) ReadRouteReleaseReceipt(
 			owner.releasePendingRead(responseCharge)
 		}
 	}()
-	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	delivery := owner.acquireReadDelivery()
 	command := bytes.Clone(request.Command)
 	reply, err := owner.enqueueRead(ctx, ownerRequest{
 		kind: requestReadRouteReleaseReceipt, group: request.Fence.Group, reply: delivery.reply,

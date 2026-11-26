@@ -77,7 +77,7 @@ func TestRouteGateReadUsesQuorumFloorAndHoldsBoundedLease(t *testing.T) {
 			t.Errorf("kind %d", r.kind)
 		}
 		owner.release(r.bytes)
-		r.reply <- ownerReply{read: readAuthorization{routeGate: source, minimumApplied: 19}}
+		r.reply.send(ownerReply{read: readAuthorization{routeGate: source, minimumApplied: 19}})
 	}
 	go authorize()
 	request := RouteGateReadRequest{Fence: serving, Capability: serviceauthz.CapabilityDataWrite, MinimumApplied: 7}

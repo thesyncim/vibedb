@@ -201,7 +201,7 @@ func TestOwnerControlDrainStopsNewTicksThenResumesThem(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- owner.Run(ctx) }()
 	<-host.firstRunEntered
-	reply := make(chan ownerReply, 1)
+	reply := newOwnerReplySlot()
 	if err := owner.publish(ownerRequest{kind: requestCampaign, group: group, reply: reply}); err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,8 @@ func TestOwnerControlDrainStopsNewTicksThenResumesThem(t *testing.T) {
 		t.Fatal("ticks did not resume after control")
 	}
 	select {
-	case r := <-reply:
+	case <-reply.done:
+		r := reply.reply
 		if r.err != nil {
 			t.Fatal(r.err)
 		}

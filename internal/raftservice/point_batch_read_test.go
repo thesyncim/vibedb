@@ -73,7 +73,7 @@ func TestExecutionOwnersPointBatchPreservesReadIndexAndLease(t *testing.T) {
 			t.Errorf("wrong authorization request: %+v", request)
 		}
 		owner.release(request.bytes)
-		request.reply <- ownerReply{read: readAuthorization{source: source, minimumApplied: 19}}
+		request.reply.send(ownerReply{read: readAuthorization{source: source, minimumApplied: 19}})
 	}
 	go authorize()
 	request := PointReadBatchRequest{Fence: serving, Packed: packed, MinimumApplied: 7, MaxResultBytes: 4096}

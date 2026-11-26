@@ -91,14 +91,15 @@ func TestOwnerDeferredReadAllowsOtherGroupAndPeerProgress(t *testing.T) {
 		t.Fatalf("blocked read settled without its own barrier: %v", err)
 	default:
 	}
-	reply := make(chan ownerReply, 1)
+	reply := newOwnerReplySlot()
 	if err := owner.publish(ownerRequest{kind: requestInbound, group: group, reply: reply,
 		inbound: rafttransport.Inbound{Group: group, Message: &pb.Message{}},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case got := <-reply:
+	case <-reply.done:
+		got := reply.reply
 		if got.err != nil {
 			t.Fatal(got.err)
 		}

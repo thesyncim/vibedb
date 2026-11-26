@@ -98,9 +98,9 @@ func TestRouteReleaseReceiptReadUsesExactCommandAndQuorumFloor(t *testing.T) {
 			t.Errorf("owner command = %x, want %x", request.read.routeReleaseCommand, command)
 		}
 		owner.release(request.bytes)
-		request.reply <- ownerReply{read: readAuthorization{
+		request.reply.send(ownerReply{read: readAuthorization{
 			routeReleaseReceipt: source, routeReleaseCommand: command, minimumApplied: 19,
-		}}
+		}})
 	}()
 	request := RouteReleaseReceiptReadRequest{
 		Fence:      ServingFence{Group: peerServerTestGroup()},

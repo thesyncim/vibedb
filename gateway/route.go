@@ -59,6 +59,7 @@ type plan struct {
 	generation   uint64
 	scatter      ScatterReason
 	calls        []shardCall
+	inlineCall   [1]shardCall
 	order        []OrderKey
 	limit        int
 	offset       int
@@ -70,6 +71,17 @@ type plan struct {
 	groupLocal   bool
 	physical     *queryplanner.Plan
 	planning     queryplanner.OptimizerStatistics
+}
+
+var planPool = sync.Pool{New: func() any { return &plan{} }}
+
+func releasePlan(pl *plan) {
+	if pl == nil {
+		return
+	}
+	releaseShardCalls(pl.calls)
+	*pl = plan{}
+	planPool.Put(pl)
 }
 
 // routerPool hands each routing call its own distribution.Router. The Router
@@ -153,11 +165,19 @@ func (e *Executor) routeContextCached(
 		return nil, err
 	}
 
-	calls := make([]shardCall, len(route.Targets))
+	pl := planPool.Get().(*plan)
+	var calls []shardCall
+	if len(route.Targets) == 1 {
+		calls = pl.inlineCall[:1]
+	} else {
+		calls = make([]shardCall, len(route.Targets))
+	}
 	ownedCalls := true
 	defer func() {
 		if ownedCalls {
 			releaseShardCalls(calls)
+			*pl = plan{}
+			planPool.Put(pl)
 		}
 	}()
 	partialAggregate := len(route.Targets) > 1 && len(bound.groupKeys) != 0
@@ -228,25 +248,24 @@ func (e *Executor) routeContextCached(
 		}
 	}
 	ownedCalls = false
-	return &plan{
-		kind:         route.Kind,
-		distribution: route.Distribution,
-		version:      route.RoutingVersion,
-		generation:   snap.Generation(),
-		scatter:      scatterReason(route.Kind, bound.constraints),
-		calls:        calls,
-		order:        bound.order,
-		limit:        bound.limit,
-		offset:       bound.offset,
-		hasLimit:     bound.hasLimit,
-		aggregates:   bound.aggregates,
-		groupKeys:    bound.groupKeys,
-		aggHeaders:   bound.aggHeaders,
-		repartition:  physicalPlanContains(physical, queryplanner.OpRepartition),
-		groupLocal:   bound.groupLocal,
-		physical:     physical,
-		planning:     planning,
-	}, nil
+	pl.kind = route.Kind
+	pl.distribution = route.Distribution
+	pl.version = route.RoutingVersion
+	pl.generation = snap.Generation()
+	pl.scatter = scatterReason(route.Kind, bound.constraints)
+	pl.calls = calls
+	pl.order = bound.order
+	pl.limit = bound.limit
+	pl.offset = bound.offset
+	pl.hasLimit = bound.hasLimit
+	pl.aggregates = bound.aggregates
+	pl.groupKeys = bound.groupKeys
+	pl.aggHeaders = bound.aggHeaders
+	pl.repartition = physicalPlanContains(physical, queryplanner.OpRepartition)
+	pl.groupLocal = bound.groupLocal
+	pl.physical = physical
+	pl.planning = planning
+	return pl, nil
 }
 
 // populateReplicatedPrimaryKeyRead adds the native primary-key candidate only

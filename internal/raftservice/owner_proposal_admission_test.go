@@ -160,7 +160,7 @@ func newBusyProposalOwner(t *testing.T, groups []raftmember.GroupKey, host *busy
 
 func busyProposalRequest(
 	t *testing.T, group raftmember.GroupKey, fence CommandFence, storeID [16]byte,
-	data []byte, reply chan ownerReply,
+	data []byte, reply *ownerReplySlot,
 ) ownerRequest {
 	t.Helper()
 	return ownerRequest{
@@ -171,7 +171,7 @@ func busyProposalRequest(
 	}
 }
 
-func busyCampaignRequest(group raftmember.GroupKey, reply chan ownerReply) ownerRequest {
+func busyCampaignRequest(group raftmember.GroupKey, reply *ownerReplySlot) ownerRequest {
 	return ownerRequest{kind: requestCampaign, group: group, reply: reply}
 }
 
@@ -246,14 +246,14 @@ func TestOwnerAdmitsOrdinaryProposalsBeforeReadyDrain(t *testing.T) {
 		name       string
 		blockAfter int
 		control    bool
-		requests   func(t *testing.T, fences []CommandFence, replies []chan ownerReply) []ownerRequest
+		requests   func(t *testing.T, fences []CommandFence, replies []*ownerReplySlot) []ownerRequest
 		wantGroups []raftmember.GroupKey
 	}{
 		{
 			name:       "cross-group-prefix",
 			blockAfter: 3,
 			control:    true,
-			requests: func(t *testing.T, fences []CommandFence, replies []chan ownerReply) []ownerRequest {
+			requests: func(t *testing.T, fences []CommandFence, replies []*ownerReplySlot) []ownerRequest {
 				return []ownerRequest{
 					busyProposalRequest(t, groupA, fences[0], [16]byte{1}, proposalPrefixCommand(t, groupA, 1), replies[0]),
 					busyProposalRequest(t, groupA, fences[0], [16]byte{1}, proposalPrefixCommand(t, groupA, 2), replies[1]),
@@ -265,7 +265,7 @@ func TestOwnerAdmitsOrdinaryProposalsBeforeReadyDrain(t *testing.T) {
 		{
 			name:       "same-group-byte-boundary",
 			blockAfter: 2,
-			requests: func(t *testing.T, fences []CommandFence, replies []chan ownerReply) []ownerRequest {
+			requests: func(t *testing.T, fences []CommandFence, replies []*ownerReplySlot) []ownerRequest {
 				second := proposalPrefixCommand(t, groupA, 5)
 				first := proposalAtLeastBytes(t, groupA, 4,
 					int(raftmodel.MaxProposalBatchBytes)-len(second)+1)
@@ -284,7 +284,7 @@ func TestOwnerAdmitsOrdinaryProposalsBeforeReadyDrain(t *testing.T) {
 		{
 			name:       "noncandidate-oversized",
 			blockAfter: 1,
-			requests: func(t *testing.T, fences []CommandFence, replies []chan ownerReply) []ownerRequest {
+			requests: func(t *testing.T, fences []CommandFence, replies []*ownerReplySlot) []ownerRequest {
 				large := proposalAtLeastBytes(t, groupA, 6, int(raftmodel.MaxProposalBatchBytes))
 				if len(large) < int(raftmodel.MaxProposalBatchBytes) {
 					t.Fatalf("oversized proposal length=%d target=%d", len(large), raftmodel.MaxProposalBatchBytes)
@@ -327,18 +327,18 @@ func TestOwnerAdmitsOrdinaryProposalsBeforeReadyDrain(t *testing.T) {
 			<-owner.ready
 			<-host.firstRunEntered
 
-			replies := make([]chan ownerReply, test.blockAfter)
+			replies := make([]*ownerReplySlot, test.blockAfter)
 			for index := range replies {
-				replies[index] = make(chan ownerReply, 1)
+				replies[index] = newOwnerReplySlot()
 			}
 			for _, request := range test.requests(t, fences, replies) {
 				if err := owner.publish(request); err != nil {
 					t.Fatal(err)
 				}
 			}
-			var controlReply chan ownerReply
+			var controlReply *ownerReplySlot
 			if test.control {
-				controlReply = make(chan ownerReply, 1)
+				controlReply = newOwnerReplySlot()
 				if err := owner.publish(busyCampaignRequest(groupA, controlReply)); err != nil {
 					t.Fatal(err)
 				}
@@ -388,14 +388,15 @@ func TestOwnerAdmitsOrdinaryProposalsBeforeReadyDrain(t *testing.T) {
 				case <-time.After(5 * time.Second):
 					t.Fatal("control did not run after Ready drain")
 				}
-				if reply := <-controlReply; reply.err != nil {
+				if reply := controlReply.recv(); reply.err != nil {
 					t.Fatalf("control: %v", reply.err)
 				}
 			}
 
 			for index, replyChannel := range replies {
 				select {
-				case reply := <-replyChannel:
+				case <-replyChannel.done:
+					reply := replyChannel.reply
 					if reply.err != nil {
 						t.Fatalf("proposal %d: %v", index, reply.err)
 					}

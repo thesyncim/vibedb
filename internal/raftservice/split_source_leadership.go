@@ -15,7 +15,7 @@ func (owner *Owner) TransferSplitSourceLeadership(ctx context.Context, fence Ser
 		return ErrInvalidOwner
 	}
 	_, err := owner.enqueue(ctx, ownerRequest{kind: requestSplitSourceLeadership,
-		group: fence.Group, fence: fence, targetMember: target, reply: make(chan ownerReply, 1),
+		group: fence.Group, fence: fence, targetMember: target,
 		transferDelivery: &transferDelivery{}})
 	if errors.Is(err, errOwnerTransferCanceled) {
 		return context.Cause(ctx)
@@ -39,7 +39,7 @@ func (owner *Owner) TransferSchemaLeadership(ctx context.Context, fence ServingF
 		return ErrInvalidOwner
 	}
 	_, err := owner.enqueue(ctx, ownerRequest{kind: requestSchemaLeadershipTransfer,
-		group: fence.Group, fence: fence, reply: make(chan ownerReply, 1),
+		group: fence.Group, fence: fence,
 		transferDelivery: &transferDelivery{}})
 	if errors.Is(err, errOwnerTransferCanceled) {
 		return context.Cause(ctx)

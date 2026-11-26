@@ -35,18 +35,51 @@ const (
 		replicatedSQLWorkingReservationBudgets*replicatedSQLWorkingBytes
 )
 
+const maxPooledPointReadScratchBytes = 64 << 10
+
 type replicatedSQLLease struct {
-	budget *replicatedFrameByteBudget
-	bytes  int64
-	point  sqldriver.ReplicatedReadLease
-	cursor sqldriver.Cursor
-	cancel query.CancelFlag
+	budget   *replicatedFrameByteBudget
+	bytes    int64
+	point    sqldriver.ReplicatedReadLease
+	cursor   sqldriver.Cursor
+	cancel   query.CancelFlag
+	pointBuf []byte
+	pointCut raftservice.LinearizablePointReadCut
+	dataCut  raftservice.LinearizableDataReadCut
+}
+
+var replicatedSQLRequestPool = sync.Pool{
+	New: func() any {
+		return &ShardRequest{}
+	},
+}
+
+var replicatedSQLLeasePool = sync.Pool{
+	New: func() any {
+		return &replicatedSQLLease{}
+	},
+}
+
+func acquireReplicatedSQLLease(budget *replicatedFrameByteBudget, bytes int64) *replicatedSQLLease {
+	lease := replicatedSQLLeasePool.Get().(*replicatedSQLLease)
+	lease.budget = budget
+	lease.bytes = bytes
+	return lease
 }
 
 func (l *replicatedSQLLease) Release() {
 	if l.budget != nil {
 		l.budget.releaseSQL(l.bytes)
 		l.budget = nil
+		l.bytes = 0
+		l.pointCut = raftservice.LinearizablePointReadCut{}
+		l.dataCut = raftservice.LinearizableDataReadCut{}
+		if cap(l.pointBuf) > maxPooledPointReadScratchBytes {
+			l.pointBuf = nil
+		} else {
+			l.pointBuf = l.pointBuf[:0]
+		}
+		replicatedSQLLeasePool.Put(l)
 	}
 }
 
@@ -81,10 +114,16 @@ func (server *ReplicatedServer) executeReplicatedQueryCallValidated(
 	inner := semantic
 	var err error
 	if inner == nil {
-		inner, err = DecodeReplicatedSQLRequest(request.Query)
+		pooled := replicatedSQLRequestPool.Get().(*ShardRequest)
+		defer func() {
+			*pooled = ShardRequest{}
+			replicatedSQLRequestPool.Put(pooled)
+		}()
+		err = decodeReplicatedSQLRequestInto(request.Query, pooled)
 		if err != nil {
 			return refuse(ReplicatedRefusalStaleFence)
 		}
+		inner = pooled
 	} else if !semanticValidated {
 		err = ValidateRequest(inner)
 		if err != nil {
@@ -322,7 +361,7 @@ func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Conte
 	if !admitted {
 		return refuse(ReplicatedRefusalAdmissionBound)
 	}
-	lease := &replicatedSQLLease{budget: &server.frames, bytes: charge}
+	lease := acquireReplicatedSQLLease(&server.frames, charge)
 	retained := false
 	defer func() {
 		if !retained {
@@ -345,9 +384,9 @@ func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Conte
 	if !ok {
 		return refuse(ReplicatedRefusalUnavailable)
 	}
-	var cut raftservice.LinearizableDataReadCut
+	cut := &lease.dataCut
 	quorum := trace.StartRegion(ctx, "sql.read.quorum")
-	err := dataOwner.ReadLinearizableDataInto(ctx, raftservice.LinearizableDataReadRequest{Fence: state.Fence(), Capability: request.Capability, Authorize: authorize}, &cut)
+	err := dataOwner.ReadLinearizableDataInto(ctx, raftservice.LinearizableDataReadRequest{Fence: state.Fence(), Capability: request.Capability, Authorize: authorize}, cut)
 	quorum.End()
 	if err != nil {
 		switch {
@@ -442,7 +481,7 @@ func (server *ReplicatedServer) executeReplicatedPointQueryTierCall(
 		}
 	}
 	primary := inner.PrimaryKeyRead
-	var cut raftservice.LinearizablePointReadCut
+	cut := &lease.pointCut
 	quorum := trace.StartRegion(ctx, "sql.read.quorum")
 	pointFence := state.Fence()
 	if fusedPoint {
@@ -459,7 +498,7 @@ func (server *ReplicatedServer) executeReplicatedPointQueryTierCall(
 	err := owner.ReadLinearizablePointInto(ctx, raftservice.LinearizablePointReadRequest{
 		Fence: pointFence, Capability: request.Capability, Authorize: pointAuthorize,
 		ConcurrentAuthorize: concurrentAuthorize,
-	}, &cut)
+	}, cut)
 	quorum.End()
 	if err != nil {
 		return pointRefuse(err)
@@ -473,8 +512,11 @@ func (server *ReplicatedServer) executeReplicatedPointQueryTierCall(
 		return refuse(ReplicatedRefusalStaleFence)
 	}
 	point, err := cut.PointReadInto(
-		ctx, primary.Relation, primary.Keys[0], int(primary.MaxDocumentBytes), nil,
+		ctx, primary.Relation, primary.Keys[0], int(primary.MaxDocumentBytes), lease.pointBuf[:0],
 	)
+	if cap(point.Value) <= maxPooledPointReadScratchBytes && cap(point.Value) > cap(lease.pointBuf) {
+		lease.pointBuf = point.Value[:0]
+	}
 	// Authority-backed cuts can replace their admission with a fresh ReadIndex
 	// cut after a final validation race. Carry the final serialized witness into
 	// both the result and any refusal emitted below.

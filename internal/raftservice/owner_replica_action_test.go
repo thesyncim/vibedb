@@ -119,13 +119,13 @@ func newHealthProbeOwner() (*Owner, *healthProbeHost, raftmember.GroupKey) {
 func TestReplicaHealthObservationUsesOnlyAuthorizationFence(t *testing.T) {
 	owner, host, group := newHealthProbeOwner()
 	member := owner.members[group]
-	reply := make(chan ownerReply, 1)
+	reply := newOwnerReplySlot()
 	request := ownerRequest{kind: requestReplicaHealthObservation, group: group,
 		targetMember: 2, reply: reply}
 	if err := owner.handle(request); err != nil {
 		t.Fatalf("health handle err=%v", err)
 	}
-	got := (<-reply).health
+	got := reply.recv().health
 	if got.Identity != member.identity || got.Status != host.status ||
 		got.Publication.Applied != host.publication.Applied ||
 		got.Publication.ReplicaSetVersion != host.publication.ReplicaSetVersion {
@@ -171,13 +171,13 @@ func TestReplicaHealthObservationPreservesRejectionFences(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			owner, host, group := newHealthProbeOwner()
 			before := owner.members[group].command
-			replies := make(chan ownerReply, 1)
+			replies := newOwnerReplySlot()
 			request := ownerRequest{kind: requestReplicaHealthObservation, group: group, targetMember: 2, reply: replies}
 			test.mutate(host, &request)
 			if err := owner.handle(request); !errors.Is(err, test.want) {
 				t.Fatalf("handle=%v want=%v", err, test.want)
 			}
-			if reply := <-replies; !errors.Is(reply.err, test.want) {
+			if reply := replies.recv(); !errors.Is(reply.err, test.want) {
 				t.Fatalf("reply=%v want=%v", reply.err, test.want)
 			}
 			if host.snapshotCalls != 0 || owner.members[group].command != before {
@@ -319,11 +319,11 @@ func TestReplicaActionFencesOwnershipAndRetirementExactly(t *testing.T) {
 	retireFence.MemberID = 1
 	probeHost := &retirementHost{state: state, manifestDigest: member.identity.RelationManifestDigest}
 	probeOwner := &Owner{host: probeHost, members: map[raftmember.GroupKey]ownerMember{group: member}}
-	reply := make(chan ownerReply, 1)
+	reply := newOwnerReplySlot()
 	if err := probeOwner.handle(ownerRequest{kind: requestStatus, group: group, reply: reply}); err != nil {
 		t.Fatal(err)
 	}
-	if observed := <-reply; observed.err != nil || observed.state.Command != retireFence.Command {
+	if observed := reply.recv(); observed.err != nil || observed.state.Command != retireFence.Command {
 		t.Fatalf("probe returned pre-transition command fence: %+v", observed)
 	}
 	if probeHost.authorizationCalls != 1 || probeHost.snapshotCalls != 0 {
@@ -331,11 +331,11 @@ func TestReplicaActionFencesOwnershipAndRetirementExactly(t *testing.T) {
 			probeHost.authorizationCalls, probeHost.snapshotCalls)
 	}
 	probeHost.manifestDigest = [32]byte{99}
-	reply = make(chan ownerReply, 1)
+	reply = newOwnerReplySlot()
 	if err := probeOwner.handle(ownerRequest{kind: requestStatus, group: group, reply: reply}); !errors.Is(err, ErrServingFence) {
 		t.Fatalf("manifest-mismatched handle = %v", err)
 	}
-	if observed := <-reply; !errors.Is(observed.err, ErrServingFence) ||
+	if observed := reply.recv(); !errors.Is(observed.err, ErrServingFence) ||
 		observed.state.Command != retireFence.Command {
 		t.Fatalf("manifest-mismatched probe = %+v", observed)
 	}
@@ -382,11 +382,11 @@ func TestProbeBeforeReplicaSetPublicationPreservesBootstrapState(t *testing.T) {
 		Term: 12, Commit: 1, Applied: 1,
 	}}
 	owner := &Owner{host: host, members: map[raftmember.GroupKey]ownerMember{group: member}}
-	reply := make(chan ownerReply, 1)
+	reply := newOwnerReplySlot()
 	if err := owner.handle(ownerRequest{kind: requestStatus, group: group, reply: reply}); err != nil {
 		t.Fatal(err)
 	}
-	observed := <-reply
+	observed := reply.recv()
 	if observed.err != nil || observed.state.Command != command || observed.state.Status != host.status {
 		t.Fatalf("pre-publication probe = %+v", observed)
 	}

@@ -63,7 +63,7 @@ func (owner *Owner) ReadRouteGate(
 			owner.releasePendingRead(responseCharge)
 		}
 	}()
-	delivery := &readDelivery{reply: make(chan ownerReply, 1)}
+	delivery := owner.acquireReadDelivery()
 	reply, err := owner.enqueueRead(ctx, ownerRequest{
 		kind: requestReadRouteGate, group: request.Fence.Group, reply: delivery.reply,
 		read: readRequest{
