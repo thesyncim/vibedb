@@ -250,11 +250,6 @@ func (p *Parser) parseInsert() error {
 	switch {
 	case p.atKeyword(kwSelect), p.atKeyword(kwWith),
 		p.atKeyword(kwTable), parenthesizedSource:
-		if len(p.ins.Columns) != 0 {
-			return p.featureNotSupportedHere(
-				"INSERT ... SELECT initially accepts one complete JSON document column; a target column list would require row-to-document construction",
-			)
-		}
 		if err := p.parseInsertSource(); err != nil {
 			return err
 		}

@@ -924,6 +924,47 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 			return statementScalarValue{}, err
 		}
 		return statementScalarValue{value: scalar{kind: kindString, sval: string(raw)}}, nil
+	case "jsonb_set", "json_set":
+		if len(args) < 3 || len(args) > 4 {
+			return statementScalarValue{}, fmt.Errorf("%w: %s requires 3 or 4 arguments", ErrScalarType, name)
+		}
+		var target any
+		if err := json.Unmarshal(scalarAsJSONRaw(args[0]), &target); err != nil {
+			return statementScalarValue{}, fmt.Errorf("%w: %s target is not valid JSON", ErrScalarType, name)
+		}
+		if s, ok := target.(string); ok {
+			var inner any
+			if json.Unmarshal([]byte(s), &inner) == nil {
+				target = inner
+			}
+		}
+		pathStr, err := requireStringArg(name, args[1])
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		segments := parsePGJSONPath(pathStr)
+		var newVal any
+		if args[2].direct {
+			if err := json.Unmarshal(scalarAsJSONRaw(args[2]), &newVal); err != nil {
+				newVal = string(scalarAsJSONRaw(args[2]))
+			}
+		} else if args[2].value.kind == kindString {
+			if err := json.Unmarshal([]byte(args[2].value.sval), &newVal); err != nil {
+				newVal = args[2].value.sval
+			}
+		} else {
+			_ = json.Unmarshal(scalarAsJSONRaw(args[2]), &newVal)
+		}
+		createMissing := true
+		if len(args) == 4 && args[3].value.kind == kindBool {
+			createMissing = args[3].value.bval
+		}
+		updated := jsonbSetPath(target, segments, newVal, createMissing)
+		raw, err := json.Marshal(updated)
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		return statementScalarValue{cell: jsonCellFromBytes(arena, raw), direct: true}, nil
 	case "regexp_like", "regexp_count", "regexp_substr":
 		if len(args) < 2 || len(args) > 3 {
 			return statementScalarValue{}, fmt.Errorf("%w: %s takes 2 or 3 arguments", ErrScalarType, name)
@@ -1005,6 +1046,162 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 
 func compilePGRegexp(pat, flags string) (*regexp.Regexp, error) {
 	return cachedPGRegexp(pat, flags)
+}
+
+func evalTimestampIntervalArith(arena *[]byte, tsStr, intervalStr string, subtract bool) (scalar, bool) {
+	ts, hasTime, ok := parseTimestampForArith(tsStr)
+	if !ok {
+		return scalar{}, false
+	}
+	years, months, days, dur, ok := parsePGInterval(intervalStr)
+	if !ok {
+		return scalar{}, false
+	}
+	if subtract {
+		years, months, days, dur = -years, -months, -days, -dur
+	}
+	res := ts.AddDate(years, months, days).Add(dur)
+	var formatted string
+	if !hasTime && dur == 0 {
+		formatted = res.Format("2006-01-02")
+	} else {
+		formatted = res.UTC().Format(time.RFC3339Nano)
+	}
+	return scalar{kind: kindString, sval: formatted}, true
+}
+
+func parseTimestampForArith(s string) (time.Time, bool, bool) {
+	s = strings.TrimSpace(s)
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999Z07:00",
+		"2006-01-02 15:04:05Z07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02T15:04:05",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true, true
+		}
+	}
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return t, false, true
+	}
+	return time.Time{}, false, false
+}
+
+func parsePGInterval(s string) (years, months, days int, dur time.Duration, ok bool) {
+	fields := strings.Fields(s)
+	if len(fields) == 0 || len(fields)%2 != 0 {
+		return 0, 0, 0, 0, false
+	}
+	for i := 0; i < len(fields); i += 2 {
+		val, err := strconv.ParseFloat(fields[i], 64)
+		if err != nil {
+			return 0, 0, 0, 0, false
+		}
+		unit := strings.ToLower(strings.TrimSuffix(fields[i+1], ","))
+		switch unit {
+		case "year", "years", "yr", "yrs", "y":
+			years += int(val)
+		case "month", "months", "mon", "mons":
+			months += int(val)
+		case "week", "weeks", "w":
+			days += int(val) * 7
+		case "day", "days", "d":
+			days += int(val)
+		case "hour", "hours", "hr", "hrs", "h":
+			dur += time.Duration(val * float64(time.Hour))
+		case "minute", "minutes", "min", "mins", "m":
+			dur += time.Duration(val * float64(time.Minute))
+		case "second", "seconds", "sec", "secs", "s":
+			dur += time.Duration(val * float64(time.Second))
+		case "millisecond", "milliseconds", "ms":
+			dur += time.Duration(val * float64(time.Millisecond))
+		case "microsecond", "microseconds", "us":
+			dur += time.Duration(val * float64(time.Microsecond))
+		default:
+			return 0, 0, 0, 0, false
+		}
+	}
+	return years, months, days, dur, true
+}
+
+func parsePGJSONPath(s string) []string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}' {
+		inner := s[1 : len(s)-1]
+		if inner == "" {
+			return nil
+		}
+		parts := strings.Split(inner, ",")
+		for i := range parts {
+			parts[i] = strings.Trim(strings.TrimSpace(parts[i]), `"`)
+		}
+		return parts
+	}
+	if len(s) >= 2 && s[0] == '[' && s[len(s)-1] == ']' {
+		var arr []string
+		if json.Unmarshal([]byte(s), &arr) == nil {
+			return arr
+		}
+	}
+	if s == "" {
+		return nil
+	}
+	return []string{s}
+}
+
+func jsonbSetPath(target any, path []string, newVal any, createMissing bool) any {
+	if len(path) == 0 {
+		return newVal
+	}
+	key := path[0]
+	switch container := target.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(container)+1)
+		for k, v := range container {
+			out[k] = v
+		}
+		if len(path) == 1 {
+			if _, exists := out[key]; exists || createMissing {
+				out[key] = newVal
+			}
+			return out
+		}
+		if existing, exists := out[key]; exists {
+			out[key] = jsonbSetPath(existing, path[1:], newVal, createMissing)
+		}
+		return out
+	case []any:
+		idx, err := strconv.Atoi(key)
+		if err != nil {
+			return target
+		}
+		if idx < 0 {
+			idx = len(container) + idx
+		}
+		out := append([]any(nil), container...)
+		if idx < 0 || idx >= len(out) {
+			if createMissing && len(path) == 1 {
+				if idx >= len(out) {
+					return append(out, newVal)
+				}
+				return append([]any{newVal}, out...)
+			}
+			return out
+		}
+		if len(path) == 1 {
+			out[idx] = newVal
+		} else {
+			out[idx] = jsonbSetPath(out[idx], path[1:], newVal, createMissing)
+		}
+		return out
+	default:
+		return target
+	}
 }
 
 func stripJSONNulls(v any) any {

@@ -334,7 +334,11 @@ func (s *session) catalogShim(
 		return nil, false, err
 	}
 	if !ok {
-		return s.discoveryShim(text, check)
+		res, matched, err := s.discoveryShim(text, check)
+		if matched || err != nil {
+			return res, matched, err
+		}
+		return s.virtualCatalogShim(text, check)
 	}
 	tables, err := s.sql.Tables(s.operationContext())
 	if err != nil {

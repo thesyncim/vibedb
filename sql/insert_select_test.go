@@ -1,7 +1,6 @@
 package sql
 
 import (
-	"errors"
 	"strings"
 	"testing"
 )
@@ -101,10 +100,12 @@ func TestParseInsertQueryExpressionLeaders(t *testing.T) {
 }
 
 func TestParseInsertSelectRejectsColumnConstructionAndStatementSplit(t *testing.T) {
-	_, err := ParseStatement("INSERT INTO dst (doc) SELECT * FROM src")
-	var unsupported *FeatureNotSupportedError
-	if !errors.As(err, &unsupported) || unsupported.Pos != 22 {
-		t.Fatalf("column-list error = %#v", err)
+	stmt, err := ParseStatement("INSERT INTO dst (doc) SELECT * FROM src")
+	if err != nil {
+		t.Fatalf("column-list INSERT SELECT failed: %v", err)
+	}
+	if len(stmt.Insert.Columns) != 1 || stmt.Insert.Source == nil {
+		t.Fatalf("unexpected column-list INSERT SELECT AST: %#v", stmt.Insert)
 	}
 	if _, err := ParseStatement(
 		"INSERT INTO dst SELECT * FROM src; RETURNING id",

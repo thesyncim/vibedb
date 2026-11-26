@@ -261,6 +261,10 @@ type CreateIndexStmt struct {
 	// Paths are the indexed paths in declared order. One path is a column
 	// index; several form an order-sensitive compound key.
 	Paths []*PathExpr
+	// Include holds optional covering INCLUDE (...) paths.
+	Include []*PathExpr
+	// Where holds an optional partial-index WHERE predicate.
+	Where *Expr
 	// IfNotExists records IF NOT EXISTS.
 	IfNotExists bool
 	// Pos is the byte offset of the collection name.

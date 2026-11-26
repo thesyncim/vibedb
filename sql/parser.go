@@ -2582,6 +2582,23 @@ func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {
 	}
 	switch p.tok.kind {
 	case tokIdent:
+		if tokenTextEqual(p.tok, "UNNEST") {
+			head := p.tok
+			p.advance()
+			if p.tok.kind == tokLParen {
+				return p.parseUnnestTableRef(ref, head.pos)
+			}
+			ref.Name = p.internToken(head)
+			alias, err := p.parseTableAlias()
+			if err != nil {
+				return ref, err
+			}
+			ref.Alias, ref.HasAlias = ref.Name, alias != ""
+			if alias != "" {
+				ref.Alias = alias
+			}
+			return ref, nil
+		}
 		if err := p.checkNameable("a collection name"); err != nil {
 			return ref, err
 		}
@@ -2621,6 +2638,97 @@ func (p *Parser) parseTableRef(join JoinKind) (TableRef, error) {
 // The nested statement uses the same child-parser path as predicate subqueries,
 // which preserves independent FROM scope, arena ownership, nesting limits,
 // cancellation, position rebasing, and placeholder accounting in one place.
+// parseUnnestTableRef lowers PostgreSQL FROM unnest(ARRAY[e1, e2, ...]) [AS alias]
+// directly into a native RelationDerived VALUES relation so joins, filters,
+// ordering, CTEs, and distributed execution work with zero extra runtime code.
+func (p *Parser) parseUnnestTableRef(ref TableRef, pos int) (TableRef, error) {
+	p.advance() // '('
+	var closeKind tokenKind
+	if p.tok.kind == tokIdent && tokenTextEqual(p.tok, "ARRAY") {
+		p.advance()
+		if err := p.expect(tokLBracket, "'[' after ARRAY inside UNNEST"); err != nil {
+			return ref, err
+		}
+		closeKind = tokRBracket
+	} else {
+		return ref, p.errHere("UNNEST(...) requires an ARRAY[...] argument")
+	}
+	var values []SetValue
+	if p.tok.kind != closeKind {
+		for {
+			valPos := p.tok.pos
+			if p.acceptKeyword(kwNull) {
+				values = append(values, SetValue{Null: true, Pos: valPos})
+			} else {
+				op, err := p.parseOperand()
+				if err != nil {
+					return ref, err
+				}
+				values = append(values, SetValue{Operand: op, Pos: valPos})
+			}
+			if p.tok.kind != tokComma {
+				break
+			}
+			p.advance()
+		}
+	}
+	if err := p.expect(closeKind, "']' after ARRAY[...] in UNNEST"); err != nil {
+		return ref, err
+	}
+	if err := p.expect(tokRParen, "')' after UNNEST(...)"); err != nil {
+		return ref, err
+	}
+	alias, err := p.parseTableAlias()
+	if err != nil {
+		return ref, err
+	}
+	if alias == "" {
+		alias = "unnest"
+	}
+	colName := alias
+	if p.tok.kind == tokLParen {
+		p.advance()
+		colName, err = p.parseAliasName("column alias after UNNEST(...) AS alias(")
+		if err != nil {
+			return ref, err
+		}
+		if err := p.expect(tokRParen, "')' after UNNEST column alias"); err != nil {
+			return ref, err
+		}
+	}
+	rows := make([]SetValuesRow, len(values))
+	for i, v := range values {
+		rows[i] = SetValuesRow{Values: []SetValue{v}, Pos: v.Pos}
+	}
+	valuesOp := &SetValuesOperand{Rows: rows, Pos: pos}
+	first := &SelectStmt{
+		Columns: []ResultColumn{{Alias: colName, Pos: pos}},
+	}
+	root := &SetExpr{
+		Kind:    SetValuesExpr,
+		Values:  valuesOp,
+		First:   first,
+		Columns: 1,
+		Pos:     pos,
+		End:     -1,
+	}
+	setExpr := &SetExpression{
+		Root:    root,
+		First:   first,
+		Outputs: []SetOutputColumn{{Name: colName, Pos: pos}},
+		Pos:     pos,
+	}
+	query := &SelectStmt{
+		Columns: []ResultColumn{{Alias: colName, Pos: pos}},
+		Set:     setExpr,
+	}
+	ref.Kind = RelationDerived
+	ref.Query = query
+	ref.Alias = alias
+	ref.HasAlias = true
+	return ref, nil
+}
+
 func (p *Parser) parseDerivedTableRef(
 	ref TableRef,
 	capture *correlationCapture,

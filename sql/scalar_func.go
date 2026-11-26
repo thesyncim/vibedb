@@ -105,6 +105,10 @@ func builtinScalarFuncName(tok token) (string, bool) {
 			return "jsonb_strip_nulls", true
 		case equalFoldASCII(s, "jsonb_pretty"):
 			return "jsonb_pretty", true
+		case equalFoldASCII(s, "jsonb_set"):
+			return "jsonb_set", true
+		case equalFoldASCII(s, "json_set"):
+			return "json_set", true
 		}
 	case 'l':
 		switch {

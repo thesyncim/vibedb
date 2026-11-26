@@ -55,13 +55,39 @@ func (p *postgresWriteStatement) execInsertSelect(
 	b.WriteString(" VALUES ")
 	docParams := make([]shardservice.Param, 0, len(sourceRes.Rows))
 	for i, row := range sourceRes.Rows {
-		if len(row) != 1 || row[0].Null {
-			return nil, ErrMalformedRequest
-		}
 		if i > 0 {
 			b.WriteString(", ")
 		}
 		b.WriteString("(?)")
+		if len(p.insertColumns) > 0 {
+			if len(row) != len(p.insertColumns) {
+				return nil, ErrMalformedRequest
+			}
+			var docBuf []byte
+			docBuf = append(docBuf, '{')
+			for ci, colName := range p.insertColumns {
+				if ci > 0 {
+					docBuf = append(docBuf, ',')
+				}
+				keyBytes, err := json.Marshal(colName)
+				if err != nil {
+					return nil, err
+				}
+				docBuf = append(docBuf, keyBytes...)
+				docBuf = append(docBuf, ':')
+				if row[ci].Null {
+					docBuf = append(docBuf, "null"...)
+				} else {
+					docBuf = append(docBuf, row[ci].Bytes...)
+				}
+			}
+			docBuf = append(docBuf, '}')
+			docParams = append(docParams, shardservice.DocumentParam(string(docBuf)))
+			continue
+		}
+		if len(row) != 1 || row[0].Null {
+			return nil, ErrMalformedRequest
+		}
 		docParams = append(docParams, shardservice.DocumentParam(string(row[0].Bytes)))
 	}
 	if p.insertOnConflictDoNothing {

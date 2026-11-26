@@ -3,7 +3,6 @@ package query
 import (
 	"fmt"
 	"math"
-	"regexp"
 	"slices"
 	"strconv"
 	"unicode"
@@ -87,6 +86,12 @@ const (
 	// predRegex matches a string column against a compiled RE2 regular expression
 	// (~, ~*, !~, !~*, and SIMILAR TO). Compiled once at prepare time.
 	predRegex
+	// predJSONExists tests PostgreSQL JSONB key existence (?, ?|, ?&) directly
+	// on the vibejson tape with zero per-row allocation.
+	predJSONExists
+	// predArrayQuant tests PostgreSQL Value <op> ANY(arr) / Value <op> ALL(arr)
+	// directly on the vibejson tape with zero per-row allocation.
+	predArrayQuant
 	// predIsString is an internal SQL three-valued-logic guard for LIKE. It is
 	// not exported because the builder surface has no general JSON type tests.
 	predIsString
@@ -199,6 +204,16 @@ func Regex(path, pattern string) Predicate {
 // IRegex is Regex with case-insensitive matching (~*).
 func IRegex(path, pattern string) Predicate {
 	return Predicate{kind: predRegex, path: path, pattern: pattern, insensitive: true}
+}
+
+// JSONExists tests PostgreSQL JSONB key existence (?, ?|, ?&).
+func JSONExists(path string, allKeys bool, keys ...any) Predicate {
+	return Predicate{kind: predJSONExists, path: path, insensitive: allKeys, values: keys}
+}
+
+// ArrayQuant tests PostgreSQL value <op> ANY(path) / ALL(path).
+func ArrayQuant(path string, op Op, isAll bool, value any) Predicate {
+	return Predicate{kind: predArrayQuant, path: path, op: op, insensitive: isAll, value: value}
 }
 
 // Match tests whether the string at path satisfies a TINQL full-text query,
@@ -436,7 +451,6 @@ type compiledPredicate struct {
 	lit         scalar
 	needle      vibejson.Index
 	pattern     string
-	re          *regexp.Regexp
 	insensitive bool
 	probe       postProbe
 	boundPath   string
@@ -614,14 +628,54 @@ func (c *compiler) compilePredicate(p Predicate, reg *pathRegistry) (*compiledPr
 		if p.insensitive {
 			flags = "i"
 		}
-		re, err := cachedPGRegexp(p.pattern, flags)
-		if err != nil {
+		if _, err := cachedPGRegexp(p.pattern, flags); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidPattern, err)
 		}
 		cp := c.nodes.one()
 		*cp = compiledPredicate{
 			kind: predRegex, col: col,
-			pattern: c.internString(p.pattern), re: re, insensitive: p.insensitive,
+			pattern: c.internString(p.pattern), insensitive: p.insensitive,
+		}
+		return cp, nil
+	case predJSONExists:
+		col, err := c.addPath(reg, p.path)
+		if err != nil {
+			return nil, err
+		}
+		lits := make([]scalar, 0, len(p.values))
+		for _, v := range p.values {
+			lit, err := c.makeLiteral(v)
+			if err != nil {
+				return nil, err
+			}
+			if lit.kind != kindString {
+				return nil, fmt.Errorf("query: JSONB key existence requires string keys")
+			}
+			lits = append(lits, scalar{kind: kindString, sval: c.internString(lit.sval)})
+		}
+		cp := c.nodes.one()
+		*cp = compiledPredicate{
+			kind: predJSONExists, col: col, lits: lits, insensitive: p.insensitive,
+		}
+		return cp, nil
+	case predArrayQuant:
+		col, err := c.addPath(reg, p.path)
+		if err != nil {
+			return nil, err
+		}
+		lit, err := c.makeLiteral(p.value)
+		if err != nil {
+			return nil, err
+		}
+		s := scalar{kind: lit.kind, bval: lit.bval, ival: lit.ival, isInt: lit.isInt}
+		if lit.kind == kindString {
+			s.sval = c.internString(lit.sval)
+		} else if lit.kind == kindNumber {
+			s.num = lit.num
+		}
+		cp := c.nodes.one()
+		*cp = compiledPredicate{
+			kind: predArrayQuant, col: col, op: p.op, lit: s, insensitive: p.insensitive,
 		}
 		return cp, nil
 	case predMatch:
@@ -1114,7 +1168,43 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int, s *evalScratch) bool 
 		return cell.kind == kindString && likeMatch(p.pattern, cell.sval, p.insensitive)
 	case predRegex:
 		cell := cols[p.col][row]
-		return cell.kind == kindString && p.re != nil && p.re.MatchString(cell.sval)
+		if cell.kind != kindString {
+			return false
+		}
+		flags := ""
+		if p.insensitive {
+			flags = "i"
+		}
+		re, err := cachedPGRegexp(p.pattern, flags)
+		return err == nil && re.MatchString(cell.sval)
+	case predJSONExists:
+		cell := cols[p.col][row]
+		raw := cell.raw
+		if cell.kind == kindString {
+			raw = byteview.Bytes(cell.sval)
+		}
+		if len(raw) == 0 {
+			return false
+		}
+		idx, err := s.containsTape(raw)
+		if err != nil {
+			return false
+		}
+		return evalJSONKeyExists(idx.Root(), p.lits, p.insensitive)
+	case predArrayQuant:
+		cell := cols[p.col][row]
+		raw := cell.raw
+		if cell.kind == kindString {
+			raw = byteview.Bytes(cell.sval)
+		}
+		if len(raw) == 0 {
+			return false
+		}
+		idx, err := s.containsTape(raw)
+		if err != nil {
+			return false
+		}
+		return evalArrayQuant(idx.Root(), p.lit, p.op, p.insensitive)
 	case predMatch:
 		return evalMatch(s, p, cols, row)
 	case predInBound:
@@ -1168,6 +1258,137 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int, s *evalScratch) bool 
 		return false
 	default: // predNot
 		return !p.kids[0].eval(cols, row, s)
+	}
+}
+
+func evalJSONKeyExists(root vibejson.Node, keys []scalar, allKeys bool) bool {
+	if len(keys) == 0 {
+		return allKeys
+	}
+	switch root.Kind() {
+	case document.Object:
+		if len(keys) == 1 {
+			return jsonObjectHasKey(root, keys[0].sval)
+		}
+		if allKeys {
+			for _, k := range keys {
+				if !jsonObjectHasKey(root, k.sval) {
+					return false
+				}
+			}
+			return true
+		}
+		for _, k := range keys {
+			if jsonObjectHasKey(root, k.sval) {
+				return true
+			}
+		}
+		return false
+	case document.Array:
+		if allKeys {
+			for _, k := range keys {
+				if !jsonArrayHasString(root, k.sval) {
+					return false
+				}
+			}
+			return true
+		}
+		for _, k := range keys {
+			if jsonArrayHasString(root, k.sval) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func jsonObjectHasKey(obj vibejson.Node, target string) bool {
+	it, ok := obj.ObjectIter()
+	if !ok {
+		return false
+	}
+	var scratch [64]byte
+	for {
+		k, _, hasNext := it.Next()
+		if !hasNext {
+			return false
+		}
+		decoded, _ := k.AppendText(scratch[:0])
+		if string(decoded) == target {
+			return true
+		}
+	}
+}
+
+func jsonArrayHasString(arr vibejson.Node, target string) bool {
+	it, ok := arr.ArrayIter()
+	if !ok {
+		return false
+	}
+	var scratch [64]byte
+	for {
+		el, hasNext := it.Next()
+		if !hasNext {
+			return false
+		}
+		if el.Kind() == document.String {
+			decoded, _ := el.AppendText(scratch[:0])
+			if string(decoded) == target {
+				return true
+			}
+		}
+	}
+}
+
+func evalArrayQuant(root vibejson.Node, left scalar, op Op, isAll bool) bool {
+	if root.Kind() != document.Array {
+		return false
+	}
+	it, ok := root.ArrayIter()
+	if !ok {
+		return isAll
+	}
+	var scratch [64]byte
+	for {
+		el, hasNext := it.Next()
+		if !hasNext {
+			return isAll
+		}
+		var right scalar
+		switch el.Kind() {
+		case document.Null:
+			if isAll {
+				return false
+			}
+			continue
+		case document.Bool:
+			bv, _ := el.Bool()
+			right = scalar{kind: kindBool, bval: bv}
+		case document.String:
+			decoded, _ := el.AppendText(scratch[:0])
+			right = scalar{kind: kindString, sval: string(decoded)}
+		case document.Number:
+			raw := el.Raw().Bytes()
+			right = scalar{kind: kindNumber, num: raw}
+			if iv, err := strconv.ParseInt(byteview.String(raw), 10, 64); err == nil {
+				right.isInt = true
+				right.ival = iv
+			}
+		default:
+			if isAll {
+				return false
+			}
+			continue
+		}
+		matched := evalCmp(left, op, right)
+		if isAll && !matched {
+			return false
+		}
+		if !isAll && matched {
+			return true
+		}
 	}
 }
 

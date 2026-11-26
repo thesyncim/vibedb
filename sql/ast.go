@@ -772,6 +772,13 @@ const (
 	// ExprRegex is Path ~ / ~* / !~ / !~* Value (and SIMILAR TO lowered to a
 	// full-string RE2 pattern). Compiled once at query prepare time.
 	ExprRegex
+	// ExprJSONExists is Path ? key, Path ?| ARRAY[...], or Path ?& ARRAY[...].
+	// Value holds the single key for '?'; List holds the keys for '?|'/'?&' with
+	// Insensitive=true distinguishing '?&' (all keys) from '?|' (any key).
+	ExprJSONExists
+	// ExprArrayQuant is Value <op> ANY(Path) / Value <op> ALL(Path).
+	// Insensitive=true marks ALL; false marks ANY/SOME.
+	ExprArrayQuant
 	// ExprMatch is Path [NOT] ==> Value, full-text match. Value must be a
 	// string literal or a placeholder holding TINQL; the query lowerer
 	// resolves it against the collection's tin index for the path.

@@ -28,6 +28,7 @@ type postgresWriteStatement struct {
 	kind                      sqlast.Kind
 	table                     string
 	insertSelectSQL           string
+	insertColumns             []string
 	insertOnConflictDoNothing bool
 	params                    int
 	documents                 map[int]int
@@ -73,6 +74,7 @@ func (s *postgresSession) prepareWrite(
 		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL ON CONFLICT with RETURNING is not supported")
 	}
 	var insertSelectSQL string
+	var insertColumns []string
 	var insertOnConflictDoNothing bool
 	if parsed.Kind == sqlast.KindInsert && parsed.Insert.Source != nil {
 		if parsed.Insert.OnConflictUpdate != nil {
@@ -84,6 +86,12 @@ func (s *postgresSession) prepareWrite(
 			return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL INSERT ... SELECT source could not be extracted")
 		}
 		insertOnConflictDoNothing = parsed.Insert.OnConflictDoNothing
+		if len(parsed.Insert.Columns) > 0 {
+			insertColumns = make([]string, len(parsed.Insert.Columns))
+			for i, col := range parsed.Insert.Columns {
+				insertColumns[i] = strings.Clone(col.Spec())
+			}
+		}
 	}
 	if parsed.Kind == sqlast.KindInsert && !replicatedConflictActionSupported(parsed.Insert.OnConflictUpdate) {
 		return nil, sqlast.NewFeatureNotSupportedError(
@@ -146,6 +154,7 @@ func (s *postgresSession) prepareWrite(
 		session: s, text: strings.Clone(text), kind: parsed.Kind,
 		table:                     strings.Clone(parsed.Table()),
 		insertSelectSQL:           insertSelectSQL,
+		insertColumns:             insertColumns,
 		insertOnConflictDoNothing: insertOnConflictDoNothing,
 		params:                    parsed.Params(), compiled: compiled,
 		returning:  returningStmt,

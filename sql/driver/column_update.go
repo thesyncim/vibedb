@@ -212,7 +212,9 @@ func applyColumnAssignments(
 				}
 			}
 			kind := (vibejson.RawValue{Src: value}).Kind()
-			if kind == jsondoc.Object || kind == jsondoc.Array {
+			if (kind == jsondoc.Object || kind == jsondoc.Array) &&
+				assignments[i].Expr.Kind != sqlast.ScalarFunc &&
+				assignments[i].Expr.Kind != sqlast.ScalarCast {
 				return nil, &query.ScalarTypeError{
 					Pos:       assignments[i].Expr.Pos,
 					Operation: "UPDATE SET",

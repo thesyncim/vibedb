@@ -44,6 +44,9 @@ const (
 	tokRegexIMatch    // ~*
 	tokRegexNotMatch  // !~
 	tokRegexNotIMatch // !~*
+	tokJSONAnyKey     // ?|
+	tokJSONAllKeys    // ?&
+	tokContainedBy    // <@
 )
 
 // A token is one lexeme. text is a slice of the source for identifiers,
