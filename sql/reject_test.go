@@ -102,7 +102,7 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 		{"LIKE ESCAPE", `SELECT a FROM t WHERE b LIKE 'x%' ESCAPE '!'`, 34, "LIKE ... ESCAPE"},
 		{"regular expressions", `SELECT a FROM t WHERE b ~ 'x'`, 24, "regular-expression"},
 		{"a scalar subquery on the left", `SELECT a FROM t WHERE (SELECT 1 FROM u) = 1`, 23, "cannot stand alone"},
-		{"scalar functions", `SELECT lower(a) FROM t`, 12, "not a supported function"},
+		{"scalar functions", `SELECT unknown_fn(a) FROM t`, 17, "not a supported function"},
 		// Parse is the SELECT-only entry point. These three are statements the
 		// dialect does support, through ParseStatement, so the message names
 		// that entry point rather than claiming the engine cannot run them.
