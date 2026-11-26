@@ -237,8 +237,7 @@ func TestCTEUnsupportedBoundariesStayTypedAndRebased(t *testing.T) {
 		src    string
 		marker string
 	}{
-		{"insert body", `WITH c AS (INSERT INTO docs VALUES (?)) SELECT id FROM c`, "INSERT"},
-		{"update body", `WITH c AS (UPDATE docs SET "$doc" = ?) SELECT id FROM c`, "UPDATE"},
+		{"merge body", `WITH c AS (MERGE INTO docs USING other ON docs.id = other.id WHEN MATCHED THEN DELETE) SELECT id FROM c`, "MERGE"},
 		{"delete primary", `WITH c AS (SELECT id FROM docs) DELETE FROM docs`, "DELETE"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

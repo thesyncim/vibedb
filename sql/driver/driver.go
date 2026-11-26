@@ -610,6 +610,11 @@ func (c *conn) prepareContextMode(
 	if isSavepointKind(tree.Kind) {
 		return s, nil
 	}
+	if tree.Kind == sqlast.KindSelect && hasMutationCTE(tree.Select) {
+		s.text = strings.Clone(src)
+		s.mutationCTE = true
+		return s, nil
+	}
 	if err := c.validateViewStatementContext(ctx, src, tree); err != nil {
 		return nil, err
 	}

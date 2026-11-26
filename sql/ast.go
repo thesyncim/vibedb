@@ -188,6 +188,9 @@ type CommonTableExpr struct {
 	// consumed by bounded fixpoint lowering. A consumer must branch on
 	// Recursive.Anchor before treating Query as an ordinary CTE body.
 	Query           *SelectStmt
+	MutationSQL     string
+	MutationStart   int
+	MutationEnd     int
 	Recursive       RecursiveCTE
 	Materialization CTEMaterialization
 	// Pos is the byte offset of Name. HintPos is the byte offset of

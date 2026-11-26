@@ -11,7 +11,6 @@ type SQLWorkloadGap struct {
 }
 
 var SQLWorkloadGaps = []SQLWorkloadGap{
-	{"mutation_cte", `WITH removed AS (DELETE FROM compatibility_docs WHERE id = 'a' RETURNING n) SELECT n FROM removed`},
 	{"composite_conflict_target", `INSERT INTO compatibility_docs (id, n) VALUES ('a', 0) ON CONFLICT (id, n) DO NOTHING`},
 	{"copy", `COPY compatibility_docs FROM STDIN`},
 }
