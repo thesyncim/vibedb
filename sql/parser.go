@@ -818,6 +818,9 @@ func (p *Parser) parseStatement() error {
 	if err := p.parseLimitOffset(); err != nil {
 		return err
 	}
+	if err := p.parseLockingClause(); err != nil {
+		return err
+	}
 	if isSetOperatorToken(p.tok) {
 		return p.parseSetStatement(statementPos)
 	}
@@ -2753,7 +2756,7 @@ func (p *Parser) parseTableAlias() (string, error) {
 	if p.acceptKeyword(kwAs) {
 		return p.parseAliasName("an alias after AS")
 	}
-	if p.tok.kind == tokQuotedIdent || (p.tok.kind == tokIdent && !reserved(p.tok.kw)) {
+	if p.tok.kind == tokQuotedIdent || (p.tok.kind == tokIdent && !reserved(p.tok.kw) && !tokenTextEqual(p.tok, "FOR")) {
 		return p.parseAliasName("an alias")
 	}
 	return "", nil
@@ -3025,6 +3028,63 @@ func (p *Parser) resolveOrderAlias(path *PathExpr) (*PathExpr, int, error) {
 	return path, 0, nil
 }
 
+func (p *Parser) parseLockingClause() error {
+	if !tokenTextEqual(p.tok, "FOR") {
+		return nil
+	}
+	p.advance() // FOR
+	switch {
+	case p.atKeyword(kwUpdate):
+		p.advance()
+		p.out.LockMode = RowLockUpdate
+	case tokenTextEqual(p.tok, "NO"):
+		p.advance()
+		if !p.acceptKeyword(kwKey) {
+			return p.errHere("expected KEY after FOR NO")
+		}
+		if !p.acceptKeyword(kwUpdate) {
+			return p.errHere("expected UPDATE after FOR NO KEY")
+		}
+		p.out.LockMode = RowLockNoKeyUpdate
+	case tokenTextEqual(p.tok, "KEY"):
+		p.advance()
+		if !tokenTextEqual(p.tok, "SHARE") {
+			return p.errHere("expected SHARE after FOR KEY")
+		}
+		p.advance()
+		p.out.LockMode = RowLockKeyShare
+	case tokenTextEqual(p.tok, "SHARE"):
+		p.advance()
+		p.out.LockMode = RowLockShare
+	default:
+		return p.errHere("expected UPDATE, NO KEY UPDATE, SHARE, or KEY SHARE after FOR")
+	}
+	if tokenTextEqual(p.tok, "OF") {
+		p.advance()
+		for {
+			if _, _, err := p.parseCollectionName(); err != nil {
+				return err
+			}
+			if p.tok.kind != tokComma {
+				break
+			}
+			p.advance()
+		}
+	}
+	if tokenTextEqual(p.tok, "NOWAIT") {
+		p.out.NoWait = true
+		p.advance()
+	} else if tokenTextEqual(p.tok, "SKIP") {
+		p.advance()
+		if !tokenTextEqual(p.tok, "LOCKED") {
+			return p.errHere("expected LOCKED after SKIP")
+		}
+		p.out.SkipLocked = true
+		p.advance()
+	}
+	return nil
+}
+
 func (p *Parser) parseLimitOffset() error {
 	for i := 0; i < 2; i++ {
 		switch {
@@ -3033,6 +3093,10 @@ func (p *Parser) parseLimitOffset() error {
 				return p.errHere("LIMIT is given twice")
 			}
 			p.advance()
+			if p.acceptKeyword(kwAll) {
+				// PostgreSQL LIMIT ALL means unbounded.
+				continue
+			}
 			op, err := p.parseRowCount("LIMIT")
 			if err != nil {
 				return err
@@ -3048,8 +3112,36 @@ func (p *Parser) parseLimitOffset() error {
 				return err
 			}
 			p.out.Offset = op
+			if tokenTextEqual(p.tok, "ROW") || tokenTextEqual(p.tok, "ROWS") {
+				p.advance()
+			}
 		case p.atKeyword(kwFetch):
-			return p.errHere("FETCH FIRST is not supported; write LIMIT")
+			if p.out.Limit != nil {
+				return p.errHere("LIMIT/FETCH is given twice")
+			}
+			p.advance() // FETCH
+			if !tokenTextEqual(p.tok, "FIRST") && !tokenTextEqual(p.tok, "NEXT") {
+				return p.errHere("expected FIRST or NEXT after FETCH")
+			}
+			p.advance()
+			if tokenTextEqual(p.tok, "ROW") || tokenTextEqual(p.tok, "ROWS") {
+				p.out.Limit = &Operand{Kind: OperandNumber, Text: "1", Pos: p.tok.pos}
+				p.advance()
+			} else {
+				op, err := p.parseRowCount("FETCH")
+				if err != nil {
+					return err
+				}
+				p.out.Limit = op
+				if !tokenTextEqual(p.tok, "ROW") && !tokenTextEqual(p.tok, "ROWS") {
+					return p.errHere("expected ROW or ROWS in FETCH clause")
+				}
+				p.advance()
+			}
+			if !tokenTextEqual(p.tok, "ONLY") {
+				return p.errHere("expected ONLY after FETCH ... ROWS (WITH TIES is not supported)")
+			}
+			p.advance()
 		default:
 			return nil
 		}
@@ -3257,6 +3349,15 @@ loop:
 // unify those spellings, whereas PostgreSQL distinguishes ->'0' from ->0.
 // Silently accepting them would return an array element for an object key.
 func (p *Parser) parseJSONAccessor() (Segment, error) {
+	if p.tok.kind == tokNumber {
+		n, err := strconv.Atoi(p.tok.text)
+		if err != nil || n < 0 {
+			return Segment{}, newFeatureNotSupportedError(p.lx.src, p.tok.pos,
+				"JSON -> and ->> array index must be a non-negative integer")
+		}
+		p.advance()
+		return Segment{Index: n, IsIndex: true}, nil
+	}
 	if p.tok.kind == tokString {
 		key := p.internToken(p.tok)
 		numeric := len(key) != 0
@@ -3269,7 +3370,7 @@ func (p *Parser) parseJSONAccessor() (Segment, error) {
 		}
 	}
 	return Segment{}, newFeatureNotSupportedError(p.lx.src, p.tok.pos,
-		"JSON -> and ->> require a constant non-numeric object key; array indexes, numeric keys, and dynamic keys are not supported")
+		"JSON -> and ->> require a constant non-numeric object key or non-negative integer array index")
 }
 
 // parseSubscript parses the content of a '[...]' accessor: a non-negative

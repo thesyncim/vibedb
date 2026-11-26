@@ -422,6 +422,12 @@ func (p *Parser) parseScalarCondition(
 			p.advance()
 			return p.scalarBooleanTest(left, truth, negated, pos)
 		}
+		if tokenTextEqual(p.tok, "UNKNOWN") {
+			p.advance()
+			e := p.exprs.one()
+			*e = Expr{Kind: ExprScalarIsNull, Negated: negated, Column: -1, ScalarLeft: left, Pos: pos}
+			return e, nil
+		}
 		if !p.acceptKeyword(kwNull) {
 			return nil, p.errHere("a computed scalar supports IS [NOT] NULL; IS MISSING applies only to a stored path")
 		}
@@ -805,7 +811,18 @@ func (p *Parser) parseLikeTail(
 		return nil, p.errAt(value.Pos, "LIKE pattern must be a string literal or a placeholder")
 	}
 	if p.atKeyword(kwEscape) {
-		return nil, p.errHere("LIKE ... ESCAPE is not supported; use the default backslash escape")
+		p.advance() // ESCAPE
+		escOp, err := p.parseOperand()
+		if err != nil {
+			return nil, err
+		}
+		if escOp.Kind != OperandString || len([]rune(escOp.Text)) > 1 {
+			return nil, p.errAt(escOp.Pos, "ESCAPE string must be empty or one character")
+		}
+		if value.Kind != OperandString {
+			return nil, p.errAt(escOp.Pos, "LIKE ... ESCAPE with a parameterized pattern is not supported")
+		}
+		value.Text = rewriteLikeEscapeToBackslash(value.Text, escOp.Text)
 	}
 	e := p.exprs.one()
 	*e = Expr{
@@ -813,6 +830,32 @@ func (p *Parser) parseLikeTail(
 		Column: -1, Path: path, Value: value, Pos: pos,
 	}
 	return e, nil
+}
+
+func rewriteLikeEscapeToBackslash(pattern, esc string) string {
+	out := make([]rune, 0, len(pattern))
+	var escRune rune
+	hasEsc := false
+	for _, r := range esc {
+		escRune = r
+		hasEsc = true
+		break
+	}
+	runes := []rune(pattern)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if hasEsc && r == escRune && i+1 < len(runes) {
+			i++
+			out = append(out, '\\', runes[i])
+			continue
+		}
+		if r == '\\' {
+			out = append(out, '\\', '\\')
+			continue
+		}
+		out = append(out, r)
+	}
+	return string(out)
 }
 
 // parseMatchTail parses Path [NOT] ==> TINQL. The right side is a string
@@ -850,6 +893,8 @@ func (p *Parser) parseIsTail(ctx exprContext, agg AggKind, path *PathExpr, pos i
 	case p.acceptKeyword(kwDistinct):
 		return p.parseDistinctTail(ctx, p.scalarFromColumn(ResultColumn{Agg: agg, Path: path, Pos: pos}), negated, pos)
 	case p.acceptKeyword(kwNull):
+	case tokenTextEqual(p.tok, "UNKNOWN"):
+		p.advance()
 	case p.acceptKeyword(kwMissing):
 		kind = ExprIsMissing
 	case p.atKeyword(kwTrue), p.atKeyword(kwFalse):

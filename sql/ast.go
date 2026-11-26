@@ -16,6 +16,17 @@ package sql
 // its next Parse; see the Parser documentation. It never points into the
 // statement text, so the source may be reused as soon as Parse returns.
 
+// RowLockMode identifies a PostgreSQL SELECT ... FOR locking strength.
+type RowLockMode uint8
+
+const (
+	RowLockNone RowLockMode = iota
+	RowLockUpdate
+	RowLockNoKeyUpdate
+	RowLockShare
+	RowLockKeyShare
+)
+
 // A SelectStmt is one parsed SELECT statement.
 type SelectStmt struct {
 	// With holds the non-recursive common-table-expression definitions visible
@@ -32,6 +43,10 @@ type SelectStmt struct {
 	// lowers the non-aggregate form to GROUP BY over the projection paths so the
 	// existing spill-aware grouping engine supplies equality and bounded memory.
 	Distinct bool
+	// LockMode records an optional FOR UPDATE / FOR SHARE locking clause.
+	LockMode   RowLockMode
+	SkipLocked bool
+	NoWait     bool
 
 	// From holds the range variables. It is empty for a source-independent
 	// one-row SELECT. Otherwise From[0] is the driving relation; each later entry

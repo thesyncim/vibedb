@@ -5,7 +5,7 @@ package sql
 // immediately followed by '(', so bare field names like "length", "left",
 // "right", "trim", or "lower" remain ordinary JSON paths.
 func builtinScalarFuncName(tok token) (string, bool) {
-	if tok.kind != tokIdent || len(tok.text) < 2 || len(tok.text) > 20 {
+	if tok.kind != tokIdent || len(tok.text) < 2 || len(tok.text) > 25 {
 		return "", false
 	}
 	s := tok.text
@@ -14,6 +14,10 @@ func builtinScalarFuncName(tok token) (string, bool) {
 		switch {
 		case equalFoldASCII(s, "abs"):
 			return "abs", true
+		case equalFoldASCII(s, "array_length"):
+			return "array_length", true
+		case equalFoldASCII(s, "array_to_string"):
+			return "array_to_string", true
 		case equalFoldASCII(s, "ascii"):
 			return "ascii", true
 		}
@@ -23,6 +27,8 @@ func builtinScalarFuncName(tok token) (string, bool) {
 		}
 	case 'c':
 		switch {
+		case equalFoldASCII(s, "cardinality"):
+			return "cardinality", true
 		case equalFoldASCII(s, "ceil"):
 			return "ceil", true
 		case equalFoldASCII(s, "ceiling"):
@@ -85,6 +91,20 @@ func builtinScalarFuncName(tok token) (string, bool) {
 			return "json_build_array", true
 		case equalFoldASCII(s, "jsonb_build_array"):
 			return "jsonb_build_array", true
+		case equalFoldASCII(s, "json_extract_path"):
+			return "json_extract_path", true
+		case equalFoldASCII(s, "jsonb_extract_path"):
+			return "jsonb_extract_path", true
+		case equalFoldASCII(s, "json_extract_path_text"):
+			return "json_extract_path_text", true
+		case equalFoldASCII(s, "jsonb_extract_path_text"):
+			return "jsonb_extract_path_text", true
+		case equalFoldASCII(s, "json_strip_nulls"):
+			return "json_strip_nulls", true
+		case equalFoldASCII(s, "jsonb_strip_nulls"):
+			return "jsonb_strip_nulls", true
+		case equalFoldASCII(s, "jsonb_pretty"):
+			return "jsonb_pretty", true
 		}
 	case 'l':
 		switch {
@@ -131,6 +151,14 @@ func builtinScalarFuncName(tok token) (string, bool) {
 		}
 	case 'r':
 		switch {
+		case equalFoldASCII(s, "regexp_count"):
+			return "regexp_count", true
+		case equalFoldASCII(s, "regexp_like"):
+			return "regexp_like", true
+		case equalFoldASCII(s, "regexp_replace"):
+			return "regexp_replace", true
+		case equalFoldASCII(s, "regexp_substr"):
+			return "regexp_substr", true
 		case equalFoldASCII(s, "repeat"):
 			return "repeat", true
 		case equalFoldASCII(s, "replace"):
@@ -158,6 +186,8 @@ func builtinScalarFuncName(tok token) (string, bool) {
 			return "starts_with", true
 		case equalFoldASCII(s, "statement_timestamp"):
 			return "statement_timestamp", true
+		case equalFoldASCII(s, "string_to_array"):
+			return "string_to_array", true
 		case equalFoldASCII(s, "strpos"):
 			return "strpos", true
 		case equalFoldASCII(s, "substr"):
