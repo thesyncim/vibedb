@@ -94,7 +94,7 @@ func TestRouteGateReadUsesQuorumFloorAndHoldsBoundedLease(t *testing.T) {
 	if result, lease, err := owner.ReadRouteGate(t.Context(), request); !errors.Is(err, ErrServingFence) || lease != nil || result != (RouteGateReadResult{}) {
 		t.Fatalf("foreign fence %+v %v", result, err)
 	}
-	if owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 {
+	if owner.pendingReadItems.Load() != 0 || owner.pendingReadBytes.Load() != 0 {
 		t.Fatal("leaked budget")
 	}
 }

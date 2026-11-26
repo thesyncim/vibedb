@@ -121,8 +121,8 @@ func TestOwnerDeferredReadAllowsOtherGroupAndPeerProgress(t *testing.T) {
 	healthyCut.Close()
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
-	if owner.ingressItems != 0 || owner.pendingReadItems != 0 {
-		t.Fatalf("retained charges: ingress=%d reads=%d", owner.ingressItems, owner.pendingReadItems)
+	if owner.ingressItems != 0 || owner.pendingReadItems.Load() != 0 {
+		t.Fatalf("retained charges: ingress=%d reads=%d", owner.ingressItems, owner.pendingReadItems.Load())
 	}
 }
 

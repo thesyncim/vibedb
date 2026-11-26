@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sync"
 	"time"
 )
 
@@ -66,6 +67,7 @@ type ElapsedClock interface {
 // error or rollback.  It is intentionally stateful and must be owned by the
 // serialized Raft member that owns the corresponding promise or holder.
 type CheckedClock struct {
+	mu          sync.Mutex
 	source      ElapsedClock
 	last        time.Duration
 	initialized bool
@@ -95,6 +97,8 @@ func (clock *CheckedClock) Now() (time.Duration, error) {
 	if clock == nil || clock.source == nil {
 		return 0, ErrClockUnavailable
 	}
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
 	if clock.fault != nil {
 		return 0, clock.fault
 	}
@@ -117,7 +121,14 @@ func (clock *CheckedClock) Now() (time.Duration, error) {
 }
 
 // Faulted reports whether the clock has permanently disabled this owner.
-func (clock *CheckedClock) Faulted() bool { return clock != nil && clock.fault != nil }
+func (clock *CheckedClock) Faulted() bool {
+	if clock == nil {
+		return false
+	}
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return clock.fault != nil
+}
 
 // Evidence returns the last locally accepted sample and the permanent fault
 // bit without advancing or otherwise changing the checked clock.
@@ -125,6 +136,8 @@ func (clock *CheckedClock) Evidence() CheckedClockEvidence {
 	if clock == nil {
 		return CheckedClockEvidence{}
 	}
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
 	return CheckedClockEvidence{
 		Sample:      clock.last,
 		Initialized: clock.initialized,

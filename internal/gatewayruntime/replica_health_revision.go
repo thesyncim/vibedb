@@ -20,6 +20,28 @@ type gatewayReplicaHealthRevisionController struct {
 	catalog      gatewayReplicaCatalogReader
 	observations gatewayReplicaHealthObservationClient
 	authority    gateway.ReplicaHealthRevisionAuthority
+	sessionRound *replicacontrol.HealthRound
+}
+
+// BeginHealthSession opens one persistent HealthRound shared across RunPass
+// ticks for the lifetime of ctx, eliminating per-tick mTLS handshakes while
+// keeping standalone RunPass calls in tests self-contained.
+func (controller *gatewayReplicaHealthRevisionController) BeginHealthSession(ctx context.Context) func() {
+	if controller == nil || ctx == nil {
+		return func() {}
+	}
+	source, ok := controller.observations.(interface {
+		BeginHealthRound(context.Context) *replicacontrol.HealthRound
+	})
+	if !ok {
+		return func() {}
+	}
+	round := source.BeginHealthRound(ctx)
+	controller.sessionRound = round
+	return func() {
+		controller.sessionRound = nil
+		_ = round.Close()
+	}
 }
 
 type gatewayReplicaHealthRevisionPass struct {
@@ -54,7 +76,11 @@ func (controller *gatewayReplicaHealthRevisionController) RunPass(
 	if err != nil || catalog == nil {
 		return gatewayReplicaHealthRevisionPass{}, errors.Join(err, errGatewayReplicaHealth)
 	}
-	if source, ok := controller.observations.(interface {
+	if controller.sessionRound != nil {
+		scoped := *controller
+		scoped.observations = controller.sessionRound
+		controller = &scoped
+	} else if source, ok := controller.observations.(interface {
 		BeginHealthRound(context.Context) *replicacontrol.HealthRound
 	}); ok {
 		round := source.BeginHealthRound(ctx)

@@ -581,10 +581,10 @@ func TestOwnerPointReadAuthorityFastPathUsesCommitFloorAndSkipsReadIndex(t *test
 		got.AuthorityReadIndexFallbacks != 0 || got.AuthorityReadValidationFailures != 0 {
 		t.Fatalf("authority metrics=%+v", got)
 	}
-	if fixture.owner.pendingReadItems != 0 || fixture.owner.pendingReadBytes != 0 ||
+	if fixture.owner.pendingReadItems.Load() != 0 || fixture.owner.pendingReadBytes.Load() != 0 ||
 		fixture.generation.pinCount() != 0 {
-		t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems,
-			fixture.owner.pendingReadBytes, fixture.generation.pinCount())
+		t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems.Load(),
+			fixture.owner.pendingReadBytes.Load(), fixture.generation.pinCount())
 	}
 }
 
@@ -647,10 +647,10 @@ func TestOwnerLinearizablePointCutAuthorityPathSkipsReadIndex(t *testing.T) {
 		got.AuthorityReadIndexFallbacks != 0 {
 		t.Fatalf("authority metrics=%+v", got)
 	}
-	if fixture.owner.pendingReadItems != 0 || fixture.owner.pendingReadBytes != 0 ||
+	if fixture.owner.pendingReadItems.Load() != 0 || fixture.owner.pendingReadBytes.Load() != 0 ||
 		fixture.generation.pinCount() != 0 {
-		t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems,
-			fixture.owner.pendingReadBytes, fixture.generation.pinCount())
+		t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems.Load(),
+			fixture.owner.pendingReadBytes.Load(), fixture.generation.pinCount())
 	}
 }
 
@@ -688,10 +688,10 @@ func TestOwnerLinearizablePointCutRetriesAfterAuthorityValidation(t *testing.T) 
 		got.AuthorityReadValidationFailures != 1 {
 		t.Fatalf("authority metrics=%+v", got)
 	}
-	if fixture.owner.pendingReadItems != 0 || fixture.owner.pendingReadBytes != 0 ||
+	if fixture.owner.pendingReadItems.Load() != 0 || fixture.owner.pendingReadBytes.Load() != 0 ||
 		fixture.generation.pinCount() != 0 {
-		t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems,
-			fixture.owner.pendingReadBytes, fixture.generation.pinCount())
+		t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems.Load(),
+			fixture.owner.pendingReadBytes.Load(), fixture.generation.pinCount())
 	}
 }
 
@@ -754,11 +754,11 @@ func TestOwnerLinearizablePointCutRejectsGenerationFenceChanges(t *testing.T) {
 				t.Fatalf("readIndexes=%d validations=%d sourceCalls=%d", readIndexes, validations, calls)
 			}
 			currentGeneration := fixture.owner.members[fixture.group].generation
-			if fixture.owner.pendingReadItems != 0 || fixture.owner.pendingReadBytes != 0 ||
+			if fixture.owner.pendingReadItems.Load() != 0 || fixture.owner.pendingReadBytes.Load() != 0 ||
 				fixture.generation.pinCount() != 0 || currentGeneration == nil ||
 				currentGeneration.pinCount() != 0 {
-				t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems,
-					fixture.owner.pendingReadBytes, fixture.generation.pinCount())
+				t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems.Load(),
+					fixture.owner.pendingReadBytes.Load(), fixture.generation.pinCount())
 			}
 		})
 	}
@@ -791,10 +791,10 @@ func TestOwnerPointReadAuthorityExpiryFallsBackToReadIndexOnce(t *testing.T) {
 		got.AuthorityReadValidationFailures != 1 {
 		t.Fatalf("authority metrics=%+v", got)
 	}
-	if fixture.owner.pendingReadItems != 0 || fixture.owner.pendingReadBytes != 0 ||
+	if fixture.owner.pendingReadItems.Load() != 0 || fixture.owner.pendingReadBytes.Load() != 0 ||
 		fixture.generation.pinCount() != 0 {
-		t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems,
-			fixture.owner.pendingReadBytes, fixture.generation.pinCount())
+		t.Fatalf("retained resources reads=%d/%d pins=%d", fixture.owner.pendingReadItems.Load(),
+			fixture.owner.pendingReadBytes.Load(), fixture.generation.pinCount())
 	}
 }
 
@@ -836,10 +836,10 @@ func TestOwnerPointBatchAuthorityFastPathFinalValidationAndCancelCleanup(t *test
 	validations = fixture.host.validations
 	readIndexes = fixture.host.readIndexes
 	fixture.host.mu.Unlock()
-	if validations != 1 || readIndexes != 0 || fixture.owner.pendingReadItems != 0 ||
-		fixture.owner.pendingReadBytes != 0 || fixture.generation.pinCount() != 0 {
+	if validations != 1 || readIndexes != 0 || fixture.owner.pendingReadItems.Load() != 0 ||
+		fixture.owner.pendingReadBytes.Load() != 0 || fixture.generation.pinCount() != 0 {
 		t.Fatalf("canceled cleanup validations=%d readIndexes=%d reads=%d/%d pins=%d",
-			validations, readIndexes, fixture.owner.pendingReadItems, fixture.owner.pendingReadBytes,
+			validations, readIndexes, fixture.owner.pendingReadItems.Load(), fixture.owner.pendingReadBytes.Load(),
 			fixture.generation.pinCount())
 	}
 }

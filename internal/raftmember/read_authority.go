@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftauthority"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"go.etcd.io/raft/v3"
+	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -174,6 +175,12 @@ type ReadAuthorityEvidence struct {
 	Gate                 ReadAuthorityGateMetrics
 }
 
+type cachedConfStateDigest struct {
+	conf    *pb.ConfState
+	version uint64
+	digest  [32]byte
+}
+
 type runtimeAuthority struct {
 	policy  raftauthority.ReadAuthorityPolicy
 	clock   *raftauthority.CheckedClock
@@ -196,6 +203,10 @@ type runtimeAuthority struct {
 	installedVoters   []uint64
 	leaderIncarnation func(uint64) (uint64, bool, error)
 	outbound          []OutboundMessage
+	// confDigest caches the deterministic SHA-256 of the immutable published
+	// ConfState so high-frequency read-authority checks avoid re-marshaling and
+	// re-hashing the same membership configuration on every read.
+	confDigest atomic.Pointer[cachedConfStateDigest]
 	// These counters are read by diagnostics outside the serialized owner. The
 	// protocol state itself remains single-owner; only the detached counters are
 	// atomic.
@@ -582,29 +593,68 @@ func (runtime *Runtime) authorityElectionGate(input raftmodel.ElectionInput) err
 // complete authority proof. The public protocol method keeps its historical
 // all-or-nothing contract; diagnostics use the partial value so an unknown
 // state remains visible alongside the current term/leader/configuration.
+func (runtime *Runtime) confStateDigest(publication raftmodel.Publication) ([32]byte, error) {
+	if state := runtime.authority; state != nil {
+		if cached := state.confDigest.Load(); cached != nil &&
+			cached.conf == publication.ConfState && cached.version == publication.ReplicaSetVersion {
+			return cached.digest, nil
+		}
+	}
+	encoded, err := (proto.MarshalOptions{Deterministic: true}).Marshal(publication.ConfState)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("raftmember: encode authority ConfState: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	if state := runtime.authority; state != nil {
+		state.confDigest.Store(&cachedConfStateDigest{
+			conf:    publication.ConfState,
+			version: publication.ReplicaSetVersion,
+			digest:  digest,
+		})
+	}
+	return digest, nil
+}
+
 func (runtime *Runtime) readAuthorityObservation() (raftauthority.AuthorityObservation, error) {
+	return runtime.readAuthorityObservationMode(false)
+}
+
+func (runtime *Runtime) readAuthorityObservationReadOnly() (raftauthority.AuthorityObservation, error) {
+	return runtime.readAuthorityObservationMode(true)
+}
+
+func (runtime *Runtime) readAuthorityObservationMode(readOnly bool) (raftauthority.AuthorityObservation, error) {
 	if err := runtime.checkUsable(); err != nil {
 		return raftauthority.AuthorityObservation{}, err
 	}
 	status := runtime.node.Status()
 	publication := runtime.node.Published()
+	var currentTermCommitted bool
+	var pendingConfig bool
+	if readOnly {
+		currentTermCommitted = runtime.node.CurrentTermCommittedReadOnly()
+		pendingConfig = runtime.node.PendingConfigurationReadOnly()
+	} else {
+		currentTermCommitted = runtime.node.CurrentTermCommitted()
+		pendingConfig = runtime.node.PendingConfiguration()
+	}
 	observation := raftauthority.AuthorityObservation{
 		Group: authorityGroupKey(runtime.identity.Group), Term: status.GetTerm(),
-		Leader: status.Lead, CurrentTermCommitted: runtime.node.CurrentTermCommitted(),
+		Leader: status.Lead, CurrentTermCommitted: currentTermCommitted,
 	}
 	if publication.ConfState == nil {
 		return observation, errors.New("raftmember: authority observation has nil ConfState")
 	}
-	encoded, err := (proto.MarshalOptions{Deterministic: true}).Marshal(publication.ConfState)
+	digest, err := runtime.confStateDigest(publication)
 	if err != nil {
-		return observation, fmt.Errorf("raftmember: encode authority ConfState: %w", err)
+		return observation, err
 	}
 	config := raftauthority.ConfigIdentity{
 		AppliedVersion: publication.ReplicaSetVersion,
-		Digest:         sha256.Sum256(encoded),
+		Digest:         digest,
 		Joint: len(publication.ConfState.GetVotersOutgoing()) != 0 ||
 			len(publication.ConfState.GetLearnersNext()) != 0 || publication.ConfState.GetAutoLeave(),
-		Pending: runtime.node.PendingConfiguration(),
+		Pending: pendingConfig,
 	}
 	observation.Config = config
 	observation.Stable = !config.Joint && !config.Pending
@@ -936,6 +986,107 @@ func (runtime *Runtime) ValidateReadAuthorityToken(token raftauthority.Authority
 		return state.round.ValidateToken(token, observation)
 	}
 	return raftauthority.ErrObservationStale
+}
+
+// ValidateReadAuthorityTokenReadOnly performs the exact same final check as
+// ValidateReadAuthorityToken without mutating Runtime or Node fields, so
+// concurrent readers holding a shared lane read lock remain race-free.
+func (runtime *Runtime) ValidateReadAuthorityTokenReadOnly(token raftauthority.AuthorityToken) error {
+	if err := runtime.checkUsable(); err != nil {
+		return err
+	}
+	state := runtime.authority
+	if state == nil || state.disabled {
+		return raftauthority.ErrPolicyDisabled
+	}
+	if runtime.transferPending() {
+		return ErrAuthorityTransferPending
+	}
+	observation, err := runtime.readAuthorityObservationReadOnly()
+	if err != nil {
+		return err
+	}
+	if state.renewal != nil && token.Nonce == state.renewal.Request().Nonce {
+		return state.renewal.ValidateToken(token, observation)
+	}
+	if state.round != nil && token.Nonce == state.round.Request().Nonce {
+		return state.round.ValidateToken(token, observation)
+	}
+	return raftauthority.ErrObservationStale
+}
+
+// ReadPointAuthorityTokenReadOnly returns a currently valid authority token
+// without mutating Runtime or Node state. needsExclusive is true whenever a
+// round has expired, is missing, is within the renewal lead window, or has
+// pending outbound authority traffic, signaling the caller to take the
+// exclusive lane lock to run the ordinary mutation/renewal edge.
+func (runtime *Runtime) ReadPointAuthorityTokenReadOnly() (token raftauthority.AuthorityToken, needsExclusive bool, err error) {
+	if err := runtime.checkUsable(); err != nil {
+		return raftauthority.AuthorityToken{}, false, err
+	}
+	state := runtime.authority
+	if state == nil || state.disabled {
+		return raftauthority.AuthorityToken{}, false, raftauthority.ErrPolicyDisabled
+	}
+	if runtime.transferPending() {
+		return raftauthority.AuthorityToken{}, false, ErrAuthorityTransferPending
+	}
+	observation, err := runtime.readAuthorityObservationReadOnly()
+	if err != nil {
+		return raftauthority.AuthorityToken{}, false, err
+	}
+	var found bool
+	if state.renewal != nil {
+		expired, expiredErr := state.renewal.Expired()
+		if expiredErr != nil {
+			return raftauthority.AuthorityToken{}, false, expiredErr
+		}
+		if expired {
+			return raftauthority.AuthorityToken{}, true, nil
+		}
+		if state.renewal.HasQuorum() {
+			if candidate, tokenErr := state.renewal.Token(observation); tokenErr == nil {
+				token = candidate
+				found = true
+			}
+		}
+	}
+	if !found {
+		if state.round == nil {
+			return raftauthority.AuthorityToken{}, true, nil
+		}
+		expired, expiredErr := state.round.Expired()
+		if expiredErr != nil {
+			return raftauthority.AuthorityToken{}, false, expiredErr
+		}
+		if expired {
+			return raftauthority.AuthorityToken{}, true, nil
+		}
+		candidate, tokenErr := state.round.Token(observation)
+		if tokenErr != nil {
+			return raftauthority.AuthorityToken{}, true, nil
+		}
+		token = candidate
+	}
+	if len(state.outbound) != 0 {
+		return raftauthority.AuthorityToken{}, true, nil
+	}
+	now, nowErr := state.clock.Now()
+	if nowErr != nil {
+		return raftauthority.AuthorityToken{}, true, nil
+	}
+	usable, usableErr := state.policy.UsableDuration()
+	if usableErr != nil {
+		return raftauthority.AuthorityToken{}, true, nil
+	}
+	lead := usable / 4
+	if lead < state.policy.RoundingMargin {
+		lead = state.policy.RoundingMargin
+	}
+	if token.ExpiresAt <= now || token.ExpiresAt-now <= lead {
+		return raftauthority.AuthorityToken{}, true, nil
+	}
+	return token, false, nil
 }
 
 // StepAuthorityMessage handles one authenticated control record in the same

@@ -100,7 +100,7 @@ func TestOwnerReadAndCancellationProgressWhileHostNeverIdle(t *testing.T) {
 				t.Fatalf("read admitted at turn %d, bound %d", host.admittedAt, maxTurns)
 			}
 			cut.Close()
-			if owner.ingressItems != 0 || owner.pendingReadItems != 0 {
+			if owner.ingressItems != 0 || owner.pendingReadItems.Load() != 0 {
 				t.Fatal("admission leaked")
 			}
 		})

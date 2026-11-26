@@ -117,7 +117,7 @@ func TestRouteReleaseReceiptReadUsesExactCommandAndQuorumFloor(t *testing.T) {
 		t.Fatalf("receipt budget = %v", err)
 	}
 	lease.Release()
-	if owner.pendingReadItems != 0 || owner.pendingReadBytes != 0 {
+	if owner.pendingReadItems.Load() != 0 || owner.pendingReadBytes.Load() != 0 {
 		t.Fatal("receipt budget leaked")
 	}
 	for _, capability := range []serviceauthz.Capability{0, serviceauthz.CapabilityDataRead, serviceauthz.CapabilityDataWrite} {

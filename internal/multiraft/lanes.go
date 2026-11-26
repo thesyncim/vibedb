@@ -33,18 +33,18 @@ var (
 // gap between adjacent counter regions prevents false sharing even when the
 // backing allocation itself is not cache-line aligned.
 type laneCounters struct {
-	calls      uint64
-	rejected   uint64
-	progressed uint64
-	failures   uint64
+	calls      atomic.Uint64
+	rejected   atomic.Uint64
+	progressed atomic.Uint64
+	failures   atomic.Uint64
 	_          [32]byte
 }
 
 type executionLane struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	host     *Host
 	counters laneCounters
-	_        [176]byte
+	_        [160]byte
 }
 
 // ExecutionLanes routes each group to one immutable single-owner Host lane.
@@ -169,20 +169,40 @@ func (lane *ExecutionLane) TryValidateReadAuthorityToken(
 		return false, err
 	}
 	entry := &lane.set.lanes[lane.index]
+	if entry.mu.TryRLock() {
+		if lane.set.state.Load() != executionLanesOpen || entry.host == nil {
+			entry.counters.calls.Add(1)
+			entry.counters.rejected.Add(1)
+			entry.mu.RUnlock()
+			return true, ErrHostClosed
+		}
+		handled, err := entry.host.tryValidateReadAuthorityTokenReadOnly(
+			key, memberID, nodeIncarnation, term, token,
+		)
+		if handled {
+			entry.counters.calls.Add(1)
+			if err != nil {
+				entry.counters.rejected.Add(1)
+			}
+			entry.mu.RUnlock()
+			return true, err
+		}
+		entry.mu.RUnlock()
+	}
 	if !entry.mu.TryLock() {
 		return false, nil
 	}
 	defer entry.mu.Unlock()
-	entry.counters.calls++
+	entry.counters.calls.Add(1)
 	if lane.set.state.Load() != executionLanesOpen || entry.host == nil {
-		entry.counters.rejected++
+		entry.counters.rejected.Add(1)
 		return true, ErrHostClosed
 	}
 	err := entry.host.tryValidateReadAuthorityToken(
 		key, memberID, nodeIncarnation, term, token,
 	)
 	if err != nil {
-		entry.counters.rejected++
+		entry.counters.rejected.Add(1)
 	}
 	return true, err
 }
@@ -201,20 +221,40 @@ func (lane *ExecutionLane) TryReadPointAdmission(
 		return false, false, false, PointReadAdmission{}, err
 	}
 	entry := &lane.set.lanes[lane.index]
+	if entry.mu.TryRLock() {
+		if lane.set.state.Load() != executionLanesOpen || entry.host == nil {
+			entry.counters.calls.Add(1)
+			entry.counters.rejected.Add(1)
+			entry.mu.RUnlock()
+			return true, false, false, PointReadAdmission{}, ErrHostClosed
+		}
+		handled, rAdmitted, rAuthorized, rResult, rErr := entry.host.tryReadPointAdmissionReadOnly(
+			key, expected, term, authorize,
+		)
+		if handled {
+			entry.counters.calls.Add(1)
+			if rErr != nil {
+				entry.counters.rejected.Add(1)
+			}
+			entry.mu.RUnlock()
+			return true, rAdmitted, rAuthorized, rResult, rErr
+		}
+		entry.mu.RUnlock()
+	}
 	if !entry.mu.TryLock() {
 		return false, false, false, PointReadAdmission{}, nil
 	}
 	defer entry.mu.Unlock()
-	entry.counters.calls++
+	entry.counters.calls.Add(1)
 	if lane.set.state.Load() != executionLanesOpen || entry.host == nil {
-		entry.counters.rejected++
+		entry.counters.rejected.Add(1)
 		return true, false, false, PointReadAdmission{}, ErrHostClosed
 	}
 	admitted, authorized, result, err = entry.host.tryReadPointAdmission(
 		key, expected, term, authorize,
 	)
 	if err != nil {
-		entry.counters.rejected++
+		entry.counters.rejected.Add(1)
 	}
 	return true, admitted, authorized, result, err
 }
@@ -556,14 +596,14 @@ func (set *ExecutionLanes) addRuntime(runtime memberRuntime) error {
 	}
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
-	lane.counters.calls++
+	lane.counters.calls.Add(1)
 	if set.state.Load() != executionLanesOpen {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 		return ErrHostClosed
 	}
 	err = lane.host.addRuntime(runtime)
 	if err != nil {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 	}
 	return err
 }
@@ -586,14 +626,14 @@ func (set *ExecutionLanes) withGroup(
 	}
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
-	lane.counters.calls++
+	lane.counters.calls.Add(1)
 	if set.state.Load() != executionLanesOpen {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 		return ErrHostClosed
 	}
 	err = operation(lane.host)
 	if err != nil {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 	}
 	return err
 }
@@ -754,14 +794,14 @@ func (set *ExecutionLanes) ReadAuthorityToken(
 	}
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
-	lane.counters.calls++
+	lane.counters.calls.Add(1)
 	if set.state.Load() != executionLanesOpen {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 		return raftauthority.AuthorityToken{}, ErrHostClosed
 	}
 	token, err := lane.host.ReadAuthorityToken(key)
 	if err != nil {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 	}
 	return token, err
 }
@@ -775,14 +815,14 @@ func (set *ExecutionLanes) ValidateReadAuthorityToken(
 	}
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
-	lane.counters.calls++
+	lane.counters.calls.Add(1)
 	if set.state.Load() != executionLanesOpen {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 		return ErrHostClosed
 	}
 	err = lane.host.ValidateReadAuthorityToken(key, token)
 	if err != nil {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 	}
 	return err
 }
@@ -857,14 +897,14 @@ func (set *ExecutionLanes) Publication(key raftmember.GroupKey) (raftmodel.Publi
 	}
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
-	lane.counters.calls++
+	lane.counters.calls.Add(1)
 	if set.state.Load() != executionLanesOpen {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 		return raftmodel.Publication{}, ErrHostClosed
 	}
 	result, err := lane.host.Publication(key)
 	if err != nil {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 	}
 	return result, err
 }
@@ -878,14 +918,14 @@ func (set *ExecutionLanes) ConfigurationReplay(key raftmember.GroupKey) (raftmem
 	}
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
-	lane.counters.calls++
+	lane.counters.calls.Add(1)
 	if set.state.Load() != executionLanesOpen {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 		return nil, ErrHostClosed
 	}
 	result, err := lane.host.ConfigurationReplay(key)
 	if err != nil {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 	}
 	return result, err
 }
@@ -897,14 +937,14 @@ func (set *ExecutionLanes) SnapshotState(key raftmember.GroupKey) (replicatedsta
 	}
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
-	lane.counters.calls++
+	lane.counters.calls.Add(1)
 	if set.state.Load() != executionLanesOpen {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 		return replicatedstate.State{}, ErrHostClosed
 	}
 	result, err := lane.host.SnapshotState(key)
 	if err != nil {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 	}
 	return result, err
 }
@@ -918,14 +958,14 @@ func (set *ExecutionLanes) SnapshotAuthorizationFence(
 	}
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
-	lane.counters.calls++
+	lane.counters.calls.Add(1)
 	if set.state.Load() != executionLanesOpen {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 		return replicatedstate.SnapshotFence{}, ErrHostClosed
 	}
 	result, err := lane.host.SnapshotAuthorizationFence(key)
 	if err != nil {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 	}
 	return result, err
 }
@@ -954,14 +994,14 @@ func (set *ExecutionLanes) SnapshotBaseCertificate(
 	}
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
-	lane.counters.calls++
+	lane.counters.calls.Add(1)
 	if set.state.Load() != executionLanesOpen {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 		return replicatedstate.SnapshotBaseCertificate{}, ErrHostClosed
 	}
 	result, err := lane.host.SnapshotBaseCertificate(key)
 	if err != nil {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 	}
 	return result, err
 }
@@ -973,14 +1013,14 @@ func (set *ExecutionLanes) Status(key raftmember.GroupKey) (raftmember.RuntimeSt
 	}
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
-	lane.counters.calls++
+	lane.counters.calls.Add(1)
 	if set.state.Load() != executionLanesOpen {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 		return raftmember.RuntimeStatus{}, ErrHostClosed
 	}
 	result, err := lane.host.Status(key)
 	if err != nil {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 	}
 	return result, err
 }
@@ -995,14 +1035,14 @@ func (set *ExecutionLanes) Progress(
 	}
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
-	lane.counters.calls++
+	lane.counters.calls.Add(1)
 	if set.state.Load() != executionLanesOpen {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 		return raftmodel.MemberProgress{}, false, ErrHostClosed
 	}
 	result, found, err := lane.host.Progress(key, memberID)
 	if err != nil {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 	}
 	return result, found, err
 }
@@ -1017,14 +1057,14 @@ func (set *ExecutionLanes) DurablePromotion(
 	}
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
-	lane.counters.calls++
+	lane.counters.calls.Add(1)
 	if set.state.Load() != executionLanesOpen {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 		return raftmember.DurablePromotionProof{}, false, ErrHostClosed
 	}
 	result, found, err := lane.host.DurablePromotion(key, memberID)
 	if err != nil {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 	}
 	return result, found, err
 }
@@ -1038,17 +1078,17 @@ func (set *ExecutionLanes) RunOne(index int) (Progress, bool, error) {
 	lane := &set.lanes[index]
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
-	lane.counters.calls++
+	lane.counters.calls.Add(1)
 	if set.state.Load() != executionLanesOpen {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 		return Progress{}, false, ErrHostClosed
 	}
 	progress, done, err := lane.host.RunOne()
 	if done {
-		lane.counters.progressed++
+		lane.counters.progressed.Add(1)
 	}
 	if err != nil {
-		lane.counters.failures++
+		lane.counters.failures.Add(1)
 	}
 	return progress, done, err
 }
@@ -1062,9 +1102,9 @@ func (set *ExecutionLanes) PopOutbound(index int) (raftmember.OutboundMessage, b
 	lane := &set.lanes[index]
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
-	lane.counters.calls++
+	lane.counters.calls.Add(1)
 	if set.state.Load() != executionLanesOpen {
-		lane.counters.rejected++
+		lane.counters.rejected.Add(1)
 		return raftmember.OutboundMessage{}, false, ErrHostClosed
 	}
 	message, ok := lane.host.PopOutbound()
@@ -1084,8 +1124,8 @@ func (set *ExecutionLanes) StatsInto(dst []ExecutionLaneStats) []ExecutionLaneSt
 		lane.mu.Lock()
 		host := lane.host
 		stats := ExecutionLaneStats{Lane: index,
-			Calls: lane.counters.calls, Rejected: lane.counters.rejected,
-			Progressed: lane.counters.progressed, Failures: lane.counters.failures}
+			Calls: lane.counters.calls.Load(), Rejected: lane.counters.rejected.Load(),
+			Progressed: lane.counters.progressed.Load(), Failures: lane.counters.failures.Load()}
 		if host != nil {
 			stats.Groups, stats.Runnable = len(host.groups), host.runnableLen()
 			stats.QueueItems, stats.QueueBytes = host.queueItems, host.queueBytes
