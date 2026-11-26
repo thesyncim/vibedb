@@ -99,14 +99,14 @@ func (s *postgresSession) MarkFailed() {
 }
 func (s *postgresSession) SetCancelFlag(flag *query.CancelFlag) error { s.flag = flag; return nil }
 func (s *postgresSession) SetResultLimits(rows int, bytes int64) error {
-	if rows <= 0 || bytes <= 0 {
+	if (rows != -1 && rows <= 0) || (bytes != -1 && bytes <= 0) {
 		return ErrResultLimit
 	}
 	s.rows, s.bytes = rows, bytes
 	return nil
 }
 func (s *postgresSession) SetIntermediateLimit(bytes int64) error {
-	if bytes <= 0 {
+	if bytes != -1 && bytes <= 0 {
 		return ErrResultLimit
 	}
 	s.intermediate = bytes
@@ -121,10 +121,10 @@ func (s *postgresSession) Cancel() {
 }
 func (s *postgresSession) Begin(_ context.Context, options driver.TxOptions) error {
 	if s.state != driver.SessionIdle {
-		return errors.New("gateway: transaction already active")
+		return fmt.Errorf("%w: gateway transaction already active", driver.ErrTransactionActive)
 	}
 	if options.Isolation != driver.IsolationDefault && options.Isolation != driver.IsolationReadCommitted {
-		return errors.New("gateway: RF3 PostgreSQL supports per-statement quorum reads, not repeatable-read or serializable snapshots")
+		return fmt.Errorf("%w: gateway RF3 PostgreSQL supports per-statement quorum reads, not repeatable-read or serializable snapshots", driver.ErrUnsupportedIsolation)
 	}
 	s.state = driver.SessionInTransaction
 	return nil
@@ -148,7 +148,7 @@ func (s *postgresSession) Rollback(context.Context) error {
 	return nil
 }
 func (s *postgresSession) Savepoint(context.Context, string) error {
-	return errors.New("gateway: savepoints are not supported on the RF3 read endpoint")
+	return sqlast.NewFeatureNotSupportedError("SAVEPOINT", 0, "savepoints are not supported on the RF3 endpoint")
 }
 func (s *postgresSession) ReleaseSavepoint(ctx context.Context, name string) error {
 	return s.Savepoint(ctx, name)
@@ -597,10 +597,14 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 	}
 	profile := s.backend.Executor.profileFor(ClassBatch)
 	profile.MaxConcurrency = min(profile.MaxConcurrency, 4)
-	profile.MaxAggregateRows = min(profile.MaxAggregateRows, uint64(s.rows))
-	profile.PerShardRows = min(profile.PerShardRows, profile.MaxAggregateRows)
-	profile.MaxAggregateBytes = min(profile.MaxAggregateBytes, uint64(s.bytes))
-	profile.PerShardBytes = min(profile.PerShardBytes, profile.MaxAggregateBytes)
+	if s.rows > 0 {
+		profile.MaxAggregateRows = min(profile.MaxAggregateRows, uint64(s.rows))
+		profile.PerShardRows = min(profile.PerShardRows, profile.MaxAggregateRows)
+	}
+	if s.bytes > 0 {
+		profile.MaxAggregateBytes = min(profile.MaxAggregateBytes, uint64(s.bytes))
+		profile.PerShardBytes = min(profile.PerShardBytes, profile.MaxAggregateBytes)
+	}
 	result, err := s.backend.Executor.queryPreparedWithProfile(ctx, Query{
 		SQL: p.compiled.SQL(), Params: params, ParamTypes: p.paramTypes, Class: ClassBatch,
 	}, profile, p.compiled.NumParams(), &p.execution)
@@ -613,17 +617,19 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 		}
 		return err
 	}
-	if len(result.Rows) > s.rows {
+	if s.rows > 0 && len(result.Rows) > s.rows {
 		return ErrResultLimit
 	}
-	retained := int64(len(result.Rows)) * int64(len(result.Columns)) * 64
-	for _, row := range result.Rows {
-		for _, cell := range row {
-			retained += int64(2 * len(cell.Bytes))
+	if s.bytes > 0 {
+		retained := int64(len(result.Rows)) * int64(len(result.Columns)) * 64
+		for _, row := range result.Rows {
+			for _, cell := range row {
+				retained += int64(2 * len(cell.Bytes))
+			}
 		}
-	}
-	if retained > s.bytes {
-		return ErrResultLimit
+		if retained > s.bytes {
+			return ErrResultLimit
+		}
 	}
 	materialized := &s.materialized
 	installed := false
