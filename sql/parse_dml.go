@@ -1230,15 +1230,17 @@ func (p *Parser) parseDelete() error {
 		return err
 	}
 	p.del.Table, p.del.Pos = name, pos
-	if err := p.rejectAlias(); err != nil {
+	alias, _, err := p.parseMutationTargetAlias(true)
+	if err != nil {
 		return err
 	}
-	p.beginFilter(name, pos)
+	p.setHiddenMutationTarget(name, alias)
+	p.beginMutationFilter(name, alias, pos)
 	if p.atKeyword(kwUsing) {
 		return p.errHere("DELETE ... USING is not supported: the rows to delete are chosen by a condition on the collection itself, never by a join")
 	}
 	whereAt := p.tok.pos
-	if err := p.parseDMLWhere("DELETE", name, ""); err != nil {
+	if err := p.parseDMLWhere("DELETE", name, alias); err != nil {
 		return err
 	}
 	switch {
@@ -1257,7 +1259,7 @@ func (p *Parser) parseDelete() error {
 	p.del.Limit = p.mutationLimit
 	if p.acceptKeyword(kwReturning) {
 		p.saveFilter()
-		if err := p.parseMutationReturning(name, "", pos); err != nil {
+		if err := p.parseMutationReturning(name, alias, pos); err != nil {
 			return err
 		}
 		p.del.Returning = &p.returning

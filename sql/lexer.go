@@ -93,8 +93,12 @@ func (lx *lexer) next() token {
 	start := lx.pos
 	c := lx.src[lx.pos]
 	switch {
+	case (c == 'E' || c == 'e') && lx.pos+1 < len(lx.src) && lx.src[lx.pos+1] == '\'':
+		return lx.lexEscapeString()
 	case isIdentStart(c):
 		return lx.lexIdent()
+	case c == '$' && lx.pos+1 < len(lx.src) && (lx.src[lx.pos+1] == '$' || isIdentStart(lx.src[lx.pos+1])):
+		return lx.lexDollarString()
 	case c >= '0' && c <= '9':
 		return lx.lexNumber()
 	case c == '-' && lx.pos+1 < len(lx.src) && isDigit(lx.src[lx.pos+1]):
@@ -236,6 +240,78 @@ func (lx *lexer) skipLineComment() bool {
 // skipBlockComment consumes "/* ... */". Block comments do not nest, matching
 // the SQL standard: nesting them would make an unterminated inner comment
 // swallow the rest of a statement silently instead of being reported.
+func (lx *lexer) lexDollarString() token {
+	start := lx.pos
+	i := start + 1
+	for i < len(lx.src) && lx.src[i] != '$' {
+		if !isIdentStart(lx.src[i]) && !isDigit(lx.src[i]) {
+			lx.pos = start + 1
+			return errorToken(start, "invalid dollar-quoted string tag")
+		}
+		i++
+	}
+	if i >= len(lx.src) || lx.src[i] != '$' {
+		lx.pos = len(lx.src)
+		return errorToken(start, "unterminated dollar-quoted string tag")
+	}
+	tag := lx.src[start : i+1]
+	bodyStart := i + 1
+	closeIdx := -1
+	for j := bodyStart; j+len(tag) <= len(lx.src); j++ {
+		if lx.src[j] == '$' && lx.src[j:j+len(tag)] == tag {
+			closeIdx = j
+			break
+		}
+	}
+	if closeIdx < 0 {
+		lx.pos = len(lx.src)
+		return errorToken(start, "unterminated dollar-quoted string literal")
+	}
+	lx.pos = closeIdx + len(tag)
+	return token{kind: tokString, text: lx.src[bodyStart:closeIdx], pos: start}
+}
+
+func (lx *lexer) lexEscapeString() token {
+	start := lx.pos
+	lx.pos += 2 // skip E'
+	var buf []byte
+	for lx.pos < len(lx.src) {
+		ch := lx.src[lx.pos]
+		lx.pos++
+		if ch == '\'' {
+			if lx.pos < len(lx.src) && lx.src[lx.pos] == '\'' {
+				buf = append(buf, '\'')
+				lx.pos++
+				continue
+			}
+			return token{kind: tokString, text: string(buf), pos: start}
+		}
+		if ch == '\\' && lx.pos < len(lx.src) {
+			esc := lx.src[lx.pos]
+			lx.pos++
+			switch esc {
+			case 'n':
+				buf = append(buf, '\n')
+			case 'r':
+				buf = append(buf, '\r')
+			case 't':
+				buf = append(buf, '\t')
+			case 'b':
+				buf = append(buf, '\b')
+			case 'f':
+				buf = append(buf, '\f')
+			case '\\', '\'':
+				buf = append(buf, esc)
+			default:
+				buf = append(buf, esc)
+			}
+			continue
+		}
+		buf = append(buf, ch)
+	}
+	return errorToken(start, "unterminated escape string literal")
+}
+
 func (lx *lexer) skipBlockComment() (token, bool) {
 	start := lx.pos
 	lx.pos += 2
