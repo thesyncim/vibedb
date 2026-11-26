@@ -120,7 +120,11 @@ func scalarTypedStringHead(tok token) (ScalarCastTarget, bool, bool) {
 		return 0, false, false
 	}
 	switch {
-	case equalFoldASCII(tok.text, "text"):
+	case equalFoldASCII(tok.text, "text"),
+		equalFoldASCII(tok.text, "interval"),
+		equalFoldASCII(tok.text, "timestamp"),
+		equalFoldASCII(tok.text, "timestamptz"),
+		equalFoldASCII(tok.text, "date"):
 		return ScalarCastText, true, true
 	case equalFoldASCII(tok.text, "boolean"), equalFoldASCII(tok.text, "bool"):
 		return ScalarCastBoolean, true, true

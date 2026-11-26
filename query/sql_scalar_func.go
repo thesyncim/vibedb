@@ -1048,6 +1048,87 @@ func compilePGRegexp(pat, flags string) (*regexp.Regexp, error) {
 	return cachedPGRegexp(pat, flags)
 }
 
+func evalTimestampIntervalArith(arena *[]byte, tsStr, intervalStr string, subtract bool) (scalar, bool) {
+	ts, hasTime, ok := parseTimestampForArith(tsStr)
+	if !ok {
+		return scalar{}, false
+	}
+	years, months, days, dur, ok := parsePGInterval(intervalStr)
+	if !ok {
+		return scalar{}, false
+	}
+	if subtract {
+		years, months, days, dur = -years, -months, -days, -dur
+	}
+	res := ts.AddDate(years, months, days).Add(dur)
+	var formatted string
+	if !hasTime && dur == 0 {
+		formatted = res.Format("2006-01-02")
+	} else {
+		formatted = res.UTC().Format(time.RFC3339Nano)
+	}
+	return scalar{kind: kindString, sval: formatted}, true
+}
+
+func parseTimestampForArith(s string) (time.Time, bool, bool) {
+	s = strings.TrimSpace(s)
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999Z07:00",
+		"2006-01-02 15:04:05Z07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02T15:04:05",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true, true
+		}
+	}
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return t, false, true
+	}
+	return time.Time{}, false, false
+}
+
+func parsePGInterval(s string) (years, months, days int, dur time.Duration, ok bool) {
+	fields := strings.Fields(s)
+	if len(fields) == 0 || len(fields)%2 != 0 {
+		return 0, 0, 0, 0, false
+	}
+	for i := 0; i < len(fields); i += 2 {
+		val, err := strconv.ParseFloat(fields[i], 64)
+		if err != nil {
+			return 0, 0, 0, 0, false
+		}
+		unit := strings.ToLower(strings.TrimSuffix(fields[i+1], ","))
+		switch unit {
+		case "year", "years", "yr", "yrs", "y":
+			years += int(val)
+		case "month", "months", "mon", "mons":
+			months += int(val)
+		case "week", "weeks", "w":
+			days += int(val) * 7
+		case "day", "days", "d":
+			days += int(val)
+		case "hour", "hours", "hr", "hrs", "h":
+			dur += time.Duration(val * float64(time.Hour))
+		case "minute", "minutes", "min", "mins", "m":
+			dur += time.Duration(val * float64(time.Minute))
+		case "second", "seconds", "sec", "secs", "s":
+			dur += time.Duration(val * float64(time.Second))
+		case "millisecond", "milliseconds", "ms":
+			dur += time.Duration(val * float64(time.Millisecond))
+		case "microsecond", "microseconds", "us":
+			dur += time.Duration(val * float64(time.Microsecond))
+		default:
+			return 0, 0, 0, 0, false
+		}
+	}
+	return years, months, days, dur, true
+}
+
 func parsePGJSONPath(s string) []string {
 	s = strings.TrimSpace(s)
 	if len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}' {

@@ -192,9 +192,47 @@ func (p *Parser) parsePrimary(ctx exprContext) (*Expr, error) {
 	}
 	switch {
 	case p.tok.kind == tokLParen:
+		openPos := p.tok.pos
 		p.advance()
 		if p.atKeyword(kwSelect) || p.atKeyword(kwWith) {
 			return nil, p.errHere("a SELECT subquery cannot stand alone as a condition; use EXISTS (SELECT ...)")
+		}
+		// Check for PostgreSQL row-value comparison: (p1, p2, ...) <op> (v1, v2, ...).
+		// Only inspect when the first token is a plain path head (not a boolean
+		// prefix keyword, subquery, or nested paren) so ordinary parenthesized
+		// predicates pay zero extra work and never backtrack.
+		if p.isRowValuePathStart() {
+			firstPos := p.tok.pos
+			firstPath, err := p.parsePath(false)
+			if err != nil {
+				return nil, err
+			}
+			if p.tok.kind == tokComma {
+				return p.parseRowValueComparison(ctx, firstPath, openPos)
+			}
+			// Not a row value: finish this leaf predicate and any AND/OR tail inside (...).
+			var firstExpr *Expr
+			if scalarContinues(p.tok) {
+				col := ResultColumn{Path: firstPath, Pos: firstPos}
+				firstExpr, err = p.parseScalarCondition(ctx, p.scalarFromColumn(col), firstPos)
+			} else if p.inCaseTruth() && caseTruthTerminator(p.tok) {
+				node := p.exprs.one()
+				*node = Expr{Kind: ExprScalarTruth, Column: -1, ScalarLeft: p.scalarFromColumn(ResultColumn{Path: firstPath, Pos: firstPos}), Pos: firstPos}
+				firstExpr = node
+			} else {
+				firstExpr, err = p.parseLeafTail(ctx, AggNone, firstPath, firstPos)
+			}
+			if err != nil {
+				return nil, err
+			}
+			inner, err := p.finishParenBoolExpr(ctx, firstExpr)
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expect(tokRParen, "')'"); err != nil {
+				return nil, err
+			}
+			return inner, nil
 		}
 		inner, err := p.parseOr(ctx)
 		if err != nil {
@@ -895,6 +933,172 @@ func isRegexOp(k tokenKind) bool {
 
 func isArrayQuantifierToken(tok token) bool {
 	return tok.kind == tokIdent && (tokenTextEqual(tok, "ANY") || tokenTextEqual(tok, "SOME") || tokenTextEqual(tok, "ALL"))
+}
+
+func (p *Parser) isRowValuePathStart() bool {
+	if p.tok.kind == tokQuotedIdent {
+		return true
+	}
+	if p.tok.kind != tokIdent {
+		return false
+	}
+	switch p.tok.kw {
+	case kwNot, kwExists, kwTrue, kwFalse, kwNull, kwCase, kwCast, kwSelect, kwWith, kwScore:
+		return false
+	}
+	if _, ok := aggregateOf(p.tok.kw); ok {
+		return false
+	}
+	if _, ok := conditionalScalarOp(p.tok); ok {
+		return false
+	}
+	if _, ok := builtinScalarFuncName(p.tok); ok {
+		return false
+	}
+	if _, _, known := scalarTypedStringHead(p.tok); known {
+		return false
+	}
+	return true
+}
+
+func (p *Parser) finishParenBoolExpr(ctx exprContext, first *Expr) (*Expr, error) {
+	// Complete any AND chain starting from first.
+	left := first
+	if p.atKeyword(kwAnd) {
+		start := len(p.kidStack)
+		p.kidStack = append(p.kidStack, left)
+		for p.acceptKeyword(kwAnd) {
+			next, err := p.parseNot(ctx)
+			if err != nil {
+				p.kidStack = p.kidStack[:start]
+				return nil, err
+			}
+			p.kidStack = append(p.kidStack, next)
+		}
+		kids := p.kids.allocDirty(len(p.kidStack) - start)
+		copy(kids, p.kidStack[start:])
+		p.kidStack = p.kidStack[:start]
+		e := p.exprs.one()
+		*e = Expr{Kind: ExprAnd, Column: -1, Kids: kids, Pos: left.Pos}
+		left = e
+	}
+	// Complete any OR chain starting from left.
+	if p.atKeyword(kwOr) {
+		start := len(p.kidStack)
+		p.kidStack = append(p.kidStack, left)
+		for p.acceptKeyword(kwOr) {
+			next, err := p.parseAnd(ctx)
+			if err != nil {
+				p.kidStack = p.kidStack[:start]
+				return nil, err
+			}
+			p.kidStack = append(p.kidStack, next)
+		}
+		kids := p.kids.allocDirty(len(p.kidStack) - start)
+		copy(kids, p.kidStack[start:])
+		p.kidStack = p.kidStack[:start]
+		e := p.exprs.one()
+		*e = Expr{Kind: ExprOr, Column: -1, Kids: kids, Pos: left.Pos}
+		left = e
+	}
+	return left, nil
+}
+
+// parseRowValueComparison lowers PostgreSQL row-value comparisons
+// (p0, p1, ...) <op> (v0, v1, ...) algebraically into native ExprAnd / ExprOr /
+// ExprCompare trees so index range pruning and all execution paths work natively.
+func (p *Parser) parseRowValueComparison(ctx exprContext, firstPath *PathExpr, pos int) (*Expr, error) {
+	paths := []*PathExpr{firstPath}
+	for p.tok.kind == tokComma {
+		p.advance()
+		next, err := p.parsePath(false)
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, next)
+	}
+	if err := p.expect(tokRParen, "')' after row value"); err != nil {
+		return nil, err
+	}
+	op, ok := comparisonOp(p.tok.kind)
+	if !ok {
+		return nil, p.errHere("expected a comparison operator (=, <>, <, <=, >, >=) after row value")
+	}
+	p.advance()
+	if err := p.expect(tokLParen, "'(' for right-hand row value"); err != nil {
+		return nil, err
+	}
+	vals := make([]Operand, 0, len(paths))
+	for {
+		v, err := p.parseOperand()
+		if err != nil {
+			return nil, err
+		}
+		vals = append(vals, v)
+		if p.tok.kind != tokComma {
+			break
+		}
+		p.advance()
+	}
+	if err := p.expect(tokRParen, "')' after right-hand row value"); err != nil {
+		return nil, err
+	}
+	if len(vals) != len(paths) {
+		return nil, p.errfAt(pos, "row value comparison has %d columns on the left and %d on the right", len(paths), len(vals))
+	}
+	makeCmp := func(i int, cmp CmpOp) *Expr {
+		e := p.exprs.one()
+		*e = Expr{Kind: ExprCompare, Op: cmp, Column: -1, Path: paths[i], Value: vals[i], Pos: pos}
+		return e
+	}
+	switch op {
+	case OpEq:
+		kids := p.kids.allocDirty(len(paths))
+		for i := range paths {
+			kids[i] = makeCmp(i, OpEq)
+		}
+		e := p.exprs.one()
+		*e = Expr{Kind: ExprAnd, Column: -1, Kids: kids, Pos: pos}
+		return e, nil
+	case OpNe:
+		kids := p.kids.allocDirty(len(paths))
+		for i := range paths {
+			kids[i] = makeCmp(i, OpNe)
+		}
+		e := p.exprs.one()
+		*e = Expr{Kind: ExprOr, Column: -1, Kids: kids, Pos: pos}
+		return e, nil
+	default:
+		// Strict op for prefix branches: > for >/>=, < for </<=.
+		strictOp := op
+		if op == OpGe {
+			strictOp = OpGt
+		} else if op == OpLe {
+			strictOp = OpLt
+		}
+		branches := p.kids.allocDirty(len(paths))
+		for i := range paths {
+			branchOp := strictOp
+			if i == len(paths)-1 {
+				branchOp = op
+			}
+			if i == 0 {
+				branches[0] = makeCmp(0, branchOp)
+				continue
+			}
+			conj := p.kids.allocDirty(i + 1)
+			for j := 0; j < i; j++ {
+				conj[j] = makeCmp(j, OpEq)
+			}
+			conj[i] = makeCmp(i, branchOp)
+			andNode := p.exprs.one()
+			*andNode = Expr{Kind: ExprAnd, Column: -1, Kids: conj, Pos: pos}
+			branches[i] = andNode
+		}
+		orNode := p.exprs.one()
+		*orNode = Expr{Kind: ExprOr, Column: -1, Kids: branches, Pos: pos}
+		return orNode, nil
+	}
 }
 
 func (p *Parser) parseJSONKeyExistsTail(agg AggKind, path *PathExpr, pos int) (*Expr, error) {

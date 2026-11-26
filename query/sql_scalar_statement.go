@@ -1179,6 +1179,13 @@ func (r *statementScalar) evalNodes(
 				value.value = scalar{kind: kindString, sval: byteview.String((*arena)[start:])}
 				break
 			}
+			if (node.op == sqlast.ScalarAdd || node.op == sqlast.ScalarSubtract) &&
+				left.value.kind == kindString && right.value.kind == kindString {
+				if out, ok := evalTimestampIntervalArith(arena, left.value.sval, right.value.sval, node.op == sqlast.ScalarSubtract); ok {
+					value.value = out
+					break
+				}
+			}
 			if left.value.kind != kindNumber || right.value.kind != kindNumber {
 				return &ScalarTypeError{Pos: node.pos, Operation: scalarOperationName(node.op), Left: valueTypeOfScalar(left.value), Right: valueTypeOfScalar(right.value)}
 			}
