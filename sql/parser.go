@@ -3289,6 +3289,15 @@ loop:
 // unify those spellings, whereas PostgreSQL distinguishes ->'0' from ->0.
 // Silently accepting them would return an array element for an object key.
 func (p *Parser) parseJSONAccessor() (Segment, error) {
+	if p.tok.kind == tokNumber {
+		n, err := strconv.Atoi(p.tok.text)
+		if err != nil || n < 0 {
+			return Segment{}, newFeatureNotSupportedError(p.lx.src, p.tok.pos,
+				"JSON -> and ->> array index must be a non-negative integer")
+		}
+		p.advance()
+		return Segment{Index: n, IsIndex: true}, nil
+	}
 	if p.tok.kind == tokString {
 		key := p.internToken(p.tok)
 		numeric := len(key) != 0
@@ -3301,7 +3310,7 @@ func (p *Parser) parseJSONAccessor() (Segment, error) {
 		}
 	}
 	return Segment{}, newFeatureNotSupportedError(p.lx.src, p.tok.pos,
-		"JSON -> and ->> require a constant non-numeric object key; array indexes, numeric keys, and dynamic keys are not supported")
+		"JSON -> and ->> require a constant non-numeric object key or non-negative integer array index")
 }
 
 // parseSubscript parses the content of a '[...]' accessor: a non-negative

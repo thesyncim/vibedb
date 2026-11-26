@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,11 +20,14 @@ func builtinScalarFuncValueType(name string) ValueType {
 	case "length", "char_length", "character_length", "octet_length", "strpos", "ascii",
 		"abs", "ceil", "ceiling", "floor", "round", "trunc", "power", "pow", "sqrt",
 		"mod", "sign", "ln", "log", "log10", "exp", "pi",
-		"extract", "json_array_length", "jsonb_array_length":
+		"extract", "json_array_length", "jsonb_array_length",
+		"array_length", "cardinality", "regexp_count":
 		return TypeNumber
-	case "starts_with":
+	case "starts_with", "regexp_like":
 		return TypeBool
-	case "json_build_object", "jsonb_build_object", "json_build_array", "jsonb_build_array", "to_json", "to_jsonb":
+	case "json_build_object", "jsonb_build_object", "json_build_array", "jsonb_build_array",
+		"to_json", "to_jsonb", "json_extract_path", "jsonb_extract_path",
+		"json_strip_nulls", "jsonb_strip_nulls", "string_to_array":
 		return TypeAny
 	default:
 		return TypeString
@@ -772,7 +776,7 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 			return statementScalarValue{}, fmt.Errorf("%w: unsupported extract field %q", ErrScalarInvalidText, field)
 		}
 		return statementScalarValue{value: arenaFloatScalar(arena, out)}, nil
-	case "json_array_length", "jsonb_array_length":
+	case "json_array_length", "jsonb_array_length", "cardinality":
 		if len(args) != 1 {
 			return statementScalarValue{}, fmt.Errorf("%w: %s requires 1 argument", ErrScalarType, name)
 		}
@@ -782,8 +786,256 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 			return statementScalarValue{}, fmt.Errorf("%w: %s expects a JSON array", ErrScalarType, name)
 		}
 		return statementScalarValue{value: arenaIntScalar(arena, int64(len(arr)))}, nil
+	case "array_length":
+		if len(args) != 2 {
+			return statementScalarValue{}, fmt.Errorf("%w: array_length requires 2 arguments", ErrScalarType)
+		}
+		dim, err := requireNumberArg(name, args[1])
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		if int(dim) != 1 {
+			return statementScalarValue{value: scalar{kind: kindNull}}, nil
+		}
+		raw := scalarAsJSONRaw(args[0])
+		var arr []json.RawMessage
+		if err := json.Unmarshal(raw, &arr); err != nil {
+			return statementScalarValue{}, fmt.Errorf("%w: array_length expects a JSON array", ErrScalarType)
+		}
+		if len(arr) == 0 {
+			return statementScalarValue{value: scalar{kind: kindNull}}, nil
+		}
+		return statementScalarValue{value: arenaIntScalar(arena, int64(len(arr)))}, nil
+	case "array_to_string":
+		if len(args) < 2 || len(args) > 3 {
+			return statementScalarValue{}, fmt.Errorf("%w: array_to_string takes 2 or 3 arguments", ErrScalarType)
+		}
+		delim, err := requireStringArg(name, args[1])
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		hasNullStr := len(args) == 3
+		nullStr := ""
+		if hasNullStr {
+			nullStr, err = requireStringArg(name, args[2])
+			if err != nil {
+				return statementScalarValue{}, err
+			}
+		}
+		var arr []any
+		if err := json.Unmarshal(scalarAsJSONRaw(args[0]), &arr); err != nil {
+			return statementScalarValue{}, fmt.Errorf("%w: array_to_string expects an array", ErrScalarType)
+		}
+		var parts []string
+		for _, elem := range arr {
+			if elem == nil {
+				if hasNullStr {
+					parts = append(parts, nullStr)
+				}
+				continue
+			}
+			parts = append(parts, fmt.Sprint(elem))
+		}
+		return statementScalarValue{value: scalar{kind: kindString, sval: strings.Join(parts, delim)}}, nil
+	case "string_to_array":
+		if len(args) != 2 {
+			return statementScalarValue{}, fmt.Errorf("%w: string_to_array requires 2 arguments", ErrScalarType)
+		}
+		s, err := requireStringArg(name, args[0])
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		delim, err := requireStringArg(name, args[1])
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		parts := strings.Split(s, delim)
+		raw, err := json.Marshal(parts)
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		return statementScalarValue{cell: jsonCellFromBytes(arena, raw), direct: true}, nil
+	case "json_extract_path", "jsonb_extract_path", "json_extract_path_text", "jsonb_extract_path_text":
+		if len(args) < 1 {
+			return statementScalarValue{}, fmt.Errorf("%w: %s requires at least 1 argument", ErrScalarType, name)
+		}
+		var current any
+		if err := json.Unmarshal(scalarAsJSONRaw(args[0]), &current); err != nil {
+			return statementScalarValue{value: scalar{kind: kindNull}}, nil
+		}
+		for _, pathArg := range args[1:] {
+			key, err := requireStringArg(name, pathArg)
+			if err != nil {
+				return statementScalarValue{}, err
+			}
+			switch container := current.(type) {
+			case map[string]any:
+				next, exists := container[key]
+				if !exists {
+					return statementScalarValue{value: scalar{kind: kindNull}}, nil
+				}
+				current = next
+			case []any:
+				idx, convErr := strconv.Atoi(key)
+				if convErr != nil || idx < 0 || idx >= len(container) {
+					return statementScalarValue{value: scalar{kind: kindNull}}, nil
+				}
+				current = container[idx]
+			default:
+				return statementScalarValue{value: scalar{kind: kindNull}}, nil
+			}
+		}
+		if current == nil {
+			return statementScalarValue{value: scalar{kind: kindNull}}, nil
+		}
+		if strings.HasSuffix(name, "_text") {
+			if s, ok := current.(string); ok {
+				return statementScalarValue{value: scalar{kind: kindString, sval: s}}, nil
+			}
+			raw, _ := json.Marshal(current)
+			return statementScalarValue{value: scalar{kind: kindString, sval: string(raw)}}, nil
+		}
+		raw, _ := json.Marshal(current)
+		return statementScalarValue{cell: jsonCellFromBytes(arena, raw), direct: true}, nil
+	case "json_strip_nulls", "jsonb_strip_nulls":
+		if len(args) != 1 {
+			return statementScalarValue{}, fmt.Errorf("%w: %s requires 1 argument", ErrScalarType, name)
+		}
+		var val any
+		if err := json.Unmarshal(scalarAsJSONRaw(args[0]), &val); err != nil {
+			return statementScalarValue{}, err
+		}
+		stripped := stripJSONNulls(val)
+		raw, err := json.Marshal(stripped)
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		return statementScalarValue{cell: jsonCellFromBytes(arena, raw), direct: true}, nil
+	case "jsonb_pretty":
+		if len(args) != 1 {
+			return statementScalarValue{}, fmt.Errorf("%w: jsonb_pretty requires 1 argument", ErrScalarType)
+		}
+		var val any
+		if err := json.Unmarshal(scalarAsJSONRaw(args[0]), &val); err != nil {
+			return statementScalarValue{}, err
+		}
+		raw, err := json.MarshalIndent(val, "", "    ")
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		return statementScalarValue{value: scalar{kind: kindString, sval: string(raw)}}, nil
+	case "regexp_like", "regexp_count", "regexp_substr":
+		if len(args) < 2 || len(args) > 3 {
+			return statementScalarValue{}, fmt.Errorf("%w: %s takes 2 or 3 arguments", ErrScalarType, name)
+		}
+		src, err := requireStringArg(name, args[0])
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		pat, err := requireStringArg(name, args[1])
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		flags := ""
+		if len(args) == 3 {
+			flags, err = requireStringArg(name, args[2])
+			if err != nil {
+				return statementScalarValue{}, err
+			}
+		}
+		re, err := compilePGRegexp(pat, flags)
+		if err != nil {
+			return statementScalarValue{}, fmt.Errorf("%w: %v", ErrInvalidPattern, err)
+		}
+		switch name {
+		case "regexp_like":
+			return statementScalarValue{value: scalar{kind: kindBool, bval: re.MatchString(src)}}, nil
+		case "regexp_count":
+			return statementScalarValue{value: arenaIntScalar(arena, int64(len(re.FindAllStringIndex(src, -1))))}, nil
+		default:
+			loc := re.FindString(src)
+			if loc == "" && !re.MatchString(src) {
+				return statementScalarValue{value: scalar{kind: kindNull}}, nil
+			}
+			return statementScalarValue{value: scalar{kind: kindString, sval: loc}}, nil
+		}
+	case "regexp_replace":
+		if len(args) < 3 || len(args) > 4 {
+			return statementScalarValue{}, fmt.Errorf("%w: regexp_replace takes 3 or 4 arguments", ErrScalarType)
+		}
+		src, err := requireStringArg(name, args[0])
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		pat, err := requireStringArg(name, args[1])
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		repl, err := requireStringArg(name, args[2])
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		flags := ""
+		if len(args) == 4 {
+			flags, err = requireStringArg(name, args[3])
+			if err != nil {
+				return statementScalarValue{}, err
+			}
+		}
+		re, err := compilePGRegexp(pat, flags)
+		if err != nil {
+			return statementScalarValue{}, fmt.Errorf("%w: %v", ErrInvalidPattern, err)
+		}
+		if strings.ContainsRune(flags, 'g') {
+			return statementScalarValue{value: scalar{kind: kindString, sval: re.ReplaceAllString(src, repl)}}, nil
+		}
+		loc := re.FindStringSubmatchIndex(src)
+		if loc == nil {
+			return statementScalarValue{value: scalar{kind: kindString, sval: src}}, nil
+		}
+		out := make([]byte, 0, len(src))
+		out = append(out, src[:loc[0]]...)
+		out = re.ExpandString(out, repl, src, loc)
+		out = append(out, src[loc[1]:]...)
+		return statementScalarValue{value: scalar{kind: kindString, sval: string(out)}}, nil
 	default:
 		return statementScalarValue{}, fmt.Errorf("%w: unknown scalar function %q", ErrScalarType, name)
+	}
+}
+
+func compilePGRegexp(pat, flags string) (*regexp.Regexp, error) {
+	prefix := ""
+	if strings.ContainsRune(flags, 'i') {
+		prefix += "(?i)"
+	}
+	if strings.ContainsRune(flags, 'm') || strings.ContainsRune(flags, 'n') {
+		prefix += "(?m)"
+	}
+	if strings.ContainsRune(flags, 's') {
+		prefix += "(?s)"
+	}
+	return regexp.Compile(prefix + pat)
+}
+
+func stripJSONNulls(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, val := range x {
+			if val == nil {
+				continue
+			}
+			out[k] = stripJSONNulls(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, val := range x {
+			out[i] = stripJSONNulls(val)
+		}
+		return out
+	default:
+		return v
 	}
 }
 
