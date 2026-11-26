@@ -787,13 +787,36 @@ func (p *Parser) parseScalarCast(ctx scalarExprContext) (*ScalarExpr, error) {
 
 func scalarCastTargetOf(text string) (ScalarCastTarget, bool) {
 	switch {
-	case equalFoldASCII(text, "text"):
+	case equalFoldASCII(text, "text"),
+		equalFoldASCII(text, "varchar"),
+		equalFoldASCII(text, "char"),
+		equalFoldASCII(text, "character"),
+		equalFoldASCII(text, "bpchar"),
+		equalFoldASCII(text, "name"),
+		equalFoldASCII(text, "uuid"),
+		equalFoldASCII(text, "date"),
+		equalFoldASCII(text, "time"),
+		equalFoldASCII(text, "timestamp"),
+		equalFoldASCII(text, "timestamptz"):
 		return ScalarCastText, true
 	case equalFoldASCII(text, "boolean"), equalFoldASCII(text, "bool"):
 		return ScalarCastBoolean, true
-	case equalFoldASCII(text, "numeric"), equalFoldASCII(text, "decimal"):
+	case equalFoldASCII(text, "numeric"),
+		equalFoldASCII(text, "decimal"),
+		equalFoldASCII(text, "int"),
+		equalFoldASCII(text, "int2"),
+		equalFoldASCII(text, "int4"),
+		equalFoldASCII(text, "int8"),
+		equalFoldASCII(text, "integer"),
+		equalFoldASCII(text, "bigint"),
+		equalFoldASCII(text, "smallint"),
+		equalFoldASCII(text, "float"),
+		equalFoldASCII(text, "float4"),
+		equalFoldASCII(text, "float8"),
+		equalFoldASCII(text, "real"),
+		equalFoldASCII(text, "double"):
 		return ScalarCastNumeric, true
-	case equalFoldASCII(text, "json"):
+	case equalFoldASCII(text, "json"), equalFoldASCII(text, "jsonb"):
 		return ScalarCastJSON, true
 	default:
 		return 0, false

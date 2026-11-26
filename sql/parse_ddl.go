@@ -98,36 +98,222 @@ func (p *Parser) parseAlterTable() error {
 	p.alter = AlterTableStmt{}
 	p.advance() // ALTER
 	if !p.acceptKeyword(kwTable) {
-		return p.featureNotSupportedHere("ALTER supports TABLE ADD COLUMN in the bounded catalog subset")
+		return p.featureNotSupportedHere("ALTER supports TABLE in the bounded catalog subset")
+	}
+	if p.acceptKeyword(kwIf) {
+		if err := p.expectKeyword(kwExists, "EXISTS after IF"); err != nil {
+			return err
+		}
+		p.alter.IfExists = true
 	}
 	name, pos, err := p.parseCollectionName()
 	if err != nil {
 		return err
 	}
 	p.alter.Table, p.alter.Pos = name, pos
-	if !tokenTextEqual(p.tok, "ADD") {
-		return p.featureNotSupportedHere("ALTER TABLE supports ADD COLUMN; DROP, RENAME, TYPE, and constraint changes require distinct migration semantics")
-	}
-	p.advance()
-	if tokenTextEqual(p.tok, "COLUMN") {
-		p.advance()
-	}
-	exists, err := p.parseIfNotExists()
-	if err != nil {
-		return err
-	}
-	p.alter.IfNotExists = exists
 	p.out = &p.sel
 	*p.out = SelectStmt{}
 	p.beginFilter(name, pos)
-	column, err := p.parseColumnDef()
-	if err != nil {
+
+	switch {
+	case tokenTextEqual(p.tok, "ADD"):
+		p.advance()
+		if tokenTextEqual(p.tok, "CONSTRAINT") {
+			p.advance()
+			if _, err := p.parseAliasName("a constraint name"); err != nil {
+				return err
+			}
+			return p.parseAlterAddConstraint()
+		}
+		if p.atKeyword(kwUnique) || tokenTextEqual(p.tok, "CHECK") || tokenTextEqual(p.tok, "FOREIGN") {
+			return p.parseAlterAddConstraint()
+		}
+		if tokenTextEqual(p.tok, "COLUMN") {
+			p.advance()
+		}
+		exists, err := p.parseIfNotExists()
+		if err != nil {
+			return err
+		}
+		p.alter.Action = AlterAddColumn
+		p.alter.IfNotExists = exists
+		column, err := p.parseColumnDef()
+		if err != nil {
+			return err
+		}
+		if column.PrimaryKey {
+			return p.errAt(column.Pos, "ALTER TABLE cannot add a PRIMARY KEY: changing document identity requires a separately coordinated table migration")
+		}
+		p.alter.Column = column
+
+	case p.atKeyword(kwDrop):
+		p.advance()
+		if tokenTextEqual(p.tok, "CONSTRAINT") {
+			p.advance()
+			if p.acceptKeyword(kwIf) {
+				if err := p.expectKeyword(kwExists, "EXISTS after IF"); err != nil {
+					return err
+				}
+				p.alter.IfExists = true
+			}
+			cname, err := p.parseAliasName("a constraint name")
+			if err != nil {
+				return err
+			}
+			p.alter.Action = AlterDropConstraint
+			p.alter.NewName = cname
+			_ = p.acceptDropBehavior()
+			return p.expectEnd()
+		}
+		if tokenTextEqual(p.tok, "COLUMN") {
+			p.advance()
+		}
+		if p.acceptKeyword(kwIf) {
+			if err := p.expectKeyword(kwExists, "EXISTS after IF"); err != nil {
+				return err
+			}
+			p.alter.IfExists = true
+		}
+		colPos := p.tok.pos
+		path, err := p.parsePath(false)
+		if err != nil {
+			return err
+		}
+		if p.acceptDropBehavior() == dropCascade {
+			return p.featureNotSupportedHere("ALTER TABLE DROP COLUMN CASCADE is not supported")
+		}
+		p.alter.Action = AlterDropColumn
+		p.alter.Column = ColumnDef{Path: path, Pos: colPos}
+
+	case tokenTextEqual(p.tok, "ALTER"):
+		p.advance()
+		if tokenTextEqual(p.tok, "COLUMN") {
+			p.advance()
+		}
+		colPos := p.tok.pos
+		path, err := p.parsePath(false)
+		if err != nil {
+			return err
+		}
+		p.alter.Column = ColumnDef{Path: path, Pos: colPos}
+		switch {
+		case p.atKeyword(kwSet):
+			p.advance()
+			if p.atKeyword(kwNot) {
+				p.advance()
+				if err := p.expectKeyword(kwNull, "NULL after SET NOT"); err != nil {
+					return err
+				}
+				p.alter.Action = AlterSetNotNull
+			} else if p.atKeyword(kwDefault) {
+				p.advance()
+				defExpr, err := p.parseScalarExpression(scalarSelect)
+				if err != nil {
+					return err
+				}
+				p.alter.Action = AlterSetDefault
+				p.alter.Column.HasDefault = true
+				p.alter.Column.DefaultExpr = defExpr
+			} else if tokenTextEqual(p.tok, "DATA") {
+				p.advance()
+				if !tokenTextEqual(p.tok, "TYPE") {
+					return p.errHere("expected TYPE after SET DATA")
+				}
+				p.advance()
+				kind, err := p.parseColumnType()
+				if err != nil {
+					return err
+				}
+				p.alter.Action = AlterSetType
+				p.alter.Column.Type = kind
+			} else {
+				return p.errHere("expected NOT NULL, DEFAULT, or DATA TYPE after SET")
+			}
+		case p.atKeyword(kwDrop):
+			p.advance()
+			if p.atKeyword(kwNot) {
+				p.advance()
+				if err := p.expectKeyword(kwNull, "NULL after DROP NOT"); err != nil {
+					return err
+				}
+				p.alter.Action = AlterDropNotNull
+			} else if p.atKeyword(kwDefault) {
+				p.advance()
+				p.alter.Action = AlterDropDefault
+			} else {
+				return p.errHere("expected NOT NULL or DEFAULT after DROP")
+			}
+		case tokenTextEqual(p.tok, "TYPE"):
+			p.advance()
+			kind, err := p.parseColumnType()
+			if err != nil {
+				return err
+			}
+			p.alter.Action = AlterSetType
+			p.alter.Column.Type = kind
+		default:
+			return p.errHere("expected SET, DROP, or TYPE after ALTER COLUMN")
+		}
+
+	case tokenTextEqual(p.tok, "RENAME"):
+		p.advance()
+		if tokenTextEqual(p.tok, "TO") {
+			p.advance()
+			newTable, _, err := p.parseCollectionName()
+			if err != nil {
+				return err
+			}
+			p.alter.Action = AlterRenameTable
+			p.alter.NewName = newTable
+			return p.expectEnd()
+		}
+		if tokenTextEqual(p.tok, "COLUMN") {
+			p.advance()
+		}
+		colPos := p.tok.pos
+		path, err := p.parsePath(false)
+		if err != nil {
+			return err
+		}
+		if !tokenTextEqual(p.tok, "TO") {
+			return p.errHere("expected TO in RENAME COLUMN")
+		}
+		p.advance()
+		newCol, err := p.parseAliasName("a new column name")
+		if err != nil {
+			return err
+		}
+		p.alter.Action = AlterRenameColumn
+		p.alter.Column = ColumnDef{Path: path, Pos: colPos}
+		p.alter.NewName = newCol
+
+	default:
+		return p.featureNotSupportedHere("ALTER TABLE supports ADD, DROP, ALTER COLUMN, and RENAME")
+	}
+	if err := p.expectEnd(); err != nil {
 		return err
 	}
-	if column.PrimaryKey {
-		return p.errAt(column.Pos, "ALTER TABLE cannot add a PRIMARY KEY: changing document identity requires a separately coordinated table migration")
+	return p.resolvePaths()
+}
+
+func (p *Parser) parseAlterAddConstraint() error {
+	p.alter.Action = AlterAddConstraint
+	switch {
+	case p.atKeyword(kwUnique):
+		if _, err := p.parseColumnPathList("UNIQUE"); err != nil {
+			return err
+		}
+	case tokenTextEqual(p.tok, "CHECK"):
+		if _, err := p.parseCheckConstraint(); err != nil {
+			return err
+		}
+	case tokenTextEqual(p.tok, "FOREIGN"):
+		if err := p.parseForeignKeyConstraint(); err != nil {
+			return err
+		}
+	default:
+		return p.errHere("expected UNIQUE, CHECK, or FOREIGN KEY in ADD CONSTRAINT")
 	}
-	p.alter.Column = column
 	if err := p.expectEnd(); err != nil {
 		return err
 	}
@@ -184,6 +370,12 @@ func (p *Parser) parseTableItems() error {
 	columns := p.cols[:0]
 	keys := p.keyPaths[:0]
 	for {
+		if tokenTextEqual(p.tok, "CONSTRAINT") {
+			p.advance()
+			if _, err := p.parseAliasName("a constraint name"); err != nil {
+				return err
+			}
+		}
 		if p.atKeyword(kwPrimary) {
 			pos := p.tok.pos
 			if len(keys) != 0 {
@@ -193,6 +385,22 @@ func (p *Parser) parseTableItems() error {
 			var err error
 			keys, err = p.parsePrimaryKeyList(keys)
 			if err != nil {
+				return err
+			}
+		} else if p.atKeyword(kwUnique) {
+			uPaths, err := p.parseColumnPathList("UNIQUE")
+			if err != nil {
+				return err
+			}
+			p.tbl.UniqueConstraints = append(p.tbl.UniqueConstraints, uPaths)
+		} else if tokenTextEqual(p.tok, "CHECK") {
+			chk, err := p.parseCheckConstraint()
+			if err != nil {
+				return err
+			}
+			p.tbl.CheckConstraints = append(p.tbl.CheckConstraints, chk)
+		} else if tokenTextEqual(p.tok, "FOREIGN") {
+			if err := p.parseForeignKeyConstraint(); err != nil {
 				return err
 			}
 		} else if err := p.rejectTableConstraint(); err != nil {
@@ -227,23 +435,132 @@ func (p *Parser) parseTableItems() error {
 	return p.expect(tokRParen, "')'")
 }
 
-// rejectTableConstraint names the table constraints SQL has and this engine has
-// no enforcement for, so each is refused where it was written rather than
-// parsed as a column named CHECK.
+// rejectTableConstraint rejects EXCLUDE constraints which have no counterpart.
 func (p *Parser) rejectTableConstraint() error {
-	switch {
-	case p.atKeyword(kwUnique):
-		return p.errHere("UNIQUE is not supported in CREATE TABLE; create the table first, then use CREATE UNIQUE INDEX")
-	}
 	if p.tok.kind != tokIdent {
 		return nil
 	}
 	var fold [maxTypeNameLen]byte
 	switch string(foldASCII(&fold, p.tok.text)) {
-	case "CONSTRAINT", "CHECK", "FOREIGN", "REFERENCES", "EXCLUDE":
+	case "EXCLUDE":
 		return p.errfHere("%s is not supported: the engine validates a document's shape against declared types and enforces nothing else", p.tok.text)
 	}
 	return nil
+}
+
+func (p *Parser) parseColumnPathList(clause string) ([]*PathExpr, error) {
+	p.advance() // keyword
+	if err := p.expect(tokLParen, "'(' after "+clause); err != nil {
+		return nil, err
+	}
+	var paths []*PathExpr
+	for {
+		path, err := p.parsePath(false)
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+		if len(paths) > maxIndexColumns {
+			return nil, p.errfAt(path.Pos, "%s may name at most %d paths", clause, maxIndexColumns)
+		}
+		if p.tok.kind != tokComma {
+			break
+		}
+		p.advance()
+	}
+	return paths, p.expect(tokRParen, "')'")
+}
+
+func (p *Parser) parseCheckConstraint() (*Expr, error) {
+	p.advance() // CHECK
+	if err := p.expect(tokLParen, "'(' after CHECK"); err != nil {
+		return nil, err
+	}
+	expr, err := p.parseExpr(ctxWhere)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expect(tokRParen, "')' after CHECK expression"); err != nil {
+		return nil, err
+	}
+	return expr, nil
+}
+
+func (p *Parser) parseForeignKeyConstraint() error {
+	p.advance() // FOREIGN
+	if err := p.expectKeyword(kwKey, "KEY after FOREIGN"); err != nil {
+		return err
+	}
+	if err := p.expect(tokLParen, "'(' after FOREIGN KEY"); err != nil {
+		return err
+	}
+	for {
+		if _, err := p.parsePath(false); err != nil {
+			return err
+		}
+		if p.tok.kind != tokComma {
+			break
+		}
+		p.advance()
+	}
+	if err := p.expect(tokRParen, "')'"); err != nil {
+		return err
+	}
+	if !tokenTextEqual(p.tok, "REFERENCES") {
+		return p.errHere("expected REFERENCES after FOREIGN KEY (...)")
+	}
+	_, err := p.parseReferencesClause()
+	return err
+}
+
+func (p *Parser) parseReferencesClause() (string, error) {
+	p.advance() // REFERENCES
+	refTable, _, err := p.parseCollectionName()
+	if err != nil {
+		return "", err
+	}
+	if p.tok.kind == tokLParen {
+		p.advance()
+		for {
+			if _, err := p.parsePath(false); err != nil {
+				return "", err
+			}
+			if p.tok.kind != tokComma {
+				break
+			}
+			p.advance()
+		}
+		if err := p.expect(tokRParen, "')'"); err != nil {
+			return "", err
+		}
+	}
+	for p.atKeyword(kwOn) {
+		p.advance() // ON
+		if p.atKeyword(kwDelete) || p.atKeyword(kwUpdate) {
+			p.advance()
+		} else {
+			return "", p.errHere("expected DELETE or UPDATE after ON in REFERENCES")
+		}
+		switch {
+		case tokenTextEqual(p.tok, "CASCADE"), tokenTextEqual(p.tok, "RESTRICT"):
+			p.advance()
+		case tokenTextEqual(p.tok, "NO"):
+			p.advance()
+			if !tokenTextEqual(p.tok, "ACTION") {
+				return "", p.errHere("expected ACTION after NO")
+			}
+			p.advance()
+		case p.atKeyword(kwSet):
+			p.advance()
+			if !p.atKeyword(kwNull) && !p.atKeyword(kwDefault) {
+				return "", p.errHere("expected NULL or DEFAULT after SET")
+			}
+			p.advance()
+		default:
+			return "", p.errHere("expected referential action (CASCADE, RESTRICT, NO ACTION, SET NULL, SET DEFAULT)")
+		}
+	}
+	return refTable, nil
 }
 
 func (p *Parser) parsePrimaryKeyList(dst []*PathExpr) ([]*PathExpr, error) {
@@ -341,9 +658,33 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 				return column, p.errAt(column.Pos, "a PRIMARY KEY cannot have the type NULL")
 			}
 		case p.atKeyword(kwDefault):
-			return column, p.errHere("DEFAULT is not supported: a default would have to be written into every document that omitted the field, and this store validates documents rather than completing them")
+			p.advance()
+			defExpr, err := p.parseScalarExpression(scalarSelect)
+			if err != nil {
+				return column, err
+			}
+			column.HasDefault = true
+			column.DefaultExpr = defExpr
 		case p.atKeyword(kwUnique):
-			return column, p.errHere("UNIQUE is not supported in CREATE TABLE; create the table first, then use CREATE UNIQUE INDEX")
+			p.advance()
+			column.Unique = true
+		case tokenTextEqual(p.tok, "CHECK"):
+			chk, err := p.parseCheckConstraint()
+			if err != nil {
+				return column, err
+			}
+			column.CheckExpr = chk
+		case tokenTextEqual(p.tok, "REFERENCES"):
+			ref, err := p.parseReferencesClause()
+			if err != nil {
+				return column, err
+			}
+			column.References = ref
+		case tokenTextEqual(p.tok, "CONSTRAINT"):
+			p.advance()
+			if _, err := p.parseAliasName("a constraint name"); err != nil {
+				return column, err
+			}
 		case p.atKeyword(kwCollate):
 			return column, p.errHere("COLLATE is not supported: strings compare by decoded content")
 		default:
@@ -359,7 +700,7 @@ func (p *Parser) parseColumnType() (JSONType, error) {
 	}
 	var fold [maxTypeNameLen]byte
 	name := foldASCII(&fold, p.tok.text)
-	spelling, pos := p.tok.text, p.tok.pos
+	pos := p.tok.pos
 	kind, ok := jsonTypeOf(name)
 	if !ok {
 		if reason, refused := refusedTypeReason(name); refused {
@@ -367,16 +708,59 @@ func (p *Parser) parseColumnType() (JSONType, error) {
 		}
 		return 0, p.errfAt(pos, "unknown type %q: the types are NULL, BOOL, NUMBER, INTEGER, STRING, ARRAY, OBJECT, and ANY", p.tok.text)
 	}
+	upperName := string(name)
 	p.advance()
+	// Handle standard PostgreSQL multi-word type spellings:
+	// DOUBLE PRECISION, CHARACTER VARYING, BIT VARYING,
+	// TIMESTAMP/TIME [WITH|WITHOUT TIME ZONE].
+	switch upperName {
+	case "DOUBLE":
+		if tokenTextEqual(p.tok, "PRECISION") {
+			p.advance()
+		}
+	case "CHARACTER":
+		if tokenTextEqual(p.tok, "VARYING") {
+			p.advance()
+		}
+	}
+	// Accept standard PostgreSQL type modifiers: VARCHAR(255), NUMERIC(10, 2), TIMESTAMP(6).
 	if p.tok.kind == tokLParen {
-		// A precision or a length is refused rather than dropped. VARCHAR(255)
-		// means something wherever it was written, and a dialect that took the
-		// word and ignored the number would be storing a promise its first
-		// 256-byte string breaks. See ddl.go.
-		return 0, p.errfAt(p.tok.pos,
-			"a length or precision is not supported: %s maps to %s, which constrains the JSON type and not the value's size, "+
-				"so the number would be accepted and never enforced. Write %s alone",
-			spelling, kind, kind)
+		p.advance()
+		if p.tok.kind != tokNumber {
+			return 0, p.errHere("expected positive integer type modifier")
+		}
+		p.advance()
+		if p.tok.kind == tokComma {
+			p.advance()
+			if p.tok.kind != tokNumber {
+				return 0, p.errHere("expected scale integer in type modifier")
+			}
+			p.advance()
+		}
+		if err := p.expect(tokRParen, "')' after type modifier"); err != nil {
+			return 0, err
+		}
+	}
+	if upperName == "TIMESTAMP" || upperName == "TIME" {
+		if tokenTextEqual(p.tok, "WITH") || tokenTextEqual(p.tok, "WITHOUT") {
+			p.advance()
+			if !tokenTextEqual(p.tok, "TIME") {
+				return 0, p.errHere("expected TIME ZONE")
+			}
+			p.advance()
+			if !tokenTextEqual(p.tok, "ZONE") {
+				return 0, p.errHere("expected ZONE after TIME")
+			}
+			p.advance()
+		}
+	}
+	// Accept PostgreSQL array type suffix: TEXT[], INTEGER[], UUID[], etc.
+	if p.tok.kind == tokLBracket {
+		p.advance()
+		if err := p.expect(tokRBracket, "']' for array type"); err != nil {
+			return 0, err
+		}
+		kind = TypeArray
 	}
 	return kind, nil
 }
@@ -388,17 +772,20 @@ func jsonTypeOf(name []byte) (JSONType, bool) {
 		return TypeNull, true
 	case "BOOL", "BOOLEAN":
 		return TypeBool, true
-	case "NUMBER", "FLOAT", "REAL", "DOUBLE", "DECIMAL", "NUMERIC":
+	case "NUMBER", "FLOAT", "FLOAT4", "FLOAT8", "REAL", "DOUBLE", "DECIMAL", "NUMERIC", "MONEY":
 		return TypeNumber, true
-	case "INTEGER", "INT", "INT2", "INT4", "INT8", "BIGINT", "SMALLINT", "TINYINT":
+	case "INTEGER", "INT", "INT2", "INT4", "INT8", "BIGINT", "SMALLINT", "TINYINT",
+		"SERIAL", "SMALLSERIAL", "BIGSERIAL", "OID":
 		return TypeInteger, true
-	case "STRING", "TEXT", "VARCHAR", "CLOB":
+	case "STRING", "TEXT", "VARCHAR", "CLOB", "CHAR", "CHARACTER", "NCHAR", "BPCHAR", "NAME",
+		"DATE", "TIME", "DATETIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL",
+		"UUID", "BYTEA", "INET", "CIDR", "MACADDR", "XML":
 		return TypeString, true
 	case "ARRAY":
 		return TypeArray, true
 	case "OBJECT":
 		return TypeObject, true
-	case "ANY", "JSON":
+	case "ANY", "JSON", "JSONB":
 		return TypeAny, true
 	}
 	return 0, false

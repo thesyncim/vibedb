@@ -125,9 +125,11 @@ func TestPostgreSQLRF3PreparesComputedUpdateAndKeepsReturningFenced(t *testing.T
 	returning, err := session.Prepare(
 		context.Background(), text+` RETURNING value`,
 	)
-	var unsupported *sqlast.FeatureNotSupportedError
-	if !errors.As(err, &unsupported) || returning != nil {
-		t.Fatalf("RETURNING prepare = %v, %T %v", returning, err, err)
+	if err != nil || returning == nil || !returning.ReturnsRows() {
+		t.Fatalf("RETURNING prepare = %v, %T %v; want returning statement", returning, err, err)
+	}
+	if err := returning.Close(); err != nil {
+		t.Fatal(err)
 	}
 	if dispatches != 1 || len(session.(*postgresSession).statements) != 0 {
 		t.Fatalf("RETURNING dispatches=%d retained=%d", dispatches, len(session.(*postgresSession).statements))

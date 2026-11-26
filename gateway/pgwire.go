@@ -26,9 +26,10 @@ const (
 // PostgreSQLBackend exposes distributed reads and optional durable autocommit
 // writes, never an embedded database or a replica-local mutation path.
 type PostgreSQLBackend struct {
-	Executor  *Executor
-	Authorize func(pgwire.SessionIdentity) (serviceauthz.Authority, error)
-	Write     func(context.Context, serviceauthz.Authority, Query) (*Result, error)
+	Executor   *Executor
+	Authorize  func(pgwire.SessionIdentity) (serviceauthz.Authority, error)
+	Write      func(context.Context, serviceauthz.Authority, Query) (*Result, error)
+	WriteBatch func(context.Context, serviceauthz.Authority, []Query) (*Result, error)
 	// DDL is a cold, coordinated schema operation. It must return success only
 	// after the serving catalog is durable; it is never a replica-local Exec.
 	DDL func(context.Context, serviceauthz.Authority, string) error
@@ -53,6 +54,13 @@ func (b *PostgreSQLBackend) NewSession(ctx context.Context, identity pgwire.Sess
 	return session, nil
 }
 
+type postgresSavepoint struct {
+	name       string
+	writeCount int
+}
+
+const maxPostgresSavepoints = 64
+
 type postgresSession struct {
 	backend             *PostgreSQLBackend
 	authority           serviceauthz.Authority
@@ -68,6 +76,8 @@ type postgresSession struct {
 	materializedRelease func() error
 	cancelMu            sync.Mutex
 	cancel              context.CancelFunc
+	txWrites            []Query
+	savepoints          []postgresSavepoint
 }
 
 func (s *postgresSession) releaseMaterialized() error {
@@ -96,7 +106,10 @@ type postgresReadCache struct {
 
 func (s *postgresSession) State() driver.SessionState { return s.state }
 func (s *postgresSession) AutocommitWrites() bool {
-	return s.backend.Write != nil || s.backend.DDL != nil
+	if s.backend != nil && s.backend.WriteBatch != nil {
+		return false
+	}
+	return s.backend != nil && (s.backend.Write != nil || s.backend.DDL != nil)
 }
 func (s *postgresSession) MarkFailed() {
 	if s.state == driver.SessionInTransaction {
@@ -132,17 +145,40 @@ func (s *postgresSession) Begin(_ context.Context, options driver.TxOptions) err
 	if options.Isolation != driver.IsolationDefault && options.Isolation != driver.IsolationReadCommitted {
 		return fmt.Errorf("%w: gateway RF3 PostgreSQL supports per-statement quorum reads, not repeatable-read or serializable snapshots", driver.ErrUnsupportedIsolation)
 	}
+	s.txWrites = s.txWrites[:0]
+	s.savepoints = s.savepoints[:0]
 	s.state = driver.SessionInTransaction
 	return nil
 }
-func (s *postgresSession) Commit(context.Context) error {
+func (s *postgresSession) Commit(ctx context.Context) error {
 	if s.state == driver.SessionClosed {
 		return driver.ErrSessionClosed
 	}
 	failed := s.state == driver.SessionFailedTransaction
+	pending := s.txWrites
+	s.txWrites = nil
+	s.savepoints = nil
 	s.state = driver.SessionIdle
 	if failed {
 		return driver.ErrTransactionFailed
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	authCtx, err := serviceauthz.WithAuthority(ctx, s.authority)
+	if err != nil {
+		return err
+	}
+	if s.backend != nil && s.backend.WriteBatch != nil {
+		_, err = s.backend.WriteBatch(authCtx, s.authority, pending)
+		return err
+	}
+	if s.backend != nil && s.backend.Write != nil {
+		for _, q := range pending {
+			if _, err = s.backend.Write(authCtx, s.authority, q); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -150,17 +186,64 @@ func (s *postgresSession) Rollback(context.Context) error {
 	if s.state == driver.SessionClosed {
 		return driver.ErrSessionClosed
 	}
+	s.txWrites = nil
+	s.savepoints = nil
 	s.state = driver.SessionIdle
 	return nil
 }
-func (s *postgresSession) Savepoint(context.Context, string) error {
-	return sqlast.NewFeatureNotSupportedError("SAVEPOINT", 0, "savepoints are not supported on the RF3 endpoint")
+func (s *postgresSession) Savepoint(_ context.Context, name string) error {
+	if s.state == driver.SessionClosed {
+		return driver.ErrSessionClosed
+	}
+	if s.state == driver.SessionFailedTransaction {
+		return driver.ErrTransactionFailed
+	}
+	if s.state != driver.SessionInTransaction {
+		return driver.ErrNoTransaction
+	}
+	if len(s.savepoints) >= maxPostgresSavepoints {
+		return driver.ErrTooManySavepoints
+	}
+	s.savepoints = append(s.savepoints, postgresSavepoint{
+		name:       name,
+		writeCount: len(s.txWrites),
+	})
+	return nil
 }
-func (s *postgresSession) ReleaseSavepoint(ctx context.Context, name string) error {
-	return s.Savepoint(ctx, name)
+func (s *postgresSession) ReleaseSavepoint(_ context.Context, name string) error {
+	if s.state == driver.SessionClosed {
+		return driver.ErrSessionClosed
+	}
+	if s.state == driver.SessionFailedTransaction {
+		return driver.ErrTransactionFailed
+	}
+	if s.state != driver.SessionInTransaction {
+		return driver.ErrNoTransaction
+	}
+	for i := len(s.savepoints) - 1; i >= 0; i-- {
+		if s.savepoints[i].name == name {
+			s.savepoints = s.savepoints[:i]
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %q", driver.ErrSavepointNotFound, name)
 }
-func (s *postgresSession) RollbackTo(ctx context.Context, name string) error {
-	return s.Savepoint(ctx, name)
+func (s *postgresSession) RollbackTo(_ context.Context, name string) error {
+	if s.state == driver.SessionClosed {
+		return driver.ErrSessionClosed
+	}
+	if s.state != driver.SessionInTransaction && s.state != driver.SessionFailedTransaction {
+		return driver.ErrNoTransaction
+	}
+	for i := len(s.savepoints) - 1; i >= 0; i-- {
+		if s.savepoints[i].name == name {
+			s.txWrites = s.txWrites[:s.savepoints[i].writeCount]
+			s.savepoints = s.savepoints[:i+1]
+			s.state = driver.SessionInTransaction
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %q", driver.ErrSavepointNotFound, name)
 }
 func (s *postgresSession) Close() error {
 	s.Cancel()

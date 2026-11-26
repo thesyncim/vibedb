@@ -112,8 +112,8 @@ func TestUpdateAssignmentUnsupportedScalarShapesAreTypedAndPositioned(t *testing
 		},
 		{
 			name:    "scalar function",
-			source:  `UPDATE t SET label = lower(label)`,
-			marker:  "lower",
+			source:  `UPDATE t SET label = unknown_fn(label)`,
+			marker:  "unknown_fn",
 			message: "not a supported function",
 		},
 		{
@@ -130,7 +130,7 @@ func TestUpdateAssignmentUnsupportedScalarShapesAreTypedAndPositioned(t *testing
 		},
 		{
 			name:    "function inside CASE predicate",
-			source:  `UPDATE t SET n = CASE WHEN lower(label) = 'x' THEN 1 ELSE 0 END`,
+			source:  `UPDATE t SET n = CASE WHEN unknown_fn(label) = 'x' THEN 1 ELSE 0 END`,
 			marker:  "(",
 			message: "not a supported function",
 		},

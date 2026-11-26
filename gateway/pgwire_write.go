@@ -459,6 +459,26 @@ func (p *postgresWriteStatement) execWrite(ctx context.Context, args []any) (*Re
 	if s.state == driver.SessionFailedTransaction {
 		return nil, driver.ErrTransactionFailed
 	}
+	if s.state == driver.SessionInTransaction {
+		if s.backend == nil || s.backend.WriteBatch == nil || p.returning != nil || p.insertSelectSQL != "" {
+			return nil, sqlast.NewFeatureNotSupportedError(p.text, 0, "distributed writes require auto-commit mode")
+		}
+		if len(args) != p.params {
+			return nil, ErrPlanParameters
+		}
+		params := make([]shardservice.Param, len(args))
+		for i, value := range args {
+			var err error
+			params[i], err = postgresWriteParam(value, p.ParamKind(i) == driver.ParamDocument)
+			if err != nil {
+				return nil, err
+			}
+		}
+		s.txWrites = append(s.txWrites, Query{
+			SQL: p.text, Params: params, ParamTypes: p.paramTypes, Class: ClassBatch,
+		})
+		return &Result{Kind: shardservice.ResponseCompletion, RowsAffected: 1}, nil
+	}
 	if s.state != driver.SessionIdle {
 		return nil, sqlast.NewFeatureNotSupportedError(p.text, 0, "distributed writes require auto-commit mode")
 	}
@@ -501,7 +521,8 @@ func (p *postgresWriteStatement) execWrite(ctx context.Context, args []any) (*Re
 	result, err := s.backend.Write(ctx, s.authority, Query{
 		SQL: p.text, Params: params, ParamTypes: p.paramTypes, Class: ClassBatch,
 	})
-	if errors.Is(err, ErrReplicatedSQLTransactionUnsupported) &&
+	if !errors.Is(err, durable.ErrCommitOutcomeUnknown) &&
+		errors.Is(err, ErrReplicatedSQLTransactionUnsupported) &&
 		(p.kind == sqlast.KindDelete || p.kind == sqlast.KindUpdate) {
 		result, err = p.execGeneralDeleteOrUpdate(ctx, params)
 	}
