@@ -23,16 +23,18 @@ func (p *postgresStatement) Exec(context.Context, []any) (driver.Result, error) 
 }
 
 type postgresWriteStatement struct {
-	session    *postgresSession
-	text       string
-	kind       sqlast.Kind
-	table      string
-	params     int
-	documents  map[int]int
-	compiled   *query.DMLStatement
-	returning  *query.Statement
-	paramTypes []driver.ParamType
-	closed     bool
+	session                   *postgresSession
+	text                      string
+	kind                      sqlast.Kind
+	table                     string
+	insertSelectSQL           string
+	insertOnConflictDoNothing bool
+	params                    int
+	documents                 map[int]int
+	compiled                  *query.DMLStatement
+	returning                 *query.Statement
+	paramTypes                []driver.ParamType
+	closed                    bool
 }
 
 // RetainedBytes accounts the one backend-owned allocation that an ordinary
@@ -70,8 +72,18 @@ func (s *postgresSession) prepareWrite(
 		(parsed.Insert.OnConflictDoNothing || parsed.Insert.OnConflictUpdate != nil) {
 		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL ON CONFLICT with RETURNING is not supported")
 	}
+	var insertSelectSQL string
+	var insertOnConflictDoNothing bool
 	if parsed.Kind == sqlast.KindInsert && parsed.Insert.Source != nil {
-		return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL INSERT requires VALUES")
+		if parsed.Insert.OnConflictUpdate != nil {
+			return nil, sqlast.NewFeatureNotSupportedError(text, 0, "INSERT ... SELECT with ON CONFLICT DO UPDATE is not supported")
+		}
+		var extractErr error
+		insertSelectSQL, extractErr = extractInsertSelectSource(text, parsed.Insert)
+		if extractErr != nil {
+			return nil, sqlast.NewFeatureNotSupportedError(text, 0, "RF3 PostgreSQL INSERT ... SELECT source could not be extracted")
+		}
+		insertOnConflictDoNothing = parsed.Insert.OnConflictDoNothing
 	}
 	if parsed.Kind == sqlast.KindInsert && !replicatedConflictActionSupported(parsed.Insert.OnConflictUpdate) {
 		return nil, sqlast.NewFeatureNotSupportedError(
@@ -111,7 +123,17 @@ func (s *postgresSession) prepareWrite(
 	}
 	// The catalog prepare below compiles routing only and never analyzes scalar
 	// input types. The typed DML compile above is the sole semantic authority.
-	if _, err := s.backend.Executor.validateCatalogPrepare(ctx, text); err != nil {
+	if insertSelectSQL != "" {
+		if _, _, err := s.backend.Executor.prepareCatalogWithRefresh(ctx, insertSelectSQL); err != nil {
+			if compiled != nil {
+				compiled.Release()
+			}
+			if returningStmt != nil {
+				returningStmt.Release()
+			}
+			return nil, err
+		}
+	} else if _, err := s.backend.Executor.validateCatalogPrepare(ctx, text); err != nil {
 		if compiled != nil {
 			compiled.Release()
 		}
@@ -122,9 +144,11 @@ func (s *postgresSession) prepareWrite(
 	}
 	p := &postgresWriteStatement{
 		session: s, text: strings.Clone(text), kind: parsed.Kind,
-		table:     strings.Clone(parsed.Table()),
-		params:    parsed.Params(), compiled: compiled,
-		returning: returningStmt,
+		table:                     strings.Clone(parsed.Table()),
+		insertSelectSQL:           insertSelectSQL,
+		insertOnConflictDoNothing: insertOnConflictDoNothing,
+		params:                    parsed.Params(), compiled: compiled,
+		returning:  returningStmt,
 		documents:  documents,
 		paramTypes: resolvedParameterTypes,
 	}
@@ -464,9 +488,23 @@ func (p *postgresWriteStatement) execWrite(ctx context.Context, args []any) (*Re
 	if err != nil {
 		return nil, err
 	}
+	if p.insertSelectSQL != "" {
+		result, err := p.execInsertSelect(ctx, params)
+		if err != nil {
+			return nil, err
+		}
+		if result == nil || result.Kind != shardservice.ResponseCompletion {
+			return nil, ErrDurableSQLRequest
+		}
+		return result, nil
+	}
 	result, err := s.backend.Write(ctx, s.authority, Query{
 		SQL: p.text, Params: params, ParamTypes: p.paramTypes, Class: ClassBatch,
 	})
+	if errors.Is(err, ErrReplicatedSQLTransactionUnsupported) &&
+		(p.kind == sqlast.KindDelete || p.kind == sqlast.KindUpdate) {
+		result, err = p.execGeneralDeleteOrUpdate(ctx, params)
+	}
 	if errors.Is(err, durable.ErrCommitOutcomeUnknown) {
 		return nil, err
 	}
