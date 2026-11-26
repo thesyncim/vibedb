@@ -2315,6 +2315,16 @@ func (c *Collection) materializePrimaryParentsOnceLocked() (err error) {
 							"apply compact checkpoint overlay bucket=%d base_rows=%d: %w",
 							pending.leafRoute.Bucket, stripe.Len(), renderErr,
 						)
+					} else if !primarySlotGeometryMaintained(visible.root) &&
+						stripe.Len() >= storeio.CommonPrimaryLeafWideSlots {
+						// Overlay inserts on an unindexed >=256-row leaf carry
+						// overlay-local 8-bit slots that are independent of
+						// base posting slots. Clear slots before re-encoding so
+						// a folded <=256-row unindexed leaf uses canonical rank
+						// slots without duplicate-slot collisions.
+						for row := range records {
+							records[row].Slot = 0
+						}
 					}
 				}
 				if renderErr == nil {

@@ -46,7 +46,7 @@ func TestReplicatedBatchCeilingFitsConditionalJournal(t *testing.T) {
 	}
 	if got := canonicalReplicatedShardStoreSidecars(); got != (ReplicatedShardStoreSidecarProfile{
 		UserRecoveryJournalBytes: 16794624,
-		TransactionMarkerBytes:   1048576,
+		TransactionMarkerBytes:   262144,
 	}) {
 		t.Fatalf("canonical base sidecars = %+v", got)
 	}
@@ -55,9 +55,9 @@ func TestReplicatedBatchCeilingFitsConditionalJournal(t *testing.T) {
 		t.Fatal("current marker grammar rejected two participants")
 	}
 	if markerPadded > int(ReplicatedTransactionMarkerBytes) ||
-		int(ReplicatedTransactionMarkerBytes)/markerPadded != 2048 {
+		int(ReplicatedTransactionMarkerBytes)/markerPadded != 512 {
 		t.Fatalf(
-			"two-participant decision = %d padded bytes, marker profile = %d; want 2048-decision window",
+			"two-participant decision = %d padded bytes, marker profile = %d; want 512-decision window",
 			markerPadded, ReplicatedTransactionMarkerBytes,
 		)
 	}
@@ -68,7 +68,7 @@ func TestReplicatedBatchCeilingFitsConditionalJournal(t *testing.T) {
 		systemLimits.MaxBatchBytes+storeio.RecoveryConditionalHeaderSize,
 	)
 	if systemRequired > int(ReplicatedSystemRecoveryJournalBytes) ||
-		ReplicatedSystemRecoveryJournalBytes != 16<<20 {
+		ReplicatedSystemRecoveryJournalBytes != 2<<20 {
 		t.Fatalf(
 			"system conditional record = %d, system profile = %d",
 			systemRequired, ReplicatedSystemRecoveryJournalBytes,
@@ -168,7 +168,7 @@ func TestReplicatedSidecarProfilesStrictCurrentGrammar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantBase = `{"user_recovery_journal_bytes":16794624,"transaction_marker_bytes":1048576}`
+	const wantBase = `{"user_recovery_journal_bytes":16794624,"transaction_marker_bytes":262144}`
 	if string(baseRaw) != wantBase {
 		t.Fatalf("base sidecar JSON = %s, want %s", baseRaw, wantBase)
 	}
@@ -177,11 +177,11 @@ func TestReplicatedSidecarProfilesStrictCurrentGrammar(t *testing.T) {
 		t.Fatalf("base sidecar round trip = %+v, %v", baseRoundTrip, err)
 	}
 	baseCases := map[string]string{
-		"missing_user":   `{"transaction_marker_bytes":1048576}`,
+		"missing_user":   `{"transaction_marker_bytes":262144}`,
 		"missing_marker": `{"user_recovery_journal_bytes":16794624}`,
-		"unknown":        `{"unknown":1,"user_recovery_journal_bytes":16794624,"transaction_marker_bytes":1048576}`,
-		"duplicate":      `{"user_recovery_journal_bytes":16794624,"user_recovery_journal_bytes":16794624,"transaction_marker_bytes":1048576}`,
-		"wrong_user":     `{"user_recovery_journal_bytes":16794112,"transaction_marker_bytes":1048576}`,
+		"unknown":        `{"unknown":1,"user_recovery_journal_bytes":16794624,"transaction_marker_bytes":262144}`,
+		"duplicate":      `{"user_recovery_journal_bytes":16794624,"user_recovery_journal_bytes":16794624,"transaction_marker_bytes":262144}`,
+		"wrong_user":     `{"user_recovery_journal_bytes":16794112,"transaction_marker_bytes":262144}`,
 		"wrong_marker":   `{"user_recovery_journal_bytes":16794624,"transaction_marker_bytes":512}`,
 		"null":           `null`,
 		"non_object":     `[]`,
@@ -202,7 +202,7 @@ func TestReplicatedSidecarProfilesStrictCurrentGrammar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantApply = `{"system_recovery_journal_bytes":16777216}`
+	const wantApply = `{"system_recovery_journal_bytes":2097152}`
 	if string(applyRaw) != wantApply {
 		t.Fatalf("apply sidecar JSON = %s, want %s", applyRaw, wantApply)
 	}
@@ -212,8 +212,8 @@ func TestReplicatedSidecarProfilesStrictCurrentGrammar(t *testing.T) {
 	}
 	applyCases := map[string]string{
 		"missing":    `{}`,
-		"unknown":    `{"unknown":1,"system_recovery_journal_bytes":16777216}`,
-		"duplicate":  `{"system_recovery_journal_bytes":16777216,"system_recovery_journal_bytes":16777216}`,
+		"unknown":    `{"unknown":1,"system_recovery_journal_bytes":2097152}`,
+		"duplicate":  `{"system_recovery_journal_bytes":2097152,"system_recovery_journal_bytes":2097152}`,
 		"wrong":      `{"system_recovery_journal_bytes":197120}`,
 		"null":       `null`,
 		"non_object": `[]`,
@@ -1293,7 +1293,7 @@ func TestReplicatedShardStoreStrictIdentityDecode(t *testing.T) {
 		t.Fatalf("direct canonical image = %s, %v; want %s", direct, err, raw)
 	}
 	if digest := fmt.Sprintf("%x", sha256.Sum256(direct)); digest !=
-		"ca0a84d864e17c24c172dbd9eb3dee21e5d3bf5b0d4faa518a1709a5217fc6a5" {
+		"78a73e7f2df88c05742ca2795afe7658ea331483fae6cf9f3a4062392c76d216" {
 		t.Fatalf("singleton identity golden digest = %s", digest)
 	}
 	ownedInput := bytes.Clone(direct)
@@ -1354,7 +1354,7 @@ func TestReplicatedShardStoreStrictIdentityDecode(t *testing.T) {
 		"limits_unknown":   []byte(strings.Replace(string(raw), `"user_limits":{`, `"user_limits":{"unknown":1,`, 1)),
 		"sidecars_unknown": []byte(strings.Replace(string(raw), `"sidecars":{`, `"sidecars":{"unknown":1,`, 1)),
 		"sidecars_missing_member": []byte(strings.Replace(
-			string(raw), `"transaction_marker_bytes":1048576`, `"unused":1048576`, 1,
+			string(raw), `"transaction_marker_bytes":262144`, `"unused":262144`, 1,
 		)),
 		"sidecars_wrong_user_journal": []byte(strings.Replace(
 			string(raw), `"user_recovery_journal_bytes":16794624`,

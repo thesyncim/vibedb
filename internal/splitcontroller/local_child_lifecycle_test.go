@@ -92,3 +92,57 @@ func TestLocalChildLifecycleRequiresExactPlanTargetAndAbsoluteWAL(t *testing.T) 
 		t.Fatalf("wrong target activation = %v", err)
 	}
 }
+
+func testLocalChildLifecycleReplayWithCertificate(
+	t *testing.T,
+	plan *Plan,
+	certificate rangesplit.CutoverCertificate,
+) {
+	t.Helper()
+	target, ok := plan.Target(1)
+	if !ok || len(target.Replicas) == 0 {
+		t.Fatalf("expected target replicas, got ok=%t len=%d", ok, len(target.Replicas))
+	}
+	replica := target.Replicas[len(target.Replicas)-1]
+	replicaCopy := replica
+	replicaCopy.SQL = replica.SQL.Clone()
+	local := cloneChildTarget(target)
+	local.WAL = replica.WAL
+	local.SQL = replica.SQL.Clone()
+	lifecycle := &LocalChildLifecycle{
+		options: LocalChildLifecycleOptions{
+			Child:                 1,
+			Replica:               &replicaCopy,
+			WALIdentity:           replica.WAL,
+			TopologyRecoveryEpoch: target.TopologyRecoveryEpoch,
+			Authority:             target.Authority,
+			SQL:                   replica.SQL.Clone(),
+		},
+		certificateDigest: certificate.Digest(),
+		applyID:           replica.Apply,
+		profile: sqldriver.ReplicatedApplyCapacityProfile{
+			Binding:                replica.SQL.Binding,
+			Initialized:            true,
+			Applied:                certificate.SourceCut().Applied,
+			SessionEpochHighWater:  certificate.SourceCut().Applied,
+			RelationManifestDigest: target.RelationManifestDigest,
+			MaxSessions:            replica.Apply.MaxSessions,
+			RetryWindow:            replica.Apply.RetryWindow,
+		},
+		walBinding: replica.SQL.Binding,
+		adopted:    testRuntimeIdentity(local),
+	}
+	if err := lifecycle.ExecuteActivateChild(plan, certificate); err != nil {
+		t.Fatalf("replayed ExecuteActivateChild after adoption = %v", err)
+	}
+	if err := lifecycle.ExecuteCreateChildWAL(plan, certificate); err != nil {
+		t.Fatalf("replayed ExecuteCreateChildWAL after adoption = %v", err)
+	}
+	lifecycle.certificateDigest[0] ^= 0xff
+	if err := lifecycle.ExecuteActivateChild(plan, certificate); !errors.Is(err, ErrTopologyConflict) {
+		t.Fatalf("mismatched digest ExecuteActivateChild = %v, want ErrTopologyConflict", err)
+	}
+	if err := lifecycle.ExecuteCreateChildWAL(plan, certificate); !errors.Is(err, ErrTopologyConflict) {
+		t.Fatalf("mismatched digest ExecuteCreateChildWAL = %v, want ErrTopologyConflict", err)
+	}
+}

@@ -120,8 +120,8 @@ func TestDefaultNodeGeometryIsUsableAndSpaceBounded(t *testing.T) {
 		options.MaxGroups != DefaultNodeMaxGroups {
 		t.Fatalf("default node geometry=%+v", options)
 	}
-	if options.SegmentBytes*3 != 96<<20 {
-		t.Fatalf("active plus two reserves=%d, want %d", options.SegmentBytes*3, 96<<20)
+	if options.SegmentBytes*3 != 3*DefaultNodeSegmentBytes {
+		t.Fatalf("active plus two reserves=%d, want %d", options.SegmentBytes*3, 3*DefaultNodeSegmentBytes)
 	}
 	dir := filepath.Join(t.TempDir(), "node")
 	store, err := CreateNodeStore(dir, testNodeIdentity(), testKey(), []NodeBootstrap{{Descriptor: testGroupDescriptor(10), Snapshot: nodeSnapshot(10, 1, 1)}}, NodeStoreOptions{})

@@ -819,6 +819,10 @@ func (c *Collection) stagePrimaryBatchUnifiedOverlayLocked(
 						lease.Release()
 						return stagedPrimaryBatch{}, false, nil
 					}
+				} else if stripe.Len() == storeio.CommonPrimaryLeafWideSlots &&
+					overlay.pendingInsertSlotOccupied(leaf.resident.Bucket, stableSlot) {
+					lease.Release()
+					return stagedPrimaryBatch{}, false, nil
 				}
 			default:
 				lease.Release()

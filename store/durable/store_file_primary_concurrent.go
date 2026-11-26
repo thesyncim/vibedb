@@ -796,6 +796,12 @@ func (c *Collection) tryConcurrentPrimaryPut(
 		stableSlot = overlaySlot
 	case primaryUnifiedOverlayMissing:
 		if baseFound {
+			if !largeUnindexed &&
+				leaf.Len() == storeio.CommonPrimaryLeafWideSlots &&
+				c.primaryUnifiedOverlay.pendingInsertSlotOccupied(route.Bucket, baseSlot) {
+				leafLease.Release()
+				return false, false, errConcurrentPrimaryPressure
+			}
 			if _, overflow := leaf.OverflowRef(baseRank); overflow {
 				leafLease.Release()
 				return false, false, nil
@@ -1070,6 +1076,12 @@ func (c *Collection) tryConcurrentPrimaryDelete(
 		if !baseFound {
 			leafLease.Release()
 			return true, false, nil
+		}
+		if !largeUnindexed &&
+			leaf.Len() == storeio.CommonPrimaryLeafWideSlots &&
+			c.primaryUnifiedOverlay.pendingInsertSlotOccupied(route.Bucket, baseSlot) {
+			leafLease.Release()
+			return false, false, errConcurrentPrimaryPressure
 		}
 		if _, overflow := leaf.OverflowRef(baseRank); overflow {
 			leafLease.Release()

@@ -30,7 +30,7 @@ const (
 	nodeCheckpointDir   = "checkpoints"
 	nodeMetaHeaderBytes = 48
 
-	DefaultNodeSegmentBytes       = 32 << 20
+	DefaultNodeSegmentBytes       = 24 << 20
 	DefaultNodeMaxWaveBytes       = 20 << 20
 	DefaultNodeMaxSegmentEvents   = 32 << 10
 	DefaultNodeRecentWaves        = 4 << 10

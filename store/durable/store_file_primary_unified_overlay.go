@@ -507,6 +507,13 @@ func (o *primaryUnifiedOverlay) pendingInsertSlots(
 	return occupied
 }
 
+func (o *primaryUnifiedOverlay) pendingInsertSlotOccupied(
+	bucket storeio.BucketID, slot uint8,
+) bool {
+	occupied := o.pendingInsertSlots(bucket)
+	return occupied[slot>>6]&(uint64(1)<<uint(slot&63)) != 0
+}
+
 // chooseLargeUnindexedSlot assigns a collision-free overlay-local identity.
 // Large unindexed compact stripes have no persisted uint8 posting geometry;
 // the slot exists only so the bounded overlay can coalesce repeated keys.
@@ -2081,6 +2088,11 @@ func (c *Collection) tryPrimaryUnifiedOverlayPut(
 		stableSlot = overlaySlot
 	case primaryUnifiedOverlayMissing:
 		if baseFound {
+			if !largeUnindexed &&
+				stripe.Len() == storeio.CommonPrimaryLeafWideSlots &&
+				overlay.pendingInsertSlotOccupied(route.Bucket, baseSlot) {
+				return false, false, true, nil
+			}
 			if _, overflow := stripe.OverflowRef(baseRank); overflow {
 				return false, false, false, nil
 			}
@@ -2274,6 +2286,11 @@ func (c *Collection) tryPrimaryUnifiedOverlayDelete(
 	case primaryUnifiedOverlayMissing:
 		if !baseFound {
 			return true, false, false, nil
+		}
+		if !largeUnindexed &&
+			stripe.Len() == storeio.CommonPrimaryLeafWideSlots &&
+			overlay.pendingInsertSlotOccupied(route.Bucket, baseSlot) {
+			return false, false, true, nil
 		}
 		if _, overflow := stripe.OverflowRef(baseRank); overflow {
 			return false, false, false, nil

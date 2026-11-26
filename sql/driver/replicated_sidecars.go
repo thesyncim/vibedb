@@ -16,17 +16,14 @@ const (
 	// request-ledger system journal ceiling.
 	ReplicatedUserRecoveryJournalBytes = (uint64(16) << 20) + 34*storeio.RecoveryJournalMinSectorSize
 	// ReplicatedTransactionMarkerBytes is the exact fixed decision-log window.
-	// Replicated SQL has exactly the user and system targets; one MiB holds
-	// 2,048 current two-target decisions so recycle is pressure handling,
+	// Replicated SQL has exactly the user and system targets; 256 KiB holds
+	// 512 current two-target decisions so recycle is pressure handling,
 	// not a per-apply steady-state fence.
-	ReplicatedTransactionMarkerBytes uint64 = 1 << 20
+	ReplicatedTransactionMarkerBytes uint64 = 256 << 10
 	// ReplicatedSystemRecoveryJournalBytes is the exact sealed decision suffix
-	// retained by the hidden state collection. A one-record geometry turns
-	// journal recycling into steady-state checkpoint work even for tiny direct
-	// writes. One ordinary 16 MiB segment holds many small group commits while
-	// still covering the maximum legal hidden-state batch; the independently
-	// bounded checkpoint cadence remains the durability/retention fence.
-	ReplicatedSystemRecoveryJournalBytes uint64 = 16 << 20
+	// retained by the hidden state collection. A 2 MiB segment holds hundreds
+	// of group commits while still covering the maximum legal hidden-state batch.
+	ReplicatedSystemRecoveryJournalBytes uint64 = 2 << 20
 )
 
 // ReplicatedShardStoreSidecarProfile freezes the exact sealed sidecars owned
