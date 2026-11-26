@@ -112,12 +112,12 @@ func (c *Collection) derivePrimaryLiveFromRouter(
 	if router == nil {
 		return nil, storeio.ErrPrimaryExactIndexCorrupt
 	}
+	routeCount := router.Len()
 	live := make(
-		map[uint32]*[storeio.TermPostingTileChunks]uint64, router.Len()*4,
+		map[uint32]*[storeio.TermPostingTileChunks]uint64, routeCount*4,
 	)
-	bounds := c.primaryLeafBounds(state)
-	var scratch []byte
-	for rank := 0; rank < router.Len(); rank++ {
+	liveSlab := make([][storeio.TermPostingTileChunks]uint64, 0, routeCount*4)
+	for rank := 0; rank < routeCount; rank++ {
 		route, ok := router.RouteAtRank(rank)
 		if !ok {
 			return nil, storeio.ErrPrimaryExactIndexCorrupt
@@ -126,22 +126,40 @@ func (c *Collection) derivePrimaryLiveFromRouter(
 		if err != nil {
 			return nil, err
 		}
-		scratch, err = storeio.VisitPrimaryLeafPostingRows(
-			lease.Page(), state.root.StoreID, route.Bucket, bounds, scratch,
-			func(slot uint8, _, _ []byte, _ bool) error {
-				tileID := uint32(route.Bucket)<<2 | uint32(slot>>6)
-				mask := live[tileID]
-				if mask == nil {
-					mask = new([storeio.TermPostingTileChunks]uint64)
-					live[tileID] = mask
-				}
-				mask[0] |= uint64(1) << uint(slot&63)
-				return nil
-			},
+		page := lease.Page()
+		if storeio.PrimaryLeafClass(page) != storeio.CommonPrimaryLeafCompact {
+			lease.Release()
+			return nil, storeio.ErrPrimaryExactIndexCorrupt
+		}
+		stripe, admitted := storeio.AdmittedCompactPrimaryStripe(
+			page, state.root.StoreID, route.Bucket,
 		)
+		if !admitted || stripe.Len() > storeio.CommonPrimaryLeafWideSlots {
+			lease.Release()
+			return nil, storeio.ErrPrimaryExactIndexCorrupt
+		}
+		var bucketLive [4]uint64
+		for row := 0; row < stripe.Len(); row++ {
+			slot, slotOK := stripe.PostingSlot(row)
+			if !slotOK {
+				lease.Release()
+				return nil, storeio.ErrPrimaryExactIndexCorrupt
+			}
+			bucketLive[slot>>6] |= uint64(1) << uint(slot&63)
+		}
 		lease.Release()
-		if err != nil {
-			return nil, err
+		for quadrant, bits := range bucketLive {
+			if bits == 0 {
+				continue
+			}
+			tileID := uint32(route.Bucket)<<2 | uint32(quadrant)
+			mask := live[tileID]
+			if mask == nil {
+				liveSlab = append(liveSlab, [storeio.TermPostingTileChunks]uint64{})
+				mask = &liveSlab[len(liveSlab)-1]
+				live[tileID] = mask
+			}
+			mask[0] |= bits
 		}
 	}
 	return live, nil
@@ -1317,10 +1335,53 @@ func primaryExactIndexPageBound(
 	var components [store.MaxIndexColumns]storeio.IndexTermComponent
 	var canonical [storeio.IndexTermMaxKeyBytes]byte
 	total := 1 + 4 // the root page plus arithmetic headroom
+	var (
+		keyArena   []byte
+		termKeys   []string
+		pairs      []uint64
+		order      []uint32
+		termStarts []int
+		termEnds   []int
+	)
+	termIndex := make(map[string]uint32)
+	bucketRows := make(map[uint32]int)
 	for _, exact := range indexes {
-		tiles := make(map[string]map[uint32]bool)
-		bucketRows := make(map[string]int)
+		clear(termIndex)
+		keyArena = keyArena[:0]
+		termKeys = termKeys[:0]
+		pairs = pairs[:0]
+		intern := func(key []byte) uint32 {
+			if id, exists := termIndex[byteview.String(key)]; exists {
+				return id
+			}
+			id := uint32(len(termKeys))
+			start := len(keyArena)
+			keyArena = append(keyArena, key...)
+			stored := byteview.String(keyArena[start:len(keyArena):len(keyArena)])
+			termIndex[stored] = id
+			termKeys = append(termKeys, stored)
+			return id
+		}
 		for _, span := range spans {
+			if span.Ordinal {
+				for row := span.First; row < span.Last; row++ {
+					key, present, termErr := appendPrimaryExactDocumentTerm(
+						canonical[:0], components[:], exact,
+						byteview.Bytes(records[row].Value),
+					)
+					if termErr != nil {
+						return 0, termErr
+					}
+					if !present {
+						continue
+					}
+					termID := intern(key)
+					tileID := uint32(span.Bucket)<<2 |
+						uint32(row-span.First)>>6
+					pairs = append(pairs, uint64(termID)<<32|uint64(tileID))
+				}
+				continue
+			}
 			clear(bucketRows)
 			for row := span.First; row < span.Last; row++ {
 				key, present, termErr := appendPrimaryExactDocumentTerm(
@@ -1333,60 +1394,75 @@ func primaryExactIndexPageBound(
 				if !present {
 					continue
 				}
-				if span.Ordinal {
-					tileID := uint32(span.Bucket)<<2 |
-						uint32(row-span.First)>>6
-					set := tiles[string(key)]
-					if set == nil {
-						set = make(map[uint32]bool, 4)
-						tiles[string(key)] = set
-					}
-					set[tileID] = true
-					continue
-				}
-				bucketRows[string(key)]++
+				bucketRows[intern(key)]++
 			}
-			for term, rows := range bucketRows {
-				set := tiles[term]
-				if set == nil {
-					set = make(map[uint32]bool, 4)
-					tiles[term] = set
-				}
+			for termID, rows := range bucketRows {
 				for q := uint32(0); q < uint32(min(rows, 4)); q++ {
-					set[uint32(span.Bucket)<<2|q] = true
+					tileID := uint32(span.Bucket)<<2 | q
+					pairs = append(pairs, uint64(termID)<<32|uint64(tileID))
 				}
 			}
 		}
-		if len(tiles) == 0 {
+		if len(termKeys) == 0 {
 			continue
 		}
-		keys := make([]string, 0, len(tiles))
-		for key := range tiles {
-			keys = append(keys, key)
+		slices.Sort(pairs)
+		// Deduplicate (termID, tileID) pairs in place.
+		uniquePairs := pairs[:0]
+		for i, pair := range pairs {
+			if i == 0 || pair != pairs[i-1] {
+				uniquePairs = append(uniquePairs, pair)
+			}
 		}
-		slices.Sort(keys)
-		terms := make([]storeio.IndexTermLeafTerm, len(keys))
-		postingArena := make(
-			[]storeio.IndexTermLeafPosting, 0, len(records)*4,
-		)
+		pairs = uniquePairs
+
+		if cap(termStarts) < len(termKeys) {
+			termStarts = make([]int, len(termKeys))
+			termEnds = make([]int, len(termKeys))
+		} else {
+			termStarts = termStarts[:len(termKeys)]
+			termEnds = termEnds[:len(termKeys)]
+		}
+		for i := 0; i < len(pairs); {
+			termID := uint32(pairs[i] >> 32)
+			start := i
+			for i < len(pairs) && uint32(pairs[i]>>32) == termID {
+				i++
+			}
+			termStarts[termID] = start
+			termEnds[termID] = i
+		}
+
+		order = order[:0]
+		for id := range termKeys {
+			order = append(order, uint32(id))
+		}
+		slices.SortFunc(order, func(a, b uint32) int {
+			if termKeys[a] < termKeys[b] {
+				return -1
+			}
+			if termKeys[a] > termKeys[b] {
+				return 1
+			}
+			return 0
+		})
+		terms := make([]storeio.IndexTermLeafTerm, len(order))
+		postingArena := make([]storeio.IndexTermLeafPosting, 0, len(pairs))
 		var live [storeio.TermPostingTileChunks]uint64
 		live[0] = 1
-		for at, key := range keys {
-			record, ok := storeio.OpenIndexTermKeyRecord(storeID, []byte(key))
+		for at, termID := range order {
+			record, ok := storeio.OpenIndexTermKeyRecord(
+				storeID, byteview.Bytes(termKeys[termID]),
+			)
 			if !ok {
 				return 0, fmt.Errorf(
 					"%w: canonical exact term", storeio.ErrInvalidWrite,
 				)
 			}
-			sorted := make([]uint32, 0, len(tiles[key]))
-			for tileID := range tiles[key] {
-				sorted = append(sorted, tileID)
-			}
-			slices.Sort(sorted)
 			start := len(postingArena)
-			for _, tileID := range sorted {
+			for _, pair := range pairs[termStarts[termID]:termEnds[termID]] {
 				postingArena = append(postingArena, storeio.IndexTermLeafPosting{
-					Posting:    storeio.TermPosting{TileID: tileID, Rows: 1},
+					Posting:    storeio.TermPosting{TileID: uint32(pair), Rows: 1},
 					Live:       &live,
 					Chunk0Bits: 1, Chunk0Only: true,
 				})
