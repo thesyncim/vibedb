@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/pgwire"
@@ -83,6 +84,8 @@ type postgresReadCache struct {
 	text              string
 	parameterTypes    []driver.ParamType
 	compiled          *query.Statement
+	explain           bool
+	analyze           bool
 	resultParamTypes  []driver.ParamType
 	catalogGeneration uint64
 	execution         preparedQueryExecution
@@ -190,6 +193,8 @@ func (s *postgresSession) takeCachedRead(
 	}
 	statement := &postgresStatement{
 		session: s, compiled: cache.compiled,
+		explain:             cache.explain,
+		analyze:             cache.analyze,
 		paramTypes:          cache.resultParamTypes,
 		cacheParameterTypes: cache.parameterTypes,
 		catalogGeneration:   cache.catalogGeneration,
@@ -212,6 +217,8 @@ func (s *postgresSession) retainRead(statement *postgresStatement) bool {
 		text:              statement.compiled.SQL(),
 		parameterTypes:    statement.cacheParameterTypes,
 		compiled:          statement.compiled,
+		explain:           statement.explain,
+		analyze:           statement.analyze,
 		resultParamTypes:  statement.paramTypes,
 		catalogGeneration: statement.catalogGeneration,
 		execution:         statement.execution,
@@ -333,6 +340,8 @@ func (s *postgresSession) prepare(
 	}
 	statement := &postgresStatement{
 		session: s, compiled: compiled, local: local,
+		explain:           parsed.Explain,
+		analyze:           parsed.Analyze,
 		paramTypes:        postgresSelectParameterTypes(compiled),
 		catalogGeneration: catalogGeneration,
 		execution:         execution,
@@ -433,6 +442,8 @@ type postgresStatement struct {
 	session  *postgresSession
 	compiled *query.Statement
 	local    bool
+	explain  bool
+	analyze  bool
 	// paramTypes is absent on the ordinary schemaless path. Distributed
 	// execution forwards a present vector so the shard's independent prepare
 	// observes the same analyzed input domains as this gateway prepare.
@@ -483,8 +494,20 @@ func (p *postgresStatement) ReusableForParse() bool {
 	snapshot := p.session.backend.Executor.catalog.Current()
 	return snapshot != nil && snapshot.Generation() == p.catalogGeneration
 }
-func (p *postgresStatement) Columns() []string { return p.compiled.Columns() }
+func (p *postgresStatement) Columns() []string {
+	if p.explain {
+		return []string{"QUERY PLAN"}
+	}
+	return p.compiled.Columns()
+}
 func (p *postgresStatement) AppendSchema(dst []query.OutputColumn) []query.OutputColumn {
+	if p.explain {
+		return append(dst, query.OutputColumn{
+			Header:         "QUERY PLAN",
+			Type:           query.TypeString,
+			Representation: query.OutputSQLText,
+		})
+	}
 	return p.compiled.AppendSchema(dst)
 }
 func (p *postgresStatement) Close() error {
@@ -521,11 +544,37 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 		return err
 	}
 	if p.local {
+		if p.explain && !p.analyze {
+			plan, err := p.compiled.ExplainBoundWith(args, query.ExplainOptions{})
+			if err != nil {
+				return err
+			}
+			return rows.SetMaterialized(query.NewTextCursor("QUERY PLAN", plan), nil)
+		}
+		started := time.Now()
 		exec := &query.Exec{Options: query.ExecOptions{Cancel: s.flag, ResultRows: s.rows, ResultBytes: s.bytes, IntermediateBytes: s.intermediate}}
 		cursor, err := p.compiled.RunInto(exec, query.Source{}, args)
 		if err != nil {
 			exec.Release()
 			return err
+		}
+		if p.explain && p.analyze {
+			returned := 0
+			for cursor.Next() {
+				returned++
+			}
+			stats := exec.Stats
+			exec.Release()
+			plan, err := p.compiled.ExplainAnalyze(query.ExplainOptions{}, query.ExplainAnalysis{
+				ElapsedNanoseconds: time.Since(started).Nanoseconds(),
+				Rows:               returned,
+				ActualAccessPath:   "local-scalar",
+				Stats:              stats,
+			})
+			if err != nil {
+				return err
+			}
+			return rows.SetMaterialized(query.NewTextCursor("QUERY PLAN", plan), nil)
 		}
 		if err := rows.SetMaterialized(cursor, func() error { exec.Release(); return nil }); err != nil {
 			exec.Release()
