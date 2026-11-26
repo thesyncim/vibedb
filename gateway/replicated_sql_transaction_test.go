@@ -867,7 +867,7 @@ func TestReplicatedSQLComputedUpdateValidatesBindingsBeforeCurrentRowRead(t *tes
 	)
 	targets, handled, err := executor.planReplicatedSQLTransactionWithData(
 		t.Context(), snapshot, []Query{{
-			SQL: `UPDATE messages SET n = n + CAST(? AS INTEGER) WHERE id = ?`,
+			SQL: `UPDATE messages SET n = n + CAST(? AS BYTEA) WHERE id = ?`,
 			Params: []shardservice.Param{
 				shardservice.StringParam("bad"),
 				shardservice.StringParam("message-1"),

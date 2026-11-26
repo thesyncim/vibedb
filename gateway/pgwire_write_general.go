@@ -2,12 +2,12 @@ package gateway
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
+	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -69,7 +69,7 @@ func (p *postgresWriteStatement) execInsertSelect(
 				if ci > 0 {
 					docBuf = append(docBuf, ',')
 				}
-				keyBytes, err := json.Marshal(colName)
+				keyBytes, err := vibejson.Marshal(&colName)
 				if err != nil {
 					return nil, err
 				}
@@ -245,34 +245,25 @@ func extractPrimaryKeyParam(doc []byte, pointer string) (shardservice.Param, err
 	if !strings.HasPrefix(pointer, "/") || len(pointer) <= 1 {
 		return shardservice.Param{}, ErrMalformedRequest
 	}
-	dec := json.NewDecoder(strings.NewReader(string(doc)))
-	dec.UseNumber()
-	var current any
-	if err := dec.Decode(&current); err != nil {
+	raw, ok, err := vibejson.GetRaw(doc, pointer)
+	if err != nil {
 		return shardservice.Param{}, err
 	}
-	for _, seg := range strings.Split(pointer[1:], "/") {
-		seg = strings.ReplaceAll(strings.ReplaceAll(seg, "~1", "/"), "~0", "~")
-		obj, ok := current.(map[string]any)
-		if !ok {
-			return shardservice.Param{}, ErrMalformedRequest
-		}
-		next, exists := obj[seg]
-		if !exists {
-			return shardservice.Param{}, ErrMalformedRequest
-		}
-		current = next
-	}
-	switch v := current.(type) {
-	case string:
-		return shardservice.StringParam(v), nil
-	case bool:
-		return shardservice.BoolParam(v), nil
-	case json.Number:
-		return shardservice.NumberParam(v.String()), nil
-	default:
+	if !ok {
 		return shardservice.Param{}, ErrMalformedRequest
 	}
+	if text, isText, err := raw.Text(); err != nil {
+		return shardservice.Param{}, err
+	} else if isText {
+		return shardservice.StringParam(text), nil
+	}
+	if b, isBool := raw.Bool(); isBool {
+		return shardservice.BoolParam(b), nil
+	}
+	if num, isNum := raw.NumberText(); isNum {
+		return shardservice.NumberParam(num), nil
+	}
+	return shardservice.Param{}, ErrMalformedRequest
 }
 
 func buildSelectFromDelete(text, table string) string {

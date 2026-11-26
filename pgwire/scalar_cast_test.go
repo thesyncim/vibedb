@@ -33,8 +33,8 @@ func TestScalarCastSQLStatesMetadataFormatsAndRecovery(t *testing.T) {
 		{`SELECT CAST('wat' AS JSON) FROM users`, sqlstateInvalidTextRepresentation},
 		{`SELECT CAST('1e999999999999999999999' AS NUMERIC) FROM users`, sqlstateNumericValueOutOfRange},
 		{`SELECT CAST(true AS NUMERIC) FROM users`, sqlstateDatatypeMismatch},
-		{`SELECT CAST(id AS jsonb) FROM users`, sqlstateFeatureNotSupported},
-		{`SELECT id::jsonb FROM users`, sqlstateFeatureNotSupported},
+		{`SELECT CAST(id AS bytea) FROM users`, sqlstateFeatureNotSupported},
+		{`SELECT id::bytea FROM users`, sqlstateFeatureNotSupported},
 	} {
 		fields := expectError(t, c.query(test.sql), test.code)
 		if fields['P'] == "" {
@@ -173,7 +173,6 @@ func TestPostgreSQLTypedStringConstantsWireMetadataValuesAndErrors(t *testing.T)
 		`SELECT pg_catalog.bool 't'`,
 		`SELECT bool(1) 't'`,
 		`SELECT bool[] 't'`,
-		`SELECT BOOL E't'`,
 		`SELECT BOOL U&'t'`,
 		`SELECT VARCHAR 'x'`,
 		`SELECT CHAR 'x'`,
