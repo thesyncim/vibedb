@@ -243,12 +243,19 @@ func (s *Statement) prepareWindow(
 			if err != nil {
 				return err
 			}
-			stage.plan.functions[j] = windowFunctionSpec{
-				kind: kind, column: w.inputOrdinal(expr.Argument),
+			spec := windowFunctionSpec{
+				kind:     kind,
+				column:   w.inputOrdinal(expr.Argument),
+				fromLast: expr.FromLast,
+				distinct: expr.Distinct,
+			}
+			if expr.IgnoreNulls {
+				spec.nullTreatment = windowIgnoreNulls
 			}
 			if expr.Argument == nil {
-				stage.plan.functions[j].column = -1
+				spec.column = -1
 			}
+			stage.plan.functions[j] = spec
 			stage.requiresNumericRange = stage.requiresNumericRange ||
 				sqlWindowFunctionUsesFrame(expr.Kind) &&
 					expr.Spec.Frame.Explicit &&

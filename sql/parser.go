@@ -1070,7 +1070,7 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 		default:
 			switch agg, head, state := p.tryAggregate(); state {
 			case aggCall:
-				path, err := p.parseAggregateArgs(agg)
+				path, distinctPos, err := p.parseAggregateArgsAllowDistinct(agg)
 				if err != nil {
 					return col, err
 				}
@@ -1079,8 +1079,12 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 					if err != nil {
 						return col, err
 					}
+					window.Distinct = distinctPos >= 0
 					col.Window = window
 				} else {
+					if distinctPos >= 0 {
+						return col, p.errfAt(distinctPos, "%s(DISTINCT ...) is not supported: the engine's reductions have no distinct variant", agg)
+					}
 					col.Agg, col.Path = agg, path
 				}
 			case aggHeadOnly:
@@ -1276,28 +1280,44 @@ func (p *Parser) parseSelectPath() (*PathExpr, error) {
 // parseAggregateArgs parses an aggregate's argument list. The current token is
 // '('.
 func (p *Parser) parseAggregateArgs(agg AggKind) (*PathExpr, error) {
-	p.advance() // '('
-	if p.atKeyword(kwDistinct) {
-		return nil, p.errfHere("%s(DISTINCT ...) is not supported: the engine's reductions have no distinct variant", agg)
-	}
-	if agg == AggCount && p.tok.kind == tokStar {
-		p.advance()
-		if err := p.expect(tokRParen, "')'"); err != nil {
-			return nil, err
-		}
-		return nil, nil // COUNT(*) reads no path
-	}
-	path, err := p.parsePath(false)
+	path, distinctPos, err := p.parseAggregateArgsAllowDistinct(agg)
 	if err != nil {
 		return nil, err
 	}
-	if p.tok.kind == tokComma {
-		return nil, p.errfHere("%s takes exactly one path", agg)
-	}
-	if err := p.expect(tokRParen, "')'"); err != nil {
-		return nil, err
+	if distinctPos >= 0 {
+		return nil, p.errfAt(distinctPos, "%s(DISTINCT ...) is not supported: the engine's reductions have no distinct variant", agg)
 	}
 	return path, nil
+}
+
+func (p *Parser) parseAggregateArgsAllowDistinct(agg AggKind) (*PathExpr, int, error) {
+	p.advance() // '('
+	distinctPos := -1
+	if p.atKeyword(kwDistinct) {
+		distinctPos = p.tok.pos
+		p.advance()
+	}
+	if agg == AggCount && p.tok.kind == tokStar {
+		if distinctPos >= 0 {
+			return nil, -1, p.errfAt(distinctPos, "COUNT(DISTINCT *) is not valid SQL")
+		}
+		p.advance()
+		if err := p.expect(tokRParen, "')'"); err != nil {
+			return nil, -1, err
+		}
+		return nil, -1, nil // COUNT(*) reads no path
+	}
+	path, err := p.parsePath(false)
+	if err != nil {
+		return nil, -1, err
+	}
+	if p.tok.kind == tokComma {
+		return nil, -1, p.errfHere("%s takes exactly one path", agg)
+	}
+	if err := p.expect(tokRParen, "')'"); err != nil {
+		return nil, -1, err
+	}
+	return path, distinctPos, nil
 }
 
 // parseColumnAlias follows PostgreSQL's target_el grammar: AS accepts any
@@ -1472,6 +1492,35 @@ func (p *Parser) parseWindowOnlyCall(
 	}
 	if err := p.expect(tokRParen, "')'"); err != nil {
 		return nil, err
+	}
+	if kind == WindowNthValue && p.atKeyword(kwFrom) {
+		p.advance()
+		switch {
+		case tokenTextEqual(p.tok, "FIRST"):
+			p.advance()
+		case tokenTextEqual(p.tok, "LAST"):
+			w.FromLast = true
+			p.advance()
+		default:
+			return nil, p.errHere("expected FIRST or LAST after FROM in NTH_VALUE")
+		}
+	}
+	switch kind {
+	case WindowFirstValue, WindowLastValue, WindowNthValue, WindowLag, WindowLead:
+		if tokenTextEqual(p.tok, "IGNORE") {
+			p.advance()
+			if !tokenTextEqual(p.tok, "NULLS") {
+				return nil, p.errHere("expected NULLS after IGNORE")
+			}
+			w.IgnoreNulls = true
+			p.advance()
+		} else if tokenTextEqual(p.tok, "RESPECT") {
+			p.advance()
+			if !tokenTextEqual(p.tok, "NULLS") {
+				return nil, p.errHere("expected NULLS after RESPECT")
+			}
+			p.advance()
+		}
 	}
 	if !p.atKeyword(kwOver) {
 		return nil, p.errfHere("%s is a window function and requires OVER (...)", kind)
