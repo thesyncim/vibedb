@@ -401,6 +401,10 @@ func (a AggKind) String() string {
 type ResultColumn struct {
 	// Agg is the reduction, or AggNone for a projection.
 	Agg AggKind
+	// AggDistinct records COUNT(DISTINCT x), SUM(DISTINCT x), etc.
+	AggDistinct bool
+	// AggFilter records an optional FILTER (WHERE ...) predicate on an aggregate.
+	AggFilter *Expr
 	// Path is the projected or aggregated path. It is nil only for COUNT(*),
 	// which reads no path at all. A Path with no segments is the whole
 	// document — what '*' and 'alias.*' parse to.

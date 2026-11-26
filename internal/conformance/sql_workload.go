@@ -26,8 +26,6 @@ var SQLWorkloadGaps = []SQLWorkloadGap{
 	{"mutation_cte", `WITH removed AS (DELETE FROM compatibility_docs WHERE id = 'a' RETURNING n) SELECT n FROM removed`},
 	{"insert_select_columns", `INSERT INTO compatibility_docs (id, n) SELECT id, n FROM compatibility_changes`},
 	{"distinct_on", `SELECT DISTINCT ON (n) id, n FROM compatibility_docs ORDER BY n, id`},
-	{"count_distinct", `SELECT COUNT(DISTINCT n) FROM compatibility_docs`},
-	{"aggregate_filter", `SELECT COUNT(*) FILTER (WHERE hidden = TRUE) FROM compatibility_docs`},
 	{"time_arithmetic", `SELECT NOW() + INTERVAL '1 second'`},
 	{"computed_group_key", `SELECT COALESCE(n, 0), COUNT(*) FROM compatibility_docs GROUP BY COALESCE(n, 0)`},
 	{"derived_wildcard_scalar_projection", `SELECT d.*, COALESCE(d.n, 0) FROM (SELECT * FROM compatibility_docs) AS d`},

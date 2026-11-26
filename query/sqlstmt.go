@@ -104,6 +104,7 @@ type Statement struct {
 	// correlation is immutable, cold metadata installed only on a LATERAL child.
 	// Live slot values belong to the child Exec.Workspace, never to Statement.
 	correlation *statementCorrelationPlan
+	extAgg      *statementExtAgg
 
 	// c and q are this statement's own compiler and the Query it compiles
 	// into. They are values rather than pointers so a Statement is one
@@ -435,6 +436,9 @@ func prepareTreeInCorrelationContext(
 	mode := unknownOutputPrepareMode{}
 	if len(unknownModes) != 0 {
 		mode = unknownModes[0]
+	}
+	if hasExtendedAggregate(tree) {
+		return prepareExtendedAggregateStatement(src, tree, subqueryLimit, ctes, argBase, correlation, parameterTypes)
 	}
 	deferUnknownScalarOutput := mode.deferScalar
 	preserveDocumentUnknown := mode.preserveDocument
@@ -899,6 +903,28 @@ func (s *Statement) RequiresCatalog() bool {
 // that advertised it would be advertising a column [Cursor.Cell] refuses to
 // return.
 func (s *Statement) AppendSchema(dst []OutputColumn) []OutputColumn {
+	if s.extAgg != nil {
+		for i, sp := range s.extAgg.specs {
+			col := OutputColumn{Header: sp.header, Ordinal: uint32(i), Type: TypeAny}
+			switch sp.agg {
+			case sqlast.AggCount:
+				col.Reduction = ReductionCount
+				col.Type = TypeNumber
+			case sqlast.AggSum:
+				col.Reduction = ReductionSum
+				col.Type = TypeNumber
+			case sqlast.AggAvg:
+				col.Reduction = ReductionAvg
+				col.Type = TypeNumber
+			case sqlast.AggMin:
+				col.Reduction = ReductionMin
+			case sqlast.AggMax:
+				col.Reduction = ReductionMax
+			}
+			dst = append(dst, col)
+		}
+		return dst
+	}
 	if set := s.setSQL(); set != nil {
 		return set.AppendSchema(dst)
 	}
@@ -992,6 +1018,10 @@ func (s *Statement) Release() {
 	if s == nil {
 		return
 	}
+	if s.extAgg != nil && s.extAgg.input != nil {
+		s.extAgg.input.Release()
+		s.extAgg.input = nil
+	}
 	s.c.release()
 	if s.nested != nil {
 		if s.nested.set != nil {
@@ -1047,6 +1077,9 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 	// stats before validating anything that can fail.
 	clearExecBorrowedViews(e)
 	e.Stats = ExecStats{}
+	if s.extAgg != nil {
+		return s.runExtAggInto(e, src, args)
+	}
 	if s.nested == nil {
 		// IntermediateBytes is a statement-wide option even when this statement
 		// has no relation-valued child. Validate it without constructing a frame;

@@ -1077,6 +1077,23 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 				if err != nil {
 					return col, err
 				}
+				var aggFilter *Expr
+				if tokenTextEqual(p.tok, "FILTER") {
+					p.advance() // FILTER
+					if err := p.expect(tokLParen, "'(' after FILTER"); err != nil {
+						return col, err
+					}
+					if err := p.expectKeyword(kwWhere, "WHERE inside FILTER (...)"); err != nil {
+						return col, err
+					}
+					aggFilter, err = p.parseExpr(ctxWhere)
+					if err != nil {
+						return col, err
+					}
+					if err := p.expect(tokRParen, "')' after FILTER (WHERE ...)"); err != nil {
+						return col, err
+					}
+				}
 				if p.atKeyword(kwOver) {
 					window, err := p.parseWindowOver(windowAggregateKind(agg), path, col.Pos)
 					if err != nil {
@@ -1085,10 +1102,9 @@ func (p *Parser) parseResultColumn() (ResultColumn, error) {
 					window.Distinct = distinctPos >= 0
 					col.Window = window
 				} else {
-					if distinctPos >= 0 {
-						return col, p.errfAt(distinctPos, "%s(DISTINCT ...) is not supported: the engine's reductions have no distinct variant", agg)
-					}
 					col.Agg, col.Path = agg, path
+					col.AggDistinct = distinctPos >= 0
+					col.AggFilter = aggFilter
 				}
 			case aggHeadOnly:
 				path, err := p.continuePath(head, true)

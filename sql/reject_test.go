@@ -98,7 +98,6 @@ func TestRejectsConstructsTheEngineCannotExecute(t *testing.T) {
 	runRejections(t, []rejection{
 		{"DISTINCT and ALL", `SELECT DISTINCT ALL a FROM t`, 16, "mutually exclusive"},
 		{"DISTINCT with GROUP BY", `SELECT DISTINCT a FROM t GROUP BY a`, 35, "grouping changes"},
-		{"COUNT DISTINCT", `SELECT COUNT(DISTINCT a) FROM t`, 13, "no distinct variant"},
 		{"regular expressions", `SELECT a FROM t WHERE b ~ 'x'`, 24, "regular-expression"},
 		{"a scalar subquery on the left", `SELECT a FROM t WHERE (SELECT 1 FROM u) = 1`, 23, "cannot stand alone"},
 		{"scalar functions", `SELECT unknown_fn(a) FROM t`, 17, "not a supported function"},
