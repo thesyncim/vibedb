@@ -246,6 +246,8 @@ type InsertStmt struct {
 	// ConflictTarget optionally names the one primary-key column. Execution
 	// validates it against the current table schema before admitting any row.
 	ConflictTarget *PathExpr
+	// ConflictTargets holds all paths in a composite ON CONFLICT (c1, c2, ...) target.
+	ConflictTargets []*PathExpr
 	// OnConflictDoNothing makes an identity collision a skipped row instead of
 	// an error. It is the deliberately narrow, atomic subset of PostgreSQL's
 	// ON CONFLICT grammar supported by the storage adapter. Only primary-key

@@ -53,7 +53,7 @@ var catalogVibeEncoder = func() vibejson.Encoder[catalogFileVibe] {
 
 var (
 	catalogRootFields        = vibejson.MakeFieldSet("version", "tables", "views", "shard_store", "shard_store_fence", "replicated_shard_store", "replicated_apply", "replicated_child_apply")
-	tableMetaFields          = vibejson.MakeFieldSet("primary_key", "schema", "indexes", "storage", "materialized", "sealed_recovery_journal_bytes")
+	tableMetaFields          = vibejson.MakeFieldSet("primary_key", "schema", "indexes", "storage", "materialized", "sealed_recovery_journal_bytes", "primary_keys")
 	viewMetaFields           = vibejson.MakeFieldSet("query", "columns", "outputs", "view_dependencies", "table_dependencies")
 	schemaMetaFields         = vibejson.MakeFieldSet("root", "fields")
 	schemaFieldFields        = vibejson.MakeFieldSet("path", "types", "required")
@@ -352,6 +352,16 @@ func appendCatalogViews(w vibejson.TrustedAppender, values map[string]*viewMeta)
 
 func appendTableMeta(w vibejson.TrustedAppender, m tableMeta) vibejson.TrustedAppender {
 	w = w.RawUnchecked(`{"primary_key":`).String(m.PrimaryKey)
+	if len(m.PrimaryKeys) > 1 {
+		w = w.RawUnchecked(`,"primary_keys":[`)
+		for i, pk := range m.PrimaryKeys {
+			if i != 0 {
+				w = w.RawByteUnchecked(',')
+			}
+			w = w.String(pk)
+		}
+		w = w.RawByteUnchecked(']')
+	}
 	if m.Schema != nil {
 		w = w.RawUnchecked(`,"schema":`)
 		w = appendSchemaMeta(w, *m.Schema)
@@ -645,6 +655,8 @@ func decodeTableMetaVibe(c *vibejson.DecodeCursor, dst *tableMeta) error {
 			err = c.Bool(&decoded.Materialized)
 		case 5:
 			err = c.Uint(&decoded.SealedRecoveryJournalBytes)
+		case 6:
+			err = decodeStringListVibe(c, &decoded.PrimaryKeys, 4, "primary keys")
 		}
 		if err != nil {
 			return err

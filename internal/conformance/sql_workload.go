@@ -11,7 +11,6 @@ type SQLWorkloadGap struct {
 }
 
 var SQLWorkloadGaps = []SQLWorkloadGap{
-	{"composite_primary_key", `CREATE TABLE compatibility_members (app_pk INT, channel_cid TEXT, user_id TEXT, PRIMARY KEY (app_pk, channel_cid, user_id))`},
 	{"mutation_cte", `WITH removed AS (DELETE FROM compatibility_docs WHERE id = 'a' RETURNING n) SELECT n FROM removed`},
 	{"composite_conflict_target", `INSERT INTO compatibility_docs (id, n) VALUES ('a', 0) ON CONFLICT (id, n) DO NOTHING`},
 	{"copy", `COPY compatibility_docs FROM STDIN`},

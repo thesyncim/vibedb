@@ -15,8 +15,8 @@ func (c *conn) validateSurfaceContext(
 ) error {
 	switch statement.Kind {
 	case sqlast.KindCreateTable:
-		if len(statement.CreateTable.PrimaryKey) != 1 {
-			return fmt.Errorf("vibedb: CREATE TABLE requires exactly one PRIMARY KEY JSON path")
+		if len(statement.CreateTable.PrimaryKey) == 0 || len(statement.CreateTable.PrimaryKey) > 4 {
+			return fmt.Errorf("vibedb: CREATE TABLE requires between 1 and 4 PRIMARY KEY JSON paths")
 		}
 		for i := range statement.CreateTable.Columns {
 			if pseudoDocumentPath(statement.CreateTable.Columns[i].Path) {
@@ -142,12 +142,42 @@ func (c *conn) validateSurfaceContext(
 }
 
 func validateInsertConflictTarget(source string, insert *sqlast.InsertStmt, meta *tableMeta) error {
-	if insert.ConflictTarget == nil {
+	if insert.ConflictTarget == nil && len(insert.ConflictTargets) == 0 {
 		return nil
 	}
-	if meta == nil || string(insert.ConflictTarget.AppendPointer(nil)) != meta.PrimaryKey {
-		return sqlast.NewFeatureNotSupportedError(source, insert.ConflictTarget.Pos,
+	if meta == nil {
+		pos := 0
+		if insert.ConflictTarget != nil {
+			pos = insert.ConflictTarget.Pos
+		}
+		return sqlast.NewFeatureNotSupportedError(source, pos,
 			"ON CONFLICT target must match the table's declared primary key; secondary unique-index conflict arbitration is not supported")
+	}
+	targets := insert.ConflictTargets
+	if len(targets) == 0 && insert.ConflictTarget != nil {
+		targets = []*sqlast.PathExpr{insert.ConflictTarget}
+	}
+	pkList := meta.PrimaryKeys
+	if len(pkList) == 0 {
+		pkList = []string{meta.PrimaryKey}
+	}
+	if len(targets) != len(pkList) {
+		return sqlast.NewFeatureNotSupportedError(source, targets[0].Pos,
+			"ON CONFLICT target must match the table's declared primary key; secondary unique-index conflict arbitration is not supported")
+	}
+	for _, tgt := range targets {
+		ptr := string(tgt.AppendPointer(nil))
+		found := false
+		for _, pk := range pkList {
+			if pk == ptr {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return sqlast.NewFeatureNotSupportedError(source, tgt.Pos,
+				"ON CONFLICT target must match the table's declared primary key; secondary unique-index conflict arbitration is not supported")
+		}
 	}
 	return nil
 }

@@ -665,7 +665,7 @@ func (c *conn) prepareContextMode(
 				} else {
 					t = c.db.tables[s.query.Collection()]
 				}
-				if t != nil {
+				if t != nil && len(t.primaries) <= 1 {
 					drivingPredicate := s.query.DrivingPredicate()
 					s.primaryRange = compilePrimaryRangeProgram(
 						drivingPredicate, t.meta.PrimaryKey,

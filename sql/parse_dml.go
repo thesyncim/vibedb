@@ -302,13 +302,20 @@ func (p *Parser) parseInsert() error {
 			if len(path.Segments) != 1 || path.Segments[0].IsIndex {
 				return p.featureNotSupportedHere("ON CONFLICT targets must name one unqualified primary-key column")
 			}
-			if p.tok.kind == tokComma {
-				return p.featureNotSupportedHere("composite ON CONFLICT targets require composite primary-key support")
+			targets := []*PathExpr{path}
+			for p.tok.kind == tokComma {
+				p.advance()
+				nextPath, err := p.parsePath(false)
+				if err != nil {
+					return err
+				}
+				targets = append(targets, nextPath)
 			}
 			if err := p.expect(tokRParen, "')' after ON CONFLICT target"); err != nil {
 				return err
 			}
 			p.ins.ConflictTarget = path
+			p.ins.ConflictTargets = targets
 		}
 		if p.atKeyword(kwOn) {
 			return p.featureNotSupportedHere("ON CONFLICT ON CONSTRAINT is not supported; the document-derived primary key is the only conflict target")

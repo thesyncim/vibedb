@@ -446,23 +446,31 @@ func (d *database) createTableLockedContext(
 		return nil, fmt.Errorf("vibedb: CREATE TABLE %q: %w",
 			definition.Name, err)
 	}
-	if len(definition.PrimaryKey) != 1 {
-		return nil, fmt.Errorf("vibedb: CREATE TABLE requires exactly one PRIMARY KEY JSON path")
+	if len(definition.PrimaryKey) == 0 || len(definition.PrimaryKey) > 4 {
+		return nil, fmt.Errorf("vibedb: CREATE TABLE requires between 1 and 4 PRIMARY KEY JSON paths")
 	}
-	path := statement.Tree().CreateTable.PrimaryKey[0]
-	pointer := string(path.AppendPointer(nil))
+	pkPaths := statement.Tree().CreateTable.PrimaryKey
+	pointers := make([]string, len(pkPaths))
+	primaries := make([]vibejson.CompiledPointer, len(pkPaths))
+	for i, path := range pkPaths {
+		ptr := string(path.AppendPointer(nil))
+		pointers[i] = ptr
+		compiled, cpErr := vibejson.CompilePointer(ptr)
+		if cpErr != nil {
+			return nil, fmt.Errorf("vibedb: compile primary-key path %q: %w", ptr, cpErr)
+		}
+		primaries[i] = compiled
+		if err := validatePrimarySchema(ptr, definition.Schema); err != nil {
+			return nil, fmt.Errorf(
+				"vibedb: CREATE TABLE %q primary key: %w",
+				definition.Name, err,
+			)
+		}
+	}
+	pointer := pointers[0]
+	primary := primaries[0]
 	if err := d.cluster.validatePlacementLocality(definition.Name, pointer); err != nil {
 		return nil, err
-	}
-	primary, err := vibejson.CompilePointer(pointer)
-	if err != nil {
-		return nil, fmt.Errorf("vibedb: compile primary-key path %q: %w", pointer, err)
-	}
-	if err := validatePrimarySchema(pointer, definition.Schema); err != nil {
-		return nil, fmt.Errorf(
-			"vibedb: CREATE TABLE %q primary key: %w",
-			definition.Name, err,
-		)
 	}
 	storage, err := d.newStorageIdentityLocked()
 	if err != nil {
@@ -497,14 +505,21 @@ func (d *database) createTableLockedContext(
 			addUnique(paths)
 		}
 	}
+	var primaryKeysMeta []string
+	var tablePrimaries []vibejson.CompiledPointer
+	if len(pointers) > 1 {
+		primaryKeysMeta = pointers
+		tablePrimaries = primaries
+	}
 	meta := &tableMeta{
-		PrimaryKey: pointer,
-		Schema:     schemaMetaFrom(definition.Schema),
-		Indexes:    uniqueIndexes,
-		Storage:    storage,
+		PrimaryKey:  pointer,
+		PrimaryKeys: primaryKeysMeta,
+		Schema:      schemaMetaFrom(definition.Schema),
+		Indexes:     uniqueIndexes,
+		Storage:     storage,
 	}
 	candidate := &table{
-		meta: meta, schema: definition.Schema, primary: primary,
+		meta: meta, schema: definition.Schema, primary: primary, primaries: tablePrimaries,
 	}
 	if err := durable.ValidateOptions(durableOptions(candidate)); err != nil {
 		return nil, fmt.Errorf(
@@ -1000,6 +1015,9 @@ func (c *conn) insertLocked(
 			statement, tree, &tree.Rows[i], args,
 			t.meta.PrimaryKey, t.primary, limits,
 		)
+		if err == nil && len(t.primaries) > 1 {
+			key, err = tableDocumentKey(t, document, limits.MaxKeyBytes)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1096,10 +1114,7 @@ func (c *conn) insertLocked(
 				); err != nil {
 					return nil, err
 				}
-				finalKey, err := documentKey(
-					finalDocument, t.meta.PrimaryKey, t.primary,
-					limits.MaxKeyBytes,
-				)
+				finalKey, err := tableDocumentKey(t, finalDocument, limits.MaxKeyBytes)
 				if err != nil {
 					return nil, err
 				}
@@ -1288,9 +1303,8 @@ func (c *conn) insertSelectLocked(
 		keyStart := len(c.insertKeyRaw)
 		var key string
 		var keyCharge int64
-		c.insertKeyRaw, key, keyCharge, err = appendDocumentKeyBudgeted(
-			c.insertKeyRaw, document, t.meta.PrimaryKey,
-			t.primary, limits.MaxKeyBytes, &intermediate,
+		c.insertKeyRaw, key, keyCharge, err = appendTableDocumentKeyBudgeted(
+			c.insertKeyRaw, document, t, limits.MaxKeyBytes, &intermediate,
 		)
 		if err != nil {
 			c.pointRaw = conflictScratch
@@ -2163,6 +2177,43 @@ func operandValueWithUTF8(
 	return nil, errors.New("vibedb: flat INSERT values must be JSON scalars or placeholders")
 }
 
+func tableDocumentKey(t *table, document []byte, maxKeyBytes int) (string, error) {
+	if len(t.primaries) <= 1 {
+		return documentKey(document, t.meta.PrimaryKey, t.primary, maxKeyBytes)
+	}
+	var buf []byte
+	for i, cp := range t.primaries {
+		part, err := documentKey(document, t.meta.PrimaryKeys[i], cp, maxKeyBytes)
+		if err != nil {
+			return "", err
+		}
+		if len(buf)+len(part) > maxKeyBytes {
+			return "", durable.ErrKeyTooLarge
+		}
+		buf = append(buf, part...)
+	}
+	return string(buf), nil
+}
+
+func appendTableDocumentKeyBudgeted(
+	dst []byte,
+	document []byte,
+	t *table,
+	maxKeyBytes int,
+	budget *insertSelectIntermediateBudget,
+) ([]byte, string, int64, error) {
+	if len(t.primaries) <= 1 {
+		return appendDocumentKeyBudgeted(dst, document, t.meta.PrimaryKey, t.primary, maxKeyBytes, budget)
+	}
+	key, err := tableDocumentKey(t, document, maxKeyBytes)
+	if err != nil {
+		return dst, "", 0, err
+	}
+	start := len(dst)
+	dst = append(dst, key...)
+	return dst, string(dst[start:]), int64(len(key)), nil
+}
+
 func documentKey(
 	document []byte,
 	pointer string,
@@ -2476,9 +2527,7 @@ func (c *conn) updateLockedReturning(
 	if err != nil {
 		return nil, err
 	}
-	newKey, err := documentKey(
-		document, t.meta.PrimaryKey, t.primary, limits.MaxKeyBytes,
-	)
+	newKey, err := tableDocumentKey(t, document, limits.MaxKeyBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -2894,7 +2943,7 @@ func (c *conn) matchingJoinKeysLocked(
 	var keys []string
 	for cursor.Next() {
 		doc := cursor.Cell(0).Payload()
-		key, err := documentKey(doc, t.meta.PrimaryKey, t.primary, limits.MaxKeyBytes)
+		key, err := tableDocumentKey(t, doc, limits.MaxKeyBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -2927,7 +2976,7 @@ func (c *conn) updateFromJoinLockedReturning(
 	var keys []string
 	for cursor.Next() {
 		oldDoc := cursor.Cell(0).Payload()
-		key, err := documentKey(oldDoc, t.meta.PrimaryKey, t.primary, limits.MaxKeyBytes)
+		key, err := tableDocumentKey(t, oldDoc, limits.MaxKeyBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -2954,7 +3003,7 @@ func (c *conn) updateFromJoinLockedReturning(
 		if err := validateDocument(t.schema, patched, limits.MaxDocumentBytes, &c.insertTape); err != nil {
 			return nil, err
 		}
-		newKey, err := documentKey(patched, t.meta.PrimaryKey, t.primary, limits.MaxKeyBytes)
+		newKey, err := tableDocumentKey(t, patched, limits.MaxKeyBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -3033,10 +3082,14 @@ func (c *conn) matchingKeysLocked(
 			where = statement.Tree().Delete.Filter.Where
 		}
 	}
-	keys, point, err := primaryPredicateKeys(
-		where, t.meta.PrimaryKey, args, c.pointKeys,
-		limits.MaxKeyBytes)
-	c.pointKeys = keys
+	var keys []string
+	var point bool
+	if len(t.primaries) <= 1 {
+		keys, point, err = primaryPredicateKeys(
+			where, t.meta.PrimaryKey, args, c.pointKeys,
+			limits.MaxKeyBytes)
+		c.pointKeys = keys
+	}
 	if point || err != nil {
 		if err != nil {
 			return nil, err
