@@ -489,6 +489,14 @@ func (p *Parser) parseCreateIndex(unique bool) error {
 	if err := p.rejectAlias(); err != nil {
 		return err
 	}
+	if p.atKeyword(kwUsing) {
+		p.advance() // USING
+		method, err := p.parseIndexMethod()
+		if err != nil {
+			return err
+		}
+		p.idx.Method = method
+	}
 	if p.tok.kind != tokLParen {
 		return p.errHere("expected '(' after the collection name: an index names the paths it indexes")
 	}
@@ -517,15 +525,18 @@ func (p *Parser) parseCreateIndex(unique bool) error {
 	case p.atKeyword(kwWhere):
 		return p.errHere("a partial index (INDEX ... WHERE) is not supported: this engine's indexes cover every document of the collection")
 	case p.atKeyword(kwUsing):
+		if p.idx.Method != "" {
+			return p.errHere("duplicate USING clause in CREATE INDEX")
+		}
 		p.advance() // USING
 		method, err := p.parseIndexMethod()
 		if err != nil {
 			return err
 		}
 		p.idx.Method = method
-		if method == "tin" && len(p.idx.Paths) != 1 {
-			return p.errHere("USING tin indexes one text path; compound full-text indexes are not supported")
-		}
+	}
+	if p.idx.Method == "tin" && len(p.idx.Paths) != 1 {
+		return p.errHere("USING tin indexes one text path; compound full-text indexes are not supported")
 	}
 	if err := p.expectEnd(); err != nil {
 		return err

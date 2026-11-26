@@ -661,6 +661,8 @@ func multiShardSemanticBoundary(
 		return firstPlanReason(reason, "OFFSET requires distributed top-k rewriting")
 	case aggregateSupported && !groupedAggregateSupported && stmt.Limit != nil:
 		return firstPlanReason(reason, "aggregate LIMIT requires coordinator-side rewriting")
+	case selectHasScore(stmt):
+		return firstPlanReason(reason, "SCORE() requires global corpus BM25 statistics")
 	}
 	if aggregateSupported {
 		return reason
@@ -782,6 +784,56 @@ func scalarHasAggregate(expr *sqlast.ScalarExpr) bool {
 	for i := range expr.Whens {
 		if exprHasAggregate(expr.Whens[i].Predicate) ||
 			scalarHasAggregate(expr.Whens[i].Match) || scalarHasAggregate(expr.Whens[i].Result) {
+			return true
+		}
+	}
+	return false
+}
+
+func selectHasScore(stmt *sqlast.SelectStmt) bool {
+	if stmt == nil {
+		return false
+	}
+	for i := range stmt.Columns {
+		if scalarHasScore(stmt.Columns[i].Scalar) {
+			return true
+		}
+	}
+	for i := range stmt.OrderBy {
+		if scalarHasScore(stmt.OrderBy[i].Scalar) {
+			return true
+		}
+	}
+	return exprHasScore(stmt.Where) || exprHasScore(stmt.Having)
+}
+
+func scalarHasScore(expr *sqlast.ScalarExpr) bool {
+	if expr == nil {
+		return false
+	}
+	if expr.Kind == sqlast.ScalarScore ||
+		scalarHasScore(expr.Left) || scalarHasScore(expr.Right) ||
+		scalarHasScore(expr.Else) {
+		return true
+	}
+	for i := range expr.Whens {
+		if exprHasScore(expr.Whens[i].Predicate) ||
+			scalarHasScore(expr.Whens[i].Match) || scalarHasScore(expr.Whens[i].Result) {
+			return true
+		}
+	}
+	return false
+}
+
+func exprHasScore(expr *sqlast.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	if scalarHasScore(expr.ScalarLeft) || scalarHasScore(expr.ScalarRight) {
+		return true
+	}
+	for _, kid := range expr.Kids {
+		if exprHasScore(kid) {
 			return true
 		}
 	}
