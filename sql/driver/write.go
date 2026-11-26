@@ -1678,6 +1678,10 @@ func resolveInsertRow(
 	var err error
 	if len(insert.Columns) == 0 {
 		document, err = operandDocument(statement, row.Values[0], args)
+	} else if len(row.Exprs) > 0 {
+		document, err = encodeFlatInsertDocumentWithExprs(
+			statement.SQL(), insert, row, args, limits.MaxDocumentBytes,
+		)
 	} else {
 		document, err = encodeFlatInsertDocument(
 			statement.InsertFlatFieldOrdinals(), statement.InsertFlatKeyJSONBytes(),
@@ -1747,6 +1751,84 @@ func (d *flatInsertDocument) MarshalVibeJSON(
 		}
 	}
 	return w.RawByteUnchecked('}')
+}
+
+func encodeFlatInsertDocumentWithExprs(
+	src string,
+	insert *sqlast.InsertStmt,
+	row *sqlast.InsertRow,
+	args []any,
+	maxDocumentBytes int,
+) ([]byte, error) {
+	if len(insert.Columns) != len(row.Values) {
+		return nil, errors.New("vibedb: internal flat INSERT shape is incomplete")
+	}
+	var cols []sqlast.ResultColumn
+	exprMap := make([]int, len(insert.Columns))
+	for i := range insert.Columns {
+		exprMap[i] = -1
+		if i < len(row.Exprs) && row.Exprs[i] != nil {
+			exprMap[i] = len(cols)
+			cols = append(cols, sqlast.ResultColumn{Scalar: row.Exprs[i], Pos: row.Exprs[i].Pos})
+		}
+	}
+	var evalExec query.Exec
+	var evalCursor query.Cursor
+	if len(cols) > 0 {
+		sel := &sqlast.SelectStmt{Columns: cols, Params: len(args)}
+		evalStmt, err := query.PrepareParsedStatement(src, sel)
+		if err != nil {
+			return nil, err
+		}
+		defer evalStmt.Release()
+		defer evalExec.Release()
+		cur, err := evalStmt.RunInto(&evalExec, query.Source{}, args)
+		if err != nil {
+			return nil, err
+		}
+		if !cur.Next() {
+			return nil, errors.New("vibedb: INSERT VALUES expression evaluation returned no row")
+		}
+		evalCursor = cur
+	}
+	var buf []byte
+	buf = append(buf, '{')
+	for i, col := range insert.Columns {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = strconv.AppendQuote(buf, col.Spec())
+		buf = append(buf, ':')
+		if exprMap[i] >= 0 {
+			cell := evalCursor.Cell(exprMap[i])
+			if cell.IsNull() {
+				buf = append(buf, "null"...)
+			} else {
+				val := cell.JSON()
+				if cell.Kind() == query.TypeNumber {
+					if integer, ok := canonicalComputedInteger(val, maxDocumentBytes); ok {
+						val = integer
+					}
+				}
+				buf = append(buf, val...)
+			}
+			continue
+		}
+		val, err := flatInsertOperandValue(row.Values[i], args)
+		if err != nil {
+			return nil, err
+		}
+		raw, err := json.Marshal(val)
+		if err != nil {
+			return nil, err
+		}
+		buf = append(buf, raw...)
+	}
+	buf = append(buf, '}')
+	if len(buf) > maxDocumentBytes {
+		return nil, durable.ErrDocumentTooLarge
+	}
+	return buf, nil
 }
 
 func encodeFlatInsertDocument(
