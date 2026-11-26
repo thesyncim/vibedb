@@ -783,7 +783,15 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 	if fusedPoint {
 		_, fusedPoint = server.owner.(replicatedSQLPointReadOwner)
 	}
-	fusedRead := replicatedReadOperation(request.Operation) || fusedPoint
+	fusedData := request.Operation == ReplicatedQueryLeader && query != nil &&
+		queryValidated && !fusedPoint
+	if fusedData {
+		_, hasRead := server.owner.(replicatedSQLReadOwner)
+		_, hasPoint := server.owner.(replicatedSQLPointReadOwner)
+		fusedData = hasRead && hasPoint
+	}
+	fusedQuery := fusedPoint || fusedData
+	fusedRead := replicatedReadOperation(request.Operation) || fusedQuery
 	var readAuthorize raftservice.ProposalAuthorization
 	if fusedRead || request.Operation == ReplicatedQueryLeader {
 		readAuthorize = func(candidate raftservice.ServingState) bool {
@@ -792,7 +800,7 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 		}
 	}
 	var concurrentReadAuthorize raftservice.ConcurrentReadAuthorization
-	if fusedPoint && server.serving != nil && server.concurrentServing != nil &&
+	if fusedQuery && server.serving != nil && server.concurrentServing != nil &&
 		(!authenticated || server.transition == nil || server.concurrentTransition != nil) {
 		concurrentReadAuthorize = func(candidate raftservice.ServingState) bool {
 			return server.concurrentServing(candidate) ||
@@ -871,7 +879,7 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 		}
 	}
 	if request.Operation == ReplicatedQueryLeader {
-		return server.executeReplicatedQueryCallValidated(ctx, request, state, query, readAuthorize, queryValidated, fusedPoint, concurrentReadAuthorize)
+		return server.executeReplicatedQueryCallValidated(ctx, request, state, query, readAuthorize, queryValidated, fusedQuery, concurrentReadAuthorize)
 	}
 	if request.Operation == ReplicatedReadBatchLeader {
 		batchOwner, ok := server.owner.(interface {

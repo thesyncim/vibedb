@@ -32,6 +32,10 @@ type LinearizableDataReadRequest struct {
 	// Authorize runs on the serialized owner cut immediately before the read
 	// is admitted, matching point reads and proposal admission.
 	Authorize ProposalAuthorization
+	// ConcurrentAuthorize is an optional pure, nonblocking authorization check
+	// for the ExecutionOwners warm direct-admission path, matching
+	// LinearizablePointReadRequest.
+	ConcurrentAuthorize ConcurrentReadAuthorization
 }
 
 // LinearizableDataReadCut pins both the storage cut and the serving generation.
@@ -39,6 +43,7 @@ type LinearizableDataReadRequest struct {
 type LinearizableDataReadCut struct {
 	source     DataReadSource
 	data       replicatedstate.DataReadCut
+	state      ServingState
 	generation *ownerGeneration
 	owner      *Owner
 }
@@ -236,6 +241,15 @@ func (cut *LinearizableDataReadCut) Data() *replicatedstate.DataReadCut {
 	return &cut.data
 }
 
+// State returns the serving state that admitted this cut. It is valid only
+// while the cut is open, matching LinearizablePointReadCut.State.
+func (cut *LinearizableDataReadCut) State() ServingState {
+	if cut == nil || cut.owner == nil {
+		return ServingState{}
+	}
+	return cut.state
+}
+
 func (cut *LinearizableDataReadCut) Close() error {
 	if cut == nil || cut.owner == nil {
 		return nil
@@ -245,16 +259,33 @@ func (cut *LinearizableDataReadCut) Close() error {
 	cut.owner.releasePendingRead(1)
 	cut.generation, cut.owner = nil, nil
 	cut.source = nil
+	cut.state = ServingState{}
 	return err
 }
 
-// ReadLinearizableDataInto acquires a leader ReadIndex, waits for apply, and
-// pins the exact serving generation until the caller closes dst. Network
-// boundaries must authenticate and authorize the request before calling this
-// method; only the dedicated data-read capability is accepted here.
+// ReadLinearizableDataInto acquires a leader read cut (using a currently valid
+// read authority with post-snapshot validation, or falling back to a leader
+// ReadIndex), waits for apply, and pins the exact serving generation until the
+// caller closes dst. Network boundaries must authenticate and authorize the
+// request before calling this method; only the dedicated data-read capability
+// is accepted here.
 func (owner *Owner) ReadLinearizableDataInto(
 	ctx context.Context, request LinearizableDataReadRequest, dst *LinearizableDataReadCut,
 ) error {
+	return owner.readLinearizableDataInto(ctx, request, dst, false)
+}
+
+func (owner *Owner) readLinearizableDataInto(
+	ctx context.Context,
+	request LinearizableDataReadRequest,
+	dst *LinearizableDataReadCut,
+	forceReadIndex bool,
+) error {
+	var err error
+	request, err = normalizeDataReadRequest(request)
+	if err != nil {
+		return err
+	}
 	if owner == nil || ctx == nil || dst == nil || request.Capability != serviceauthz.CapabilityDataRead ||
 		request.Relations != nil && len(request.Relations) == 0 || len(request.Relations) > replication.MaxRelationsPerBundle {
 		return ErrInvalidOwner
@@ -271,40 +302,70 @@ func (owner *Owner) ReadLinearizableDataInto(
 			owner.releasePendingRead(1)
 		}
 	}()
-	delivery := owner.acquireReadDelivery()
-	reply, err := owner.enqueueRead(ctx, ownerRequest{
-		kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
-		read: readRequest{fence: request.Fence, delivery: delivery, authorize: request.Authorize},
-	}, delivery)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if !admitted {
-			reply.read.generation.release()
+	for attempt := 0; attempt < 2; attempt++ {
+		force := forceReadIndex || attempt > 0
+		delivery := owner.acquireReadDelivery()
+		reply, err := owner.enqueueRead(ctx, ownerRequest{
+			kind: requestReadLinear, group: request.Fence.Group, reply: delivery.reply,
+			read: readRequest{
+				fence: request.Fence, delivery: delivery, authorize: request.Authorize,
+				authorityEligible: !force, forceReadIndex: force, authorityFallback: force,
+			},
+		}, delivery)
+		if err != nil {
+			return err
 		}
-	}()
-	source, ok := reply.read.source.(DataReadSource)
-	if !ok {
-		return ErrServingFence
+		source, ok := reply.read.source.(DataReadSource)
+		if !ok {
+			reply.read.generation.release()
+			return ErrServingFence
+		}
+		if err := context.Cause(ctx); err != nil {
+			reply.read.generation.release()
+			return err
+		}
+		if err := source.DataReadCutInto(request.Relations, reply.read.minimumApplied, &dst.data); err != nil {
+			reply.read.generation.release()
+			if attempt == 0 && reply.read.authorityFast && readAuthoritySourceFallback(err, false) {
+				continue
+			}
+			return err
+		}
+		if err := context.Cause(ctx); err != nil {
+			reply.read.generation.release()
+			return errors.Join(err, dst.data.Close())
+		}
+		fence := dst.data.Fence()
+		if !pointReadFenceMatches(fence, request.Fence) || fence.Applied < reply.read.minimumApplied {
+			closeErr := dst.data.Close()
+			reply.read.generation.release()
+			if closeErr == nil && attempt == 0 && reply.read.authorityFast && readAuthoritySourceFallback(nil, false) {
+				continue
+			}
+			return errors.Join(ErrServingFence, closeErr)
+		}
+		if reply.read.authorityFast {
+			if validationErr := owner.validateReadAuthority(
+				ctx, request.Fence, reply.read.generation, reply.read.authorityPermit, reply.read.authorityToken,
+			); validationErr != nil {
+				retry := attempt == 0 && readAuthorityFallback(validationErr)
+				owner.recordAuthorityValidation(request.Fence.Group, validationErr, retry)
+				closeErr := dst.data.Close()
+				reply.read.generation.release()
+				if retry && closeErr == nil {
+					continue
+				}
+				return errors.Join(validationErr, closeErr)
+			}
+			owner.recordAuthorityHit(request.Fence.Group)
+		}
+		dst.generation, dst.owner = reply.read.generation, owner
+		dst.source = source
+		dst.state = reply.read.state
+		admitted = true
+		return nil
 	}
-	if err := context.Cause(ctx); err != nil {
-		return err
-	}
-	if err := source.DataReadCutInto(request.Relations, reply.read.minimumApplied, &dst.data); err != nil {
-		return err
-	}
-	if err := context.Cause(ctx); err != nil {
-		return errors.Join(err, dst.data.Close())
-	}
-	fence := dst.data.Fence()
-	if !pointReadFenceMatches(fence, request.Fence) || fence.Applied < reply.read.minimumApplied {
-		return errors.Join(ErrServingFence, dst.data.Close())
-	}
-	dst.generation, dst.owner = reply.read.generation, owner
-	dst.source = source
-	admitted = true
-	return nil
+	return ErrServingFence
 }
 
 // ReadLinearizablePointInto acquires the same serving authorization, applied
@@ -388,11 +449,21 @@ func (owner *Owner) readLinearizablePointInto(
 func (owners *ExecutionOwners) ReadLinearizableDataInto(
 	ctx context.Context, request LinearizableDataReadRequest, dst *LinearizableDataReadCut,
 ) error {
-	owner, err := owners.owner(request.Fence.Group)
+	if request.Authorize != nil && request.ConcurrentAuthorize != nil {
+		return ErrInvalidOwner
+	}
+	route, err := owners.ownerRoute(request.Fence.Group)
 	if err != nil {
 		return err
 	}
-	return owner.ReadLinearizableDataInto(ctx, request, dst)
+	if route.point != nil {
+		if attempted, directErr := route.owner.tryReadLinearizableDataInto(
+			ctx, request, dst, route.point,
+		); attempted {
+			return directErr
+		}
+	}
+	return route.owner.ReadLinearizableDataInto(ctx, request, dst)
 }
 
 func (owners *ExecutionOwners) ReadLinearizablePointInto(
