@@ -86,4 +86,37 @@ func TestDefaultAndCheckConstraintEnforcement(t *testing.T) {
 	if _, err := db2.Exec(`INSERT INTO accounts (id, balance) VALUES ('a5', -1)`); !errors.Is(err, sqldriver.ErrCheckViolation) {
 		t.Fatalf("CHECK after reopen err = %v, want ErrCheckViolation", err)
 	}
+
+	// 7. ALTER TABLE SET DEFAULT, DROP DEFAULT, and ADD CONSTRAINT CHECK.
+	if _, err := db2.Exec(`ALTER TABLE accounts ALTER COLUMN status SET DEFAULT 'pending'`); err != nil {
+		t.Fatalf("ALTER SET DEFAULT: %v", err)
+	}
+	if _, err := db2.Exec(`INSERT INTO accounts (id) VALUES ('a6')`); err != nil {
+		t.Fatalf("INSERT after ALTER SET DEFAULT: %v", err)
+	}
+	if err := db2.QueryRow(`SELECT status FROM accounts WHERE id = 'a6'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Fatalf("status after ALTER SET DEFAULT = %q, want pending", status)
+	}
+	if _, err := db2.Exec(`ALTER TABLE accounts ADD CONSTRAINT chk_min_limit CHECK (credit_limit >= 100)`); err != nil {
+		t.Fatalf("ALTER ADD CONSTRAINT CHECK: %v", err)
+	}
+	if _, err := db2.Exec(`INSERT INTO accounts (id, balance, credit_limit) VALUES ('a7', 50, 50)`); !errors.Is(err, sqldriver.ErrCheckViolation) {
+		t.Fatalf("INSERT violating ALTER CHECK err = %v, want ErrCheckViolation", err)
+	}
+	if _, err := db2.Exec(`ALTER TABLE accounts ALTER COLUMN status DROP DEFAULT`); err != nil {
+		t.Fatalf("ALTER DROP DEFAULT: %v", err)
+	}
+	if _, err := db2.Exec(`INSERT INTO accounts (id) VALUES ('a8')`); err != nil {
+		t.Fatalf("INSERT after ALTER DROP DEFAULT: %v", err)
+	}
+	var nullStatus sql.NullString
+	if err := db2.QueryRow(`SELECT status FROM accounts WHERE id = 'a8'`).Scan(&nullStatus); err != nil {
+		t.Fatal(err)
+	}
+	if nullStatus.Valid {
+		t.Fatalf("expected NULL status after DROP DEFAULT, got %q", nullStatus.String)
+	}
 }
