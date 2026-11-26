@@ -51,6 +51,7 @@ var unsupportedStatements = map[string]string{
 	"ANALYZE": "storage maintenance is the owning application's, not a client's",
 	"REINDEX": "storage maintenance is the owning application's, not a client's",
 	"CLUSTER": "storage maintenance is the owning application's, not a client's",
+	"REFRESH": "there are no materialized views",
 
 	"PREPARE":    "SQL-level PREPARE is not supported: use the adapter's prepared-statement API",
 	"EXECUTE":    "SQL-level EXECUTE is not supported: use the adapter's prepared-statement API",

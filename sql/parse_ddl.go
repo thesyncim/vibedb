@@ -56,8 +56,35 @@ func (p *Parser) parseCreate(dst *Statement) error {
 		return p.featureNotSupportedHere(
 			"CREATE OR REPLACE VIEW is not supported because replacing a durable definition requires dependency-generation invalidation; use DROP VIEW followed by CREATE VIEW",
 		)
+	case p.tok.kind == tokIdent && isUnsupportedCreateObject(p.tok.text):
+		return p.featureNotSupportedHere(
+			"CREATE " + asciiUpper(p.tok.text) + " is not supported",
+		)
 	}
 	return p.errHere("expected TABLE, INDEX, VIEW, or MATERIALIZED VIEW after CREATE")
+}
+
+func isUnsupportedCreateObject(name string) bool {
+	switch asciiUpper(name) {
+	case "SCHEMA", "SEQUENCE", "TYPE", "DOMAIN", "FUNCTION", "PROCEDURE",
+		"TRIGGER", "EXTENSION", "ROLE", "USER", "POLICY", "DATABASE",
+		"PUBLICATION", "SUBSCRIPTION", "TABLESPACE", "COLLATION",
+		"AGGREGATE", "OPERATOR", "RULE", "SERVER", "FOREIGN", "TEMP", "TEMPORARY", "UNLOGGED":
+		return true
+	}
+	return false
+}
+
+func asciiUpper(s string) string {
+	b := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		b[i] = c
+	}
+	return string(b)
 }
 
 // parseAlterTable accepts the additive PostgreSQL spelling
