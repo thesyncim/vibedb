@@ -1308,23 +1308,72 @@ func (q *NodeSubmissionSequencer) failAccepted(err error) {
 	}
 }
 
+const (
+	sequencerCoalesceWindow     = 250 * time.Microsecond
+	sequencerConcurrentHold     = 20 * time.Millisecond
+	sequencerCoalesceTargetWave = 4
+)
+
 func (q *NodeSubmissionSequencer) run() {
 	defer close(q.done)
 	var items [MaxPersistGroupBatches]*Submission
 	var ready [MaxPersistGroupBatches]NodeReady
+	var concurrentUntil time.Time
+	var coalesceTimer *time.Timer
+	defer func() {
+		if coalesceTimer != nil {
+			coalesceTimer.Stop()
+		}
+	}()
 	for {
 		count := 0
 		yielded := false
+		var coalesceDeadline time.Time
 		var admission nodeWaveAdmission
 		for count < len(items) {
 			s, ok := q.peek()
-			if !ok && count == 1 && items[0].kind == submissionReady && !yielded {
-				// A just-completed wave wakes multiple independent owners. Give their
-				// already-runnable work one scheduler turn before freezing a singleton
-				// wave; never wait on a timer, missing group, or new arrival.
-				yielded = true
-				runtime.Gosched()
-				continue
+			if !ok && count > 0 && items[0].kind == submissionReady && !submissionHintCandidate(items[0]) {
+				if count == 1 && !yielded {
+					// A just-completed wave wakes multiple independent owners. Give their
+					// already-runnable work one scheduler turn before freezing a singleton
+					// wave; never wait on a timer, missing group, or new arrival.
+					yielded = true
+					runtime.Gosched()
+					continue
+				}
+				// Under active concurrent write load on a real disk-backed NodeStore,
+				// give peer groups a short bounded window to join the same fdatasync
+				// wave. Single-client sequential traffic never sets concurrentUntil
+				// and pays zero wait.
+				if count < sequencerCoalesceTargetWave && !concurrentUntil.IsZero() &&
+					q.store != nil && q.store.engine != nil && !q.closed.Load() {
+					now := time.Now()
+					if now.Before(concurrentUntil) {
+						if coalesceDeadline.IsZero() {
+							coalesceDeadline = now.Add(sequencerCoalesceWindow)
+						}
+						if remaining := coalesceDeadline.Sub(now); remaining > 0 {
+							if coalesceTimer == nil {
+								coalesceTimer = time.NewTimer(remaining)
+							} else {
+								coalesceTimer.Reset(remaining)
+							}
+							select {
+							case <-q.wake:
+								if !coalesceTimer.Stop() {
+									select {
+									case <-coalesceTimer.C:
+									default:
+									}
+								}
+								continue
+							case <-coalesceTimer.C:
+							}
+						}
+					} else {
+						concurrentUntil = time.Time{}
+					}
+				}
 			}
 			if !ok || count > 0 && (items[0].kind != submissionReady || s.kind != submissionReady) ||
 				count > 0 && items[0].kind == submissionReady &&
@@ -1381,6 +1430,9 @@ func (q *NodeSubmissionSequencer) run() {
 			q.stats.controlWaveDurationNanos.Add(waveDuration)
 		}
 		q.observeWaveResult(&items, count, err, engineDelta, appendedGroups)
+		if readyWave && engineDelta > 0 && count >= 2 {
+			concurrentUntil = time.Now().Add(sequencerConcurrentHold)
+		}
 		fatal := errors.Is(err, ErrPersistenceUnknown) || errors.Is(err, ErrSubmissionPanic)
 		completionErr := err
 		if fatal {

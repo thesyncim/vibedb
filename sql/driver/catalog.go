@@ -23,6 +23,7 @@ const catalogVersion = 0
 const maxCatalogTableNameBytes = 1<<16 - 1
 
 const (
+	replicatedCheckpointEvery = 4096
 	maxCatalogViews            = 256
 	maxCatalogViewQueryBytes   = 1 << 20
 	maxCatalogViewColumns      = 1024
@@ -906,7 +907,7 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked(openOptions Repl
 				durable.OpenCollectionsWithSnapshotCheckpointGroup(
 					d.dataDir, txnOptions, requests, groupNames,
 					replicatedstate.SystemCollectionName,
-					durable.CheckpointGroupOptions{},
+					durable.CheckpointGroupOptions{CheckpointEvery: replicatedCheckpointEvery},
 				)
 			if errors.Is(err, durable.ErrCheckpointGroupSeedChanged) {
 				err = errors.Join(ErrReplicatedSnapshotStageProof, err)
@@ -916,13 +917,13 @@ func (d *database) openCatalogCollectionsWithTransactionsLocked(openOptions Repl
 				durable.OpenCollectionsWithSeededCheckpointGroup(
 					d.dataDir, txnOptions, requests, groupNames,
 					replicatedstate.SystemCollectionName,
-					durable.CheckpointGroupOptions{},
+					durable.CheckpointGroupOptions{CheckpointEvery: replicatedCheckpointEvery},
 				)
 		} else {
 			collections, txnLog, checkpointGroup, err =
 				durable.OpenCollectionsWithCheckpointGroup(
 					d.dataDir, txnOptions, requests, groupNames,
-					durable.CheckpointGroupOptions{},
+					durable.CheckpointGroupOptions{CheckpointEvery: replicatedCheckpointEvery},
 				)
 		}
 		if errors.Is(err, durable.ErrCheckpointGroupMissing) {
