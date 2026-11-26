@@ -324,44 +324,67 @@ func checkedIntegerSum(a, b int64) (int64, bool) {
 func (w *integerGroupWorkspace) add(
 	key, sum int64, row uint64, withSum bool, memoryBytes int64,
 ) error {
-	if len(w.groups)*10+10 > cap(w.slots)*7 {
-		if err := w.ensureCapacity(len(w.groups)+1, memoryBytes); err != nil {
-			return err
+	keys := [1]int64{key}
+	sums := [1]int64{sum}
+	return w.addBatch(row, keys[:], sums[:], withSum, memoryBytes)
+}
+
+func (w *integerGroupWorkspace) addBatch(
+	startRow uint64, keys, sums []int64, withSum bool, memoryBytes int64,
+) error {
+	slots := w.slots
+	mask := uint64(len(slots) - 1)
+	groups := w.groups
+	for i, key := range keys {
+		row := startRow + uint64(i)
+		if len(groups)*10+10 > cap(slots)*7 {
+			w.groups = groups
+			if err := w.ensureCapacity(len(groups)+1, memoryBytes); err != nil {
+				return err
+			}
+			slots = w.slots
+			mask = uint64(len(slots) - 1)
+			groups = w.groups
 		}
-	}
-	at := int(integerGroupHash(key) & uint64(cap(w.slots)-1))
-	for {
-		slot := &w.slots[at]
-		if slot.group < 0 {
-			if len(w.groups) >= integerGroupMaxInt() || len(w.groups) > int(1<<31-1) {
-				return errIntegerGroupsDeclined
-			}
-			id := int32(len(w.groups))
-			w.groups = append(w.groups, integerGroupValue{
-				key: key, first: row,
-			})
-			slot.key, slot.group = key, id
-		}
-		if slot.key == key {
-			g := &w.groups[slot.group]
-			if g.count == integerGroupMaxInt() {
-				return errIntegerGroupsDeclined
-			}
-			g.count++
-			if row < g.first {
-				g.first = row
-			}
-			if withSum {
-				var ok bool
-				g.sum, ok = checkedIntegerSum(g.sum, sum)
-				if !ok {
-					return errIntegerGroupsOverflow
+		at := int(integerGroupHash(key) & mask)
+		for {
+			slot := &slots[at]
+			if slot.group < 0 {
+				if len(groups) >= integerGroupMaxInt() || len(groups) > int(1<<31-1) {
+					w.groups = groups
+					return errIntegerGroupsDeclined
 				}
+				id := int32(len(groups))
+				groups = append(groups, integerGroupValue{
+					key: key, first: row,
+				})
+				slot.key, slot.group = key, id
 			}
-			return nil
+			if slot.key == key {
+				g := &groups[slot.group]
+				if g.count == integerGroupMaxInt() {
+					w.groups = groups
+					return errIntegerGroupsDeclined
+				}
+				g.count++
+				if row < g.first {
+					g.first = row
+				}
+				if withSum {
+					var ok bool
+					g.sum, ok = checkedIntegerSum(g.sum, sums[i])
+					if !ok {
+						w.groups = groups
+						return errIntegerGroupsOverflow
+					}
+				}
+				break
+			}
+			at = (at + 1) & int(mask)
 		}
-		at = (at + 1) & (cap(w.slots) - 1)
 	}
+	w.groups = groups
+	return nil
 }
 
 func (w *integerGroupWorkspace) groupsInto(
@@ -479,18 +502,18 @@ func (p *plan) runDirectFileIntegerGroups(
 		return directFileIntegerGroupStats{}, true, err
 	}
 	var scanErr error
-	filtered, err := snapshot.FilterIntegerGroupsWithScratch(
+	filtered, err := snapshot.FilterIntegerGroupsBatchWithScratch(
 		filter, workspace.shapeSeen, workspace.shapeWork,
-		func(row uint64, key, sum int64) error {
+		func(startRow uint64, keys, sums []int64) error {
 			if scanErr != nil {
 				return scanErr
 			}
-			if err := cancellationCheckpoint(e.Options.Cancel, int(row)); err != nil {
-				scanErr = err
-				return err
+			if e.Options.Cancel != nil && e.Options.Cancel.Canceled() {
+				scanErr = ErrCanceled
+				return ErrCanceled
 			}
-			if err := workspace.add(
-				key, sum, row, shape.hasSum, memoryBytes,
+			if err := workspace.addBatch(
+				startRow, keys, sums, shape.hasSum, memoryBytes,
 			); err != nil {
 				scanErr = err
 				return err

@@ -1282,7 +1282,7 @@ func compactCommonPrefix(a, b []byte) int {
 }
 
 // Keep the immediate mismatch case in the small, inlinable caller.
-func compactCommonPrefixEqualHead(a, b []byte) int {
+func compactCommonPrefixEqualHeadScalar(a, b []byte) int {
 	n := min(len(a), len(b))
 	i := 0
 	// Canonical scalar strings often share long payloads. Compare whole words

@@ -10,6 +10,7 @@ type UnifiedIntegerGroupFilter struct {
 	group  UnifiedHoleResolver
 	sum    UnifiedHoleResolver
 	hasSum bool
+	batch  IntegerGroupBatch
 }
 
 // UnifiedIntegerGroupProgress reports rows visited by a successful strict
@@ -73,6 +74,65 @@ func (c *PrimaryGraphCursor) FilterIntegerGroups(
 					return fmt.Errorf("%w: integer group row ordinal", ErrCommonPrimaryLeafCorrupt)
 				}
 				return visit(uint64(base+row), group, sum)
+			},
+		)
+		if scanErr != nil {
+			*progress = UnifiedIntegerGroupProgress{}
+			c.Close()
+			return false, scanErr
+		}
+		if !ok {
+			*progress = UnifiedIntegerGroupProgress{}
+			return false, nil
+		}
+		if c.leaf.Len() > int(^uint(0)>>1)-progress.Scanned {
+			*progress = UnifiedIntegerGroupProgress{}
+			return false, fmt.Errorf("%w: integer group scanned rows", ErrCommonPrimaryLeafCorrupt)
+		}
+		progress.Scanned += c.leaf.Len()
+		if err := c.advanceLeaf(); err != nil {
+			*progress = UnifiedIntegerGroupProgress{}
+			c.Close()
+			return false, err
+		}
+		if c.done {
+			return true, nil
+		}
+	}
+}
+
+// FilterIntegerGroupsBatch is the batched counterpart of FilterIntegerGroups,
+// yielding contiguous slices of up to 32 physical rows per callback.
+func (c *PrimaryGraphCursor) FilterIntegerGroupsBatch(
+	f *UnifiedIntegerGroupFilter,
+	progress *UnifiedIntegerGroupProgress,
+	shapeSeen []int,
+	shapeWork []IntegerGroupShapeWorkspace,
+	visitBatch func(startRow uint64, groups, sums []int64) error,
+) (supported bool, err error) {
+	if c == nil || f == nil || progress == nil || visitBatch == nil {
+		return false, nil
+	}
+	if c.done {
+		return true, nil
+	}
+	var sumResolver *UnifiedHoleResolver
+	if f.hasSum {
+		sumResolver = &f.sum
+	}
+	for {
+		base := progress.Scanned
+		if base < 0 {
+			*progress = UnifiedIntegerGroupProgress{}
+			return false, fmt.Errorf("%w: integer group row count", ErrCommonPrimaryLeafCorrupt)
+		}
+		ok, scanErr := c.leaf.VisitResolvedIntegerGroupsBatch(
+			&f.group, sumResolver, shapeSeen, shapeWork, &f.batch,
+			func(startRow int, groups, sums []int64) error {
+				if startRow < 0 || base > int(^uint(0)>>1)-startRow {
+					return fmt.Errorf("%w: integer group row ordinal", ErrCommonPrimaryLeafCorrupt)
+				}
+				return visitBatch(uint64(base+startRow), groups, sums)
 			},
 		)
 		if scanErr != nil {

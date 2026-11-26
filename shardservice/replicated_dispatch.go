@@ -5,11 +5,13 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/query"
 )
 
 // ReplicatedCall is the transport-neutral operation envelope. SQL remains a
@@ -22,10 +24,12 @@ type ReplicatedCall struct {
 
 // ReplicatedReply is the transport-neutral result envelope. SQL is populated
 // for a query result and is detached from the native response frame before a
-// local reply lease is released.
+// local reply lease is released. TypedCells carries parallel owned query.Cell
+// values when materialized directly on the fused local path.
 type ReplicatedReply struct {
-	Response ReplicatedResponse
-	SQL      *ShardResponse
+	Response   ReplicatedResponse
+	SQL        *ShardResponse
+	TypedCells []query.Cell
 }
 
 // ReplicatedReplyLease keeps read buffers and the shared admission charge
@@ -42,6 +46,7 @@ type replicatedReplyLease struct {
 	readLease   interface{ Release() }
 	frameBudget *replicatedFrameByteBudget
 	frameBytes  int64
+	sqlOwned    bool
 	released    bool
 }
 
@@ -57,6 +62,7 @@ func (lease *replicatedReplyLease) Release() {
 		return
 	}
 	lease.released = true
+	lease.reply = nil
 	if lease.readLease != nil {
 		lease.readLease.Release()
 		lease.readLease = nil
@@ -81,6 +87,14 @@ func DetachReplicatedReply(lease ReplicatedReplyLease) (*ReplicatedReply, error)
 		lease.Release()
 		return nil, ErrReplicatedWire
 	}
+	if ownedLease, ok := lease.(*replicatedReplyLease); ok && ownedLease.sqlOwned &&
+		len(reply.Response.Completion) == 0 && len(reply.Response.Value) == 0 {
+		reply.Response.readLease = nil
+		reply.Response.sqlOwned = false
+		ownedLease.reply = nil
+		ownedLease.Release()
+		return reply, nil
+	}
 	detached := cloneReplicatedReply(reply)
 	lease.Release()
 	return detached, nil
@@ -99,8 +113,6 @@ type replicatedLocalBinding struct {
 	ctx                        context.Context
 	cancel                     context.CancelFunc
 }
-
-type replicatedLocalCall struct{ cancel context.CancelFunc }
 
 // DispatchReplicated applies the same service authorization, owner admission,
 // SQL quotas and complete serving fences as the authenticated socket path.
@@ -142,31 +154,28 @@ func (server *ReplicatedServer) DispatchReplicated(ctx context.Context, call Rep
 			server.frames.release(charge)
 		}
 	}()
-	requestCtx, cancel := context.WithTimeout(ctx, server.requestTimeout)
+	var requestCtx context.Context
+	var cancel context.CancelFunc
+	if deadline, ok := ctx.Deadline(); ok && !deadline.After(time.Now().Add(server.requestTimeout)) {
+		requestCtx, cancel = context.WithCancel(ctx)
+	} else {
+		requestCtx, cancel = context.WithTimeout(ctx, server.requestTimeout)
+	}
 	defer cancel()
 	// A binding context that can never be done needs no arm.
 	if binding.ctx.Done() != nil {
 		stop := context.AfterFunc(binding.ctx, cancel)
 		defer stop()
 	}
-	active := &replicatedLocalCall{cancel: cancel}
-	binding.storage.mu.Lock()
-	_, allowed := binding.storage.allow[binding.principal.Node]
-	admitted := allowed && binding.generation == binding.storage.generation &&
-		server.local.Load() == binding && binding.ctx.Err() == nil &&
-		server.state.Load() != replicatedServerClosed
-	if admitted {
-		binding.storage.localActive[active] = struct{}{}
-	}
-	binding.storage.mu.Unlock()
-	if !admitted {
+	// Lock-free generation + binding liveness check: ReplicatedServerTLS.Rotate
+	// and closeActive atomically bump generationAtomic and cancel binding.ctx
+	// for every registered local binding, canceling all in-flight calls without
+	// per-call mutex or map contention.
+	if binding.generation != binding.storage.generationAtomic.Load() ||
+		server.local.Load() != binding || binding.ctx.Err() != nil ||
+		server.state.Load() == replicatedServerClosed {
 		return nil, ErrReplicatedAuthentication
 	}
-	defer func() {
-		binding.storage.mu.Lock()
-		delete(binding.storage.localActive, active)
-		binding.storage.mu.Unlock()
-	}()
 	if call.Request.Fence.Group.ClusterID != binding.principal.TrustDomain.ClusterID ||
 		call.Request.Fence.Group.ClusterIncarnation != binding.principal.TrustDomain.ClusterIncarnation ||
 		!server.authorizeReplicatedPeerWithDirectoryRefresh(requestCtx, binding.servicePeer, &call.Request) {
@@ -198,14 +207,14 @@ func (server *ReplicatedServer) DispatchReplicated(ctx context.Context, call Rep
 	}
 	retained = true
 	return &replicatedReplyLease{reply: reply, readLease: response.readLease,
-		frameBudget: &server.frames, frameBytes: charge}, nil
+		frameBudget: &server.frames, frameBytes: charge, sqlOwned: response.sqlOwned}, nil
 }
 
 func semanticReplyFromExecutedResponse(response *ReplicatedResponse) (*ReplicatedReply, error) {
 	if response == nil || !validReplicatedResponse(response) {
 		return nil, ErrReplicatedWire
 	}
-	reply := &ReplicatedReply{Response: *response, SQL: response.sqlResult}
+	reply := &ReplicatedReply{Response: *response, SQL: response.sqlResult, TypedCells: response.typedCells}
 	if response.Kind != ReplicatedQueryResult || reply.SQL != nil {
 		return reply, nil
 	}
@@ -400,8 +409,26 @@ func cloneReplicatedReply(reply *ReplicatedReply) *ReplicatedReply {
 	clone.Response.Value = slices.Clone(reply.Response.Value)
 	clone.Response.readLease = nil
 	clone.Response.sqlResult = nil
+	clone.Response.typedCells = nil
+	clone.Response.sqlOwned = false
 	clone.SQL = cloneShardResponse(reply.SQL)
 	clone.Response.sqlResult = clone.SQL
+	if len(reply.TypedCells) != 0 {
+		var arenaBytes int64
+		for _, cell := range reply.TypedCells {
+			arenaBytes += query.OwnedCellBytes(cell)
+		}
+		var arena []byte
+		if arenaBytes > 0 {
+			arena = make([]byte, 0, arenaBytes)
+		}
+		typed := make([]query.Cell, len(reply.TypedCells))
+		for i, cell := range reply.TypedCells {
+			typed[i], arena = query.OwnCellInto(arena, cell)
+		}
+		clone.TypedCells = typed
+		clone.Response.typedCells = typed
+	}
 	return &clone
 }
 

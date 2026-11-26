@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	queryplanner "github.com/thesyncim/vibedb/planner"
+	"github.com/thesyncim/vibedb/query"
 	"github.com/thesyncim/vibedb/shardservice"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -162,9 +163,10 @@ type Query struct {
 type Result struct {
 	// Observations records independent RF3 group cuts, not a global MVCC timestamp.
 	Observations []ReplicatedGroupReadObservation
-	Kind         shardservice.ResponseKind
+	Kind          shardservice.ResponseKind
 	Columns       []shardservice.Column
 	Rows          [][]shardservice.Cell
+	TypedCells    []query.Cell
 	ReturningDocs [][]byte
 	RowsAffected  int64
 	// TransactionID is nonzero for an RF3 multi-group write. It lets the shipped
@@ -1139,7 +1141,16 @@ func tightenTimeoutSignal(ctx context.Context, d time.Duration) (context.Context
 func (e *Executor) single(ctx context.Context, call shardCall, p Profile) (*Result, error) {
 	opctx, cancel := tightenTimeout(ctx, p.PerShardDeadline)
 	defer cancel()
-	resp, err := e.client.Do(opctx, call.address, call.req)
+	var resp *shardservice.ShardResponse
+	var typedCells []query.Cell
+	var err error
+	if typedClient, ok := e.client.(interface {
+		DoTyped(context.Context, string, *shardservice.ShardRequest) (*shardservice.ShardResponse, []query.Cell, error)
+	}); ok {
+		resp, typedCells, err = typedClient.DoTyped(opctx, call.address, call.req)
+	} else {
+		resp, err = e.client.Do(opctx, call.address, call.req)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1149,7 +1160,7 @@ func (e *Executor) single(ctx context.Context, call shardCall, p Profile) (*Resu
 		return nil, err
 	}
 	e.metrics.observeResult(rows, bytes)
-	return &Result{Kind: resp.Kind, Columns: resp.Columns, Rows: resp.Rows, RowsAffected: resp.RowsAffected}, nil
+	return &Result{Kind: resp.Kind, Columns: resp.Columns, Rows: resp.Rows, TypedCells: typedCells, RowsAffected: resp.RowsAffected}, nil
 }
 
 func (e *Executor) captureIndexedMutation(

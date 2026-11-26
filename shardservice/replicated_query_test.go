@@ -3,7 +3,6 @@ package shardservice
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -324,7 +323,7 @@ func TestSQLExecutionQuotaPreservesNativeCapacity(t *testing.T) {
 	for range count {
 		(&replicatedSQLLease{budget: budget, bytes: charge}).Release()
 	}
-	if budget.used.Load() != 0 || budget.sqlUsed != 0 {
+	if budget.used.Load() != 0 || budget.sqlUsed.Load() != 0 {
 		t.Fatal("accounting leaked")
 	}
 	// An impossible reservation refuses immediately even without a deadline.
@@ -391,7 +390,7 @@ func TestReplicatedSQLTierEscalationClassifiesOnlyGrowableLimits(t *testing.T) {
 
 func TestReplicatedSQLBudgetHintsBoundedAndConservative(t *testing.T) {
 	var hints replicatedSQLBudgetHints
-	key := sha256.Sum256([]byte("SELECT bucket, COUNT(*) FROM docs GROUP BY bucket"))
+	key := hashSQLBudgetKey("SELECT bucket, COUNT(*) FROM docs GROUP BY bucket")
 	if hints.lookup(key) != 0 {
 		t.Fatal("cold query skipped smallest tier")
 	}
@@ -400,8 +399,7 @@ func TestReplicatedSQLBudgetHintsBoundedAndConservative(t *testing.T) {
 	if hints.lookup(key) != 2 {
 		t.Fatal("smaller concurrent result reduced proven allowance")
 	}
-	collision := key
-	collision[1] ^= 1
+	collision := key ^ (1 << 16)
 	if hints.lookup(collision) != 0 {
 		t.Fatal("colliding query inherited allowance")
 	}
@@ -631,7 +629,7 @@ func TestReplicatedSQLPointAdmissionIncludesCatalogFrozenDocumentBound(t *testin
 	}
 	server.frames.limit = charge - 1
 	response, grow := server.executeReplicatedQueryTierCall(
-		t.Context(), request, state, inner, owner, budget, MaxReplicatedSQLResultBytes, nil, false,
+		t.Context(), request, state, inner, owner, budget, MaxReplicatedSQLResultBytes, nil, false, false,
 	)
 	if grow || response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalAdmissionBound {
 		t.Fatalf("under-reserved point response=%+v grow=%v", response, grow)
@@ -644,7 +642,7 @@ func TestReplicatedSQLPointAdmissionIncludesCatalogFrozenDocumentBound(t *testin
 	// classification still releases the complete tier lease.
 	server.frames.limit = charge
 	response, grow = server.executeReplicatedQueryTierCall(
-		t.Context(), request, state, inner, owner, budget, MaxReplicatedSQLResultBytes, nil, false,
+		t.Context(), request, state, inner, owner, budget, MaxReplicatedSQLResultBytes, nil, false, false,
 	)
 	if grow || response.Kind != ReplicatedNotLeader {
 		t.Fatalf("exactly reserved point response=%+v grow=%v", response, grow)

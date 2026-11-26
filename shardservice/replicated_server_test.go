@@ -33,11 +33,13 @@ type fakeReplicatedOwner struct {
 	readErr              error
 	readLease            raftservice.PointReadLease
 	readCalled           chan struct{}
+	readCalledClosed     atomic.Bool
 	transactionResult    raftservice.TransactionReadResult
 	transactionErr       error
 	transactionLease     raftservice.TransactionReadLease
 	transactionRequest   raftservice.TransactionReadRequest
 	transactionCalled    chan struct{}
+	transactionClosed    atomic.Bool
 	requestLedgerResult  raftservice.RequestLedgerReadResult
 	requestLedgerErr     error
 	requestLedgerLease   raftservice.RequestLedgerReadLease
@@ -228,12 +230,8 @@ func (owner *fakeReplicatedOwner) ReadPoint(
 	_ context.Context,
 	request raftservice.PointReadRequest,
 ) (raftservice.PointReadResult, raftservice.PointReadLease, error) {
-	if owner.readCalled != nil {
-		select {
-		case <-owner.readCalled:
-		default:
-			close(owner.readCalled)
-		}
+	if owner.readCalled != nil && owner.readCalledClosed.CompareAndSwap(false, true) {
+		close(owner.readCalled)
 	}
 	result := owner.readResult
 	result.State = owner.state
@@ -248,12 +246,8 @@ func (owner *fakeReplicatedOwner) ReadTransaction(
 	request raftservice.TransactionReadRequest,
 ) (raftservice.TransactionReadResult, raftservice.TransactionReadLease, error) {
 	owner.transactionRequest = request
-	if owner.transactionCalled != nil {
-		select {
-		case <-owner.transactionCalled:
-		default:
-			close(owner.transactionCalled)
-		}
+	if owner.transactionCalled != nil && owner.transactionClosed.CompareAndSwap(false, true) {
+		close(owner.transactionCalled)
 	}
 	result := owner.transactionResult
 	result.State = owner.state

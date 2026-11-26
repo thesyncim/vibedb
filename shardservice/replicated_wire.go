@@ -20,6 +20,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/routegate"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
+	"github.com/thesyncim/vibedb/query"
 )
 
 const (
@@ -42,7 +43,7 @@ const (
 	// Small native requests are common on persistent authenticated streams.
 	// Coalesce only complete frames up to this bound; larger borrowed payloads
 	// retain the zero-copy scatter path.
-	replicatedBorrowedCoalesceBytes = 4 << 10
+	replicatedBorrowedCoalesceBytes = 16 << 10
 )
 
 // Membership is fixed-width: the original 279-byte control body plus the
@@ -335,7 +336,9 @@ type ReplicatedResponse struct {
 	// sqlResult is populated only for an in-process semantic query. It is kept
 	// out of the wire grammar; remote callers receive Value encoded by the
 	// authenticated adapter instead.
-	sqlResult *ShardResponse
+	sqlResult  *ShardResponse
+	typedCells []query.Cell
+	sqlOwned   bool
 }
 
 // EncodeReplicatedRequest emits one canonical native request frame with a
@@ -625,7 +628,17 @@ func (f *FrameEncoder) EncodeReplicatedRequestBorrowed(w io.Writer, request *Rep
 	}
 	e.b[0] = tag
 	binary.BigEndian.PutUint32(e.b[1:5], uint32(len(e.b)+len(payload)+len(continuation.b)-1))
-	if scratch != nil && len(e.b)+len(payload)+len(continuation.b) <= replicatedBorrowedCoalesceBytes {
+	if scratch == nil {
+		if len(continuation.b) != 0 {
+			e.b = append(e.b, continuation.b...)
+		}
+		written, err := w.Write(e.b)
+		if err == nil && written != len(e.b) {
+			return io.ErrShortWrite
+		}
+		return err
+	}
+	if len(e.b)+len(payload)+len(continuation.b) <= replicatedBorrowedCoalesceBytes {
 		e.b = append(e.b, payload...)
 		e.b = append(e.b, continuation.b...)
 		written, err := w.Write(e.b)
@@ -1053,6 +1066,13 @@ func decodeReplicatedResponseLimit(r io.Reader, maxBody int) (*ReplicatedRespons
 
 func maximumReplicatedResponseBody(request *ReplicatedRequest) (int, error) {
 	if !validReplicatedRequest(request) {
+		return 0, ErrReplicatedWire
+	}
+	return maximumReplicatedResponseBodyValidated(request)
+}
+
+func maximumReplicatedResponseBodyValidated(request *ReplicatedRequest) (int, error) {
+	if request == nil {
 		return 0, ErrReplicatedWire
 	}
 	switch request.Operation {

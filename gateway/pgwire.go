@@ -808,19 +808,29 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 		}
 		materialized.Columns[i] = query.ResultColumn{Header: column.Name, Cells: cells}
 	}
-	for r, row := range result.Rows {
-		if len(row) != len(result.Columns) {
-			return ErrMergeSchema
+	cols := len(result.Columns)
+	if cols > 0 && len(result.TypedCells) == len(result.Rows)*cols {
+		for r := range result.Rows {
+			base := r * cols
+			for c := range cols {
+				materialized.Columns[c].Cells[r] = result.TypedCells[base+c]
+			}
 		}
-		for c, cell := range row {
-			if cell.Null {
-				materialized.Columns[c].Cells[r] = query.NullCell()
-			} else {
-				value, err := query.ParseJSONCell(cell.Bytes)
-				if err != nil {
-					return err
+	} else {
+		for r, row := range result.Rows {
+			if len(row) != cols {
+				return ErrMergeSchema
+			}
+			for c, cell := range row {
+				if cell.Null {
+					materialized.Columns[c].Cells[r] = query.NullCell()
+				} else {
+					value, err := query.ParseJSONCell(cell.Bytes)
+					if err != nil {
+						return err
+					}
+					materialized.Columns[c].Cells[r] = value
 				}
-				materialized.Columns[c].Cells[r] = value
 			}
 		}
 	}
