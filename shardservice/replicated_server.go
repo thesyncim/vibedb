@@ -1,6 +1,7 @@
 package shardservice
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -556,6 +557,8 @@ func (server *ReplicatedServer) ServeReplicatedConn(
 	return server.serveReplicatedConn(ctx, conn, rafttransport.NodeID{}, false, serviceauthz.AuthenticatedPeer{})
 }
 
+const replicatedServerReadBufferBytes = 32 << 10
+
 func (server *ReplicatedServer) serveReplicatedConn(
 	ctx context.Context,
 	conn net.Conn,
@@ -569,11 +572,13 @@ func (server *ReplicatedServer) serveReplicatedConn(
 	}
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
-	// One encoder serves the whole stream: every response on this
-	// connection reuses a single arena.
+	// One encoder and one buffered reader serve the whole stream: every
+	// request coalesces header+body TLS reads and every response reuses one
+	// arena.
 	var enc FrameEncoder
+	reader := bufio.NewReaderSize(conn, replicatedServerReadBufferBytes)
 	for {
-		err := server.serveReplicatedRequestAuthorized(ctx, conn, peer, authenticated, directoryPeer, &enc)
+		err := server.serveReplicatedRequestAuthorizedReader(ctx, conn, reader, peer, authenticated, directoryPeer, &enc)
 		if err != nil {
 			if errors.Is(err, errFrameBudget) {
 				server.frameRejected.Add(1)
@@ -592,7 +597,7 @@ func (server *ReplicatedServer) serveReplicatedRequest(
 
 ) error {
 	var enc FrameEncoder
-	return server.serveReplicatedRequestAuthorized(ctx, conn, rafttransport.NodeID{}, false,
+	return server.serveReplicatedRequestAuthorizedReader(ctx, conn, conn, rafttransport.NodeID{}, false,
 		serviceauthz.AuthenticatedPeer{}, &enc)
 }
 
@@ -604,13 +609,25 @@ func (server *ReplicatedServer) serveReplicatedRequestAuthorized(
 	directoryPeer serviceauthz.AuthenticatedPeer,
 	enc *FrameEncoder,
 ) error {
+	return server.serveReplicatedRequestAuthorizedReader(ctx, conn, conn, peer, authenticated, directoryPeer, enc)
+}
+
+func (server *ReplicatedServer) serveReplicatedRequestAuthorizedReader(
+	ctx context.Context,
+	conn net.Conn,
+	reader io.Reader,
+	peer rafttransport.NodeID,
+	authenticated bool,
+	directoryPeer serviceauthz.AuthenticatedPeer,
+	enc *FrameEncoder,
+) error {
 	requestCtx, cancel := context.WithTimeout(ctx, server.requestTimeout)
 	defer cancel()
 	deadline, _ := requestCtx.Deadline()
 	if err := conn.SetDeadline(deadline); err != nil {
 		return err
 	}
-	request, charged, err := decodeReplicatedRequest(conn, &server.frames)
+	request, charged, err := decodeReplicatedRequest(reader, &server.frames)
 	if err != nil {
 		return err
 	}
@@ -884,7 +901,7 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 		}
 	}
 	if request.Operation == ReplicatedQueryLeader {
-		return server.executeReplicatedQueryCallValidated(ctx, request, state, query, readAuthorize, queryValidated, fusedQuery, concurrentReadAuthorize)
+		return server.executeReplicatedQueryCallValidated(ctx, request, state, query, readAuthorize, queryValidated, sql != nil, fusedQuery, concurrentReadAuthorize)
 	}
 	if request.Operation == ReplicatedReadBatchLeader {
 		batchOwner, ok := server.owner.(interface {
@@ -1601,7 +1618,7 @@ func RoundTripReplicated(
 	request *ReplicatedRequest,
 ) (*ReplicatedResponse, error) {
 	var enc FrameEncoder
-	return roundTripReplicated(ctx, conn, request, &enc)
+	return roundTripReplicated(ctx, conn, conn, request, &enc)
 }
 
 // RoundTripReplicated performs one exact request/response exchange using this
@@ -1615,18 +1632,34 @@ func (f *FrameEncoder) RoundTripReplicated(
 	if f == nil {
 		return nil, ErrReplicatedWire
 	}
-	return roundTripReplicated(ctx, conn, request, f)
+	return roundTripReplicated(ctx, conn, conn, request, f)
+}
+
+// RoundTripReplicatedReader is RoundTripReplicated reading responses from r
+// (typically a per-connection bufio.Reader wrapping conn so header and body
+// coalesce into one TLS read). The caller exclusively holds conn, r, and f.
+func (f *FrameEncoder) RoundTripReplicatedReader(
+	ctx context.Context,
+	conn net.Conn,
+	r io.Reader,
+	request *ReplicatedRequest,
+) (*ReplicatedResponse, error) {
+	if f == nil || r == nil {
+		return nil, ErrReplicatedWire
+	}
+	return roundTripReplicated(ctx, conn, r, request, f)
 }
 
 // roundTripReplicated is RoundTripReplicated with an explicit encoder for the
-// request prefix. enc must be exclusively held for the call.
+// request prefix and response reader. enc and r must be exclusively held.
 func roundTripReplicated(
 	ctx context.Context,
 	conn net.Conn,
+	r io.Reader,
 	request *ReplicatedRequest,
 	enc *FrameEncoder,
 ) (*ReplicatedResponse, error) {
-	if ctx == nil || conn == nil || request == nil {
+	if ctx == nil || conn == nil || r == nil || request == nil {
 		return nil, ErrReplicatedWire
 	}
 	if deadline, ok := ctx.Deadline(); ok {
@@ -1658,11 +1691,11 @@ func roundTripReplicated(
 		}
 		return nil, err
 	}
-	maximumResponse, boundErr := maximumReplicatedResponseBody(request)
+	maximumResponse, boundErr := maximumReplicatedResponseBodyValidated(request)
 	if boundErr != nil {
 		return nil, boundErr
 	}
-	response, err := decodeReplicatedResponseLimit(conn, maximumResponse)
+	response, err := decodeReplicatedResponseLimit(r, maximumResponse)
 	if err != nil && request.Operation == ReplicatedPropose {
 		return nil, &raftservice.UnknownOutcomeError{
 			Command: append([]byte(nil), request.Command...), Cause: err,

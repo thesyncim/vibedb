@@ -118,6 +118,9 @@ func refreshRF3FrontendDrainServiceCut(
 	if !cut.Valid() || !cut.AtLeastFloor(floor) {
 		return errRF3FrontendDrainCutRefreshState
 	}
+	if haveFloor && cut.ReadFloor() == floor {
+		return nil
+	}
 	applied, err := server.InstallFrontendDrainServiceCut(ctx, cut)
 	if err != nil {
 		return errors.Join(errRF3FrontendDrainCutRefreshState, err)
@@ -184,7 +187,11 @@ func runRF3FrontendDrainServiceCutRefresh(
 			// distinguish a missing source from an installed-gate denial.
 			reportError(err)
 		}
-		timer := time.NewTimer(interval)
+		wait := interval
+		if readyClosed && wait < 5*time.Second {
+			wait = 5 * time.Second
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			// Readiness is a success-only latch. Cancellation is delivered through

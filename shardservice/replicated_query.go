@@ -91,7 +91,7 @@ func (server *ReplicatedServer) executeReplicatedQueryCall(
 	semantic *ShardRequest,
 	authorize raftservice.ProposalAuthorization,
 ) *ReplicatedResponse {
-	return server.executeReplicatedQueryCallValidated(ctx, request, state, semantic, authorize, false, false)
+	return server.executeReplicatedQueryCallValidated(ctx, request, state, semantic, authorize, false, semantic != nil, false)
 }
 
 func (server *ReplicatedServer) executeReplicatedQueryCallValidated(
@@ -101,6 +101,7 @@ func (server *ReplicatedServer) executeReplicatedQueryCallValidated(
 	semantic *ShardRequest,
 	authorize raftservice.ProposalAuthorization,
 	semanticValidated bool,
+	inProcessSemantic bool,
 	fusedPoint bool,
 	concurrentAuthorize ...raftservice.ConcurrentReadAuthorization,
 ) *ReplicatedResponse {
@@ -170,7 +171,7 @@ func (server *ReplicatedServer) executeReplicatedQueryCallValidated(
 		maximum = int(inner.MaxResultBytes)
 	}
 	key := hashSQLBudgetKey(inner.SQL)
-	semanticDirect := semantic != nil && semanticValidated
+	semanticDirect := inProcessSemantic && semantic != nil && semanticValidated
 	var directAuthorize raftservice.ConcurrentReadAuthorization
 	if len(concurrentAuthorize) != 0 {
 		directAuthorize = concurrentAuthorize[0]

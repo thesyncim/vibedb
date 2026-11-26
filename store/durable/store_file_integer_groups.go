@@ -118,3 +118,67 @@ func (s *Snapshot) FilterIntegerGroupsWithScratch(
 		Scanned: progress.Scanned, Supported: true,
 	}, nil
 }
+
+// FilterIntegerGroupsBatchWithScratch is the batched counterpart of
+// FilterIntegerGroupsWithScratch, delivering up to 32 rows per callback.
+func (s *Snapshot) FilterIntegerGroupsBatchWithScratch(
+	f *IntegerGroupFilter,
+	shapeSeen []int,
+	shapeWork []storeio.IntegerGroupShapeWorkspace,
+	visitBatch func(startRow uint64, groups, sums []int64) error,
+) (FilterIntegerGroupsResult, error) {
+	if s == nil || s.collection == nil || s.state == nil {
+		return FilterIntegerGroupsResult{}, ErrClosed
+	}
+	if f == nil || f.inner == nil || visitBatch == nil {
+		return FilterIntegerGroupsResult{}, fmt.Errorf("vibedb: nil unified integer group filter")
+	}
+	state := s.state
+	catalogBounds := storeio.GlobalTabletCatalogBounds{
+		StoreID:                state.root.StoreID,
+		SelectedRootGeneration: state.root.Generation,
+		FileEnd:                state.fileEnd,
+		NextLogicalID:          state.root.NextLogicalID,
+	}
+	leafBounds := storeio.CommonPrimaryLeafBounds{
+		FileEnd:           state.fileEnd,
+		NextLogicalID:     state.root.NextLogicalID,
+		AllocationQuantum: state.root.PageSize,
+	}
+	var cursor storeio.PrimaryGraphCursor
+	if err := storeio.InitPrimaryGraphCursor(
+		&cursor, s.collection.cache, state.root.PrimaryRoot,
+		catalogBounds, leafBounds, nil, nil,
+	); err != nil {
+		return FilterIntegerGroupsResult{}, err
+	}
+	defer cursor.Close()
+	if cap(shapeSeen) < storeio.CompactPrimaryStripeMaxRows {
+		shapeSeen = make([]int, storeio.CompactPrimaryStripeMaxRows)
+	}
+	shapeSeen = shapeSeen[:storeio.CompactPrimaryStripeMaxRows]
+	if cap(shapeWork) < storeio.CompactPrimaryStripeMaxRows {
+		shapeWork = make(
+			[]storeio.IntegerGroupShapeWorkspace,
+			storeio.CompactPrimaryStripeMaxRows,
+		)
+	}
+	shapeWork = shapeWork[:storeio.CompactPrimaryStripeMaxRows]
+	defer func() {
+		clear(shapeSeen)
+		clear(shapeWork)
+	}()
+	var progress storeio.UnifiedIntegerGroupProgress
+	supported, err := cursor.FilterIntegerGroupsBatch(
+		f.inner, &progress, shapeSeen, shapeWork, visitBatch,
+	)
+	if err != nil {
+		return FilterIntegerGroupsResult{}, err
+	}
+	if !supported {
+		return FilterIntegerGroupsResult{}, nil
+	}
+	return FilterIntegerGroupsResult{
+		Scanned: progress.Scanned, Supported: true,
+	}, nil
+}

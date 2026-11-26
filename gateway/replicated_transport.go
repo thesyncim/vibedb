@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"net"
@@ -60,8 +61,11 @@ type AuthenticatedReplicatedClientOptions struct {
 	MaxLifetime            time.Duration
 }
 
+const replicatedTransportReadBufferBytes = 32 << 10
+
 type pooledReplicatedConn struct {
 	conn                         rafttransport.PeerConnection
+	reader                       *bufio.Reader
 	encoder                      shardservice.FrameEncoder
 	endpoint                     replicatedTransportEndpoint
 	created                      time.Time
@@ -414,7 +418,15 @@ func (client *AuthenticatedReplicatedClient) acquireClass(
 				client.mu.Unlock()
 				return nil, ErrReplicatedTLSProfile
 			}
-			connection := &pooledReplicatedConn{conn: authenticated, endpoint: physical, created: now, lastUsed: now, generation: generation, control: control}
+			connection := &pooledReplicatedConn{
+				conn:       authenticated,
+				reader:     bufio.NewReaderSize(authenticated, replicatedTransportReadBufferBytes),
+				endpoint:   physical,
+				created:    now,
+				lastUsed:   now,
+				generation: generation,
+				control:    control,
+			}
 			client.active[connection] = struct{}{}
 			client.mu.Unlock()
 			client.dials.Add(1)
@@ -495,11 +507,11 @@ func (client *AuthenticatedReplicatedClient) DoReplicated(ctx context.Context, e
 	if err != nil {
 		return nil, err
 	}
-	response, err := connection.encoder.RoundTripReplicated(ctx, connection.conn, request)
+	response, err := connection.encoder.RoundTripReplicatedReader(ctx, connection.conn, connection.reader, request)
 	identityMismatch := err == nil && response != nil && response.HasState &&
 		(response.State.Fence.MemberID != endpoint.Member || response.State.Fence.StoreID != endpoint.StoreID ||
 			response.State.Fence.NodeIncarnation != endpoint.NodeIncarnation)
-	healthy := err == nil && !identityMismatch && context.Cause(ctx) == nil
+	healthy := err == nil && !identityMismatch && context.Cause(ctx) == nil && connection.reader.Buffered() == 0
 	client.release(connection, healthy)
 	if identityMismatch {
 		return nil, ErrReplicatedRoute
