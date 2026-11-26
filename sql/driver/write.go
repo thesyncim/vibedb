@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -1221,6 +1222,14 @@ func (c *conn) insertSelectLocked(
 	}()
 	c.pointDocs.Reset()
 	conflictScratch := c.pointRaw[:0]
+	var colKeyJSON [][]byte
+	var rowDocBuf []byte
+	if len(tree.Columns) > 0 {
+		colKeyJSON = make([][]byte, len(tree.Columns))
+		for i, col := range tree.Columns {
+			colKeyJSON[i] = strconv.AppendQuote(nil, col.Spec())
+		}
+	}
 	stagedBytes := 0
 	cancellable := ctx.Done() != nil
 	row := 0
@@ -1239,15 +1248,35 @@ func (c *conn) insertSelectLocked(
 				return nil, err
 			}
 		}
-		cell := cursor.Cell(0)
-		if cell.Kind() != query.TypeJSON {
-			c.pointRaw = conflictScratch
-			return nil, &query.InsertSelectShapeError{
-				Pos: insertSelectOutputPosition(tree), Columns: 1,
-				Type: cell.Kind(), Row: row,
+		var document []byte
+		if len(colKeyJSON) > 0 {
+			rowDocBuf = append(rowDocBuf[:0], '{')
+			for ci, keyBytes := range colKeyJSON {
+				if ci > 0 {
+					rowDocBuf = append(rowDocBuf, ',')
+				}
+				rowDocBuf = append(rowDocBuf, keyBytes...)
+				rowDocBuf = append(rowDocBuf, ':')
+				cell := cursor.Cell(ci)
+				if cell.IsNull() {
+					rowDocBuf = append(rowDocBuf, "null"...)
+				} else {
+					rowDocBuf = cell.AppendJSON(rowDocBuf)
+				}
 			}
+			rowDocBuf = append(rowDocBuf, '}')
+			document = append([]byte(nil), rowDocBuf...)
+		} else {
+			cell := cursor.Cell(0)
+			if cell.Kind() != query.TypeJSON {
+				c.pointRaw = conflictScratch
+				return nil, &query.InsertSelectShapeError{
+					Pos: insertSelectOutputPosition(tree), Columns: 1,
+					Type: cell.Kind(), Row: row,
+				}
+			}
+			document = cell.Payload()
 		}
-		document := cell.Payload()
 		if err := validateDocumentWithIntermediateBudget(
 			t.schema, document, limits.MaxDocumentBytes, &c.insertTape,
 			&intermediate,

@@ -12,14 +12,9 @@ type SQLWorkloadGap struct {
 
 var SQLWorkloadGaps = []SQLWorkloadGap{
 	{"composite_primary_key", `CREATE TABLE compatibility_members (app_pk INT, channel_cid TEXT, user_id TEXT, PRIMARY KEY (app_pk, channel_cid, user_id))`},
-	{"partial_index", `CREATE INDEX compatibility_partial ON compatibility_docs(n) WHERE n > 0`},
-	{"expression_index", `CREATE INDEX compatibility_expression ON compatibility_docs(GREATEST(n, 0))`},
-	{"covering_index", `CREATE INDEX compatibility_covering ON compatibility_docs(n) INCLUDE (hidden)`},
-	{"descending_index", `CREATE INDEX compatibility_desc ON compatibility_docs(n DESC)`},
 	{"update_from", `UPDATE compatibility_docs SET n = changes.n FROM compatibility_changes AS changes WHERE compatibility_docs.id = changes.id`},
 	{"delete_using", `DELETE FROM compatibility_docs USING compatibility_changes WHERE compatibility_docs.id = compatibility_changes.id`},
 	{"mutation_cte", `WITH removed AS (DELETE FROM compatibility_docs WHERE id = 'a' RETURNING n) SELECT n FROM removed`},
-	{"insert_select_columns", `INSERT INTO compatibility_docs (id, n) SELECT id, n FROM compatibility_changes`},
 	{"derived_wildcard_scalar_projection", `SELECT d.*, COALESCE(d.n, 0) FROM (SELECT * FROM compatibility_docs) AS d`},
 	{"composite_conflict_target", `INSERT INTO compatibility_docs (id, n) VALUES ('a', 0) ON CONFLICT (id, n) DO NOTHING`},
 	{"copy", `COPY compatibility_docs FROM STDIN`},

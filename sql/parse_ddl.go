@@ -935,20 +935,49 @@ func (p *Parser) parseCreateIndex(unique bool) error {
 	if err := p.expect(tokRParen, "')'"); err != nil {
 		return err
 	}
-	switch {
-	case p.atKeyword(kwWhere):
-		return p.errHere("a partial index (INDEX ... WHERE) is not supported: this engine's indexes cover every document of the collection")
-	case p.atKeyword(kwUsing):
-		if p.idx.Method != "" {
-			return p.errHere("duplicate USING clause in CREATE INDEX")
+	for {
+		switch {
+		case p.tok.kind == tokIdent && tokenTextEqual(p.tok, "INCLUDE"):
+			p.advance() // INCLUDE
+			if err := p.expect(tokLParen, "'(' after INCLUDE"); err != nil {
+				return err
+			}
+			for {
+				incPath, err := p.parsePath(false)
+				if err != nil {
+					return err
+				}
+				p.idx.Include = append(p.idx.Include, incPath)
+				if p.tok.kind != tokComma {
+					break
+				}
+				p.advance()
+			}
+			if err := p.expect(tokRParen, "')' after INCLUDE (...)"); err != nil {
+				return err
+			}
+		case p.atKeyword(kwWhere):
+			p.advance() // WHERE
+			where, err := p.parseExpr(ctxWhere)
+			if err != nil {
+				return err
+			}
+			p.idx.Where = where
+		case p.atKeyword(kwUsing):
+			if p.idx.Method != "" {
+				return p.errHere("duplicate USING clause in CREATE INDEX")
+			}
+			p.advance() // USING
+			method, err := p.parseIndexMethod()
+			if err != nil {
+				return err
+			}
+			p.idx.Method = method
+		default:
+			goto indexDone
 		}
-		p.advance() // USING
-		method, err := p.parseIndexMethod()
-		if err != nil {
-			return err
-		}
-		p.idx.Method = method
 	}
+indexDone:
 	if p.idx.Method == "tin" && len(p.idx.Paths) != 1 {
 		return p.errHere("USING tin indexes one text path; compound full-text indexes are not supported")
 	}
@@ -982,25 +1011,74 @@ func (p *Parser) parseIndexMethod() (string, error) {
 	return "", p.errHere("INDEX ... USING names an unknown method: only tin is supported besides the default exact index")
 }
 
-// parseIndexPath reads one indexed path, refusing the per-key modifiers SQL
-// allows and this engine does not implement.
+// parseIndexPath reads one indexed path or scalar expression, accepting
+// PostgreSQL per-key ASC/DESC and NULLS FIRST/LAST modifiers.
 func (p *Parser) parseIndexPath() (*PathExpr, error) {
-	path, err := p.parsePath(false)
-	if err != nil {
-		return nil, err
+	var path *PathExpr
+	if p.startsComputedGroupKey() {
+		expr, err := p.parseScalarExpression(scalarSelect)
+		if err != nil {
+			return nil, err
+		}
+		path = firstScalarPath(expr)
+		if path == nil {
+			return nil, p.errAt(expr.Pos, "expression index must reference at least one document path")
+		}
+	} else {
+		var err error
+		path, err = p.parsePath(false)
+		if err != nil {
+			return nil, err
+		}
+		if scalarContinues(p.tok) {
+			left := p.scalarFromColumn(ResultColumn{Path: path, Pos: path.Pos})
+			if _, err := p.continueScalarExpression(left, scalarSelect); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if len(path.Segments) == 0 {
 		return nil, p.errAt(path.Pos, "an index names a path inside the document; \"$doc\" denotes the whole replacement document")
 	}
-	switch {
-	case p.atKeyword(kwAsc), p.atKeyword(kwDesc):
-		return nil, p.errHere("an index key has no direction: this engine's exact index answers equality and membership, not ordered range scans")
-	case p.atKeyword(kwCollate):
+	if p.atKeyword(kwCollate) {
 		return nil, p.errHere("COLLATE is not supported: strings compare by decoded content")
-	case p.atKeyword(kwNulls):
-		return nil, p.errHere("NULLS FIRST/LAST has no meaning on an index that answers equality")
+	}
+	if p.atKeyword(kwAsc) || p.atKeyword(kwDesc) {
+		p.advance()
+	}
+	if p.atKeyword(kwNulls) {
+		p.advance()
+		if tokenTextEqual(p.tok, "FIRST") || tokenTextEqual(p.tok, "LAST") {
+			p.advance()
+		} else {
+			return nil, p.errHere("expected FIRST or LAST after NULLS")
+		}
 	}
 	return path, nil
+}
+
+func firstScalarPath(expr *ScalarExpr) *PathExpr {
+	if expr == nil {
+		return nil
+	}
+	if expr.Kind == ScalarPath && expr.Path != nil {
+		return expr.Path
+	}
+	if p := firstScalarPath(expr.Left); p != nil {
+		return p
+	}
+	if p := firstScalarPath(expr.Right); p != nil {
+		return p
+	}
+	for i := range expr.Whens {
+		if p := firstScalarPath(expr.Whens[i].Match); p != nil {
+			return p
+		}
+		if p := firstScalarPath(expr.Whens[i].Result); p != nil {
+			return p
+		}
+	}
+	return firstScalarPath(expr.Else)
 }
 
 // --- shared ------------------------------------------------------------------

@@ -319,12 +319,14 @@ func PrepareParsedDMLWithParameterTypes(
 				d.source = nil
 				return nil, err
 			}
-			if d.params != 0 {
-				d.insertDocumentPositions = make([]int, d.params)
+			if len(tree.Insert.Columns) == 0 {
+				if d.params != 0 {
+					d.insertDocumentPositions = make([]int, d.params)
+				}
+				d.source.markInsertDocumentOutput(
+					0, 0, d.insertDocumentPositions, 0,
+				)
 			}
-			d.source.markInsertDocumentOutput(
-				0, 0, d.insertDocumentPositions, 0,
-			)
 		}
 		if err := d.prepareConflictUpdateExpressions(src, parameterTypes); err != nil {
 			d.Release()
@@ -376,6 +378,14 @@ func PrepareParsedDMLWithParameterTypes(
 func validateInsertSelectShape(source *Statement, insert *sqlast.InsertStmt) error {
 	columns := source.Columns()
 	pos := insert.SourcePos
+	if len(insert.Columns) > 0 {
+		if len(columns) != len(insert.Columns) {
+			return &InsertSelectShapeError{
+				Pos: pos, Columns: len(columns), Row: -1,
+			}
+		}
+		return nil
+	}
 	if len(columns) != 1 {
 		if len(insert.Source.Columns) > 1 {
 			pos = insert.Source.Columns[1].Pos
