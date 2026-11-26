@@ -3033,6 +3033,10 @@ func (p *Parser) parseLimitOffset() error {
 				return p.errHere("LIMIT is given twice")
 			}
 			p.advance()
+			if p.acceptKeyword(kwAll) {
+				// PostgreSQL LIMIT ALL means unbounded.
+				continue
+			}
 			op, err := p.parseRowCount("LIMIT")
 			if err != nil {
 				return err
@@ -3048,8 +3052,36 @@ func (p *Parser) parseLimitOffset() error {
 				return err
 			}
 			p.out.Offset = op
+			if tokenTextEqual(p.tok, "ROW") || tokenTextEqual(p.tok, "ROWS") {
+				p.advance()
+			}
 		case p.atKeyword(kwFetch):
-			return p.errHere("FETCH FIRST is not supported; write LIMIT")
+			if p.out.Limit != nil {
+				return p.errHere("LIMIT/FETCH is given twice")
+			}
+			p.advance() // FETCH
+			if !tokenTextEqual(p.tok, "FIRST") && !tokenTextEqual(p.tok, "NEXT") {
+				return p.errHere("expected FIRST or NEXT after FETCH")
+			}
+			p.advance()
+			if tokenTextEqual(p.tok, "ROW") || tokenTextEqual(p.tok, "ROWS") {
+				p.out.Limit = &Operand{Kind: OperandNumber, Text: "1", Pos: p.tok.pos}
+				p.advance()
+			} else {
+				op, err := p.parseRowCount("FETCH")
+				if err != nil {
+					return err
+				}
+				p.out.Limit = op
+				if !tokenTextEqual(p.tok, "ROW") && !tokenTextEqual(p.tok, "ROWS") {
+					return p.errHere("expected ROW or ROWS in FETCH clause")
+				}
+				p.advance()
+			}
+			if !tokenTextEqual(p.tok, "ONLY") {
+				return p.errHere("expected ONLY after FETCH ... ROWS (WITH TIES is not supported)")
+			}
+			p.advance()
 		default:
 			return nil
 		}
