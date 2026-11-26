@@ -59,6 +59,43 @@ type IndexInfo struct {
 // storage with the catalog, so a caller may hold it across later DDL without
 // observing mutation. This is a cold-path read for introspection; it is not
 // allocation-free and is not meant to sit on a query path.
+// A ViewInfo describes one cataloged read-only SQL view.
+type ViewInfo struct {
+	Name    string
+	Query   string
+	Columns []string
+	Outputs []string
+}
+
+// Views returns the cataloged SQL views sorted by name.
+func (s *Session) Views(ctx context.Context) ([]ViewInfo, error) {
+	if err := s.live(); err != nil {
+		return nil, err
+	}
+	d := s.conn.db
+	if err := rlockContext(ctx, &d.mu); err != nil {
+		return nil, err
+	}
+	defer d.mu.RUnlock()
+	if d.closed {
+		return nil, ErrDatabaseClosed
+	}
+	out := make([]ViewInfo, 0, len(d.catalog.Views))
+	for name, meta := range d.catalog.Views {
+		info := ViewInfo{
+			Name:    name,
+			Query:   meta.Query,
+			Columns: slices.Clone(meta.Columns),
+			Outputs: slices.Clone(meta.Outputs),
+		}
+		out = append(out, info)
+	}
+	slices.SortFunc(out, func(a, b ViewInfo) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return out, nil
+}
+
 func (s *Session) Tables(ctx context.Context) ([]TableInfo, error) {
 	if err := s.live(); err != nil {
 		return nil, err

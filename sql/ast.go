@@ -594,7 +594,13 @@ type WindowExpr struct {
 	Default     Operand
 	HasDefault  bool
 	DefaultNull bool
-	Spec        WindowSpec
+	// IgnoreNulls records IGNORE NULLS on value/navigation window functions.
+	IgnoreNulls bool
+	// FromLast records FROM LAST on NTH_VALUE.
+	FromLast bool
+	// Distinct records DISTINCT on window aggregate calls.
+	Distinct bool
+	Spec     WindowSpec
 	// DirectName is true for OVER name. False with Spec.Name set represents
 	// OVER (name ...), whose SQL inheritance restrictions are stricter.
 	DirectName bool

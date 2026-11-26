@@ -52,8 +52,8 @@ func (p *Parser) parseDropTable() error {
 			}
 		}
 	}
-	behavior := p.acceptUnsupportedDropBehavior()
-	if multiple || behavior {
+	behavior := p.acceptDropBehavior()
+	if multiple || behavior == dropCascade {
 		if err := p.expectEnd(); err != nil {
 			return err
 		}
@@ -63,7 +63,7 @@ func (p *Parser) parseDropTable() error {
 			)
 		}
 		return p.featureNotSupportedHere(
-			"DROP TABLE CASCADE/RESTRICT is not supported; remove dependencies explicitly",
+			"DROP TABLE CASCADE is not supported; remove dependencies explicitly",
 		)
 	}
 	if err := p.rejectAlias(); err != nil {
@@ -97,8 +97,8 @@ func (p *Parser) parseDropIndex() error {
 			}
 		}
 	}
-	behavior := p.acceptUnsupportedDropBehavior()
-	if multiple || behavior {
+	behavior := p.acceptDropBehavior()
+	if multiple || behavior == dropCascade {
 		if err := p.expectEnd(); err != nil {
 			return err
 		}
@@ -108,7 +108,7 @@ func (p *Parser) parseDropIndex() error {
 			)
 		}
 		return p.featureNotSupportedHere(
-			"DROP INDEX CASCADE/RESTRICT is not supported",
+			"DROP INDEX CASCADE is not supported",
 		)
 	}
 	if p.acceptKeyword(kwOn) {
@@ -119,12 +119,12 @@ func (p *Parser) parseDropIndex() error {
 		p.dropIndex.Table = table
 		p.dropIndex.HasTable = true
 		p.dropIndex.TablePos = pos
-		if p.acceptUnsupportedDropBehavior() {
+		if p.acceptDropBehavior() == dropCascade {
 			if err := p.expectEnd(); err != nil {
 				return err
 			}
 			return p.featureNotSupportedHere(
-				"DROP INDEX CASCADE/RESTRICT is not supported",
+				"DROP INDEX CASCADE is not supported",
 			)
 		}
 		if err := p.rejectAlias(); err != nil {
@@ -161,8 +161,8 @@ func (p *Parser) parseTruncate() error {
 		}
 		p.advance()
 	}
-	behavior := p.acceptUnsupportedDropBehavior()
-	if multiple || identity || behavior {
+	behavior := p.acceptDropBehavior()
+	if multiple || identity || behavior == dropCascade {
 		if err := p.expectEnd(); err != nil {
 			return err
 		}
@@ -177,7 +177,7 @@ func (p *Parser) parseTruncate() error {
 			)
 		default:
 			return p.featureNotSupportedHere(
-				"TRUNCATE CASCADE/RESTRICT is not supported",
+				"TRUNCATE CASCADE is not supported",
 			)
 		}
 	}
@@ -187,12 +187,24 @@ func (p *Parser) parseTruncate() error {
 	return p.expectEnd()
 }
 
-func (p *Parser) acceptUnsupportedDropBehavior() bool {
-	if !tokenTextEqual(p.tok, "CASCADE") && !tokenTextEqual(p.tok, "RESTRICT") {
-		return false
+type dropBehavior uint8
+
+const (
+	dropBehaviorNone dropBehavior = iota
+	dropRestrict
+	dropCascade
+)
+
+func (p *Parser) acceptDropBehavior() dropBehavior {
+	if tokenTextEqual(p.tok, "CASCADE") {
+		p.advance()
+		return dropCascade
 	}
-	p.advance()
-	return true
+	if tokenTextEqual(p.tok, "RESTRICT") {
+		p.advance()
+		return dropRestrict
+	}
+	return dropBehaviorNone
 }
 
 // parseUnsupportedDrop validates the complete structural grammar before
@@ -252,7 +264,7 @@ func (p *Parser) parseUnsupportedDrop() error {
 		}
 	}
 	if kind != "DATABASE" && kind != "ROLE" && kind != "USER" {
-		p.acceptUnsupportedDropBehavior()
+		p.acceptDropBehavior()
 	}
 	if err := p.expectEnd(); err != nil {
 		return err

@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"context"
 	"strconv"
 	"strings"
 
@@ -265,6 +266,7 @@ type catalogAnswer struct {
 	database string
 	user     string
 	tables   []sqldriver.TableInfo
+	views    []sqldriver.ViewInfo
 	oids     []catalogOIDEntry
 	oidMap   map[string]uint32
 }
@@ -346,8 +348,16 @@ func (s *session) catalogShim(
 	if !s.ensureCatalogOIDs(tables) {
 		return nil, false, nil
 	}
+	var views []sqldriver.ViewInfo
+	if lister, ok := s.sql.(interface {
+		Views(context.Context) ([]sqldriver.ViewInfo, error)
+	}); ok {
+		if v, vErr := lister.Views(s.operationContext()); vErr == nil {
+			views = v
+		}
+	}
 	answer := catalogAnswer{
-		database: s.database, user: s.user, tables: tables, oids: s.catalogOIDs,
+		database: s.database, user: s.user, tables: tables, views: views, oids: s.catalogOIDs,
 	}
 	fixed := shape.respond(&answer, capture)
 	if fixed == nil {
@@ -447,9 +457,15 @@ func respondListRelations(a *catalogAnswer, _ string) *fixedResult {
 	return catalogResult(textCols("Schema", "Name", "Type", "Owner"), rows)
 }
 
-func respondListViews(*catalogAnswer, string) *fixedResult {
-	// There are no views; psql prints its own "Did not find any views."
-	return catalogResult(textCols("Schema", "Name", "Type", "Owner"), nil)
+func respondListViews(a *catalogAnswer, _ string) *fixedResult {
+	rows := make([][]*string, 0, len(a.views))
+	for i := range a.views {
+		rows = append(rows, []*string{
+			strPtr("public"), strPtr(a.views[i].Name),
+			strPtr("view"), strPtr(a.user),
+		})
+	}
+	return catalogResult(textCols("Schema", "Name", "Type", "Owner"), rows)
 }
 
 func respondListFunctions(*catalogAnswer, string) *fixedResult {

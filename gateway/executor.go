@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -325,6 +326,23 @@ func (e *Executor) queryWithProfileValidation(
 			// Query is the read path: it fans out and merges, so it must never
 			// partially commit a mutation. Writes dispatch through Exec instead.
 			return nil, &WriteNotSupportedError{Kind: prepared.statement.Kind}
+		}
+		if prepared.statement.Explain {
+			res, explainErr := e.executeExplain(attemptContext, snap, q, prepared, profile, args)
+			if explainErr == nil {
+				res.Retries = attempt
+				if nativeAttempt != nil {
+					res.Observations = nativeAttempt.resultObservations()
+				}
+				return res, nil
+			}
+			if isStaleErr(explainErr) && attempt < e.maxRetry {
+				staleGen = snap.Generation()
+				attempt++
+				e.metrics.observeRetry()
+				continue
+			}
+			return nil, explainErr
 		}
 		if prepared.manifest == nil {
 			res, coordinatorErr := e.queryCoordinator(attemptContext, snap, q, prepared, profile, args)
@@ -835,6 +853,10 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 		return nil, &WriteNotSupportedError{Kind: prepared.statement.Kind}
 	}
 	profile := e.profileFor(q.Class)
+	return e.explainPrepared(ctx, snap, q, prepared, profile, args)
+}
+
+func (e *Executor) explainPrepared(ctx context.Context, snap *Snapshot, q Query, prepared *PreparedPlan, profile Profile, args []any) (*Explanation, error) {
 	if prepared.manifest == nil {
 		return e.explainCoordinator(ctx, snap, q, prepared, profile, args)
 	}
@@ -905,6 +927,82 @@ func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 		RouteKind: physical.kind, Generation: physical.generation,
 		Shards: len(physical.calls), ScatterReason: physical.scatter,
 	}, nil
+}
+
+type explainAnalyzeStats struct {
+	Elapsed      time.Duration
+	Rows         int
+	ShardsFanned int
+}
+
+func (e *Executor) executeExplain(ctx context.Context, snap *Snapshot, q Query, prepared *PreparedPlan, profile Profile, args []any) (*Result, error) {
+	exp, err := e.explainPrepared(ctx, snap, q, prepared, profile, args)
+	if err != nil {
+		return nil, err
+	}
+	var analyzed *explainAnalyzeStats
+	if prepared.statement.Analyze {
+		inner := q
+		inner.SQL = stripLeadingExplain(q.SQL)
+		started := time.Now()
+		res, runErr := e.queryWithProfileValidation(ctx, inner, profile, -1)
+		if runErr != nil {
+			return nil, runErr
+		}
+		analyzed = &explainAnalyzeStats{
+			Elapsed:      time.Since(started),
+			Rows:         len(res.Rows),
+			ShardsFanned: res.ShardsFanned,
+		}
+	}
+	return formatExplainResult(snap, exp, analyzed), nil
+}
+
+func formatExplainResult(snap *Snapshot, exp *Explanation, analyzed *explainAnalyzeStats) *Result {
+	var b strings.Builder
+	if exp.PhysicalPlan != "" {
+		b.WriteString(exp.PhysicalPlan)
+	} else {
+		fmt.Fprintf(&b, "DistributedPlan(route=%s, shards=%d)", exp.RouteKind, exp.Shards)
+	}
+	fmt.Fprintf(&b, "\nRoute: %s, Shards: %d", exp.RouteKind, exp.Shards)
+	if exp.ScatterReason != ScatterNone {
+		fmt.Fprintf(&b, ", Scatter: %s", exp.ScatterReason)
+	}
+	if exp.PlanFingerprint != "" {
+		fmt.Fprintf(&b, "\nFingerprint: %s", exp.PlanFingerprint)
+	}
+	if analyzed != nil {
+		fmt.Fprintf(&b, "\nActual Rows: %d, Shards Fanned: %d, Execution Time: %.3f ms",
+			analyzed.Rows, analyzed.ShardsFanned, float64(analyzed.Elapsed.Nanoseconds())/1e6)
+	}
+	lines := strings.Split(b.String(), "\n")
+	rows := make([][]shardservice.Cell, 0, len(lines))
+	for _, line := range lines {
+		rows = append(rows, []shardservice.Cell{{Bytes: strconv.AppendQuote(nil, line)}})
+	}
+	return &Result{
+		Kind:            shardservice.ResponseRows,
+		Columns:         []shardservice.Column{{Name: "QUERY PLAN", TypeOID: 25}},
+		Rows:            rows,
+		Generation:      snap.Generation(),
+		RouteKind:       exp.RouteKind,
+		ShardsFanned:    exp.Shards,
+		ScatterReason:   exp.ScatterReason,
+		PlanFingerprint: exp.PlanFingerprint,
+		Planning:        exp.Planning,
+	}
+}
+
+func stripLeadingExplain(text string) string {
+	rest := strings.TrimSpace(text)
+	if len(rest) >= 7 && strings.EqualFold(rest[:7], "EXPLAIN") {
+		rest = strings.TrimSpace(rest[7:])
+		if len(rest) >= 7 && strings.EqualFold(rest[:7], "ANALYZE") {
+			rest = strings.TrimSpace(rest[7:])
+		}
+	}
+	return rest
 }
 
 func queryRuntimeArgs(params []shardservice.Param) ([]any, error) {

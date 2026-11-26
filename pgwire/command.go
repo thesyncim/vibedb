@@ -77,8 +77,9 @@ const (
 // a reader of the message can act on, which is the whole reason the table
 // exists instead of a default branch saying "unsupported statement".
 var unsupportedStatements = map[string]string{
-	"MERGE": "MERGE is not in the bounded mutation subset; use explicit INSERT, UPDATE, or DELETE",
-	"COPY":  "COPY is not supported: this server implements the simple and extended query protocols and not the copy subprotocol",
+	"MERGE":   "MERGE is not in the bounded mutation subset; use explicit INSERT, UPDATE, or DELETE",
+	"REPLACE": "REPLACE is not supported; INSERT into an existing key is refused, and deliberate overwrites use UPDATE",
+	"COPY":    "COPY is not supported: this server implements the simple and extended query protocols and not the copy subprotocol",
 
 	"GRANT":   "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",
 	"REVOKE":  "there is no SQL privilege catalog: connection authentication authorizes the configured database as one unit",

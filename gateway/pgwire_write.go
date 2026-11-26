@@ -380,7 +380,7 @@ func (p *postgresWriteStatement) Exec(ctx context.Context, args []any) (driver.R
 		return driver.Result{}, errors.Join(driver.ErrTransactionConflict, err)
 	}
 	if errors.Is(err, ErrReplicatedSQLTransactionUnsupported) {
-		return driver.Result{}, sqlast.NewFeatureNotSupportedError(p.text, 0, "RF3 writes require INSERT VALUES, primary-key UPDATE, or primary-key equality/IN DELETE without RETURNING or ON CONFLICT")
+		return driver.Result{}, sqlast.NewFeatureNotSupportedError(p.text, 0, "RF3 writes require INSERT VALUES (optional primary-key ON CONFLICT without global indexes), primary-key UPDATE, or primary-key equality/IN DELETE without RETURNING")
 	}
 	if err != nil {
 		return driver.Result{}, err

@@ -56,8 +56,35 @@ func (p *Parser) parseCreate(dst *Statement) error {
 		return p.featureNotSupportedHere(
 			"CREATE OR REPLACE VIEW is not supported because replacing a durable definition requires dependency-generation invalidation; use DROP VIEW followed by CREATE VIEW",
 		)
+	case p.tok.kind == tokIdent && isUnsupportedCreateObject(p.tok.text):
+		return p.featureNotSupportedHere(
+			"CREATE " + asciiUpper(p.tok.text) + " is not supported",
+		)
 	}
 	return p.errHere("expected TABLE, INDEX, VIEW, or MATERIALIZED VIEW after CREATE")
+}
+
+func isUnsupportedCreateObject(name string) bool {
+	switch asciiUpper(name) {
+	case "SCHEMA", "SEQUENCE", "TYPE", "DOMAIN", "FUNCTION", "PROCEDURE",
+		"TRIGGER", "EXTENSION", "ROLE", "USER", "POLICY", "DATABASE",
+		"PUBLICATION", "SUBSCRIPTION", "TABLESPACE", "COLLATION",
+		"AGGREGATE", "OPERATOR", "RULE", "SERVER", "FOREIGN", "TEMP", "TEMPORARY", "UNLOGGED":
+		return true
+	}
+	return false
+}
+
+func asciiUpper(s string) string {
+	b := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		b[i] = c
+	}
+	return string(b)
 }
 
 // parseAlterTable accepts the additive PostgreSQL spelling
@@ -489,6 +516,14 @@ func (p *Parser) parseCreateIndex(unique bool) error {
 	if err := p.rejectAlias(); err != nil {
 		return err
 	}
+	if p.atKeyword(kwUsing) {
+		p.advance() // USING
+		method, err := p.parseIndexMethod()
+		if err != nil {
+			return err
+		}
+		p.idx.Method = method
+	}
 	if p.tok.kind != tokLParen {
 		return p.errHere("expected '(' after the collection name: an index names the paths it indexes")
 	}
@@ -517,15 +552,18 @@ func (p *Parser) parseCreateIndex(unique bool) error {
 	case p.atKeyword(kwWhere):
 		return p.errHere("a partial index (INDEX ... WHERE) is not supported: this engine's indexes cover every document of the collection")
 	case p.atKeyword(kwUsing):
+		if p.idx.Method != "" {
+			return p.errHere("duplicate USING clause in CREATE INDEX")
+		}
 		p.advance() // USING
 		method, err := p.parseIndexMethod()
 		if err != nil {
 			return err
 		}
 		p.idx.Method = method
-		if method == "tin" && len(p.idx.Paths) != 1 {
-			return p.errHere("USING tin indexes one text path; compound full-text indexes are not supported")
-		}
+	}
+	if p.idx.Method == "tin" && len(p.idx.Paths) != 1 {
+		return p.errHere("USING tin indexes one text path; compound full-text indexes are not supported")
 	}
 	if err := p.expectEnd(); err != nil {
 		return err
