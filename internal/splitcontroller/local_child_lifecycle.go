@@ -67,13 +67,14 @@ type LocalChildLifecycleOptions struct {
 type LocalChildLifecycle struct {
 	mu sync.Mutex
 
-	options    LocalChildLifecycleOptions
-	activation sqldriver.ReplicatedChildActivation
-	wal        *raftstore.Store
-	adopted    raftmember.RuntimeIdentity
-	applyID    sqldriver.ReplicatedApplyIdentity
-	profile    sqldriver.ReplicatedApplyCapacityProfile
-	walBinding sqldriver.ReplicatedShardStoreBinding
+	options           LocalChildLifecycleOptions
+	activation        sqldriver.ReplicatedChildActivation
+	certificateDigest [32]byte
+	wal               *raftstore.Store
+	adopted           raftmember.RuntimeIdentity
+	applyID           sqldriver.ReplicatedApplyIdentity
+	profile           sqldriver.ReplicatedApplyCapacityProfile
+	walBinding        sqldriver.ReplicatedShardStoreBinding
 }
 
 func NewLocalChildLifecycle(options LocalChildLifecycleOptions) (*LocalChildLifecycle, error) {
@@ -102,9 +103,11 @@ func NewLocalChildLifecycle(options LocalChildLifecycleOptions) (*LocalChildLife
 }
 
 // ExecuteActivateChild performs the O(1) certified-image handoff into normal
-// replicated apply. An exact retry in the same process is a read-only proof;
-// after a crash OpenReplicatedChildStage reconstructs the durable activation
-// intent and Activate settles the same state.
+// replicated apply. An exact retry in the same process is a read-only proof
+// even after this replica has advanced to WAL creation or runtime adoption
+// while a peer replica still needs activation; after a crash
+// OpenReplicatedChildStage reconstructs the durable activation intent and
+// Activate settles the same state.
 func (l *LocalChildLifecycle) ExecuteActivateChild(
 	plan *Plan,
 	certificate rangesplit.CutoverCertificate,
@@ -119,11 +122,20 @@ func (l *LocalChildLifecycle) ExecuteActivateChild(
 		plan.partitioner.VerifyCutoverCertificate(certificate) != nil {
 		return ErrTopologyConflict
 	}
-	if l.adopted != (raftmember.RuntimeIdentity{}) || l.wal != nil {
-		return ErrTopologyConflict
+	if l.adopted != (raftmember.RuntimeIdentity{}) {
+		return l.validateAdopted(target, certificate)
 	}
 	if l.activation.Apply != nil {
-		return l.validateActivation(target, certificate)
+		if err := l.validateActivation(target, certificate); err != nil {
+			return err
+		}
+		if l.wal != nil && l.walBinding != l.options.SQL.Binding {
+			return ErrTopologyConflict
+		}
+		return nil
+	}
+	if l.wal != nil {
+		return ErrTopologyConflict
 	}
 	activation, err := l.options.Stage.Activate(
 		certificate, l.options.StaticBootstrap, l.options.ArtifactOptions,
@@ -132,6 +144,7 @@ func (l *LocalChildLifecycle) ExecuteActivateChild(
 		return err
 	}
 	l.activation = activation
+	l.certificateDigest = certificate.Digest()
 	l.applyID = activation.ApplyIdentity
 	l.profile, err = activation.Apply.CapacityQualificationProfile()
 	if err != nil {
@@ -141,7 +154,9 @@ func (l *LocalChildLifecycle) ExecuteActivateChild(
 }
 
 // ExecuteCreateChildWAL publishes or reopens the exact immutable WAL base. It
-// never mints a runtime incarnation and therefore remains non-serving.
+// never mints a runtime incarnation and therefore remains non-serving. Replays
+// for the same verified cutover certificate succeed read-only after WAL
+// creation or runtime adoption so partial multi-replica waves converge.
 func (l *LocalChildLifecycle) ExecuteCreateChildWAL(
 	plan *Plan,
 	certificate rangesplit.CutoverCertificate,
@@ -152,13 +167,19 @@ func (l *LocalChildLifecycle) ExecuteCreateChildWAL(
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	target, ok := plan.Target(l.options.Child)
-	if !ok || !l.matchesTarget(target) || l.adopted != (raftmember.RuntimeIdentity{}) ||
-		l.validateActivation(target, certificate) != nil {
+	if !ok || !l.matchesTarget(target) ||
+		plan.partitioner.VerifyCutoverCertificate(certificate) != nil {
+		return ErrTopologyConflict
+	}
+	if l.adopted != (raftmember.RuntimeIdentity{}) {
+		return l.validateAdopted(target, certificate)
+	}
+	if l.validateActivation(target, certificate) != nil {
 		return ErrTopologyConflict
 	}
 	if l.wal != nil {
 		binding, err := raftmember.BindingFromWAL(l.wal, l.options.Authority)
-		if err != nil || binding != target.SQL.Binding {
+		if err != nil || binding != l.options.SQL.Binding || l.walBinding != l.options.SQL.Binding {
 			return errors.Join(ErrTopologyConflict, err)
 		}
 		return nil
@@ -318,7 +339,9 @@ func (l *LocalChildLifecycle) validateActivation(
 ) error {
 	activation := l.activation
 	if activation.Apply == nil || activation.SnapshotBase == nil ||
-		activation.ApplyIdentity == (sqldriver.ReplicatedApplyIdentity{}) {
+		activation.ApplyIdentity == (sqldriver.ReplicatedApplyIdentity{}) ||
+		l.certificateDigest == ([32]byte{}) ||
+		l.certificateDigest != certificate.Digest() {
 		return ErrTopologyConflict
 	}
 	identity, identityErr := activation.Apply.Identity()
@@ -332,6 +355,26 @@ func (l *LocalChildLifecycle) validateActivation(
 		base.Manifest.State.Applied != certificate.SourceCut().Applied ||
 		activation.ArtifactManifest.Digest != base.Manifest.Digest {
 		return errors.Join(ErrTopologyConflict, identityErr, profileErr, baseErr)
+	}
+	return nil
+}
+
+func (l *LocalChildLifecycle) validateAdopted(
+	target ChildTarget,
+	certificate rangesplit.CutoverCertificate,
+) error {
+	if l.adopted == (raftmember.RuntimeIdentity{}) ||
+		!l.runtimeIdentityMatches(target, l.adopted) ||
+		l.walBinding != l.options.SQL.Binding ||
+		l.applyID == (sqldriver.ReplicatedApplyIdentity{}) ||
+		l.certificateDigest == ([32]byte{}) ||
+		l.certificateDigest != certificate.Digest() ||
+		l.profile.Binding != l.options.SQL.Binding ||
+		!l.profile.Initialized ||
+		l.profile.Applied != certificate.SourceCut().Applied ||
+		l.profile.SessionEpochHighWater != certificate.SourceCut().Applied ||
+		l.profile.SessionCount != 0 || l.profile.SessionSlotCount != 0 {
+		return ErrTopologyConflict
 	}
 	return nil
 }
