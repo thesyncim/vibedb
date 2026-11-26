@@ -105,6 +105,7 @@ type Statement struct {
 	// Live slot values belong to the child Exec.Workspace, never to Statement.
 	correlation *statementCorrelationPlan
 	extAgg      *statementExtAgg
+	distinctOn  *statementDistinctOn
 
 	// c and q are this statement's own compiler and the Query it compiles
 	// into. They are values rather than pointers so a Statement is one
@@ -436,6 +437,9 @@ func prepareTreeInCorrelationContext(
 	mode := unknownOutputPrepareMode{}
 	if len(unknownModes) != 0 {
 		mode = unknownModes[0]
+	}
+	if len(tree.DistinctOn) > 0 {
+		return prepareDistinctOnStatement(src, tree, subqueryLimit, ctes, argBase, correlation, parameterTypes)
 	}
 	if hasExtendedAggregate(tree) {
 		return prepareExtendedAggregateStatement(src, tree, subqueryLimit, ctes, argBase, correlation, parameterTypes)
@@ -903,6 +907,16 @@ func (s *Statement) RequiresCatalog() bool {
 // that advertised it would be advertising a column [Cursor.Cell] refuses to
 // return.
 func (s *Statement) AppendSchema(dst []OutputColumn) []OutputColumn {
+	if s.distinctOn != nil {
+		inSchema := s.distinctOn.input.AppendSchema(nil)
+		if len(inSchema) >= s.distinctOn.visibleCount {
+			return append(dst, inSchema[:s.distinctOn.visibleCount]...)
+		}
+		for i, name := range s.names {
+			dst = append(dst, OutputColumn{Header: name, Ordinal: uint32(i), Type: TypeAny})
+		}
+		return dst
+	}
 	if s.extAgg != nil {
 		for i, sp := range s.extAgg.specs {
 			col := OutputColumn{Header: sp.header, Ordinal: uint32(i), Type: TypeAny}
@@ -1018,6 +1032,10 @@ func (s *Statement) Release() {
 	if s == nil {
 		return
 	}
+	if s.distinctOn != nil && s.distinctOn.input != nil {
+		s.distinctOn.input.Release()
+		s.distinctOn.input = nil
+	}
 	if s.extAgg != nil && s.extAgg.input != nil {
 		s.extAgg.input.Release()
 		s.extAgg.input = nil
@@ -1077,6 +1095,9 @@ func (s *Statement) RunInto(e *Exec, src Source, args []any) (Cursor, error) {
 	// stats before validating anything that can fail.
 	clearExecBorrowedViews(e)
 	e.Stats = ExecStats{}
+	if s.distinctOn != nil {
+		return s.runDistinctOnInto(e, src, args)
+	}
 	if s.extAgg != nil {
 		return s.runExtAggInto(e, src, args)
 	}

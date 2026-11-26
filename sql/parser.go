@@ -754,6 +754,31 @@ func (p *Parser) parseStatement() error {
 		return err
 	}
 	p.out.Distinct = p.acceptKeyword(kwDistinct)
+	if p.out.Distinct && p.acceptKeyword(kwOn) {
+		if err := p.expect(tokLParen, "'(' after DISTINCT ON"); err != nil {
+			return err
+		}
+		var onPaths []*PathExpr
+		for {
+			path, err := p.parsePath(false)
+			if err != nil {
+				return err
+			}
+			onPaths = append(onPaths, path)
+			if len(onPaths) > maxClauseItems {
+				return p.errfAt(path.Pos, "DISTINCT ON accepts at most %d paths", maxClauseItems)
+			}
+			if p.tok.kind != tokComma {
+				break
+			}
+			p.advance()
+		}
+		if err := p.expect(tokRParen, "')' after DISTINCT ON paths"); err != nil {
+			return err
+		}
+		p.out.DistinctOn = onPaths
+		p.out.Distinct = false
+	}
 	if p.out.Distinct && p.atKeyword(kwAll) {
 		return p.errHere("SELECT DISTINCT and SELECT ALL are mutually exclusive")
 	}

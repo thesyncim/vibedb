@@ -43,6 +43,8 @@ type SelectStmt struct {
 	// lowers the non-aggregate form to GROUP BY over the projection paths so the
 	// existing spill-aware grouping engine supplies equality and bounded memory.
 	Distinct bool
+	// DistinctOn holds PostgreSQL DISTINCT ON (path, ...) expressions.
+	DistinctOn []*PathExpr
 	// LockMode records an optional FOR UPDATE / FOR SHARE locking clause.
 	LockMode   RowLockMode
 	SkipLocked bool
