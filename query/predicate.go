@@ -3,7 +3,6 @@ package query
 import (
 	"fmt"
 	"math"
-	"regexp"
 	"slices"
 	"strconv"
 	"unicode"
@@ -452,7 +451,6 @@ type compiledPredicate struct {
 	lit         scalar
 	needle      vibejson.Index
 	pattern     string
-	re          *regexp.Regexp
 	insensitive bool
 	probe       postProbe
 	boundPath   string
@@ -630,14 +628,13 @@ func (c *compiler) compilePredicate(p Predicate, reg *pathRegistry) (*compiledPr
 		if p.insensitive {
 			flags = "i"
 		}
-		re, err := cachedPGRegexp(p.pattern, flags)
-		if err != nil {
+		if _, err := cachedPGRegexp(p.pattern, flags); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidPattern, err)
 		}
 		cp := c.nodes.one()
 		*cp = compiledPredicate{
 			kind: predRegex, col: col,
-			pattern: c.internString(p.pattern), re: re, insensitive: p.insensitive,
+			pattern: c.internString(p.pattern), insensitive: p.insensitive,
 		}
 		return cp, nil
 	case predJSONExists:
@@ -1171,7 +1168,15 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int, s *evalScratch) bool 
 		return cell.kind == kindString && likeMatch(p.pattern, cell.sval, p.insensitive)
 	case predRegex:
 		cell := cols[p.col][row]
-		return cell.kind == kindString && p.re != nil && p.re.MatchString(cell.sval)
+		if cell.kind != kindString {
+			return false
+		}
+		flags := ""
+		if p.insensitive {
+			flags = "i"
+		}
+		re, err := cachedPGRegexp(p.pattern, flags)
+		return err == nil && re.MatchString(cell.sval)
 	case predJSONExists:
 		cell := cols[p.col][row]
 		raw := cell.raw
