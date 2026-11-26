@@ -818,6 +818,9 @@ func (p *Parser) parseStatement() error {
 	if err := p.parseLimitOffset(); err != nil {
 		return err
 	}
+	if err := p.parseLockingClause(); err != nil {
+		return err
+	}
 	if isSetOperatorToken(p.tok) {
 		return p.parseSetStatement(statementPos)
 	}
@@ -2753,7 +2756,7 @@ func (p *Parser) parseTableAlias() (string, error) {
 	if p.acceptKeyword(kwAs) {
 		return p.parseAliasName("an alias after AS")
 	}
-	if p.tok.kind == tokQuotedIdent || (p.tok.kind == tokIdent && !reserved(p.tok.kw)) {
+	if p.tok.kind == tokQuotedIdent || (p.tok.kind == tokIdent && !reserved(p.tok.kw) && !tokenTextEqual(p.tok, "FOR")) {
 		return p.parseAliasName("an alias")
 	}
 	return "", nil
@@ -3023,6 +3026,63 @@ func (p *Parser) resolveOrderAlias(path *PathExpr) (*PathExpr, int, error) {
 		return column.Path, 0, nil
 	}
 	return path, 0, nil
+}
+
+func (p *Parser) parseLockingClause() error {
+	if !tokenTextEqual(p.tok, "FOR") {
+		return nil
+	}
+	p.advance() // FOR
+	switch {
+	case p.atKeyword(kwUpdate):
+		p.advance()
+		p.out.LockMode = RowLockUpdate
+	case tokenTextEqual(p.tok, "NO"):
+		p.advance()
+		if !p.acceptKeyword(kwKey) {
+			return p.errHere("expected KEY after FOR NO")
+		}
+		if !p.acceptKeyword(kwUpdate) {
+			return p.errHere("expected UPDATE after FOR NO KEY")
+		}
+		p.out.LockMode = RowLockNoKeyUpdate
+	case tokenTextEqual(p.tok, "KEY"):
+		p.advance()
+		if !tokenTextEqual(p.tok, "SHARE") {
+			return p.errHere("expected SHARE after FOR KEY")
+		}
+		p.advance()
+		p.out.LockMode = RowLockKeyShare
+	case tokenTextEqual(p.tok, "SHARE"):
+		p.advance()
+		p.out.LockMode = RowLockShare
+	default:
+		return p.errHere("expected UPDATE, NO KEY UPDATE, SHARE, or KEY SHARE after FOR")
+	}
+	if tokenTextEqual(p.tok, "OF") {
+		p.advance()
+		for {
+			if _, _, err := p.parseCollectionName(); err != nil {
+				return err
+			}
+			if p.tok.kind != tokComma {
+				break
+			}
+			p.advance()
+		}
+	}
+	if tokenTextEqual(p.tok, "NOWAIT") {
+		p.out.NoWait = true
+		p.advance()
+	} else if tokenTextEqual(p.tok, "SKIP") {
+		p.advance()
+		if !tokenTextEqual(p.tok, "LOCKED") {
+			return p.errHere("expected LOCKED after SKIP")
+		}
+		p.out.SkipLocked = true
+		p.advance()
+	}
+	return nil
 }
 
 func (p *Parser) parseLimitOffset() error {
