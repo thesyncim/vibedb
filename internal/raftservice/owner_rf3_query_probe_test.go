@@ -107,7 +107,7 @@ func TestRF3SQLReadUsesAcceptedFenceWithoutPostProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Kind != shardservice.ReplicatedQueryResult || owner.probes.Load() != 1 ||
+	if response.Kind != shardservice.ReplicatedQueryResult || owner.probes.Load() != 0 ||
 		response.State.Fence != request.Fence || response.ReadApplied <= advertised.Status.Applied ||
 		response.State.Applied != response.ReadApplied ||
 		response.State.Commit != response.ReadApplied {

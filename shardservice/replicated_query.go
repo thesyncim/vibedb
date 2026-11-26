@@ -368,12 +368,12 @@ func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Conte
 			lease.Release()
 		}
 	}()
+	var directAuthorize raftservice.ConcurrentReadAuthorization
+	if len(concurrentAuthorize) != 0 {
+		directAuthorize = concurrentAuthorize[0]
+	}
 	if pointRead {
 		if pointOwner, ok := owner.(replicatedSQLPointReadOwner); ok {
-			var directAuthorize raftservice.ConcurrentReadAuthorization
-			if len(concurrentAuthorize) != 0 {
-				directAuthorize = concurrentAuthorize[0]
-			}
 			return server.executeReplicatedPointQueryTierCall(
 				ctx, request, state, inner, pointOwner, budget, maximum,
 				authorize, directAuthorize, fusedPoint, lease, &retained,
@@ -386,12 +386,24 @@ func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Conte
 	}
 	cut := &lease.dataCut
 	quorum := trace.StartRegion(ctx, "sql.read.quorum")
-	err := dataOwner.ReadLinearizableDataInto(ctx, raftservice.LinearizableDataReadRequest{Fence: state.Fence(), Capability: request.Capability, Authorize: authorize}, cut)
+	dataFence := state.Fence()
+	if fusedPoint {
+		dataFence = replicatedServingFence(request.Fence)
+	}
+	dataAuthorize := authorize
+	if directAuthorize != nil {
+		dataAuthorize = nil
+	}
+	err := dataOwner.ReadLinearizableDataInto(ctx, raftservice.LinearizableDataReadRequest{
+		Fence: dataFence, Capability: request.Capability,
+		Authorize: dataAuthorize, ConcurrentAuthorize: directAuthorize,
+	}, cut)
 	quorum.End()
 	if err != nil {
 		switch {
 		case errors.Is(err, raftmodel.ErrNotLeader), errors.Is(err, raftmodel.ErrReadLeadershipLost):
-			return &ReplicatedResponse{Kind: ReplicatedNotLeader, HasState: true, State: wireState}, false
+			return server.fusedPointRefusalResponse(ctx, request, fusedPoint, &wireState,
+				ReplicatedNotLeader, ReplicatedRefusalNone), false
 		case errors.Is(err, raftservice.ErrServingFence):
 			return refuse(ReplicatedRefusalStaleFence)
 		case errors.Is(err, raftservice.ErrServingAuthorization):
@@ -403,6 +415,15 @@ func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Conte
 		}
 	}
 	defer cut.Close()
+	if fusedPoint {
+		cutState := cut.State()
+		wireState = replicatedWireState(cutState)
+		if !replicatedSQLRequestMatchesState(request, inner, cutState) ||
+			cutState.Status.MemberID != cutState.Identity.MemberID ||
+			cutState.Status.LeaderID != cutState.Identity.MemberID {
+			return refuse(ReplicatedRefusalStaleFence)
+		}
+	}
 	source, ok := cut.Source().(interface {
 		NewDataReadSession(context.Context, *replicatedstate.DataReadCut, query.ExecOptions) (*sqldriver.ReplicatedReadSession, error)
 	})
