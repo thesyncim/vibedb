@@ -902,6 +902,7 @@ type Owner struct {
 	ingressBytes          int64
 	pendingProposalItems  int
 	pendingProposalBytes  int64
+	pendingProposalCount  atomic.Int64
 	pendingReadItems      atomic.Int64
 	pendingReadBytes      atomic.Int64
 	stateAtomic           atomic.Uint32
@@ -1334,6 +1335,13 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 		asyncHost = host
 		asyncNotify = host.AsyncNotify()
 	}
+	var concurrentProposalsUntil time.Time
+	var proposalCoalesceTimer *time.Timer
+	defer func() {
+		if proposalCoalesceTimer != nil {
+			proposalCoalesceTimer.Stop()
+		}
+	}()
 	handleRequest := func(request ownerRequest) error {
 		err := owner.handle(request)
 		if errors.Is(err, errOwnerReadDeferred) {
@@ -1417,6 +1425,90 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 			}
 			collector.start(request)
 			barrier, barrierPresent, drainErr := collector.drain(owner.ingress, handleRequest)
+			if len(collector.requests) >= 2 || owner.pendingProposalCount.Load() >= 2 {
+				concurrentProposalsUntil = time.Now().Add(20 * time.Millisecond)
+			}
+			if drainErr == nil && !barrierPresent && asyncNotify != nil &&
+				!concurrentProposalsUntil.IsZero() && len(collector.requests) < 8 && !collector.full() {
+				now := time.Now()
+				if now.Before(concurrentProposalsUntil) {
+					deadline := now.Add(650 * time.Microsecond)
+					for len(collector.requests) < 8 && !collector.full() && !barrierPresent && drainErr == nil {
+						remaining := deadline.Sub(time.Now())
+						if remaining <= 0 {
+							break
+						}
+						if proposalCoalesceTimer == nil {
+							proposalCoalesceTimer = time.NewTimer(remaining)
+						} else {
+							proposalCoalesceTimer.Reset(remaining)
+						}
+						select {
+						case next, open := <-owner.ingress:
+							if !proposalCoalesceTimer.Stop() {
+								select {
+								case <-proposalCoalesceTimer.C:
+								default:
+								}
+							}
+							if !open {
+								deadline = time.Time{}
+								break
+							}
+							switch {
+							case collector.accepts(next):
+								collector.append(next)
+								b, bp, de := collector.drain(owner.ingress, handleRequest)
+								if bp {
+									barrier, barrierPresent = b, true
+								}
+								if de != nil {
+									drainErr = de
+								}
+							case next.kind == requestInbound || readIngressCandidate(next):
+								if err := handleRequest(next); err != nil {
+									if errors.Is(err, errOwnerReadDeferred) {
+										barrier, barrierPresent, drainErr = next, true, err
+									} else {
+										drainErr = err
+									}
+								}
+							default:
+								barrier, barrierPresent = next, true
+							}
+						case _, ok := <-asyncNotify:
+							if !proposalCoalesceTimer.Stop() {
+								select {
+								case <-proposalCoalesceTimer.C:
+								default:
+								}
+							}
+							if !ok {
+								asyncNotify = nil
+								asyncHost = nil
+								deadline = time.Time{}
+							} else {
+								asyncHost.WakePipelined()
+								if len(collector.requests) >= 4 {
+									deadline = time.Time{}
+								}
+							}
+						case <-ctx.Done():
+							if !proposalCoalesceTimer.Stop() {
+								select {
+								case <-proposalCoalesceTimer.C:
+								default:
+								}
+							}
+							deadline = time.Time{}
+						case <-proposalCoalesceTimer.C:
+							deadline = time.Time{}
+						}
+					}
+				} else {
+					concurrentProposalsUntil = time.Time{}
+				}
+			}
 			if drainErr != nil && !errors.Is(drainErr, errOwnerReadDeferred) {
 				failCollected(errors.Join(ErrOwnerClosed, drainErr))
 				return drainErr
@@ -1679,6 +1771,90 @@ func (owner *Owner) Run(ctx context.Context) (runErr error) {
 			}
 			collector.start(request)
 			barrier, barrierPresent, drainErr := collector.drain(owner.ingress, handleRequest)
+			if len(collector.requests) >= 2 || owner.pendingProposalCount.Load() >= 2 {
+				concurrentProposalsUntil = time.Now().Add(20 * time.Millisecond)
+			}
+			if drainErr == nil && !barrierPresent && asyncNotify != nil &&
+				!concurrentProposalsUntil.IsZero() && len(collector.requests) < 8 && !collector.full() {
+				now := time.Now()
+				if now.Before(concurrentProposalsUntil) {
+					deadline := now.Add(650 * time.Microsecond)
+					for len(collector.requests) < 8 && !collector.full() && !barrierPresent && drainErr == nil {
+						remaining := deadline.Sub(time.Now())
+						if remaining <= 0 {
+							break
+						}
+						if proposalCoalesceTimer == nil {
+							proposalCoalesceTimer = time.NewTimer(remaining)
+						} else {
+							proposalCoalesceTimer.Reset(remaining)
+						}
+						select {
+						case next, open := <-owner.ingress:
+							if !proposalCoalesceTimer.Stop() {
+								select {
+								case <-proposalCoalesceTimer.C:
+								default:
+								}
+							}
+							if !open {
+								deadline = time.Time{}
+								break
+							}
+							switch {
+							case collector.accepts(next):
+								collector.append(next)
+								b, bp, de := collector.drain(owner.ingress, handleRequest)
+								if bp {
+									barrier, barrierPresent = b, true
+								}
+								if de != nil {
+									drainErr = de
+								}
+							case next.kind == requestInbound || readIngressCandidate(next):
+								if err := handleRequest(next); err != nil {
+									if errors.Is(err, errOwnerReadDeferred) {
+										barrier, barrierPresent, drainErr = next, true, err
+									} else {
+										drainErr = err
+									}
+								}
+							default:
+								barrier, barrierPresent = next, true
+							}
+						case _, ok := <-asyncNotify:
+							if !proposalCoalesceTimer.Stop() {
+								select {
+								case <-proposalCoalesceTimer.C:
+								default:
+								}
+							}
+							if !ok {
+								asyncNotify = nil
+								asyncHost = nil
+								deadline = time.Time{}
+							} else {
+								asyncHost.WakePipelined()
+								if len(collector.requests) >= 4 {
+									deadline = time.Time{}
+								}
+							}
+						case <-ctx.Done():
+							if !proposalCoalesceTimer.Stop() {
+								select {
+								case <-proposalCoalesceTimer.C:
+								default:
+								}
+							}
+							deadline = time.Time{}
+						case <-proposalCoalesceTimer.C:
+							deadline = time.Time{}
+						}
+					}
+				} else {
+					concurrentProposalsUntil = time.Time{}
+				}
+			}
 			if drainErr != nil && !errors.Is(drainErr, errOwnerReadDeferred) {
 				failCollected(errors.Join(ErrOwnerClosed, drainErr))
 				return owner.stop(drainErr)
@@ -4411,6 +4587,7 @@ func (owner *Owner) reservePendingProposalForGroup(_ raftmember.GroupKey, bytes 
 	}
 	owner.pendingProposalItems++
 	owner.pendingProposalBytes += bytes
+	owner.pendingProposalCount.Add(1)
 	return nil
 }
 
@@ -4422,6 +4599,7 @@ func (owner *Owner) releasePendingProposalForGroup(_ raftmember.GroupKey, bytes 
 	owner.mu.Lock()
 	owner.pendingProposalItems--
 	owner.pendingProposalBytes -= bytes
+	owner.pendingProposalCount.Add(-1)
 	owner.mu.Unlock()
 }
 
