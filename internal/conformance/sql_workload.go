@@ -15,7 +15,6 @@ var SQLWorkloadGaps = []SQLWorkloadGap{
 	{"update_from", `UPDATE compatibility_docs SET n = changes.n FROM compatibility_changes AS changes WHERE compatibility_docs.id = changes.id`},
 	{"delete_using", `DELETE FROM compatibility_docs USING compatibility_changes WHERE compatibility_docs.id = compatibility_changes.id`},
 	{"mutation_cte", `WITH removed AS (DELETE FROM compatibility_docs WHERE id = 'a' RETURNING n) SELECT n FROM removed`},
-	{"derived_wildcard_scalar_projection", `SELECT d.*, COALESCE(d.n, 0) FROM (SELECT * FROM compatibility_docs) AS d`},
 	{"composite_conflict_target", `INSERT INTO compatibility_docs (id, n) VALUES ('a', 0) ON CONFLICT (id, n) DO NOTHING`},
 	{"copy", `COPY compatibility_docs FROM STDIN`},
 }

@@ -309,7 +309,6 @@ func TestRejectsMutationsTheEngineCannotExecute(t *testing.T) {
 		{"the removed pseudo-column pair", `INSERT INTO t ("$key", "$doc") VALUES ('k', ?)`, -1, "one complete document"},
 		{"a three-value row", `INSERT INTO t VALUES ('k', ?, ?)`, -1, "one complete JSON document"},
 		{"a NULL document", `INSERT INTO t VALUES (NULL)`, -1, "not a document"},
-		{"DEFAULT VALUES", `INSERT INTO t DEFAULT VALUES`, -1, "no declared columns"},
 		{"composite conflict target", `INSERT INTO t VALUES (?) ON CONFLICT (id, tenant) DO NOTHING`, -1, "composite ON CONFLICT targets"},
 		{"conflict constraint", `INSERT INTO t VALUES (?) ON CONFLICT ON CONSTRAINT t_pkey DO UPDATE SET value = EXCLUDED.value`, -1, "ON CONSTRAINT"},
 		{"nested conflict target", `INSERT INTO t VALUES (?) ON CONFLICT DO UPDATE SET profile.name = EXCLUDED.name`, -1, "top-level column"},

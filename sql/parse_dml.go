@@ -254,7 +254,17 @@ func (p *Parser) parseInsert() error {
 			return err
 		}
 	case p.atKeyword(kwDefault):
-		return p.errHere("INSERT ... DEFAULT VALUES is not supported: a schemaless document has no declared columns and therefore no defaults")
+		defPos := p.tok.pos
+		p.advance() // DEFAULT
+		if err := p.expectKeyword(kwValues, "VALUES after DEFAULT"); err != nil {
+			return err
+		}
+		val := p.ops.allocDirty(1)
+		val[0] = Operand{Kind: OperandJSON, Text: "{}", Pos: defPos}
+		rows := p.rows[:0]
+		rows = append(rows, InsertRow{Values: val, Pos: defPos})
+		p.rows = rows
+		p.ins.Rows = rows
 	default:
 		if err := p.expectKeyword(kwValues, "VALUES or SELECT"); err != nil {
 			return err
