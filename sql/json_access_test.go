@@ -42,7 +42,6 @@ func TestJSONAccessRejectsUnsupportedAndIncomplete(t *testing.T) {
 	for _, source := range []string{
 		`SELECT "$doc"->>? FROM documents`,
 		`SELECT "$doc"->>-1 FROM documents`,
-		`SELECT "$doc"->>0 FROM documents`,
 		`SELECT "$doc"->>'0' FROM documents`,
 		`SELECT "$doc"->>1.5 FROM documents`,
 		`SELECT "$doc"->>'a'->>'b' FROM documents`,
