@@ -206,6 +206,9 @@ func (runtime *Runtime) waitOptionalServices() {
 	if runtime.splitControllerDone != nil {
 		<-runtime.splitControllerDone
 	}
+	if runtime.controllerLeaseDone != nil {
+		<-runtime.controllerLeaseDone
+	}
 	if runtime.hotShardDone != nil {
 		<-runtime.hotShardDone
 	}

@@ -67,6 +67,9 @@ func runServe(args []string) (exitCode int) {
 	minFreeDiskBytes := fs.Uint64("min-free-disk-bytes", 0, "optional hard minimum free filesystem bytes admission watermark (0 disables)")
 	diskWatermarkPath := fs.String("disk-watermark-path", "", "filesystem path sampled for -min-free-disk-bytes (defaults to catalog directory)")
 	slowQueryThreshold := fs.Duration("slow-query-threshold", 0, "optional duration threshold above which slow reads/writes are logged (0 disables)")
+	controllerLeaseDir := fs.String("controller-lease-dir", "", "optional shared directory for durable CAS-fenced controller lease failover across frontends")
+	controllerLeaseKey := fs.String("controller-lease-key", "vibedb/controller/primary", "lease key name inside -controller-lease-dir")
+	controllerLeaseTTL := fs.Duration("controller-lease-ttl", 10*time.Second, "controller lease TTL when -controller-lease-dir is set")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -135,6 +138,9 @@ func runServe(args []string) (exitCode int) {
 			minFreeDiskBytes:   *minFreeDiskBytes,
 			diskWatermarkPath:  *diskWatermarkPath,
 			slowQueryThreshold: *slowQueryThreshold,
+			controllerLeaseDir: *controllerLeaseDir,
+			controllerLeaseKey: *controllerLeaseKey,
+			controllerLeaseTTL: *controllerLeaseTTL,
 		},
 	)
 	if !handled {
