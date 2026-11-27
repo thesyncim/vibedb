@@ -95,8 +95,12 @@ its generated client identity only `data_read` and `data_write`. That
 credential cannot request metrics (`topology`), run cluster control
 (`topology`, plus `membership` for mutations), or start backups (`backup`).
 
-No shipped command rotates certificates, edits the policy, or integrates an
-external secret store. Treat every generated root as containing private keys.
+`vibedb cluster rotate-cert` rotates leaf certificates in place while preserving
+their VibeDB binary identity (and optionally updates `node-descriptor.vibejson`
+SPKI digests), and `vibedb cluster policy (show|grant|revoke)` edits and
+verifies `authorization-policy.vibejson` atomically. External secret-store
+integration remains operator-provided; treat every generated root as containing
+private keys.
 
 ## What an evaluation deployment must provide
 
