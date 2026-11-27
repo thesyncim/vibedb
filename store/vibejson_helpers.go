@@ -1,16 +1,15 @@
 package store
 
 import (
-	"encoding/binary"
 	"math/bits"
 
-	"github.com/thesyncim/vibedb/internal/jsoncmp"
 	"github.com/thesyncim/vibejson"
-	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibejson/x/byteview"
+	"github.com/thesyncim/vibejson/x/jsoncmp"
+	"github.com/thesyncim/vibejson/x/keyhash"
 )
 
-// FxHash-style mixing constants matching vibejson's compiled key hashes.
+// FxHash-style mixing constants matching vibejson/x/keyhash.
 const (
 	keyHashSeed = 0x9E3779B97F4A7C15
 	keyHashMul  = 0xFF51AFD7ED558CCD
@@ -31,45 +30,15 @@ func keyHashFinish(h uint64) uint32 {
 }
 
 func hashKeyContent(content []byte) uint32 {
-	n := len(content)
-	h := keyHashInit(n)
-	switch {
-	case n >= 8:
-		for i := 8; i < n; i += 8 {
-			h = keyHashMix(h, binary.LittleEndian.Uint64(content[i-8:i]))
-		}
-		h = keyHashMix(h, binary.LittleEndian.Uint64(content[n-8:n]))
-	case n >= 4:
-		lo := uint64(binary.LittleEndian.Uint32(content[:4]))
-		hi := uint64(binary.LittleEndian.Uint32(content[n-4:]))
-		h = keyHashMix(h, lo|hi<<(8*(uint(n)-4)))
-	default:
-		var w uint64
-		if n > 0 {
-			w = uint64(content[0]) |
-				uint64(content[n>>1])<<(8*(uint(n)>>1)) |
-				uint64(content[n-1])<<(8*(uint(n)-1))
-		}
-		h = keyHashMix(h, w)
-	}
-	return keyHashFinish(h)
+	return keyhash.Bytes(content)
 }
 
 func hashKey(key string) uint32 {
-	return hashKeyContent(byteview.Bytes(key))
+	return keyhash.String(key)
 }
 
 func enrichKeyHashes(index *vibejson.Index) {
-	src := index.Src
-	entries := index.Entries
-	for i := range entries {
-		e := &entries[i]
-		if e.Flags()&document.TapeFlagKey != 0 {
-			e.Next = hashKeyContent(src[e.Start+1 : e.End-1])
-		} else if e.Kind() == document.Object {
-			e.Info |= uint32(document.TapeFlagObjectKeysHashed) << document.InfoFlagsShift
-		}
-	}
+	keyhash.EnrichIndex(index.Src, index.Entries)
 }
 
 func isJSONWhitespace(c byte) bool {
@@ -92,7 +61,7 @@ func bytesEqualString(b []byte, s string) bool {
 }
 
 func rawJSONStringEqual(a []byte, aFlags uint8, b []byte, bFlags uint8) bool {
-	return jsoncmp.RawJSONStringEqual(a, aFlags, b, bFlags)
+	return jsoncmp.RawStringEqual(a, aFlags, b, bFlags)
 }
 
 func nodeFromEntries(src []byte, entries []vibejson.IndexEntry) vibejson.Node {

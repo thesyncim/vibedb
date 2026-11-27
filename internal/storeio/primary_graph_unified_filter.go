@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/thesyncim/vibedb/internal/jsoncmp"
+	"github.com/thesyncim/vibejson/x/jsoncmp"
 )
 
 // The token filter resolves the
@@ -208,7 +208,7 @@ func (f *UnifiedEqFilter) equalLiteral(value []byte) bool {
 		(value[0] != '-' && (value[0] < '0' || value[0] > '9')) {
 		return false
 	}
-	return jsoncmp.JSONNumberEqual(value, f.needle)
+	return jsoncmp.NumberEqual(value, f.needle)
 }
 
 // prepareLeaf derives the per-leaf token-lane state: one hole resolution per
@@ -336,7 +336,7 @@ func (f *UnifiedEqFilter) matchBody(body []byte) (matched, needsRender, ok bool)
 				}
 				if f.numbersByValue {
 					var spelling [20]byte
-					return jsoncmp.JSONNumberEqual(
+					return jsoncmp.NumberEqual(
 						strconv.AppendInt(spelling[:0], value, 10), f.needle,
 					), false, true
 				}

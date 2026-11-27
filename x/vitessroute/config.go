@@ -12,6 +12,7 @@ import (
 	"github.com/thesyncim/vibedb/distribution"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
+	"github.com/thesyncim/vibejson/x/jsoncmp"
 )
 
 // ErrUnsupportedVSchema is the sentinel every strict-subset rejection matches
@@ -209,25 +210,9 @@ func validateVSchemaNode(node vibejson.Node) error {
 	return nil
 }
 
-func decodedJSONStringBytes(raw []byte, flags uint8, buf []byte) []byte {
-	inner := raw[1 : len(raw)-1]
-	if flags&document.TapeFlagEscaped == 0 {
-		return inner
-	}
-	return vibejson.AppendDecodedJSONString(buf[:0], inner)
-}
-
-func rawJSONStringEqual(a []byte, aFlags uint8, b []byte, bFlags uint8) bool {
-	if (aFlags|bFlags)&document.TapeFlagEscaped == 0 {
-		return bytes.Equal(a, b)
-	}
-	var sa, sb [128]byte
-	return bytes.Equal(decodedJSONStringBytes(a, aFlags, sa[:0]), decodedJSONStringBytes(b, bFlags, sb[:0]))
-}
-
 func duplicateVSchemaKey(object, current, first vibejson.Node) bool {
 	currentRaw := current.Raw().Bytes()
-	if rawJSONStringEqual(currentRaw, current.Entry.Flags(), first.Raw().Bytes(), first.Entry.Flags()) {
+	if jsoncmp.RawStringEqual(currentRaw, current.Entry.Flags(), first.Raw().Bytes(), first.Entry.Flags()) {
 		return true
 	}
 	// A hash collision is rare, but all earlier keys in the same object must be
@@ -235,7 +220,7 @@ func duplicateVSchemaKey(object, current, first vibejson.Node) bool {
 	iter, _ := object.ObjectIter()
 	for key, _, ok := iter.Next(); ok && key.Entry != current.Entry; key, _, ok = iter.Next() {
 		if hashDecodedJSONString(key) == hashDecodedJSONString(current) &&
-			rawJSONStringEqual(currentRaw, current.Entry.Flags(), key.Raw().Bytes(), key.Entry.Flags()) {
+			jsoncmp.RawStringEqual(currentRaw, current.Entry.Flags(), key.Raw().Bytes(), key.Entry.Flags()) {
 			return true
 		}
 	}
@@ -247,19 +232,33 @@ func hashDecodedJSONString(node vibejson.Node) uint32 {
 		offset32 = uint32(2166136261)
 		prime32  = uint32(16777619)
 	)
-	var scratch [128]byte
-	decoded := decodedJSONStringBytes(node.Raw().Bytes(), node.Entry.Flags(), scratch[:0])
+	raw := node.Raw().Bytes()
 	hash := offset32
-	for _, b := range decoded {
+	if node.Entry.Flags()&document.TapeFlagEscaped == 0 {
+		for _, b := range raw[1 : len(raw)-1] {
+			hash = (hash ^ uint32(b)) * prime32
+		}
+		return hash
+	}
+	iter := jsoncmp.StringByteIter{Raw: raw[1 : len(raw)-1]}
+	for b, ok := iter.Next(); ok; b, ok = iter.Next() {
 		hash = (hash ^ uint32(b)) * prime32
 	}
 	return hash
 }
 
 func jsonStringContainsNUL(node vibejson.Node) bool {
-	var scratch [128]byte
-	decoded := decodedJSONStringBytes(node.Raw().Bytes(), node.Entry.Flags(), scratch[:0])
-	return bytes.IndexByte(decoded, 0) >= 0
+	raw := node.Raw().Bytes()
+	if node.Entry.Flags()&document.TapeFlagEscaped == 0 {
+		return bytes.IndexByte(raw[1:len(raw)-1], 0) >= 0
+	}
+	iter := jsoncmp.StringByteIter{Raw: raw[1 : len(raw)-1]}
+	for b, ok := iter.Next(); ok; b, ok = iter.Next() {
+		if b == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // buildVindex resolves one supported vindex definition to a mapper.
