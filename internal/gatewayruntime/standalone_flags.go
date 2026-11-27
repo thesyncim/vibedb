@@ -66,6 +66,7 @@ func runServe(args []string) (exitCode int) {
 	maxMemoryBytes := fs.Uint64("max-memory-bytes", 0, "optional hard process memory admission ceiling in bytes (0 disables)")
 	minFreeDiskBytes := fs.Uint64("min-free-disk-bytes", 0, "optional hard minimum free filesystem bytes admission watermark (0 disables)")
 	diskWatermarkPath := fs.String("disk-watermark-path", "", "filesystem path sampled for -min-free-disk-bytes (defaults to catalog directory)")
+	slowQueryThreshold := fs.Duration("slow-query-threshold", 0, "optional duration threshold above which slow reads/writes are logged (0 disables)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -133,6 +134,7 @@ func runServe(args []string) (exitCode int) {
 			maxMemoryBytes:     *maxMemoryBytes,
 			minFreeDiskBytes:   *minFreeDiskBytes,
 			diskWatermarkPath:  *diskWatermarkPath,
+			slowQueryThreshold: *slowQueryThreshold,
 		},
 	)
 	if !handled {

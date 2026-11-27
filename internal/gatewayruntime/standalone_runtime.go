@@ -22,6 +22,7 @@ type standaloneOpsFlags struct {
 	maxMemoryBytes     uint64
 	minFreeDiskBytes   uint64
 	diskWatermarkPath  string
+	slowQueryThreshold time.Duration
 }
 
 // runServeThroughRuntime is the sole standalone serving entry point. It keeps
@@ -87,6 +88,7 @@ func runServeThroughRuntime(
 		MetricsHTTPListenAddress: ops.metricsHTTPListen,
 		FrontendDrainGracePeriod: ops.frontendDrainGrace,
 		ResourceGuard:            guard,
+		SlowQueryThreshold:       ops.slowQueryThreshold,
 		CatalogPath:          catalog, CatalogRouteSeedPath: routeSeed,
 		DevStaticCatalog: static, DevPlaintext: plaintext,
 		CatalogBootstrapIfMissing: bootstrap,
