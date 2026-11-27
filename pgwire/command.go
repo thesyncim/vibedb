@@ -1354,8 +1354,14 @@ func unquoteCancelable(v string, check func() error) (string, error) {
 // asks for.
 type fixedResult struct {
 	discovery *discoveryQuery
-	cols      []column
-	rows      [][]*string
+	// eval, when non-nil, computes the result rows at Execute time rather than
+	// Parse time. Side-effecting shim functions (pg_stat_statements_reset,
+	// pg_cancel_backend, pg_terminate_backend) MUST use eval so Parse/Describe
+	// and malformed queries never trigger side effects and repeated Executions
+	// of a prepared statement re-run the function.
+	eval func() [][]*string
+	cols []column
+	rows [][]*string
 	// tag is the CommandComplete tag, which for a fixed result is always one of
 	// PostgreSQL's own command tags so a client's tag parsing keeps working.
 	tag string
@@ -1380,6 +1386,7 @@ type shimFunctions struct {
 type shimColumn struct {
 	name  string
 	value *string
+	eval  func() *string
 	typ   columnType
 }
 
@@ -1410,6 +1417,8 @@ func (fn shimFunctions) parseFixedSelectCancelable(
 	}
 	var cols []column
 	var row []*string
+	var evals []func() *string
+	hasEval := false
 	for {
 		col, ok := fn.parseShimItem(&s)
 		if !ok {
@@ -1431,12 +1440,34 @@ func (fn shimFunctions) parseFixedSelectCancelable(
 		}
 		cols = append(cols, column{name: col.name, typ: col.typ})
 		row = append(row, col.value)
+		evals = append(evals, col.eval)
+		if col.eval != nil {
+			hasEval = true
+		}
 		if !s.symbol(',') {
 			break
 		}
 	}
 	if !s.atEnd() {
 		return fixedResult{}, false, nil
+	}
+	if hasEval {
+		baseRow := row
+		colEvals := evals
+		return fixedResult{
+			cols: cols,
+			eval: func() [][]*string {
+				out := make([]*string, len(baseRow))
+				copy(out, baseRow)
+				for i, ev := range colEvals {
+					if ev != nil {
+						out[i] = ev()
+					}
+				}
+				return [][]*string{out}
+			},
+			tag: "SELECT 1",
+		}, true, nil
 	}
 	return fixedResult{
 		cols: cols,
@@ -1506,19 +1537,29 @@ func (fn shimFunctions) parseShimItem(s *scanner) (shimColumn, bool) {
 		if err != nil {
 			return shimColumn{}, false
 		}
-		var signaled bool
+		isTerminate := strings.EqualFold(word, "pg_terminate_backend")
 		name := "pg_cancel_backend"
-		if strings.EqualFold(word, "pg_terminate_backend") {
+		if isTerminate {
 			name = "pg_terminate_backend"
-			signaled = fn.server.terminateBackendByPID(fn.user, int32(pidVal))
-		} else {
-			signaled = fn.server.cancelBackendByPID(fn.user, int32(pidVal))
 		}
-		v := "f"
-		if signaled {
-			v = "t"
-		}
-		return shimColumn{name: name, value: &v, typ: typeBool}, true
+		srv, user, targetPID := fn.server, fn.user, int32(pidVal)
+		return shimColumn{
+			name: name,
+			typ:  typeBool,
+			eval: func() *string {
+				var signaled bool
+				if isTerminate {
+					signaled = srv.terminateBackendByPID(user, targetPID)
+				} else {
+					signaled = srv.cancelBackendByPID(user, targetPID)
+				}
+				v := "f"
+				if signaled {
+					v = "t"
+				}
+				return &v
+			},
+		}, true
 	}
 	// The remaining forms are function calls and must be followed by "()".
 	if !s.symbol('(') || !s.symbol(')') {
@@ -1552,10 +1593,17 @@ func (fn shimFunctions) parseShimItem(s *scanner) (shimColumn, bool) {
 		v := strconv.Itoa(int(fn.pid))
 		return shimColumn{name: "pg_backend_pid", value: &v, typ: typeInt8}, true
 	case strings.EqualFold(word, "pg_stat_statements_reset"):
-		if fn.server != nil {
-			fn.server.resetStatementStats()
-		}
-		return shimColumn{name: "pg_stat_statements_reset", value: nil, typ: typeText}, true
+		srv := fn.server
+		return shimColumn{
+			name: "pg_stat_statements_reset",
+			typ:  typeText,
+			eval: func() *string {
+				if srv != nil {
+					srv.resetStatementStats()
+				}
+				return nil
+			},
+		}, true
 	}
 	return shimColumn{}, false
 }
