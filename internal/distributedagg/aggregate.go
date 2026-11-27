@@ -43,131 +43,137 @@ func (k Kind) Valid() bool { return k <= Max }
 type extreme struct {
 	cell   exchange.Cell
 	number []byte
+	ival   int64
+	isInt  bool
 	set    bool
 }
 
+// exactCount stores a 64-bit count inline (16 bytes) and lazily promotes to a
+// heap-allocated big.Int only on uint64 overflow.
 type exactCount struct {
 	small uint64
-	wide  big.Int
-	large bool
+	wide  *big.Int
 }
 
 func (c *exactCount) add(value uint64) {
-	if !c.large && ^uint64(0)-c.small >= value {
+	if c.wide == nil && ^uint64(0)-c.small >= value {
 		c.small += value
 		return
 	}
-	if !c.large {
-		c.wide.SetUint64(c.small)
-		c.large = true
+	if c.wide == nil {
+		c.wide = new(big.Int).SetUint64(c.small)
 	}
 	var term big.Int
 	term.SetUint64(value)
-	c.wide.Add(&c.wide, &term)
+	c.wide.Add(c.wide, &term)
 }
 
 func (c *exactCount) addBig(value *big.Int) {
-	if !c.large {
-		c.wide.SetUint64(c.small)
-		c.large = true
+	if c.wide == nil {
+		c.wide = new(big.Int).SetUint64(c.small)
 	}
-	c.wide.Add(&c.wide, value)
+	c.wide.Add(c.wide, value)
 }
 
 func (c *exactCount) appendTo(dst []byte) []byte {
-	if c.large {
+	if c.wide != nil {
 		return c.wide.Append(dst, 10)
 	}
 	return strconv.AppendUint(dst, c.small, 10)
 }
 
 func (c *exactCount) retainedBytes() uint64 {
-	if !c.large {
+	if c.wide == nil {
 		return 0
 	}
-	return retainedBigIntBytes(&c.wide)
+	return retainedBigIntBytes(c.wide)
 }
 
-type exactSignedInteger struct {
+type exactSumWide struct {
+	integer  big.Int
+	rational big.Rat
+	fraction bool
+}
+
+// exactSum stores a 64-bit integer sum inline (24 bytes, down from 120 bytes)
+// and lazily allocates exactSumWide only on int64 overflow or fractional input.
+type exactSum struct {
 	small int64
-	wide  big.Int
-	large bool
+	wide  *exactSumWide
+	set   bool
 }
 
-func (i *exactSignedInteger) add(value int64) {
+func (s *exactSum) addInt64(value int64) {
 	const maxInt64 = int64(^uint64(0) >> 1)
 	const minInt64 = -maxInt64 - 1
-	if !i.large && !((value > 0 && i.small > maxInt64-value) ||
-		(value < 0 && i.small < minInt64-value)) {
-		i.small += value
-		return
+	if s.wide == nil {
+		if !((value > 0 && s.small > maxInt64-value) ||
+			(value < 0 && s.small < minInt64-value)) {
+			s.small += value
+			s.set = true
+			return
+		}
+		w := &exactSumWide{}
+		w.integer.SetInt64(s.small)
+		s.wide = w
 	}
-	if !i.large {
-		i.wide.SetInt64(i.small)
-		i.large = true
+	if s.wide.fraction {
+		var term big.Rat
+		term.SetInt64(value)
+		s.wide.rational.Add(&s.wide.rational, &term)
+	} else {
+		var term big.Int
+		term.SetInt64(value)
+		s.wide.integer.Add(&s.wide.integer, &term)
 	}
-	var term big.Int
-	term.SetInt64(value)
-	i.wide.Add(&i.wide, &term)
+	s.set = true
 }
 
-func (i *exactSignedInteger) addBig(value *big.Int) {
-	if !i.large {
-		i.wide.SetInt64(i.small)
-		i.large = true
+func (s *exactSum) addBigInt(value *big.Int) {
+	if s.wide == nil {
+		w := &exactSumWide{}
+		w.integer.SetInt64(s.small)
+		s.wide = w
 	}
-	i.wide.Add(&i.wide, value)
+	if s.wide.fraction {
+		var term big.Rat
+		term.SetInt(value)
+		s.wide.rational.Add(&s.wide.rational, &term)
+	} else {
+		s.wide.integer.Add(&s.wide.integer, value)
+	}
+	s.set = true
 }
 
-func (i *exactSignedInteger) appendTo(dst []byte) []byte {
-	if i.large {
-		return i.wide.Append(dst, 10)
+func (s *exactSum) addRat(value *big.Rat) {
+	if s.wide == nil {
+		w := &exactSumWide{fraction: true}
+		w.rational.SetInt64(s.small)
+		s.wide = w
+	} else if !s.wide.fraction {
+		s.wide.rational.SetInt(&s.wide.integer)
+		s.wide.integer = big.Int{}
+		s.wide.fraction = true
 	}
-	return strconv.AppendInt(dst, i.small, 10)
-}
-
-func (i *exactSignedInteger) setRat(dst *big.Rat) {
-	if i.large {
-		dst.SetInt(&i.wide)
-		return
-	}
-	var value big.Int
-	value.SetInt64(i.small)
-	dst.SetInt(&value)
-}
-
-func (i *exactSignedInteger) retainedBytes() uint64 {
-	if !i.large {
-		return 0
-	}
-	return retainedBigIntBytes(&i.wide)
-}
-
-type exactSum struct {
-	integer  exactSignedInteger
-	rational big.Rat
-	set      bool
-	fraction bool
+	s.wide.rational.Add(&s.wide.rational, value)
+	s.set = true
 }
 
 func (s *exactSum) add(cell exchange.Cell, maxBytes uint64, scratch []byte) ([]byte, error) {
 	if cell.Null {
 		return scratch, nil
 	}
-	spelling := bytes.TrimSpace(cell.Bytes)
+	spelling := trimJSONSpace(cell.Bytes)
 	if maxBytes != 0 && uint64(len(spelling)) > maxBytes {
 		return scratch, fmt.Errorf("%w: SUM state exceeds exact numeric admission", ErrLimit)
 	}
+	if value, ok := parseCanonicalInt64(spelling); ok {
+		s.addInt64(value)
+		return scratch, nil
+	}
 	raw := vibejson.RawValue{Src: spelling}
 	if value, ok := raw.Int64(); ok {
-		if s.fraction {
-			var term big.Rat
-			term.SetInt64(value)
-			s.rational.Add(&s.rational, &term)
-		} else {
-			s.integer.add(value)
-		}
-		s.set = true
+		s.addInt64(value)
 		return scratch, nil
 	}
 	if isPlainJSONInteger(spelling) && vibejson.Valid(spelling) {
@@ -177,14 +183,7 @@ func (s *exactSum) add(cell exchange.Cell, maxBytes uint64, scratch []byte) ([]b
 		if _, ok := value.SetString(byteview.String(spelling), 10); !ok {
 			return scratch, fmt.Errorf("%w: SUM state is not an exact number", ErrAggregate)
 		}
-		if s.fraction {
-			var term big.Rat
-			term.SetInt(&value)
-			s.rational.Add(&s.rational, &term)
-		} else {
-			s.integer.addBig(&value)
-		}
-		s.set = true
+		s.addBigInt(&value)
 		return scratch, nil
 	}
 
@@ -198,29 +197,122 @@ func (s *exactSum) add(cell exchange.Cell, maxBytes uint64, scratch []byte) ([]b
 	if _, ok := value.SetString(byteview.String(canonical)); !ok {
 		return canonical, fmt.Errorf("%w: SUM state is not an exact number", ErrAggregate)
 	}
-	if !s.fraction {
-		s.integer.setRat(&s.rational)
-		s.fraction = true
-	}
-	s.rational.Add(&s.rational, &value)
-	s.set = true
+	s.addRat(&value)
 	return canonical, nil
 }
 
-func (s *exactSum) retainedBytes() uint64 {
-	if s.fraction {
-		return retainedBigRatBytes(&s.rational)
+func (s *exactSum) appendIntegerTo(dst []byte) []byte {
+	if s.wide != nil {
+		return s.wide.integer.Append(dst, 10)
 	}
-	return s.integer.retainedBytes()
+	return strconv.AppendInt(dst, s.small, 10)
+}
+
+func (s *exactSum) isFraction() bool {
+	return s.wide != nil && s.wide.fraction
+}
+
+func (s *exactSum) retainedBytes() uint64 {
+	if s.wide == nil {
+		return 0
+	}
+	if s.wide.fraction {
+		return retainedBigRatBytes(&s.wide.rational)
+	}
+	return retainedBigIntBytes(&s.wide.integer)
+}
+
+func trimJSONSpace(b []byte) []byte {
+	if len(b) == 0 || (b[0] > ' ' && b[len(b)-1] > ' ') {
+		return b
+	}
+	return bytes.TrimSpace(b)
+}
+
+// parseCanonicalUint64 validates and parses a canonical JSON non-negative
+// integer (no leading zeros except "0", no decimals/exponents) in one pass.
+func parseCanonicalUint64(b []byte) (uint64, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	if b[0] == '0' {
+		return 0, len(b) == 1
+	}
+	if b[0] < '1' || b[0] > '9' {
+		return 0, false
+	}
+	var val uint64
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		d := uint64(c - '0')
+		if val > (^uint64(0)-d)/10 {
+			return 0, false
+		}
+		val = val*10 + d
+	}
+	return val, true
+}
+
+// parseCanonicalInt64 validates and parses a canonical JSON signed integer
+// (optional '-', no leading zeros except "0"/"-0", no decimals/exponents) in
+// one pass.
+func parseCanonicalInt64(b []byte) (int64, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	neg := false
+	i := 0
+	if b[0] == '-' {
+		neg = true
+		i = 1
+		if len(b) == 1 {
+			return 0, false
+		}
+	}
+	if b[i] == '0' {
+		return 0, len(b) == i+1
+	}
+	if b[i] < '1' || b[i] > '9' {
+		return 0, false
+	}
+	const maxPos = uint64(1<<63 - 1)
+	const maxNeg = uint64(1 << 63)
+	limit := maxPos
+	if neg {
+		limit = maxNeg
+	}
+	var mag uint64
+	for ; i < len(b); i++ {
+		c := b[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		d := uint64(c - '0')
+		if mag > (limit-d)/10 {
+			return 0, false
+		}
+		mag = mag*10 + d
+	}
+	if neg {
+		return -int64(mag), true
+	}
+	return int64(mag), true
 }
 
 func addCount(total *exactCount, cell exchange.Cell, maxBytes uint64) error {
 	if cell.Null {
 		return fmt.Errorf("%w: COUNT state is null", ErrAggregate)
 	}
-	spelling := bytes.TrimSpace(cell.Bytes)
+	spelling := trimJSONSpace(cell.Bytes)
 	if maxBytes != 0 && uint64(len(spelling)) > maxBytes {
 		return fmt.Errorf("%w: COUNT state exceeds aggregate byte cap", ErrLimit)
+	}
+	if count, ok := parseCanonicalUint64(spelling); ok {
+		total.add(count)
+		return nil
 	}
 	if count, ok := (vibejson.RawValue{Src: spelling}).Uint64(); ok {
 		total.add(count)
@@ -241,18 +333,31 @@ func addExtreme(state *extreme, cell exchange.Cell, maximum bool) error {
 	if cell.Null {
 		return nil
 	}
-	spelling := bytes.TrimSpace(cell.Bytes)
-	raw := vibejson.RawValue{Src: spelling}
-	if raw.Kind() != jsondoc.Number || !vibejson.Valid(spelling) {
-		return fmt.Errorf("%w: MIN/MAX state is not numeric", ErrAggregate)
+	spelling := trimJSONSpace(cell.Bytes)
+	ival, isInt := parseCanonicalInt64(spelling)
+	if !isInt {
+		raw := vibejson.RawValue{Src: spelling}
+		if raw.Kind() != jsondoc.Number || !vibejson.Valid(spelling) {
+			return fmt.Errorf("%w: MIN/MAX state is not numeric", ErrAggregate)
+		}
 	}
 	if !state.set {
-		state.cell, state.number, state.set = cell, spelling, true
+		state.cell, state.number, state.ival, state.isInt, state.set = cell, spelling, ival, isInt, true
 		return nil
 	}
-	comparison := queryengine.CompareValidatedJSONNumbers(spelling, state.number)
-	if (maximum && comparison > 0) || (!maximum && comparison < 0) {
-		state.cell, state.number = cell, spelling
+	var replace bool
+	if isInt && state.isInt {
+		if maximum {
+			replace = ival > state.ival
+		} else {
+			replace = ival < state.ival
+		}
+	} else {
+		comparison := queryengine.CompareValidatedJSONNumbers(spelling, state.number)
+		replace = (maximum && comparison > 0) || (!maximum && comparison < 0)
+	}
+	if replace {
+		state.cell, state.number, state.ival, state.isInt = cell, spelling, ival, isInt
 	}
 	return nil
 }
@@ -286,14 +391,14 @@ func MergeCells(kind Kind, cells []exchange.Cell, maxBytes uint64) (exchange.Cel
 		if !total.set {
 			return exchange.Cell{Null: true}, nil
 		}
-		if !total.fraction {
-			spelling := total.integer.appendTo(nil)
+		if !total.isFraction() {
+			spelling := total.appendIntegerTo(nil)
 			if maxBytes != 0 && uint64(len(spelling)) > maxBytes {
 				return exchange.Cell{}, fmt.Errorf("%w: SUM output exceeds aggregate byte cap", ErrLimit)
 			}
 			return exchange.Cell{Bytes: spelling}, nil
 		}
-		spelling, err := appendExactDecimal(nil, &total.rational, maxBytes)
+		spelling, err := appendExactDecimal(nil, &total.wide.rational, maxBytes)
 		if err != nil {
 			return exchange.Cell{}, err
 		}

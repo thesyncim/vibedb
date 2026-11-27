@@ -536,3 +536,46 @@ func TestMergeSumRejectsExponentExpansionBeforeBigArithmetic(t *testing.T) {
 		t.Fatalf("merge error = %v, want ErrMergeAggregate", err)
 	}
 }
+
+func TestClassifyCellFastPathAndTopKStringEdgeCases(t *testing.T) {
+	// Invalid JSON must never be accepted by integer or string fast paths.
+	for _, bad := range []string{"01", "-01", "-", "+1", "1x", `"unterminated`, "\"\x00\"", `"a"x`, "nul", "tru", "fals"} {
+		v := classifyCell(cell(bad))
+		if v.valid {
+			t.Fatalf("classifyCell(%q).valid = true, want false", bad)
+		}
+	}
+	// Boundary int64 values and -0 vs 0.
+	minI := classifyCell(cell("-9223372036854775808"))
+	maxI := classifyCell(cell("9223372036854775807"))
+	negZero := classifyCell(cell("-0"))
+	posZero := classifyCell(cell("0"))
+	if !minI.valid || !minI.isInt || minI.ival != -9223372036854775808 {
+		t.Fatalf("minInt64 = %+v", minI)
+	}
+	if !maxI.valid || !maxI.isInt || maxI.ival != 9223372036854775807 {
+		t.Fatalf("maxInt64 = %+v", maxI)
+	}
+	if compareCells(negZero, posZero) != 0 {
+		t.Fatalf("compareCells(-0, 0) = %d, want 0", compareCells(negZero, posZero))
+	}
+	// Single-column groupedTopK with whitespace-padded escaped string (tests
+	// non-nil candidate.text when groupedEscapedTextBytes sees leading space).
+	rows := [][]shardservice.Cell{
+		{cell(`"z"`)},
+		{cell(` "b\n1" `)},
+		{cell(` "a\u0061" `)},
+		{cell(`"c"`)},
+	}
+	out, err := finalizeGroupedRows(rows, []OrderKey{{Column: 0}}, 2, 1<<20)
+	if err != nil {
+		t.Fatalf("finalizeGroupedRows failed: %v", err)
+	}
+	if len(out) != 2 || string(out[0][0].Bytes) != ` "a\u0061" ` || string(out[1][0].Bytes) != ` "b\n1" ` {
+		t.Fatalf("top-2 escaped strings = %q, %q", out[0][0].Bytes, out[1][0].Bytes)
+	}
+	// Whitespace-padded escaped strings must still be charged against maxBytes.
+	if got := groupedEscapedTextBytes(rows[1], []OrderKey{{Column: 0}}); got == 0 {
+		t.Fatalf("groupedEscapedTextBytes(%q) = 0, want > 0", rows[1][0].Bytes)
+	}
+}

@@ -317,3 +317,37 @@ func TestKeyInternerAppendKeyIDsDifferential(t *testing.T) {
 		}
 	}
 }
+
+func TestKeyInternerReserve(t *testing.T) {
+	var in KeyInterner
+	in.Reserve(0)
+	in.Reserve(-5)
+	id0 := in.InternString("alpha")
+	id1 := in.InternString("beta")
+	in.Reserve(1024)
+	if id0 != 0 || id1 != 1 {
+		t.Fatalf("initial IDs = %d, %d; want 0, 1", id0, id1)
+	}
+	if got, ok := in.LookupString("alpha"); !ok || got != 0 {
+		t.Fatalf("LookupString(alpha) after Reserve = %d, %v", got, ok)
+	}
+	if got, ok := in.LookupString("beta"); !ok || got != 1 {
+		t.Fatalf("LookupString(beta) after Reserve = %d, %v", got, ok)
+	}
+	for i := 2; i < 1024; i++ {
+		key := []byte{byte(i >> 8), byte(i)}
+		id := in.Intern(key)
+		if int(id) != i {
+			t.Fatalf("Intern(%d) = %d, want %d", i, id, i)
+		}
+	}
+	if in.Len() != 1024 {
+		t.Fatalf("Len() = %d, want 1024", in.Len())
+	}
+	for i := 2; i < 1024; i++ {
+		key := []byte{byte(i >> 8), byte(i)}
+		if got, ok := in.Lookup(key); !ok || int(got) != i {
+			t.Fatalf("Lookup(%d) = %d, %v", i, got, ok)
+		}
+	}
+}

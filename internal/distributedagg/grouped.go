@@ -1,7 +1,6 @@
 package distributedagg
 
 import (
-	"bytes"
 	"fmt"
 
 	"github.com/thesyncim/vibedb/internal/exchange"
@@ -34,7 +33,7 @@ func (a *outputArena) reserve(need int) int {
 
 func (a *outputArena) appendCount(value *exactCount) []byte {
 	need := 21
-	if value.large {
+	if value.wide != nil {
 		need = value.wide.BitLen()/3 + 2
 	}
 	start := a.reserve(need)
@@ -42,20 +41,20 @@ func (a *outputArena) appendCount(value *exactCount) []byte {
 	return a.current[start:len(a.current):len(a.current)]
 }
 
-func (a *outputArena) appendInteger(value *exactSignedInteger) []byte {
+func (a *outputArena) appendSumInteger(value *exactSum) []byte {
 	need := 21
-	if value.large {
-		need = value.wide.BitLen()/3 + 3
+	if value.wide != nil {
+		need = value.wide.integer.BitLen()/3 + 3
 	}
 	start := a.reserve(need)
-	a.current = value.appendTo(a.current)
+	a.current = value.appendIntegerTo(a.current)
 	return a.current[start:len(a.current):len(a.current)]
 }
 
 func (a *outputArena) appendRat(value *exactSum, maxBytes uint64) ([]byte, error) {
 	start := a.reserve(64)
 	var err error
-	a.current, err = appendExactDecimal(a.current, &value.rational, maxBytes)
+	a.current, err = appendExactDecimal(a.current, &value.wide.rational, maxBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -112,6 +111,54 @@ func NewMerger(kinds []Kind, groupKeys []uint16, maxBytes uint64) (*Merger, erro
 		maxBytes: maxBytes, counts: make([][]exactCount, len(kinds)),
 		sums: make([][]exactSum, len(kinds)), extrema: make([][]extreme, len(kinds)),
 	}, nil
+}
+
+// Reserve pre-sizes the merger's group table and columnar accumulator slices
+// for up to groupsHint distinct groups, clamped to the merger's maxBytes
+// admission budget so callers cannot over-allocate before admission checks.
+func (m *Merger) Reserve(groupsHint int) {
+	if m == nil || groupsHint <= 0 || m.interner.Len() != 0 {
+		return
+	}
+	perGroupMin := uint64(96 + len(m.kinds)*192)
+	maxGroups := m.maxBytes / perGroupMin
+	if maxGroups == 0 {
+		return
+	}
+	const (
+		reserveCap      = 1 << 20
+		maxReserveCells = 4 << 20
+	)
+	hintCap := min(reserveCap, max(1, maxReserveCells/len(m.kinds)))
+	if uint64(groupsHint) > maxGroups {
+		groupsHint = int(min(maxGroups, uint64(hintCap)))
+	}
+	if groupsHint > hintCap {
+		groupsHint = hintCap
+	}
+	if groupsHint <= 0 {
+		return
+	}
+	m.interner.Reserve(groupsHint)
+	if needRows := groupsHint * len(m.kinds); cap(m.rows) < needRows {
+		m.rows = make([]exchange.Cell, 0, needRows)
+	}
+	for column, kind := range m.kinds {
+		switch kind {
+		case Count:
+			if cap(m.counts[column]) < groupsHint {
+				m.counts[column] = make([]exactCount, 0, groupsHint)
+			}
+		case Sum:
+			if cap(m.sums[column]) < groupsHint {
+				m.sums[column] = make([]exactSum, 0, groupsHint)
+			}
+		case Min, Max:
+			if cap(m.extrema[column]) < groupsHint {
+				m.extrema[column] = make([]extreme, 0, groupsHint)
+			}
+		}
+	}
 }
 
 // Add consumes one borrowed partial row. All retained keys and extrema are
@@ -221,15 +268,26 @@ func (m *Merger) addExtreme(state *extreme, cell exchange.Cell, maximum bool) er
 	if cell.Null {
 		return nil
 	}
-	spelling := bytes.TrimSpace(cell.Bytes)
-	if !vibejson.Valid(spelling) || len(spelling) == 0 ||
-		(spelling[0] != '-' && (spelling[0] < '0' || spelling[0] > '9')) {
-		return fmt.Errorf("%w: MIN/MAX state is not numeric", ErrAggregate)
+	spelling := trimJSONSpace(cell.Bytes)
+	ival, isInt := parseCanonicalInt64(spelling)
+	if !isInt {
+		if !vibejson.Valid(spelling) || len(spelling) == 0 ||
+			(spelling[0] != '-' && (spelling[0] < '0' || spelling[0] > '9')) {
+			return fmt.Errorf("%w: MIN/MAX state is not numeric", ErrAggregate)
+		}
 	}
 	replace := !state.set
 	if state.set {
-		comparison := queryengine.CompareValidatedJSONNumbers(spelling, state.number)
-		replace = (maximum && comparison > 0) || (!maximum && comparison < 0)
+		if isInt && state.isInt {
+			if maximum {
+				replace = ival > state.ival
+			} else {
+				replace = ival < state.ival
+			}
+		} else {
+			comparison := queryengine.CompareValidatedJSONNumbers(spelling, state.number)
+			replace = (maximum && comparison > 0) || (!maximum && comparison < 0)
+		}
 	}
 	if !replace {
 		return nil
@@ -238,7 +296,7 @@ func (m *Merger) addExtreme(state *extreme, cell exchange.Cell, maximum bool) er
 		return err
 	}
 	owned := exchange.Cell{Bytes: m.input.appendBytes(cell.Bytes)}
-	state.cell, state.number, state.set = owned, bytes.TrimSpace(owned.Bytes), true
+	state.cell, state.number, state.ival, state.isInt, state.set = owned, trimJSONSpace(owned.Bytes), ival, isInt, true
 	return nil
 }
 
@@ -279,8 +337,8 @@ func (m *Merger) Finish() ([][]exchange.Cell, error) {
 				state := &m.sums[column][group]
 				if !state.set {
 					*cell = exchange.Cell{Null: true}
-				} else if !state.fraction {
-					*cell = exchange.Cell{Bytes: m.output.appendInteger(&state.integer)}
+				} else if !state.isFraction() {
+					*cell = exchange.Cell{Bytes: m.output.appendSumInteger(state)}
 				} else {
 					spelling, err := m.output.appendRat(state, m.maxBytes)
 					if err != nil {

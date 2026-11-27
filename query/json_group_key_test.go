@@ -2,7 +2,10 @@ package query
 
 import (
 	"bytes"
+	"strings"
 	"testing"
+
+	vibejson "github.com/thesyncim/vibejson"
 )
 
 func TestJSONGroupKeyEncoderMatchesExactScalarIdentity(t *testing.T) {
@@ -75,4 +78,46 @@ func FuzzJSONGroupKeyEncoder(f *testing.F) {
 			t.Fatalf("group-key encoding is not deterministic for %x", value)
 		}
 	})
+}
+
+func TestJSONGroupKeyEncoderFastPathDifferential(t *testing.T) {
+	cases := []string{
+		"0", "-0", "0.0", "-0.0", "0e0",
+		"1", "-1", "9", "-9", "10", "-10", "100", "1e2", "1000", "-1000",
+		"1234500", "1.2345e6",
+		"9223372036854775807", "-9223372036854775808",
+		"9999999999", "10000000000",
+		strings.Repeat("9", 100),
+		"1" + strings.Repeat("0", 120),
+		"-1" + strings.Repeat("0", 150) + "5",
+		`""`, `"a"`, `"hello"`, `"a\nb"`, `"\"quoted\""`, `"\u0041"`, `"A"`,
+		`"café"`, `"🎉"`, `"` + strings.Repeat("x", 200) + `"`,
+		"null", "true", "false",
+		"  42  ", "\t\"ok\"\n", " null ", " true\r\n",
+		"[]", "[1,2]", "{}", `{"a":1}`,
+		// Invalid JSON inputs that must be rejected identically.
+		"", "   ", "-", "01", "-01", "00", "+1", "1.", "1e", "1x",
+		`"unterminated`, "\"\x00\"", "\"\x1f\"", `"a"x`, `"a""b"`,
+		"nul", "tru", "fals", "true1", "nullx", "NaN", "Infinity",
+	}
+	var encoder JSONGroupKeyEncoder
+	for _, tc := range cases {
+		raw := []byte(tc)
+		got, gotOK := encoder.Append(nil, raw)
+
+		trimmed := trimJSONGroupSpace(raw)
+		wantOK := len(trimmed) > 0 && vibejson.Valid(trimmed)
+		var want []byte
+		if wantOK {
+			var scratch []byte
+			scalar := classifyRawInto(vibejson.RawValue{Src: trimmed}, &scratch)
+			want = appendGroupKey(nil, scalar)
+		}
+		if gotOK != wantOK {
+			t.Fatalf("Append(%q): ok = %v, want %v", tc, gotOK, wantOK)
+		}
+		if gotOK && !bytes.Equal(got, want) {
+			t.Fatalf("Append(%q): got %x, want %x", tc, got, want)
+		}
+	}
 }

@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"bytes"
-	"container/heap"
 	"errors"
 	"fmt"
 	"slices"
@@ -99,9 +98,51 @@ func classifyCellInto(c shardservice.Cell, text *[]byte) cellValue {
 	if c.Null {
 		return cellValue{kind: ckNull, valid: true}
 	}
-	b := bytes.TrimSpace(c.Bytes)
+	b := c.Bytes
 	if len(b) == 0 {
 		return cellValue{kind: ckNull, valid: true}
+	}
+	if b[0] <= ' ' || b[len(b)-1] <= ' ' {
+		b = bytes.TrimSpace(b)
+		if len(b) == 0 {
+			return cellValue{kind: ckNull, valid: true}
+		}
+	}
+	// Single-pass fast paths for the dominant canonical wire tokens: signed
+	// JSON integers fitting in int64, unescaped ASCII strings, null, and
+	// booleans. Any complex or invalid token falls through to vibejson.Valid.
+	switch b[0] {
+	case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-':
+		if i, ok := parseCanonicalJSONInt64(b); ok {
+			return cellValue{kind: ckNumber, isInt: true, ival: i, num: b, valid: true}
+		}
+	case '"':
+		if len(b) >= 2 && b[len(b)-1] == '"' {
+			inner := b[1 : len(b)-1]
+			plain := true
+			for i := 0; i < len(inner); i++ {
+				ch := inner[i]
+				if ch < 0x20 || ch >= 0x80 || ch == '"' || ch == '\\' {
+					plain = false
+					break
+				}
+			}
+			if plain {
+				return cellValue{kind: ckString, sval: inner, valid: true}
+			}
+		}
+	case 'n':
+		if len(b) == 4 && b[1] == 'u' && b[2] == 'l' && b[3] == 'l' {
+			return cellValue{kind: ckNull, valid: true}
+		}
+	case 't':
+		if len(b) == 4 && b[1] == 'r' && b[2] == 'u' && b[3] == 'e' {
+			return cellValue{kind: ckBool, bval: true, valid: true, raw: b}
+		}
+	case 'f':
+		if len(b) == 5 && b[1] == 'a' && b[2] == 'l' && b[3] == 's' && b[4] == 'e' {
+			return cellValue{kind: ckBool, bval: false, valid: true, raw: b}
+		}
 	}
 	valid := vibejson.Valid(b)
 	raw := vibejson.RawValue{Src: b}
@@ -139,9 +180,56 @@ func classifyCellInto(c shardservice.Cell, text *[]byte) cellValue {
 	}
 }
 
+func parseCanonicalJSONInt64(b []byte) (int64, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	neg := false
+	i := 0
+	if b[0] == '-' {
+		neg = true
+		i = 1
+		if len(b) == 1 {
+			return 0, false
+		}
+	}
+	if b[i] == '0' {
+		return 0, len(b) == i+1
+	}
+	if b[i] < '1' || b[i] > '9' {
+		return 0, false
+	}
+	const maxPos = uint64(1<<63 - 1)
+	const maxNeg = uint64(1 << 63)
+	limit := maxPos
+	if neg {
+		limit = maxNeg
+	}
+	var mag uint64
+	for ; i < len(b); i++ {
+		c := b[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		d := uint64(c - '0')
+		if mag > (limit-d)/10 {
+			return 0, false
+		}
+		mag = mag*10 + d
+	}
+	if neg {
+		return -int64(mag), true
+	}
+	return int64(mag), true
+}
+
 // compareCells returns the sign of a - b under the query's total order over JSON
 // values.
 func compareCells(a, b cellValue) int {
+	return compareCellPtrs(&a, &b)
+}
+
+func compareCellPtrs(a, b *cellValue) int {
 	if a.kind != b.kind {
 		if a.kind < b.kind {
 			return -1
@@ -193,45 +281,46 @@ func compareNumberSpelling(a, b []byte) int {
 // each row and a cursor. idx breaks ties deterministically by shard position.
 type shardRun struct {
 	rows [][]shardservice.Cell
-	keys [][]cellValue
+	keys []cellValue // flat row-major slab: row r, key k at keys[r*width+k]
 	pos  int
 	idx  int
 }
 
-// mergeHeap is the k-way merge frontier: one shardRun per shard, ordered by the
-// current head row under the sort keys. It mirrors the query engine's rowHeap.
-type mergeHeap struct {
-	runs  []*shardRun
-	order []OrderKey
-}
-
-func (h mergeHeap) Len() int { return len(h.runs) }
-
-func (h mergeHeap) Less(i, j int) bool {
-	c := compareHeads(h.runs[i], h.runs[j], h.order)
+func mergeRunLess(a, b *shardRun, order []OrderKey) bool {
+	c := compareHeads(a, b, order)
 	if c != 0 {
 		return c < 0
 	}
-	return h.runs[i].idx < h.runs[j].idx
+	return a.idx < b.idx
 }
 
-func (h mergeHeap) Swap(i, j int) { h.runs[i], h.runs[j] = h.runs[j], h.runs[i] }
-
-func (h *mergeHeap) Push(x any) { h.runs = append(h.runs, x.(*shardRun)) }
-
-func (h *mergeHeap) Pop() any {
-	n := len(h.runs) - 1
-	x := h.runs[n]
-	h.runs = h.runs[:n]
-	return x
+func mergeHeapSiftDown(runs []*shardRun, order []OrderKey, i int) {
+	n := len(runs)
+	for {
+		left := 2*i + 1
+		if left >= n {
+			break
+		}
+		best := left
+		if right := left + 1; right < n && mergeRunLess(runs[right], runs[left], order) {
+			best = right
+		}
+		if !mergeRunLess(runs[best], runs[i], order) {
+			break
+		}
+		runs[i], runs[best] = runs[best], runs[i]
+		i = best
+	}
 }
 
 // compareHeads compares the current head rows of two runs across the sort keys,
 // negating each descending key, and returns the first non-zero sign.
 func compareHeads(a, b *shardRun, order []OrderKey) int {
-	ka, kb := a.keys[a.pos], b.keys[b.pos]
+	width := len(order)
+	ka := a.keys[a.pos*width : (a.pos+1)*width]
+	kb := b.keys[b.pos*width : (b.pos+1)*width]
 	for k := range order {
-		c := compareOrderedCells(ka[k], kb[k], order[k])
+		c := compareOrderedCellPtrs(&ka[k], &kb[k], order[k])
 		if c != 0 {
 			return c
 		}
@@ -239,7 +328,7 @@ func compareHeads(a, b *shardRun, order []OrderKey) int {
 	return 0
 }
 
-func compareOrderedCells(a, b cellValue, order OrderKey) int {
+func compareOrderedCellPtrs(a, b *cellValue, order OrderKey) int {
 	if order.Nulls != sqlast.WindowNullsDefault && (a.kind == ckNull || b.kind == ckNull) {
 		if a.kind == b.kind {
 			return 0
@@ -249,7 +338,7 @@ func compareOrderedCells(a, b cellValue, order OrderKey) int {
 		}
 		return 1
 	}
-	cmp := compareCells(a, b)
+	cmp := compareCellPtrs(a, b)
 	if order.Desc {
 		return -cmp
 	}
@@ -265,7 +354,7 @@ type groupedSortEntry struct {
 
 func compareGroupedSortEntries(a, b *groupedSortEntry, order []OrderKey) int {
 	for key := range order {
-		comparison := compareOrderedCells(a.keys[key], b.keys[key], order[key])
+		comparison := compareOrderedCellPtrs(&a.keys[key], &b.keys[key], order[key])
 		if comparison != 0 {
 			return comparison
 		}
@@ -280,25 +369,27 @@ func compareGroupedSortEntries(a, b *groupedSortEntry, order []OrderKey) int {
 	}
 }
 
-type groupedTopKHeap struct {
-	entries []groupedSortEntry
-	order   []OrderKey
-}
-
-func (h groupedTopKHeap) Len() int { return len(h.entries) }
-func (h groupedTopKHeap) Less(i, j int) bool {
-	// Reverse the requested order so the worst retained row is the root.
-	return compareGroupedSortEntries(&h.entries[i], &h.entries[j], h.order) > 0
-}
-func (h groupedTopKHeap) Swap(i, j int) { h.entries[i], h.entries[j] = h.entries[j], h.entries[i] }
-func (h *groupedTopKHeap) Push(value any) {
-	h.entries = append(h.entries, value.(groupedSortEntry))
-}
-func (h *groupedTopKHeap) Pop() any {
-	last := len(h.entries) - 1
-	value := h.entries[last]
-	h.entries = h.entries[:last]
-	return value
+func groupedTopKSiftDown(entries []groupedSortEntry, order []OrderKey, i int) {
+	// Max-heap in requested order so the worst retained row is at entries[0].
+	n := len(entries)
+	moving := entries[i]
+	for {
+		left := 2*i + 1
+		if left >= n {
+			break
+		}
+		worst := left
+		if right := left + 1; right < n &&
+			compareGroupedSortEntries(&entries[right], &entries[left], order) > 0 {
+			worst = right
+		}
+		if compareGroupedSortEntries(&entries[worst], &moving, order) <= 0 {
+			break
+		}
+		entries[i] = entries[worst]
+		i = worst
+	}
+	entries[i] = moving
 }
 
 // finalizeGroupedRows applies the coordinator-only stage after exact grouped
@@ -384,36 +475,62 @@ func groupedTopK(
 	if err := admitGroupedSortState(limit+1, len(order), maxText, maxBytes); err != nil {
 		return nil, err
 	}
+	hasEscapedText := maxText > 0
 	keySlab := make([]cellValue, (limit+1)*len(order))
-	h := &groupedTopKHeap{
-		entries: make([]groupedSortEntry, limit), order: order,
-	}
+	entries := make([]groupedSortEntry, limit)
 	for row := 0; row < limit; row++ {
-		h.entries[row].keys = keySlab[row*len(order) : (row+1)*len(order)]
-		if err := prepareGroupedSortEntry(&h.entries[row], rows[row], order, row); err != nil {
+		entries[row].keys = keySlab[row*len(order) : (row+1)*len(order)]
+		if err := prepareGroupedSortEntry(&entries[row], rows[row], order, row, hasEscapedText); err != nil {
 			return nil, err
 		}
 	}
-	heap.Init(h)
+	for i := limit/2 - 1; i >= 0; i-- {
+		groupedTopKSiftDown(entries, order, i)
+	}
 	candidate := groupedSortEntry{keys: keySlab[limit*len(order):]}
-	for row := limit; row < len(rows); row++ {
-		if err := prepareGroupedSortEntry(&candidate, rows[row], order, row); err != nil {
-			return nil, err
+	if len(order) == 1 && !hasEscapedText {
+		ord0 := order[0]
+		col0 := ord0.Column
+		for row := limit; row < len(rows); row++ {
+			if len(candidate.text) != 0 {
+				candidate.text = candidate.text[:0]
+			}
+			kv := classifyCellInto(rows[row][col0], &candidate.text)
+			if !kv.valid {
+				return nil, fmt.Errorf("%w: grouped row %d column %d", ErrMergeValue, row, col0)
+			}
+			cmp := compareOrderedCellPtrs(&kv, &entries[0].keys[0], ord0)
+			if cmp > 0 || (cmp == 0 && row >= entries[0].ordinal) {
+				continue
+			}
+			candidate.row = rows[row]
+			candidate.ordinal = row
+			candidate.keys[0] = kv
+			displaced := entries[0]
+			entries[0] = candidate
+			candidate = displaced
+			groupedTopKSiftDown(entries, order, 0)
 		}
-		if compareGroupedSortEntries(&candidate, &h.entries[0], order) >= 0 {
-			continue
+	} else {
+		for row := limit; row < len(rows); row++ {
+			if err := prepareGroupedSortEntry(&candidate, rows[row], order, row, hasEscapedText); err != nil {
+				return nil, err
+			}
+			if compareGroupedSortEntries(&candidate, &entries[0], order) >= 0 {
+				continue
+			}
+			displaced := entries[0]
+			entries[0] = candidate
+			candidate = displaced
+			groupedTopKSiftDown(entries, order, 0)
 		}
-		displaced := h.entries[0]
-		h.entries[0] = candidate
-		candidate = displaced
-		heap.Fix(h, 0)
 	}
-	slices.SortFunc(h.entries, func(a, b groupedSortEntry) int {
+	slices.SortFunc(entries, func(a, b groupedSortEntry) int {
 		return compareGroupedSortEntries(&a, &b, order)
 	})
 	out := make([][]shardservice.Cell, limit)
 	for row := range out {
-		out[row] = h.entries[row].row
+		out[row] = entries[row].row
 	}
 	return out, nil
 }
@@ -463,11 +580,16 @@ func prepareGroupedSortEntry(
 	row []shardservice.Cell,
 	order []OrderKey,
 	ordinal int,
+	hasEscapedText bool,
 ) error {
-	textBytes := groupedEscapedTextBytes(row, order)
-	if cap(entry.text) < textBytes {
-		entry.text = make([]byte, 0, textBytes)
-	} else {
+	if hasEscapedText {
+		textBytes := groupedEscapedTextBytes(row, order)
+		if cap(entry.text) < textBytes {
+			entry.text = make([]byte, 0, textBytes)
+		} else {
+			entry.text = entry.text[:0]
+		}
+	} else if len(entry.text) != 0 {
 		entry.text = entry.text[:0]
 	}
 	entry.row, entry.ordinal = row, ordinal
@@ -484,9 +606,15 @@ func groupedEscapedTextBytes(row []shardservice.Cell, order []OrderKey) int {
 	total := 0
 	for _, key := range order {
 		cell := row[key.Column]
-		if !cell.Null && len(cell.Bytes) >= 2 && cell.Bytes[0] == '"' &&
-			bytes.IndexByte(cell.Bytes, '\\') >= 0 {
-			total += len(cell.Bytes)
+		if cell.Null || len(cell.Bytes) < 2 {
+			continue
+		}
+		b := cell.Bytes
+		if b[0] <= ' ' {
+			b = bytes.TrimLeft(b, " \t\r\n")
+		}
+		if len(b) >= 2 && b[0] == '"' && bytes.IndexByte(b, '\\') >= 0 {
+			total += len(b)
 		}
 	}
 	return total
@@ -655,6 +783,13 @@ func mergeGroupedAggregateRows(
 	if err != nil {
 		return nil, nil, err
 	}
+	hint := 0
+	for shard := range results {
+		if len(results[shard].Rows) > hint {
+			hint = len(results[shard].Rows)
+		}
+	}
+	merger.reserve(hint)
 	for shard := range results {
 		for row := range results[shard].Rows {
 			if err := merger.add(results[shard].Rows[row]); err != nil {
@@ -667,6 +802,13 @@ func mergeGroupedAggregateRows(
 		return nil, nil, err
 	}
 	return columns, rows, nil
+}
+
+func (m *groupedAggregateMerger) reserve(groupsHint int) {
+	if m == nil || m.shared == nil {
+		return
+	}
+	m.shared.Reserve(groupsHint)
 }
 
 func (m *groupedAggregateMerger) add(row []shardservice.Cell) error {
@@ -707,48 +849,58 @@ func concatRows(results []*shardservice.ShardResponse, limit int) [][]shardservi
 // stream, decoding each row's sort-key columns once, and trims at a positive
 // limit.
 func kwayMerge(results []*shardservice.ShardResponse, order []OrderKey, limit int) ([][]shardservice.Cell, error) {
-	h := &mergeHeap{order: order}
+	runs := make([]*shardRun, 0, len(results))
+	width := len(order)
 	total := 0
 	for idx, resp := range results {
 		if len(resp.Rows) == 0 {
 			continue
 		}
-		keys := make([][]cellValue, len(resp.Rows))
+		keySlab := make([]cellValue, len(resp.Rows)*width)
+		var text []byte
 		for r, row := range resp.Rows {
-			kv := make([]cellValue, len(order))
+			base := r * width
 			for k := range order {
 				col := order[k].Column
 				if col < 0 || col >= len(row) {
 					return nil, ErrMergeColumn
 				}
-				kv[k] = classifyCell(row[col])
-				if !kv[k].valid {
+				kv := classifyCellInto(row[col], &text)
+				if !kv.valid {
 					return nil, fmt.Errorf("%w: shard %d row %d column %d", ErrMergeValue, idx, r, col)
 				}
+				keySlab[base+k] = kv
 			}
-			keys[r] = kv
 		}
-		h.runs = append(h.runs, &shardRun{rows: resp.Rows, keys: keys, idx: idx})
+		runs = append(runs, &shardRun{rows: resp.Rows, keys: keySlab, idx: idx})
 		total += len(resp.Rows)
 	}
-	heap.Init(h)
+	for i := len(runs)/2 - 1; i >= 0; i-- {
+		mergeHeapSiftDown(runs, order, i)
+	}
 
 	capacity := total
 	if limit > 0 && limit < capacity {
 		capacity = limit
 	}
 	out := make([][]shardservice.Cell, 0, capacity)
-	for h.Len() > 0 {
-		top := h.runs[0]
+	for len(runs) > 0 {
+		top := runs[0]
 		out = append(out, top.rows[top.pos])
 		if limit > 0 && len(out) >= limit {
 			break
 		}
 		top.pos++
 		if top.pos < len(top.rows) {
-			heap.Fix(h, 0)
+			mergeHeapSiftDown(runs, order, 0)
 		} else {
-			heap.Pop(h)
+			last := len(runs) - 1
+			runs[0] = runs[last]
+			runs[last] = nil
+			runs = runs[:last]
+			if len(runs) > 1 {
+				mergeHeapSiftDown(runs, order, 0)
+			}
 		}
 	}
 	return out, nil
