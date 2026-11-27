@@ -1950,60 +1950,79 @@ func TestSeamlessScaleInOutProcessQualification(t *testing.T) {
 
 		joinRequestID := mustSeamlessScaleRequestID(t)
 		join := runSeamlessScaleCLI(t, ctx, vibedbBinary, "join", profilePath,
-			"--node-file", target.Descriptor, "--request-id", joinRequestID, "--wait", seamlessScaleOperationWait.String())
+			"--node-file", target.Descriptor, "--request-id", joinRequestID, "--wait", "0s")
 		if !join.OK || join.OperationID == "" {
 			t.Fatalf("cycle %d join response=%+v", cycle+1, join)
 		}
 		joinDuplicate := runSeamlessScaleCLI(t, ctx, vibedbBinary, "join", profilePath,
-			"--node-file", target.Descriptor, "--request-id", joinRequestID, "--wait", seamlessScaleOperationWait.String())
+			"--node-file", target.Descriptor, "--request-id", joinRequestID, "--wait", "0s")
 		if !joinDuplicate.OK || joinDuplicate.OperationID != join.OperationID {
 			duplicateStable = false
 			t.Fatalf("cycle %d duplicate join changed operation: first=%+v duplicate=%+v", cycle+1, join, joinDuplicate)
 		}
 		var joinPacingResponse, joinFinal clustercontrol.Response
 		joinPacingObserved := false
-		if err := waitSeamlessScaleOperation(ctx, vibedbBinary, profilePath, join.OperationID, func(response clustercontrol.Response) bool {
-			joinFinal = response
-			if seamlessScalePacingObserved(response) {
-				joinPacingResponse = response
+		for _, initial := range []clustercontrol.Response{join, joinDuplicate} {
+			joinFinal = initial
+			if seamlessScalePacingObserved(initial) {
+				joinPacingResponse = initial
 				joinPacingObserved = true
-				return true
+				break
 			}
-			return seamlessScaleTerminalSuccess(response)
-		}, func(response clustercontrol.Response) {
-			processes := append([]*seamlessScaleNodeProcess(nil), physical.nodes...)
-			processes = append(processes, targetProcesses...)
-			captures, captureErr := captureSeamlessScaleRaftDiagnostics(processes)
-			artifact := struct {
-				Cycle      int                            `json:"cycle"`
-				Operation  string                         `json:"operation_id"`
-				Status     clustercontrol.Response        `json:"status"`
-				CapturedAt time.Time                      `json:"captured_at"`
-				Details    seamlessScaleFirstStallDetails `json:"first_stall_details"`
-				Processes  []json.RawMessage              `json:"process_snapshots,omitempty"`
-				Error      string                         `json:"snapshot_error,omitempty"`
-			}{Cycle: cycle + 1, Operation: join.OperationID, Status: response,
-				CapturedAt: time.Now().UTC(), Details: captureSeamlessScaleFirstStallDetails(response, cluster, target), Processes: captures}
-			if captureErr != nil {
-				artifact.Error = captureErr.Error()
-			}
-			if raw, marshalErr := json.MarshalIndent(artifact, "", "  "); marshalErr == nil {
-				if evidencePath := os.Getenv(seamlessScaleEvidenceEnvironment); evidencePath != "" {
-					marshalErr = os.WriteFile(fmt.Sprintf("%s.cycle-%d-join-pre-pacing-first-stall.json", evidencePath, cycle+1), append(raw, '\n'), 0o600)
+		}
+		if !joinPacingObserved && !seamlessScaleTerminalSuccess(joinFinal) {
+			if err := waitSeamlessScaleOperationWithWait(ctx, vibedbBinary, profilePath, join.OperationID, 0, func(response clustercontrol.Response) bool {
+				joinFinal = response
+				if seamlessScalePacingObserved(response) {
+					joinPacingResponse = response
+					joinPacingObserved = true
+					return true
 				}
-				if marshalErr != nil {
-					t.Errorf("persist first-stalled pre-pacing join diagnostics: %v", marshalErr)
+				return seamlessScaleTerminalSuccess(response)
+			}, func(response clustercontrol.Response) {
+				processes := append([]*seamlessScaleNodeProcess(nil), physical.nodes...)
+				processes = append(processes, targetProcesses...)
+				captures, captureErr := captureSeamlessScaleRaftDiagnostics(processes)
+				artifact := struct {
+					Cycle      int                            `json:"cycle"`
+					Operation  string                         `json:"operation_id"`
+					Status     clustercontrol.Response        `json:"status"`
+					CapturedAt time.Time                      `json:"captured_at"`
+					Details    seamlessScaleFirstStallDetails `json:"first_stall_details"`
+					Processes  []json.RawMessage              `json:"process_snapshots,omitempty"`
+					Error      string                         `json:"snapshot_error,omitempty"`
+				}{Cycle: cycle + 1, Operation: join.OperationID, Status: response,
+					CapturedAt: time.Now().UTC(), Details: captureSeamlessScaleFirstStallDetails(response, cluster, target), Processes: captures}
+				if captureErr != nil {
+					artifact.Error = captureErr.Error()
 				}
-			} else {
-				t.Errorf("marshal first-stalled pre-pacing join diagnostics: %v", marshalErr)
+				if raw, marshalErr := json.MarshalIndent(artifact, "", "  "); marshalErr == nil {
+					if evidencePath := os.Getenv(seamlessScaleEvidenceEnvironment); evidencePath != "" {
+						marshalErr = os.WriteFile(fmt.Sprintf("%s.cycle-%d-join-pre-pacing-first-stall.json", evidencePath, cycle+1), append(raw, '\n'), 0o600)
+					}
+					if marshalErr != nil {
+						t.Errorf("persist first-stalled pre-pacing join diagnostics: %v", marshalErr)
+					}
+				} else {
+					t.Errorf("marshal first-stalled pre-pacing join diagnostics: %v", marshalErr)
+				}
+				t.Logf("cycle %d pre-pacing join first-stall diagnostics captured: process_count=%d error=%v",
+					cycle+1, len(captures), captureErr)
+			}); err != nil {
+				t.Fatalf("cycle %d join did not reach pacing or completion: %v", cycle+1, err)
 			}
-			t.Logf("cycle %d pre-pacing join first-stall diagnostics captured: process_count=%d error=%v",
-				cycle+1, len(captures), captureErr)
-		}); err != nil {
-			t.Fatalf("cycle %d join did not reach pacing or completion: %v", cycle+1, err)
 		}
 		if !joinPacingObserved {
-			t.Fatalf("cycle %d enrollment move never exposed positive pacing in an active move phase: final=%+v", cycle+1, joinFinal)
+			if seamlessScaleTerminalSuccess(joinFinal) && joinFinal.Budget != nil &&
+				joinFinal.Budget.ThrottledCalls > 0 && joinFinal.Budget.ThrottledBytes > 0 &&
+				(joinFinal.ApplicationGroupsMoved > 0 || joinFinal.InternalGroupsMoved > 0) {
+				joinPacingResponse = joinFinal
+				joinPacingObserved = true
+				t.Logf("scale cycle %d enrollment completed with positive pacing before active-phase poll caught it: operation=%s throttled_calls=%d throttled_bytes=%d",
+					cycle+1, join.OperationID, joinFinal.Budget.ThrottledCalls, joinFinal.Budget.ThrottledBytes)
+			} else {
+				t.Fatalf("cycle %d enrollment move never exposed positive pacing in an active move phase: final=%+v", cycle+1, joinFinal)
+			}
 		}
 		applicationMoved = maxUint32(applicationMoved, joinPacingResponse.ApplicationGroupsMoved)
 		internalMoved = maxUint32(internalMoved, joinPacingResponse.InternalGroupsMoved)
@@ -3265,6 +3284,14 @@ func pollSeamlessScaleStatus(
 	predicate func(clustercontrol.Response) bool,
 	stallObservers ...func(clustercontrol.Response),
 ) (bool, error) {
+	return pollSeamlessScaleStatusWithWait(ctx, binary, profile, operationID, seamlessScaleOperationWait, predicate, stallObservers...)
+}
+
+func pollSeamlessScaleStatusWithWait(
+	ctx context.Context, binary, profile, operationID string, wait time.Duration,
+	predicate func(clustercontrol.Response) bool,
+	stallObservers ...func(clustercontrol.Response),
+) (bool, error) {
 	deadline := time.NewTimer(10 * time.Minute)
 	defer deadline.Stop()
 	var prior string
@@ -3311,7 +3338,7 @@ func pollSeamlessScaleStatus(
 		}
 	}
 	for {
-		response, err := runSeamlessScaleCLIForPoll(ctx, binary, profile, operationID)
+		response, err := runSeamlessScaleCLIForPollWithWait(ctx, binary, profile, operationID, wait)
 		if err != nil {
 			// A rejected status reflects the live control plane's momentary
 			// view, not a broken poll: a leader-election gap right after a
@@ -3729,14 +3756,24 @@ func latestSeamlessScaleRaftSnapshot(
 func waitSeamlessScaleOperation(ctx context.Context, binary, profile, operationID string,
 	predicate func(clustercontrol.Response) bool, stallObservers ...func(clustercontrol.Response),
 ) error {
-	if _, err := pollSeamlessScaleStatus(ctx, binary, profile, operationID, predicate, stallObservers...); err != nil {
+	return waitSeamlessScaleOperationWithWait(ctx, binary, profile, operationID, seamlessScaleOperationWait, predicate, stallObservers...)
+}
+
+func waitSeamlessScaleOperationWithWait(ctx context.Context, binary, profile, operationID string, wait time.Duration,
+	predicate func(clustercontrol.Response) bool, stallObservers ...func(clustercontrol.Response),
+) error {
+	if _, err := pollSeamlessScaleStatusWithWait(ctx, binary, profile, operationID, wait, predicate, stallObservers...); err != nil {
 		return fmt.Errorf("operation %s did not reach requested state: %w", operationID, err)
 	}
 	return nil
 }
 
 func runSeamlessScaleCLIForPoll(ctx context.Context, binary, profile, operationID string) (clustercontrol.Response, error) {
-	command := exec.CommandContext(ctx, binary, "cluster", "status", "--profile", profile, "--operation", operationID, "--json", "--wait", seamlessScaleOperationWait.String())
+	return runSeamlessScaleCLIForPollWithWait(ctx, binary, profile, operationID, seamlessScaleOperationWait)
+}
+
+func runSeamlessScaleCLIForPollWithWait(ctx context.Context, binary, profile, operationID string, wait time.Duration) (clustercontrol.Response, error) {
+	command := exec.CommandContext(ctx, binary, "cluster", "status", "--profile", profile, "--operation", operationID, "--json", "--wait", wait.String())
 	var stdout, stderr bytes.Buffer
 	command.Stdout, command.Stderr = &stdout, &stderr
 	if err := command.Run(); err != nil && stdout.Len() == 0 {

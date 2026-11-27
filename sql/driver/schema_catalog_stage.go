@@ -175,8 +175,19 @@ func (a *ReplicatedApply) RecoverPreparedReplicatedSchemaTargetAfterEmptySuffix(
 	if a == nil || a.database == nil || requestDigest == ([32]byte{}) {
 		return ReplicatedSchemaTargetProof{}, ErrReplicatedSchemaCatalogImage
 	}
-	proof, err := a.CertifyReplicatedSchemaTarget(raw)
+	// A stage marker freezes a shadow against replay. Require that durable
+	// preparation before auditing a retained shadow after an empty suffix or
+	// an already-applied peer schema transition.
+	marker, found, err := readReplicatedSchemaStageMarker(a.database.dataDir)
+	if err != nil || !found || marker.authorization != requestDigest || marker.catalogDigest != sha256.Sum256(raw) {
+		return ReplicatedSchemaTargetProof{}, errors.Join(err, ErrReplicatedSchemaCatalogImage)
+	}
+	verified, err := a.preflightReplicatedSchemaTarget(context.Background(), raw, marker.sourceApplied, false)
 	if err != nil {
+		return ReplicatedSchemaTargetProof{}, err
+	}
+	proof := verified.proof
+	if err := verified.Close(); err != nil {
 		return ReplicatedSchemaTargetProof{}, err
 	}
 	return a.recoverPreparedSchemaTargetProof(raw, requestDigest, proof)
