@@ -59,12 +59,20 @@ func TestWriteGatewayMetricsIsCanonicalAndComplete(t *testing.T) {
 		RouteSingle: 1, RouteTargeted: 2, RouteScatter: 3, RouteEmpty: 4,
 		ShardsFanned: 5, RowsReturned: 6, BytesReturned: 7, Retries: 8,
 		ScatterAllShards: 9, ScatterUnknownRoute: 10,
+		ReadLatency: gateway.LatencyHistogramSnapshot{
+			Count: 2, SumUS: 175,
+			Buckets: [gateway.LatencyBucketCount]uint64{1, 0, 1},
+		},
+		WriteLatency: gateway.LatencyHistogramSnapshot{
+			Count: 1, SumUS: 4200,
+			Buckets: [gateway.LatencyBucketCount]uint64{0, 0, 0, 0, 0, 0, 1},
+		},
 	}
 	var output bytes.Buffer
 	if err := writeServeResponse(vibejson.NewWriter(&output), &serveResponse{Metrics: &metrics}); err != nil {
 		t.Fatal(err)
 	}
-	want := `{"metrics":{"route_single":1,"route_targeted":2,"route_scatter":3,"route_empty":4,"shards_fanned":5,"rows_returned":6,"bytes_returned":7,"retries":8,"scatter_all_shards":9,"scatter_unknown_route":10}}` + "\n"
+	want := `{"metrics":{"route_single":1,"route_targeted":2,"route_scatter":3,"route_empty":4,"shards_fanned":5,"rows_returned":6,"bytes_returned":7,"retries":8,"scatter_all_shards":9,"scatter_unknown_route":10,"read_latency_us":{"count":2,"sum_us":175,"bounds_us":[50,100,250,500,1000,2500,5000,10000,25000,50000,100000,250000,500000,1000000,5000000],"buckets":[1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0]},"write_latency_us":{"count":1,"sum_us":4200,"bounds_us":[50,100,250,500,1000,2500,5000,10000,25000,50000,100000,250000,500000,1000000,5000000],"buckets":[0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0]}}}` + "\n"
 	if got := output.String(); got != want {
 		t.Fatalf("metrics response=%q want=%q", got, want)
 	}
@@ -91,7 +99,7 @@ func TestGatewayMetricsServingRequiresTopologyCapability(t *testing.T) {
 			t.Fatal(err)
 		}
 		response, err := bytes.NewBuffer(nil), error(nil)
-		line := make([]byte, 512)
+		line := make([]byte, 2048)
 		count, readErr := client.Read(line)
 		if readErr != nil {
 			err = readErr
@@ -118,7 +126,7 @@ func TestGatewayMetricsServingRequiresTopologyCapability(t *testing.T) {
 func BenchmarkWriteGatewayMetrics(b *testing.B) {
 	metrics := gateway.MetricsSnapshot{RouteSingle: 1, ShardsFanned: 2, BytesReturned: 3}
 	var output bytes.Buffer
-	output.Grow(512)
+	output.Grow(1024)
 	writer := vibejson.NewWriter(&output)
 	b.ReportAllocs()
 	for b.Loop() {

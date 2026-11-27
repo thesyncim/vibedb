@@ -85,6 +85,8 @@ identity outside VibeDB.
 | `retries` | stale-generation retries |
 | `scatter_all_shards` | scatters whose resolved route covered every shard |
 | `scatter_unknown_route` | scatters caused by no usable bound prefix |
+| `read_latency_us` | fixed-bucket microsecond latency histogram (`count`, `sum_us`, `bounds_us`, `buckets`) for completed gateway reads |
+| `write_latency_us` | fixed-bucket microsecond latency histogram (`count`, `sum_us`, `bounds_us`, `buckets`) for completed gateway writes |
 
 These counters start with the gateway process. They do not include client wire
 bytes, shard-control traffic, Raft traffic, retries below this accounting point,

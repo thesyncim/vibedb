@@ -86,6 +86,66 @@ func writeGatewayMetrics(writer *vibejson.Writer, metrics gateway.MetricsSnapsho
 			return err
 		}
 	}
+	if err := writeGatewayLatencyHistogram(writer, "read_latency_us", metrics.ReadLatency); err != nil {
+		return err
+	}
+	if err := writeGatewayLatencyHistogram(writer, "write_latency_us", metrics.WriteLatency); err != nil {
+		return err
+	}
+	return writer.EndObject()
+}
+
+func writeGatewayLatencyHistogram(
+	writer *vibejson.Writer,
+	key string,
+	hist gateway.LatencyHistogramSnapshot,
+) error {
+	if err := writer.Key(key); err != nil {
+		return err
+	}
+	if err := writer.BeginObject(); err != nil {
+		return err
+	}
+	if err := writer.Key("count"); err != nil {
+		return err
+	}
+	if err := writer.Uint(hist.Count); err != nil {
+		return err
+	}
+	if err := writer.Key("sum_us"); err != nil {
+		return err
+	}
+	if err := writer.Uint(hist.SumUS); err != nil {
+		return err
+	}
+	if err := writer.Key("bounds_us"); err != nil {
+		return err
+	}
+	if err := writer.BeginArray(); err != nil {
+		return err
+	}
+	for _, bound := range gateway.LatencyBoundsUS {
+		if err := writer.Uint(bound); err != nil {
+			return err
+		}
+	}
+	if err := writer.EndArray(); err != nil {
+		return err
+	}
+	if err := writer.Key("buckets"); err != nil {
+		return err
+	}
+	if err := writer.BeginArray(); err != nil {
+		return err
+	}
+	for _, count := range hist.Buckets {
+		if err := writer.Uint(count); err != nil {
+			return err
+		}
+	}
+	if err := writer.EndArray(); err != nil {
+		return err
+	}
 	return writer.EndObject()
 }
 
