@@ -2,86 +2,39 @@
 
 [Documentation](../README.md) / [Operations](README.md) / Embedded backup
 
-Copy the complete database directory after a successful close, then verify
-and reopen a separate restored copy with the same build. This procedure is
-for a database opened through the native facade. For running RF3 groups, use
-[distributed backup and restore](backup-restore.md).
+Back up an embedded database by closing it cleanly, copying the entire
+directory as one unit (`.vjc` primaries, `.rjournal` siblings, `txn.vtm`), and
+verifying the copy with `vibedb-verify` from the exact same build. For RF3
+clusters, see [RF3 backup and restore](backup-restore.md).
 
-## Before you copy
+## Copy and verify
 
-Stop application writes and release query results, sessions, transactions,
-and snapshots. Call `db.Close()` and check its result. If close reports an
-error, resolve it using the [native lifecycle contract](../api/native.md)
-before treating the files as a completed backup source.
+1. Release all query results, sessions, transactions, and snapshots; call
+   `db.Close()` and confirm `CloseCompleted(err)` with no persistence error.
+2. Build `vibedb-verify` from the same revision and copy into an absent path:
 
-A database directory can contain collection files, recovery journals, and a
-transaction decision log. Copying one apparent data file or copying while a
-writer is active does not preserve that recovery unit. Writer locks coordinate
-cooperating processes; they do not make a filesystem copy coherent.
+   ```sh
+   GOEXPERIMENT=simd go build -o ./bin/vibedb-verify ./cmd/vibedb-verify
+   test ! -e "$backup_dir" && cp -pR "$source_dir" "$backup_dir"
+   ./bin/vibedb-verify verify "$backup_dir"
+   ```
 
-## Create a copy
-
-Build the verifier from the same checkout used to build the application:
-
-```sh
-mkdir -p ./bin
-GOEXPERIMENT=simd go build -o ./bin/vibedb-verify ./cmd/vibedb-verify
-```
-
-With the application stopped and successfully closed, adapt the source path
-and choose an absent backup destination:
-
-```sh
-source_dir=/absolute/path/to/closed-database
-backup_dir=/absolute/path/to/new-backup
-(test ! -e "$backup_dir" && cp -pR "$source_dir" "$backup_dir")
-./bin/vibedb-verify verify "$backup_dir"
-```
-
-For a healthy copy, `vibedb-verify` ends with a summary and `result ok`:
-
-```text
-summary txn_log=absent decisions=0 journals=1 findings=0
-result ok
-```
-
-`txn_log=absent` is normal for a database that has not used multi-collection
-transactions. The copy command refuses an existing destination. Preserve permissions and
-protect the backup under the same access policy as the source. Store the
-application revision, build settings, configuration, and any external keys
-beside your backup inventory.
+3. Expect `summary txn_log=... findings=0` and `result ok` (exit 0). Record the
+   writer commit alongside the backup.
 
 ## Test a restore
 
-1. Copy the backup into another absent directory. Keep the backup itself closed.
-2. Run `vibedb-verify verify` on that restored directory and inspect all findings.
-3. Configure an isolated instance of the same application build to open it.
-4. Read known keys and verify application invariants, including indexed queries
-   and related records committed together.
-5. Close the verification instance and inspect its close result.
-
-File verification checks structural consistency. Application reads establish
-whether the restored state contains the data you expected. Record both results
-before replacing a failed application instance.
-
-## If verification fails
-
-Preserve the source and backup. Recheck that the source was closed, the whole
-directory was copied, and the verifier matches the writer build. Use
-[offline verification and salvage](verification.md) to investigate remaining
-findings. Salvage can omit unprovable data, so its output needs a separate
-application-level review.
+Copy the backup to a fresh directory, verify it with `vibedb-verify verify`,
+open it with the same application build, validate key/index reads, and close
+cleanly. If verification fails, preserve both source and backup and follow
+[offline verification and salvage](verification.md).
 
 ## Limitations
 
-- There is no online or incremental backup for embedded databases; the
-  application must close the database first.
-- No tool records which build wrote a directory. Keep that record yourself.
-- A backup restores only with the same build; see [upgrades](upgrades.md).
+- No online or incremental backup API for embedded databases; writers must
+  close first.
+- Backups reopen only with the exact build that wrote them ([upgrades](upgrades.md)).
 
 ## Source map
 
-- [Facade ownership and close](../../vibedb.go).
-- [Lifecycle tests](../../vibedb_lifecycle_internal_test.go).
-- [Offline verifier](../../cmd/vibedb-verify/main.go).
-- [Database transaction recovery](../../store/durable/).
+- [vibedb.go](../../vibedb.go) · [cmd/vibedb-verify/main.go](../../cmd/vibedb-verify/main.go)

@@ -2,238 +2,64 @@
 
 [Documentation](../README.md) / [Operations](README.md) / Observability
 
-VibeDB exposes raw counters, not a monitoring system. Use this page to choose
-the surface that answers your question and to avoid reading more into a
-counter than its source measures.
+VibeDB exposes four observation surfaces. All counters are process-local and
+reset on restart; derive rates and alerting externally.
 
-## Choose an observation path
+## Observation surfaces
 
-| Need | Surface | Scope |
+| Surface | Endpoint / trigger | What it exposes |
 | --- | --- | --- |
-| Routing and cached RF3 progress | Authenticated native `metrics` request | Gateway counters, latency histograms, and independently collected member samples. |
-| Prometheus scraping and liveness/readiness probes | Gateway HTTP observability endpoint (`MetricsHTTPListenAddress`: `/metrics`, `/healthz`, `/readyz`) | Prometheus v0.0.4 counters, cumulative read/write duration histograms, and drain-aware readiness probes. |
-| Physical-node persistence and local dispatch work | SIGUSR1 node diagnostics | Detached counters from one serving process and its current group inventory. |
-| CPU, RSS, disk capacity, and network traffic | Host monitoring or a recorded profile | Operating-system measurements outside the gateway metrics response. |
+| **Prometheus & probes** | `-metrics-http-listen` (`/metrics`, `/healthz`, `/readyz`) on `vibedb-gateway serve` and `vibedb-shard serve-node` | Prometheus v0.0.4 metrics: gateway routing, lock-free per-P read/write latency histograms, RF3 Raft aggregates, `ResourceGuard` memory/disk watermarks, controller lease status, cluster version window, live `pgwire` sessions & `pg_stat_statements` counters; drain-aware `/readyz` |
+| **Slow-query observer** | `-slow-query-threshold <duration>` | Structured stderr log entries for queries exceeding the latency threshold |
+| **Native `metrics` RPC** | `{"op":"metrics"}` over mTLS gateway listener (requires `topology` capability) | JSON snapshot of gateway routing, latency histograms, cached per-group/per-node RF3 counters, and move/split controller loops |
+| **Node diagnostics** | `kill -USR1 <serve-node-pid>` | Detached JSON record to stderr (`VIBEDB_RF3_DIAGNOSTIC`) and `<node-dir>/rf3-diagnostics.json` (Ready waves, node-log syncs, checkpoints, local/remote dispatch, read authority, storage folds) |
 
-### Collect a physical-node diagnostic
+## Prometheus and health endpoints
 
-On Linux or macOS, find the exact `vibedb-shard serve-node` PID for the node
-and send it `SIGUSR1`. Do not signal the launcher or any other process.
+Enable `-metrics-http-listen` (loopback-only unless TLS is configured):
 
-```sh
-kill -USR1 <serve-node-pid>
-```
+- `GET /metrics` — Prometheus exposition format covering:
+  - Gateway routing (`route_single`, `route_targeted`, `route_scatter`,
+    `route_empty`, `shards_fanned`, `rows_returned`, `bytes_returned`,
+    `retries`) and cumulative microsecond `read_latency_us` / `write_latency_us`
+    histograms.
+  - RF3 progress & node service-stage aggregates (proposals, applied/committed
+    entries, `ReadIndex` completions, WAL live bytes/syncs, checkpoints, backup
+    logical/scan bytes, snapshot transfer, bootstrap).
+  - `ResourceGuard` memory and disk free-space watermark gauges and admission
+    refusal counters.
+  - Active-standby controller lease state and epoch (`internal/controllerlease`).
+  - Cluster version window (`internal/clusterversion`).
+  - Live `pgwire` connection/session gauges and `pg_stat_statements` execution
+    totals.
+- `GET /healthz` — Process liveness.
+- `GET /readyz` — Drain-aware readiness (fails once frontend drain begins).
 
-The process writes one JSON record to its stderr, prefixed with
-`VIBEDB_RF3_DIAGNOSTIC`, and, when it has a node log, atomically replaces
-`rf3-diagnostics.json` in the node-log's parent directory (for the local
-launcher, `<root>/node-<n>/rf3-diagnostics.json`). The file is written and
-synced before it is renamed into place; only the latest record is kept.
-Under the local launcher, stderr goes to the supervisor's in-memory buffer, so
-read the file.
+## Native `metrics` and `SIGUSR1`
 
-The record includes PID, node ID, group count, Ready waves, node-log append
-barriers, checkpoint activity, local and remote dispatch, read-authority
-evidence, and storage-overlay fold counters. It reads detached counters; it
-does not take a storage snapshot, flush, or checkpoint.
+Send canonical JSON `{"op":"metrics"}` over the authenticated native listener
+with a `topology`-capable principal. The response includes `metrics`,
+`distributed_metrics` (refreshed at most 1/sec via 80/408-byte authenticated
+shard-control RPCs; per-group `node_aggregate:false` and per-node
+`node_aggregate:true` entries), and `controller_metrics` (move/split loop
+passes, completions, faults, pass durations).
 
-Compare samples only for the same PID and a compatible group and schema
-inventory. Check the availability, coverage, failure, and overflow fields
-before using storage counters. A provider change can reset collection
-counters within one PID. Keep raw samples when deriving rates.
+For scaling/migration pacing counters (`throttled_calls`, `throttled_bytes`,
+`peak_active`, `max_active`), run `vibedb cluster status --json`.
 
-## Read the current counter snapshot
+## Interpretation rules
 
-Send the closed canonical request over the gateway's authenticated native
-listener:
-
-```json
-{"op":"metrics"}
-```
-
-The peer needs the `topology` capability. The local launcher's generated
-client credential has only `data_read` and `data_write`, so it cannot request
-metrics; an evaluator must add a principal with `topology` to the policy. No SQL, parameters, request identity,
-class, routing hint, or result budget may accompany the operation. The composed
-distributed path uses TLS; explicit development plaintext is limited to the
-loopback-only listener.
-
-The response can contain three objects:
-
-| Object | Present when | Scope |
-| --- | --- | --- |
-| `metrics` | Always | Routing/fan-out counters from this gateway process |
-| `distributed_metrics` | Replicated routes and shard-control collection are configured | Cached per-group/per-node RF3 cuts plus a saturating aggregate |
-| `controller_metrics` | Move/split controllers are configured | Loop counters from this gateway process |
-
-All values are unsigned 64-bit integers except `overflow` and identity fields.
-They are raw counters/gauges, not rates. Derive rates and retain source/process
-identity outside VibeDB.
-
-## Gateway routing counters
-
-`metrics` has this fixed field set:
-
-| Field | Meaning |
-| --- | --- |
-| `route_single` | operations routed to one shard |
-| `route_targeted` | operations routed to a bounded shard subset |
-| `route_scatter` | scatter operations |
-| `route_empty` | operations with no route |
-| `shards_fanned` | cumulative selected-shard count |
-| `rows_returned` | rows reported by completed results |
-| `bytes_returned` | encoded result bytes reported by completed results |
-| `retries` | stale-generation retries |
-| `scatter_all_shards` | scatters whose resolved route covered every shard |
-| `scatter_unknown_route` | scatters caused by no usable bound prefix |
-| `read_latency_us` | fixed-bucket microsecond latency histogram (`count`, `sum_us`, `bounds_us`, `buckets`) for completed gateway reads |
-| `write_latency_us` | fixed-bucket microsecond latency histogram (`count`, `sum_us`, `bounds_us`, `buckets`) for completed gateway writes |
-
-These counters start with the gateway process. They do not include client wire
-bytes, shard-control traffic, Raft traffic, retries below this accounting point,
-or storage I/O.
-
-## Distributed RF3 snapshot
-
-Group-specific sampling requires a provider implementing `GroupProvider`.
-A provider without that interface returns `ErrMetrics` for a group request.
-
-The gateway fixes the group/member and unique-node sample directory from its
-startup routes. A bounded worker set refreshes it with authenticated shard-control reads at
-most once per second (the larger of `-controller-interval` and 1 s). Each
-internal request is exactly 80 bytes; each response is a 408-byte payload plus
-a 32-byte SHA-256 digest.
-
-`distributed_metrics.members` contains two kinds of entries:
-
-- `node_aggregate:false`: one exact group/member/node identity and nine RF3
-  progress counters;
-- `node_aggregate:true`: one physical process/node and 27 service-stage values.
-  Its group is zero and member is zero.
-
-Do not merge entries by a display label or infer a missing member. Complete
-cluster, incarnation, topology-recovery epoch, shard, group, member, and node
-identity define a group sample.
-
-The aggregate includes `samples`, `collection_reads`, `collection_faults`, and
-`overflow`. RF3 progress is summed only from group entries; service stages are
-summed only from node aggregates, avoiding duplicate process-stage accounting.
-Addition saturates at `uint64` maximum and sets `overflow=true`.
-
-### RF3 progress fields
-
-| Fields | Exact scope |
-| --- | --- |
-| `proposal_commands`, `proposal_bytes` | commands/bytes observed by the RF3 proposal path |
-| `applied_entries` | entries applied by the state machine |
-| `ready_persisted` | durable Ready-processing steps; not quorum acknowledgements |
-| `snapshots_finished` | completed snapshot applies |
-| `read_completions` | completed ReadIndex operations |
-| `raft_faults` | faults counted by this RF3 runtime |
-| `quorum_commit_advancements`, `committed_entries` | authoritative commit-index movement and entry count; no latency or byte total |
-
-### Node service-stage fields
-
-| Area | Fields |
-| --- | --- |
-| Checkpoint | `checkpoint_applied`, `checkpoints`, `physical_checkpoints`, `checkpoint_barrier_syncs` |
-| WAL | `wal_live_bytes`, `wal_entries`, `wal_syncs` (completed durability phases, including the Ready record barrier and final current-slot sync) |
-| Live backup | `backup_requests`, `backup_faults`, `backup_logical_bytes`, `backup_scan_bytes` |
-| Snapshot transfer | `snapshot_transfer_chunks`, `snapshot_transfer_bytes`, `snapshot_resident_bytes` |
-| Replica action | `replica_action_requests`, `replica_action_completions`, `replica_action_faults` |
-| Split control | `split_control_requests`, `split_control_completions`, `split_control_faults` |
-| Cold bootstrap | `bootstrap_requests`, `bootstrap_chunks`, `bootstrap_bytes`, `bootstrap_completions`, `bootstrap_faults`, `bootstrap_resident_bytes`, `bootstrap_inflight` |
-
-`wal_live_bytes`, resident-byte fields, and in-flight work are gauges and may
-decrease. Most event counts reset on process restart. Collection read/fault
-counters describe gateway refresh attempts, not shard health authority.
-
-### Backup double-scan accounting
-
-A successful live backup pins one immutable group snapshot, scans it once to
-derive exact geometry/hash, then scans the same cut again while streaming. On
-success the service adds:
-
-```text
-backup_logical_bytes += artifact_bytes
-backup_scan_bytes    += 2 * artifact_bytes
-```
-
-The 2× value is intentional read amplification. It does not mean two repository
-copies or twice the network output. These byte counters advance only after the
-complete export succeeds; partial failed scan work is represented by
-`backup_faults`, not necessarily by proportional scan bytes.
-
-## Controller loop counters
-
-`controller_metrics` exposes move and split loop activity:
-
-- move: `move_passes`, `move_discovered`, `move_advanced`, `move_completed`,
-  `move_faults`, `move_duration_ns`, `move_duration_max_ns`;
-- split: `split_passes`, `split_discovered`, `split_triggered`,
-  `split_completed`, `split_faults`, `split_duration_ns`,
-  `split_duration_max_ns`.
-
-Durations cover controller passes in this gateway incarnation. They are not
-per-operation phase latency, queue delay, foreground latency, or a replicated
-operation clock. The replicated catalog records remain recovery/topology
-authority.
-
-## Interpretation limits
-
-The metrics response is **not** a simultaneous cluster snapshot. Each remote
-sample has its own collection time and exact per-source cut. The aggregate is a
-telemetry sum, not a quorum certificate, common applied position, or global
-consistency witness.
-
-The current surface does not expose:
-
-- latency histograms, percentiles, traces, or SLO/error-budget calculations;
-- total client, Raft, shard-control, backup, or snapshot-transfer network bytes;
-- filesystem, block-device, or media-write totals;
-- leader identity, catalog age, controller queue depth, or exact replicated
-  split/move/backup/restore phase;
-- quorum, apply, checkpoint, response-settlement, failover, or recovery latency;
-- CPU, file descriptors, process RSS, disk capacity, or host health; or
-- durable counters across restart.
-
-In particular, `proposal_bytes` is not total network traffic,
-`snapshot_transfer_bytes` is not all cluster traffic, and `wal_syncs` counts
-durability phases—not `File.Sync` calls, device writes, or media flushes. A
-normal nonempty Ready contributes two phases. A completion count is not a
-duration. Build alerts only from semantics the source actually exports.
-
-Collection failure increments explicit fault counters and leaves the last cached
-sample; it never changes routing, membership, cleanup, acknowledgement, split,
-or move authority.
-
-## Scaling and migration status
-
-Replica-move pacing is not in the `metrics` response. `vibedb cluster status
---json` returns a `budget` object with `throttled_calls`, `throttled_bytes`,
-`peak_active`, and `max_active`, aggregated from the same distributed sample,
-plus moved-group counts and blockers. See [scaling](scaling.md).
-
-## Limitations
-
-- No Prometheus, OpenTelemetry, or HTTP endpoint exists. Collection means
-  sending the native request yourself over mutual TLS.
-- No latency histograms, traces, or alerts.
-- Counters reset on process restart.
-- Logs are unstructured stderr text.
-
-The [diagnostics qualification record](../qualification/fused-diagnostics-2026-09-04/README.md)
-describes the storage-sampling checks.
+- Metrics are **not** a simultaneous cluster snapshot; each remote member
+  sample has its own collection time and saturating `uint64` aggregate.
+- Successful live backups intentionally report `backup_scan_bytes = 2 ×
+  backup_logical_bytes` (two-pass hash + stream).
+- `wal_syncs` counts durability phases (a normal Ready adds 2 phases), not raw
+  device flushes.
+- Host CPU, RSS, disk space, FD counts, and raw network bytes still require OS
+  telemetry alongside VibeDB metrics.
 
 ## Source map
 
-| Boundary | Source |
-| --- | --- |
-| Physical-node diagnostics | [rf3_diagnostics.go](../../cmd/vibedb-shard/rf3_diagnostics.go) |
-| Gateway route/fan-out counters | [`gateway/metrics.go`](../../gateway/metrics.go) |
-| Fixed sample directory, refresh, and saturating aggregate | [`gateway/distributed_metrics.go`](../../gateway/distributed_metrics.go) |
-| Public request validation and exact response fields | [`internal/gatewayruntime/serve_metrics.go`](../../internal/gatewayruntime/serve_metrics.go) |
-| Move/split controller counters | [`internal/gatewayruntime/controller_metrics.go`](../../internal/gatewayruntime/controller_metrics.go) |
-| Fixed 80/408-byte authenticated RF3 exchange | [`internal/servicemetrics/service.go`](../../internal/servicemetrics/service.go) |
-| Mapping runtime/WAL/checkpoint/service counters to node stages | [`cmd/vibedb-shard/rf3_metrics.go`](../../cmd/vibedb-shard/rf3_metrics.go) |
-| Backup requests, faults, logical bytes, and double-scan bytes | [`internal/clusterbackupservice/service.go`](../../internal/clusterbackupservice/service.go) |
+- HTTP `/metrics`, `/healthz`, `/readyz` & slow queries: [internal/gatewayruntime/serve_metrics.go](../../internal/gatewayruntime/serve_metrics.go), [cmd/vibedb-shard/serve_node.go](../../cmd/vibedb-shard/serve_node.go)
+- Gateway & distributed counters: [gateway/metrics.go](../../gateway/metrics.go), [gateway/distributed_metrics.go](../../gateway/distributed_metrics.go), [internal/servicemetrics/service.go](../../internal/servicemetrics/service.go)
+- Node diagnostics & RF3 mapping: [cmd/vibedb-shard/rf3_diagnostics.go](../../cmd/vibedb-shard/rf3_diagnostics.go), [cmd/vibedb-shard/rf3_metrics.go](../../cmd/vibedb-shard/rf3_metrics.go)

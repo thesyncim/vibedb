@@ -1,54 +1,33 @@
 # Choose an API
 
-[Documentation](../README.md) · [Development status](../status.md)
+[Documentation](../README.md) · [Stability](../status.md)
 
-VibeDB has four embedded interfaces over the same JSON document model and
-storage engine. They share value semantics but not catalogs: a directory
-opened with `vibedb.Open` and a catalog opened by the SQL driver are separate
-formats.
+VibeDB offers five application surfaces over the same JSON document model and
+storage engine. Native collections (`vibedb.Open`) and SQL catalogs
+(`sql/driver`) use separate on-disk layouts.
 
-| Interface | Choose it when | Key boundary |
+| Interface | Choose it when | Primary boundary |
 | --- | --- | --- |
-| [`vibedb`](native.md) | You want embedded JSON CRUD, exact indexes, typed queries, and serializable transactions | Recommended starting surface; builder queries only, no SQL text |
-| [Full-text search](search.md) | You need ranked text search over one string field | Index rebuilt in memory per searched generation |
-| [`query`](query.md) | You need reusable typed plans, SQL `SELECT` text over your own sources, or direct snapshot control | Results and workspaces have explicit ownership |
-| [`database/sql`](sql.md) | Your application wants SQL tables, DDL, and connection pooling | VibeDB dialect over a durable catalog; one fixed synchronous durability profile |
-| [`pgwire`](pgwire.md) | You need psql, pgx, lib/pq, or JDBC protocol access | PostgreSQL v3 protocol adapter, not PostgreSQL compatibility |
-| `store` / `store/durable` | You need explicit page geometry, I/O modes, or recovery primitives | Expert API; read [storage engines](../store.md) first |
-
-## Decision guide
-
-- Start with the native facade unless the application needs SQL.
-- Use `query` through the facade for typed queries. Call lower-level sources
-  only when you own their snapshot and lifetime contracts.
-- Use `database/sql` for embedded SQL. `OpenCluster` adds one-shard placement
-  preflight to an embedded catalog; it does not start a network service or
-  replication.
-- Use pgwire to connect an existing PostgreSQL client. Test every discovery
-  query and SQL shape the client emits.
-- Distributed gateway protocols are internal development interfaces; see the
-  [protocol reference](../reference/protocols.md).
+| [`vibedb`](native.md) | Embedded JSON CRUD, exact indexes, typed queries, serializable transactions | Recommended default; builder queries only (no SQL text) |
+| [Full-text search](search.md) | BM25-ranked TINQL search over one string path (`==>`, `SCORE()`) | Incremental with `.tin` sidecar; active index must fit in RAM |
+| [`query`](query.md) | Reusable compiled plans, SQL `SELECT` over custom sources, explicit snapshot control | Caller manages snapshots, `Exec`, and result lifetimes |
+| [`database/sql`](sql.md) | Embedded SQL tables, DDL, savepoints, Go connection pooling | VibeDB SQL dialect; fixed synchronous durability profile |
+| [`pgwire`](pgwire.md) | Connecting `psql`, `pgx`, `lib/pq`, or JDBC | PostgreSQL v3 protocol adapter, not full PostgreSQL compatibility |
+| `store` / `store/durable` | Explicit page geometry, I/O modes, or recovery primitives | Expert API; read [storage engines](../store.md) first |
 
 ## Shared rules
 
-- Missing JSON paths and explicit JSON `null` are distinct. SQL exposes the
-  difference with `IS MISSING`; projection renders both as null.
-- Numbers compare and aggregate by exact decimal value; they never round
-  through `float64`.
-- Index candidates are rechecked against documents, so an index changes cost,
-  never the answer.
-- Bounded execution returns a typed error instead of dropping rows or
-  returning a partial result.
-- A persistence or transport error can leave a commit outcome unknown. Close,
-  reopen, and reconcile by application identity before retrying.
+- **Null vs missing:** Absent paths and explicit JSON `null` stay distinct
+  (`Exists` in `query`, `IS MISSING` in SQL); projections render both as NULL.
+- **Exact decimals:** Numbers compare and aggregate by exact decimal value,
+  never rounding through `float64`.
+- **Rechecked indexes:** Exact-index candidates are rechecked against
+  documents, so indexes change cost, never results.
+- **Fail-closed budgets:** Exhausting a workspace or result budget returns a
+  typed error rather than partial rows.
+- **Unknown outcomes:** On a persistence or transport error, close/reopen and
+  reconcile by application identity before retrying.
 
-## Current gaps
-
-- No interface is a stable API; see [stability](../status.md).
-- The native facade cannot execute SQL text, and SQL tables cannot be opened
-  through the native facade.
-- The embedded interfaces are single-process. Network access comes from the
-  pgwire adapter or the separate distributed runtime.
-
-For feature-by-feature evidence, see the generated [embedded capability
-matrix](../capabilities.md). It does not describe the distributed gateway.
+See the generated [embedded capability matrix](../capabilities.md) for
+per-profile contract coverage, and [protocols](../reference/protocols.md) for
+internal distributed gateway interfaces.

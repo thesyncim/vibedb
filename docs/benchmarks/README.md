@@ -1,91 +1,33 @@
-# Benchmark reports
+# Benchmark methods
 
-[Documentation](../README.md) / Benchmark reports
+[Documentation](../README.md) / Benchmarks
 
-Measurements are grouped by experiment. Each report records its own revision,
-workload, method, and limitations; read those before comparing numbers. Profiles,
-failed precursors, and short qualification runs remain part of the record.
+Use [performance evidence](../performance.md) to pick a benchmark harness and
+check publication rules. This directory holds reusable benchmark methods and
+CI-referenced control fixtures; dated raw captures belong in CI artifacts or
+git history rather than the working tree.
 
-Start with [performance methodology](../performance.md). The
-[competitive harness publication registry](../../bench/competitive/RESULTS.md)
-is separate from this engineering archive.
+## Comparison methods
 
-## Methods
-
-- [RF3 SQL comparison](crdb-sql-method.md).
-- [Physical-node SQL comparison](fused-node-sql-method.md).
-- [Online scale in and out qualification and evidence](seamless-scale-in-out-method.md).
-
-## Reports
-
-| Date | Report |
+| Method | Covers |
 | --- | --- |
-| 2026-09-14 | [Direct PostgreSQL write ownership](pgwire-direct-ownership-2026-09-14/README.md) |
-| 2026-09-14 | [Replicated integer delta writes](replicated-int64-delta-2026-09-14/README.md) |
-| 2026-09-09 | [Cancelled 10M-row comparison: insertion scaling](../history/ten-million-row-run-2026-09-09.md) (raw summary in `ten-million-2026-09-09/`) |
-| 2026-09-08 | [Batch slot preservation: September 8 improvement round](../history/batch-slot-preservation-results.md) (raw rows in `storage-round-2026-09-08/`) |
-| 2026-09-06 | [Bounded owner progress and isolated performance evidence](owner-progress-2026-09-06/README.md) |
-| 2026-09-06 | [Direct point execution checkpoint](point-direct-2026-09-06/README.md) |
-| 2026-09-06 | [Raft persistence and transport improvements](raft-impact-2026-09-06/README.md) |
-| 2026-09-06 | [Read coalescing: merged PR 194 performance](read-coalesce-2026-09-06/README.md) |
-| 2026-09-06 | [Read coalescing: fast path and update-regression follow-up](read-coalesce-followup-2026-09-06/README.md) |
-| 2026-09-05 | [Distributed projected-range comparison](distributed-projected-ranges-2026-09-05/README.md) |
-| 2026-09-05 | [Distributed integer GROUP BY comparison](distributed-integer-groups-2026-09-05/README.md) |
-| 2026-09-05 | [RF3 Ready-series comparison](rf3-ready-series-2026-09-05/README.md) |
-| 2026-09-05 | [Prepared indexed point and ordered-page reads](indexed-page-projection-2026-09-05/README.md) |
-| 2026-09-05 | [Packed integer extrema final qualification](packed-extrema-simd-final-2026-09-05/README.md) |
-| 2026-09-05 | [Packed integer extrema SIMD evidence](packed-extrema-simd-2026-09-05/README.md) |
-| 2026-09-05 | [Packed SIMD layout regression follow-up](packed-extrema-simd-layout-fix-2026-09-05/README.md) |
-| 2026-09-05 | [Distributed point-read evidence](distributed-point-reads-2026-09-05/README.md) |
-| 2026-09-05 | [Prepared distributed-read reuse microbenchmark](distributed-read-preparation-2026-09-05/README.md) |
-| 2026-09-05 | [Storage-format research](format-research-2026-09-05/README.md) |
-| 2026-09-05 | [Horizontal execution investigation](horizontal-execution-2026-09-05/README.md) |
-| 2026-09-05 | [Point-read compiler reuse evidence](point-compiler-reuse-2026-09-05/README.md) |
-| 2026-09-05 | [Shared-node RF3 history reclamation](space-rf3-2026-09-05/README.md) |
-| 2026-09-04 | [Wide packed equality count SIMD measurements](packed-count-simd-wide-2026-09-04/README.md) |
-| 2026-09-04 | [Shared-node log: matched SQL comparison](crdb-sql-2026-09-04-node/README.md) |
-| 2026-09-04 | [Retained pgwire semantic prepare](prepared-pgwire-reads-2026-09-04/README.md) |
-| 2026-09-04 | [Retained JSON placement index comparison](vibejson-placement-2026-09-04/README.md) |
-| 2026-09-04 | [RF3 SQL comparison with concurrent autocommit](crdb-sql-2026-09-04-concurrent/README.md) |
-| 2026-09-04 | [RF3 SQL comparison after durable update and checkpoint fixes](crdb-sql-2026-09-04-writes/README.md) |
-| 2026-09-04 | [RF3 SQL comparison after adaptive read admission](crdb-sql-2026-09-04-reads/README.md) |
-| 2026-09-04 | [Physical-node short comparison audit](fused-node-short-2026-09-04/audit-summary.md) |
-| 2026-09-04 | [Pgwire exact unnamed-Parse reuse](pgwire-frontend-reuse-2026-09-04/README.md) |
-| 2026-09-04 | [Packed ordered FOR COUNT SIMD evidence](packed-order-simd-2026-09-04/README.md) |
-| 2026-09-04 | [Packed integer interval count, Go 1.27 SIMD](packed-interval-simd-2026-09-04/README.md) |
-| 2026-09-04 | [Packed equality count SIMD measurements](packed-count-simd-2026-09-04/README.md) |
-| 2026-09-04 | [Indexed point reads and ordered pages](indexed-pages-2026-09-04/README.md) |
-| 2026-09-04 | [Health-observation rerun](fused-health-2026-09-04/README.md) |
-| 2026-09-04 | [Guarded point-update comparison](fused-guarded-update-2026-09-04/README.md) |
-| 2026-09-04 | [Gateway pgwire distributed-read prepare cache](pgwire-read-prepare-cache-2026-09-04/README.md) |
-| 2026-09-04 | [Distributed SQL result encoding](distributed-read-results-2026-09-04/README.md) |
-| 2026-09-04 | [Compact scalar prefix comparison](compact-prefix-2026-09-04/README.md) |
-| 2026-09-04 | [Compact prefix CPU change: matched SQL comparison](crdb-sql-2026-09-04-prefix/README.md) |
-| 2026-09-04 | [Compact batch-column experiment and revert](fused-storage-2026-09-04/README.md) |
-| 2026-09-04 | [CockroachDB comparison after ordered primary LIMIT: 2026-09-04](crdb-sql-2026-09-04/README.md) |
-| 2026-09-04 | [Asynchronous Raft serving comparison](crdb-sql-2026-09-04-pipelined/README.md) |
-| 2026-09-04 | [AMD64 packed equality count SIMD measurements](packed-count-simd-amd64-2026-09-04/README.md) |
-| 2026-09-03 | [CockroachDB comparison: 2026-09-03](crdb-sql-2026-09-03/README.md) |
+| [RF3 SQL comparison](crdb-sql-method.md) | Matched-durability RF3 SQL comparison against CockroachDB |
+| [Physical-node SQL comparison](fused-node-sql-method.md) | Multi-group physical-node SQL comparison protocol |
+| [Online scale-in/out qualification](seamless-scale-in-out-method.md) | 3 → 4 → 3 scaling under open-loop traffic (`seamless-scale-in-out.yml`) |
 
-## Investigations and raw files
+## Harnesses
 
-- [Distributed SQL bottleneck investigation, 2026-09-04](distributed-sql-bottlenecks-2026-09-04.md).
-- [Wide-key update and mixed-read workload plan](wide-update-workload-plan.md), a proposal rather than a measurement.
-- [Distributed planner raw output, Go 1.27](distributed-planner-go127.txt), used by the
-  [distributed optimizer guide](../distributed-optimizer.md).
+- **Allocation gate (`bench/gate`):** `go run ./bench/gate` rejects `allocs/op`
+  regressions and `>5%` `B/op` regressions against base.
+- **Competitive suite (`bench/competitive`):** See
+  [bench/competitive/README.md](../../bench/competitive/README.md),
+  [COVERAGE.md](../../bench/competitive/COVERAGE.md), and
+  [RESULTS.md](../../bench/competitive/RESULTS.md).
+- **RF3 chaos (`bench/rf3chaos`):** External-process fault injection harness
+  ([bench/rf3chaos/README.md](../../bench/rf3chaos/README.md)).
 
-Many reports compare VibeDB with CockroachDB on a single Docker host with a
-shared CPU and memory ceiling. They are engineering measurements for one
-revision and workload, not product performance claims. Several record results
-where VibeDB is slower than the comparison system. CI qualification runs are
-listed separately in the [qualification index](../qualification/README.md).
+## CI fixtures
 
-## Read archived evidence
-
-Some reports retain raw files in a sibling `.tar.gz` archive. Follow the
-report's extraction instructions; a path inside that archive becomes a local
-link after extraction. Check the recorded hashes before using raw files.
-Keep checksum-bound reports unchanged when adding navigation or a new result.
-
-[Research records](../design/research.md) index proposals and bottleneck notes
-that have not become a benchmark report.
+`format-research-2026-09-05/rank-affine/checksum-alignment-control/` is a small
+control fixture consumed by `.github/workflows/fused-node-rf3.yml` when the
+optional primary-format comparison job is triggered manually.

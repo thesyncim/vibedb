@@ -1,481 +1,139 @@
 # SQL reference
 
-[Documentation](../README.md) / [Reference](README.md) · [Development status](../status.md)
+[Documentation](../README.md) / [Reference](README.md) · [Stability](../status.md)
 
-This is the executable surface shared by the native driver and pgwire. The
-parser can represent a few forms an execution adapter rejects; those are called
-out below. PostgreSQL syntax not listed here is unsupported.
+Executable SQL dialect shared by `sql/driver` and `pgwire`. Syntax not listed
+here is unsupported.
 
-## Lexical rules
+## Lexical rules and statements
 
-| Rule | Behavior |
+- Keywords are case-insensitive; identifiers are case-sensitive (`"..."`
+  preserves reserved text); strings are single-quoted; comments use `--` and
+  `/* ... */`.
+- Native placeholder is `?`; `pgwire` rewrites `$1`…`$32767` to `?`.
+- Operators: `= != <> < <= > >= @> ==> + - * / % || :: -> ->>` plus regex
+  (`~`, `~*`, `!~`, `!~*`, `SIMILAR TO`) and JSONB (`?`, `?|`, `?&`).
+
+| Family | Statements |
 | --- | --- |
-| Keywords | Case-insensitive |
-| Identifiers | Case-sensitive; double quotes preserve otherwise reserved text |
-| Strings | Single-quoted |
-| Comments | `--` line comments and `/* ... */` block comments |
-| Native parameter | `?` |
-| pgwire parameter | `$1`…`$32767`, rewritten to native parameters |
-| Statement terminator | One optional trailing semicolon |
-| Error position | Zero-based byte offset in parser errors |
+| Query | `SELECT`, `VALUES`, `TABLE`, `UNION`, `INTERSECT`, `EXCEPT`, `EXPLAIN [ANALYZE]` |
+| DML | `INSERT`, `UPDATE`, `DELETE` (with `RETURNING`, `UPDATE ... FROM`, `DELETE ... USING`, modifying CTEs) |
+| DDL | `CREATE TABLE [AS SELECT]`, `ALTER TABLE`, `DROP TABLE`, `TRUNCATE`, `CREATE [UNIQUE] INDEX [... USING tin]`, `DROP INDEX`, `CREATE VIEW`, `DROP VIEW` |
+| Wire & Tx | `BEGIN`/`START TRANSACTION`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`, wire `COPY ... FROM STDIN / TO STDOUT` |
 
-`Parse`/`ParseStatement` accept one statement; pgwire splits bounded batches.
-A zero `sql.Parser` is reusable but not concurrent, and its returned AST
-borrows parser-arena storage only until the next parse or release.
+DDL cannot run inside a transaction and operates on one object per statement.
 
-Operators:
-
-```text
-=  !=  <>  <  <=  >  >=  @>  ==>
-+  -  *  /  %  ||  ::  ->  ->>
-```
-
-Regex operators, bitwise operators, named parameters, and native `$n`
-parameters are not part of the SQL parser.
-
-## Statement summary
-
-| Family | Implemented statements |
-| --- | --- |
-| Query | SELECT, VALUES, TABLE, UNION, INTERSECT, EXCEPT, EXPLAIN `[ANALYZE]` query |
-| DML | INSERT, UPDATE, DELETE; optional RETURNING |
-| Tables | CREATE TABLE, ALTER TABLE ADD COLUMN, DROP TABLE, TRUNCATE |
-| Indexes | CREATE `[UNIQUE]` INDEX, CREATE INDEX ... USING tin, DROP INDEX |
-| Views | CREATE VIEW, DROP VIEW; read-only queries |
-| Savepoints | SAVEPOINT, RELEASE, ROLLBACK TO |
-| Wire-only transaction commands | BEGIN/START TRANSACTION, COMMIT, ROLLBACK |
-
-DDL cannot execute inside a transaction. CREATE/DROP/TRUNCATE operate on one
-catalog object per statement.
-
-## CREATE TABLE
+## DDL: tables, indexes, and views
 
 ```sql
 CREATE TABLE accounts (
     id STRING PRIMARY KEY,
-    profile.name STRING NOT NULL, balance NUMERIC,
-    active BOOLEAN NULL, tags ARRAY, metadata OBJECT
+    profile.name STRING NOT NULL,
+    balance NUMERIC DEFAULT 0 CHECK (balance >= 0),
+    active BOOLEAN NULL,
+    tags ARRAY,
+    metadata OBJECT
 );
-```
-
-The runtime requires one primary-key path resolving to a present, non-null
-string, bool, or number; numeric identity is exact (`1`, `1.0`, and `1e0` match).
-The parser represents up to four key paths, but the driver rejects every count
-other than one; a parser-only columnless declaration is not executable.
-
-Type spellings are grouped as follows:
-
-| Logical family | Accepted spellings |
-| --- | --- |
-| Null | NULL |
-| Boolean | BOOL, BOOLEAN |
-| Exact/general number | NUMBER, DECIMAL, NUMERIC, FLOAT, REAL, DOUBLE |
-| Integer | INTEGER, INT, INT2, INT4, INT8, BIGINT, SMALLINT, TINYINT |
-| String | STRING, TEXT, VARCHAR, CLOB |
-| Container | ARRAY, OBJECT |
-| Any JSON value | ANY, JSON |
-
-Nested column paths are allowed. A table may declare at most 1,024 columns.
-`NULL`, `NOT NULL`, and `PRIMARY KEY` are the only column constraints.
-
-Not implemented: DEFAULT, UNIQUE, CHECK, FOREIGN KEY/REFERENCES, type modifiers,
-COLLATE, generated/identity columns, and CREATE TABLE AS SELECT.
-
-## ALTER, index, drop, truncate, and views
-
-```sql
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS profile.tier STRING NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS accounts_email ON accounts(profile.email);
-DROP INDEX IF EXISTS accounts_email;
-TRUNCATE TABLE scratch; -- or: DROP TABLE IF EXISTS scratch;
+CREATE INDEX accounts_bio_tin ON accounts(profile.bio) USING tin;
 ```
 
-ALTER TABLE supports only `ADD [COLUMN] [IF NOT EXISTS] path type
-[NULL|NOT NULL]`. It validates existing documents before atomically publishing
-the new catalog generation. It cannot add or change a primary key.
-
-An index contains one to four exact scalar paths. Missing/null tuples are not
-indexed; container values are invalid. A unique index rejects duplicate
-non-null tuples. Index sort direction, expressions, predicates, collations,
-and INCLUDE are unsupported, as are USING methods other than `tin`.
-
-`USING tin` declares a full-text index over exactly one string path, for the
-`==>` predicate and `SCORE()`. `CREATE UNIQUE INDEX ... USING tin` is refused,
-a duplicate name fails unless `IF NOT EXISTS` is given, and a catalog holds at
-most 64 tin declarations. The declaration does not build postings; each
-generation's postings are built in memory on first query. Declarations survive
-reopen and TRUNCATE; DROP INDEX removes one, after which `==>` over that path
-is a statement error. See [full-text search](../api/search.md).
-
-DROP TABLE/INDEX and TRUNCATE reject multiple objects, CASCADE/RESTRICT, and
-identity options. A table with dependent views cannot be dropped until its
-views are removed.
-
-```sql
-CREATE VIEW active_accounts (id, balance) AS SELECT id, balance FROM accounts WHERE active = TRUE;
-DROP VIEW active_accounts RESTRICT;
-```
-
-Views are durable and read-only. Definitions cannot contain parameters.
-CREATE OR REPLACE VIEW, materialized views, REFRESH, and DROP VIEW CASCADE are
-unsupported. View expansion is bounded to depth 32, 1,024 references, and
-16 MiB expanded SQL; cycles are rejected.
+- **Types:** `NULL`, `BOOL`/`BOOLEAN`, `NUMBER`/`DECIMAL`/`NUMERIC`/`FLOAT`/
+  `REAL`/`DOUBLE`, `INTEGER`/`INT`/`INT2`/`INT4`/`INT8`/`BIGINT`/`SMALLINT`/
+  `TINYINT`, `STRING`/`TEXT`/`VARCHAR`/`CLOB`, `ARRAY`, `OBJECT`, `ANY`/`JSON`,
+  `TIMESTAMP`/`INTERVAL`.
+- **Table constraints & DDL:** Composite primary keys (up to 4 columns),
+  `UNIQUE`, `DEFAULT`, `CHECK` (`23514`), `ALTER TABLE` (`ADD`/`DROP`/`RENAME`/
+  `SET TYPE`/`SET NOT NULL`/`DROP NOT NULL`/`SET DEFAULT`/`DROP DEFAULT`/
+  `ADD CONSTRAINT CHECK`/`RENAME TO`), `CREATE TABLE ... AS SELECT`, and
+  `CREATE INDEX` options (`WHERE`, expression, `INCLUDE`, `DESC`/`NULLS`).
+  `FOREIGN KEY`, sequences, generated columns, and collations are unsupported.
+- **Exact indexes:** 1–4 scalar paths (omits null/missing; unique rejects
+  duplicate non-null tuples).
+- **Full-text (`USING tin`):** Single string path for `==>` and `SCORE()` (max
+  64 per catalog; `UNIQUE` refused; incremental `.tin` sidecar). See
+  [search](../api/search.md).
+- **Views:** Durable read-only views (no params, no `CREATE OR REPLACE`, no
+  materialized views; expansion cap: depth 32, 1,024 refs, 16 MiB).
 
 ## INSERT and upsert
 
 ```sql
-INSERT INTO accounts VALUES (?);
-INSERT INTO accounts AS target (id, balance, active)
-VALUES (?, ?, TRUE)
-ON CONFLICT DO UPDATE SET
-    balance = target.balance + EXCLUDED.balance, active = EXCLUDED.active
+INSERT INTO accounts VALUES (?); -- whole JSON document
+INSERT INTO accounts AS t (id, balance, active) VALUES (?, ?, TRUE)
+ON CONFLICT (id) DO UPDATE SET balance = t.balance + EXCLUDED.balance
 RETURNING id, balance;
 ```
 
-`ON CONFLICT` targets only the implicit primary key; secondary unique-index
-violations are errors. DO NOTHING and DO UPDATE are supported. Qualify current
-fields with the table name or INSERT target alias and incoming fields with
-`EXCLUDED`; a bare field is ambiguous. Parameters, arithmetic, concatenation,
-casts, and CASE are valid in assignment expressions.
-
-An explicit single-column primary-key target, such as `ON CONFLICT (id)`, is
-supported and validated against the table schema at prepare and execution.
-Composite targets, secondary unique-index targets, `ON CONSTRAINT`, action WHERE, nested assignments or `EXCLUDED`
-paths, and mixed document/column assignments are unsupported. A DO UPDATE batch containing the same canonical key twice fails atomically.
-
-```sql
-INSERT INTO archive SELECT "$doc" FROM accounts WHERE active = FALSE ON CONFLICT DO NOTHING;
-```
-
-INSERT…SELECT requires one whole-document output and no target list. VALUES
-document rows accept parameter/quoted/bare JSON and are atomic. INSERT…SELECT
-with ON CONFLICT DO UPDATE is execution-refused; use VALUES or DO NOTHING.
-Declared-column VALUES rows accept literal NULL as well as null parameters;
-the primary key and NOT NULL constraints still apply atomically.
+- Supports `ON CONFLICT DO NOTHING` and `DO UPDATE` (including `WHERE`
+  predicates and composite PK targets in embedded SQL; branch-aware
+  `ON CONFLICT DO NOTHING/UPDATE` with global indexes in RF3 SQL).
+- Qualify current-row fields with the table name/alias and incoming fields with
+  `EXCLUDED`. `INSERT ... SELECT` and `INSERT ... DEFAULT VALUES` are supported
+  in embedded SQL.
 
 ## UPDATE and DELETE
 
 ```sql
-UPDATE accounts AS a
-SET balance = a.balance + ?, active = TRUE
-WHERE a.id = ? RETURNING id, balance;
-
+UPDATE accounts AS a SET balance = a.balance + ? WHERE a.id = ? RETURNING id, balance;
 DELETE FROM accounts WHERE active = FALSE ORDER BY id LIMIT 100 RETURNING id;
 ```
 
-UPDATE supports an alias, row expressions, whole-document replacement, declared
-top-level assignments, WHERE, path ORDER BY, LIMIT, and RETURNING. UPDATE cannot
-change the primary key; one constant document therefore cannot replace several
-distinct keys. DELETE supports the same tail but no alias or USING. Mutation
-ORDER BY requires LIMIT; UPDATE FROM and mutation OFFSET are unsupported.
+- Embedded SQL supports `UPDATE ... FROM`, `DELETE ... USING`, data-modifying
+  CTEs, `ORDER BY ... LIMIT`, and `RETURNING`. Primary keys cannot be modified
+  in place.
+- **RF3 gateway boundary:** Autocommit-only for writes; exact-PK `UPDATE`
+  (whole-doc or declared top-level computed scalar assignments guarded by
+  old-length + SHA-256 CAS), `INSERT VALUES` (including branch-aware
+  `ON CONFLICT`), and `DELETE`; `ORDER BY`/`LIMIT` and nested targets remain
+  fenced on RF3 mutations.
 
-The durable RF3 gateway is narrower than embedded execution. It accepts whole-
-document or declared top-level UPDATE only with exact-primary-key equality;
-top-level assignments may use supported scalar right-hand sides and are
-simultaneous. RETURNING, ORDER BY/LIMIT, nested targets, and primary-key moves
-are refused. The coordinator linearizably reads the old row,
-evaluates each right-hand side once, and retains the canonical postimage with an
-exact old-length/SHA-256 CAS. Global indexes derive from that postimage. An
-ordinary exact retry may first replan; after admission, transaction execution
-and recovery use the retained program instead of reevaluating expressions.
-
-For RF3 INSERT without global indexes, primary-key DO NOTHING and whole-document
-EXCLUDED replacement are atomic. Declared column DO UPDATE supports bound scalar
-constants and EXCLUDED columns. A bounded binary conflict program is evaluated
-against the replica's current row during apply; no coordinator preimage is used.
-Both branches validate the candidate and referenced columns, and only the update
-branch evaluates assignments. Computed conflict assignments and indexed conflict
-maintenance remain unsupported.
-
-RETURNING accepts bounded path/scalar projections but no aggregates,
-parameters, or SELECT tail. Execute a returning mutation through a query API;
-its rows are materialized before publication.
-
-## SELECT order and projections
-
-Predicates support `IS DISTINCT FROM` and `IS NOT DISTINCT FROM` over the
-supported scalar domains. NULL and a missing path compare equal to each other,
-and different from a live value; the result is always Boolean. Each operand is
-evaluated once. The existing computed-predicate restrictions, including scalar
-WHERE before grouping, still apply. JSON/JSONB equality is not introduced.
-
-Clause order:
+## SELECT, expressions, and predicates
 
 ```sql
-WITH ...
-SELECT [ALL | DISTINCT] projection [, ...]
-[FROM relation]
-[WHERE predicate]
-[GROUP BY path [, ...]]
-[HAVING predicate]
-[WINDOW name AS (...)]
-[ORDER BY key [ASC | DESC] [, ...]]
-[LIMIT nonnegative_integer_or_parameter]
-[OFFSET nonnegative_integer_or_parameter];
+WITH [RECURSIVE] ...
+SELECT [ALL | DISTINCT [ON (...)]] projection [, ...]
+[FROM relation] [WHERE predicate] [GROUP BY ...] [HAVING predicate]
+[WINDOW name AS (...)] [ORDER BY key [ASC|DESC] [NULLS FIRST|LAST]]
+[LIMIT n] [OFFSET n] [FOR UPDATE | FOR SHARE];
 ```
 
-Projections may be a path, wildcard, scalar, aggregate, or window. A wildcard
-cannot mix with a computed scalar. FROM-less SELECT rejects paths, wildcards,
-aggregates, and windows; only source-independent scalars are valid.
+- **Paths & JSON:** Dotted/bracket paths (`profile.name`, `items[0]`,
+  `"$doc"`), `->`/`->>`, JSONB `?`/`?|`/`?&`/`jsonb_set`, `ARRAY[...]`/`ANY`/
+  `ALL`/`UNNEST`, row-value comparisons.
+- **Expressions:** Exact decimal arithmetic (`+ - * / %`), `||`, `CAST`/
+  `::` (`TEXT`, `BOOL`, `NUMERIC`, `JSON`), `CASE` (≤1,024 arms), `COALESCE`,
+  `GREATEST`, `LEAST`, `NULLIF`, `TIMESTAMP`/`NOW() + INTERVAL`.
+- **Aggregates:** `COUNT(*)`, `COUNT(path)`, `SUM`, `AVG`, `MIN`, `MAX` (with
+  `DISTINCT` and `FILTER (WHERE ...)`), `STRING_AGG`, `ARRAY_AGG`, `JSON_AGG`/
+  `JSONB_AGG`, `BOOL_AND`/`EVERY`, `BOOL_OR`. Exact decimal math (no `float64`
+  rounding).
+- **Predicates & 3VL:** Comparisons, `IS [NOT] NULL`, `IS [NOT] MISSING`
+  (absence only), `IS [NOT] DISTINCT FROM`, `IS [NOT] TRUE/FALSE`, `IN`,
+  `BETWEEN`, `@>`, `LIKE`/`ILIKE`, `==>`, `SCORE()`, `EXISTS`, scalar
+  subqueries. Authored `x = NULL` is rejected.
+- **Joins, CTEs, sets, windows:** `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`,
+  `USING`, `LATERAL`; `WITH RECURSIVE` (cap: 1,000 iters, 100,000 rows, 64 MiB);
+  `UNION`/`INTERSECT`/`EXCEPT [ALL|DISTINCT]`; full window suite
+  (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `NTILE`, `PERCENT_RANK`,
+  `CUME_DIST`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, aggregate `OVER` with
+  `ROWS`/`GROUPS`/`RANGE` frames and `EXCLUDE`).
+- **Virtual tables (`pgwire`):** `pg_stat_activity`, `pg_stat_statements`,
+  `pg_stat_statements_reset()`, `pg_cancel_backend(pid)`,
+  `pg_terminate_backend(pid)`, plus queryable `information_schema` /
+  `pg_catalog` views.
 
-`DISTINCT` lowers to grouping and rejects computed scalar projections and
-explicit GROUP BY. GROUP BY accepts stored paths, not expressions or ordinals.
-HAVING requires grouping/aggregation; its aggregates must also be projected and
-its plain paths must be group keys.
+## Limits and unsupported families
 
-ORDER BY accepts a path, supported scalar expression, aggregate, projection
-alias, or positive one-based projection ordinal. Aliases win name resolution
-when they are the entire sort key. Computed keys can remain hidden from the
-output, including in grouped and window queries; ordinary paths in a grouped
-sort expression must be group keys. A numeric constant starting an arithmetic
-sort expression must be parenthesized to distinguish it from an ordinal.
-NULLS FIRST/LAST is supported for paths, expressions, output aliases, ordinals,
-and set-result ordering, including distributed result merging. Without an
-explicit NULLS clause, ascending uses nulls first and descending uses nulls last.
-COLLATE is unsupported.
-
-LIMIT and OFFSET may appear in either order, at most once each. FETCH is
-unsupported.
-
-## Paths and JSON access
-
-```sql
-SELECT profile.name, profile['display name'], items[0],
-       metadata -> 'region', metadata ->> 'region', "$doc"
-FROM accounts;
-```
-
-Paths use dotted components or brackets containing a nonnegative integer or
-constant string. Quoted `"$doc"` means the whole document.
-
-`->` and `->>` accept constant, nonnumeric object keys only. Dynamic keys,
-numeric keys, and array indexing through these operators are unsupported.
-`->>` produces terminal text.
-
-## Scalar expressions
-
-- String, number, boolean, and NULL literals, plus parameters.
-- Paths and path-to-path comparisons in supported contexts.
-- Unary `+` and `-`.
-- Arithmetic `+ - * / %`, concatenation `||`, and JSON access.
-- CAST using `CAST(value AS type)` or `value::type`.
-- Simple and searched CASE with at least one WHEN and optional ELSE.
-- COALESCE, GREATEST, LEAST, and NULLIF.
-- COUNT, SUM, AVG, MIN, and MAX.
-- Window functions listed below.
-
-CAST targets are TEXT, BOOL/BOOLEAN, NUMERIC/DECIMAL, and JSON. Type modifiers,
-arrays, qualified/multiword types, and collations are unsupported. Typed
-literal prefixes are limited to BOOL/BOOLEAN and TEXT.
-
-COALESCE returns the first non-null argument and does not evaluate later
-arguments. GREATEST/LEAST ignore null arguments and compare exact numbers,
-text, or booleans; NULLIF returns null on equality. Arguments must share a
-supported type; use explicit casts for other conversions. The existing
-BOOL/TEXT typed-string common-type rules also apply. JSON comparison and
-PostgreSQL timestamp/array domains are not added by these expressions.
-Variadic conditional expressions accept 1–1,024 arguments; NULLIF requires two.
-
-There is no general scalar-function catalog. Arithmetic over a window result
-is not supported. CASE is lazy and bounded to 1,024 WHEN/Boolean-test arms.
-
-Aggregates behave as follows:
-
-| Aggregate | Behavior |
-| --- | --- |
-| `COUNT(*)` | Counts rows |
-| `COUNT(path)` | Counts present, non-null values |
-| SUM/AVG/MIN/MAX | Consume numeric values, skip null/nonnumeric, null on empty input |
-
-Exact JSON-decimal semantics are preserved: `1`, `1.0`, and `1e0` compare
-equally without a `float64` round trip. Aggregate DISTINCT is unsupported.
-
-## Predicates and three-valued logic
-
-```sql
-WHERE active = TRUE AND tier IN ('pro', 'team') AND score BETWEEN 10 AND 20
-  AND profile @> '{"verified":true}' AND name ILIKE 'ada%' AND deleted_at IS MISSING
-```
-
-Implemented predicates are comparisons, IS `[NOT]` NULL, IS `[NOT]` MISSING,
-IN/NOT IN lists or subqueries, BETWEEN, `@>`, LIKE/ILIKE, full-text `==>`,
-EXISTS, IS [NOT]
-TRUE/FALSE, AND/OR/NOT,
-and bounded scalar subqueries.
-
-```sql
-CREATE INDEX docs_body_tin ON docs(body) USING tin;
-SELECT id FROM docs WHERE body ==> 'luxury AND goods' ORDER BY id;
-```
-
-`path ==> 'tinql'` tests the string at `path` against a TINQL query and needs
-a tin index over that path; the right side may be a parameter. Non-string,
-null, and missing values never match, including under `NOT`. `SCORE()` returns
-the BM25 score for the statement's single top-level `==>` predicate and may
-appear in the SELECT list, ORDER BY, and WHERE; `SCORE` without `(` remains an
-ordinary field name. `==>` is refused over a table with staged, uncommitted
-writes in the current transaction.
-
-```sql
-SELECT id, SCORE() FROM docs WHERE body ==> 'luxury AND goods' ORDER BY SCORE() DESC LIMIT 10;
-```
-
-The TINQL language, analyzer, ranking, execution cost, and limitations are in
-[full-text search](../api/search.md).
-
-`IS NULL` is true for explicit JSON null and an absent path. `IS MISSING` is
-true only for absence. Projection and wire encoding render both as SQL NULL.
-Authored `value = NULL` and authored NULL members of IN are rejected; a bound
-parameter may evaluate to null and follows three-valued logic.
-
-LIKE has no ESCAPE clause. SIMILAR TO, regular-expression operators,
-and bare boolean-path predicates are unsupported. IS [NOT] TRUE/FALSE returns
-true or false even for null/missing input and requires Boolean non-null values;
-these tests use the computed-predicate execution surface and its limits below.
-Computed scalar WHERE cannot share a grouped/aggregate statement. Mixed scalar/path
-predicates combine only under top-level AND, not OR/NOT; HAVING rejects IS MISSING/containment.
-
-## Joins and derived relations
-
-```sql
-SELECT a.id, o.total
-FROM accounts AS a
-LEFT JOIN orders AS o
-  ON a.id = o.account_id AND o.state = 'open';
-```
-
-| Join | Supported |
-| --- | --- |
-| INNER / bare JOIN | Yes |
-| LEFT / RIGHT / FULL `[OUTER]` | Yes |
-| CROSS or comma | Yes |
-| USING `(simple_name, ...)` | Yes; merged output column |
-| NATURAL | No |
-
-ON is a bounded join predicate: equality keys plus supported residual
-predicates or a boolean constant. It is not an arbitrary computed-expression
-or subquery join condition. USING names must be simple and distinct.
-
-Derived tables require an alias and do not accept a column alias list.
-LATERAL supports correlated CROSS/INNER/LEFT joins. RIGHT/FULL LATERAL is
-accepted only when decorrelated. LATERAL USING, forward references, and self
-references are rejected.
-
-## Subqueries
-
-EXISTS/NOT EXISTS, IN/NOT IN, and scalar subqueries are implemented. A scalar
-subquery returning zero rows yields null, one row yields its value, and more
-than one row is an error.
-
-Correlation is supported when it can be reduced to bounded conjunctive
-equality/proven shapes. Correlation under OR, correlated ON subqueries, nested
-predicate subqueries, and generalized NOT-over-OR shapes are rejected at
-prepare time. This is deliberate bounded execution, not a planner hint.
-
-## CTEs and recursion
-
-```sql
-WITH RECURSIVE walk(node) AS (
-    SELECT root FROM roots
-    UNION ALL
-    SELECT edges.child FROM walk JOIN edges ON walk.node = edges.parent
-)
-SELECT node FROM walk;
-```
-
-WITH supports column aliases, MATERIALIZED/NOT MATERIALIZED hints, and
-references to earlier sibling CTEs. Data-modifying CTEs and WITH before a
-top-level VALUES/TABLE operand are unsupported.
-
-A recursive CTE is one anchor SELECT, UNION or UNION ALL, and one direct
-recursive SELECT. Evaluation is breadth-first/fixpoint and finite by default.
-Mutual/forward recursion, nested self-reference, SEARCH/CYCLE, recursive
-aggregate/window/GROUP/HAVING/ORDER/LIMIT/OFFSET, multiple self-references, and
-self-reference on a nullable join side are unsupported.
-
-## Sets, VALUES, and TABLE
-
-UNION, INTERSECT, and EXCEPT support ALL and DISTINCT. INTERSECT binds tighter.
-Operands may be SELECT, VALUES, TABLE, or a parenthesized set expression.
-
-VALUES cells are literals, nulls, parameters, or typed bool/text constants—not
-general expressions or DEFAULT. Bounds are 1,024 rows by 1,024 columns. TABLE
-accepts one unqualified relation. A set tree has at most 2,047 nodes.
-
-## Windows
-
-Implemented functions:
-
-```text
-ROW_NUMBER  RANK  DENSE_RANK  LAG  LEAD  NTILE
-PERCENT_RANK  CUME_DIST  FIRST_VALUE  LAST_VALUE  NTH_VALUE
-COUNT  SUM  AVG  MIN  MAX ... OVER
-```
-
-Named/inline windows and inheritance are supported. PARTITION/ORDER accept
-paths. ROWS, GROUPS, and RANGE accept UNBOUNDED, CURRENT ROW, and value
-PRECEDING/FOLLOWING bounds plus EXCLUDE CURRENT ROW/GROUP/TIES/NO OTHERS.
-
-SQL does not expose aggregate FILTER, aggregate DISTINCT in a window, or
-IGNORE/RESPECT NULLS even though lower-level execution kernels contain related
-internal machinery.
-
-## Transactions and savepoints
-
-The native shared parser recognizes SAVEPOINT, RELEASE, and ROLLBACK TO.
-`database/sql` and typed runtime APIs start/commit/rollback transactions. The
-pgwire adapter additionally parses BEGIN/START TRANSACTION, COMMIT, and full
-ROLLBACK, including READ ONLY/WRITE and Read Committed, Repeatable Read, or
-Serializable. READ UNCOMMITTED and chaining are unsupported.
-
-Savepoint names are bare identifiers. Maximum depth is 64. Duplicate names
-shadow older names. RELEASE removes the named savepoint and every newer one;
-ROLLBACK TO restores and retains the named savepoint and drops newer ones.
-
-## Current limits
-
-| Boundary | Limit/default |
-| --- | ---: |
-| SQL source | 16 MiB |
-| Parameters, native parser | 65,536 |
-| Parameters, pgwire | 32,767 |
-| Predicate/scalar depth | 64 |
-| Subquery depth | 32 |
-| Set nesting | 64 |
-| Per clause/list, projection, or schema | 1,024 |
-| Mutation transaction | Per table: 64 docs / 16 MiB values + keys; total: 16 tables / 256 docs / ~64 MiB |
-| Default result | 100,000 rows / 64 MiB |
-| Default intermediate / aggregate / join workspace | 64 MiB / 16 MiB / 64 MiB |
-| Recursive CTE | 1,000 evaluations / 100,000 rows / 64 MiB |
-
-## Unsupported SQL families
-
-Unsupported families include MERGE, REPLACE, file-path COPY (`COPY ... FROM/TO 'file'`), GRANT/REVOKE, COMMENT, VACUUM,
-ANALYZE, REINDEX, CLUSTER, PREPARE/EXECUTE/DEALLOCATE, DECLARE/FETCH/MOVE,
-LISTEN/NOTIFY/UNLISTEN, LOCK, CALL, and DO. PostgreSQL extensions, procedures,
-triggers, policies, sequences, materialized views, and logical replication are outside this dialect.
-
-## Supported PostgreSQL extensions
-
-- **Wire COPY**: `COPY table [(cols)] FROM STDIN` and `COPY table|(SELECT ...) TO STDOUT` (text & CSV formats, `HEADER`, `DELIMITER`, `NULL`, `QUOTE`, atomic `CopyFail` rollback).
-- **DDL & Constraints**: composite `PRIMARY KEY` (up to 4 columns) with composite `ON CONFLICT (c1, c2, ...)`, `UNIQUE` constraints, column `DEFAULT` expressions, column & table `CHECK (...)` constraints (`23514`), `ALTER TABLE` (`ADD`/`DROP`/`RENAME`/`SET TYPE`/`SET NOT NULL`/`DROP NOT NULL`/`SET DEFAULT`/`DROP DEFAULT`/`ADD CONSTRAINT CHECK`/`RENAME TO`), `CREATE TABLE [IF NOT EXISTS] ... AS SELECT` (CTAS), and `CREATE INDEX` options (`WHERE`, expression, `INCLUDE`, `DESC`/`NULLS`).
-- **DML**: `UPDATE ... FROM`, `DELETE ... USING`, data-modifying CTEs (`WITH ... AS (INSERT/UPDATE/DELETE RETURNING) SELECT`), `INSERT ... DEFAULT VALUES`, scalar expressions in `INSERT ... VALUES (...)`, `INSERT ... SELECT`, and `RETURNING` across local and RF3 distributed backends.
-- **Queries & Aggregates**: `DISTINCT ON (...)`, `COUNT/SUM/AVG/MIN/MAX(DISTINCT x)`, `AGG(...) FILTER (WHERE ...)`, `STRING_AGG`, `ARRAY_AGG`, `JSON_AGG`/`JSONB_AGG`, `BOOL_AND`/`EVERY`, `BOOL_OR`, expression/ordinal/alias `GROUP BY`, `HAVING` on extended aggregates, regex (`~`, `~*`, `!~`, `!~*`, `SIMILAR TO`), JSONB operators (`?`, `?|`, `?&`, `jsonb_set`), `ARRAY[...]` / `ANY` / `ALL` / `UNNEST`, row-value comparisons, `TIMESTAMP`/`NOW() + INTERVAL` arithmetic, `SELECT ... FOR UPDATE/SHARE`, and queryable `information_schema` / `pg_catalog` virtual tables.
-
-## Limitations
-
-- The dialect is bounded by design: shapes the lowerer cannot prove are
-  rejected at prepare time rather than executed slowly.
-- Foreign keys, sequences, generated columns, and collations are not enforced.
-- DDL is not transactional and changes one object per statement.
-- Views are not materialized and cannot be replaced in place.
+- **Limits:** SQL ≤16 MiB; ≤65,536 params (32,767 in `pgwire`); depth 64
+  (subqueries 32); ≤1,024 items/list; savepoints ≤64; Tx ≤64 docs/table, ≤16
+  tables / 256 docs / ~64 MiB; default result 100,000 rows / 64 MiB.
+- **Unsupported:** `MERGE`, `REPLACE`, file-path `COPY`, `GRANT`/`REVOKE`,
+  `VACUUM`, `ANALYZE`, `REINDEX`, `CLUSTER`, `LISTEN`/`NOTIFY`, `CALL`, `DO`,
+  stored procedures, triggers, foreign keys, sequences, materialized views.
 
 ## Source map
 
-- Parser and expressions: [sql/parser.go](../../sql/parser.go), [sql/lexer.go](../../sql/lexer.go), [sql/scalar_parse.go](../../sql/scalar_parse.go), [sql/predicate.go](../../sql/predicate.go)
-- SELECT and relations: [sql/parser.go](../../sql/parser.go), [sql/parser.go](../../sql/parser.go), [sql/resolve.go](../../sql/resolve.go)
-- CTE/set/window: [sql/parse_cte.go](../../sql/parse_cte.go), [sql/recursive_cte.go](../../sql/recursive_cte.go), [sql/set.go](../../sql/set.go), [sql/parser.go](../../sql/parser.go)
-- DML and RF3 images: [sql/parse_dml.go](../../sql/parse_dml.go), [sql/driver/write.go](../../sql/driver/write.go), [gateway/replicated_sql_transaction.go](../../gateway/replicated_sql_transaction.go)
-- DDL/views: [sql/parse_ddl.go](../../sql/parse_ddl.go), [sql/parse_drop.go](../../sql/parse_drop.go), [sql/parse_view.go](../../sql/parse_view.go)
-- Full text: [query/match.go](../../query/match.go), [query/score.go](../../query/score.go), [sql/driver/tin_fulltext_test.go](../../sql/driver/tin_fulltext_test.go)
-- Runtime transactions: [sql/driver/tx.go](../../sql/driver/tx.go), [sql/driver/savepoint.go](../../sql/driver/savepoint.go)
+- Parser: [sql/parser.go](../../sql/parser.go), [sql/lexer.go](../../sql/lexer.go), [sql/parse_dml.go](../../sql/parse_dml.go), [sql/parse_ddl.go](../../sql/parse_ddl.go)
+- Execution & RF3: [sql/driver/write.go](../../sql/driver/write.go), [sql/driver/tx.go](../../sql/driver/tx.go), [gateway/replicated_sql_transaction.go](../../gateway/replicated_sql_transaction.go)

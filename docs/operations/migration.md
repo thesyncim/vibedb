@@ -2,225 +2,60 @@
 
 [Documentation](../README.md) / [Operations](README.md) / Replica migration
 
-This page explains how replica moves are paced on each physical node, how to
-configure that pacing, and how to tell a slow but healthy move from a stuck
-one. Moves are started by [scaling operations](scaling.md) and
-[hot-shard splits](hot-shard-splits.md); there is no separate command to move
-one replica.
+Replica moves (triggered by [scaling](scaling.md) and
+[hot-shard splits](hot-shard-splits.md)) stream certified snapshot artifacts
+while foreground traffic continues. All groups on a physical node share one
+`migrationbudget.Budget`.
 
-Replica movement uses a durable, target-bound snapshot artifact. A scale-out
-learner, a scale-in replacement, and node decommissioning all use the same
-source export, resumable transfer, and cold install barriers. The operation
-does not pause client serving while a snapshot is copied. Traffic admission,
-Raft membership, and learner promotion remain separate control-plane steps.
+## Node budget defaults
 
-## Node budget
-
-Migration work is bounded per physical serving node, not per group. Every
-group on a node shares one budget, so adding groups does not multiply the
-allowance. (Code that embeds the runtime must inject the same
-`migrationbudget.Budget` into every provider, data service, receiver, and
-learner installer on the node.)
-
-The default is deliberately conservative:
+Set optional top-level `migration_budget` in the `prepare-node-rf3` manifest
+(fixed at node preparation; all groups on a node must agree):
 
 | Class | Sustained rate | Burst |
 | --- | ---: | ---: |
-| Serialized snapshot work (CPU proxy) | 64 MiB/s | 4 MiB |
-| Source artifact reads | 64 MiB/s | 4 MiB |
-| Repository and target-stage writes | 64 MiB/s | 4 MiB |
-| Snapshot network sends | 32 MiB/s | 2 MiB |
-| Snapshot network receives | 32 MiB/s | 2 MiB |
-| Concurrent local heavy phases | 2 | — |
-| Transient migration workspaces | 16 MiB total | — |
+| `cpu` (serialization/hashing proxy) | 64 MiB/s | 4 MiB |
+| `disk_read` / `disk_write` | 64 MiB/s each | 4 MiB |
+| `network_send` / `network_receive` | 32 MiB/s each | 2 MiB |
+| `max_active` (concurrent heavy phases) | 2 (range 1–256) | — |
+| Transient chunk workspaces | 16 MiB total | — |
 
-`BytesPerSecond` is the sustained allowance and `BurstBytes` is the largest
-actual operation issued to that class. Every accepted operation larger than a
-burst is split into smaller reads, writes, hashes, or network body segments;
-the caller does not prepay a large token amount and then issue an unbounded
-I/O. The accepted configuration bounds rates and bursts before a node starts:
-`MaxActive` is 1 through 256, rates are positive and at most 1 TiB/s, and
-bursts are positive and at most 1 GiB. Invalid values fail with
-`migrationbudget.ErrInvalidConfig`.
+Operations larger than `burst_bytes` are segmented so no caller issues an
+unbounded I/O. Receivers do not hold active permits while waiting on peer
+sockets, avoiding cross-node permit deadlocks.
 
-The transient workspace pool is a separate node-wide ceiling. A source export
-reserves both chunk workspaces atomically, and senders and receivers use
-dedicated halves of the pool for their body buffers. This prevents opposite
-transfer directions from each holding the last local credit while waiting for
-the peer socket. These reservations live only while the operation is active;
-idle groups retain no chunk-sized buffer. The default pool is 16 MiB, and
-callers that construct a budget directly may lower it subject to the largest
-chunk they intend to admit. A buffer wait never holds an active phase permit.
-`Metrics()` reports aggregate and directional usage, capacity, waiters,
-acquisitions, cancellations, and releases.
+## Foreground pressure feedback
 
-Prepared RF3 nodes persist these values in
-`replica_control.migration_budget`. The same object is copied to the node
-runtime when several groups share one physical node, and all groups must agree
-on it. A node preparation input (the manifest given to
-`vibedb-shard prepare-node-rf3`) may set the optional top-level
-`migration_budget` object; omitted input uses the defaults above. The local
-launcher always uses the defaults and has no flag to change them. The shape
-is:
+On shared node-log nodes, a 250 ms sampler scales effective migration rates
+automatically without holding foreground locks:
 
-```json
-"migration_budget": {
-  "max_active": 2,
-  "cpu": {"bytes_per_second": 67108864, "burst_bytes": 4194304},
-  "disk_read": {"bytes_per_second": 67108864, "burst_bytes": 4194304},
-  "disk_write": {"bytes_per_second": 67108864, "burst_bytes": 4194304},
-  "network_send": {"bytes_per_second": 33554432, "burst_bytes": 2097152},
-  "network_receive": {"bytes_per_second": 33554432, "burst_bytes": 2097152}
-}
-```
-
-The classes are independent. A source disk read does not spend the source
-network-send allowance, and a target network receive is not charged again as
-source disk work. A phase can account several classes when it really performs
-several kinds of work, but each class is charged once at its corresponding
-execution boundary.
-
-### Foreground pressure
-
-Every 250 ms the node samples its own foreground load and scales the effective
-migration rate. The inputs and default thresholds:
-
-| Signal | High (halve the rate) | Severe (counts toward pause) |
+| Signal | High (halve rate to ≥12.5% floor) | Severe (2 consecutive → pause new phases) |
 | --- | --- | --- |
-| Node-log submission queue occupancy | 75% | 90% |
-| Ready-queue wait per submission | 25 ms | 100 ms |
-| Go scheduling latency p99 | 5 ms | never pauses |
-| Backpressure submissions in the interval | any | any |
+| Node-log queue occupancy | ≥75% | ≥90% |
+| Ready-queue wait | ≥25 ms | ≥100 ms |
+| Backpressure submissions | Any | Any |
+| Go scheduler latency p99 | ≥5 ms | Never pauses (throttles only) |
 
-A high sample halves the rate, down to a floor of 12.5% of the configured
-value, and clamps accumulated tokens so there is no burst afterwards. Two
-consecutive severe samples pause new heavy phases before their next bounded
-chunk; work already inside a read, write, or hash finishes. Three quiet samples
-(queue at most 25%, no high signal) restore 12.5 percentage points and wake
-paused work. Scheduling latency measures CPU contention between foreground and
-migration work in the same process; it slows migration but never pauses it.
+Three consecutive quiet windows (queue ≤25%, no high signal) restore +12.5%
+rate and resume paused work.
 
-The first sample sets a baseline, and a counter reset never becomes a false
-spike. The sampler reads detached atomics and holds no foreground, Raft, or
-authority lock. Pressure feedback reduces migration's share; it does not
-guarantee zero foreground latency impact under continuous saturation.
+## Observability and timeouts
 
-`CPU` is a serialized snapshot encoding and hashing byte-work proxy. It does
-not reserve cores or impose an operating-system CPU quota. Artifact framing
-may perform small encode steps before bytes reach the budgeted writer, and the
-repository's final artifact verification remains a serialized repository
-operation. Host CPU and storage telemetry are required when those limits need
-to be measured directly.
-
-## What is paced
-
-Source export pins one immutable Raft/data cut and performs its existing two
-passes. Both passes charge serialized bytes. Repository publication charges
-each bounded write before `Repository.Append` and retains the durable cursor.
-The source data service limits each response body to the smallest configured
-CPU, source-read, and network-send burst, charges the read and hash before
-the operation, and writes the body only after network admission.
-
-The target receives a body in network-receive burst segments and refreshes the
-transport read deadline for each segment after local budget admission. It
-checks the complete chunk hash before acquiring an active permit, then appends
-disk-write burst segments. Each successful append advances the repository's
-durable offset, so a reconnect resumes at that offset without replaying a
-partial append. Cold learner installation uses the same budgeted reader while
-the artifact stage applies and checkpoints verified rows.
-
-The receiver does not hold an active local permit while waiting for the source
-connection or for network pacing. This avoids a source/target cycle in which
-both nodes hold the last permit while waiting for one another. Source and
-target operations still share their own node's active capacity across all
-groups.
-
-Budget-backed source providers, data services, and cold receivers allocate
-chunk workspaces through the node pool and release them after the operation
-becomes idle. Source providers reserve their artifact and transfer workspaces
-as one request; this keeps logical transfer working memory below the shared
-pool instead of retaining a chunk-sized buffer for every group that has ever
-moved.
-The Go allocator may keep released pages in its process heap; use process RSS
-and runtime heap telemetry when sizing the host.
-
-## Cancellation, retry, and shutdown
-
-Pass the operation context through source control, transfer, and installation.
-Cancellation wakes active-permit and token waiters immediately. A canceled
-lease releases its active permit exactly once. Token reservations are not
-refunded: a reservation may have crossed an I/O boundary, and refunding it
-would allow a retry to spend the same capacity twice. The durable repository
-cursor is the only resume authority.
-
-Allow the operation deadline to include the configured pacing time. A slow but
-healthy budget is not treated as a stalled peer: source writes and target body
-reads install a fresh transport deadline after their local pacing wait. A
-deadline still bounds a peer that stops responding. Closing a node budget wakes
-all waiters and leaves already acquired leases safe to release during orderly
-shutdown.
-
-Stop source and bootstrap listeners before closing their retained providers.
-The provider waits for pinned export plans to return their workspaces, then
-closes the repository. It does not hold its provider mutex while a paced
-export runs, so observation, release, and shutdown do not serialize behind a
-rate wait.
-
-## Observability
-
-The budget exposes a detached `Metrics` value. Read it from
-`Budget.Metrics()` or from the transfer surfaces:
-
-- `snapshottransfer.Service.Stats().Budget` reports source-side work;
-- `snapshottransfer.Receiver.Metrics().Budget` reports target-side work; and
-- `migrationbudget.ResourceMetrics` reports cumulative bytes, throttle events,
-  throttled nanoseconds, current available tokens, configured rate, and burst
-  for CPU proxy, disk read, disk write, network send, and network receive.
-
-The node-level fields also include active capacity, current active permits,
-active waiters, workspace usage and capacity, workspace waiters, acquisitions,
-cancellations, releases, budget calls, and budget errors. Counters are
-process-local and monotonic until restart. Available tokens are a scheduling
-hint and can refill while a status response is being read; the configured rate,
-burst, and workspace ceiling are the enforceable limits.
-
-Watch for increasing throttle events or waiters together with migration
-progress. If foreground latency rises, the node pressure controller lowers
-effective migration rates or pauses new phases while the configured ceilings
-remain in force. If transfers repeatedly hit their deadline, increase
-the operation deadline to cover the selected rate after checking peer health;
-do not mint a new operation identity or discard its cursor.
+- Inspect `vibedb cluster status --json` (`budget.throttled_calls`,
+  `throttled_bytes`, `peak_active`, `max_active`) or `Budget.Metrics()`.
+- Size operation `--wait` deadlines to cover `shard_bytes / effective_rate`.
+  Resumable repository cursors mean reconnects resume from the last durable
+  offset—never mint a new operation ID.
 
 ## Limitations
 
-The budget bounds the migration paths that call it. It does not make a
-filesystem, host scheduler, kernel socket buffer, or every internal encoder
-instruction a hard quota. Final repository publish verification scans and
-hashes the complete artifact through paced read/hash segments, while the
-repository still serializes the metadata transition; large artifacts remain a
-possible local latency bottleneck. Measure it separately when sizing a node.
-
-The artifact descriptor, membership fence, source and target identities, and
-repository cursor remain authoritative during retries. Budget metrics never
-grant membership, serving authority, or a promotion. Only the catalog and
-Raft barriers can complete a scale operation.
-
-- The budget values are fixed at node preparation. Changing them means
-  preparing the node again; there is no runtime control.
-- The pressure thresholds have no configuration surface in the manifest.
-- The `seamless-scale-in-out` qualification lowers network rates to 8 MiB/s
-  with 64 KiB bursts to force visible pacing; the defaults above are not what
-  that workflow measured.
+- Budget values are fixed at node preparation; pressure thresholds are fixed in
+  code.
+- Dynamic pressure sampling applies only to shared node-log nodes (per-group
+  WAL processes use static rates).
+- `CPU` is a byte-work proxy, not an OS cgroup CPU quota.
 
 ## Source map
 
-| Boundary | Source |
-| --- | --- |
-| Node-scoped rates, permits, cancellation, and metrics | [`internal/migrationbudget/budget.go`](../../internal/migrationbudget/budget.go) and [`internal/migrationbudget/pressure.go`](../../internal/migrationbudget/pressure.go) |
-| RF3 manifest construction and node pressure sampler | [`cmd/vibedb-shard/rf3_migration.go`](../../cmd/vibedb-shard/rf3_migration.go) and [`cmd/vibedb-shard/rf3_migration_pressure.go`](../../cmd/vibedb-shard/rf3_migration_pressure.go) |
-| Two-pass source export and durable cursor writes | [`internal/snapshottransfer/source_export.go`](../../internal/snapshottransfer/source_export.go) |
-| Retained source ownership and provider injection | [`internal/snapshottransfer/source_provider.go`](../../internal/snapshottransfer/source_provider.go) |
-| Snapshot network sender and receiver pacing | [`internal/snapshottransfer/service.go`](../../internal/snapshottransfer/service.go) |
-| Actual I/O segmentation and paced verification readers | [`internal/snapshottransfer/budget_io.go`](../../internal/snapshottransfer/budget_io.go) |
-| Target artifact staging and learner install | [`internal/snapshottransfer/learner_install.go`](../../internal/snapshottransfer/learner_install.go) |
-| Durable offset, append, publication, and recovery | [`internal/snapshottransfer/repository.go`](../../internal/snapshottransfer/repository.go) |
+- [internal/migrationbudget/budget.go](../../internal/migrationbudget/budget.go) · [pressure.go](../../internal/migrationbudget/pressure.go)
+- [cmd/vibedb-shard/rf3_migration.go](../../cmd/vibedb-shard/rf3_migration.go) · [internal/snapshottransfer/budget_io.go](../../internal/snapshottransfer/budget_io.go)

@@ -1,2 +1,0 @@
-ok  	github.com/thesyncim/vibedb/shardservice	25.063s
-ok  	github.com/thesyncim/vibedb/gateway	140.407s
