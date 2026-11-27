@@ -101,12 +101,29 @@ func materializeJSONColumnPatch(
 			}
 		}
 	}
-	addedCount := 0
+	var addedInline [8]int
+	addedOrder := addedInline[:0]
+	if len(fields) > len(addedInline) {
+		addedOrder = make([]int, 0, len(fields))
+	}
 	for i := range fields {
 		if fields[i].member < 0 {
 			fields[i].addedKey = strconv.AppendQuote(nil, string(fields[i].column))
-			addedCount++
+			addedOrder = append(addedOrder, i)
 		}
+	}
+	addedCount := len(addedOrder)
+	// Insertion-sort added fields by column name so newly added columns
+	// (e.g. after ALTER TABLE ADD COLUMN) merge into canonical key order
+	// without forcing a full canonicalization rewrite.
+	for i := 1; i < len(addedOrder); i++ {
+		idx := addedOrder[i]
+		j := i - 1
+		for j >= 0 && bytes.Compare(fields[addedOrder[j]].column, fields[idx].column) > 0 {
+			addedOrder[j+1] = addedOrder[j]
+			j--
+		}
+		addedOrder[j+1] = idx
 	}
 	updatedBytes := 2 // braces
 	totalMembers := memberCount + addedCount
@@ -130,11 +147,8 @@ func materializeJSONColumnPatch(
 			return nil, ResultTargetBound
 		}
 	}
-	for i := range fields {
-		if fields[i].member >= 0 {
-			continue
-		}
-		if !jsonDeltaAddSize(&updatedBytes, len(fields[i].addedKey)+1+len(fields[i].rawJSON), maxBytes) {
+	for _, idx := range addedOrder {
+		if !jsonDeltaAddSize(&updatedBytes, len(fields[idx].addedKey)+1+len(fields[idx].rawJSON), maxBytes) {
 			return nil, ResultTargetBound
 		}
 	}
@@ -144,11 +158,33 @@ func materializeJSONColumnPatch(
 	updated := make([]byte, 0, updatedBytes)
 	updated = append(updated, '{')
 	wrote := 0
+	addedPos := 0
 	iter, _ = root.ObjectIter()
 	for member := 0; ; member++ {
 		key, value, hasNext := iter.NextRaw()
 		if !hasNext {
 			break
+		}
+		if addedPos < len(addedOrder) {
+			rawKey, clean := key.StringBytes()
+			if !clean {
+				var err error
+				scratch, _, err = key.AppendText(scratch[:0])
+				if err == nil {
+					rawKey = scratch
+				}
+			}
+			for addedPos < len(addedOrder) && bytes.Compare(fields[addedOrder[addedPos]].column, rawKey) < 0 {
+				idx := addedOrder[addedPos]
+				if wrote != 0 {
+					updated = append(updated, ',')
+				}
+				updated = append(updated, fields[idx].addedKey...)
+				updated = append(updated, ':')
+				updated = append(updated, fields[idx].rawJSON...)
+				wrote++
+				addedPos++
+			}
 		}
 		if wrote != 0 {
 			updated = append(updated, ',')
@@ -168,16 +204,14 @@ func materializeJSONColumnPatch(
 		}
 		wrote++
 	}
-	for i := range fields {
-		if fields[i].member >= 0 {
-			continue
-		}
+	for ; addedPos < len(addedOrder); addedPos++ {
+		idx := addedOrder[addedPos]
 		if wrote != 0 {
 			updated = append(updated, ',')
 		}
-		updated = append(updated, fields[i].addedKey...)
+		updated = append(updated, fields[idx].addedKey...)
 		updated = append(updated, ':')
-		updated = append(updated, fields[i].rawJSON...)
+		updated = append(updated, fields[idx].rawJSON...)
 		wrote++
 	}
 	updated = append(updated, '}')
