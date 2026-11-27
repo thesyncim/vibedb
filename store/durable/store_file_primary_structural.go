@@ -26,7 +26,7 @@ const (
 	// primaryLeafMergeBudgetPerFold bounds opportunistic inline sibling leaf
 	// merges performed at the end of one fold/checkpoint so delete bursts
 	// reclaim sparse leaves incrementally on the write path without stalling.
-	primaryLeafMergeBudgetPerFold = 2
+	primaryLeafMergeBudgetPerFold = 8
 
 	// primaryLeafMergeMaxExtent limits merge candidates to leaves at or below
 	// 8 KiB so large active leaves are never considered underfilled.
