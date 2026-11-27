@@ -29,19 +29,25 @@ func (s *session) virtualCatalogShim(
 			return nil, false, err
 		}
 	}
-	tables, err := s.sql.Tables(s.operationContext())
-	if err != nil {
-		return nil, false, nil
-	}
-	var views []sqldriver.ViewInfo
-	if lister, ok := s.sql.(interface {
-		Views(context.Context) ([]sqldriver.ViewInfo, error)
-	}); ok {
-		if v, vErr := lister.Views(s.operationContext()); vErr == nil {
-			views = v
+	var allCols []column
+	var allRows [][]*string
+	if q.table == "pg_catalog.pg_stat_activity" || q.table == "pg_stat_activity" {
+		allCols, allRows = buildStatActivityRows(s.server)
+	} else {
+		tables, err := s.sql.Tables(s.operationContext())
+		if err != nil {
+			return nil, false, nil
 		}
+		var views []sqldriver.ViewInfo
+		if lister, ok := s.sql.(interface {
+			Views(context.Context) ([]sqldriver.ViewInfo, error)
+		}); ok {
+			if v, vErr := lister.Views(s.operationContext()); vErr == nil {
+				views = v
+			}
+		}
+		allCols, allRows = buildVirtualCatalogRows(q.table, s.database, s.user, tables, views)
 	}
-	allCols, allRows := buildVirtualCatalogRows(q.table, s.database, s.user, tables, views)
 	if len(allCols) == 0 {
 		return nil, false, nil
 	}
@@ -186,7 +192,8 @@ func parseVirtualCatalogQuery(raw string) (virtualCatalogQuery, bool) {
 		"information_schema.views",
 		"pg_catalog.pg_tables", "pg_tables",
 		"pg_catalog.pg_views", "pg_views",
-		"pg_catalog.pg_indexes", "pg_indexes":
+		"pg_catalog.pg_indexes", "pg_indexes",
+		"pg_catalog.pg_stat_activity", "pg_stat_activity":
 	default:
 		return virtualCatalogQuery{}, false
 	}
@@ -352,6 +359,28 @@ func splitTopLevelAND(s string) []string {
 	}
 	out = append(out, s[start:])
 	return out
+}
+
+func buildStatActivityRows(srv *Server) ([]column, [][]*string) {
+	cols := textCols("pid", "datname", "usename", "application_name", "client_addr", "backend_start", "state", "query")
+	if srv == nil {
+		return cols, nil
+	}
+	snaps := srv.activitySnapshot()
+	rows := make([][]*string, 0, len(snaps))
+	for _, a := range snaps {
+		rows = append(rows, []*string{
+			strPtr(strconv.FormatInt(int64(a.pid), 10)),
+			strPtr(a.datname),
+			strPtr(a.usename),
+			strPtr(a.appName),
+			strPtr(a.clientAddr),
+			strPtr(a.backendStart),
+			strPtr(a.state),
+			strPtr(a.query),
+		})
+	}
+	return cols, rows
 }
 
 func buildVirtualCatalogRows(

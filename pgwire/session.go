@@ -76,6 +76,12 @@ type session struct {
 	cancelBackend     func()
 	statementTimer    *time.Timer
 	statementTimedOut bool
+	// Activity telemetry read concurrently by pg_stat_activity under cancelMu.
+	startedAt        time.Time
+	clientAddr       string
+	activityAppName  string
+	activityState    string
+	activityQuery    string
 
 	// implicitExtended records the transaction opened for an extended-query
 	// batch. An explicit BEGIN leaves it false and therefore survives Sync.
@@ -462,6 +468,7 @@ func (s *session) beginCancelable() {
 	s.statementTimedOut = false
 	s.queryCancel.Reset()
 	s.cancelActive = true
+	s.activityState = "active"
 	if s.cancelShutdown {
 		s.queryCancel.Cancel()
 	} else if timeout > 0 {
@@ -522,6 +529,32 @@ func (s *session) endCancelable() {
 	s.statementTimedOut = false
 	s.cancelActive = false
 	s.queryCancel.Reset()
+	s.cancelMu.Unlock()
+	s.refreshIdleActivityState()
+}
+
+func (s *session) refreshIdleActivityState() {
+	state := "idle"
+	switch s.transactionStatus() {
+	case statusInTx:
+		state = "idle in transaction"
+	case statusFailedT:
+		state = "idle in transaction (aborted)"
+	}
+	appName := s.params["application_name"]
+	s.cancelMu.Lock()
+	if !s.cancelActive {
+		s.activityState = state
+	}
+	s.activityAppName = appName
+	s.cancelMu.Unlock()
+}
+
+func (s *session) recordActivityQuery(sql string) {
+	appName := s.params["application_name"]
+	s.cancelMu.Lock()
+	s.activityQuery = sql
+	s.activityAppName = appName
 	s.cancelMu.Unlock()
 }
 
@@ -749,6 +782,12 @@ func (s *session) negotiate(body []byte) error {
 		return err
 	}
 	s.secret = secret
+	s.startedAt = time.Now().UTC()
+	if s.conn != nil && s.conn.RemoteAddr() != nil {
+		s.clientAddr = s.conn.RemoteAddr().String()
+	}
+	s.activityAppName = s.params["application_name"]
+	s.activityState = "idle"
 	// Admission happens before authentication, not after. SCRAM costs a PBKDF2
 	// round per attempt, so a limit enforced afterwards would bound the sessions
 	// that succeeded while leaving the work an unauthenticated peer can demand
@@ -1011,6 +1050,7 @@ func (s *session) dispatch(tag byte, body []byte) error {
 			// were still being thrown away.
 			return nil
 		}
+		s.recordActivityQuery(s.msg.query)
 		return s.simpleQuery(s.msg.query)
 	case msgParse, msgBind, msgDescribe, msgExecute, msgClose, msgSync, msgFlush:
 		return s.extended(tag)
