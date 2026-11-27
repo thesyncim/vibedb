@@ -70,10 +70,12 @@ type session struct {
 	// backend was idle could leave queryCancel armed and cancel the next
 	// statement instead. The mutex is touched once at command entry/exit and
 	// once per CancelRequest, never at an executor checkpoint or row.
-	cancelMu       sync.Mutex
-	cancelActive   bool
-	cancelShutdown bool
-	cancelBackend  func()
+	cancelMu          sync.Mutex
+	cancelActive      bool
+	cancelShutdown    bool
+	cancelBackend     func()
+	statementTimer    *time.Timer
+	statementTimedOut bool
 
 	// implicitExtended records the transaction opened for an extended-query
 	// batch. An explicit BEGIN leaves it false and therefore survives Sync.
@@ -447,17 +449,57 @@ func (s *session) shutdownCancel() {
 }
 
 // beginCancelable marks one frontend command as the only target of an
-// out-of-band CancelRequest. Session execution is single-threaded, so command
-// windows never nest.
+// out-of-band CancelRequest and arms statement_timeout when > 0. Session
+// execution is single-threaded, so command windows never nest.
 func (s *session) beginCancelable() {
 	s.bindCancellationCheck()
+	timeout := s.durationParam("statement_timeout")
 	s.cancelMu.Lock()
+	if s.statementTimer != nil {
+		s.statementTimer.Stop()
+		s.statementTimer = nil
+	}
+	s.statementTimedOut = false
 	s.queryCancel.Reset()
 	s.cancelActive = true
 	if s.cancelShutdown {
 		s.queryCancel.Cancel()
+	} else if timeout > 0 {
+		s.statementTimer = time.AfterFunc(timeout, s.triggerStatementTimeout)
 	}
 	s.cancelMu.Unlock()
+}
+
+func (s *session) triggerStatementTimeout() {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+	if !s.cancelActive {
+		return
+	}
+	s.statementTimedOut = true
+	s.queryCancel.Cancel()
+	if s.cancelBackend != nil {
+		s.cancelBackend()
+	}
+}
+
+func (s *session) wasStatementTimeout() bool {
+	s.cancelMu.Lock()
+	timedOut := s.statementTimedOut
+	s.cancelMu.Unlock()
+	return timedOut
+}
+
+func (s *session) durationParam(name string) time.Duration {
+	raw, ok := s.params[name]
+	if !ok || raw == "" || raw == "0" {
+		return 0
+	}
+	ms, err := parsePGDurationMillis(raw)
+	if err != nil || ms <= 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 func (s *session) bindCancellationCheck() {
@@ -473,6 +515,11 @@ func (s *session) bindCancellationCheck() {
 // arm the next command.
 func (s *session) endCancelable() {
 	s.cancelMu.Lock()
+	if s.statementTimer != nil {
+		s.statementTimer.Stop()
+		s.statementTimer = nil
+	}
+	s.statementTimedOut = false
 	s.cancelActive = false
 	s.queryCancel.Reset()
 	s.cancelMu.Unlock()
@@ -782,9 +829,19 @@ func (s *session) takeCancel() bool {
 
 func (s *session) cancellationError() error {
 	if s.queryCancel.Canceled() {
+		if s.wasStatementTimeout() {
+			return statementTimeoutCanceled()
+		}
 		return query.ErrCanceled
 	}
 	return nil
+}
+
+func (s *session) queryCanceledError() *pgError {
+	if s.wasStatementTimeout() {
+		return statementTimeoutCanceled()
+	}
+	return queryCanceled()
 }
 
 // startupParameter applies one startup-packet parameter.
@@ -877,11 +934,29 @@ func (s *session) nextAuthReply() ([]byte, error) {
 // fails.
 func (s *session) loop() error {
 	for {
-		deadline(s.conn, s.conn.SetReadDeadline, s.server.opts.IdleTimeout)
+		readTimeout := s.server.opts.IdleTimeout
+		idleInTx := false
+		if s.transactionStatus() != statusIdle {
+			if txTimeout := s.durationParam("idle_in_transaction_session_timeout"); txTimeout > 0 {
+				if readTimeout <= 0 || txTimeout < readTimeout {
+					readTimeout = txTimeout
+					idleInTx = true
+				}
+			}
+		}
+		deadline(s.conn, s.conn.SetReadDeadline, readTimeout)
 		tag, body, err := s.r.next(maxMessageBody)
 		if err != nil {
 			if s.terminated || errors.Is(err, io.EOF) {
 				return nil
+			}
+			var ne net.Error
+			if idleInTx && errors.As(err, &ne) && ne.Timeout() {
+				// Clear read deadline before writing the FATAL ErrorResponse so
+				// the client receives SQLSTATE 25P03 before EOF.
+				deadline(s.conn, s.conn.SetReadDeadline, 0)
+				return s.die(fatal(sqlstateIdleInTransactionTimeout,
+					"terminating connection due to idle-in-transaction timeout"))
 			}
 			return err
 		}
@@ -1013,7 +1088,7 @@ func (s *session) simpleQuery(sql string) error {
 		}
 		if s.takeCancel() {
 			s.markTransactionFailed()
-			s.w.errorResponse(queryCanceled())
+			s.w.errorResponse(s.queryCanceledError())
 			failed = true
 			break
 		}
@@ -1035,7 +1110,7 @@ func (s *session) simpleQuery(sql string) error {
 	if implicit {
 		if !failed && s.takeCancel() {
 			s.markTransactionFailed()
-			s.w.errorResponse(queryCanceled())
+			s.w.errorResponse(s.queryCanceledError())
 			failed = true
 		}
 		if failed {
@@ -1710,7 +1785,7 @@ func (s *session) execute(p *portal, limit int32) error {
 		return asPGError(sqldriver.ErrTransactionFailed)
 	}
 	if s.takeCancel() {
-		return queryCanceled()
+		return s.queryCanceledError()
 	}
 	switch {
 	case stmt.kind == kindSet || stmt.kind == kindReset:
@@ -1762,7 +1837,7 @@ func (s *session) execute(p *portal, limit int32) error {
 
 func (s *session) executeTransaction(stmt *prepared) error {
 	if s.takeCancel() {
-		return queryCanceled()
+		return s.queryCanceledError()
 	}
 	var err error
 	tag := stmt.tag
@@ -1823,14 +1898,14 @@ func (s *session) executeTransaction(stmt *prepared) error {
 func (s *session) cancelSuccessfulBegin(stmt *prepared) error {
 	rollbackErr := s.sql.Rollback(s.operationContext())
 	if rollbackErr == nil {
-		return queryCanceled()
+		return s.queryCanceledError()
 	}
-	return asPGErrorIn(errors.Join(queryCanceled(), rollbackErr), stmt.sql)
+	return asPGErrorIn(errors.Join(s.queryCanceledError(), rollbackErr), stmt.sql)
 }
 
 func (s *session) executeSavepoint(stmt *prepared) error {
 	if s.takeCancel() {
-		return queryCanceled()
+		return s.queryCanceledError()
 	}
 	// Clone the mark name before it escapes into the typed session: simple
 	// Query text is a view into the reader's reused body buffer, and the
@@ -1864,20 +1939,20 @@ func (s *session) executeRuntimeExec(p *portal) error {
 		return nil
 	}
 	if s.takeCancel() {
-		return queryCanceled()
+		return s.queryCanceledError()
 	}
 	s.invalidateRuntimePortals(p)
 	result, err := p.stmt.runtime.Exec(p.operationContext(), p.args)
 	if err != nil {
 		_ = s.takeCancel()
 		if errors.Is(err, query.ErrCanceled) && !errors.Is(err, durable.ErrCommitOutcomeUnknown) {
-			return queryCanceled()
+			return s.queryCanceledError()
 		}
 		return asPGErrorIn(err, p.stmt.sql)
 	}
 	if s.takeCancel() {
 		if !runtimeKindIsDDL(kind) && !autocommitWrites(s.sql) {
-			return queryCanceled()
+			return s.queryCanceledError()
 		}
 		// DDL's atomic catalog publication is the commit point and cannot
 		// participate in the transaction overlay. Once it succeeds, a cancel
@@ -1954,7 +2029,7 @@ func (s *session) executeRuntimeExecAsync(p *portal) (handled bool, err error) {
 		return false, nil
 	}
 	if s.takeCancel() {
-		return true, queryCanceled()
+		return true, s.queryCanceledError()
 	}
 	sess, err := s.acquireDirectSession()
 	if err != nil {
@@ -2107,18 +2182,18 @@ func (s *session) executeRuntimeQuery(p *portal, limit int32) error {
 		return invalidatedPortalError()
 	case portalBound:
 		if s.takeCancel() {
-			return queryCanceled()
+			return s.queryCanceledError()
 		}
 		if err := s.startRuntime(p); err != nil {
 			_ = s.takeCancel()
 			if errors.Is(err, query.ErrCanceled) {
-				return queryCanceled()
+				return s.queryCanceledError()
 			}
 			return asPGErrorIn(err, p.stmt.sql)
 		}
 		if s.takeCancel() {
 			cancelPortal(p)
-			return queryCanceled()
+			return s.queryCanceledError()
 		}
 	case portalActiveRuntime:
 		// Resuming a suspended runtime portal.
@@ -2128,7 +2203,7 @@ func (s *session) executeRuntimeQuery(p *portal, limit int32) error {
 	for p.runtime.Next() {
 		if s.takeCancel() {
 			cancelPortal(p)
-			return queryCanceled()
+			return s.queryCanceledError()
 		}
 		cells := s.rowCellsRuntime(&p.runtime, len(p.stmt.cols))
 		if err := s.rows.row(s.w, cells, p.stmt.cols, p.formats); err != nil {
@@ -2139,7 +2214,7 @@ func (s *session) executeRuntimeQuery(p *portal, limit int32) error {
 		p.row++
 		if s.takeCancel() {
 			cancelPortal(p)
-			return queryCanceled()
+			return s.queryCanceledError()
 		}
 		if limit > 0 && int32(sent) >= limit {
 			s.w.portalSuspended()
@@ -2148,7 +2223,7 @@ func (s *session) executeRuntimeQuery(p *portal, limit int32) error {
 	}
 	if s.takeCancel() {
 		cancelPortal(p)
-		return queryCanceled()
+		return s.queryCanceledError()
 	}
 	p.state = portalExhausted
 	if err := p.runtime.Close(); err != nil {
@@ -2349,7 +2424,7 @@ func (s *session) executeFixed(p *portal, limit int32) error {
 	sent := 0
 	for p.row < len(fixed.rows) {
 		if s.takeCancel() {
-			return queryCanceled()
+			return s.queryCanceledError()
 		}
 		if limit > 0 && int32(sent) >= limit {
 			s.w.portalSuspended()
@@ -2362,7 +2437,7 @@ func (s *session) executeFixed(p *portal, limit int32) error {
 		sent++
 	}
 	if s.takeCancel() {
-		return queryCanceled()
+		return s.queryCanceledError()
 	}
 	s.w.commandComplete(fixed.tag)
 	return nil
@@ -2371,6 +2446,11 @@ func (s *session) executeFixed(p *portal, limit int32) error {
 func queryCanceled() *pgError {
 	return newError(sqlstateQueryCanceled,
 		"canceling statement due to a cancel request").withCause(query.ErrCanceled)
+}
+
+func statementTimeoutCanceled() *pgError {
+	return newError(sqlstateQueryCanceled,
+		"canceling statement due to statement timeout").withCause(query.ErrCanceled)
 }
 
 func cancelPortal(p *portal) {
