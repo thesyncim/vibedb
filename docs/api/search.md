@@ -15,8 +15,8 @@ interfaces:
 
 Full-text search is a development feature. Read [limitations](#limitations)
 before relying on it for a large collection: postings are maintained
-incrementally in memory across generations, but are not persisted across
-restarts.
+incrementally across generations and persisted in a checksummed sidecar for
+reopen, but the active index must fit in memory.
 
 ## Search from Go
 
@@ -299,11 +299,13 @@ outside the transaction.
   ordinal-table compaction fall back to a full generation scan. On the `Memory`
   profile the build holds the collection's writer lock, so writes to that
   collection wait for it.
-- **Resident memory.** Durable declarations are persisted, but postings are
-  never written to disk. Each cached build (up to four generations per
-  collection, plus segmented builds on large in-memory snapshots) holds the
-  complete inverted index, vocabulary, and key table in memory. Plan memory
-  for the largest searched collection; the index cannot exceed RAM.
+- **Resident memory and persistence.** Durable collections persist sealed
+  postings, keys, slots, and leaf references in a SHA-256-checksummed `.tin`
+  sidecar file next to the collection primary (removed on `DropCollection`,
+  failing closed to a full scan on corruption or schema mismatch). Once loaded,
+  each cached generation (up to four per collection, plus segmented builds on
+  large in-memory snapshots) holds the index in memory, so the active index
+  must fit in RAM.
 - **Single path.** One index covers one string path. Fields are not combined,
   and arrays of strings are not indexed.
 - **Analyzer.** No stemming, stop words, synonyms, or configurable analyzers;

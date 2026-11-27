@@ -314,6 +314,7 @@ func OpenDatabase(dir string, options DatabaseOptions) (*Database, error) {
 				"vibedb: durable collection %q: %w", name, openErr,
 			))
 		}
+		collection.setTinSidecarPath(tinSidecarPath(filepath.Join(d.dir, base)))
 		d.collections[name] = &databaseEntry{
 			name: name, filename: base, collection: collection, file: file,
 		}
@@ -522,6 +523,7 @@ func (d *Database) CreateCollection(name string, options Options) (*Collection, 
 			return nil, err
 		}
 	}
+	collection.setTinSidecarPath(tinSidecarPath(path))
 	entry := &databaseEntry{
 		name: strings.Clone(name), filename: filename,
 		collection: collection, file: file,
@@ -629,6 +631,7 @@ func (d *Database) DropCollection(name string) error {
 	if err := os.Remove(journal); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return errors.Join(closeErr, err)
 	}
+	_ = os.Remove(tinSidecarPath(primary))
 	if err := syncRecoveryJournalParent(journal); err != nil {
 		return errors.Join(closeErr,
 			fmt.Errorf("vibedb: persist dropped collection journal: %w", err))

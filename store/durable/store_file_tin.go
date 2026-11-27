@@ -189,21 +189,42 @@ func (c *Collection) tinBuild(snap *Snapshot) (*tinSnapshotBuild, error) {
 	var (
 		build       *tinSnapshotBuild
 		incremental bool
+		persistedOK bool
 	)
-	if base != nil {
-		build, incremental, err = buildTinSnapshotIncremental(snap, base, paths)
-		if err != nil {
-			return nil, err
+	if base == nil && !c.tinSidecarLoaded && c.tinSidecarPath != "" && len(paths) > 0 {
+		c.tinSidecarLoaded = true
+		if persisted, loadErr := loadTinSnapshotBuild(c.tinSidecarPath, snap.state.root.StoreID, paths); loadErr == nil {
+			if persisted.generation == generation && tinLeafRefsMatchRouter(snap, persisted.leafRefs) {
+				build = persisted
+				persistedOK = true
+				c.tinPersistedLoads++
+			} else {
+				// Sidecar is from an older (or newer) generation; use it as an
+				// incremental base so only changed leaves are read and patched!
+				base = persisted
+				c.tinPersistedLoads++
+			}
 		}
 	}
-	if !incremental {
-		build, err = buildTinSnapshot(snap, paths)
-		if err != nil {
-			return nil, err
+	if !persistedOK {
+		if base != nil {
+			build, incremental, err = buildTinSnapshotIncremental(snap, base, paths)
+			if err != nil {
+				return nil, err
+			}
 		}
-		c.tinFullBuilds++
-	} else {
-		c.tinIncrementalBuilds++
+		if !incremental {
+			build, err = buildTinSnapshot(snap, paths)
+			if err != nil {
+				return nil, err
+			}
+			c.tinFullBuilds++
+		} else {
+			c.tinIncrementalBuilds++
+		}
+		if c.tinSidecarPath != "" && build.leafRefs != nil && len(paths) > 0 {
+			_ = saveTinSnapshotBuild(c.tinSidecarPath, snap.state.root.StoreID, build)
+		}
 	}
 	if c.tinBuilds == nil {
 		c.tinBuilds = make(map[uint64]*tinSnapshotBuild)

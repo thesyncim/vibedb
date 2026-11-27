@@ -145,8 +145,11 @@ type Collection struct {
 	// through its own build reference.
 	tinMu                sync.Mutex
 	tinBuilds            map[uint64]*tinSnapshotBuild
+	tinSidecarPath       string
+	tinSidecarLoaded     bool
 	tinFullBuilds        uint64
 	tinIncrementalBuilds uint64
+	tinPersistedLoads    uint64
 	closed     bool
 	closeDone  bool
 	closePhase collectionClosePhase
