@@ -1,27 +1,23 @@
 # VibeDB
 
-VibeDB is a JSON document database for Go. Embed it in an application for
-exact indexes, full-text search, typed queries, and serializable transactions,
-or reach it through `database/sql` and the PostgreSQL wire protocol. The same
-engine also runs as an RF3 replicated cluster. The cluster has embedded
-gateways, exactly-once writes, online hot-shard split, and online scale-out and
-scale-in.
+VibeDB is a JSON document database written in Go. Embed it in-process for
+canonical JSON storage, exact secondary indexes, BM25 full-text search, typed
+queries, and serializable transactions—or expose it via `database/sql` and the
+PostgreSQL v3 wire protocol. The same storage engine also runs as a replicated
+RF3 cluster with embedded gateways, independent Multi-Raft groups, exactly-once
+writes, online hot-shard splits, and online scale-out/scale-in.
 
-[Get started](docs/getting-started.md) · [Documentation](docs/README.md) ·
-[API guides](docs/api/README.md) · [Design](docs/design/README.md) ·
+[Get started](docs/getting-started.md) · [Docs](docs/README.md) ·
+[APIs](docs/api/README.md) · [Design](docs/design/README.md) ·
 [Operations](docs/operations/README.md) · [Reference](docs/reference/README.md)
 
-**Development status:** APIs, wire protocols, and data formats can change
-between commits. Evaluate a pinned revision; see [status](#status-strengths-and-limitations).
+> **Status:** Pre-release development software. APIs, wire protocols, and disk
+> formats may change between commits. Pin a revision and keep binaries and data
+> on the same build; see [stability and compatibility](docs/status.md).
 
-## Store JSON in Go
+## Quick start (embedded Go)
 
-Use Go 1.27 or later, as declared in [go.mod](go.mod). In a Go module, install
-the revision you intend to evaluate:
-
-```sh
-go get github.com/thesyncim/vibedb@6f7350bd1
-```
+Requires Go 1.27+ (see [go.mod](go.mod)).
 
 ```go
 package main
@@ -61,119 +57,81 @@ func run() (err error) {
 }
 ```
 
-Running it prints `found=true doc={"name":"Ada","team":"compiler"}`. The
-default `Durable` profile persists a mutation's recovery record before
-acknowledging it, so a second run reopens `./data` and reads the same row.
-Collections are created on the first valid write, and stored JSON is
-canonicalized. The [tutorial](docs/getting-started.md) explains the files it
-creates and how to close correctly; the [native API guide](docs/api/native.md)
-covers indexes, queries, and transactions.
+The default `Durable` profile syncs each mutation's recovery record before
+returning, canonicalizes stored JSON, and creates collections on first write.
+See the [embedded tutorial](docs/getting-started.md) for reopen verification and
+close semantics.
 
-## Choose an interface
+## Interfaces
 
-| Interface | Use it for | Read next |
+| Interface | Use for | Guide |
 | --- | --- | --- |
-| Native Go (`vibedb`) | Embedded document storage, exact indexes, and transactions | [Native API](docs/api/native.md) |
-| Full-text search | BM25-ranked TINQL search over one text path, from Go or SQL (`==>`, `SCORE()`) | [Search](docs/api/search.md) |
-| Typed queries (`query`) | Reusable plans and explicit snapshot control | [Query API](docs/api/query.md) |
-| `database/sql` | Embedded SQL tables and DDL with Go connection pooling | [SQL API](docs/api/sql.md) |
-| PostgreSQL wire | Access from psql, pgx, lib/pq, and JDBC | [Client support and limits](docs/api/pgwire.md) |
-| RF3 cluster | Replicated SQL across physical nodes, each with an embedded gateway | [Start a local cluster](docs/operations/local-cluster.md) |
+| Native Go (`vibedb`) | Embedded JSON collections, exact indexes, serializable transactions | [Native API](docs/api/native.md) |
+| Full-text search (`tin`) | Incremental BM25 TINQL search (`==>`, `SCORE()`) with `.tin` sidecar | [Search](docs/api/search.md) |
+| Typed queries (`query`) | Reusable compiled plans, explicit snapshots, bounded workspaces | [Query API](docs/api/query.md) |
+| `database/sql` | Embedded SQL tables, DDL, and Go connection pooling | [SQL API](docs/api/sql.md) |
+| PostgreSQL wire (`pgwire`) | `psql`, `pgx`, `lib/pq`, JDBC; TLS + SCRAM, `pg_stat_activity`, `pg_stat_statements` | [pgwire](docs/api/pgwire.md) |
+| RF3 cluster | Replicated SQL across physical nodes with embedded gateways | [Local cluster](docs/operations/local-cluster.md) |
 
-The SQL surface is the VibeDB dialect, not PostgreSQL. Check the
-[SQL reference](docs/reference/sql.md) before porting an application.
+SQL uses the VibeDB dialect, not full PostgreSQL; check the
+[SQL reference](docs/reference/sql.md) before porting queries.
 
-## How it works
+## Architecture at a glance
 
-Readers pin immutable generations, and each mutation maintains documents and
-their exact indexes together. In a cluster, every shard, the catalog, and the
-request ledger is an independent Raft group with three replicas. Each physical
-node hosts replicas from many groups behind one shared node log. Any node's
-gateway can route a request. A durable request identity lets a client retry an
-unknown outcome without applying the write twice. Controllers move replicas,
-split hot shards, and add or retire nodes while traffic continues.
+```mermaid
+flowchart LR
+    Client["Go / SQL / pgwire"] --> Frontend["Gateway / Frontend<br/>catalog pin, planning, request ID"]
+    Frontend --> Local["Execution lanes & RF3 Raft groups<br/>catalog, request ledger, data shards"]
+    Local --> Log["Shared node log (one sync / wave)"]
+    Local --> Store["Durable collections<br/>immutable generations, exact & tin indexes"]
+    Local <--> Peers["Peer nodes (mTLS)"]
+```
 
-- [Architecture](docs/architecture.md): components, reads, writes, and ownership.
-- [Distributed design](docs/design/README.md#distributed-design): routing,
-  replication, exactly-once writes, transactions, reads, and topology changes.
-- [Transactions](docs/transactions.md) and [durability](docs/durability.md):
-  visibility, commit, and recovery.
+- **Embedded engine:** Readers pin immutable generations; mutations publish
+  documents and exact indexes atomically; multi-collection transactions are
+  serializable and crash-atomic.
+- **Distributed cluster:** Every shard, the catalog, and the request ledger is
+  an independent RF3 Raft group sharing a physical node's WAL and execution
+  lanes. Durable request identities give exactly-once write recovery.
+  Active-standby controller leases (`internal/controllerlease`) drive replica
+  moves, hot-shard splits, and scale-out/scale-in without downtime.
+- **Observability & operations:** Prometheus `/metrics`, `/healthz`, `/readyz`
+  (gateway, RF3 Raft, `ResourceGuard` watermarks, controller lease, version
+  window, `pgwire` sessions, `pg_stat_statements`); slow-query observer;
+  `vibedb cluster` operator CLI (`init-operator`, `init-node`, `rotate-cert`,
+  `policy`, `version --check-peers`, `join`, `rebalance`, `decommission`,
+  `status`).
 
-## Status, strengths, and limitations
+Read [Architecture](docs/architecture.md) and the
+[Design guide](docs/design/README.md) for invariants and failure models.
 
-VibeDB is development-grade software with no release, support window, or
-compatibility promise. Its strengths are explicit, tested contracts:
+## Key boundaries
 
-- **Embedded:** serializable transactions across collections, crash-atomic
-  durable commits, exact indexes that publish with their rows, and incremental
-  BM25 full-text search with SHA-256-checksummed `.tin` sidecar persistence. A
-  generated [capability matrix](docs/capabilities.md) runs the same mutation
-  cases through native Go, `database/sql`, and pgwire.
-- **Operations & Observability:** Prometheus `/metrics`, `/healthz`, and
-  `/readyz` HTTP endpoints (gateway counters, lock-free per-P read/write
-  latency histograms, RF3 Raft aggregates, `ResourceGuard` memory/disk
-  watermarks, controller lease status, cluster version window, and live
-  `pgwire` session & `pg_stat_statements` counters); remote TLS + SCRAM-SHA-256
-  PostgreSQL wire support with enforced `statement_timeout`,
-  `idle_in_transaction_session_timeout`, `pg_stat_activity`,
-  `pg_stat_statements`, `pg_cancel_backend`/`pg_terminate_backend`; operator
-  CLI workflows (`vibedb cluster init-operator`, `init-node`, `rotate-cert`,
-  `policy (show|grant|revoke)`, `version --check-peers`, `join`, `rebalance`,
-  `decommission`, `status`); and CAS-fenced active-standby controller lease
-  failover (`internal/controllerlease`).
-- **Distributed:** Linux CI workflows run named fault and scaling scenarios
-  against shipped binaries on pull requests:
+- **No cross-build format stability yet:** Rolling mixed-build upgrades and
+  cross-build restore are not qualified end-to-end (use
+  `vibedb cluster version --check-peers` for pre-flight window checks).
+- **Per-group consistency:** No global MVCC snapshot across Raft groups.
+- **Online splits:** Base-relation splits are process-qualified; global-index
+  and repeated descendant splits are not yet end-to-end qualified.
+- **Full-text search:** Active `tin` index stays memory-resident (persisted to a
+  checksummed `.tin` sidecar for zero-scan reopen); distributed `==>` is not
+  qualified.
+- **PostgreSQL wire:** Covers selected client flows, not full PostgreSQL SQL,
+  catalog, or extension compatibility.
 
-| Scenario | Workflow |
-| --- | --- |
-| Process kills, partitions, and exact replay of acknowledged writes | `durable-rf3-external.yml`, `durable-rf3-multirelation.yml` |
-| Physical nodes hosting many RF3 groups, at 3 and 6 nodes | `fused-node-rf3.yml` |
-| Online 3 → 4 → 3 node scaling under open-loop traffic | `seamless-scale-in-out.yml` |
-| Automatic hot-shard split | `dev-hot-split.yml` |
-| Restore into fresh identities, then failover | `restore-rf3-external.yml` |
-| Clock faults and log retention | `clock-fault-matrix.yml`, `wal-retention.yml` |
-| RF3 create, restart, and replica replacement on Linux and macOS | `ci.yml` (`portable-rf3`) |
+See [stability and compatibility](docs/status.md), the generated
+[embedded capability matrix](docs/capabilities.md), and the
+[distributed feature ledger](docs/distributed-feature-state.md).
 
-Key gaps:
-
-- Rolling mixed-build upgrades, downgrades, and cross-build restore are not yet
-  qualified end-to-end (`internal/clusterversion` and
-  `vibedb cluster version --check-peers` provide version-window negotiation and
-  pre-flight checks, while production builds still deploy one commit at a time).
-- Online split supports base relations and global-index cut validation and
-  multi-relation retained pruning; end-to-end process qualification for globally
-  indexed splits and repeated descendant splits is not yet landed.
-- Scaling commands ship together with `vibedb cluster init-operator`,
-  `init-node`, `rotate-cert`, and `policy (show|grant|revoke)`; external CA
-  management and multi-host process supervision remain operator-provided.
-- No global MVCC snapshot across Raft groups; no Kubernetes operator.
-- Tin search maintains postings incrementally across generations and persists
-  checksummed sealed postings in a collection sidecar for zero-scan reopen and
-  incremental catch-up, but the active index remains memory-resident.
-- PostgreSQL wire support covers selected client flows (including TLS + SCRAM,
-  `statement_timeout`, `idle_in_transaction_session_timeout`, `pg_stat_activity`,
-  `pg_stat_statements`, and `pg_cancel_backend`/`pg_terminate_backend`), not
-  full PostgreSQL compatibility. Several [benchmark reports](docs/benchmarks/README.md)
-  record VibeDB slower than the comparison system.
-
-[Stability and compatibility](docs/status.md) lists every current limitation,
-and [deployment readiness](docs/operations/production-readiness.md) gives the
-evidence level of each operator workflow.
-
-## Develop
-
-From a checkout:
+## Build and test
 
 ```sh
 make build
 make test
 ```
 
-These targets enable Go's SIMD experiment. Use `GOEXPERIMENT=nosimd` with
-`make` for portable checks, or set `GOEXPERIMENT=simd` explicitly for raw Go
-commands. See [SIMD](docs/simd.md) for supported kernels and CPU fallbacks.
-
-Read [Contributing](CONTRIBUTING.md) and the [developer guide](docs/development/README.md)
-for tests, generated docs, and qualification workflows, and [Security](SECURITY.md)
-for reporting and trust boundaries. The repository has no project license;
-third-party notice files apply to their respective incorporated work.
+`make` enables `GOEXPERIMENT=simd`; pass `GOEXPERIMENT=nosimd` for portable
+builds (see [SIMD](docs/simd.md)). Read [Contributing](CONTRIBUTING.md), the
+[developer guide](docs/development/README.md), and [Security](SECURITY.md).
+No project license is published; third-party notices in `LICENSE-*` apply to
+their incorporated work.

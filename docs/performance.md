@@ -1,35 +1,27 @@
 # Performance evidence
 
-[Documentation](README.md) · [Development status](status.md)
+[Documentation](README.md) · [Stability](status.md)
 
-Use the [benchmark archive](benchmarks/README.md) to find measured results and
-this guide to choose a harness or reproduce a comparison. Every result belongs
-to its recorded revision, workload, configuration, and hardware.
+Use this guide to choose a benchmark harness and follow VibeDB's measurement
+rules. Reusable comparison methods live in [benchmark methods](benchmarks/README.md);
+the separate formal registry [`bench/competitive/RESULTS.md`](../bench/competitive/RESULTS.md)
+currently has no endorsed entries.
 
-There are two distinct collections: dated engineering reports under
-`docs/benchmarks`, and the formal publication registry for `bench/competitive`.
-The first contains measurements; the second has no endorsed entries. A
-coverage table describes harness support, not an executed result.
+## Harnesses
 
-## Choose the evidence
-
-| Question | Tool | What it establishes |
+| Question | Tool | Establishes |
 | --- | --- | --- |
-| Did a hot path allocate more? | `go run ./bench/gate` | Same-machine `allocs/op` and `B/op` comparison to a Git base; never gates time |
-| How does one embedded workload behave? | `bench/competitive/cmd/mixed` | One isolated engine/process workload with latency, throughput, memory, and disk observations |
-| Are repeated mixed runs comparable? | `cmd/mixedsuite` | Deterministic Latin-square execution order with raw per-run rows and matching summary TSV |
-| What is the file/RSS footprint? | `cmd/footprint` | Apparent bytes, allocated blocks, Go memory, RSS, and corpus metadata |
-| Does a live set grow on disk? | `cmd/churndisk` | Bounded churn/storage samples; nonstandard shapes are diagnostic |
-| Where does one host/workload saturate? | `cmd/saturation` | Host-specific plateau search, not universal capacity |
-| What does a held snapshot cost? | `cmd/snapshotpressure` | Matched control versus pinned-snapshot pressure |
-| What is SQL interface overhead? | `cmd/sqlsurface` | VibeDB/SQLite embedded SQL or VibeDB pgwire shapes; not a PostgreSQL server comparison |
-| How do open/cold/recovery paths behave? | `cmd/lifecycle` | Isolated lifecycle stages with explicit timer boundaries |
-| Can the corpus exceed RAM safely? | `cmd/outofram` | Qualification of streaming/bounds, not a load-speed result |
-| Does RF3 survive the defined faults? | `go run ./bench/rf3chaos` | Canonical external-fault evidence for one exact build and scenario |
+| Did a hot path allocate more? | `go run ./bench/gate` | Same-machine `allocs/op` (0 increase) and `B/op` (≤5% increase) vs Git base; never gates time |
+| Single embedded workload | `bench/competitive/cmd/mixed` | Isolated latency, throughput, memory, and disk |
+| Comparable repeated runs | `cmd/mixedsuite` | Latin-square execution order + raw per-run TSV |
+| File & RSS footprint | `cmd/footprint` | Apparent bytes, allocated blocks, Go memory, RSS |
+| Churn disk growth / saturation | `cmd/churndisk`, `cmd/saturation` | Bounded disk growth and host-specific plateau |
+| Snapshot pressure / SQL overhead | `cmd/snapshotpressure`, `cmd/sqlsurface` | Pinned-snapshot cost; embedded SQL / pgwire overhead |
+| Cold open / out-of-RAM streaming | `cmd/lifecycle`, `cmd/outofram` | Isolated lifecycle timers; streaming bounds |
+| RF3 fault survival | `go run ./bench/rf3chaos` | External-process fault evidence for one exact build |
 
-`bench/competitive/COVERAGE.md` is generated from a 38-cell harness manifest.
-“Implemented” there means that an executable harness and oracle exist. It does
-not mean the product surface is complete or that the cell has been measured.
+`bench/competitive/COVERAGE.md` is generated from a 38-cell harness manifest;
+"Implemented" means an executable harness exists, not a published result.
 
 ## Allocation gate
 
@@ -38,83 +30,24 @@ go run ./bench/gate
 go run ./bench/gate -base <commit>
 ```
 
-The curated gate rejects any gated `allocs/op` increase and a `B/op` increase
-greater than five percent. It neither reads, reports, nor gates `ns/op`. The
-local default compares with the merge base of `main`; pull-request CI supplies
-the exact PR base.
+Local default compares against the merge base of `main`; CI (`bench-gate.yml`)
+passes the exact PR base.
 
-## Publication requirements
+## Comparison and publication rules
 
-A result intended for comparison must record:
-
-- exact commit, dirty state, toolchain, dependency lockfiles, and command;
-- host CPU, memory, OS, architecture, filesystem, device, mount/controller, and
-  power/durability assumptions;
-- engine versions, configuration, compression/storage profile, cache budget,
-  indexes, and acknowledgement contract;
-- corpus generator/digest, count, document shape, cardinalities, seed, and
-  logical bytes;
-- clients, operations, mix, warmup, conditioning, checkpoints, and timer
-  boundaries;
-- per-run raw rows, repetitions, failure/skip rows, and summary method;
-- for RF3: process/node/group/replica/shard topology and which byte/latency/RSS
-  cuts were actually observed.
-
-Keep each summary row linked to immutable raw evidence. Never remove slow or
-failed repetitions without a predeclared exclusion rule.
-
-The publication validator checks artifact inventory, exact revision, selected
-metadata, and canonical receipt digests. It assumes a trusted, immutable
-evidence directory while validation runs: files are reopened for hashing,
-symlinks are followed, and receipt publication is not a directory-fsync
-protocol. The receipt is therefore neither tamper-proof nor proof that a crash
-made the directory entry durable. It also does **not** independently prove every
-runner flag, workload equivalence, hardware fairness, or a comparative
-conclusion. Qualification mode uses a smaller CI-only inventory and cannot be
-promoted to a publication result.
-
-## Comparison rules
-
+- Record exact commit, dirty state, Go toolchain, lockfiles, host hardware/OS/FS,
+  durability profile, cache budget, corpus digest/seed, warmup, and all raw
+  per-run rows (never drop slow/failed repetitions without a predeclared rule).
 - Match acknowledgement durability before comparing write latency.
-- Name cache/accounting differences. For example, bbolt maps the complete
-  database and cannot honor the nominal engine cache; the SQLite adapter uses
-  one open connection.
-- Plain KV engines do not execute exact-index lanes. Only compare a lane that
-  both engines implement with equivalent semantics.
-- A setting named `production` in the harness only selects an optional
-  compression profile; it says nothing about product maturity.
-- `BenchmarkScan` touches one byte per document and cannot support a
-  bytes-throughput claim; use full-byte scan evidence.
-- Do not use single-group in-process RF3 latency as horizontal scaling evidence.
-- Do not translate whole-harness elapsed time into election, failover, recovery,
-  or foreground latency when the protocol does not expose those cuts.
-
-## Current result state
-
-Browse [benchmark reports](benchmarks/README.md) for dated SQL comparisons,
-SIMD measurements, profiles, and retained failed experiments. Read each
-report's method and exclusions before using its numbers.
-
-[`bench/competitive/RESULTS.md`](../bench/competitive/RESULTS.md) is the separate
-publication registry for that harness and remains empty. CI also uploads raw
-qualification artifacts for limited retention. Neither a CI artifact nor an
-engineering report automatically becomes an endorsed registry entry.
-
-## Limitations
-
-- The competitive publication registry has no endorsed results; dated
-  engineering reports apply only to their recorded revision and hardware.
-- The allocation gate never measures time; a pass is not a latency or
-  throughput result.
-- No harness in this repository establishes horizontal scaling or
-  production capacity; see the [coverage matrix](../bench/competitive/COVERAGE.md)
-  for what is outside its scope.
+- Account for engine differences (e.g., bbolt mmaps the whole file; SQLite
+  adapter uses one connection; plain KV engines do not run exact-index lanes).
+- Do not extrapolate single-group in-process RF3 latency into horizontal
+  scaling claims, or `BenchmarkScan` (1 byte/doc) into byte-throughput claims.
+- `publishcheck` validates inventory, revision, and receipt digests on a
+  trusted directory; it does not certify workload fairness or hardware parity.
 
 ## Source map
 
-- [bench/gate/main.go](../bench/gate/main.go)
-- [bench/competitive/internal/coverage/manifest.go](../bench/competitive/internal/coverage/manifest.go)
-- `bench/competitive/cmd/*`
-- [bench/competitive/cmd/publishcheck](../bench/competitive/cmd/publishcheck)
-- [bench/rf3chaos/main.go](../bench/rf3chaos/main.go)
+- [bench/gate/main.go](../bench/gate/main.go) · [bench/rf3chaos/main.go](../bench/rf3chaos/main.go)
+- [bench/competitive/internal/coverage/manifest.go](../bench/competitive/internal/coverage/manifest.go) · [bench/competitive/cmd/publishcheck](../bench/competitive/cmd/publishcheck)
 - [scripts/bench/run-ci-competitive-evidence.sh](../scripts/bench/run-ci-competitive-evidence.sh)

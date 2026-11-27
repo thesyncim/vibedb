@@ -1,199 +1,76 @@
 # Development on-disk format
 
-[Documentation](README.md) · [Development status](status.md)
+[Documentation](README.md) · [Stability](status.md)
 
-Format 0 describes the current development grammar. Use the exact writer
-build to read its files; cross-build migration is not supported.
-
-The codecs and validators in `internal/storeio`, `store/durable`,
-`internal/raftstore`, and the replicated-state packages are authoritative. This
-page is a map for contributors and offline inspection, not a standalone parser
-specification.
+Format 0 is the current development disk grammar; reopen files only with the
+build that wrote them. Codecs in `internal/storeio`, `store/durable`, and
+`internal/raftstore` are authoritative.
 
 ## Recovery unit
 
 | Component | Purpose | Backup rule |
 | --- | --- | --- |
-| Collection primary | Immutable pages plus alternating current roots | Keep with its journal when present |
-| `.rjournal` | Recovery/delta records and conditional prepares | Never copy or move independently of the primary |
-| `txn.vtm` | Cross-collection decision log | Preserve with the complete database directory |
-| Database catalog | Collection identities and persisted options | Preserve the closed directory as one unit |
-| Shared node log | Descriptor catalog, segmented log, checkpoints, and node/group identities | Preserve the whole node recovery unit and its keys; never transplant one group file |
-| Raft WAL family | Authenticated consensus state and generation activation | Preserve exact identity, keys, manifest, and family |
-| Gateway/control journals | Request, catalog, or operation recovery | Preserve with matching identities and secrets |
+| Collection primary (`.vjc`) | Immutable pages + alternating roots | Keep with `.rjournal` |
+| `.rjournal` | Redo/delta records & conditional prepares | Never separate from primary |
+| `.tin` sidecar | SHA-256-checksummed sealed full-text postings | Optional cache; rebuilt on mismatch |
+| `txn.vtm` | Cross-collection commit decision log | Keep with complete DB directory |
+| Shared node log | Descriptor catalog, segmented Raft log, checkpoints | Preserve whole node dir + keys |
+| Raft WAL family | AES-256-GCM authenticated consensus state | Preserve identity, keys, manifest |
 
-A live arbitrary file copy is not a supported backup. Stop and close the
-writer, or use a protocol that certifies an immutable cut.
+Never copy live files; close writers or use a certified cut protocol. Physical
+nodes use [NodeStore](../internal/raftstore/node_store.go) and
+[seglog](../internal/raftstore/seglog/) (separate from the `.vjc` page layout).
 
-Physical-node serving adds a node-owned descriptor catalog and segmented log.
-Its grammar and group registration are owned by
-[NodeStore](../internal/raftstore/node_store.go) and
-[seglog](../internal/raftstore/seglog/). The collection page envelope below
-is not the node-log frame format.
+## Page envelope and collection graph
 
-## Common page envelope
-
-The common page uses a 64-byte header, payload/body, and 8-byte checksum
-trailer. The physical allocation quantum is fixed at 4 KiB. A durable
-collection's maximum page extent defaults to 64 KiB and is configurable up to
-the storage codec's 64 MiB hard ceiling. For a 4 KiB base page, the mutable
-prefix is:
+Pages use a 64-byte header, body, and 8-byte CRC32C trailer (accidental
+corruption detection, not adversarial authentication). Base allocation quantum
+is 4 KiB; max extent defaults to 64 KiB (hard codec cap 64 MiB). Mutable
+prefix:
 
 | Offset | Region |
 | ---: | --- |
-| `0` | current root slot A |
-| `4096` | current root slot B |
-| `8192` | undo capsule A |
-| `12288` | undo capsule B |
-| `16384` | first immutable data extent |
+| `0` / `4096` | Alternating root slots A / B |
+| `8192` / `12288` | Undo capsules A / B |
+| `16384+` | Immutable data extents |
 
-Headers bind type, format, geometry, identity, generation, and payload length as
-required by the concrete page codec. CRC32C checksums detect accidental
-corruption; they are not authentication against an adversary. Validation also
-enforces semantic bounds and graph relationships.
-Writers zero padding, but readers do not treat every checksum-covered body
-padding byte as a reserved-zero field.
+The durable collection is copy-on-write (not LSM): alternating roots, state
+root, lexical key router, class-6 `VCS1` compact primary leaves (supporting
+arithmetic scalar sequences for ≥64 values), inline + raw linked overflow pages
+(uncompressed), exact-index catalogs/term leaves/postings, and free/retired
+extent metadata.
 
-## Collection graph
-
-The durable collection is not an LSM/SST layout. Its current primary graph
-contains:
-
-- alternating roots and a state root;
-- a lexical key catalog/router;
-- the current class-6 `VCS1` compact primary representation;
-- inline values and raw linked overflow pages;
-- exact-index catalogs, term leaves, posting structures, and build state;
-- free/retired extent state and snapshot/reclamation metadata.
-
-Compact scalar streams can encode a nonzero arithmetic sequence by physical
-leaf rank when that sequence remains exact across JSON-shape gaps. The bounded
-descriptor stores the base, step and exact prefix/suffix/decimal-width spelling;
-its count names the complete leaf domain. Other streams continue to use the
-ordinal within their shape. Readers validate the complete arithmetic domain,
-and native predicates intersect derived ranks with the existing shape table.
-Scalar replacement can retain unaffected descriptors and replans a changed
-column when the sequence no longer holds. The encoder requires at least 64
-values and uses the descriptor only when the complete encoding wins the
-existing size/scan preference policy.
-
-Overflow values are not transparently compressed or deduplicated. Exact-indexed
-open rebuilds a resident epoch by scanning persisted exact leaves/live rows; an
-indexed open is not metadata-only and its total memory is data-dependent.
-
-## Root publication order
-
-The portable device commit is ordered:
-
-```text
-data writes → data barrier → alternate root write → final sync
-```
-
-The previous valid root remains the recovery point until the new root is
-complete. A root-write or final-sync failure has an unknown outcome; close and
-reopen before deciding which root is authoritative.
-
-Topology preparation may publish an equivalent representation before a logical
-batch is admitted. A higher generation therefore does not prove that user rows
-changed.
+Root commit order: `data writes → data barrier → alternate root write → final sync`.
+A root-write or final-sync failure is outcome-unknown; close and reopen.
 
 ## Recovery journal
 
-A journal binds the exact store identity and durability lane. Records are
-framed, bounded, checksummed, and replayed only when their identity and sequence
-match the primary. A torn final tail is ignored logically during scan; recovery
-does not promise to physically truncate the underlying file at that moment.
-
-The synchronous lane appends and syncs the recovery record before applying and
-publishing the visible row change. Buffered lanes establish different
-acknowledgement and checkpoint boundaries; see [durability](durability.md).
-
-Recovery-journal and transaction-marker headers record the allocation mode in
-their flags word (offset 88 in `.rjournal`, offset 64 in `txn.vtm`):
+Journals bind store identity and durability lane with framed, checksummed
+records (torn tails are logically ignored on scan). Header flags (offset 88 in
+`.rjournal`, offset 64 in `txn.vtm`) encode allocation mode:
 
 | Flags | Capacity contract |
 | ---: | --- |
 | `0` | Ordinary unsealed journal |
-| `1` | Immutable capacity with strict private physical reservation |
-| `3` | Immutable capacity with portable allocation |
+| `1` | Sealed capacity with strict private physical reservation |
+| `3` | Sealed capacity with portable allocation (RF3 default) |
 
-Bit 1 requires bit 0; every other bit is invalid. RF3 selects the portable
-mode. Both sealed modes require the exact recorded file size and retain their
-mode across recycle. Strict callers reject portable files. Portable reopen
-performs no allocation repair or allocation sync; append and publication
-barriers remain required. The build disk-grammar identity includes these flags,
-so prior-build roots are rejected rather than silently migrated.
+Bit 1 requires bit 0; build grammar digests include these flags, so mismatched
+builds fail closed.
 
-## Cross-collection decisions
+## Raft WAL and replicated hidden state
 
-For two or more durable participants, each collection records a conditional
-prepare. The database synchronizes all prepares, then writes and synchronizes
-one commit decision in `txn.vtm`; absence of that durable decision means abort.
-Reopen requires the complete catalog, decision log, and participants. A missing
-or mismatched participant fails closed.
-
-Checkpoint groups use a different certificate protocol for replicated apply.
-Their recyclable `txn.vtm` is not a Raft WAL; an uncertified suffix depends on
-the external Raft WAL for recovery.
-
-## Raft WAL generation family
-
-The Raft store uses preallocated 4 KiB-aligned records, AES-256-GCM,
-checksums/integrity fields, and a digest chain. A family manifest and alternating
-current slots select the active authenticated generation. Ready batches are
-idempotent by `(node incarnation, Ready ID)` and different bytes for the same
-identity are rejected.
-
-For a nonempty Ready, the append-only record completes a platform ordering
-barrier before the alternate current slot is written. A final `File.Sync` makes
-that selected slot the acknowledgement boundary. A failure before the slot is
-touched is definite; a later failure is outcome-unknown and an exact retry
-settles the attempted slot without blindly rewriting it.
-
-Ordinary Raft snapshots are not stored as `MsgSnap` records. Certified snapshot
-artifacts are staged non-serving, verified, checkpointed, and activated as a new
-immutable WAL base through restart-settled publication steps.
-
-## Replicated hidden state
-
-Replicated-state rows use reserved hidden-key ranges for transaction control,
-route gates, backup, request ledgers, and execution pins. Unknown hidden rows are
-reopen-fatal so a newer grammar cannot be silently misread by an older build.
-
-Distributed coordinator, request-ledger, range-split, schema, backup, restore,
-and control journals each have closed current grammars and independent hard
-bounds. Their exact bytes belong in the owning codec, not duplicated prose.
-
-## Golden images
-
-`internal/storeio/testdata/format0` contains byte-exact fixtures for the current
-unreleased format. An intentional grammar change must:
-
-1. replace the affected fixture and test oracle;
-2. add malformed/truncated/corruption cases for the new shape;
-3. retain rejection of obsolete or noncanonical layouts;
-4. update build grammar identities and this map;
-5. prove the new crash and reopen boundaries.
-
-Golden fixtures are test evidence only. They are not files that future versions
-promise to open.
-
-## Limitations
-
-- Format 0 is edited in place; there are no readers for earlier layouts and no
-  migration tool.
-- CRC32C checksums detect accidental corruption only; collection files are
-  not authenticated or encrypted (the Raft WAL is).
-- Overflow values are not compressed or deduplicated.
-- Full-text postings are not part of the format; only tin declarations are
-  persisted.
+- **Raft WAL:** Preallocated 4 KiB-aligned AES-256-GCM records with digest
+  chaining and alternating current slots; Ready batches are idempotent by
+  `(node incarnation, Ready ID)`. Snapshots move as certified artifacts
+  activated as a new WAL base, never Raft `MsgSnap`.
+- **Hidden state:** Reserved key ranges store transaction control, route gates,
+  request ledgers, backup, and execution pins; unknown hidden rows fail reopen.
+- **Golden fixtures:** `internal/storeio/testdata/format0` holds byte-exact
+  current-grammar fixtures (test oracles only, not backward-compatibility
+  guarantees).
 
 ## Source map
 
-- [internal/storeio/page.go](../internal/storeio/page.go), `state_root.go`, `inline_superblock.go`,
-  `mutable_file_layout.go`, `recovery_journal.go`, and primary/index codecs
-- `store/durable/store_file_*`, `store_database_*`, and `checkpoint_group.go`
-- [internal/raftstore](../internal/raftstore)
-- [internal/replicatedstate](../internal/replicatedstate), [internal/distributedtxn](../internal/distributedtxn), and
-  [internal/requestledger](../internal/requestledger)
-- [internal/storeio/testdata/format0](../internal/storeio/testdata/format0)
+- Page & journal codecs: [internal/storeio/page.go](../internal/storeio/page.go), [recovery_journal.go](../internal/storeio/recovery_journal.go), [testdata/format0](../internal/storeio/testdata/format0)
+- Durable & Raft storage: [store/durable/](../store/durable/), [internal/raftstore/](../internal/raftstore/), [internal/replicatedstate/](../internal/replicatedstate/)

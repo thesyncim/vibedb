@@ -1,2 +1,0 @@
-ok  	github.com/thesyncim/vibedb/internal/storeio	0.430s
-ok  	github.com/thesyncim/vibedb/query	1.017s

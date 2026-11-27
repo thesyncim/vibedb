@@ -1,2 +1,0 @@
-ok  	github.com/thesyncim/vibedb/internal/raftstore	0.003s
-ok  	github.com/thesyncim/vibedb/internal/raftmember	0.002s

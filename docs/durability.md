@@ -1,256 +1,75 @@
 # Durability and recovery
 
-[Documentation](README.md) / [Design](design/README.md) · [Development status](status.md)
+[Documentation](README.md) / [Design](design/README.md) · [Stability](status.md)
 
-Durability asks which failures may lose a successful operation. VibeDB does not
-treat visibility, acknowledgement, and persistence as synonyms.
+VibeDB separates four write boundaries: **visible** (readers see the
+generation), **acknowledged** (call returned), **recoverable** (reopen
+reconstructs it), and **physically rooted** (primary root points to it).
 
-## Root profiles
+## Facade profiles
 
-The root `vibedb` package is the application API. Its zero value and default
-profile are `Durable`.
-
-| Profile | When readers see a mutation | What success means | Persistence action |
+| Profile | Visible when | Success guarantees | Persistence action |
 | --- | --- | --- | --- |
-| `Durable` | After its recovery record is power-safe | The mutation is recoverable before visibility | `Flush` folds/recycles state as needed |
-| `Buffered` | After bounded in-memory admission | The visible mutation can still be lost | Successful `Flush` or `Close` makes the included cut recoverable |
+| `Durable` (default) | After power-safe journal sync | Recoverable before visibility | `Flush` folds/recycles as needed |
+| `Buffered` | After bounded memory admission | Volatile until `Flush`/`Close` | `Flush` or `Close` persists cut |
 | `Memory` | After heap publication | Process memory only | `Flush` is a no-op |
 
-`Open(path)` uses a directory for `Durable` and `Buffered`; `Memory` ignores the
-path. The facade rejects low-level options that conflict with the profile.
+## Write lanes and recovery journals
 
-## Four different boundaries
+- **Synchronous (`DurabilitySync`):** Append checksummed redo record to
+  `.rjournal` → power-safe sync → apply & publish → acknowledge. A later
+  checkpoint folds pages into the primary `.vjc` and recycles the journal.
+- **Buffered (`DurabilityBufferedVisible`):** Volatile until `Flush`/`Close`
+  (lazy file/journal setup may still do metadata I/O). Low-level
+  `Options.RecoveryJournal` upgrades acknowledgement to sync redo before
+  returning (durability-before-success).
+- **Async (`DurabilityAsyncVisible`):** Low-level bounded queue with background
+  committer; `Flush` waits for the sampled generation.
+- **Recovery journal (`.rjournal`):** Cross-bound by identity to its primary
+  root with alternating headers and checksummed records. Missing journal or
+  identity mismatch fails closed. Recovery replays contiguous valid records,
+  checkpoints, then recycles. Always keep primary + `.rjournal` + `txn.vtm`
+  together.
+- **Fixed-capacity RF3 sidecars:** RF3 journals and `txn.vtm` use portable
+  fixed-capacity allocation on macOS and Linux (validated at reopen without
+  rewriting). Strict private physical allocation remains opt-in on Linux
+  ([strict allocation](../internal/storeio/strict_allocation_linux.go)).
 
-Use precise terms when reasoning about a write:
+## Low-level `store/durable` modes
 
-| Boundary | Meaning |
-| --- | --- |
-| Visible | A new reader can observe the generation |
-| Acknowledged | The mutation call returned success |
-| Recoverable | Reopen can reconstruct the generation after the selected failure |
-| Physically rooted | The primary file's selected root directly names the generation |
-
-These boundaries can differ. A buffered `Flush` can make a generation
-recoverable through one journal delta without folding all changed primary pages;
-`DurableGeneration` then advances before the physical primary root does.
-
-## Synchronous durable writes
-
-The normal `DurabilitySync` primary path is journal-before-visibility:
-
-1. append a checksummed recovery record;
-2. synchronize the journal with the power-safe barrier;
-3. apply and publish the mutation; and
-4. acknowledge success.
-
-No reader observes the generation before its redo is recoverable. A later
-checkpoint folds it into the primary graph and recycles journal space.
-
-A file created as `AsyncVisible` and reopened as `DurabilitySync` is a low-level
-exception: it has no journal identity and uses a root-fence chain. Reads are
-withheld or fail across the unsafe interval. Facade durable files use journals.
-
-## Buffered writes
-
-Ordinary `Buffered` acknowledgement leaves row state volatile, but may perform
-I/O. A lazy collection may create its primary, and its first valid mutation may
-mint, preallocate, and sync a `.rjournal` for later checkpoints. That metadata
-work does not make the acknowledged mutation recoverable.
-
-A process or machine failure before a successful `Flush` or `Close` may lose
-acknowledged buffered mutations. Recovery returns the last complete recoverable
-cut, never a promise to retain the latest visible cut.
-
-Low-level `DurabilityBufferedVisible` also has an opt-in
-`Options.RecoveryJournal` lane. It publishes resident state and requires the
-redo record to synchronize before the mutation call returns success. Visibility
-may precede that synchronization, so describe this as durability-before-success,
-not durability-before-visibility. The root facade does not expose this override.
-
-## Asynchronous visibility
-
-`DurabilityAsyncVisible` acknowledges after bounded queue admission while a
-background committer persists generations. `Flush` waits for the sampled
-reader-visible generation and completes its physical durability work.
-
-After an asynchronous persistence failure, the handle can roll back to the last
-durable state or fail reads closed. Close and reopen before deciding to retry.
-
-## Low-level mode matrix
-
-These modes belong to `store/durable`, not to the root product profiles.
-
-| Setting | Zero value | Other choices |
+| Setting | Default | Alternatives |
 | --- | --- | --- |
 | `Backend` | `BackendAuto` | `BackendPortable`, Linux `BackendIOUring` |
-| `ReadMode` | `ReadBuffered` | `ReadDirectTry`, `ReadDirectRequire` |
-| `WriteMode` | `WriteBuffered` | `WriteDirectTry`, `WriteDirectRequire` |
+| `ReadMode` / `WriteMode` | `ReadBuffered` / `WriteBuffered` | `*DirectTry`, `*DirectRequire` |
 | `Durability` | `DurabilitySync` | `DurabilityAsyncVisible`, `DurabilityBufferedVisible` |
-| `CheckpointStrength` | `CheckpointPowerSafe` | `CheckpointFilesystem` |
+| `CheckpointStrength` | `CheckpointPowerSafe` | `CheckpointFilesystem` (portable buffered-only) |
 
-`Try` modes may fall back; inspect `Collection.Stats()` for the selected path.
-`Require` modes fail construction if unavailable.
+## Flush, close, and crash boundaries
 
-`CheckpointFilesystem` is accepted only with buffered visibility, the portable
-backend, and buffered writes. It uses the ordinary filesystem sync class. On
-Darwin and storage stacks with volatile caches it does not promise sudden-power
-survival. It never weakens synchronous or asynchronous durability.
-
-## Fixed-capacity RF3 sidecars
-
-RF3 recovery journals and transaction markers use portable fixed-capacity
-allocation. Creation uses native preallocation when supported and synchronizes
-the published file. Reopen validates the exact geometry and records without
-rewriting bytes or issuing an allocation sync. Durable writes retain their
-existing acknowledgement barriers.
-
-Portable allocation does not reserve private backing for every future
-copy-on-write overwrite: disk-full errors can still occur. Such errors follow
-the existing definite-failure or outcome-unknown recovery rules. Explicit
-strict allocation remains available and rejects portable sidecars. The
-allocation mode is persisted in the [header flags](format.md#recovery-journal).
-
-## Flush and close
-
-`Collection.Flush` waits until the current reader-visible generation is
-recoverable. Depending on the lane it can:
-
-- append and synchronize a complete buffered delta;
-- fold and recycle a synchronous journal;
-- wait for the asynchronous committer; or
-- publish a complete physical checkpoint.
-
-`Database.Flush` walks collections one at a time. It attempts every collection
-and returns the first mapped error. It is not a coherent database-wide
-persistence cut: a concurrent writer can publish after its collection was
-flushed.
-
-`Close` stops new admission, drains publishers, establishes the final
-persistence boundary, and releases engine-owned resources. A direct durable
-collection does not close the caller-owned primary descriptor.
-
-Close is repeatable, but retry may perform real work. Snapshots, pinned pages, or
-unlock failure can leave teardown incomplete. Check `CloseCompleted`, release
-the blocker, and retry. A sticky error may coexist with completed teardown.
-
-## Recovery journal
-
-Each journal has an identity cross-bound to the primary root. The journal uses
-two alternating headers and an aligned, checksummed record region. Recovery
-accepts only a contiguous valid sequence.
-
-If the selected root requires a journal, a missing file or identity mismatch
-fails closed. Treat a primary and its `.rjournal` sibling as one storage object:
-move, restore, and back them up together.
-
-An append or sync error can have an unknown outcome: a complete record may be
-stable despite the error. The writer is poisoned until close and reopen; do not
-retry different data against it.
-
-Recovery replays valid redo, checkpoints the recovered generation, and only
-then recycles the record prefix. A second crash during that fold can replay the
-same intact record again.
-
-## Batch atomicity
-
-`durable.Collection.Update` publishes rows and exact-index postings as one
-logical failure-atomic publication. A rejected sibling never exposes a partial
-logical batch.
-
-Routing preparation can first publish a content-equivalent topology generation.
-A later validation or durability error can therefore leave the rows and
-postings unchanged while `Generation may advance`. Compare logical state, not
-only generation numbers, after a failed batch.
-
-## Multi-collection recovery
-
-Two or more dirty durable collections use conditional participant records and
-the database decision log `txn.vtm`:
-
-1. append every participant prepare;
-2. synchronize all participant journals;
-3. append and synchronize the sole commit decision; and
-4. publish every participant under one local snapshot-gate cut.
-
-For `K` participants, commit uses `K+1` synchronization operations. Recovery
-must open the complete catalog. A valid decision rolls every participant
-forward; no decision means presumed abort. Missing `txn.vtm`, a missing required
-participant, or a standalone collection with unresolved conditional records
-fails closed.
-
-An ambiguous decision append or sync returns `ErrCommitOutcomeUnknown` and
-poisons the catalog. Reopening the complete database resolves an all-or-none
-state. See [Transactions](transactions.md) for profile support and limits.
-
-## Snapshots and reclamation
-
-A durable snapshot pins one generation and owns mutable scratch. It is
-single-consumer and must be closed. Holding a snapshot across sustained writes
-pins retired extents; once the bounded retirement table fills, a writer returns
-a capacity error without publishing its mutation. Close the snapshot and retry.
-
-The durable package currently exports no dedicated retirement-capacity
-sentinel. Do not document one. Active snapshots can also make collection close,
-database close, and collection drop retryable.
-
-## Replicated-node storage
-
-RF3 physical nodes add their own recovery state: a node-owned descriptor
-catalog, a segmented shared Raft log, authenticated checkpoints, and
-fixed-capacity sealed sidecars. Group registration makes a checkpoint file and
-its directory durable before the log references it, and an uncertain log sync
-requires close and reopen, like the embedded rules above. These are
-distributed-runtime primitives; see [distributed internals](operations/distributed.md)
-and the [on-disk format map](format.md#recovery-unit).
-
-## Platform and failure limits
-
-Sealed recovery-journal profiles require strict physical allocation. That
-path currently requires Linux: the filesystem must support allocation and
-unsharing, or be the explicitly admitted ext4 case. An ordinary container
-overlay can fail this check. This affects RF3 preparation; it is distinct from
-the default embedded profile. See [strict allocation](../internal/storeio/strict_allocation_linux.go)
-and [local-cluster prerequisites](operations/local-cluster.md#prerequisites).
-
-“Power-safe” means the strongest implemented platform barrier; Darwin uses the
-full-sync class where available. It cannot prove every filesystem, controller,
-firmware, cache, hypervisor, or power-loss condition.
-
-The test suite injects write, sync, torn-record, and torn-root failures. Those
-tests establish behavior for the modeled cuts, not a hardware certification or
-service-level guarantee.
+- `Collection.Flush` persists the current visible generation. `Database.Flush`
+  walks collections sequentially (not a cross-collection cut).
+- `Close` stops admission, persists as required, and releases locks. Check
+  `CloseCompleted(err)` to distinguish retryable teardown (active snapshots/tx)
+  from a terminal close with a sticky error.
+- **Poison & unknown outcomes:** An append/sync error or
+  `ErrCommitOutcomeUnknown` poisons writers. Stop writing, close, reopen the
+  complete directory, and reconcile by application identity.
+- **Long-lived snapshots:** Holding durable snapshots pins retired extents
+  (up to `MaxRetiredExtents`, default 65,536) and causes bounded write
+  refusals until closed.
+- **Platform barriers:** "Power-safe" uses the strongest barrier exposed by the
+  OS (including Darwin full-sync); it cannot certify disk firmware, volatile
+  controller caches, or hypervisors.
 
 ## Operator rules
 
-- Stop writers and close the database before copying the complete directory.
-- Include every primary, `.rjournal`, `txn.vtm`, and catalog-side file.
-- Do not manipulate an open file or directory behind the writer lease.
-- Treat persistence errors and unknown outcomes as a close-and-reopen boundary.
-- Do not assume reads remain available after a persistence failure.
-- Use offline verification against a quiescent file or copy.
-- Never rely on a development image across a different commit.
-
-The public API defines no safe live raw-file backup procedure.
-
-## Limitations
-
-- The power-safe fence is the strongest barrier the platform exposes; it is
-  not a hardware certification. Qualify the actual storage stack.
-- `Buffered` can lose every mutation since the last successful `Flush` or
-  `Close`; recovery returns the last recoverable cut, not the last visible one.
-- `Database.Flush` is not a database-wide cut.
-- There is no online or incremental backup API; back up a closed directory.
-- Crash tests inject modeled write, sync, and torn-record failures; they do
-  not cover every filesystem or device behavior.
-- Files are not portable across development revisions.
+- Close the database before copying a directory; never copy or modify live
+  files behind the writer lock.
+- Run offline `Verify`/`Salvage` only on a quiescent file or consistent copy.
+- Replicated RF3 nodes add a node descriptor catalog and segmented shared Raft
+  log; see [replication](design/replication.md) and [on-disk format](format.md#recovery-unit).
 
 ## Source map
 
-- Facade profiles: [vibedb.go](../vibedb.go)
-- Durable modes and validation: [store/durable/store_file_options.go](../store/durable/store_file_options.go)
-- Visibility and poison state: [store/durable/store_file_durability.go](../store/durable/store_file_durability.go)
-- Flush and close: [store/durable/store_file_lifecycle.go](../store/durable/store_file_lifecycle.go)
-- Recovery journal: [store/durable/store_file_journal.go](../store/durable/store_file_journal.go)
-- Multi-collection protocol: [store/durable/store_database_txn.go](../store/durable/store_database_txn.go)
-- Recovery crash tests: [store/durable/store_file_journal_crash_test.go](../store/durable/store_file_journal_crash_test.go)
-- Buffered crash tests: [store/durable/store_file_buffered_test.go](../store/durable/store_file_buffered_test.go)
+- Profiles & modes: [vibedb.go](../vibedb.go), [store/durable/store_file_options.go](../store/durable/store_file_options.go), [store_file_durability.go](../store/durable/store_file_durability.go)
+- Journal, lifecycle & crash tests: [store/durable/store_file_journal.go](../store/durable/store_file_journal.go), [store_file_lifecycle.go](../store/durable/store_file_lifecycle.go), [store_file_journal_crash_test.go](../store/durable/store_file_journal_crash_test.go)

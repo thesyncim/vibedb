@@ -1,3 +1,0 @@
---- FAIL: BenchmarkReplicatedPointReadCPU
-    testing.go:1579: TempDir: mkdir /go/tmp/BenchmarkReplicatedPointReadCPU2978850120: read-only file system
-FAIL

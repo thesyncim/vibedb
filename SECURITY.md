@@ -1,95 +1,40 @@
 # Security policy
 
 > [!CAUTION]
-> VibeDB is unreleased development software with known defects and no support
-> window. Do not expose it to untrusted networks or use it for sensitive or
-> irreplaceable data. See [current status](docs/status.md).
+> VibeDB is unreleased development software with no support window. Do not
+> expose it to untrusted networks or store irreplaceable data. See
+> [stability](docs/status.md).
 
-## Supported versions
+## Supported versions and reporting
 
-There are no supported versions. Security changes land on `main`; consumers
-must select, audit, and test a fixing commit themselves. Different commits may
-be wire- and disk-incompatible.
+Security fixes land on `main` only; commits may be wire- and disk-incompatible.
+This repository has no verified private reporting channel yet—do **not** post
+exploits, credentials, or reproducers in public issues or PRs. Open a public
+issue requesting a private channel first, and wait before sharing confidential
+details (include commit, Go/OS/FS details, minimal reproducer, and impact).
 
-## Report a vulnerability
+## Trust boundaries
 
-This repository does not currently publish a verified private vulnerability
-reporting channel. Do not place exploit details, credentials, private data, or
-a reproducer in a public issue, pull request, discussion, or commit.
-
-You may open a public issue containing only a request for maintainers to enable
-and verify a private reporting channel. Wait for that verified channel before
-sending confidential material. There is no promised response or disclosure
-deadline.
-
-A useful private report should include:
-
-- exact commit and dirty state;
-- Go version, OS, architecture, filesystem, and build flags;
-- the smallest safe reproducer;
-- confidentiality, integrity, availability, or durability impact;
-- a method to verify the fix without exposing secrets.
-
-## Embedded boundary
-
-The `vibedb`, `query`, and `sql/driver` packages open no listeners. The
-embedding process owns network exposure, authentication, authorization,
-filesystem permissions, backup protection, and process isolation.
-
-Writer locks coordinate cooperating VibeDB processes only. They do not protect
-against an administrator or external process that truncates, replaces, copies,
-or edits a live file. Keep database files, journals, transaction logs, catalogs,
-keys, and parent directories in one trusted administrative boundary.
-
-## Network boundary
-
-Distributed commands require TLS and an authorization policy except for
-explicit literal-loopback development modes. Service identity comes from an
-exact certificate extension and binary NodeID—not DNS names, certificate
-subjects, or common names. Traffic classes and capabilities are separate.
-
-The `-dev-plaintext-loopback` and `-pg-dev-listen` paths are unauthenticated
-development conveniences. Do not expose them through a proxy, container port
-mapping, tunnel, or port forward. The local RF3 tutorial uses trust auth and no
-TLS intentionally; it is not a deployment template.
-
-The standalone pgwire server must be configured with SCRAM, TLS,
-`RequireTLS`, bounded deadlines, and an appropriate listener for any untrusted
-boundary. `Trust()` is local-only. SSLRequest negotiation is implemented;
-direct TLS and SCRAM-SHA-256-PLUS are not.
-
-TLS rotation closes old-generation streams. A response lost after request send
-can have an unknown outcome. Mutation protocols must retry the exact retained
-identity and bytes, never synthesize a new command because a connection closed.
-
-## Secrets and state
-
-Protect at least:
-
-- TLS private keys and roots;
-- authorization policies and identity manifests;
-- Raft WAL keys and durable acknowledgement keys;
-- gateway session journals and route seeds;
-- backup repositories, restore permits, and generated development PKI.
-
-The Kubernetes qualification script creates disposable credentials and leaves
-its private temporary directory for inspection. Remove that directory safely
-after collecting required evidence.
-
-## Security qualification
-
-Authentication and authorization tests cover specific traffic classes and
-failure scenarios. Read their exact scope before treating one passing test as
-coverage for certificate rotation, confused-deputy resistance, or external
-process failure. Development plaintext remains a separate loopback-only mode.
-
-The [feature ledger](docs/distributed-feature-state.md) links qualification
-evidence, and [current limitations](docs/status.md#known-limitations) records
-behavior that matters when evaluating a build.
+- **Embedded (`vibedb`, `query`, `sql/driver`):** Opens no sockets. The host
+  application owns network exposure, auth, permissions, and backups. Writer
+  locks coordinate cooperating VibeDB processes only—keep files, journals,
+  `txn.vtm`, and directories in one trusted boundary.
+- **Distributed services:** Require mTLS 1.3 with binary NodeIDs in a critical
+  X.509 extension (DNS/CN ignored), per-class ALPN separation, and explicit
+  capability policies ([security model](docs/design/security.md)).
+- **Development plaintext & `pgwire`:** `-dev-plaintext-loopback`,
+  `-pg-dev-listen`, and `pgwire.Trust()` are unauthenticated loopback-only
+  conveniences—never expose them via proxies or port forwards. Remote `pgwire`
+  listeners require `RequireTLS: true` + `SCRAM-SHA-256` (`PGTLSConfig` +
+  `PGUsers`).
+- **TLS rotation:** Rotating credentials revokes old-generation streams, which
+  can leave an in-flight write outcome unknown—always retry with the exact
+  retained request identity and bytes.
+- **Secrets to protect:** TLS private keys/roots, `authorization-policy.vibejson`,
+  `wal-key-source`, `durable-ack-key`, route seeds, session journals, backup
+  repositories, and temporary Kind bootstrap directories.
 
 ## Source map
 
-- [internal/servicetls](internal/servicetls) and [internal/rafttransport/identity.go](internal/rafttransport/identity.go)
-- [internal/serviceauthz](internal/serviceauthz) and [gateway/client_tls.go](gateway/client_tls.go)
-- [pgwire/server.go](pgwire/server.go), `session.go`, and `scram.go`
-- [internal/gatewayruntime/serve.go](internal/gatewayruntime/serve.go) and `cmd/vibedb-shard/*.go`
+- [internal/servicetls/](internal/servicetls/) · [internal/serviceauthz/](internal/serviceauthz/) · [internal/rafttransport/identity.go](internal/rafttransport/identity.go)
+- [pgwire/server.go](pgwire/server.go) · [pgwire/scram.go](pgwire/scram.go)

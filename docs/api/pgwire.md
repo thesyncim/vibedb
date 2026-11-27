@@ -1,303 +1,101 @@
 # PostgreSQL wire adapter
 
-[Documentation](../README.md) / [API guides](README.md) · [Development status](../status.md)
+[Documentation](../README.md) / [API guides](README.md) · [Stability](../status.md)
 
-`pgwire` is a PostgreSQL v3 **client-protocol adapter** over one VibeDB SQL
-catalog. It is **not PostgreSQL compatibility and not ORM compatibility**. The
-reported server version `16.0` helps clients choose a protocol-era handshake;
-it makes no claim about PostgreSQL 16 SQL, catalogs, behavior, or extensions.
+`pgwire` implements the PostgreSQL v3 **wire protocol** over a VibeDB SQL
+catalog or RF3 gateway. It reports server version `16.0` for client handshake
+compatibility, **not** PostgreSQL SQL, catalog, extension, or ORM parity
+(`integration/pgcompat/approved-tests.txt` currently has zero approved upstream
+regression tests).
 
-The current PostgreSQL regression ratchet has **zero approved tests**:
-`integration/pgcompat/approved-tests.txt` contains no test names. Do not turn
-an observational smoke run into a compatibility claim.
+## Start a server
 
-## Start a loopback endpoint
-
-Authentication must be chosen explicitly. `Trust` is appropriate only inside
-a trust boundary such as loopback or a protected Unix socket:
+Authentication is explicit (`Trust` is for loopback/Unix sockets only; use
+`RequireTLS: true` + `SCRAM` for network listeners):
 
 ```go
-package main
+database, err := driver.Open("app.vdb")
+defer database.Close()
 
-import (
-	"context"
-	"errors"
-	"fmt"
-	"log"
-	"net"
-	"os"
-	"os/signal"
-	"syscall"
-
-	"github.com/thesyncim/vibedb/pgwire"
-	"github.com/thesyncim/vibedb/sql/driver"
-)
-
-func main() {
-	if err := run(); err != nil {
-		log.Fatal(err)
-	}
-}
-
-func run() (err error) {
-	database, err := driver.Open("app.vdb")
-	if err != nil {
-		return err
-	}
-	defer func() { err = errors.Join(err, database.Close()) }()
-
-	server, err := pgwire.NewServer(database, pgwire.Options{
-		Auth: pgwire.Trust(), Database: "app",
-	})
-	if err != nil {
-		return err
-	}
-	defer func() { err = errors.Join(err, server.Close()) }()
-
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	fmt.Printf("postgresql://app@%s/app?sslmode=disable\n", listener.Addr())
-	served := make(chan error, 1)
-	go func() { served <- server.Serve(listener) }()
-	select {
-	case err = <-served:
-		if errors.Is(err, pgwire.ErrServerClosed) {
-			return nil
-		}
-		return err
-	case <-ctx.Done():
-		return nil // Deferred closes stop the server before closing the database.
-	}
-}
+verifier, err := pgwire.NewVerifier("correct horse battery staple") // printable ASCII
+server, err := pgwire.NewServer(database, pgwire.Options{
+	Database:   "app",
+	TLSConfig:  tlsConfig,
+	RequireTLS: true,
+	Auth: pgwire.SCRAM(func(user string) (pgwire.Verifier, bool) {
+		return verifier, user == "app"
+	}),
+})
+defer server.Close() // close server before database
 ```
 
-Run the program from a scratch directory; it creates the catalog `app.vdb`
-(with `app.vdb.lock` and `app.vdb.tables`) there. Connect psql to the printed
-URL, and press `Ctrl-C` to stop:
+For loopback testing with `pgwire.Trust()`:
 
 ```sh
 psql 'postgresql://app@127.0.0.1:PORT/app?sslmode=disable' -c 'SELECT 1'
 ```
 
-Replace `PORT` with the port the program printed.
+- Supports `SSLRequest` TLS upgrade and `SCRAM-SHA-256` (no direct TLS, MD5,
+  GSS, `SCRAM-SHA-256-PLUS`, or SASLprep).
+- `RequireTLS` applies to both normal startup and out-of-band `CancelRequest`.
+- `NewServerWithBackend` attaches a custom `Backend` (such as the RF3 gateway)
+  binding authenticated `SessionIdentity` to execution authority.
 
-`NewServer` borrows the database. Close the server first; `Server.Close` stops
-listeners, cancels sessions, waits for them, and then returns. Close the
-database afterward.
+## Protocol and session surface
 
-## Require TLS and SCRAM
-
-For a network listener, add `crypto/tls` to the imports above and use this
-constructor. The caller owns and closes the returned server:
-
-```go
-func secureServer(database *driver.Database, tlsConfig *tls.Config) (*pgwire.Server, error) {
-	verifier, err := pgwire.NewVerifier("correct horse battery staple")
-	if err != nil {
-		return nil, err
-	}
-	return pgwire.NewServer(database, pgwire.Options{
-		Database: "app", TLSConfig: tlsConfig, RequireTLS: true,
-		Auth: pgwire.SCRAM(func(user string) (pgwire.Verifier, bool) {
-			return verifier, user == "app"
-		}),
-	})
-}
-```
-
-The public API does not yet serialize or reload `Verifier`; this example is
-startup configuration, not a persistent credential-store design.
-
-The adapter supports PostgreSQL SSLRequest negotiation and SCRAM-SHA-256.
-Direct TLS, GSS encryption, MD5 authentication, SCRAM-SHA-256-PLUS channel
-binding, authorization identities, and SASLprep are not implemented. Because
-SASLprep is absent, `NewVerifier` accepts only nonempty printable-ASCII
-passwords.
-
-`RequireTLS` covers normal startup and out-of-band CancelRequest packets. A
-cancel request arrives on its own connection and receives no response, as the
-protocol requires.
-
-`NewServerWithBackend` borrows a custom `Backend`. It receives authenticated
-`SessionIdentity` and must bind it to execution authority; the server closes
-returned sessions.
-
-## Protocol surface
-
-| Area | Implemented behavior |
+| Area | Behavior |
 | --- | --- |
-| Startup | Protocol 3; `user` required; nonempty configured database enforces its label, empty accepts any label |
-| Simple query | Bounded multi-statement batches; stop at first error |
-| Extended query | Parse, Bind, Describe, Execute, Close, Flush, Sync |
-| Prepared state | Named/unnamed statements and portals, portal suspension |
-| Embedded transactions | BEGIN/START, COMMIT, ROLLBACK, SAVEPOINT, RELEASE, ROLLBACK TO |
-| Isolation | Read Committed, Repeatable Read, Serializable; READ ONLY/WRITE |
-| Cancellation | BackendKeyData plus out-of-band CancelRequest |
-| Parameters | Text plus selected binary encodings |
-| Results | Text plus selected binary encodings, preflighted before first DataRow |
-| Discovery | Exact bounded shims for tested psql, GoLand, and JDBC probes |
+| Simple & extended query | Bounded multi-statement simple batches; `Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Flush`/`Sync`; named/unnamed statements & portals; `$1`..`$32767` params (do not mix `$n` and `?`) |
+| Embedded transactions | `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`; Read Committed, Repeatable Read, Serializable; `READ ONLY`/`WRITE` |
+| Timeouts & cancellation | `statement_timeout`, `idle_in_transaction_session_timeout`, out-of-band `CancelRequest`, `pg_cancel_backend(pid)`, `pg_terminate_backend(pid)` |
+| Introspection virtual tables | Live `pg_stat_activity`, lock-free `pg_stat_statements`, and `pg_stat_statements_reset()` |
+| Session settings (`SET`/`SHOW`/`RESET`/`DISCARD ALL`) | `search_path` (`public`), `application_name`, `client_encoding` (`UTF8`), `DateStyle`, `IntervalStyle`, `TimeZone`, `extra_float_digits`, `standard_conforming_strings` (`on`), `bytea_output`, `statement_timeout`, `idle_in_transaction_session_timeout` |
+| Discovery shims | Exact captured queries for `psql` 18.4 (`\l`, `\dn`, `\dt`, `\di`, `\d`, `\df`, `\du`, `\dv`), GoLand, and JDBC |
 
-Simple-query placeholders are rejected. Extended-query clients use `$1`
-through `$32767`; repeated and out-of-order references work, and gaps count
-toward the parameter count. Mixing `$n` and `?` is rejected. Rewriting ignores
-quoted strings, identifiers, and comments.
+- **RF3 gateway backend:** Autocommit-only for writes (`INSERT VALUES`,
+  `ON CONFLICT DO NOTHING/UPDATE`, `DELETE`, exact-PK `UPDATE` without
+  `RETURNING`). Explicit multi-statement write transactions are rejected.
+- **Errors & SQLSTATEs:** `42601` syntax, `0A000` unsupported, `23505` unique,
+  `40001` serialization, `54000` resource cap, `57014` cancellation/timeout,
+  `08P01` protocol violation, `40003` unknown outcome (reconnect and reconcile;
+  never blind-retry).
 
-The gateway RF3 backend is a separate, autocommit-only write lane. It accepts
-INSERT VALUES, DELETE, and exact-primary-key UPDATE without RETURNING. A
-declared top-level UPDATE right-hand side may be a supported computed scalar;
-RETURNING, ORDER BY/LIMIT, nested targets, primary-key moves, and ON CONFLICT
-remain fenced. Each write stands alone in one Query or Execute/Sync cycle;
-explicit and multi-statement write transactions are unsupported there.
+## Parameters and results
 
-On the embedded transactional backend, an idle batch of stored SQL is
-preflighted and runs atomically in one implicit transaction. Explicit
-transaction/session commands differ. DDL must be the only statement in a batch.
+- **Accepted parameter OIDs:** `bool`, `int2`/`int4`/`int8`, `float4`/`float8`,
+  text `numeric` (no binary `numeric`), `text`/`varchar`/`bpchar`/`name`/`unknown`,
+  `bytea` (document slot only), `json`/`jsonb` (binary v1). Text numbers bind
+  as exact JSON decimals; strings must be valid UTF-8 without NUL.
+- **Result OIDs:** Schemaless values, exact numbers, and `SUM`/`AVG`/`MIN`/`MAX`
+  return JSON OID 114; `COUNT` and integer windows return `int8`; typed
+  bool/text columns return native OIDs. Both missing and JSON `null` encode as
+  wire NULL (`-1` length). Complete results are preflighted before sending the
+  first `DataRow`.
 
-After an extended-protocol error, messages are discarded until Sync. Sync
-commits or rolls back implicit work, closes non-holdable portals, and resets
-the cycle. Only one live executor is retained; executing another suspended
-portal invalidates the earlier live executor.
+## Default bounds
 
-Extended-protocol DDL must be the sole execution. It publishes at Execute,
-outside an implicit DML overlay; a later protocol error before Sync cannot undo it.
-
-## SQL and session commands
-
-The adapter executes the bounded VibeDB [SQL reference](../reference/sql.md),
-not PostgreSQL SQL. It additionally parses transaction commands and a small
-session-command surface:
-
-- `SET`, `RESET`, `SHOW`, and `DISCARD ALL` for the fixed settings below.
-- Fixed handshake SELECT probes used by supported clients.
-- Exact psql 18.4 metadata query shapes behind `\l`, `\dn`, `\dt`, `\di`,
-  `\d`, `\d name`, `\df`, `\du`, and `\dv`.
-
-Supported settings are `search_path` (`public` only), `application_name`,
-`client_encoding` (`UTF8`), `DateStyle`, `IntervalStyle`, `TimeZone`,
-`extra_float_digits`, `standard_conforming_strings` (`on`), and
-`bytea_output`. Role changes, statement/lock timeouts, and default transaction
-settings are refused. SET and RESET are refused inside a transaction.
-
-In a failed transaction, only COMMIT, ROLLBACK, and ROLLBACK TO may proceed.
-COMMIT on an aborted transaction rolls it back and reports command tag
-`ROLLBACK`. DDL is still prohibited inside transactions.
-
-Errors carry one-based character positions. Common SQLSTATEs are `42601`
-syntax, `0A000` unsupported, `23505` unique violation, `40001` serialization,
-`54000` resource cap, `57014` cancellation, and `08P01` protocol violation.
-Unknown outcome is `40003`; it outranks cancellation and requires reconnect
-and reconciliation, never a blind retry.
-
-## Parameter types
-
-Accepted PostgreSQL parameter OIDs:
-
-| Family | OIDs |
-| --- | --- |
-| Boolean | `bool` |
-| Integer | `int2`, `int4`, `int8` |
-| Floating point | `float4`, `float8` |
-| Exact number | `numeric` text input; binary numeric is unsupported |
-| Text | `text`, `varchar`, `bpchar`, `name`, `unknown` |
-| Whole document bytes | `bytea` only in a document slot |
-| JSON | `json`, `jsonb` (binary jsonb version 1) |
-
-Whole-document parameters default to JSON. SQL scalar parameters infer a
-bounded bool/text domain where context requires it. A whole-document SQL NULL
-is rejected; send JSON text `null` to store a JSON null document. Untyped text
-uses JSON-scalar spelling inference, so `21` may bind as a number; declare text
-when text is required. Scalar JSON objects and arrays are rejected in scalar
-positions. Nonfinite floats are rejected.
-
-Text `int2`/`int4`/`int8`/`float4`/`float8`/`numeric` inputs bind as exact JSON
-numbers without PostgreSQL width or range enforcement. Binary integers and
-floats use their protocol widths; binary `numeric` is unsupported.
-
-Input strings must be valid UTF-8 and contain no NUL. Text-format `name` clips
-at 63 bytes; overlength binary `name` is `42622`. Direct `bpchar` preserves
-padding; coercion to a different string target trims it.
-
-## Result types
-
-Schemaless values, exact numbers, and SUM/AVG/MIN/MAX are sent as JSON OID 114.
-Strings in those slots are JSON-quoted. COUNT and integer-valued window
-functions use `int8`; statically typed bool/text/varchar/name/bpchar outputs use
-their native OIDs. SQL NULL uses a `-1` length.
-
-Missing and explicit JSON null both encode as wire NULL. Use `IS MISSING` in
-the SQL predicate when absence must remain distinct. RowDescription currently
-reports table OID and attribute number as zero.
-
-The complete result is preflighted before the first DataRow is written. An
-encoding or budget error therefore does not publish a partial result.
-
-## Catalog discovery is a shim
-
-There is no general `pg_catalog` or `information_schema` implementation. The
-adapter recognizes exact query shapes captured from supported client paths.
-Near misses execute as ordinary SQL and usually fail.
-
-The psql shim reports tables and indexes in synthetic schema `public`; function,
-role, and view listings are empty. That omission does not mean VibeDB lacks its
-own read-only SQL views. GoLand/JDBC discovery exposes declared columns,
-primary keys, and `"$doc"`; it never infers schema by scanning documents.
-
-Repository interoperability gates cover pgx v5 and lib/pq over real loopback
-TCP and SCRAM. TLS+SCRAM has a pgx gate. Stock psql 18.4 and Java 17 with JDBC
-42.7.3 are opt-in integration checks, not broad support guarantees.
-
-## Resource bounds
-
-| Resource | Default or hard bound |
+| Resource | Default / hard bound |
 | --- | ---: |
-| Connections | 128 |
-| Startup/auth read timeout | 10 s |
-| Socket write timeout | 30 s |
-| Idle message timeout | 5 min |
-| Result | 100,000 rows / 64 MiB |
-| Relation intermediates | 64 MiB |
-| Frontend message body | 16 MiB |
-| Startup packet | 10,000 bytes |
-| Retained read buffer | 64 KiB |
-| Statement/portal identifier | 256 bytes |
-| Simple statements per query | 1,024 |
-| Named statements / portals | 1,024 each |
-| Result columns | 1,024 |
-| Parameters | 32,767 |
-| Retained prepared input / binds / portals | 16 MiB each |
-| DataRow / RowDescription | 16 MiB each |
-| Error field | 4 KiB |
-
-Zero-valued options select finite defaults. `-1` disables supported connection,
-result, intermediate, or timeout limits; other execution limits still apply.
+| Connections | 128 (`-1` disables) |
+| Startup / write / idle timeouts | 10 s / 30 s / 5 min |
+| Result / intermediates | 100,000 rows & 64 MiB / 64 MiB |
+| Message body / DataRow / RowDescription | 16 MiB each |
+| Named statements / portals / simple batch | 1,024 each |
+| Result columns / parameters | 1,024 / 32,767 |
+| Startup packet / retained read buf / error field | 10,000 B / 64 KiB / 4 KiB |
 
 ## Limitations
 
-- Not PostgreSQL: the SQL dialect, type system, and catalogs are VibeDB's.
-  The PostgreSQL regression ratchet has zero approved tests.
-- No COPY, replication, LISTEN/NOTIFY, logical decoding, large objects,
-  PostgreSQL extensions or functions, materialized views, general catalog
-  queries, direct TLS, holdable cursors, or arbitrary ORM discovery.
-  Unsupported SQL maps to `0A000`; unknown frontend messages map to `08P01`.
-- Catalog discovery recognizes only exact captured query shapes.
-- No SCRAM channel binding, SASLprep, MD5, GSS, or credential persistence.
-- Text-format integer and float parameters bind as exact JSON numbers without
-  PostgreSQL width or range checks; binary `numeric` is unsupported.
-- `RowDescription` reports zero table OIDs and attribute numbers.
-- The embedded backend serves one catalog in one process; the RF3 backend is
-  autocommit-only for writes.
+- Not PostgreSQL: no `COPY`, logical replication, `LISTEN`/`NOTIFY`, large
+  objects, extensions, materialized views, holdable cursors, or general
+  `pg_catalog`/`information_schema` queries.
+- Discovery shims match exact captured client shapes; near misses fail.
+- `RowDescription` reports zero table OID and attribute number.
+- Tested in CI with `pgx` v5, `lib/pq`, `psql` 18.4, and JDBC 42.7.3.
 
 ## Source map
 
-- Contract and compatibility boundary: [pgwire/doc.go](../../pgwire/doc.go), [pgwire/server.go](../../pgwire/server.go)
-- Server lifecycle/options: [pgwire/server.go](../../pgwire/server.go), [pgwire/server.go](../../pgwire/server.go)
-- Startup/TLS/auth: [pgwire/session.go](../../pgwire/session.go), [pgwire/scram.go](../../pgwire/scram.go)
-- Simple/extended state machines: [pgwire/session.go](../../pgwire/session.go), [pgwire/extended.go](../../pgwire/extended.go)
-- Parameters/results/errors: [pgwire/extended.go](../../pgwire/extended.go), [pgwire/rows.go](../../pgwire/rows.go), [pgwire/pgerror.go](../../pgwire/pgerror.go)
-- Commands/discovery/gates: [pgwire/command.go](../../pgwire/command.go), [pgwire/catalog_shim.go](../../pgwire/catalog_shim.go), [integration/pgclient/pgclient_test.go](../../integration/pgclient/pgclient_test.go)
-- Gateway RF3 writes: [gateway/pgwire_write.go](../../gateway/pgwire_write.go), [gateway/replicated_sql_transaction.go](../../gateway/replicated_sql_transaction.go)
-- Zero-test compatibility ratchet: [integration/pgcompat/approved-tests.txt](../../integration/pgcompat/approved-tests.txt)
+- Server, startup, TLS, SCRAM: [pgwire/server.go](../../pgwire/server.go), [pgwire/session.go](../../pgwire/session.go), [pgwire/scram.go](../../pgwire/scram.go)
+- Extended protocol, rows, errors: [pgwire/extended.go](../../pgwire/extended.go), [pgwire/rows.go](../../pgwire/rows.go), [pgwire/pgerror.go](../../pgwire/pgerror.go)
+- Commands, shims, `pg_stat_*`: [pgwire/command.go](../../pgwire/command.go), [pgwire/catalog_shim.go](../../pgwire/catalog_shim.go)
+- Gateway RF3 writes & tests: [gateway/pgwire_write.go](../../gateway/pgwire_write.go), [integration/pgclient/pgclient_test.go](../../integration/pgclient/pgclient_test.go)

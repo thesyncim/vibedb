@@ -2,111 +2,52 @@
 
 [Documentation](../README.md) / [Operations](README.md) / Node failure
 
-Decide what to do when a physical node stops, loses its disk, or cannot be
-trusted. Each RF3 group commits through a majority of its three voters, so the
-first question is always which groups still have two reachable voters.
-[Topology changes](../design/topology-changes.md#replica-moves-and-replacement)
-explains how a replacement moves a replica, and
-[replication](../design/replication.md#quorum-behavior) explains quorum loss.
+Each RF3 group commits via a majority (2 of 3 voters). When a physical node
+fails, check which groups retain at least 2 reachable voters before taking
+action.
 
-## What a failure does
+## Quorum impact
 
-| Reachable voters in a group | Behavior | Operator action |
+| Reachable voters | Group behavior | Action |
 | ---: | --- | --- |
-| 3 | Normal. | None. |
-| 2 | Elects and commits with no remaining fault tolerance. | Restore or replace the third replica before any other change. |
-| 1 | No commit and no linearizable read. Requests fail, time out, or return outcome-unknown. | Restore a second voter. Never force membership. |
-| 0 | Unavailable. | Recover processes and storage. |
+| 3 | Normal | None |
+| 2 | Commits with no remaining fault tolerance | Restart or replace the lost node promptly |
+| 1 | No commits or linearizable reads | Restore a 2nd voter; never force membership |
+| 0 | Unavailable | Recover processes/storage or restore from backup |
 
-A physical node hosts one replica of every group placed on it, so one node
-failure drops every such group to two voters at once. In a three-node cluster
-that is every group. A second node failure stops all writes and linearizable
-reads.
+In a 3-node cluster, losing 1 node drops every group to 2 voters; losing a 2nd
+node halts writes and linearizable reads.
 
-Leadership after a restart is not immediate: the group needs peer traffic and
-heartbeats before a restarted replica can lead or serve. Requests that were in
-flight when the node stopped can have committed; retry them under their
-original identity, as described in [troubleshooting](troubleshooting.md#resolve-an-uncertain-write).
+## Recovery procedures
 
-## Local launcher behavior
+- **Local launcher (`vibedb cluster dev`):** Exits all nodes if any child
+  stops. Fix the cause (disk, port, signal) and rerun the exact same launcher
+  command and root (add `--diagnostics-on-exit` for child log tails).
+- **Intact storage (restart in place):** Restart the same `serve-node` process
+  with the same build and manifest. Wait for `vibedb-shard RF3 ready` and
+  confirm a linearizable read. Never copy another node's directory or edit
+  manifests.
+- **Lost or untrusted storage (replace node):**
+  1. Keep the failed node stopped and confirm every group still has 2 voters.
+  2. Prepare and start a fresh node with a new NodeID (`vibedb cluster init-node`),
+     then run `vibedb cluster join` ([scaling](scaling.md#add-a-node-join)).
+  3. Decommission the failed node ID and incarnation with
+     `vibedb cluster decommission` until `safe_to_stop=true`.
+- **Permanent quorum loss (2+ voters lost):** Restore from backup into fresh
+  identities ([backup and restore](backup-restore.md)). Rebuilding quorum from
+  a single replica's local disk is unsupported.
 
-`vibedb cluster dev` does not tolerate a child failure. If any node process
-exits, the supervisor reports `physical node <n> exited`, stops every other
-child (SIGTERM, then SIGKILL after 10 seconds), and exits with status 1. It
-never restarts a node. To recover:
-
-1. Read the reported exit and any bounded child output. Rerun with
-   `--diagnostics-on-exit` if you need the last 64 KiB of each child's log.
-2. Fix the cause (disk space, port conflict, killed process).
-3. Start the launcher again with the same build, root, and flags. Every node
-   reopens its retained state.
-
-You cannot use the launcher to observe a two-voter cluster serving traffic.
-The fault behavior above is qualified by separate process tests instead; see
-[Evidence](#evidence).
-
-## Restart a node in place
-
-When the node's data directory is intact, restart the same process with the
-same build and manifest. It rejoins with its existing identity, replays its
-node log, and catches up from the leader. Do not copy another node's
-directory, reuse its identity, or edit its manifest to force progress.
-
-**Success check:** the node logs `vibedb-shard RF3 ready`, and a
-linearizable read through any frontend returns acknowledged data.
-
-## Replace a lost node
-
-When a node's storage is gone or untrustworthy, replace it with a fresh node
-rather than repairing its files:
-
-1. Keep the failed node stopped. Confirm every group still has two voters.
-2. Prepare and start a new empty node with a new node ID, then add it with
-   `vibedb cluster join`; see [scaling](scaling.md#add-a-node).
-3. Decommission the failed node's ID and incarnation with
-   `vibedb cluster decommission`, and poll until `safe_to_stop=true`.
-
-This is the only replacement path the current tools support, and it carries
-the [scaling prerequisites](scaling.md#prerequisites): an operator credential
-and a hand-built empty-node manifest. Decommissioning a node that cannot answer
-has not been qualified; the qualified scenario retires a live node.
-
-Membership changes are always learner, catch-up, promote to four voters,
-transfer leadership, then remove the source. A group never drops to two
-configured voters as part of a replacement. See
-[RF3 quorum and replica replacement](distributed.md#rf3-quorum-and-replica-replacement).
-
-## Lose a quorum
-
-If two of a group's three voters are permanently lost, the group cannot make
-progress and no command forces it to. Restore from backup into fresh
-identities; see [backup and restore](backup-restore.md). Rebuilding a quorum
-from one surviving replica's local state is unsupported.
-
-## Evidence
-
-| Scenario | Qualification |
-| --- | --- |
-| Process kill before a request, racing admission, and after an applied lost reply; asymmetric peer partitions; replica restarts | [Shared-node fault record](../qualification/node-fault-2026-09-04/README.md), `durable-rf3-external.yml` |
-| Multi-relation writes under process chaos | `durable-rf3-multirelation.yml` |
-| Controller and target restart during a scale operation | `seamless-scale-in-out.yml` |
-| Restored replicas serving and failing over | `restore-rf3-external.yml` |
-| Kubernetes restart of every StatefulSet | [Kind qualification](kubernetes.md) |
+Uncertain in-flight writes may have committed—reconcile under the original
+request ID ([troubleshooting](troubleshooting.md#resolve-an-uncertain-write)).
 
 ## Limitations
 
-- The launcher has no failure tolerance and no automatic restart.
-- Loss of a whole host has not been qualified across separate machines.
-- There is no automatic replacement. A failed node stays in the directory
-  until an operator decommissions it.
-- Device power-loss behavior is not proven by any lane.
-- A torn log tail without an external anti-rollback proof keeps the replica
-  non-serving. Replace the node rather than editing its files.
+- No automatic dead-node replacement; failed nodes remain in the directory
+  until explicitly decommissioned (decommissioning an unreachable node is not
+  yet end-to-end qualified).
+- Torn-slot WAL quarantines require node replacement rather than local repair.
 
 ## Source map
 
-| Concern | Source |
-| --- | --- |
-| Launcher child supervision | [cluster_dev.go](../../cmd/vibedb/cluster_dev.go) |
-| Membership grant and move sequence | [internal/membershipgrant/grant.go](../../internal/membershipgrant/grant.go), [internal/raftservice/owner.go](../../internal/raftservice/owner.go) |
-| Scaling controller | [scaling_controller.go](../../internal/gatewayruntime/scaling_controller.go) |
+- [cmd/vibedb/cluster_dev.go](../../cmd/vibedb/cluster_dev.go) · [internal/membershipgrant/grant.go](../../internal/membershipgrant/grant.go) · [internal/gatewayruntime/scaling_controller.go](../../internal/gatewayruntime/scaling_controller.go)
+- CI gates: [`durable-rf3-external.yml`](../../.github/workflows/durable-rf3-external.yml), [`durable-rf3-multirelation.yml`](../../.github/workflows/durable-rf3-multirelation.yml)
