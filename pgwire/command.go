@@ -1551,6 +1551,11 @@ func (fn shimFunctions) parseShimItem(s *scanner) (shimColumn, bool) {
 	case strings.EqualFold(word, "pg_backend_pid"):
 		v := strconv.Itoa(int(fn.pid))
 		return shimColumn{name: "pg_backend_pid", value: &v, typ: typeInt8}, true
+	case strings.EqualFold(word, "pg_stat_statements_reset"):
+		if fn.server != nil {
+			fn.server.resetStatementStats()
+		}
+		return shimColumn{name: "pg_stat_statements_reset", value: nil, typ: typeText}, true
 	}
 	return shimColumn{}, false
 }

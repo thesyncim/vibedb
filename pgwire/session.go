@@ -334,6 +334,7 @@ type portal struct {
 	// row ordinal sent.
 	state         portalState
 	row           int
+	execStart     time.Time
 	runtime       BackendRows
 	discoveryRows *fixedResult
 }
@@ -1982,6 +1983,7 @@ func (s *session) executeRuntimeExec(p *portal) error {
 		return s.queryCanceledError()
 	}
 	s.invalidateRuntimePortals(p)
+	execStart := time.Now()
 	result, err := p.stmt.runtime.Exec(p.operationContext(), p.args)
 	if err != nil {
 		_ = s.takeCancel()
@@ -2000,6 +2002,7 @@ func (s *session) executeRuntimeExec(p *portal) error {
 		// turn that durable success into a 57014 failure.
 	}
 	p.state = portalExhausted
+	s.server.recordStatementStat(s.database, s.user, p.stmt.sql, time.Since(execStart), result.RowsAffected)
 	s.w.commandComplete(runtimeCommandTag(kind, result.RowsAffected))
 	return nil
 }
@@ -2087,9 +2090,11 @@ func (s *session) executeRuntimeExecAsync(p *portal) (handled bool, err error) {
 	// parameters and schema-qualification already rewritten, see prepare);
 	// stmt.sql is the original client text, kept only for error messages.
 	text, kind := stmt.lowered, stmt.runtime.Kind()
-	pending := &pendingDirectExec{kind: pendingDirectExecResult, done: make(chan struct{}), sess: sess, text: stmt.sql}
+	rawSQL, srv, dbName, userName := stmt.sql, s.server, s.database, s.user
+	pending := &pendingDirectExec{kind: pendingDirectExecResult, done: make(chan struct{}), sess: sess, text: rawSQL}
 	go func() {
 		defer close(pending.done)
+		execStart := time.Now()
 		// A concurrent direct write can lose an optimistic-concurrency race
 		// against another lane committing to the same shard between this
 		// statement's planning and its proposal — SQLSTATE 40001,
@@ -2108,6 +2113,7 @@ func (s *session) executeRuntimeExecAsync(p *portal) (handled bool, err error) {
 			result, execErr := prepared.Exec(context.Background(), args)
 			_ = prepared.Close()
 			if execErr == nil {
+				srv.recordStatementStat(dbName, userName, rawSQL, time.Since(execStart), result.RowsAffected)
 				pending.tag = runtimeCommandTag(kind, result.RowsAffected)
 				return
 			}
@@ -2224,6 +2230,7 @@ func (s *session) executeRuntimeQuery(p *portal, limit int32) error {
 		if s.takeCancel() {
 			return s.queryCanceledError()
 		}
+		p.execStart = time.Now()
 		if err := s.startRuntime(p); err != nil {
 			_ = s.takeCancel()
 			if errors.Is(err, query.ErrCanceled) {
@@ -2269,6 +2276,7 @@ func (s *session) executeRuntimeQuery(p *portal, limit int32) error {
 	if err := p.runtime.Close(); err != nil {
 		return asPGErrorIn(err, p.stmt.sql)
 	}
+	s.server.recordStatementStat(s.database, s.user, p.stmt.sql, time.Since(p.execStart), int64(p.row))
 	if kind == sqlast.KindSelect {
 		s.w.commandComplete(commandTag(p.row))
 	} else {

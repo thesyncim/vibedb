@@ -146,6 +146,12 @@ type Options struct {
 	// result rows and bytes remain governed independently above.
 	MaxIntermediateBytes int64
 
+	// MaxStatementStats bounds the number of distinct normalized SQL
+	// fingerprints retained by the live pg_stat_statements virtual table.
+	// Zero selects DefaultMaxStatementStats; DisableStatementStats (-1)
+	// disables statement statistics collection.
+	MaxStatementStats int
+
 	// OnError is called with every session-terminating error, including the
 	// ordinary ones (a client that closed its connection). It is the only
 	// logging hook, and it is a function rather than an interface so that a
@@ -177,6 +183,7 @@ type Server struct {
 	db               *sqldriver.Database
 	backend          Backend
 	opts             Options
+	stmtStats        *stmtStatsRegistry
 
 	mu            sync.Mutex
 	sessions      map[int32]*session
@@ -251,6 +258,10 @@ func NewServerWithBackend(backend Backend, opts Options) (*Server, error) {
 		return nil, fmt.Errorf(
 			"pgwire: MaxIntermediateBytes must be >= %d", UnlimitedResults)
 	}
+	if opts.MaxStatementStats < DisableStatementStats {
+		return nil, fmt.Errorf(
+			"pgwire: MaxStatementStats must be >= %d", DisableStatementStats)
+	}
 	if opts.MaxConnections == 0 {
 		opts.MaxConnections = DefaultMaxConnections
 	}
@@ -278,10 +289,16 @@ func NewServerWithBackend(backend Backend, opts Options) (*Server, error) {
 	if opts.MaxIntermediateBytes == 0 {
 		opts.MaxIntermediateBytes = DefaultMaxIntermediateBytes
 	}
+	if opts.MaxStatementStats == 0 {
+		opts.MaxStatementStats = DefaultMaxStatementStats
+	} else if opts.MaxStatementStats < 0 {
+		opts.MaxStatementStats = 0
+	}
 	return &Server{
 		started:   time.Now(),
 		backend:   backend,
 		opts:      opts,
+		stmtStats: newStmtStatsRegistry(opts.MaxStatementStats),
 		sessions:  map[int32]*session{},
 		conns:     map[net.Conn]struct{}{},
 		listeners: map[net.Listener]struct{}{},
@@ -705,6 +722,27 @@ func (s *Server) activitySnapshot() []sessionActivity {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].pid < out[j].pid })
 	return out
+}
+
+func (s *Server) recordStatementStat(database, user, rawSQL string, dur time.Duration, rows int64) {
+	if s == nil || s.stmtStats == nil {
+		return
+	}
+	s.stmtStats.record(database, user, rawSQL, dur, rows)
+}
+
+func (s *Server) resetStatementStats() {
+	if s == nil || s.stmtStats == nil {
+		return
+	}
+	s.stmtStats.reset()
+}
+
+func (s *Server) statementStatsSnapshot() []stmtStatsSnapshot {
+	if s == nil || s.stmtStats == nil {
+		return nil
+	}
+	return s.stmtStats.snapshot()
 }
 
 // randomKey returns the secret half of a backend key. It comes from
