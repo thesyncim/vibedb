@@ -122,11 +122,19 @@ Before running VibeDB anywhere that matters, account for each gap:
    directory. Copying them elsewhere is outside VibeDB.
 6. **Monitoring.** The gateway exposes both authenticated native `{"op":"metrics"}`
    JSON snapshots and an optional Prometheus `/metrics`, `/healthz`, and `/readyz`
-   HTTP endpoint (`MetricsHTTPListenAddress`, loopback-only unless TLS is configured)
-   with counters and read/write latency histograms. Alerting rules and dashboards
+   HTTP endpoint (`-metrics-http-listen` on `vibedb-gateway serve` and
+   `vibedb-shard serve-node`, loopback-only unless TLS is configured) with
+   gateway counters, read/write latency histograms, RF3 Raft aggregates,
+   `ResourceGuard` memory/disk watermarks, controller lease status, cluster
+   version info, and live `pgwire` session & `pg_stat_statements` counters, plus
+   optional `-slow-query-threshold` logging. Alerting rules and dashboards
    remain operator-provided; see [observability](observability.md).
-7. **Capacity headroom.** Process RSS, disk, and file descriptors are not
-   bounded by VibeDB as a whole; see [capacity planning](capacity-planning.md).
+7. **Capacity headroom.** Hard process memory and disk free-space admission
+   watermarks (`-max-memory-bytes`, `-min-free-disk-bytes`,
+   `-disk-watermark-path`) are available on both `vibedb-gateway serve` and
+   `vibedb-shard serve-node` via `internal/resourceguard`, while OS-level RSS
+   and file-descriptor limits still rely on host/container enforcement; see
+   [capacity planning](capacity-planning.md).
 
 ## Limitations
 
