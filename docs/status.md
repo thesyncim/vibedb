@@ -75,8 +75,10 @@ Darwin durability uses its strongest implemented barrier; see
   indefinitely for its clients to disconnect.
 - Follower applied-floor reads and multi-group read vectors have narrower
   semantics than a linearizable global snapshot.
-- Resource budgets cover their named caches, workspaces, or overlays. They do
-  not establish a fixed total process-memory ceiling.
+- Resource budgets cover their named caches, workspaces, or overlays. Process
+  memory and disk free-space admission watermarks are available via
+  `internal/resourceguard` (`gateway.Options.ResourceGuard`), but OS-level RSS
+  and file-descriptor limits still rely on host/container enforcement.
 
 The distributed ledger lists partial qualification for each feature, and
 [defaults and limits](reference/limits.md) lists the exact bounds.
