@@ -4,7 +4,7 @@ import (
 	"math"
 	"sort"
 
-	"github.com/thesyncim/vibedb/internal/jsoncmp"
+	"github.com/thesyncim/vibejson/x/jsoncmp"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
 )
@@ -440,7 +440,7 @@ func narrowContains(src []byte, value ShapeNarrowValue, needle vibejson.Node) bo
 		return (raw[0] == 't') == want
 	case document.Number:
 		want, _ := needle.NumberBytes()
-		return jsoncmp.JSONNumberEqual(raw, want)
+		return jsoncmp.NumberEqual(raw, want)
 	case document.String:
 		return rawJSONStringEqual(raw, uint8(value.Info>>document.InfoFlagsShift), needle.Raw().Bytes(), needle.Entry.Flags())
 	case document.Array:
@@ -559,7 +559,7 @@ func postFNV(b []byte) uint64 {
 // JSON string without allocating a decoded copy.
 func postDecodedStringFNV(raw []byte) uint64 {
 	h := uint64(postFNVOffset)
-	it := jsoncmp.JSONStringByteIter{Raw: raw[1 : len(raw)-1]}
+	it := jsoncmp.StringByteIter{Raw: raw[1 : len(raw)-1]}
 	for {
 		b, ok := it.Next()
 		if !ok {
@@ -577,7 +577,7 @@ func postDecodedStringFNV(raw []byte) uint64 {
 func hashDecodedJSONString(raw []byte) uint32 {
 	content := raw[1 : len(raw)-1]
 	count := 0
-	it := jsoncmp.JSONStringByteIter{Raw: content}
+	it := jsoncmp.StringByteIter{Raw: content}
 	for {
 		_, ok := it.Next()
 		if !ok {
@@ -587,7 +587,7 @@ func hashDecodedJSONString(raw []byte) uint32 {
 	}
 
 	h := keyHashInit(count)
-	it = jsoncmp.JSONStringByteIter{Raw: content}
+	it = jsoncmp.StringByteIter{Raw: content}
 	var word, last uint64
 	for i := 0; i < count; i++ {
 		b, _ := it.Next()

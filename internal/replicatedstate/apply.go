@@ -10,7 +10,7 @@ import (
 	"slices"
 
 	"github.com/thesyncim/vibedb/distribution"
-	"github.com/thesyncim/vibedb/internal/jsoncmp"
+	"github.com/thesyncim/vibejson/x/jsoncmp"
 	"github.com/thesyncim/vibedb/internal/raftmodel"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/routegate"
@@ -2365,14 +2365,14 @@ func globalIndexLocatorsEqual(left, right []byte, count uint8) bool {
 		}
 		switch leftNode.Kind() {
 		case jsondoc.String:
-			if !jsoncmp.RawJSONStringEqual(
+			if !jsoncmp.RawStringEqual(
 				leftNode.Raw().Bytes(), leftNode.Entry.Flags(),
 				rightNode.Raw().Bytes(), rightNode.Entry.Flags(),
 			) {
 				return false
 			}
 		case jsondoc.Number:
-			if !jsoncmp.JSONNumberEqual(
+			if !jsoncmp.NumberEqual(
 				leftNode.Raw().Bytes(), rightNode.Raw().Bytes(),
 			) {
 				return false
