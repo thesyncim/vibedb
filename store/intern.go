@@ -78,6 +78,41 @@ func (in *KeyInterner) Reset() {
 	in.stack = in.stack[:0]
 }
 
+// Reserve pre-sizes the hash table and identifier slices for at least n
+// distinct keys without disturbing already-interned entries.
+func (in *KeyInterner) Reserve(n int) {
+	if n <= 0 {
+		return
+	}
+	if cap(in.hashes) < n {
+		next := make([]uint32, len(in.hashes), n)
+		copy(next, in.hashes)
+		in.hashes = next
+	}
+	if cap(in.keys) < n {
+		next := make([][]byte, len(in.keys), n)
+		copy(next, in.keys)
+		in.keys = next
+	}
+	need := uint64(internMinTable)
+	const maxTable = uint64(1) << 32
+	for need < maxTable && need*3 <= uint64(n)*4 {
+		need <<= 1
+	}
+	if uint64(len(in.table)) < need {
+		table := make([]uint32, int(need))
+		mask := uint32(need - 1)
+		for id, hash := range in.hashes {
+			slot := hash & mask
+			for table[slot] != 0 {
+				slot = (slot + 1) & mask
+			}
+			table[slot] = uint32(id) + 1
+		}
+		in.table = table
+	}
+}
+
 // Intern returns key's identifier, assigning the next dense one on first
 // appearance. The content is copied, so key may be reused or discarded.
 func (in *KeyInterner) Intern(key []byte) uint32 {
