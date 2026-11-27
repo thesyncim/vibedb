@@ -17,6 +17,7 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -69,8 +70,9 @@ type ElapsedClock interface {
 type CheckedClock struct {
 	mu          sync.Mutex
 	source      ElapsedClock
-	last        time.Duration
-	initialized bool
+	last        atomic.Int64
+	initialized atomic.Bool
+	faulted     atomic.Bool
 	fault       error
 }
 
@@ -97,27 +99,82 @@ func (clock *CheckedClock) Now() (time.Duration, error) {
 	if clock == nil || clock.source == nil {
 		return 0, ErrClockUnavailable
 	}
-	clock.mu.Lock()
-	defer clock.mu.Unlock()
-	if clock.fault != nil {
-		return 0, clock.fault
+	if clock.faulted.Load() {
+		clock.mu.Lock()
+		err := clock.fault
+		clock.mu.Unlock()
+		return 0, err
 	}
+	if !clock.initialized.Load() {
+		clock.mu.Lock()
+		defer clock.mu.Unlock()
+		if clock.fault != nil {
+			return 0, clock.fault
+		}
+		now, err := clock.source.Now()
+		if err != nil {
+			clock.fault = errors.Join(ErrClockFault, err)
+			clock.faulted.Store(true)
+			return 0, clock.fault
+		}
+		if now < 0 {
+			clock.fault = fmt.Errorf("%w: negative reading %s", ErrClockFault, now)
+			clock.faulted.Store(true)
+			return 0, clock.fault
+		}
+		if clock.initialized.Load() && now < time.Duration(clock.last.Load()) {
+			clock.fault = errors.Join(ErrClockRollback, ErrClockFault)
+			clock.faulted.Store(true)
+			return 0, clock.fault
+		}
+		if !clock.initialized.Load() || int64(now) > clock.last.Load() {
+			clock.last.Store(int64(now))
+		}
+		clock.initialized.Store(true)
+		return now, nil
+	}
+	// Observe the monotonic watermark strictly BEFORE sampling source.Now().
+	// Any reading smaller than a watermark that already completed before our
+	// sample began is a genuine clock rollback, whereas two concurrent readers
+	// sampling in parallel cannot falsely trip each other.
+	prev := time.Duration(clock.last.Load())
 	now, err := clock.source.Now()
 	if err != nil {
-		clock.fault = errors.Join(ErrClockFault, err)
-		return 0, clock.fault
+		return 0, clock.recordFault(errors.Join(ErrClockFault, err))
 	}
 	if now < 0 {
-		clock.fault = fmt.Errorf("%w: negative reading %s", ErrClockFault, now)
-		return 0, clock.fault
+		return 0, clock.recordFault(fmt.Errorf("%w: negative reading %s", ErrClockFault, now))
 	}
-	if clock.initialized && now < clock.last {
-		clock.fault = errors.Join(ErrClockRollback, ErrClockFault)
-		return 0, clock.fault
+	if now < prev {
+		return 0, clock.recordFault(errors.Join(ErrClockRollback, ErrClockFault))
 	}
-	clock.last = now
-	clock.initialized = true
+	want := int64(now)
+	for {
+		cur := clock.last.Load()
+		if cur >= want {
+			break
+		}
+		if clock.last.CompareAndSwap(cur, want) {
+			break
+		}
+	}
+	if clock.faulted.Load() {
+		clock.mu.Lock()
+		faultErr := clock.fault
+		clock.mu.Unlock()
+		return 0, faultErr
+	}
 	return now, nil
+}
+
+func (clock *CheckedClock) recordFault(err error) error {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	if clock.fault == nil {
+		clock.fault = err
+		clock.faulted.Store(true)
+	}
+	return clock.fault
 }
 
 // Faulted reports whether the clock has permanently disabled this owner.
@@ -125,9 +182,7 @@ func (clock *CheckedClock) Faulted() bool {
 	if clock == nil {
 		return false
 	}
-	clock.mu.Lock()
-	defer clock.mu.Unlock()
-	return clock.fault != nil
+	return clock.faulted.Load()
 }
 
 // Evidence returns the last locally accepted sample and the permanent fault
@@ -136,12 +191,15 @@ func (clock *CheckedClock) Evidence() CheckedClockEvidence {
 	if clock == nil {
 		return CheckedClockEvidence{}
 	}
-	clock.mu.Lock()
-	defer clock.mu.Unlock()
+	initialized := clock.initialized.Load()
+	var sample time.Duration
+	if initialized {
+		sample = time.Duration(clock.last.Load())
+	}
 	return CheckedClockEvidence{
-		Sample:      clock.last,
-		Initialized: clock.initialized,
-		Faulted:     clock.fault != nil,
+		Sample:      sample,
+		Initialized: initialized,
+		Faulted:     clock.faulted.Load(),
 	}
 }
 

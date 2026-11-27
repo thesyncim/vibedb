@@ -23,7 +23,7 @@ const catalogVersion = 0
 const maxCatalogTableNameBytes = 1<<16 - 1
 
 const (
-	replicatedCheckpointEvery = 1024
+	replicatedCheckpointEvery  = 1024
 	maxCatalogViews            = 256
 	maxCatalogViewQueryBytes   = 1 << 20
 	maxCatalogViewColumns      = 1024

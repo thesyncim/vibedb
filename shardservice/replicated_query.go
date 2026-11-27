@@ -39,14 +39,15 @@ const (
 const maxPooledPointReadScratchBytes = 64 << 10
 
 type replicatedSQLLease struct {
-	budget   *replicatedFrameByteBudget
-	bytes    int64
-	point    sqldriver.ReplicatedReadLease
-	cursor   sqldriver.Cursor
-	cancel   query.CancelFlag
-	pointBuf []byte
-	pointCut raftservice.LinearizablePointReadCut
-	dataCut  raftservice.LinearizableDataReadCut
+	budget    *replicatedFrameByteBudget
+	bytes     int64
+	directSQL *DirectSQLTarget
+	point     sqldriver.ReplicatedReadLease
+	cursor    sqldriver.Cursor
+	cancel    query.CancelFlag
+	pointBuf  []byte
+	pointCut  raftservice.LinearizablePointReadCut
+	dataCut   raftservice.LinearizableDataReadCut
 }
 
 var replicatedSQLRequestPool = sync.Pool{
@@ -73,6 +74,7 @@ func (l *replicatedSQLLease) Release() {
 		l.budget.releaseSQL(l.bytes)
 		l.budget = nil
 		l.bytes = 0
+		l.directSQL = nil
 		l.pointCut = raftservice.LinearizablePointReadCut{}
 		l.dataCut = raftservice.LinearizableDataReadCut{}
 		if cap(l.pointBuf) > maxPooledPointReadScratchBytes {
@@ -103,6 +105,24 @@ func (server *ReplicatedServer) executeReplicatedQueryCallValidated(
 	semanticValidated bool,
 	inProcessSemantic bool,
 	fusedPoint bool,
+	concurrentAuthorize ...raftservice.ConcurrentReadAuthorization,
+) *ReplicatedResponse {
+	return server.executeReplicatedQueryCallDirect(
+		ctx, request, state, semantic, authorize, semanticValidated,
+		inProcessSemantic, fusedPoint, nil, concurrentAuthorize...,
+	)
+}
+
+func (server *ReplicatedServer) executeReplicatedQueryCallDirect(
+	ctx context.Context,
+	request *ReplicatedRequest,
+	state raftservice.ServingState,
+	semantic *ShardRequest,
+	authorize raftservice.ProposalAuthorization,
+	semanticValidated bool,
+	inProcessSemantic bool,
+	fusedPoint bool,
+	directSQL *DirectSQLTarget,
 	concurrentAuthorize ...raftservice.ConcurrentReadAuthorization,
 ) *ReplicatedResponse {
 	wireState := replicatedWireState(state)
@@ -179,7 +199,7 @@ func (server *ReplicatedServer) executeReplicatedQueryCallValidated(
 	for tier := server.sqlHints.lookup(key); tier < len(replicatedSQLTiers); tier++ {
 		budget := replicatedSQLTiers[tier]
 		budget.resultBytes = min(budget.resultBytes, int(request.MaxValueBytes))
-		response, grow := server.executeReplicatedQueryTierCall(ctx, request, state, inner, owner, budget, maximum, authorize, fusedPoint, semanticDirect, directAuthorize)
+		response, grow := server.executeReplicatedQueryTierCall(ctx, request, state, inner, owner, budget, maximum, authorize, fusedPoint, semanticDirect, directSQL, directAuthorize)
 		if !grow {
 			if response.Kind == ReplicatedQueryResult {
 				server.sqlHints.record(key, tier)
@@ -367,6 +387,7 @@ type fencedSQLResult struct {
 func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Context, request *ReplicatedRequest, state raftservice.ServingState,
 	inner *ShardRequest, owner any, budget replicatedSQLBudget, maximum int,
 	authorize raftservice.ProposalAuthorization, fusedPoint, semanticDirect bool,
+	directSQL *DirectSQLTarget,
 	concurrentAuthorize ...raftservice.ConcurrentReadAuthorization) (*ReplicatedResponse, bool) {
 	wireState := replicatedWireState(state)
 	refuse := func(code ReplicatedRefusalCode) (*ReplicatedResponse, bool) {
@@ -390,6 +411,7 @@ func (server *ReplicatedServer) executeReplicatedQueryTierCall(ctx context.Conte
 		return refuse(ReplicatedRefusalAdmissionBound)
 	}
 	lease := acquireReplicatedSQLLease(&server.frames, charge)
+	lease.directSQL = directSQL
 	retained := false
 	defer func() {
 		if !retained {
@@ -823,7 +845,7 @@ func executeFencedSQLBudget(ctx context.Context, source interface {
 			ctx, cut, req.SQL, req.ParamTypes, req.PartialAggregate, options,
 		)
 		if acquireErr == nil {
-			return executeFencedSQLLease(ctx, lease, req, budget, flag, &frame.cursor, semanticDirect)
+			return executeFencedSQLLease(ctx, lease, req, budget, flag, &frame.cursor, semanticDirect, frame.directSQL)
 		}
 		if !errors.Is(acquireErr, sqldriver.ErrReplicatedReadReuseUnsupported) {
 			return fencedSQLResult{}, acquireErr
@@ -854,6 +876,10 @@ func executeFencedSQLBudget(ctx context.Context, source interface {
 	encoding := trace.StartRegion(ctx, "sql.read.encode")
 	defer encoding.End()
 	if semanticDirect {
+		if frame.directSQL != nil {
+			sem, matErr := materializeSQLReadCursorDirect(cursor.Snapshot(), prepared.Columns(), budget.resultBytes, flag, frame.directSQL)
+			return fencedSQLResult{semantic: sem}, matErr
+		}
 		sem, typed, matErr := materializeSQLReadCursor(cursor.Snapshot(), prepared.Columns(), budget.resultBytes, flag)
 		return fencedSQLResult{semantic: sem, typed: typed}, matErr
 	}
@@ -915,7 +941,7 @@ func executeFencedSQLPointBudget(
 		err := reusable.AcquireReplicatedTrustedPointReadInto(ctx, primary.Relation, primary.Keys[0],
 			point, primary.PrimaryPath, req.SQL, req.ParamTypes, req.PartialAggregate, options, &frame.point)
 		if err == nil {
-			return executeFencedSQLLease(ctx, &frame.point, req, budget, flag, &frame.cursor, semanticDirect)
+			return executeFencedSQLLease(ctx, &frame.point, req, budget, flag, &frame.cursor, semanticDirect, frame.directSQL)
 		}
 		if !errors.Is(err, sqldriver.ErrReplicatedReadReuseUnsupported) {
 			return fencedSQLResult{}, err
@@ -928,7 +954,7 @@ func executeFencedSQLPointBudget(
 		err := reusable.AcquireReplicatedPointReadInto(ctx, primary.Relation, primary.Keys[0],
 			point.Found, point.Value, primary.PrimaryPath, req.SQL, req.ParamTypes, req.PartialAggregate, options, &frame.point)
 		if err == nil {
-			return executeFencedSQLLease(ctx, &frame.point, req, budget, flag, &frame.cursor, semanticDirect)
+			return executeFencedSQLLease(ctx, &frame.point, req, budget, flag, &frame.cursor, semanticDirect, frame.directSQL)
 		}
 		if !errors.Is(err, sqldriver.ErrReplicatedReadReuseUnsupported) {
 			return fencedSQLResult{}, err
@@ -941,7 +967,7 @@ func executeFencedSQLPointBudget(
 			options,
 		)
 		if acquireErr == nil {
-			return executeFencedSQLLease(ctx, lease, req, budget, flag, &frame.cursor, semanticDirect)
+			return executeFencedSQLLease(ctx, lease, req, budget, flag, &frame.cursor, semanticDirect, frame.directSQL)
 		}
 		if !errors.Is(acquireErr, sqldriver.ErrReplicatedReadReuseUnsupported) {
 			return fencedSQLResult{}, acquireErr
@@ -972,6 +998,10 @@ func executeFencedSQLPointBudget(
 	encoding := trace.StartRegion(ctx, "sql.read.encode")
 	defer encoding.End()
 	if semanticDirect {
+		if frame.directSQL != nil {
+			sem, matErr := materializeSQLReadCursorDirect(cursor.Snapshot(), prepared.Columns(), budget.resultBytes, flag, frame.directSQL)
+			return fencedSQLResult{semantic: sem}, matErr
+		}
 		sem, typed, matErr := materializeSQLReadCursor(cursor.Snapshot(), prepared.Columns(), budget.resultBytes, flag)
 		return fencedSQLResult{semantic: sem, typed: typed}, matErr
 	}
@@ -987,6 +1017,7 @@ func executeFencedSQLLease(
 	flag *query.CancelFlag,
 	cursor *sqldriver.Cursor,
 	semanticDirect bool,
+	directSQL *DirectSQLTarget,
 ) (res fencedSQLResult, err error) {
 	if lease == nil {
 		return fencedSQLResult{}, sqldriver.ErrReplicatedReadLeaseClosed
@@ -1009,9 +1040,15 @@ func executeFencedSQLLease(
 	if err == nil {
 		encoding := trace.StartRegion(ctx, "sql.read.encode")
 		if semanticDirect {
-			res.semantic, res.typed, err = materializeSQLReadCursor(
-				cursor.Snapshot(), lease.Columns(), budget.resultBytes, flag,
-			)
+			if directSQL != nil {
+				res.semantic, err = materializeSQLReadCursorDirect(
+					cursor.Snapshot(), lease.Columns(), budget.resultBytes, flag, directSQL,
+				)
+			} else {
+				res.semantic, res.typed, err = materializeSQLReadCursor(
+					cursor.Snapshot(), lease.Columns(), budget.resultBytes, flag,
+				)
+			}
 		} else {
 			res.encoded, err = encodeSQLReadCursor(
 				cursor.Snapshot(), lease.Columns(), budget.resultBytes, flag,

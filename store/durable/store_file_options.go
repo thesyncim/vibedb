@@ -1550,10 +1550,6 @@ func (o Options) normalized() (normalizedFileStoreOptions, error) {
 		o.PageSize, o.MaxKeyBytes, o.InlineValueBytes,
 	))
 	primaryOverlayBucketLimit := primaryUnifiedOverlayBuckets
-	if o.OpaqueValues {
-		primaryOverlayTargetBytes = 0
-		primaryOverlayBucketLimit = 0
-	}
 	limitByPages := func(pageLimit int) {
 		if pageLimit <= primaryOverlayFixedPages {
 			primaryOverlayBucketLimit = 0

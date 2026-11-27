@@ -178,12 +178,161 @@ func (iterator JSONInt64DeltaIterator) Remaining() int {
 	return iterator.remaining
 }
 
-// ValidJSONInt64Delta accepts either the original JID1 descriptor or the
-// versioned JID2 plural descriptor. It additionally rejects duplicate JID2
-// field names, which are invalid SQL lowering and would otherwise make one
-// command's result depend on descriptor order.
+// JSONColumnPatchMagic carries one or more direct top-level JSON column
+// value replacements evaluated at the Raft apply index against the live row.
+// Like JID1/JID2, keeping the patch in the command makes retries and failover
+// deterministic without a gateway preimage read or optimistic digest guard.
+const JSONColumnPatchMagic = "JCP1"
+
+const (
+	jsonColumnPatchHeaderBytes = 8 // magic, field count, reserved
+	jsonColumnPatchFieldBytes  = 6 // column length (u16), value length (u32)
+)
+
+// JSONColumnPatchField is one top-level column assignment in a JCP1 patch.
+// RawJSON must be valid JSON bytes for the replacement value.
+type JSONColumnPatchField struct {
+	Column  string
+	RawJSON []byte
+}
+
+// AppendJSONColumnPatch appends a bounded JCP1 descriptor with 1..MaxJSONInt64DeltaFields
+// distinct top-level column replacements.
+func AppendJSONColumnPatch(dst []byte, fields []JSONColumnPatchField) ([]byte, error) {
+	if len(fields) == 0 || len(fields) > MaxJSONInt64DeltaFields || len(fields) > int(^uint16(0)) {
+		return dst, semantic("JSON column patch field count")
+	}
+	start := len(dst)
+	dst = append(dst, JSONColumnPatchMagic...)
+	dst = append(dst, 0, 0, 0, 0)
+	binary.LittleEndian.PutUint16(dst[start+4:start+6], uint16(len(fields)))
+	for index, field := range fields {
+		if len(field.Column) == 0 || len(field.Column) > MaxIdentityBytes ||
+			!utf8.ValidString(field.Column) || len(field.Column) > int(^uint16(0)) {
+			return dst[:start], semantic("JSON column patch column length")
+		}
+		if len(field.RawJSON) == 0 || len(field.RawJSON) > MaxMutationValueBytes {
+			return dst[:start], semantic("JSON column patch value length")
+		}
+		for prior := 0; prior < index; prior++ {
+			if fields[prior].Column == field.Column {
+				return dst[:start], semantic("JSON column patch duplicate column")
+			}
+		}
+		need := jsonColumnPatchFieldBytes + len(field.Column) + len(field.RawJSON)
+		if need > MaxMutationValueBytes || len(dst)-start > MaxMutationValueBytes-need {
+			return dst[:start], semantic("JSON column patch descriptor size")
+		}
+		at := len(dst)
+		dst = append(dst, 0, 0, 0, 0, 0, 0)
+		binary.LittleEndian.PutUint16(dst[at:at+2], uint16(len(field.Column)))
+		binary.LittleEndian.PutUint32(dst[at+2:at+6], uint32(len(field.RawJSON)))
+		dst = append(dst, field.Column...)
+		dst = append(dst, field.RawJSON...)
+	}
+	return dst, nil
+}
+
+// JSONColumnPatchIterator opens a borrowed JCP1 descriptor without allocating.
+type JSONColumnPatchIterator struct {
+	value     []byte
+	offset    int
+	remaining int
+	valid     bool
+}
+
+// OpenJSONColumnPatch validates and opens one borrowed JCP1 descriptor.
+func OpenJSONColumnPatch(value []byte) (JSONColumnPatchIterator, bool) {
+	if len(value) < jsonColumnPatchHeaderBytes || len(value) > MaxMutationValueBytes ||
+		!bytes.Equal(value[:4], []byte(JSONColumnPatchMagic)) ||
+		binary.LittleEndian.Uint16(value[6:8]) != 0 {
+		return JSONColumnPatchIterator{}, false
+	}
+	count := int(binary.LittleEndian.Uint16(value[4:6]))
+	if count == 0 || count > MaxJSONInt64DeltaFields {
+		return JSONColumnPatchIterator{}, false
+	}
+	offset := jsonColumnPatchHeaderBytes
+	for index := 0; index < count; index++ {
+		if len(value)-offset < jsonColumnPatchFieldBytes {
+			return JSONColumnPatchIterator{}, false
+		}
+		colLen := int(binary.LittleEndian.Uint16(value[offset : offset+2]))
+		valLen := int(binary.LittleEndian.Uint32(value[offset+2 : offset+6]))
+		if colLen == 0 || colLen > MaxIdentityBytes || valLen == 0 || valLen > MaxMutationValueBytes {
+			return JSONColumnPatchIterator{}, false
+		}
+		colStart := offset + jsonColumnPatchFieldBytes
+		valStart := colStart + colLen
+		end := valStart + valLen
+		if valStart < colStart || end < valStart || end > len(value) ||
+			!utf8.Valid(value[colStart:valStart]) {
+			return JSONColumnPatchIterator{}, false
+		}
+		offset = end
+	}
+	if offset != len(value) {
+		return JSONColumnPatchIterator{}, false
+	}
+	return JSONColumnPatchIterator{value: value, offset: jsonColumnPatchHeaderBytes, remaining: count, valid: true}, true
+}
+
+// Next returns the next borrowed column name and raw JSON value bytes.
+func (iterator *JSONColumnPatchIterator) Next() (column, rawJSON []byte, ok bool) {
+	if iterator == nil || !iterator.valid || iterator.remaining == 0 {
+		return nil, nil, false
+	}
+	offset := iterator.offset
+	colLen := int(binary.LittleEndian.Uint16(iterator.value[offset : offset+2]))
+	valLen := int(binary.LittleEndian.Uint32(iterator.value[offset+2 : offset+6]))
+	colStart := offset + jsonColumnPatchFieldBytes
+	valStart := colStart + colLen
+	end := valStart + valLen
+	column = iterator.value[colStart:valStart]
+	rawJSON = iterator.value[valStart:end]
+	iterator.offset = end
+	iterator.remaining--
+	return column, rawJSON, true
+}
+
+// Remaining reports the number of fields not yet returned by Next.
+func (iterator JSONColumnPatchIterator) Remaining() int {
+	if !iterator.valid {
+		return 0
+	}
+	return iterator.remaining
+}
+
+// ValidJSONInt64Delta accepts JID1, JID2, or JCP1 apply-time JSON patch
+// descriptors. It rejects duplicate column names so command evaluation never
+// depends on descriptor order.
 func ValidJSONInt64Delta(value []byte) bool {
 	if _, _, ok := OpenJSONInt64Delta(value); ok {
+		return true
+	}
+	if patchIter, ok := OpenJSONColumnPatch(value); ok {
+		count := patchIter.Remaining()
+		for index := 0; index < count; index++ {
+			outer := patchIter
+			var column []byte
+			for skip := 0; skip <= index; skip++ {
+				var next bool
+				column, _, next = outer.Next()
+				if !next {
+					return false
+				}
+			}
+			inner := patchIter
+			for prior := 0; prior < index; prior++ {
+				priorColumn, _, next := inner.Next()
+				if !next {
+					return false
+				}
+				if bytes.Equal(priorColumn, column) {
+					return false
+				}
+			}
+		}
 		return true
 	}
 	iterator, ok := OpenJSONInt64Deltas(value)

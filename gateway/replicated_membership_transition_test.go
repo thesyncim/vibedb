@@ -154,9 +154,7 @@ func membershipTransitionSQLFixture(
 		if staleGeneration != stale.Generation() {
 			return nil, fmt.Errorf("unexpected stale generation %d", staleGeneration)
 		}
-		holder.leaseMu.Lock()
-		oldLeases := holder.activeLeases[staleGeneration]
-		holder.leaseMu.Unlock()
+		oldLeases := holder.DrainStatus(staleGeneration + 1).ActiveOlderOperations
 		if oldLeases != 0 {
 			return nil, fmt.Errorf("stale planning lease still held: %d", oldLeases)
 		}

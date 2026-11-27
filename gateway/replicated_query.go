@@ -27,6 +27,7 @@ var ErrReplicatedSQLPlanUnsupported = errors.New("gateway: RF3 SQL does not yet 
 type replicatedSQLAttempt struct {
 	snapshot         *Snapshot
 	skipObservations bool
+	directTarget     *shardservice.DirectSQLTarget
 	mu               sync.Mutex
 	observations     []ReplicatedGroupReadObservation
 }
@@ -64,7 +65,7 @@ func (transport *ReplicatedSQLTransport) DoTyped(ctx context.Context, _ string, 
 		route.Command.RoutingVersion != uint64(req.RoutingVersion) || route.Command.OwnershipEpoch != uint64(req.OwnershipEpoch) {
 		return nil, nil, ErrStaleGeneration
 	}
-	return transport.Executor.QuerySQLTyped(ctx, route, req)
+	return transport.Executor.QuerySQLDirect(ctx, route, req, attempt.directTarget)
 }
 
 // DoBatches splits a fully admitted bounded native result into the existing
@@ -146,6 +147,10 @@ func (executor *ReplicatedExecutor) QuerySQL(ctx context.Context, route Replicat
 }
 
 func (executor *ReplicatedExecutor) QuerySQLTyped(ctx context.Context, route ReplicatedRoute, req *shardservice.ShardRequest) (*shardservice.ShardResponse, []query.Cell, error) {
+	return executor.QuerySQLDirect(ctx, route, req, nil)
+}
+
+func (executor *ReplicatedExecutor) QuerySQLDirect(ctx context.Context, route ReplicatedRoute, req *shardservice.ShardRequest, directTarget *shardservice.DirectSQLTarget) (*shardservice.ShardResponse, []query.Cell, error) {
 	if executor == nil || executor.client == nil || ctx == nil || req == nil || !validReplicatedRoute(route) {
 		return nil, nil, ErrReplicatedRoute
 	}
@@ -176,6 +181,7 @@ func (executor *ReplicatedExecutor) QuerySQLTyped(ctx context.Context, route Rep
 	call.Request.MaxValueBytes = shardservice.MaxReplicatedSQLResultBytes
 	call.SQL = req
 	call.SQLFrameBytes = size
+	call.DirectSQL = directTarget
 	defer putReplicatedCall(call)
 	preferred := route.Replicas[0].Member
 	var joined error
@@ -191,6 +197,9 @@ func (executor *ReplicatedExecutor) QuerySQLTyped(ctx context.Context, route Rep
 			}
 			preferred = 0
 			continue
+		}
+		if directTarget != nil {
+			directTarget.Populated = false
 		}
 		call.Request.Fence = state.Fence
 		reply, err := executor.doReplicatedCall(ctx, endpoint, call)

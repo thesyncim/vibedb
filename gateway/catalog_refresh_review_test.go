@@ -200,9 +200,7 @@ func TestCatalogRefreshReviewFailureReplaysExactRetainedRequest(t *testing.T) {
 			var refreshes int
 			planner := NewExecutor(nil, holder, Options{Refresh: func(context.Context, uint64) (*Snapshot, error) {
 				refreshes++
-				holder.leaseMu.Lock()
-				leased := len(holder.activeLeases)
-				holder.leaseMu.Unlock()
+				leased := holder.DrainStatus(^uint64(0)).ActiveOlderOperations
 				if leased != 0 {
 					t.Error("missing-table planning lease survived into refresh")
 				}

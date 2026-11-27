@@ -27,7 +27,166 @@ func materializeJSONInt64Delta(
 	if _, plural := replication.OpenJSONInt64Deltas(descriptor); plural {
 		return materializeJSONInt64Deltas(document, descriptor, maxBytes)
 	}
+	if _, patch := replication.OpenJSONColumnPatch(descriptor); patch {
+		return materializeJSONColumnPatch(document, descriptor, maxBytes)
+	}
 	return nil, ResultInvalidDocument
+}
+
+type jsonColumnPatchField struct {
+	column   []byte
+	rawJSON  []byte
+	member   int
+	addedKey []byte
+}
+
+// materializeJSONColumnPatch applies all JCP1 direct column assignments
+// simultaneously against the live row at the Raft apply index.
+func materializeJSONColumnPatch(
+	document, descriptor []byte, maxBytes int,
+) ([]byte, uint32) {
+	if maxBytes <= 0 {
+		return nil, ResultInvalidDocument
+	}
+	iterator, ok := replication.OpenJSONColumnPatch(descriptor)
+	if !ok {
+		return nil, ResultInvalidDocument
+	}
+	parsed, err := vibejson.ParseOptions(document, vibejson.Options{ZeroCopy: true})
+	if err != nil {
+		return nil, ResultInvalidDocument
+	}
+	root := parsed.Node()
+	iter, ok := root.ObjectIter()
+	if !ok {
+		return nil, ResultInvalidDocument
+	}
+	var inlineFields [8]jsonColumnPatchField
+	var fields []jsonColumnPatchField
+	if iterator.Remaining() <= len(inlineFields) {
+		fields = inlineFields[:0]
+	} else {
+		fields = make([]jsonColumnPatchField, 0, iterator.Remaining())
+	}
+	for {
+		column, rawJSON, next := iterator.Next()
+		if !next {
+			break
+		}
+		if _, parseErr := vibejson.ParseOptions(rawJSON, vibejson.Options{ZeroCopy: true}); parseErr != nil {
+			return nil, ResultInvalidDocument
+		}
+		fields = append(fields, jsonColumnPatchField{
+			column:  column,
+			rawJSON: rawJSON,
+			member:  -1,
+		})
+	}
+	if len(fields) == 0 {
+		return nil, ResultInvalidDocument
+	}
+	memberCount, _ := root.ObjectLen()
+	var keyScratch [64]byte
+	scratch := keyScratch[:0]
+	for member := 0; ; member++ {
+		key, _, hasNext := iter.NextRaw()
+		if !hasNext {
+			break
+		}
+		for i := range fields {
+			var matched bool
+			scratch, matched = jsonDeltaKeyBytes(key, fields[i].column, scratch)
+			if matched {
+				fields[i].member = member
+			}
+		}
+	}
+	addedCount := 0
+	for i := range fields {
+		if fields[i].member < 0 {
+			colText := string(fields[i].column)
+			addedKey, marshalErr := vibejson.Marshal(&colText)
+			if marshalErr != nil {
+				return nil, ResultInvalidDocument
+			}
+			fields[i].addedKey = addedKey
+			addedCount++
+		}
+	}
+	updatedBytes := 2 // braces
+	totalMembers := memberCount + addedCount
+	if totalMembers > 1 {
+		updatedBytes += totalMembers - 1
+	}
+	iter, _ = root.ObjectIter()
+	for member := 0; ; member++ {
+		key, value, hasNext := iter.NextRaw()
+		if !hasNext {
+			break
+		}
+		valBytes := value.Bytes()
+		for i := range fields {
+			if fields[i].member == member {
+				valBytes = fields[i].rawJSON
+				break
+			}
+		}
+		if !jsonDeltaAddSize(&updatedBytes, len(key.Bytes())+1+len(valBytes), maxBytes) {
+			return nil, ResultTargetBound
+		}
+	}
+	for i := range fields {
+		if fields[i].member >= 0 {
+			continue
+		}
+		if !jsonDeltaAddSize(&updatedBytes, len(fields[i].addedKey)+1+len(fields[i].rawJSON), maxBytes) {
+			return nil, ResultTargetBound
+		}
+	}
+	if updatedBytes > maxBytes {
+		return nil, ResultTargetBound
+	}
+	updated := make([]byte, 0, updatedBytes)
+	updated = append(updated, '{')
+	wrote := 0
+	iter, _ = root.ObjectIter()
+	for member := 0; ; member++ {
+		key, value, hasNext := iter.NextRaw()
+		if !hasNext {
+			break
+		}
+		if wrote != 0 {
+			updated = append(updated, ',')
+		}
+		updated = key.AppendJSON(updated)
+		updated = append(updated, ':')
+		replaced := false
+		for i := range fields {
+			if fields[i].member == member {
+				updated = append(updated, fields[i].rawJSON...)
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			updated = value.AppendJSON(updated)
+		}
+		wrote++
+	}
+	for i := range fields {
+		if fields[i].member >= 0 {
+			continue
+		}
+		if wrote != 0 {
+			updated = append(updated, ',')
+		}
+		updated = append(updated, fields[i].addedKey...)
+		updated = append(updated, ':')
+		updated = append(updated, fields[i].rawJSON...)
+		wrote++
+	}
+	updated = append(updated, '}')
+	return updated, ResultApplied
 }
 
 func materializeJSONInt64DeltaSingle(

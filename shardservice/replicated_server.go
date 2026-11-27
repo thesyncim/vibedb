@@ -780,6 +780,17 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 	sql *ShardRequest,
 	semanticValidated bool,
 ) *ReplicatedResponse {
+	return server.executeReplicatedAuthenticatedCallDirect(ctx, request, authenticated, sql, semanticValidated, nil)
+}
+
+func (server *ReplicatedServer) executeReplicatedAuthenticatedCallDirect(
+	ctx context.Context,
+	request *ReplicatedRequest,
+	authenticated bool,
+	sql *ShardRequest,
+	semanticValidated bool,
+	directSQL *DirectSQLTarget,
+) *ReplicatedResponse {
 	authorizedOwner, fusedProposal := server.owner.(replicatedAuthorizedOwner)
 	fusedProposal = fusedProposal && request.Operation == ReplicatedPropose
 	// QueryLeader normally starts with a status probe so the SQL identity can
@@ -900,7 +911,7 @@ func (server *ReplicatedServer) executeReplicatedAuthenticatedCallValidated(
 		}
 	}
 	if request.Operation == ReplicatedQueryLeader {
-		return server.executeReplicatedQueryCallValidated(ctx, request, state, query, readAuthorize, queryValidated, sql != nil, fusedQuery, concurrentReadAuthorize)
+		return server.executeReplicatedQueryCallDirect(ctx, request, state, query, readAuthorize, queryValidated, sql != nil, fusedQuery, directSQL, concurrentReadAuthorize)
 	}
 	if request.Operation == ReplicatedReadBatchLeader {
 		batchOwner, ok := server.owner.(interface {

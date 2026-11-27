@@ -223,7 +223,7 @@ func (e *Executor) Query(ctx context.Context, q Query) (*Result, error) {
 }
 
 func (e *Executor) queryWithProfile(ctx context.Context, q Query, profile Profile) (*Result, error) {
-	return e.queryWithProfileValidation(ctx, q, profile, -1)
+	return e.queryWithProfileValidation(ctx, q, profile, -1, nil)
 }
 
 // queryPreparedWithProfile is the pgwire read path. postgresStatement already
@@ -238,7 +238,18 @@ func (e *Executor) queryPreparedWithProfile(
 	preparedParams int,
 	cache *preparedQueryExecution,
 ) (*Result, error) {
-	return e.queryWithProfileValidation(ctx, q, profile, preparedParams, cache)
+	return e.queryWithProfileValidation(ctx, q, profile, preparedParams, nil, cache)
+}
+
+func (e *Executor) queryPreparedWithProfileInto(
+	ctx context.Context,
+	q Query,
+	profile Profile,
+	preparedParams int,
+	cache *preparedQueryExecution,
+	directTarget *shardservice.DirectSQLTarget,
+) (*Result, error) {
+	return e.queryWithProfileValidation(ctx, q, profile, preparedParams, directTarget, cache)
 }
 
 func (e *Executor) queryWithProfileValidation(
@@ -246,6 +257,7 @@ func (e *Executor) queryWithProfileValidation(
 	q Query,
 	profile Profile,
 	preparedParams int,
+	directTarget *shardservice.DirectSQLTarget,
 	preparedCache ...*preparedQueryExecution,
 ) (*Result, error) {
 	if ctx == nil {
@@ -459,6 +471,9 @@ func (e *Executor) queryWithProfileValidation(
 		e.observePressureCalls(pl.calls)
 		e.metrics.observeRoute(pl.kind, len(pl.calls), pl.scatter)
 
+		if nativeAttempt != nil && len(pl.calls) == 1 {
+			nativeAttempt.directTarget = directTarget
+		}
 		res, err := e.dispatch(attemptContext, pl, profile)
 		if err == nil {
 			if nativeAttempt != nil {
@@ -950,7 +965,7 @@ func (e *Executor) executeExplain(ctx context.Context, snap *Snapshot, q Query, 
 		inner := q
 		inner.SQL = stripLeadingExplain(q.SQL)
 		started := time.Now()
-		res, runErr := e.queryWithProfileValidation(ctx, inner, profile, -1)
+		res, runErr := e.queryWithProfileValidation(ctx, inner, profile, -1, nil)
 		if runErr != nil {
 			return nil, runErr
 		}
@@ -1153,6 +1168,16 @@ func (e *Executor) single(ctx context.Context, call shardCall, p Profile) (*Resu
 	}
 	if err != nil {
 		return nil, err
+	}
+	if attempt, ok := ctx.Value(replicatedSQLSnapshotKey{}).(*replicatedSQLAttempt); ok &&
+		attempt.directTarget != nil && attempt.directTarget.Populated {
+		rows := uint64(attempt.directTarget.RowCount)
+		bytes := attempt.directTarget.WireBytes
+		if err := checkAggregate(p, rows, bytes); err != nil {
+			return nil, err
+		}
+		e.metrics.observeResult(rows, bytes)
+		return &Result{Kind: resp.Kind}, nil
 	}
 	rows := uint64(len(resp.Rows))
 	bytes := responseBytes(resp)

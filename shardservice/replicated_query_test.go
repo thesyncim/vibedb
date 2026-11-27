@@ -629,7 +629,7 @@ func TestReplicatedSQLPointAdmissionIncludesCatalogFrozenDocumentBound(t *testin
 	}
 	server.frames.limit = charge - 1
 	response, grow := server.executeReplicatedQueryTierCall(
-		t.Context(), request, state, inner, owner, budget, MaxReplicatedSQLResultBytes, nil, false, false,
+		t.Context(), request, state, inner, owner, budget, MaxReplicatedSQLResultBytes, nil, false, false, nil,
 	)
 	if grow || response.Kind != ReplicatedRefusal || response.Refusal != ReplicatedRefusalAdmissionBound {
 		t.Fatalf("under-reserved point response=%+v grow=%v", response, grow)
@@ -642,7 +642,7 @@ func TestReplicatedSQLPointAdmissionIncludesCatalogFrozenDocumentBound(t *testin
 	// classification still releases the complete tier lease.
 	server.frames.limit = charge
 	response, grow = server.executeReplicatedQueryTierCall(
-		t.Context(), request, state, inner, owner, budget, MaxReplicatedSQLResultBytes, nil, false, false,
+		t.Context(), request, state, inner, owner, budget, MaxReplicatedSQLResultBytes, nil, false, false, nil,
 	)
 	if grow || response.Kind != ReplicatedNotLeader {
 		t.Fatalf("exactly reserved point response=%+v grow=%v", response, grow)

@@ -58,10 +58,14 @@ const readEpochDivertClosed = uint32(1) << 31
 // fence and the reader routes to the snapshot-gate slow path, which blocks
 // until the writer publishes. If a reader instead proceeded, its claim
 // preceded the fence store's scan and the scan vetoes the writer's action.
+type readEpochSlot struct {
+	word atomic.Uint64
+	_    [56]byte
+}
+
 type ReadEpochs struct {
 	_     [64]byte
-	slots [readEpochSlots]atomic.Uint64
-	_     [64]byte
+	slots [readEpochSlots]readEpochSlot
 	// divert shares no line with the slots: readers load it on every entry
 	// while only the writer mutates it, so it stays in shared state across
 	// reader cores instead of bouncing with slot claims.
@@ -112,7 +116,7 @@ func (e *ReadEpochs) Enter(generation uint64) (ReadEpoch, bool) {
 	start := epochSlotHint()
 	for probe := uint32(0); probe < readEpochSlots; probe++ {
 		index := (start + probe) % readEpochSlots
-		if e.slots[index].CompareAndSwap(0, word) {
+		if e.slots[index].word.CompareAndSwap(0, word) {
 			return ReadEpoch{owner: e, index: index}, true
 		}
 	}
@@ -134,7 +138,7 @@ func (r ReadEpoch) Exit() {
 	if r.owner == nil {
 		return
 	}
-	r.owner.slots[r.index].Store(0)
+	r.owner.slots[r.index].word.Store(0)
 }
 
 // BeginWriterFence diverts new direct readers to the snapshot-gate slow path.
@@ -163,7 +167,7 @@ func (e *ReadEpochs) AnyActive() bool {
 		return false
 	}
 	for index := range e.slots {
-		if e.slots[index].Load() != 0 {
+		if e.slots[index].word.Load() != 0 {
 			return true
 		}
 	}
@@ -179,7 +183,7 @@ func (e *ReadEpochs) Minimum(current uint64) uint64 {
 		return minimum
 	}
 	for index := range e.slots {
-		word := e.slots[index].Load()
+		word := e.slots[index].word.Load()
 		if word != 0 {
 			if generation := word &^ readEpochActive; generation < minimum {
 				minimum = generation
@@ -198,7 +202,7 @@ func (e *ReadEpochs) Stats(current uint64) ReadEpochStats {
 	}
 	active := uint64(0)
 	for index := range e.slots {
-		word := e.slots[index].Load()
+		word := e.slots[index].word.Load()
 		if word != 0 {
 			active++
 			if generation := word &^ readEpochActive; generation < minimum {
