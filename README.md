@@ -105,9 +105,22 @@ VibeDB is development-grade software with no release, support window, or
 compatibility promise. Its strengths are explicit, tested contracts:
 
 - **Embedded:** serializable transactions across collections, crash-atomic
-  durable commits, and exact indexes that publish with their rows. A generated
-  [capability matrix](docs/capabilities.md) runs the same mutation cases
-  through native Go, `database/sql`, and pgwire.
+  durable commits, exact indexes that publish with their rows, and incremental
+  BM25 full-text search with SHA-256-checksummed `.tin` sidecar persistence. A
+  generated [capability matrix](docs/capabilities.md) runs the same mutation
+  cases through native Go, `database/sql`, and pgwire.
+- **Operations & Observability:** Prometheus `/metrics`, `/healthz`, and
+  `/readyz` HTTP endpoints (gateway counters, lock-free per-P read/write
+  latency histograms, RF3 Raft aggregates, `ResourceGuard` memory/disk
+  watermarks, controller lease status, cluster version window, and live
+  `pgwire` session & `pg_stat_statements` counters); remote TLS + SCRAM-SHA-256
+  PostgreSQL wire support with enforced `statement_timeout`,
+  `idle_in_transaction_session_timeout`, `pg_stat_activity`,
+  `pg_stat_statements`, `pg_cancel_backend`/`pg_terminate_backend`; operator
+  CLI workflows (`vibedb cluster init-operator`, `init-node`, `rotate-cert`,
+  `policy (show|grant|revoke)`, `version --check-peers`, `join`, `rebalance`,
+  `decommission`, `status`); and CAS-fenced active-standby controller lease
+  failover (`internal/controllerlease`).
 - **Distributed:** Linux CI workflows run named fault and scaling scenarios
   against shipped binaries on pull requests:
 
@@ -123,22 +136,25 @@ compatibility promise. Its strengths are explicit, tested contracts:
 
 Key gaps:
 
-- No rolling upgrade, downgrade, or cross-build restore; every process must run
-  one build.
+- Rolling mixed-build upgrades, downgrades, and cross-build restore are not yet
+  qualified end-to-end (`internal/clusterversion` and
+  `vibedb cluster version --check-peers` provide version-window negotiation and
+  pre-flight checks, while production builds still deploy one commit at a time).
 - Online split supports base relations and global-index cut validation and
   multi-relation retained pruning; end-to-end process qualification for globally
   indexed splits and repeated descendant splits is not yet landed.
-- Scaling commands ship together with `vibedb cluster init-operator` and
-  `vibedb cluster init-node` to mint operator profiles, empty-node preparation
-  manifests, and public node descriptors from a cluster CA; external CA
+- Scaling commands ship together with `vibedb cluster init-operator`,
+  `init-node`, `rotate-cert`, and `policy (show|grant|revoke)`; external CA
   management and multi-host process supervision remain operator-provided.
 - No global MVCC snapshot across Raft groups; no Kubernetes operator.
 - Tin search maintains postings incrementally across generations and persists
   checksummed sealed postings in a collection sidecar for zero-scan reopen and
   incremental catch-up, but the active index remains memory-resident.
-- PostgreSQL wire support covers selected client flows, not PostgreSQL
-  compatibility. Several [benchmark reports](docs/benchmarks/README.md) record
-  VibeDB slower than the comparison system.
+- PostgreSQL wire support covers selected client flows (including TLS + SCRAM,
+  `statement_timeout`, `idle_in_transaction_session_timeout`, `pg_stat_activity`,
+  `pg_stat_statements`, and `pg_cancel_backend`/`pg_terminate_backend`), not
+  full PostgreSQL compatibility. Several [benchmark reports](docs/benchmarks/README.md)
+  record VibeDB slower than the comparison system.
 
 [Stability and compatibility](docs/status.md) lists every current limitation,
 and [deployment readiness](docs/operations/production-readiness.md) gives the

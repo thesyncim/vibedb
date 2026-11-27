@@ -10,6 +10,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/clusterversion"
 	"github.com/thesyncim/vibedb/internal/controllerlease"
 	"github.com/thesyncim/vibedb/internal/resourceguard"
+	"github.com/thesyncim/vibedb/pgwire"
 )
 
 func TestObservabilityHandlerHealthzReadyzAndMethodEnforcement(t *testing.T) {
@@ -185,6 +186,41 @@ func TestObservabilityHandlerHealthzReadyzAndMethodEnforcement(t *testing.T) {
 	} {
 		if !strings.Contains(rgBody, want) {
 			t.Fatalf("/metrics missing %q\nfull body:\n%s", want, rgBody)
+		}
+	}
+
+	// 9. PGWire live session & pg_stat_statements metrics are exported on /metrics.
+	hPG := NewObservabilityHandler(ObservabilitySource{
+		PGWire: func() pgwire.MetricsSnapshot {
+			return pgwire.MetricsSnapshot{
+				SessionsActive:          2,
+				SessionsIdle:            5,
+				SessionsIdleInTx:        1,
+				SessionsIdleInTxAborted: 0,
+				StatementsTracked:       14,
+				StatementCallsTotal:     420,
+				StatementRowsTotal:      1200,
+				StatementExecNanosTotal: 2_500_000_000,
+			}
+		},
+	})
+	rec = httptest.NewRecorder()
+	hPG.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /metrics (pgwire) = %d", rec.Code)
+	}
+	pgBody := rec.Body.String()
+	for _, want := range []string{
+		`vibedb_pgwire_sessions{state="active"} 2`,
+		`vibedb_pgwire_sessions{state="idle"} 5`,
+		`vibedb_pgwire_sessions{state="idle_in_transaction"} 1`,
+		`vibedb_pgwire_statements_tracked 14`,
+		`vibedb_pgwire_statement_calls_total 420`,
+		`vibedb_pgwire_statement_rows_total 1200`,
+		`vibedb_pgwire_statement_exec_seconds_total 2.5`,
+	} {
+		if !strings.Contains(pgBody, want) {
+			t.Fatalf("/metrics missing %q\nfull body:\n%s", want, pgBody)
 		}
 	}
 }

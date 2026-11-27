@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/internal/storeio"
+	"github.com/thesyncim/vibedb/pgwire"
 )
 
 func (runtime *Runtime) runServe() {
@@ -103,6 +104,9 @@ func (runtime *Runtime) runServe() {
 		}
 		if runtime.config.ResourceGuard != nil {
 			obsSrc.ResourceGuard = runtime.config.ResourceGuard.Snapshot
+		}
+		if pgMetrics, ok := runtime.pg.(interface{ MetricsSnapshot() pgwire.MetricsSnapshot }); ok {
+			obsSrc.PGWire = pgMetrics.MetricsSnapshot
 		}
 		obsHandler := NewObservabilityHandler(obsSrc)
 		obsSrv, obsLn, obsDone, err := startGatewayObservabilityHTTP(

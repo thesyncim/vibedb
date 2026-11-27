@@ -15,6 +15,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/clusterversion"
 	"github.com/thesyncim/vibedb/internal/controllerlease"
 	"github.com/thesyncim/vibedb/internal/resourceguard"
+	"github.com/thesyncim/vibedb/pgwire"
 )
 
 const (
@@ -38,6 +39,7 @@ type ObservabilitySource struct {
 	ControllerLease func() controllerlease.Status
 	ClusterVersion  func() (local clusterversion.NodeVersion, active clusterversion.Version)
 	ResourceGuard   func() resourceguard.Snapshot
+	PGWire          func() pgwire.MetricsSnapshot
 }
 
 // NewObservabilityHandler builds a bounded, stdlib-only HTTP handler exposing:
@@ -110,6 +112,9 @@ func NewObservabilityHandler(src ObservabilitySource) http.Handler {
 		}
 		if src.ResourceGuard != nil {
 			writePrometheusResourceGuardMetrics(&buf, src.ResourceGuard())
+		}
+		if src.PGWire != nil {
+			writePrometheusPGWireMetrics(&buf, src.PGWire())
 		}
 		localVer := clusterversion.LocalNodeVersion()
 		activeVer := clusterversion.Version{}
@@ -309,6 +314,31 @@ func writePrometheusResourceGuardMetrics(buf *bytes.Buffer, s resourceguard.Snap
 	buf.WriteString("# TYPE vibedb_resource_admission_rejections_total counter\n")
 	fmt.Fprintf(buf, "vibedb_resource_admission_rejections_total{kind=\"memory\"} %d\n", s.MemoryRejections)
 	fmt.Fprintf(buf, "vibedb_resource_admission_rejections_total{kind=\"disk\"} %d\n", s.DiskRejections)
+}
+
+func writePrometheusPGWireMetrics(buf *bytes.Buffer, m pgwire.MetricsSnapshot) {
+	buf.WriteString("# HELP vibedb_pgwire_sessions Active PostgreSQL wire sessions by state.\n")
+	buf.WriteString("# TYPE vibedb_pgwire_sessions gauge\n")
+	fmt.Fprintf(buf, "vibedb_pgwire_sessions{state=\"active\"} %d\n", m.SessionsActive)
+	fmt.Fprintf(buf, "vibedb_pgwire_sessions{state=\"idle\"} %d\n", m.SessionsIdle)
+	fmt.Fprintf(buf, "vibedb_pgwire_sessions{state=\"idle_in_transaction\"} %d\n", m.SessionsIdleInTx)
+	fmt.Fprintf(buf, "vibedb_pgwire_sessions{state=\"idle_in_transaction_aborted\"} %d\n", m.SessionsIdleInTxAborted)
+
+	buf.WriteString("# HELP vibedb_pgwire_statements_tracked Distinct normalized SQL fingerprints currently tracked in pg_stat_statements.\n")
+	buf.WriteString("# TYPE vibedb_pgwire_statements_tracked gauge\n")
+	fmt.Fprintf(buf, "vibedb_pgwire_statements_tracked %d\n", m.StatementsTracked)
+
+	buf.WriteString("# HELP vibedb_pgwire_statement_calls_total Cumulative SQL statement executions recorded by pg_stat_statements.\n")
+	buf.WriteString("# TYPE vibedb_pgwire_statement_calls_total counter\n")
+	fmt.Fprintf(buf, "vibedb_pgwire_statement_calls_total %d\n", m.StatementCallsTotal)
+
+	buf.WriteString("# HELP vibedb_pgwire_statement_rows_total Cumulative SQL rows returned or affected recorded by pg_stat_statements.\n")
+	buf.WriteString("# TYPE vibedb_pgwire_statement_rows_total counter\n")
+	fmt.Fprintf(buf, "vibedb_pgwire_statement_rows_total %d\n", m.StatementRowsTotal)
+
+	buf.WriteString("# HELP vibedb_pgwire_statement_exec_seconds_total Cumulative SQL statement execution time in seconds recorded by pg_stat_statements.\n")
+	buf.WriteString("# TYPE vibedb_pgwire_statement_exec_seconds_total counter\n")
+	fmt.Fprintf(buf, "vibedb_pgwire_statement_exec_seconds_total %s\n", strconv.FormatFloat(float64(m.StatementExecNanosTotal)/1e9, 'f', -1, 64))
 }
 
 func startGatewayObservabilityHTTP(

@@ -724,6 +724,53 @@ func (s *Server) activitySnapshot() []sessionActivity {
 	return out
 }
 
+// MetricsSnapshot is a point-in-time aggregate of live PostgreSQL wire sessions
+// and pg_stat_statements counters suitable for Prometheus exposition.
+type MetricsSnapshot struct {
+	SessionsActive          uint64
+	SessionsIdle            uint64
+	SessionsIdleInTx        uint64
+	SessionsIdleInTxAborted uint64
+	StatementsTracked       uint64
+	StatementCallsTotal     uint64
+	StatementRowsTotal      uint64
+	StatementExecNanosTotal uint64
+}
+
+// MetricsSnapshot returns live session state counts and lock-free cumulative
+// statement execution aggregates for this Server.
+func (s *Server) MetricsSnapshot() MetricsSnapshot {
+	if s == nil {
+		return MetricsSnapshot{}
+	}
+	var out MetricsSnapshot
+	for _, a := range s.activitySnapshot() {
+		switch a.state {
+		case "active":
+			out.SessionsActive++
+		case "idle in transaction":
+			out.SessionsIdleInTx++
+		case "idle in transaction (aborted)":
+			out.SessionsIdleInTxAborted++
+		default:
+			out.SessionsIdle++
+		}
+	}
+	if s.stmtStats != nil {
+		if tbl := s.stmtStats.table.Load(); tbl != nil {
+			out.StatementsTracked = uint64(len(tbl.entries))
+			for _, e := range tbl.entries {
+				out.StatementCallsTotal += e.calls.Load()
+				if r := e.rows.Load(); r > 0 {
+					out.StatementRowsTotal += uint64(r)
+				}
+				out.StatementExecNanosTotal += e.totalNanos.Load()
+			}
+		}
+	}
+	return out
+}
+
 func (s *Server) recordStatementStat(database, user, rawSQL string, dur time.Duration, rows int64) {
 	if s == nil || s.stmtStats == nil {
 		return
