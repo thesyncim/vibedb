@@ -1,14 +1,19 @@
 package query
 
 import (
-	"encoding/json"
+	"bytes"
+	"cmp"
+	"encoding/binary"
 	"fmt"
+	"hash/maphash"
+	"math"
 	"math/big"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 type extAggColumnSpec struct {
@@ -29,19 +34,211 @@ type extAggOrderSpec struct {
 	nullsFirst bool
 }
 
+// extKeyTable is a zero-allocation-on-warm-run open-addressed byte-key hash
+// table backed by a single contiguous byte arena. Entries reference key slices
+// by (offset, length) so arena growth never invalidates stored keys and the
+// table retains no Go pointers inside its per-entry arrays.
+type extKeyTable struct {
+	buckets  []int32
+	hashes   []uint64
+	keyOff   []int
+	keyLen   []int
+	keyArena []byte
+	seed     maphash.Seed
+	seeded   bool
+}
+
+func (t *extKeyTable) reset() {
+	if len(t.hashes) == 0 {
+		return
+	}
+	for i := range t.buckets {
+		t.buckets[i] = -1
+	}
+	t.hashes = t.hashes[:0]
+	t.keyOff = t.keyOff[:0]
+	t.keyLen = t.keyLen[:0]
+	t.keyArena = t.keyArena[:0]
+}
+
+func (t *extKeyTable) release() {
+	t.buckets = nil
+	t.hashes = nil
+	t.keyOff = nil
+	t.keyLen = nil
+	t.keyArena = nil
+}
+
+func (t *extKeyTable) grow(newCap int) {
+	if cap(t.buckets) >= newCap {
+		t.buckets = t.buckets[:newCap]
+	} else {
+		t.buckets = make([]int32, newCap)
+	}
+	for i := range t.buckets {
+		t.buckets[i] = -1
+	}
+	mask := uint64(newCap - 1)
+	for i, h := range t.hashes {
+		slot := h & mask
+		for t.buckets[slot] >= 0 {
+			slot = (slot + 1) & mask
+		}
+		t.buckets[slot] = int32(i)
+	}
+}
+
+func (t *extKeyTable) findOrInsert(key []byte) (int32, bool) {
+	if !t.seeded {
+		t.seed = maphash.MakeSeed()
+		t.seeded = true
+	}
+	if len(t.buckets) == 0 {
+		t.grow(16)
+	}
+	h := maphash.Bytes(t.seed, key)
+	mask := uint64(len(t.buckets) - 1)
+	slot := h & mask
+	for {
+		idx := t.buckets[slot]
+		if idx < 0 {
+			break
+		}
+		if t.hashes[idx] == h {
+			off := t.keyOff[idx]
+			ln := t.keyLen[idx]
+			if ln == len(key) && bytes.Equal(t.keyArena[off:off+ln], key) {
+				return idx, false
+			}
+		}
+		slot = (slot + 1) & mask
+	}
+	if (len(t.hashes)+1)*2 > len(t.buckets) {
+		t.grow(len(t.buckets) * 2)
+		mask = uint64(len(t.buckets) - 1)
+		slot = h & mask
+		for t.buckets[slot] >= 0 {
+			slot = (slot + 1) & mask
+		}
+	}
+	idx := int32(len(t.hashes))
+	off := len(t.keyArena)
+	t.keyArena = append(t.keyArena, key...)
+	t.hashes = append(t.hashes, h)
+	t.keyOff = append(t.keyOff, off)
+	t.keyLen = append(t.keyLen, len(key))
+	t.buckets[slot] = idx
+	return idx, true
+}
+
+func appendExtKeyCell(dst []byte, c Cell) []byte {
+	if c.IsNull() {
+		return append(dst, 0)
+	}
+	dst = append(dst, 1)
+	lenAt := len(dst)
+	dst = append(dst, 0, 0, 0, 0)
+	dst = c.AppendJSON(dst)
+	binary.LittleEndian.PutUint32(dst[lenAt:lenAt+4], uint32(len(dst)-lenAt-4))
+	return dst
+}
+
+func appendExtSingleKeyCell(dst []byte, c Cell) []byte {
+	if c.IsNull() {
+		return append(dst, 0)
+	}
+	dst = append(dst, 1)
+	return c.AppendJSON(dst)
+}
+
+type extAggStrNode struct {
+	off    uint32
+	length uint32
+	next   uint32 // 1-based index into strNodes; 0 = end
+}
+
+type extAggElemNode struct {
+	cell Cell
+	next uint32 // 1-based index into elemNodes; 0 = end
+}
+
+// extAggState holds one aggregate accumulator for one group. The zero value is
+// a valid empty accumulator so clear(ext.states) resets all groups in bulk.
+type extAggState struct {
+	count    int64
+	intSum   int64
+	ratSum   *big.Rat
+	minCell  Cell
+	maxCell  Cell
+	strHead  uint32 // 1-based index into strNodes; 0 = empty
+	strTail  uint32
+	elemHead uint32 // 1-based index into elemNodes; 0 = empty
+	elemTail uint32
+	hasNum   bool
+	useRat   bool
+	hasMin   bool
+	hasMax   bool
+	boolVal  bool
+	hasBool  bool
+}
+
 type statementExtAgg struct {
-	input         *Statement
-	grouped       bool
-	groupCols     []int
-	specs         []extAggColumnSpec
-	visibleCount  int
-	names         []string
-	having        *sqlast.Expr
-	havingColMap  map[*sqlast.Expr]int
-	orderBy       []extAggOrderSpec
-	limit         *sqlast.Operand
-	offset        *sqlast.Operand
+	input        *Statement
+	grouped      bool
+	groupCols    []int
+	specs        []extAggColumnSpec
+	visibleCount int
+	names        []string
+	having       *sqlast.Expr
+	havingColMap map[*sqlast.Expr]int
+	orderBy      []extAggOrderSpec
+	limit        *sqlast.Operand
+	offset       *sqlast.Operand
+
+	// Reusable per-statement execution workspaces, cleared between runs and
+	// released by Statement.Release.
+	inExec        Exec
+	groupTable    extKeyTable
+	distinctTable extKeyTable
+	keyScratch    []byte
+	valArena      []byte
+	groupKeys     []Cell
+	states        []extAggState
+	strArena      []byte
+	strNodes      []extAggStrNode
+	elemNodes     []extAggElemNode
+	finalCells    []Cell
+	surviving     []int32
+	ratScratch    big.Rat
+	ratDivScratch big.Rat
 	result        Result
+}
+
+func (ext *statementExtAgg) release() {
+	if ext == nil {
+		return
+	}
+	if ext.input != nil {
+		ext.input.Release()
+		ext.input = nil
+	}
+	ext.inExec.Release()
+	ext.groupTable.release()
+	ext.distinctTable.release()
+	ext.keyScratch = nil
+	ext.valArena = nil
+	clear(ext.groupKeys)
+	ext.groupKeys = nil
+	clear(ext.states)
+	ext.states = nil
+	ext.strArena = nil
+	ext.strNodes = nil
+	clear(ext.elemNodes)
+	ext.elemNodes = nil
+	clear(ext.finalCells)
+	ext.finalCells = nil
+	ext.surviving = nil
+	ext.result.Release()
 }
 
 func exprHasExtendedAgg(e *sqlast.Expr) bool {
@@ -326,80 +523,117 @@ func prepareExtendedAggregateStatement(
 	return s, nil
 }
 
-type extAggState struct {
-	count   int64
-	sum     *big.Rat
-	hasNum  bool
-	minCell Cell
-	maxCell Cell
-	hasMin  bool
-	hasMax  bool
-	strs    []string
-	elems   []Cell
-	boolVal bool
-	hasBool bool
-	seen    map[string]struct{}
+func (ext *statementExtAgg) resetExecution() {
+	ext.groupTable.reset()
+	ext.distinctTable.reset()
+	clear(ext.groupKeys)
+	ext.groupKeys = ext.groupKeys[:0]
+	clear(ext.states)
+	ext.states = ext.states[:0]
+	ext.strArena = ext.strArena[:0]
+	ext.strNodes = ext.strNodes[:0]
+	clear(ext.elemNodes)
+	ext.elemNodes = ext.elemNodes[:0]
+	clear(ext.finalCells)
+	ext.finalCells = ext.finalCells[:0]
+	ext.surviving = ext.surviving[:0]
+	for i := range ext.result.Columns {
+		clear(ext.result.Columns[i].Cells)
+		ext.result.Columns[i].Cells = ext.result.Columns[i].Cells[:0]
+	}
+	ext.result.RowCount = 0
+	ext.valArena = ext.valArena[:0]
+}
+
+func (ext *statementExtAgg) appendZeroStates(n int) {
+	need := len(ext.states) + n
+	if cap(ext.states) >= need {
+		prev := len(ext.states)
+		ext.states = ext.states[:need]
+		clear(ext.states[prev:need])
+		return
+	}
+	// Grow geometrically so repeated group insertions stay amortized O(1).
+	newCap := cap(ext.states) * 2
+	if newCap < need {
+		newCap = need
+	}
+	grown := make([]extAggState, need, newCap)
+	copy(grown, ext.states)
+	ext.states = grown
 }
 
 func (s *Statement) runExtAggInto(e *Exec, src Source, args []any) (Cursor, error) {
 	ext := s.extAgg
-	inExec := &Exec{Options: e.Options}
-	defer inExec.Release()
-	cursor, err := ext.input.RunInto(inExec, src, args)
+	ext.resetExecution()
+	cancel := e.Options.Cancel
+	if err := cancellationError(cancel); err != nil {
+		return Cursor{}, err
+	}
+
+	ext.inExec.Options = e.Options
+	cursor, err := ext.input.RunInto(&ext.inExec, src, args)
+	e.Stats = ext.inExec.Stats
 	if err != nil {
 		return Cursor{}, err
 	}
 
-	type groupEntry struct {
-		keys   []Cell
-		states []extAggState
-	}
-	var order []string
-	groups := make(map[string]*groupEntry)
+	numSpecs := len(ext.specs)
+	numGroupCols := len(ext.groupCols)
+	singleGroupCol := numGroupCols == 1
+	numGroups := 0
 
-	for cursor.Next() {
-		var gkey string
-		var keyCells []Cell
+	for {
+		ok, err := cursor.NextWithCancel(cancel)
+		if err != nil {
+			return Cursor{}, err
+		}
+		if !ok {
+			break
+		}
+		var gIdx int
 		if ext.grouped {
-			var kb []byte
-			keyCells = make([]Cell, len(ext.groupCols))
-			for i, colIdx := range ext.groupCols {
-				c := cursor.Cell(colIdx)
-				keyCells[i] = cloneCellValue(c)
-				if c.IsNull() {
-					kb = append(kb, 0)
-				} else {
-					kb = append(kb, 1)
-					kb = c.AppendJSON(kb)
-				}
-				kb = append(kb, 0xff)
-			}
-			gkey = string(kb)
-		}
-		entry, exists := groups[gkey]
-		if !exists {
-			states := make([]extAggState, len(ext.specs))
-			for i, sp := range ext.specs {
-				if sp.distinct {
-					states[i].seen = make(map[string]struct{})
+			kb := ext.keyScratch[:0]
+			if singleGroupCol {
+				kb = appendExtSingleKeyCell(kb, cursor.Cell(ext.groupCols[0]))
+			} else {
+				for _, colIdx := range ext.groupCols {
+					kb = appendExtKeyCell(kb, cursor.Cell(colIdx))
 				}
 			}
-			entry = &groupEntry{keys: keyCells, states: states}
-			groups[gkey] = entry
-			order = append(order, gkey)
+			ext.keyScratch = kb
+			idx, inserted := ext.groupTable.findOrInsert(kb)
+			gIdx = int(idx)
+			if inserted {
+				for _, colIdx := range ext.groupCols {
+					var detached Cell
+					detached, ext.valArena = ownResultCellInto(ext.valArena, cursor.Cell(colIdx))
+					ext.groupKeys = append(ext.groupKeys, detached)
+				}
+				ext.appendZeroStates(numSpecs)
+				numGroups++
+			}
+		} else {
+			gIdx = 0
+			if numGroups == 0 {
+				ext.appendZeroStates(numSpecs)
+				numGroups = 1
+			}
 		}
-		for i, sp := range ext.specs {
+
+		stateBase := gIdx * numSpecs
+		for i := range numSpecs {
+			sp := &ext.specs[i]
 			if sp.isGroupKey {
 				continue
 			}
 			if sp.filterCol >= 0 {
-				fc := cursor.Cell(sp.filterCol)
-				b, ok := fc.Bool()
+				b, ok := cursor.Cell(sp.filterCol).Bool()
 				if !ok || !b {
 					continue
 				}
 			}
-			st := &entry.states[i]
+			st := &ext.states[stateBase+i]
 			if sp.agg == sqlast.AggCount && sp.inputCol < 0 {
 				st.count++
 				continue
@@ -409,44 +643,57 @@ func (s *Statement) runExtAggInto(e *Exec, src Source, args []any) (Cursor, erro
 				continue
 			}
 			if sp.distinct {
-				rawKey := string(cell.AppendJSON(nil))
-				if _, dup := st.seen[rawKey]; dup {
+				dk := ext.keyScratch[:0]
+				dk = binary.LittleEndian.AppendUint32(dk, uint32(gIdx))
+				dk = binary.LittleEndian.AppendUint16(dk, uint16(i))
+				dk = cell.AppendJSON(dk)
+				ext.keyScratch = dk
+				if _, inserted := ext.distinctTable.findOrInsert(dk); !inserted {
 					continue
 				}
-				st.seen[rawKey] = struct{}{}
 			}
 			switch sp.agg {
 			case sqlast.AggCount:
 				st.count++
 			case sqlast.AggSum, sqlast.AggAvg:
-				if r, ok := cellToRat(cell); ok {
-					if st.sum == nil {
-						st.sum = new(big.Rat)
-					}
-					st.sum.Add(st.sum, r)
-					st.count++
-					st.hasNum = true
-				}
+				ext.accumulateNumber(st, cell)
 			case sqlast.AggMin:
 				if !st.hasMin || compareExtAggCells(cell, st.minCell) < 0 {
-					st.minCell = cloneCellValue(cell)
+					st.minCell, ext.valArena = ownResultCellInto(ext.valArena, cell)
 					st.hasMin = true
 				}
 			case sqlast.AggMax:
 				if !st.hasMax || compareExtAggCells(cell, st.maxCell) > 0 {
-					st.maxCell = cloneCellValue(cell)
+					st.maxCell, ext.valArena = ownResultCellInto(ext.valArena, cell)
 					st.hasMax = true
 				}
 			case sqlast.AggStringAgg:
-				raw := cell.AppendJSON(nil)
-				var unq string
-				if cell.Type() == TypeString && json.Unmarshal(raw, &unq) == nil {
-					st.strs = append(st.strs, unq)
+				off := uint32(len(ext.strArena))
+				if tb, ok := cell.TextBytes(); ok {
+					ext.strArena = append(ext.strArena, tb...)
 				} else {
-					st.strs = append(st.strs, string(raw))
+					ext.strArena = cell.AppendJSON(ext.strArena)
 				}
+				ln := uint32(len(ext.strArena)) - off
+				nodeID := uint32(len(ext.strNodes)) + 1
+				ext.strNodes = append(ext.strNodes, extAggStrNode{off: off, length: ln})
+				if st.strHead == 0 {
+					st.strHead = nodeID
+				} else {
+					ext.strNodes[st.strTail-1].next = nodeID
+				}
+				st.strTail = nodeID
 			case sqlast.AggArrayAgg, sqlast.AggJsonAgg:
-				st.elems = append(st.elems, cloneCellValue(cell))
+				var detached Cell
+				detached, ext.valArena = ownResultCellInto(ext.valArena, cell)
+				nodeID := uint32(len(ext.elemNodes)) + 1
+				ext.elemNodes = append(ext.elemNodes, extAggElemNode{cell: detached})
+				if st.elemHead == 0 {
+					st.elemHead = nodeID
+				} else {
+					ext.elemNodes[st.elemTail-1].next = nodeID
+				}
+				st.elemTail = nodeID
 			case sqlast.AggBoolAnd:
 				if b, ok := cell.Bool(); ok {
 					if !st.hasBool {
@@ -469,120 +716,78 @@ func (s *Statement) runExtAggInto(e *Exec, src Source, args []any) (Cursor, erro
 		}
 	}
 
-	if !ext.grouped && len(order) == 0 {
-		states := make([]extAggState, len(ext.specs))
-		groups[""] = &groupEntry{states: states}
-		order = append(order, "")
+	if !ext.grouped && numGroups == 0 {
+		ext.appendZeroStates(numSpecs)
+		numGroups = 1
 	}
 
-	// Build finalized rows so we can filter HAVING and sort/slice cleanly.
-	rows := make([][]Cell, 0, len(order))
-	for _, gkey := range order {
-		entry := groups[gkey]
-		row := make([]Cell, len(ext.specs))
-		for i, sp := range ext.specs {
+	// Finalize all groups into a flat matrix so HAVING and ORDER BY operate
+	// without per-row slice allocations.
+	totalFinal := numGroups * numSpecs
+	if cap(ext.finalCells) < totalFinal {
+		ext.finalCells = make([]Cell, totalFinal)
+	} else {
+		ext.finalCells = ext.finalCells[:totalFinal]
+	}
+
+	for g := range numGroups {
+		if err := cancellationCheckpoint(cancel, g); err != nil {
+			return Cursor{}, err
+		}
+		base := g * numSpecs
+		row := ext.finalCells[base : base+numSpecs]
+		keyBase := g * numGroupCols
+		for i := range numSpecs {
+			sp := &ext.specs[i]
 			if sp.isGroupKey {
-				if sp.groupKeyIdx >= 0 && sp.groupKeyIdx < len(entry.keys) {
-					row[i] = entry.keys[sp.groupKeyIdx]
+				if sp.groupKeyIdx >= 0 && sp.groupKeyIdx < numGroupCols {
+					row[i] = ext.groupKeys[keyBase+sp.groupKeyIdx]
 				} else {
 					row[i] = NullCell()
 				}
 				continue
 			}
-			st := &entry.states[i]
-			switch sp.agg {
-			case sqlast.AggCount:
-				c, _ := ParseJSONCell([]byte(strconv.FormatInt(st.count, 10)))
-				row[i] = c
-			case sqlast.AggSum:
-				if !st.hasNum {
-					row[i] = NullCell()
-				} else {
-					row[i] = ratToCell(st.sum)
-				}
-			case sqlast.AggAvg:
-				if !st.hasNum || st.count == 0 {
-					row[i] = NullCell()
-				} else {
-					avg := new(big.Rat).Quo(st.sum, big.NewRat(st.count, 1))
-					row[i] = ratToCell(avg)
-				}
-			case sqlast.AggMin:
-				if !st.hasMin {
-					row[i] = NullCell()
-				} else {
-					row[i] = st.minCell
-				}
-			case sqlast.AggMax:
-				if !st.hasMax {
-					row[i] = NullCell()
-				} else {
-					row[i] = st.maxCell
-				}
-			case sqlast.AggStringAgg:
-				if len(st.strs) == 0 {
-					row[i] = NullCell()
-				} else {
-					b, _ := json.Marshal(strings.Join(st.strs, sp.separator))
-					c, _ := ParseJSONCell(b)
-					row[i] = c
-				}
-			case sqlast.AggArrayAgg, sqlast.AggJsonAgg:
-				if len(st.elems) == 0 {
-					row[i] = NullCell()
-				} else {
-					var buf []byte
-					buf = append(buf, '[')
-					for idx, el := range st.elems {
-						if idx > 0 {
-							buf = append(buf, ',')
-						}
-						buf = el.AppendJSON(buf)
-					}
-					buf = append(buf, ']')
-					c, _ := ParseJSONCell(buf)
-					row[i] = c
-				}
-			case sqlast.AggBoolAnd, sqlast.AggBoolOr:
-				if !st.hasBool {
-					row[i] = NullCell()
-				} else if st.boolVal {
-					c, _ := ParseJSONCell([]byte("true"))
-					row[i] = c
-				} else {
-					c, _ := ParseJSONCell([]byte("false"))
-					row[i] = c
-				}
-			}
+			st := &ext.states[base+i]
+			row[i] = ext.finalizeState(sp, st)
 		}
-		if ext.having != nil && !evalExtAggHaving(ext.having, row, ext.havingColMap, args) {
+		if ext.having != nil && !ext.evalHaving(ext.having, row, args) {
 			continue
 		}
-		rows = append(rows, row)
+		ext.surviving = append(ext.surviving, int32(g))
 	}
 
-	if len(ext.orderBy) > 0 {
-		sort.SliceStable(rows, func(i, j int) bool {
+	surviving := ext.surviving
+	if len(ext.orderBy) > 0 && len(surviving) > 1 {
+		slices.SortStableFunc(surviving, func(a, b int32) int {
+			rowA := ext.finalCells[int(a)*numSpecs:]
+			rowB := ext.finalCells[int(b)*numSpecs:]
 			for _, ord := range ext.orderBy {
-				a, b := rows[i][ord.colIdx], rows[j][ord.colIdx]
-				if a.IsNull() && b.IsNull() {
+				ca, cb := rowA[ord.colIdx], rowB[ord.colIdx]
+				aNull, bNull := ca.IsNull(), cb.IsNull()
+				if aNull && bNull {
 					continue
 				}
-				if a.IsNull() {
-					return ord.nullsFirst
-				}
-				if b.IsNull() {
-					return !ord.nullsFirst
-				}
-				cmp := compareExtAggCells(a, b)
-				if cmp != 0 {
-					if ord.desc {
-						return cmp > 0
+				if aNull {
+					if ord.nullsFirst {
+						return -1
 					}
-					return cmp < 0
+					return 1
+				}
+				if bNull {
+					if ord.nullsFirst {
+						return 1
+					}
+					return -1
+				}
+				c := compareExtAggCells(ca, cb)
+				if c != 0 {
+					if ord.desc {
+						return -c
+					}
+					return c
 				}
 			}
-			return false
+			return 0
 		})
 	}
 
@@ -592,10 +797,10 @@ func (s *Statement) runExtAggInto(e *Exec, src Source, args []any) (Cursor, erro
 			return Cursor{}, err
 		}
 		if off > 0 {
-			if off >= len(rows) {
-				rows = nil
+			if off >= len(surviving) {
+				surviving = nil
 			} else {
-				rows = rows[off:]
+				surviving = surviving[off:]
 			}
 		}
 	}
@@ -604,58 +809,253 @@ func (s *Statement) runExtAggInto(e *Exec, src Source, args []any) (Cursor, erro
 		if err != nil {
 			return Cursor{}, err
 		}
-		if lim >= 0 && lim < len(rows) {
-			rows = rows[:lim]
+		if lim >= 0 && lim < len(surviving) {
+			surviving = surviving[:lim]
 		}
 	}
 
 	out := &ext.result
-	out.RowCount = len(rows)
+	out.RowCount = len(surviving)
 	vis := ext.visibleCount
 	if vis == 0 {
-		vis = len(ext.specs)
+		vis = numSpecs
 	}
-	out.Columns = make([]ResultColumn, vis)
+	if len(out.Columns) != vis {
+		out.Columns = make([]ResultColumn, vis)
+	}
 	for i := range vis {
-		sp := ext.specs[i]
-		cells := make([]Cell, len(rows))
-		for r, row := range rows {
-			cells[r] = row[i]
+		out.Columns[i].Header = ext.specs[i].header
+		cells := out.Columns[i].Cells
+		if cap(cells) < len(surviving) {
+			cells = make([]Cell, len(surviving))
+		} else {
+			cells = cells[:len(surviving)]
 		}
-		out.Columns[i] = ResultColumn{
-			Header: sp.header,
-			Cells:  cells,
+		for r, g := range surviving {
+			cells[r] = ext.finalCells[int(g)*numSpecs+i]
 		}
+		out.Columns[i].Cells = cells
 	}
 	return NewResultCursor(out)
 }
 
-func evalExtAggHaving(e *sqlast.Expr, row []Cell, colMap map[*sqlast.Expr]int, args []any) bool {
+func (ext *statementExtAgg) accumulateNumber(st *extAggState, cell Cell) {
+	if cell.Type() != TypeNumber {
+		return
+	}
+	if !st.useRat {
+		if iv, ok := cell.Int64(); ok {
+			sum := st.intSum + iv
+			if (iv > 0 && sum < st.intSum) || (iv < 0 && sum > st.intSum) {
+				// Signed int64 overflow: promote to exact big.Rat.
+				st.ratSum = new(big.Rat).SetInt64(st.intSum)
+				st.useRat = true
+				ext.ratScratch.SetInt64(iv)
+				st.ratSum.Add(st.ratSum, &ext.ratScratch)
+			} else {
+				st.intSum = sum
+			}
+			st.count++
+			st.hasNum = true
+			return
+		}
+	}
+	// Exact rational fallback for fractional or out-of-range numbers.
+	if iv, ok := cell.Int64(); ok {
+		ext.ratScratch.SetInt64(iv)
+	} else {
+		var scratch [64]byte
+		raw := cell.Payload()
+		if raw == nil {
+			raw = cell.AppendJSON(scratch[:0])
+		}
+		if _, ok := ext.ratScratch.SetString(byteview.String(raw)); !ok {
+			return
+		}
+	}
+	if !st.useRat {
+		st.ratSum = new(big.Rat)
+		if st.hasNum {
+			st.ratSum.SetInt64(st.intSum)
+		}
+		st.useRat = true
+	}
+	st.ratSum.Add(st.ratSum, &ext.ratScratch)
+	st.count++
+	st.hasNum = true
+}
+
+func (ext *statementExtAgg) finalizeState(sp *extAggColumnSpec, st *extAggState) Cell {
+	switch sp.agg {
+	case sqlast.AggCount:
+		return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(st.count)}
+	case sqlast.AggSum:
+		if !st.hasNum {
+			return NullCell()
+		}
+		if !st.useRat {
+			return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(st.intSum)}
+		}
+		return ratToCellInto(st.ratSum, &ext.valArena)
+	case sqlast.AggAvg:
+		if !st.hasNum || st.count == 0 {
+			return NullCell()
+		}
+		if !st.useRat {
+			if st.intSum%st.count == 0 {
+				return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(st.intSum / st.count)}
+			}
+			const exactFloatIntLimit = int64(1) << 53
+			if st.intSum >= -exactFloatIntLimit && st.intSum <= exactFloatIntLimit && st.count <= exactFloatIntLimit {
+				f := float64(st.intSum) / float64(st.count)
+				return Cell{kind: TypeNumber, word: math.Float64bits(f)}
+			}
+			ext.ratScratch.SetFrac64(st.intSum, st.count)
+			return ratToCellInto(&ext.ratScratch, &ext.valArena)
+		}
+		ext.ratDivScratch.SetInt64(st.count)
+		ext.ratScratch.Quo(st.ratSum, &ext.ratDivScratch)
+		return ratToCellInto(&ext.ratScratch, &ext.valArena)
+	case sqlast.AggMin:
+		if !st.hasMin {
+			return NullCell()
+		}
+		return st.minCell
+	case sqlast.AggMax:
+		if !st.hasMax {
+			return NullCell()
+		}
+		return st.maxCell
+	case sqlast.AggStringAgg:
+		if st.strHead == 0 {
+			return NullCell()
+		}
+		rawStart := len(ext.valArena)
+		ext.valArena = append(ext.valArena, '"')
+		escaped := false
+		sepBytes := byteview.Bytes(sp.separator)
+		first := true
+		for idx := st.strHead; idx != 0; idx = ext.strNodes[idx-1].next {
+			if !first && len(sepBytes) > 0 {
+				var sepEsc bool
+				ext.valArena, sepEsc = appendJSONStringContent(ext.valArena, sepBytes)
+				escaped = escaped || sepEsc
+			}
+			first = false
+			nd := ext.strNodes[idx-1]
+			var segEsc bool
+			ext.valArena, segEsc = appendJSONStringContent(ext.valArena, ext.strArena[nd.off:nd.off+nd.length])
+			escaped = escaped || segEsc
+		}
+		ext.valArena = append(ext.valArena, '"')
+		raw := ext.valArena[rawStart:len(ext.valArena):len(ext.valArena)]
+		var text string
+		if !escaped {
+			text = byteview.String(raw[1 : len(raw)-1])
+		} else {
+			textStart := len(ext.valArena)
+			first = true
+			for idx := st.strHead; idx != 0; idx = ext.strNodes[idx-1].next {
+				if !first && len(sepBytes) > 0 {
+					ext.valArena = append(ext.valArena, sepBytes...)
+				}
+				first = false
+				nd := ext.strNodes[idx-1]
+				ext.valArena = append(ext.valArena, ext.strArena[nd.off:nd.off+nd.length]...)
+			}
+			text = byteview.String(ext.valArena[textStart:len(ext.valArena):len(ext.valArena)])
+		}
+		return Cell{kind: TypeString, raw: raw, text: text}
+	case sqlast.AggArrayAgg, sqlast.AggJsonAgg:
+		if st.elemHead == 0 {
+			return NullCell()
+		}
+		start := len(ext.valArena)
+		ext.valArena = append(ext.valArena, '[')
+		first := true
+		for idx := st.elemHead; idx != 0; idx = ext.elemNodes[idx-1].next {
+			if !first {
+				ext.valArena = append(ext.valArena, ',')
+			}
+			first = false
+			ext.valArena = ext.elemNodes[idx-1].cell.AppendJSON(ext.valArena)
+		}
+		ext.valArena = append(ext.valArena, ']')
+		return Cell{kind: TypeJSON, raw: ext.valArena[start:len(ext.valArena):len(ext.valArena)]}
+	case sqlast.AggBoolAnd, sqlast.AggBoolOr:
+		if !st.hasBool {
+			return NullCell()
+		}
+		if st.boolVal {
+			return Cell{kind: TypeBool, flag: cellTrue, raw: trueBytes}
+		}
+		return Cell{kind: TypeBool, raw: falseBytes}
+	default:
+		return NullCell()
+	}
+}
+
+func appendJSONStringContent(dst []byte, s []byte) ([]byte, bool) {
+	const hex = "0123456789abcdef"
+	escaped := false
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 0x20 && c != '"' && c != '\\' {
+			continue
+		}
+		escaped = true
+		if i > start {
+			dst = append(dst, s[start:i]...)
+		}
+		switch c {
+		case '"':
+			dst = append(dst, '\\', '"')
+		case '\\':
+			dst = append(dst, '\\', '\\')
+		case '\n':
+			dst = append(dst, '\\', 'n')
+		case '\r':
+			dst = append(dst, '\\', 'r')
+		case '\t':
+			dst = append(dst, '\\', 't')
+		default:
+			dst = append(dst, '\\', 'u', '0', '0', hex[c>>4], hex[c&0xf])
+		}
+		start = i + 1
+	}
+	if start < len(s) {
+		dst = append(dst, s[start:]...)
+	}
+	return dst, escaped
+}
+
+func (ext *statementExtAgg) evalHaving(e *sqlast.Expr, row []Cell, args []any) bool {
 	if e == nil {
 		return true
 	}
 	switch e.Kind {
 	case sqlast.ExprAnd:
 		for _, kid := range e.Kids {
-			if !evalExtAggHaving(kid, row, colMap, args) {
+			if !ext.evalHaving(kid, row, args) {
 				return false
 			}
 		}
 		return true
 	case sqlast.ExprOr:
 		for _, kid := range e.Kids {
-			if evalExtAggHaving(kid, row, colMap, args) {
+			if ext.evalHaving(kid, row, args) {
 				return true
 			}
 		}
 		return false
 	case sqlast.ExprNot:
 		if len(e.Kids) == 1 {
-			return !evalExtAggHaving(e.Kids[0], row, colMap, args)
+			return !ext.evalHaving(e.Kids[0], row, args)
 		}
 		return false
 	}
-	colIdx, ok := colMap[e]
+	colIdx, ok := ext.havingColMap[e]
 	if !ok || colIdx < 0 || colIdx >= len(row) {
 		return false
 	}
@@ -674,20 +1074,20 @@ func evalExtAggHaving(e *sqlast.Expr, row []Cell, colMap map[*sqlast.Expr]int, a
 		if !rok || right.IsNull() {
 			return false
 		}
-		cmp := compareExtAggCells(left, right)
+		c := compareExtAggCells(left, right)
 		switch e.Op {
 		case sqlast.OpEq:
-			return cmp == 0
+			return c == 0
 		case sqlast.OpNe:
-			return cmp != 0
+			return c != 0
 		case sqlast.OpLt:
-			return cmp < 0
+			return c < 0
 		case sqlast.OpLe:
-			return cmp <= 0
+			return c <= 0
 		case sqlast.OpGt:
-			return cmp > 0
+			return c > 0
 		case sqlast.OpGe:
-			return cmp >= 0
+			return c >= 0
 		}
 	case sqlast.ExprBetween:
 		if left.IsNull() || len(e.List) < 2 {
@@ -728,35 +1128,122 @@ func operandToExtAggCell(op sqlast.Operand, args []any) (Cell, bool) {
 	case sqlast.OperandNull:
 		return NullCell(), true
 	case sqlast.OperandNumber:
-		c, err := ParseJSONCell([]byte(op.Text))
-		return c, err == nil
+		if v, err := strconv.ParseInt(op.Text, 10, 64); err == nil {
+			return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(v)}, true
+		}
+		return Cell{kind: TypeNumber, flag: cellNumberRaw, raw: byteview.Bytes(op.Text)}, true
 	case sqlast.OperandBool:
 		if op.Bool {
-			c, err := ParseJSONCell([]byte("true"))
-			return c, err == nil
+			return Cell{kind: TypeBool, flag: cellTrue, raw: trueBytes}, true
 		}
-		c, err := ParseJSONCell([]byte("false"))
-		return c, err == nil
+		return Cell{kind: TypeBool, raw: falseBytes}, true
 	case sqlast.OperandString:
-		b, err := json.Marshal(op.Text)
-		if err != nil {
-			return Cell{}, false
-		}
-		c, err := ParseJSONCell(b)
-		return c, err == nil
+		return Cell{kind: TypeString, text: op.Text}, true
 	case sqlast.OperandParam:
 		if op.Ordinal < 0 || op.Ordinal >= len(args) {
 			return Cell{}, false
 		}
-		v := args[op.Ordinal]
-		if v == nil {
+		return paramToExtAggCell(args[op.Ordinal])
+	}
+	return Cell{}, false
+}
+
+func paramToExtAggCell(v any) (Cell, bool) {
+	if v == nil {
+		return NullCell(), true
+	}
+	switch x := v.(type) {
+	case bool:
+		if x {
+			return Cell{kind: TypeBool, flag: cellTrue, raw: trueBytes}, true
+		}
+		return Cell{kind: TypeBool, raw: falseBytes}, true
+	case *bool:
+		if x == nil {
 			return NullCell(), true
 		}
-		b, err := json.Marshal(v)
-		if err != nil {
+		if *x {
+			return Cell{kind: TypeBool, flag: cellTrue, raw: trueBytes}, true
+		}
+		return Cell{kind: TypeBool, raw: falseBytes}, true
+	case int:
+		return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(int64(x))}, true
+	case int64:
+		return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(x)}, true
+	case *int64:
+		if x == nil {
+			return NullCell(), true
+		}
+		return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(*x)}, true
+	case int32:
+		return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(int64(x))}, true
+	case int16:
+		return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(int64(x))}, true
+	case int8:
+		return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(int64(x))}, true
+	case uint64:
+		if x <= math.MaxInt64 {
+			return Cell{kind: TypeNumber, flag: cellInteger, word: x}, true
+		}
+		return Cell{kind: TypeNumber, flag: cellNumberRaw, raw: strconv.AppendUint(nil, x, 10)}, true
+	case uint:
+		if uint64(x) <= math.MaxInt64 {
+			return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(x)}, true
+		}
+		return Cell{kind: TypeNumber, flag: cellNumberRaw, raw: strconv.AppendUint(nil, uint64(x), 10)}, true
+	case uint32:
+		return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(x)}, true
+	case uint16:
+		return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(x)}, true
+	case uint8:
+		return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(x)}, true
+	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) {
 			return Cell{}, false
 		}
-		c, err := ParseJSONCell(b)
+		return Cell{kind: TypeNumber, word: math.Float64bits(x)}, true
+	case *float64:
+		if x == nil {
+			return NullCell(), true
+		}
+		if math.IsNaN(*x) || math.IsInf(*x, 0) {
+			return Cell{}, false
+		}
+		return Cell{kind: TypeNumber, word: math.Float64bits(*x)}, true
+	case float32:
+		f := float64(x)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return Cell{}, false
+		}
+		return Cell{kind: TypeNumber, word: math.Float64bits(f)}, true
+	case string:
+		return Cell{kind: TypeString, text: x}, true
+	case *string:
+		if x == nil {
+			return NullCell(), true
+		}
+		return Cell{kind: TypeString, text: *x}, true
+	case Number:
+		if iv, err := strconv.ParseInt(string(x), 10, 64); err == nil {
+			return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(iv)}, true
+		}
+		if !validJSONNumber(string(x)) {
+			return Cell{}, false
+		}
+		return Cell{kind: TypeNumber, flag: cellNumberRaw, raw: byteview.Bytes(string(x))}, true
+	case *Number:
+		if x == nil {
+			return NullCell(), true
+		}
+		if iv, err := strconv.ParseInt(string(*x), 10, 64); err == nil {
+			return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(iv)}, true
+		}
+		if !validJSONNumber(string(*x)) {
+			return Cell{}, false
+		}
+		return Cell{kind: TypeNumber, flag: cellNumberRaw, raw: byteview.Bytes(string(*x))}, true
+	case []byte:
+		c, err := ParseJSONCell(x)
 		return c, err == nil
 	}
 	return Cell{}, false
@@ -776,79 +1263,66 @@ func resolveExtAggIntOperand(op *sqlast.Operand, args []any) (int, error) {
 			return v, nil
 		case int64:
 			return int(v), nil
+		case *int64:
+			if v != nil {
+				return int(*v), nil
+			}
 		case float64:
 			return int(v), nil
+		case Number:
+			return strconv.Atoi(string(v))
 		}
 	}
 	return 0, nil
 }
 
-func cellToRat(c Cell) (*big.Rat, bool) {
-	if c.Type() != TypeNumber {
-		return nil, false
-	}
-	r, ok := new(big.Rat).SetString(string(c.AppendJSON(nil)))
-	return r, ok
-}
-
-func ratToCell(r *big.Rat) Cell {
+func ratToCellInto(r *big.Rat, arena *[]byte) Cell {
 	if r.IsInt() {
-		c, _ := ParseJSONCell([]byte(r.Num().String()))
-		return c
+		num := r.Num()
+		if num.IsInt64() {
+			return Cell{kind: TypeNumber, flag: cellInteger, word: uint64(num.Int64())}
+		}
+		start := len(*arena)
+		*arena = num.Append(*arena, 10)
+		raw := (*arena)[start:len(*arena):len(*arena)]
+		return Cell{kind: TypeNumber, flag: cellNumberRaw, raw: raw}
 	}
 	f, _ := r.Float64()
-	c, _ := ParseJSONCell([]byte(strconv.FormatFloat(f, 'g', -1, 64)))
-	return c
-}
-
-func cloneCellValue(c Cell) Cell {
-	if c.IsNull() {
-		return NullCell()
-	}
-	raw := c.AppendJSON(nil)
-	cloned, err := ParseJSONCell(raw)
-	if err != nil {
-		return NullCell()
-	}
-	return cloned
+	return Cell{kind: TypeNumber, word: math.Float64bits(f)}
 }
 
 func compareExtAggCells(a, b Cell) int {
-	if a.Type() == TypeNumber && b.Type() == TypeNumber {
-		ra, oka := cellToRat(a)
-		rb, okb := cellToRat(b)
-		if oka && okb {
-			return ra.Cmp(rb)
+	if a.kind == TypeNumber && b.kind == TypeNumber {
+		if a.flag&cellInteger != 0 && b.flag&cellInteger != 0 {
+			return cmp.Compare(int64(a.word), int64(b.word))
 		}
+		var scratchA, scratchB [64]byte
+		ba := a.raw
+		if ba == nil {
+			ba = a.AppendJSON(scratchA[:0])
+		}
+		bb := b.raw
+		if bb == nil {
+			bb = b.AppendJSON(scratchB[:0])
+		}
+		return compareNumberBytes(ba, bb)
 	}
-	if a.Type() == TypeString && b.Type() == TypeString {
-		sa, sb := a.String(), b.String()
-		if sa < sb {
-			return -1
-		}
-		if sa > sb {
-			return 1
-		}
-		return 0
+	if a.kind == TypeString && b.kind == TypeString {
+		return cmp.Compare(a.text, b.text)
 	}
-	if ba, oka := a.Bool(); oka {
-		if bb, okb := b.Bool(); okb {
-			if !ba && bb {
-				return -1
-			}
-			if ba && !bb {
-				return 1
-			}
+	if a.kind == TypeBool && b.kind == TypeBool {
+		ba := a.flag&cellTrue != 0
+		bb := b.flag&cellTrue != 0
+		if ba == bb {
 			return 0
 		}
-	}
-	sa := string(a.AppendJSON(nil))
-	sb := string(b.AppendJSON(nil))
-	if sa < sb {
-		return -1
-	}
-	if sa > sb {
+		if !ba {
+			return -1
+		}
 		return 1
 	}
-	return 0
+	var scratchA, scratchB [64]byte
+	ba := a.AppendJSON(scratchA[:0])
+	bb := b.AppendJSON(scratchB[:0])
+	return bytes.Compare(ba, bb)
 }

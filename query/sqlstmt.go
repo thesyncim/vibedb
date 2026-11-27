@@ -1036,13 +1036,13 @@ func (s *Statement) Release() {
 	if s == nil {
 		return
 	}
-	if s.distinctOn != nil && s.distinctOn.input != nil {
-		s.distinctOn.input.Release()
-		s.distinctOn.input = nil
+	if s.distinctOn != nil {
+		s.distinctOn.release()
+		s.distinctOn = nil
 	}
-	if s.extAgg != nil && s.extAgg.input != nil {
-		s.extAgg.input.Release()
-		s.extAgg.input = nil
+	if s.extAgg != nil {
+		s.extAgg.release()
+		s.extAgg = nil
 	}
 	s.c.release()
 	if s.nested != nil {
