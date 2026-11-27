@@ -784,8 +784,46 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			t.Fatalf("accepted new-leader removal did not settle: %v", settleErr)
 		}
 	} else {
+		// Wait for the promoted target voter to catch up through the committed
+		// ownership transition before proposing source removal; otherwise the
+		// leader legitimately refuses removal with ErrMembershipStale while the
+		// target still lags behind status.Commit.
+		if leaderState.LeaderID != target.MemberID {
+			removeObserveRequest := replicacontrol.Request{
+				Operation: sha256.Sum256(removeRequest.TransitionID[:]), Step: [32]byte{0x6d, byte(removeRequest.Kind)},
+				Group: group, TargetMember: target.MemberID,
+				ExpectedReplicaSetVersion: leaderState.Fence.Command.ReplicaSetVersion,
+			}
+			leaderNode := rf4Nodes[leaderState.LeaderID-1]
+			var removeLeaderObs replicacontrol.Observation
+			var obsErr error
+			targetCaughtUp := false
+			for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+				removeLeaderObs, obsErr = observationClient.Observe(t.Context(), leaderNode, removeObserveRequest)
+				if obsErr == nil && removeLeaderObs.Status.LeaderID != 0 && removeLeaderObs.Status.LeaderID != leaderState.LeaderID {
+					if removeLeaderObs.Status.LeaderID == target.MemberID {
+						targetCaughtUp = true
+						break
+					}
+					if removeLeaderObs.Status.LeaderID >= 1 && int(removeLeaderObs.Status.LeaderID) <= len(rf4Nodes) {
+						leaderNode = rf4Nodes[removeLeaderObs.Status.LeaderID-1]
+					}
+				}
+				if obsErr == nil && removeLeaderObs.ProgressFound &&
+					!removeLeaderObs.Progress.Learner && removeLeaderObs.Progress.RecentActive &&
+					removeLeaderObs.Progress.PendingSnapshot == 0 &&
+					removeLeaderObs.Progress.Match >= leaderState.Commit {
+					targetCaughtUp = true
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if !targetCaughtUp {
+				t.Fatalf("target voter did not catch up before removal: obs=%+v err=%v", removeLeaderObs, obsErr)
+			}
+		}
 		_ = rf3CommandApplyMembershipWithProbeCommand(
-			t, servingAddresses, servingNodes, clientProfile, observationClient, authorityIdentity, group,
+			t, rf4Addresses, rf4Nodes, clientProfile, observationClient, authorityIdentity, group,
 			rf3CommandStoreIdentity(1).AllocationGeneration, removeRequest, leaderState.Fence.Command,
 		)
 	}
@@ -800,6 +838,14 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 		t.Fatalf("final RF3 did not advance membership: %+v", finalState)
 	}
 	finalReplicaSetVersion := finalState.Fence.Command.ReplicaSetVersion
+	retirementLocators, err := replicaaction.EncodeRetirementLocators([]replicaaction.RetirementLocator{
+		{Member: 2, Address: controlAddresses[1]},
+		{Member: 3, Address: controlAddresses[2]},
+		{Member: target.MemberID, Address: target.ControlAddress},
+	})
+	if err != nil {
+		t.Fatalf("encode retirement locators: %v", err)
+	}
 	rf3CommandExecuteAction(t, actionClient, nodes[0], replicaaction.Request{
 		Operation: [32]byte{0x65}, Step: [32]byte{0x66}, Kind: replicaaction.SourceRetirement,
 		Fence: raftservice.ServingFence{Group: group,
@@ -807,7 +853,7 @@ func TestServeRF3ShippedCompositionThreeProcesses(t *testing.T) {
 			Command:              finalState.Fence.Command, MemberID: 1,
 			StoreID:         rf3CommandStoreIdentity(1).StoreID,
 			NodeIncarnation: sourceState.Fence.NodeIncarnation, Term: finalState.Fence.Term},
-		SourceMember: 1, TargetMember: 4,
+		SourceMember: 1, TargetMember: 4, Command: retirementLocators,
 	})
 	if _, err = probeRF3CommandMemberWithCommand(
 		t.Context(), nativeAddresses[0], nodes[0], clientProfile, authorityIdentity.Node,

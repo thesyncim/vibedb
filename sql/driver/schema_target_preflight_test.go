@@ -361,3 +361,44 @@ func TestVerifiedSchemaTargetPublishesCapturedShadowAndReopens(t *testing.T) {
 		t.Fatalf("activated rows=%d indexes=%v", rows.Len(), rows.AppendIndexes(nil))
 	}
 }
+
+func TestRecoverPreparedSchemaShadowAfterEmptySuffix(t *testing.T) {
+	_, db, base, _, claim := schemaDDLJournalFixture(t)
+	op := [32]byte{128}
+	shadow, err := claim.BuildReplicatedSchemaDDLShadow(t.Context(), op, "CREATE INDEX by_city ON docs (city)", 100, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schemaShadowApply(t, claim, db, base, 4, `{"id":"two","city":"Porto"}`)
+	shadow, err = claim.ReplayReplicatedSchemaDDLShadow(t.Context(), op, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := claim.PreflightReplicatedSchemaTarget(t.Context(), shadow.Catalog, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preparedProof, err := verified.Prepare(t.Context(), op)
+	if err != nil {
+		_ = verified.Close()
+		t.Fatal(err)
+	}
+	if err := verified.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Advance applied past the prepared cut (as happens when a neutral Raft
+	// entry or peer schema transition applies before local command recovery).
+	if _, err := claim.ApplyNormal(testReplicatedApplyMeta(5), nil); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := claim.RecoverPreparedReplicatedSchemaTargetAfterEmptySuffix(shadow.Catalog, op)
+	if err != nil {
+		t.Fatalf("recover prepared shadow after empty suffix: %v", err)
+	}
+	if recovered != preparedProof {
+		t.Fatalf("recovered proof mismatch: got=%+v want=%+v", recovered, preparedProof)
+	}
+	if _, err := claim.RecoverPreparedReplicatedSchemaTargetAfterEmptySuffix(shadow.Catalog, [32]byte{255}); err == nil {
+		t.Fatal("wrong operation digest recovered prepared shadow")
+	}
+}

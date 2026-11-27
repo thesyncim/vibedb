@@ -44,6 +44,10 @@ type VerifiedReplicatedSchemaTarget struct {
 // owned until this handle closes. Source writes may continue during the audit;
 // Prepare refuses the stale handle if any publication overtakes its cut.
 func (a *ReplicatedApply) PreflightReplicatedSchemaTarget(ctx context.Context, raw []byte, expectedApplied uint64) (result *VerifiedReplicatedSchemaTarget, resultErr error) {
+	return a.preflightReplicatedSchemaTarget(ctx, raw, expectedApplied, true)
+}
+
+func (a *ReplicatedApply) preflightReplicatedSchemaTarget(ctx context.Context, raw []byte, expectedApplied uint64, requireExactApplied bool) (result *VerifiedReplicatedSchemaTarget, resultErr error) {
 	if expectedApplied == 0 {
 		return nil, ErrReplicatedSchemaCatalogImage
 	}
@@ -72,7 +76,7 @@ func (a *ReplicatedApply) PreflightReplicatedSchemaTarget(ctx context.Context, r
 			return nil, ErrReplicatedSchemaDDLConflict
 		}
 		verified.shadow = &shadow
-		if err := verified.checkCapture(); err != nil {
+		if err := verified.checkCapture(requireExactApplied); err != nil {
 			return nil, err
 		}
 	} else if record, found, err := readSchemaDDLBuildRecord(root); err != nil {
@@ -80,7 +84,7 @@ func (a *ReplicatedApply) PreflightReplicatedSchemaTarget(ctx context.Context, r
 	} else if found && bytes.Equal(record.Target.Catalog, raw) && (!record.Ready || record.Applied != expectedApplied) {
 		return nil, ErrReplicatedSchemaDDLConflict
 	}
-	if a.Applied() != expectedApplied {
+	if requireExactApplied && a.Applied() != expectedApplied {
 		return nil, fmt.Errorf("schema target source applied advanced: current=%d target=%d: %w",
 			a.Applied(), expectedApplied, ErrTransactionConflict)
 	}
@@ -93,13 +97,20 @@ func (a *ReplicatedApply) PreflightReplicatedSchemaTarget(ctx context.Context, r
 	return verified, nil
 }
 
-func (v *VerifiedReplicatedSchemaTarget) checkCapture() error {
+func (v *VerifiedReplicatedSchemaTarget) checkCapture(requireExactHead bool) error {
 	if v.shadow == nil {
 		return nil
 	}
 	d, err := v.owner.ReplicatedSchemaCaptureDescriptor(v.shadow.Shadow.Operation)
-	if err != nil || d.Config != v.shadow.Capture || d.Abort != schemachange.NotAborted || d.Head != v.shadow.Shadow.Cursor {
+	if err != nil || d.Config != v.shadow.Capture || d.Abort != schemachange.NotAborted {
 		return errors.Join(err, ErrReplicatedSchemaDDLConflict)
+	}
+	if requireExactHead {
+		if d.Head != v.shadow.Shadow.Cursor {
+			return ErrReplicatedSchemaDDLConflict
+		}
+	} else if d.Head.Publication.Applied < v.shadow.Shadow.Cursor.Publication.Applied {
+		return ErrReplicatedSchemaDDLConflict
 	}
 	return nil
 }
@@ -124,7 +135,7 @@ func (v *VerifiedReplicatedSchemaTarget) Prepare(ctx context.Context, authorizat
 	if v.shadow != nil && authorization != v.shadow.Shadow.Operation {
 		return ReplicatedSchemaTargetProof{}, ErrReplicatedSchemaDDLConflict
 	}
-	if err := v.checkCapture(); err != nil {
+	if err := v.checkCapture(true); err != nil {
 		return ReplicatedSchemaTargetProof{}, err
 	}
 	source, _, err := v.owner.schemaDDLShadowSource()

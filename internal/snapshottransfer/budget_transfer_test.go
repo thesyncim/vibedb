@@ -225,7 +225,7 @@ func TestReceiverCancellationDuringBudgetWaitReleasesCapacity(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- receiver.Receive(ctx, sourceIdentity.Node, d) }()
-	time.Sleep(25 * time.Millisecond)
+	waitForTransferBudget(t, func() bool { return budget.Metrics().NetworkReceive.ThrottleEvents > 0 })
 	cancel()
 	err = <-done
 	if !errors.Is(err, context.Canceled) {

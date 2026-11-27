@@ -426,6 +426,9 @@ func (r *Receiver) receiveOne(ctx context.Context, conn rafttransport.PeerConnec
 		return err
 	}
 	if err := writeFull(conn, request[:]); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return err
 	}
 	if deadline := r.ReadDeadline(); deadline.IsZero() {
@@ -435,6 +438,9 @@ func (r *Receiver) receiveOne(ctx context.Context, conn rafttransport.PeerConnec
 	}
 	var response [responseBytes]byte
 	if _, err := io.ReadFull(conn, response[:]); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return err
 	}
 	if !bytes.Equal(response[:8], responseMagic[:]) || response[9] != 0 || response[10] != 0 || response[11] != 0 ||
@@ -476,6 +482,9 @@ func (r *Receiver) receiveOne(ctx context.Context, conn rafttransport.PeerConnec
 	}
 	if r.Budget == nil {
 		if _, err := io.ReadFull(conn, chunk); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return err
 		}
 	} else {
@@ -500,6 +509,9 @@ func (r *Receiver) receiveOne(ctx context.Context, conn rafttransport.PeerConnec
 				return err
 			}
 			if _, err := io.ReadFull(conn, chunk[offset:offset+countInt]); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
 				return err
 			}
 			offset += countInt
