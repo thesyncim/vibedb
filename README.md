@@ -20,7 +20,7 @@ Use Go 1.27 or later, as declared in [go.mod](go.mod). In a Go module, install
 the revision you intend to evaluate:
 
 ```sh
-go get github.com/thesyncim/vibedb@47ac5ab23
+go get github.com/thesyncim/vibedb@6f7350bd1
 ```
 
 ```go
@@ -127,8 +127,10 @@ Key gaps:
   one build.
 - Online split covers base relations only; a split that must move a global
   index fails closed.
-- Scaling commands ship, but their inputs (operator credential, node
-  preparation manifest, node descriptor) have no shipped generator.
+- Scaling commands ship together with `vibedb cluster init-operator` and
+  `vibedb cluster init-node` to mint operator profiles, empty-node preparation
+  manifests, and public node descriptors from a cluster CA; external CA
+  management and multi-host process supervision remain operator-provided.
 - No global MVCC snapshot across Raft groups; no Kubernetes operator.
 - Tin search rebuilds postings in memory per searched generation; postings
   are not persisted or maintained incrementally.

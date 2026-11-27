@@ -19,7 +19,7 @@ it gates; it is evidence for that revision and scenario only.
 | --- | --- | --- | --- |
 | Start, write, stop, and reopen an RF3 cluster on one host | Development | `portable-rf3` job in `ci.yml` on Linux and macOS | [Local cluster](local-cluster.md) |
 | Survive process kills and peer partitions | Qualified (Linux) | `durable-rf3-external.yml`, `durable-rf3-multirelation.yml`, [node-fault record](../qualification/node-fault-2026-09-04/README.md) | No launcher procedure; see [node failure](node-failure.md) |
-| Add, rebalance, and retire a physical node under traffic | Qualified (Linux) | `seamless-scale-in-out.yml`, [method](../benchmarks/seamless-scale-in-out-method.md) | [Scale and decommission](scaling.md); join inputs have no shipped generator |
+| Add, rebalance, and retire a physical node under traffic | Qualified (Linux) | `seamless-scale-in-out.yml`, [method](../benchmarks/seamless-scale-in-out-method.md) | [Scale and decommission](scaling.md) (`init-operator`, `init-node`, `join`, `rebalance`, `decommission`) |
 | Split a hot shard automatically | Qualified (Linux, development launcher) | `dev-hot-split.yml` | [Hot-shard splits](hot-shard-splits.md) |
 | Export a live backup and restore it into fresh identities | Development; restored-replica serving and failover are qualified (Linux) | `restore-rf3-external.yml` | [Backup and restore](backup-restore.md) |
 | Install one schema generation with the rollout command | Development | Unit and process tests | [Schema rollouts](schema-rollouts.md) |
@@ -86,7 +86,7 @@ for disposable use:
 | Authorization policy (`authorization-policy.vibejson`) | Maps each node ID to capabilities | Same |
 | Durable ACK key (`durable-ack-key`) | Cluster-shared key for durable request acknowledgements | Same |
 | WAL key source (`wal-key-source`) | Node-log encryption key material | Same |
-| Operator client credential and profile | Authenticates `vibedb cluster` control commands | **Nothing shipped**; see [scaling](scaling.md#prerequisites) |
+| Operator client credential and profile | Authenticates `vibedb cluster` control commands | `vibedb cluster init-operator` (from cluster CA); see [scaling](scaling.md#prerequisites) |
 
 The policy capabilities are `data_read`, `data_write`, `schema`, `delegate`,
 `membership`, `topology`, `transaction_recovery`, `request_ledger`,
