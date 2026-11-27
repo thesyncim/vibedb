@@ -8,24 +8,35 @@ without stopping traffic using `vibedb cluster`. Qualified on Linux via
 [topology changes](../design/topology-changes.md#seamless-scale-out-scale-in-and-frontend-drain)
 for internals.
 
-## Prerequisites
+## Prerequisites: bootstrap operator and node credentials
 
-1. **Same build** across all nodes and CLI binaries.
-2. **Bootstrap operator & node credentials** from your cluster CA:
-   - `vibedb cluster init-operator` — mints operator cert and canonical
-     `operator-profile.vibejson` (requires `topology` + `membership` in
-     `authorization-policy.vibejson`; pass `--policy <path> --update-policy`).
-     Point the profile at a frontend you do **not** plan to retire.
-   - `vibedb cluster init-node` — mints node cert, WAL key,
-     `prepare-node.vibejson`, and public `node-descriptor.vibejson` (no private
-     keys/paths).
-   - Prepare & start the empty node with `vibedb-shard prepare-node-rf3` and
-     `vibedb-shard serve-node`.
+All nodes and CLI binaries must run the exact same build. Mint credentials from
+your cluster CA (point `--address` at a frontend you do **not** plan to retire):
+
+```sh
+# 1. Mint operator cert + operator-profile.vibejson and grant membership+topology
+vibedb cluster init-operator --ca-cert /abs/ca.pem --ca-key /abs/ca.key \
+  --trust-domain-from /abs/node-1/node-cert.pem \
+  --address 127.0.0.1:17400 --server-node <32-hex-gateway-node-id> \
+  --out-dir /abs/operator --policy /abs/authorization-policy.vibejson --update-policy
+
+# 2. Mint empty node cert, prepare-node.vibejson & public node-descriptor.vibejson
+vibedb cluster init-node --ca-cert /abs/ca.pem --ca-key /abs/ca.key \
+  --trust-domain-from /abs/node-1/node-cert.pem \
+  --root /abs/node-4/data --out-dir /abs/node-4/init \
+  --policy /abs/authorization-policy.vibejson --update-policy \
+  --failure-domain rack-4 --peer 127.0.0.1:18401 --native 127.0.0.1:18402 \
+  --snapshot 127.0.0.1:18403 --control 127.0.0.1:18404
+
+# 3. Prepare and start the empty node
+vibedb-shard prepare-node-rf3 -manifest /abs/node-4/init/prepare-node.vibejson
+vibedb-shard serve-node -manifest /abs/node-4/data/serve-rf3.vibejson -reload-prepared-groups
+```
 
 ## List nodes
 
 ```sh
-vibedb cluster nodes --profile /path/operator-profile.vibejson
+vibedb cluster nodes --profile /abs/operator/operator-profile.vibejson
 ```
 
 Record each node's 32-hex ID and `incarnation` (required by `decommission`).
@@ -37,11 +48,11 @@ retried idempotently:
 
 ```sh
 req_id=$(openssl rand -hex 32)
-vibedb cluster join --profile /path/operator-profile.vibejson \
-  --node-file /path/node-descriptor.vibejson \
+vibedb cluster join --profile /abs/operator/operator-profile.vibejson \
+  --node-file /abs/node-4/init/node-descriptor.vibejson \
   --request-id "$req_id" --wait 10m --json
 
-vibedb cluster status --profile /path/operator-profile.vibejson \
+vibedb cluster status --profile /abs/operator/operator-profile.vibejson \
   --operation <operation-id> --wait 5m --json
 ```
 
@@ -50,7 +61,7 @@ vibedb cluster status --profile /path/operator-profile.vibejson \
 ## Rebalance
 
 ```sh
-vibedb cluster rebalance --profile /path/operator-profile.vibejson \
+vibedb cluster rebalance --profile /abs/operator/operator-profile.vibejson \
   --desired-node-count 4 --max-moves 32 --max-migration-bytes 67108864 \
   --request-id "$(openssl rand -hex 32)" --wait 10m --json
 ```
@@ -62,7 +73,7 @@ and byte budgets apply across the entire durable operation (including restarts).
 ## Decommission a node
 
 ```sh
-vibedb cluster decommission --profile /path/operator-profile.vibejson \
+vibedb cluster decommission --profile /abs/operator/operator-profile.vibejson \
   --node <32-hex-id> --incarnation <n> \
   --request-id "$(openssl rand -hex 32)" --wait 10m --json
 ```
@@ -70,8 +81,8 @@ vibedb cluster decommission --profile /path/operator-profile.vibejson \
 Poll `cluster status --operation <id> --json` until `safe_to_stop=true`,
 `retiring_references=0`, and blockers are empty. Only then stop the process.
 Open client sessions on the retiring frontend hold blocker `gateway_sessions`
-until they disconnect (or until `FrontendDrainGracePeriod` force-closes them if
-configured). Do not retire a sole designated controller
+until they disconnect (or until `-frontend-drain-grace-period` force-closes
+them). Do not retire a sole designated controller
 (`sole_designated_controller`).
 
 ## Read blockers
@@ -100,5 +111,5 @@ configured). Do not retire a sole designated controller
 
 ## Source map
 
-- [cmd/vibedb/cluster_control.go](../../cmd/vibedb/cluster_control.go) · [internal/clustercontrol/control.go](../../internal/clustercontrol/control.go)
+- [cmd/vibedb/cluster_control.go](../../cmd/vibedb/cluster_control.go) · [cluster_scale_init.go](../../cmd/vibedb/cluster_scale_init.go) · [internal/clustercontrol/control.go](../../internal/clustercontrol/control.go)
 - [internal/gatewayruntime/cluster_control.go](../../internal/gatewayruntime/cluster_control.go) · [scaling_controller.go](../../internal/gatewayruntime/scaling_controller.go)
