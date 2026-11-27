@@ -147,7 +147,9 @@ func isExactCheckpointGroupCertificationRequired(err error) bool {
 // logical indices. Pressure may checkpoint earlier. It never checkpoints after
 // publishing the mutation that encountered pressure.
 type CheckpointGroupOptions struct {
-	CheckpointEvery uint64
+	CheckpointEvery       uint64
+	BufferedJournalWrites bool
+	OverlaySlotGeometry   bool
 }
 
 // CheckpointGroupSeed binds already durable member images to the one imported
@@ -1008,6 +1010,7 @@ func newCheckpointGroup(
 		collection.checkpointGroup.Store(group)
 	}
 	log.checkpointGroup = group
+	group.enableBufferedJournalWritesLocked()
 	return group, nil
 }
 
@@ -1241,7 +1244,22 @@ func (g *CheckpointGroup) attachLocked() error {
 		c.checkpointGroup.Store(g)
 	}
 	g.log.checkpointGroup = g
+	g.enableBufferedJournalWritesLocked()
 	return nil
+}
+
+func (g *CheckpointGroup) enableBufferedJournalWritesLocked() {
+	if g == nil || !g.opts.BufferedJournalWrites {
+		return
+	}
+	for _, member := range g.members {
+		if member.collection != nil && member.collection.journal != nil {
+			_ = member.collection.journal.SetBufferedWrites(true)
+		}
+	}
+	if g.log != nil && g.log.marker != nil {
+		_ = g.log.marker.SetBufferedWrites(true)
+	}
 }
 
 func (g *CheckpointGroup) validateRecoveredMembersLocked(requireEmptyJournal bool) error {
@@ -2001,6 +2019,13 @@ func (g *CheckpointGroup) commitTransitionLocked(
 		}
 	}
 	if checkpointGroupFaultHook != nil {
+		for i := range order {
+			if c := order[i].Collection; c != nil && c.journal != nil {
+				if flushErr := c.journal.Flush(); flushErr != nil {
+					return flushErr
+				}
+			}
+		}
 		if err := checkpointGroupFaultHook(checkpointGroupAfterPrepareAppend); err != nil {
 			return err
 		}
@@ -2022,6 +2047,12 @@ func (g *CheckpointGroup) commitTransitionLocked(
 		return poisoned
 	}
 	if checkpointGroupFaultHook != nil {
+		if flushErr := log.marker.Flush(); flushErr != nil {
+			poisoned := journalCommitOutcomeUnknown(flushErr)
+			log.poison = poisoned
+			g.poison = poisoned
+			return poisoned
+		}
 		if hookErr := checkpointGroupFaultHook(checkpointGroupAfterDecisionAppend); hookErr != nil {
 			poisoned := journalCommitOutcomeUnknown(hookErr)
 			log.poison = poisoned
@@ -2473,27 +2504,62 @@ func (g *CheckpointGroup) checkpointLocked() error {
 	// can therefore be retried independently without ever moving the accepted cut
 	// backwards or exposing a partially durable multi-collection state.
 	g.log.commitMu.Lock()
-	for _, member := range g.members {
-		c := member.collection
-		c.writer.Lock()
-		err := c.checkpointPastCertifiedPrefixConditionalsLocked(
-			checkpointCertificateResolver(
-				g.markerID, g.markerEpoch, g.txnBase, g.txn,
-			), g.markerEpoch,
-		)
-		if err == nil && !c.closed && !c.primaryStructuralActive && c.primaryUnderfilledCount > 0 {
-			c.mergeUnderfilledPrimaryLeavesLocked()
+	resolver := checkpointCertificateResolver(
+		g.markerID, g.markerEpoch, g.txnBase, g.txn,
+	)
+	if len(g.members) > 1 && checkpointGroupFaultHook == nil {
+		// Each member owns an independent Collection, file handle, committer,
+		// and journal; folding dirty members concurrently overlaps their .vjc
+		// and .rjournal fsync barriers instead of paying them serially.
+		errs := make([]error, len(g.members))
+		var wg sync.WaitGroup
+		for idx, member := range g.members {
+			wg.Add(1)
+			go func(i int, c *Collection) {
+				defer wg.Done()
+				c.writer.Lock()
+				err := c.checkpointPastCertifiedPrefixConditionalsLocked(
+					resolver, g.markerEpoch,
+				)
+				if err == nil && !c.closed && !c.primaryStructuralActive && c.primaryUnderfilledCount > 0 {
+					c.mergeUnderfilledPrimaryLeavesLocked()
+				}
+				c.writer.Unlock()
+				if err != nil {
+					errs[i] = err
+					return
+				}
+				g.physicalCheckpoints.Add(1)
+			}(idx, member.collection)
 		}
-		c.writer.Unlock()
-		if err != nil {
-			g.log.commitMu.Unlock()
-			return err
-		}
-		g.physicalCheckpoints.Add(1)
-		if checkpointGroupFaultHook != nil {
-			if err = checkpointGroupFaultHook(checkpointGroupAfterPhysicalCheckpoint); err != nil {
+		wg.Wait()
+		for _, err := range errs {
+			if err != nil {
 				g.log.commitMu.Unlock()
 				return err
+			}
+		}
+	} else {
+		for _, member := range g.members {
+			c := member.collection
+			c.writer.Lock()
+			err := c.checkpointPastCertifiedPrefixConditionalsLocked(
+				resolver, g.markerEpoch,
+			)
+			if err == nil && !c.closed && !c.primaryStructuralActive && c.primaryUnderfilledCount > 0 {
+				c.mergeUnderfilledPrimaryLeavesLocked()
+			}
+			c.writer.Unlock()
+			if err != nil {
+				g.log.commitMu.Unlock()
+				return err
+			}
+			g.physicalCheckpoints.Add(1)
+			if checkpointGroupFaultHook != nil {
+				if err = checkpointGroupFaultHook(checkpointGroupAfterPhysicalCheckpoint); err != nil {
+					g.log.commitMu.Unlock()
+					return err
+				}
 			}
 		}
 	}
@@ -2528,25 +2594,67 @@ func (g *CheckpointGroup) certifyLocked() error {
 		return ErrCheckpointGroupSequence
 	}
 	g.log.commitMu.Lock()
-	for _, member := range g.members {
-		c := member.collection
-		c.writer.Lock()
-		if failure := c.PersistenceError(); failure != nil {
-			c.writer.Unlock()
-			g.log.commitMu.Unlock()
-			return failure
+	if len(g.members) > 1 && checkpointGroupFaultHook == nil {
+		errs := make([]error, len(g.members))
+		poisonErr := make([]bool, len(g.members))
+		var wg sync.WaitGroup
+		for idx, member := range g.members {
+			wg.Add(1)
+			go func(i int, c *Collection) {
+				defer wg.Done()
+				c.writer.Lock()
+				if failure := c.PersistenceError(); failure != nil {
+					c.writer.Unlock()
+					errs[i] = failure
+					return
+				}
+				var err error
+				if c.journal.HasPendingBytes() {
+					err = c.journal.Sync(c.journalPowerSafe)
+				}
+				c.writer.Unlock()
+				if err != nil {
+					errs[i] = journalCommitOutcomeUnknown(err)
+					poisonErr[i] = true
+					return
+				}
+				g.journalSyncs.Add(1)
+			}(idx, member.collection)
 		}
-		err := c.journal.Sync(c.journalPowerSafe)
-		c.writer.Unlock()
-		if err != nil {
-			g.log.commitMu.Unlock()
-			return g.poisonLocked(journalCommitOutcomeUnknown(err))
-		}
-		g.journalSyncs.Add(1)
-		if checkpointGroupFaultHook != nil {
-			if err := checkpointGroupFaultHook(checkpointGroupAfterJournalSync); err != nil {
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
 				g.log.commitMu.Unlock()
-				return g.poisonLocked(err)
+				if poisonErr[i] {
+					return g.poisonLocked(err)
+				}
+				return err
+			}
+		}
+	} else {
+		for _, member := range g.members {
+			c := member.collection
+			c.writer.Lock()
+			if failure := c.PersistenceError(); failure != nil {
+				c.writer.Unlock()
+				g.log.commitMu.Unlock()
+				return failure
+			}
+			var err error
+			if checkpointGroupFaultHook != nil || c.journal.HasPendingBytes() {
+				err = c.journal.Sync(c.journalPowerSafe)
+			}
+			c.writer.Unlock()
+			if err != nil {
+				g.log.commitMu.Unlock()
+				return g.poisonLocked(journalCommitOutcomeUnknown(err))
+			}
+			g.journalSyncs.Add(1)
+			if checkpointGroupFaultHook != nil {
+				if err := checkpointGroupFaultHook(checkpointGroupAfterJournalSync); err != nil {
+					g.log.commitMu.Unlock()
+					return g.poisonLocked(err)
+				}
 			}
 		}
 	}

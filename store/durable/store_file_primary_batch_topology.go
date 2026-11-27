@@ -154,7 +154,7 @@ func (c *Collection) preparePrimaryBatchTopology(
 	c.structuralRows = prospective
 
 	cuts, unionKeys, err := c.planPrimaryBatchTopologyCuts(
-		baseRows, prospective, primarySlotGeometryMaintained(state.root),
+		baseRows, prospective, c.primaryBatchMaintainOverlaySlots(state.root),
 	)
 	if err != nil {
 		return err

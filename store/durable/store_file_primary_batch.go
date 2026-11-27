@@ -42,6 +42,22 @@ func primarySlotGeometryMaintained(root storeio.StateRoot) bool {
 		root.Options&storeio.StateOptionTinIndexes != 0
 }
 
+// primaryBatchMaintainOverlaySlots reports whether leaves should stay within
+// the 256-slot geometry so every row has a stable 8-bit PostingSlot. Replicated
+// CheckpointGroup collections with primaryUnifiedOverlay maintain 256-slot
+// leaves even when unindexed so high-churn UPDATEs and bulk DELETEs absorb
+// directly into the in-memory overlay instead of re-encoding wide stripes.
+func (c *Collection) primaryBatchMaintainOverlaySlots(root storeio.StateRoot) bool {
+	if primarySlotGeometryMaintained(root) {
+		return true
+	}
+	if c == nil || c.primaryUnifiedOverlay == nil {
+		return false
+	}
+	g := c.checkpointGroup.Load()
+	return g != nil && g.opts.OverlaySlotGeometry
+}
+
 func primaryUnifiedOverlayFoldExtent(
 	payloadBytes int, quantum, maxLeafBytes uint32,
 ) (uint32, bool) {
@@ -2307,7 +2323,7 @@ func (c *Collection) buildPrimaryBatchLeaf(
 			ErrPrimaryLeafSplitRequired, storeio.ErrCommonPrimaryLeafFull,
 		)
 	}
-	maintainSlots := primarySlotGeometryMaintained(state.root)
+	maintainSlots := c.primaryBatchMaintainOverlaySlots(state.root)
 	if len(final) > storeio.CommonPrimaryLeafWideSlots && maintainSlots {
 		c.primaryLeafSplitRequired.Add(1)
 		return c.primaryBatchProspectiveSplitKey(final), errors.Join(

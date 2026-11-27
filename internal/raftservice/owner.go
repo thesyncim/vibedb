@@ -4253,30 +4253,25 @@ func (owner *Owner) reservePendingRead(bytes int64) error {
 		}
 	}
 	maxItems := int64(owner.limits.MaxPendingReadItems)
-	for {
-		cur := owner.pendingReadItems.Load()
-		if cur >= maxItems {
-			return ErrPendingReadsFull
-		}
-		if owner.pendingReadItems.CompareAndSwap(cur, cur+1) {
-			break
-		}
+	if owner.pendingReadItems.Add(1) > maxItems {
+		owner.pendingReadItems.Add(-1)
+		return ErrPendingReadsFull
 	}
-	maxBytes := owner.limits.MaxPendingReadBytes
-	for {
-		cur := owner.pendingReadBytes.Load()
-		if bytes > maxBytes-cur {
+	if bytes > 0 {
+		maxBytes := owner.limits.MaxPendingReadBytes
+		if owner.pendingReadBytes.Add(bytes) > maxBytes {
+			owner.pendingReadBytes.Add(-bytes)
 			owner.pendingReadItems.Add(-1)
 			return ErrPendingReadsFull
 		}
-		if owner.pendingReadBytes.CompareAndSwap(cur, cur+bytes) {
-			return nil
-		}
 	}
+	return nil
 }
 
 func (owner *Owner) releasePendingRead(bytes int64) {
-	owner.pendingReadBytes.Add(-bytes)
+	if bytes > 0 {
+		owner.pendingReadBytes.Add(-bytes)
+	}
 	owner.pendingReadItems.Add(-1)
 }
 

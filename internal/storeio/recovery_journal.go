@@ -1325,6 +1325,68 @@ type RecoveryJournal struct {
 	journalDataSync func(*os.File) error
 	// writeAt is injected so a fault seam can intercept the append write.
 	writeAt func(p []byte, off int64) (int, error)
+	// bufferedWrites coalesces sequential record appends in user space until
+	// the buffer fills or Flush/Sync/Replay/GrowCapacity/Close runs.
+	bufferedWrites bool
+	writeBuf       []byte
+	writeBufOff    int64
+}
+
+const recoveryJournalWriteBufSize = 64 * 1024
+
+// SetBufferedWrites enables or disables 64 KiB user-space write coalescing for
+// record appends. Disabling flushes any buffered bytes immediately.
+func (rj *RecoveryJournal) SetBufferedWrites(enabled bool) error {
+	if rj == nil {
+		return nil
+	}
+	if !enabled {
+		if err := rj.Flush(); err != nil {
+			return err
+		}
+	}
+	rj.bufferedWrites = enabled
+	return nil
+}
+
+// Flush writes any buffered record bytes to the underlying file descriptor
+// without issuing an OS fsync barrier.
+func (rj *RecoveryJournal) Flush() error {
+	if rj == nil || len(rj.writeBuf) == 0 {
+		return nil
+	}
+	err := writeRecoveryJournalFull(rj.writeAt, rj.writeBuf, rj.writeBufOff)
+	rj.writeBuf = rj.writeBuf[:0]
+	return err
+}
+
+func (rj *RecoveryJournal) writeRegionBytes(data []byte, offset int64) error {
+	if !rj.bufferedWrites {
+		return writeRecoveryJournalFull(rj.writeAt, data, offset)
+	}
+	if len(rj.writeBuf) > 0 && rj.writeBufOff+int64(len(rj.writeBuf)) != offset {
+		if err := rj.Flush(); err != nil {
+			return err
+		}
+	}
+	if len(rj.writeBuf)+len(data) > recoveryJournalWriteBufSize {
+		if len(rj.writeBuf) > 0 {
+			if err := rj.Flush(); err != nil {
+				return err
+			}
+		}
+		if len(data) >= recoveryJournalWriteBufSize {
+			return writeRecoveryJournalFull(rj.writeAt, data, offset)
+		}
+	}
+	if rj.writeBuf == nil {
+		rj.writeBuf = make([]byte, 0, recoveryJournalWriteBufSize)
+	}
+	if len(rj.writeBuf) == 0 {
+		rj.writeBufOff = offset
+	}
+	rj.writeBuf = append(rj.writeBuf, data...)
+	return nil
 }
 
 // RecoveryJournalPairing is an external exact identity and recovery-epoch
@@ -1813,9 +1875,7 @@ func (rj *RecoveryJournal) Append(kind uint16, generation uint64, key, value []b
 		return 0, err
 	}
 	offset := int64(recoveryJournalRegionStart) + int64(rj.cursor)
-	if err := writeRecoveryJournalFull(
-		rj.writeAt, rj.scratch[:padded], offset,
-	); err != nil {
+	if err := rj.writeRegionBytes(rj.scratch[:padded], offset); err != nil {
 		return 0, err
 	}
 	rj.cursor += uint64(padded)
@@ -1895,6 +1955,9 @@ func (rj *RecoveryJournal) GrowCapacity(
 	// fail-before-mutation contract.
 	if rj.header.RecycleCount == ^uint64(0) {
 		return fmt.Errorf("%w: recycle count exhausted", ErrInvalidWrite)
+	}
+	if err := rj.Flush(); err != nil {
+		return err
 	}
 	total := int64(recoveryJournalRegionStart) + int64(minimum)
 	if err := recoveryJournalPreallocate(rj.file, total); err != nil {
@@ -2077,9 +2140,7 @@ func (rj *RecoveryJournal) appendPreparedBatch(
 		return 0, err
 	}
 	offset := int64(recoveryJournalRegionStart) + int64(rj.cursor)
-	if err := writeRecoveryJournalFull(
-		rj.writeAt, rj.scratch[:plan.padded], offset,
-	); err != nil {
+	if err := rj.writeRegionBytes(rj.scratch[:plan.padded], offset); err != nil {
 		return 0, err
 	}
 	rj.cursor = end
@@ -2097,7 +2158,16 @@ func (rj *RecoveryJournal) appendPreparedBatch(
 // F_FULLFSYNC-class barrier that survives sudden power loss; otherwise the
 // ordinary filesystem-strength barrier (fdatasync on Linux) that survives
 // process failure without the device-cache drain.
+// HasPendingBytes reports whether any records have been appended since the last
+// recycle. Callers can skip redundant OS fsync calls on clean journals.
+func (rj *RecoveryJournal) HasPendingBytes() bool {
+	return rj != nil && rj.cursor != 0
+}
+
 func (rj *RecoveryJournal) Sync(powerSafe bool) error {
+	if err := rj.Flush(); err != nil {
+		return err
+	}
 	if powerSafe {
 		return rj.journalDataSync(rj.file)
 	}
@@ -2313,6 +2383,7 @@ func (rj *RecoveryJournal) recycleHeader(
 	rj.header = next
 	rj.headerSlot = slot
 	rj.cursor = 0
+	rj.writeBuf = rj.writeBuf[:0]
 	rj.family = recoveryRecordFamilyEmpty
 	rj.deltaEndGeneration = baseGeneration
 	rj.atomicLastGeneration = 0
@@ -2353,6 +2424,9 @@ func (rj *RecoveryJournal) Cursor() uint64 { return rj.cursor }
 // returns nil. A checksum-valid semantic error is not a truncation: it returns
 // ErrRecoveryJournalRecord and fails recovery closed. fn's error aborts replay.
 func (rj *RecoveryJournal) Replay(baseGeneration uint64, fn func(RecoveryRecord) error) error {
+	if err := rj.Flush(); err != nil {
+		return err
+	}
 	if rj.header.BaseSequence == ^uint64(0) {
 		return nil
 	}
@@ -2417,8 +2491,9 @@ func (rj *RecoveryJournal) Close() error {
 	if rj == nil || rj.file == nil {
 		return nil
 	}
+	flushErr := rj.Flush()
 	rj.replayScratch.close()
-	return rj.file.Close()
+	return errors.Join(flushErr, rj.file.Close())
 }
 
 // readFullAt reads exactly len(buf) bytes at off, treating a short read as a
