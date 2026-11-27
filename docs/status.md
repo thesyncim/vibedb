@@ -73,8 +73,9 @@ Darwin durability uses its strongest implemented barrier; see
   `vibedb cluster init-node` (empty-node preparation manifest and public node
   descriptor). External CA management and multi-host process supervision remain
   operator-provided.
-- Controllers run on one designated frontend, and a retiring frontend waits
-  indefinitely for its clients to disconnect.
+- Controllers run on one designated frontend. A retiring frontend waits for
+  clients to disconnect by default, or force-closes lingering sessions after
+  `FrontendDrainGracePeriod` when configured.
 - Follower applied-floor reads and multi-group read vectors have narrower
   semantics than a linearizable global snapshot.
 - Resource budgets cover their named caches, workspaces, or overlays. Process
