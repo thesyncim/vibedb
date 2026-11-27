@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/thesyncim/vibedb/internal/jsoncmp"
 	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
@@ -492,7 +493,7 @@ func AppendCanonicalStatisticStringBytes(dst, value []byte) ([]byte, error) {
 
 func appendCanonicalStatisticJSONString(dst, interior []byte) []byte {
 	dst = append(dst, '"')
-	iterator := vibejson.JSONStringByteIter{Raw: interior}
+	iterator := jsoncmp.JSONStringByteIter{Raw: interior}
 	for {
 		char, ok := iterator.Next()
 		if !ok {

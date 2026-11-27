@@ -230,7 +230,7 @@ func TestPostDecodedStringHashes(t *testing.T) {
 	for n := 0; n <= 33; n++ {
 		raw := []byte(`"` + strings.Repeat(`\u0061`, n) + `"`)
 		decoded := strings.Repeat("a", n)
-		if got, want := hashDecodedJSONString(raw), vibejson.HashKey(decoded); got != want {
+		if got, want := hashDecodedJSONString(raw), hashKey(decoded); got != want {
 			t.Fatalf("decoded key hash length %d = %#x, want %#x", n, got, want)
 		}
 		if got, want := postDecodedStringFNV(raw), postFNV([]byte(decoded)); got != want {
@@ -244,7 +244,7 @@ func TestPostDecodedStringHashes(t *testing.T) {
 		{`"\u00e9"`, "é"},
 		{`"\uD83D\uDE00é"`, "😀é"},
 	} {
-		if got, want := hashDecodedJSONString([]byte(test.raw)), vibejson.HashKey(test.decoded); got != want {
+		if got, want := hashDecodedJSONString([]byte(test.raw)), hashKey(test.decoded); got != want {
 			t.Errorf("decoded key hash %s = %#x, want %#x", test.raw, got, want)
 		}
 		if got, want := postDecodedStringFNV([]byte(test.raw)), postFNV([]byte(test.decoded)); got != want {

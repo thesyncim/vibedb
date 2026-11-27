@@ -347,7 +347,7 @@ func (b *UnifiedPrimaryLeafBuilder) CanonicalSpanIndex(
 func appendHoleSpans(dst []UnifiedTokenSpan, index vibejson.Index) []UnifiedTokenSpan {
 	for i := range index.Entries {
 		e := &index.Entries[i]
-		if e.Flags()&vibejson.TapeFlagKey != 0 || e.Next != 1 {
+		if e.Flags()&document.TapeFlagKey != 0 || e.Next != 1 {
 			continue
 		}
 		dst = append(dst, UnifiedTokenSpan{Start: e.Start, End: e.End})

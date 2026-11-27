@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/thesyncim/vibedb/internal/jsoncmp"
 	"github.com/thesyncim/vibedb/store/durable"
 	vibejson "github.com/thesyncim/vibejson"
 	jsondoc "github.com/thesyncim/vibejson/document"
@@ -478,14 +479,14 @@ func globalIndexLocatorsEqual(a, b []byte, count uint8) bool {
 		}
 		switch aNode.Kind() {
 		case jsondoc.String:
-			if !vibejson.RawJSONStringEqual(
+			if !jsoncmp.RawJSONStringEqual(
 				aNode.Raw().Bytes(), aNode.Entry.Flags(),
 				bNode.Raw().Bytes(), bNode.Entry.Flags(),
 			) {
 				return false
 			}
 		case jsondoc.Number:
-			if !vibejson.JSONNumberEqual(
+			if !jsoncmp.JSONNumberEqual(
 				aNode.Raw().Bytes(), bNode.Raw().Bytes(),
 			) {
 				return false

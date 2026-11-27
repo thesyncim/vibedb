@@ -145,7 +145,7 @@ func TestKeyInternerCollisions(t *testing.T) {
 	var a, b string
 	for i := range 1 << 20 {
 		key := fmt.Sprintf("collision-probe-%07x", i)
-		h := vibejson.HashKey(key)
+		h := hashKey(key)
 		if prev, ok := seen[h]; ok {
 			a, b = prev, key
 			break

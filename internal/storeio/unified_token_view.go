@@ -270,7 +270,7 @@ func (r *UnifiedHoleResolver) segmentIndex(i int) int {
 // keys compare as source aliases; escaped keys decode once into the reusable
 // scratch (the same discipline as the canonical-form checker).
 func (r *UnifiedHoleResolver) keyEquals(src []byte, ke *vibejson.IndexEntry, target []byte) bool {
-	if ke.Flags()&vibejson.TapeFlagEscaped == 0 {
+	if ke.Flags()&document.TapeFlagEscaped == 0 {
 		return bytes.Equal(src[ke.Start+1:ke.End-1], target)
 	}
 	r.keyScratch = r.keyScratch[:0]
@@ -515,7 +515,7 @@ func (r *UnifiedHoleResolver) resolveWalkLast(
 			}
 			key := &entries[child]
 			value := child + 1
-			if key.Flags()&vibejson.TapeFlagKey == 0 {
+			if key.Flags()&document.TapeFlagKey == 0 {
 				return hole, UnifiedHoleAbsent, false, false
 			}
 			if r.keyEquals(src, key, r.segment(seg)) {

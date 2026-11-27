@@ -21,7 +21,6 @@ import (
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
-	vibejson "github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -809,8 +808,8 @@ func (c *shardConn) transaction(req *ShardRequest) *ShardResponse {
 		// The fixed-set protocol designates the first sorted participant as
 		// coordinator, avoiding another identity field in every record.
 		first := record.Targets[0]
-		if !vibejson.BytesEqualString(first.Distribution, string(req.Distribution)) ||
-			!vibejson.BytesEqualString(first.Shard, string(req.Shard)) ||
+		if string(first.Distribution) != string(req.Distribution) ||
+			string(first.Shard) != string(req.Shard) ||
 			first.RoutingVersion != uint64(req.RoutingVersion) ||
 			first.AllocationGeneration != uint64(req.AllocationGeneration) ||
 			first.OwnershipEpoch != uint64(req.OwnershipEpoch) {
@@ -1207,8 +1206,8 @@ func (c *shardConn) stageManifestCoordinator(req *ShardRequest) *ShardResponse {
 		tx.manifestMeta = &meta
 	}
 	meta := *tx.manifestMeta
-	if !vibejson.BytesEqualString(meta.distribution[:meta.distributionLen], string(req.Distribution)) ||
-		!vibejson.BytesEqualString(meta.shard[:meta.shardLen], string(req.Shard)) ||
+	if string(meta.distribution[:meta.distributionLen]) != string(req.Distribution) ||
+		string(meta.shard[:meta.shardLen]) != string(req.Shard) ||
 		meta.routingVersion != uint64(req.RoutingVersion) ||
 		meta.allocation != uint64(req.AllocationGeneration) ||
 		meta.ownershipEpoch != uint64(req.OwnershipEpoch) {

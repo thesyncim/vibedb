@@ -12,7 +12,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/distributedtxn"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
-	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -912,7 +911,7 @@ func resolveRecoveryTargets(
 		ref := &refs[i]
 		var matched *distribution.Manifest
 		for _, manifest := range snapshot.config.Manifests {
-			if vibejson.BytesEqualString(ref.Distribution, string(manifest.Distribution())) {
+			if string(ref.Distribution) == string(manifest.Distribution()) {
 				matched = manifest
 				break
 			}
@@ -923,7 +922,7 @@ func resolveRecoveryTargets(
 		found := false
 		for shardIndex := 0; shardIndex < matched.ShardCount(); shardIndex++ {
 			shard, ok := matched.ShardInfo(shardIndex)
-			if !ok || !vibejson.BytesEqualString(ref.Shard, string(shard.ID)) {
+			if !ok || string(ref.Shard) != string(shard.ID) {
 				continue
 			}
 			if uint64(shard.AllocationGeneration) != ref.AllocationGeneration ||

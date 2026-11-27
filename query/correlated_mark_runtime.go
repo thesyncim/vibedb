@@ -6,6 +6,7 @@ import (
 	"math/bits"
 	"unsafe"
 
+	"github.com/thesyncim/vibedb/internal/jsoncmp"
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson"
@@ -394,7 +395,7 @@ func hashMarkNode(seed maphash.Seed, node vibejson.Node) uint64 {
 			_, _ = hash.Write(clean)
 		} else {
 			raw := node.Raw().Bytes()
-			iter := vibejson.JSONStringByteIter{Raw: raw[1 : len(raw)-1]}
+			iter := jsoncmp.JSONStringByteIter{Raw: raw[1 : len(raw)-1]}
 			for {
 				value, ok := iter.Next()
 				if !ok {
@@ -460,9 +461,9 @@ func equalMarkNodes(a, b vibejson.Node) bool {
 	case document.Number:
 		av, _ := a.NumberBytes()
 		bv, _ := b.NumberBytes()
-		return vibejson.JSONNumberEqual(av, bv)
+		return jsoncmp.JSONNumberEqual(av, bv)
 	case document.String:
-		return vibejson.RawJSONStringEqual(
+		return jsoncmp.RawJSONStringEqual(
 			a.Raw().Bytes(), a.Entry.Flags(), b.Raw().Bytes(), b.Entry.Flags(),
 		)
 	case document.Array:

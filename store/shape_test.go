@@ -330,7 +330,7 @@ func findKeyHashCollision(t *testing.T) (string, string) {
 	seen := make(map[uint32]string, 1<<18)
 	for i := range 1 << 21 {
 		key := fmt.Sprintf("c%08x", i)
-		h := vibejson.HashKey(key)
+		h := hashKey(key)
 		if prev, ok := seen[h]; ok {
 			return prev, key
 		}
@@ -349,7 +349,7 @@ func findKeyHashCollision(t *testing.T) (string, string) {
 // selection of the queried field itself, as Resolve's trust analysis states.
 func TestShapeFingerprintCollision(t *testing.T) {
 	p, q := findKeyHashCollision(t)
-	if len(p) != len(q) || p == q || vibejson.HashKey(p) != vibejson.HashKey(q) {
+	if len(p) != len(q) || p == q || hashKey(p) != hashKey(q) {
 		t.Fatalf("collision search returned an invalid pair %q %q", p, q)
 	}
 	build := func(doc string) vibejson.Index {

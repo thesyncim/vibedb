@@ -41,9 +41,9 @@ import (
 // field is the three bits above the kind field; deriving its mask here rather
 // than hard-coding it keeps this check honest if the layout constants move.
 const (
-	infoFlagsBits          = 32 - vibejson.InfoFlagsShift
-	infoFlagsMask   uint32 = (1<<infoFlagsBits - 1) << vibejson.InfoFlagsShift
-	infoKindFieldW  uint32 = 1 << vibejson.InfoKindBits // 2^3: one past the max kind
+	infoFlagsBits          = 32 - document.InfoFlagsShift
+	infoFlagsMask   uint32 = (1<<infoFlagsBits - 1) << document.InfoFlagsShift
+	infoKindFieldW  uint32 = 1 << document.InfoKindBits // 2^3: one past the max kind
 	infoFlagsFieldW uint32 = 1 << infoFlagsBits         // 2^3: one past the max flags
 )
 
@@ -52,8 +52,8 @@ const (
 // lets bumpCount and setCount touch the count field without disturbing kind or
 // flags, and what lets packInfo compose the fields with a bare bitwise or.
 func TestInfoWordFieldsDisjoint(t *testing.T) {
-	countMask := vibejson.InfoCountMask
-	kindMask := vibejson.InfoKindMask
+	countMask := document.InfoCountMask
+	kindMask := document.InfoKindMask
 	flagsMask := infoFlagsMask
 
 	if countMask&kindMask != 0 {
@@ -70,14 +70,14 @@ func TestInfoWordFieldsDisjoint(t *testing.T) {
 	}
 	// The count field is exactly the max-count value, and the kind field sits
 	// immediately above it: the layout the SMT script models.
-	if vibejson.InfoMaxCount != countMask {
-		t.Fatalf("infoMaxCount %#08x != count mask %#08x", vibejson.InfoMaxCount, countMask)
+	if document.InfoMaxCount != countMask {
+		t.Fatalf("infoMaxCount %#08x != count mask %#08x", document.InfoMaxCount, countMask)
 	}
-	if vibejson.InfoKindShift != vibejson.InfoCountBits {
-		t.Fatalf("kind shift %d != count width %d", vibejson.InfoKindShift, vibejson.InfoCountBits)
+	if document.InfoKindShift != document.InfoCountBits {
+		t.Fatalf("kind shift %d != count width %d", document.InfoKindShift, document.InfoCountBits)
 	}
-	if vibejson.InfoFlagsShift != vibejson.InfoCountBits+vibejson.InfoKindBits {
-		t.Fatalf("flags shift %d != count+kind width %d", vibejson.InfoFlagsShift, vibejson.InfoCountBits+vibejson.InfoKindBits)
+	if document.InfoFlagsShift != document.InfoCountBits+document.InfoKindBits {
+		t.Fatalf("flags shift %d != count+kind width %d", document.InfoFlagsShift, document.InfoCountBits+document.InfoKindBits)
 	}
 }
 
@@ -109,7 +109,7 @@ func TestInfoWordRoundTrip(t *testing.T) {
 	// count axis.
 	const maxKind = infoKindFieldW - 1
 	const maxFlags = infoFlagsFieldW - 1
-	sweepTo := uint32(testIterations(int(vibejson.InfoMaxCount), 1<<16))
+	sweepTo := uint32(testIterations(int(document.InfoMaxCount), 1<<16))
 	for count := uint32(0); ; count++ {
 		assertInfoRoundTrip(t, count, maxKind, maxFlags)
 		if count == sweepTo {
@@ -126,13 +126,13 @@ func TestInfoWordRoundTrip(t *testing.T) {
 	for range setBumpIters {
 		kind := document.Kind(rng.Uint32() % infoKindFieldW)
 		flags := uint8(rng.Uint32() % infoFlagsFieldW)
-		count := rng.Uint32() & vibejson.InfoCountMask
-		e := vibejson.IndexEntry{Info: vibejson.PackInfo(0, kind, flags)}
+		count := rng.Uint32() & document.InfoCountMask
+		e := vibejson.IndexEntry{Info: document.PackInfo(0, kind, flags)}
 		e.SetCount(count)
 		if e.Count() != count || e.Kind() != kind || e.Flags() != flags {
 			t.Fatalf("setCount(%d) on (kind=%d,flags=%d) -> (%d,%d,%d)", count, kind, flags, e.Count(), e.Kind(), e.Flags())
 		}
-		if count < vibejson.InfoMaxCount {
+		if count < document.InfoMaxCount {
 			e.BumpCount()
 			if e.Count() != count+1 || e.Kind() != kind || e.Flags() != flags {
 				t.Fatalf("bumpCount from %d disturbed kind/flags", count)
@@ -148,7 +148,7 @@ func TestInfoWordRoundTrip(t *testing.T) {
 // PackInfo and asserts every accessor recovers its field.
 func assertInfoRoundTrip(t *testing.T, count, kind, flags uint32) {
 	t.Helper()
-	info := vibejson.PackInfo(count, document.Kind(kind), uint8(flags))
+	info := document.PackInfo(count, document.Kind(kind), uint8(flags))
 	e := vibejson.IndexEntry{Info: info}
 	if e.Count() != count {
 		t.Fatalf("packInfo(%d,%d,%d): Count = %d", count, kind, flags, e.Count())
@@ -164,10 +164,10 @@ func assertInfoRoundTrip(t *testing.T, count, kind, flags uint32) {
 // infoWordCountProbes returns every boundary count plus a deterministic
 // randomized saturation of the 26-bit count field.
 func infoWordCountProbes() []uint32 {
-	probes := []uint32{0, 1, 2, 3, 7, 8, 63, 64, 1 << 12, 1 << 20, 1 << 25, vibejson.InfoMaxCount - 2, vibejson.InfoMaxCount - 1, vibejson.InfoMaxCount}
+	probes := []uint32{0, 1, 2, 3, 7, 8, 63, 64, 1 << 12, 1 << 20, 1 << 25, document.InfoMaxCount - 2, document.InfoMaxCount - 1, document.InfoMaxCount}
 	rng := rand.New(rand.NewSource(0x1f0c0de))
 	for range 2048 {
-		probes = append(probes, rng.Uint32()&vibejson.InfoCountMask)
+		probes = append(probes, rng.Uint32()&document.InfoCountMask)
 	}
 	return probes
 }
@@ -224,7 +224,7 @@ func TestNarrowSpanRoundTrip(t *testing.T) {
 // so the widening carries it through unchanged.
 func assertNarrowRoundTrip(t *testing.T, start, end uint32) {
 	t.Helper()
-	wide := vibejson.IndexEntry{Start: start, End: end, Next: 1, Info: vibejson.PackInfo(0, document.String, vibejson.TapeFlagKey) ^ (start * 2654435761)}
+	wide := vibejson.IndexEntry{Start: start, End: end, Next: 1, Info: document.PackInfo(0, document.String, document.TapeFlagKey) ^ (start * 2654435761)}
 	sv := ShapeNarrowValue{Span: wide.Start | wide.End<<16, Info: wide.Info}
 	if sv.Start() != start {
 		t.Fatalf("narrow span (%d,%d): start() = %d", start, end, sv.Start())
@@ -262,17 +262,17 @@ func TestEncodingInvariantsSMT(t *testing.T) {
 		{
 			file: "info_word.smt2",
 			needs: []string{
-				fmt.Sprintf("#x%08x", vibejson.InfoCountMask),          // count mask / infoMaxCount
-				fmt.Sprintf("#x%08x", vibejson.InfoKindMask),           // kind mask
-				fmt.Sprintf("#x%08x", uint32(vibejson.InfoKindShift)),  // << to kind field
-				fmt.Sprintf("#x%08x", uint32(vibejson.InfoFlagsShift)), // << to flags field
+				fmt.Sprintf("#x%08x", document.InfoCountMask),          // count mask / infoMaxCount
+				fmt.Sprintf("#x%08x", document.InfoKindMask),           // kind mask
+				fmt.Sprintf("#x%08x", uint32(document.InfoKindShift)),  // << to kind field
+				fmt.Sprintf("#x%08x", uint32(document.InfoFlagsShift)), // << to flags field
 			},
 		},
 		{
 			file: "info_word_disjoint.smt2",
 			needs: []string{
-				fmt.Sprintf("#x%08x", vibejson.InfoCountMask),
-				fmt.Sprintf("#x%08x", vibejson.InfoKindMask),
+				fmt.Sprintf("#x%08x", document.InfoCountMask),
+				fmt.Sprintf("#x%08x", document.InfoKindMask),
 				fmt.Sprintf("#x%08x", infoFlagsMask),
 			},
 		},

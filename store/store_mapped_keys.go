@@ -9,7 +9,6 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/storekey"
 	"github.com/thesyncim/vibedb/internal/storemem"
-	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -412,7 +411,7 @@ func (m *storeMappedKeys) lookup(hash uint64, key string) (Location, bool) {
 				ref := uint64(m.slots32[slot]) - 1
 				r := m.refs[ref]
 				end := r.off + uint64(r.length)
-				if uint32(len(key)) == r.length && vibejson.BytesEqualString(m.source[r.off:end], key) {
+				if uint32(len(key)) == r.length && bytesEqualString(m.source[r.off:end], key) {
 					loc := Location{
 						Chunk: r.loc >> storeMappedLocationSlotBits,
 						Slot:  uint8(r.loc & (1<<storeMappedLocationSlotBits - 1)),
@@ -472,7 +471,7 @@ func (m *storeMappedKeys) lookupFlexible(hash uint64, key string) (Location, boo
 					}
 				}
 				end := off + uint64(length)
-				if uint32(len(key)) == length && vibejson.BytesEqualString(m.source[off:end], key) {
+				if uint32(len(key)) == length && bytesEqualString(m.source[off:end], key) {
 					runtime.KeepAlive(m)
 					return loc, true
 				}

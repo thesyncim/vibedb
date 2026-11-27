@@ -1,7 +1,6 @@
 package store
 
 import (
-	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -107,17 +106,17 @@ func (in *ValueInterner) Count(id uint32) uint32 {
 // appearance and bumping the occurrence count on every appearance. The raw span
 // is copied, so value may be reused or discarded after the call.
 func (in *ValueInterner) Intern(value []byte) uint32 {
-	return in.intern(vibejson.HashKeyContent(value), byteview.String(value))
+	return in.intern(hashKeyContent(value), byteview.String(value))
 }
 
 // InternString is Intern for a value already held as a string.
 func (in *ValueInterner) InternString(value string) uint32 {
-	return in.intern(vibejson.HashKeyContent(byteview.Bytes(value)), value)
+	return in.intern(hashKeyContent(byteview.Bytes(value)), value)
 }
 
 // Lookup returns value's identifier without assigning one or bumping its count.
 func (in *ValueInterner) Lookup(value []byte) (uint32, bool) {
-	return in.lookup(vibejson.HashKeyContent(value), byteview.String(value))
+	return in.lookup(hashKeyContent(value), byteview.String(value))
 }
 
 // lookup probes the table for a value with the given content hash. Linear

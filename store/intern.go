@@ -81,22 +81,22 @@ func (in *KeyInterner) Reset() {
 // Intern returns key's identifier, assigning the next dense one on first
 // appearance. The content is copied, so key may be reused or discarded.
 func (in *KeyInterner) Intern(key []byte) uint32 {
-	return in.intern(vibejson.HashKeyContent(key), byteview.String(key))
+	return in.intern(hashKeyContent(key), byteview.String(key))
 }
 
 // InternString is Intern for a string key.
 func (in *KeyInterner) InternString(key string) uint32 {
-	return in.intern(vibejson.HashKey(key), key)
+	return in.intern(hashKey(key), key)
 }
 
 // Lookup returns key's identifier without assigning one.
 func (in *KeyInterner) Lookup(key []byte) (uint32, bool) {
-	return in.lookup(vibejson.HashKeyContent(key), byteview.String(key))
+	return in.lookup(hashKeyContent(key), byteview.String(key))
 }
 
 // LookupString is Lookup for a string key.
 func (in *KeyInterner) LookupString(key string) (uint32, bool) {
-	return in.lookup(vibejson.HashKey(key), key)
+	return in.lookup(hashKey(key), key)
 }
 
 // lookup probes the table for a key with the given content hash. Linear
@@ -240,17 +240,17 @@ func (in *KeyInterner) AppendKeyIDs(dst []uint32, t vibejson.Index) []uint32 {
 			stack = stack[:len(stack)-1]
 		}
 		flags := e.Flags()
-		if flags&vibejson.TapeFlagKey != 0 {
+		if flags&document.TapeFlagKey != 0 {
 			content := src[e.Start+1 : e.End-1]
 			var id uint32
 			switch {
-			case flags&vibejson.TapeFlagEscaped != 0:
+			case flags&document.TapeFlagEscaped != 0:
 				in.scratch = vibejson.AppendDecodedJSONString(in.scratch[:0], content)
-				id = in.intern(vibejson.HashKeyContent(in.scratch), byteview.String(in.scratch))
+				id = in.intern(hashKeyContent(in.scratch), byteview.String(in.scratch))
 			case len(stack) > 0 && stack[len(stack)-1]&1 != 0:
 				id = in.intern(e.Next, byteview.String(content))
 			default:
-				id = in.intern(vibejson.HashKeyContent(content), byteview.String(content))
+				id = in.intern(hashKeyContent(content), byteview.String(content))
 			}
 			dst = append(dst, id)
 			continue

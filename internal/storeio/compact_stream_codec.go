@@ -9,7 +9,7 @@ import (
 	"slices"
 	"strconv"
 
-	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibedb/internal/jsoncmp"
 )
 
 // Compact scalar streams are the independently decodable columns inside the
@@ -2605,7 +2605,7 @@ func compactJSONNumberEqual(value, needle []byte) bool {
 		(value[0] != '-' && (value[0] < '0' || value[0] > '9')) {
 		return false
 	}
-	return vibejson.JSONNumberEqual(value, needle)
+	return jsoncmp.JSONNumberEqual(value, needle)
 }
 
 func (v compactStreamView) countAlphabetEqual(

@@ -200,7 +200,7 @@ func (s *Segment) valueDictScan(idx vibejson.Index) valueDictRef {
 		j := i + 1
 		end := i + int(e.Next)
 		for j < end {
-			if ent[j].Flags()&vibejson.TapeFlagKey != 0 {
+			if ent[j].Flags()&document.TapeFlagKey != 0 {
 				j++ // step over the key to its value
 				continue
 			}

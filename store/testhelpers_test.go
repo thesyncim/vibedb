@@ -9,26 +9,24 @@ import (
 	"unsafe"
 
 	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
 )
 
 // nodeKeyString decodes an object-key Node to an owned string.
 func nodeKeyString(key vibejson.Node) string {
 	if b, ok := key.StringBytes(); ok {
-		return vibejson.OwnedBytesString(b)
+		return string(b)
 	}
 	out, _ := key.AppendText(nil)
-	return vibejson.OwnedBytesString(out)
+	return string(out)
 }
 
-// buildEnrichedMachine builds a key-hash-enriched Index over the bitmap
-// engine, for tests that need an enriched tape regardless of document size.
+// buildEnrichedMachine builds a key-hash-enriched Index for tests.
 func buildEnrichedMachine(src []byte, storage []vibejson.IndexEntry) (vibejson.Index, bool) {
-	entries, ok := vibejson.BuildIndexBitmap(src, storage)
-	if !ok {
+	index, err := vibejson.BuildIndexOptions(src, storage, document.IndexOptions{HashKeys: true})
+	if err != nil {
 		return vibejson.Index{}, false
 	}
-	index := vibejson.Index{Src: src, Entries: entries}
-	vibejson.EnrichKeyHashes(&index)
 	return index, true
 }
 

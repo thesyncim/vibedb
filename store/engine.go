@@ -500,7 +500,7 @@ func copyStoreShapeTape(dst *Segment, index vibejson.Index) (vibejson.Index, Sha
 	if root.Kind() != document.Object || count == 0 {
 		return index, ShapeTapeRef{}, false
 	}
-	shape, ok := dst.shapes.Resolve(vibejson.NodeFromEntries(index.Src, entries))
+	shape, ok := dst.shapes.Resolve(nodeFromEntries(index.Src, entries))
 	if !ok || shape.rec.dupKeys {
 		return index, ShapeTapeRef{}, false
 	}

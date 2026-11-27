@@ -19,7 +19,6 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
 )
 
@@ -34,7 +33,7 @@ func joinDocs(docs []string, sep string) string {
 				prev := docs[i-1]
 				last := prev[len(prev)-1]
 				first := doc[0]
-				if (vibejson.IsDigit(last) || last == '.') && (vibejson.IsDigit(first) || first == '-') {
+				if (isDigit(last) || last == '.') && (isDigit(first) || first == '-') {
 					sb.WriteString(" ")
 				}
 			}

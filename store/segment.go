@@ -10,6 +10,12 @@ import (
 	"github.com/thesyncim/vibejson/document"
 )
 
+// entryAt returns the tape entry at offset elements from base within the same
+// contiguous IndexEntry slice.
+func entryAt(base *vibejson.IndexEntry, offset uintptr) *vibejson.IndexEntry {
+	return (*vibejson.IndexEntry)(unsafe.Add(unsafe.Pointer(base), offset*unsafe.Sizeof(*base)))
+}
+
 // A Segment indexes a batch of JSON documents into shared storage. Append
 // copies each document into a chunked source arena and builds its index in a
 // chunked entry arena, so a batch of N documents costs a handful of arena

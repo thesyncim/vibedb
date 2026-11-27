@@ -8,8 +8,9 @@ require (
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/dgraph-io/badger/v4 v4.9.5
 	github.com/thesyncim/vibedb v0.0.0
-	github.com/thesyncim/vibejson v0.1.0
+	github.com/thesyncim/vibejson v0.2.0
 	go.etcd.io/bbolt v1.5.0
+	go.etcd.io/raft/v3 v3.7.0
 	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.54.0
 )
@@ -47,7 +48,6 @@ require (
 	github.com/prometheus/procfs v0.9.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
-	go.etcd.io/raft/v3 v3.7.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel v1.41.0 // indirect
 	go.opentelemetry.io/otel/metric v1.41.0 // indirect
