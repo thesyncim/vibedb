@@ -14,6 +14,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/clusterversion"
 	"github.com/thesyncim/vibedb/internal/controllerlease"
+	"github.com/thesyncim/vibedb/internal/resourceguard"
 )
 
 const (
@@ -36,6 +37,7 @@ type ObservabilitySource struct {
 	Controller      func() *gatewayControllerMetrics
 	ControllerLease func() controllerlease.Status
 	ClusterVersion  func() (local clusterversion.NodeVersion, active clusterversion.Version)
+	ResourceGuard   func() resourceguard.Snapshot
 }
 
 // NewObservabilityHandler builds a bounded, stdlib-only HTTP handler exposing:
@@ -105,6 +107,9 @@ func NewObservabilityHandler(src ObservabilitySource) http.Handler {
 		}
 		if src.ControllerLease != nil {
 			writePrometheusControllerLeaseMetrics(&buf, src.ControllerLease())
+		}
+		if src.ResourceGuard != nil {
+			writePrometheusResourceGuardMetrics(&buf, src.ResourceGuard())
 		}
 		localVer := clusterversion.LocalNodeVersion()
 		activeVer := clusterversion.Version{}
@@ -265,6 +270,45 @@ func writePrometheusClusterVersionMetrics(buf *bytes.Buffer, local clusterversio
 		buf.WriteString("# TYPE vibedb_cluster_active_version_info gauge\n")
 		fmt.Fprintf(buf, "vibedb_cluster_active_version_info{active=%q} 1\n", active.String())
 	}
+}
+
+func writePrometheusResourceGuardMetrics(buf *bytes.Buffer, s resourceguard.Snapshot) {
+	buf.WriteString("# HELP vibedb_resource_memory_bytes Latest sampled Go runtime total memory in bytes.\n")
+	buf.WriteString("# TYPE vibedb_resource_memory_bytes gauge\n")
+	fmt.Fprintf(buf, "vibedb_resource_memory_bytes %d\n", s.MemoryBytes)
+
+	if s.MaxMemoryBytes > 0 {
+		buf.WriteString("# HELP vibedb_resource_memory_limit_bytes Configured hard process memory watermark in bytes.\n")
+		buf.WriteString("# TYPE vibedb_resource_memory_limit_bytes gauge\n")
+		fmt.Fprintf(buf, "vibedb_resource_memory_limit_bytes %d\n", s.MaxMemoryBytes)
+	}
+	if s.MinFreeDiskBytes > 0 {
+		buf.WriteString("# HELP vibedb_resource_disk_free_bytes Latest sampled available filesystem bytes.\n")
+		buf.WriteString("# TYPE vibedb_resource_disk_free_bytes gauge\n")
+		fmt.Fprintf(buf, "vibedb_resource_disk_free_bytes %d\n", s.FreeDiskBytes)
+
+		buf.WriteString("# HELP vibedb_resource_disk_min_free_bytes Configured minimum free disk space watermark in bytes.\n")
+		buf.WriteString("# TYPE vibedb_resource_disk_min_free_bytes gauge\n")
+		fmt.Fprintf(buf, "vibedb_resource_disk_min_free_bytes %d\n", s.MinFreeDiskBytes)
+	}
+
+	memTrip := 0
+	if s.MemoryTripped {
+		memTrip = 1
+	}
+	diskTrip := 0
+	if s.DiskTripped {
+		diskTrip = 1
+	}
+	buf.WriteString("# HELP vibedb_resource_watermark_tripped Whether a hard resource admission watermark is currently tripped (1=tripped, 0=ok).\n")
+	buf.WriteString("# TYPE vibedb_resource_watermark_tripped gauge\n")
+	fmt.Fprintf(buf, "vibedb_resource_watermark_tripped{kind=\"memory\"} %d\n", memTrip)
+	fmt.Fprintf(buf, "vibedb_resource_watermark_tripped{kind=\"disk\"} %d\n", diskTrip)
+
+	buf.WriteString("# HELP vibedb_resource_admission_rejections_total Total requests rejected by hard resource watermarks.\n")
+	buf.WriteString("# TYPE vibedb_resource_admission_rejections_total counter\n")
+	fmt.Fprintf(buf, "vibedb_resource_admission_rejections_total{kind=\"memory\"} %d\n", s.MemoryRejections)
+	fmt.Fprintf(buf, "vibedb_resource_admission_rejections_total{kind=\"disk\"} %d\n", s.DiskRejections)
 }
 
 func startGatewayObservabilityHTTP(

@@ -61,6 +61,11 @@ func runServe(args []string) (exitCode int) {
 	maxNativeReadConcurrency := fs.Int("max-native-read-concurrency", gateway.DefaultReplicatedReadConcurrency, "hard concurrent public RF3 point-read bound")
 	maxNativeReadBytes := fs.Uint64("max-native-read-bytes", gateway.DefaultReplicatedReadInFlight, "hard aggregate schema-bounded public RF3 response-byte reservation")
 	maxNativeScatterConcurrency := fs.Int("max-native-scatter-concurrency", gateway.DefaultReplicatedScatterConcurrency, "hard concurrent RF3 shard-group reads; requests may contain more groups and drain through this bound")
+	metricsHTTPListen := fs.String("metrics-http-listen", "", "optional loopback HTTP observability listen address serving /healthz, /readyz, and Prometheus /metrics")
+	frontendDrainGrace := fs.Duration("frontend-drain-grace-period", 0, "optional bounded drain grace period after which lingering sessions are force-closed during frontend drain (0 waits indefinitely)")
+	maxMemoryBytes := fs.Uint64("max-memory-bytes", 0, "optional hard process memory admission ceiling in bytes (0 disables)")
+	minFreeDiskBytes := fs.Uint64("min-free-disk-bytes", 0, "optional hard minimum free filesystem bytes admission watermark (0 disables)")
+	diskWatermarkPath := fs.String("disk-watermark-path", "", "filesystem path sampled for -min-free-disk-bytes (defaults to catalog directory)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -122,6 +127,13 @@ func runServe(args []string) (exitCode int) {
 		*replicaControlManifestPath, *backupRepositoryPath, *backupMaxBackups,
 		*backupMaxArtifacts, *backupMaxArtifactBytes, *backupMaxDiskBytes,
 		*controllerInterval, *schemaRolloutPlan, *schemaRolloutOnce, *initialDirectory,
+		standaloneOpsFlags{
+			metricsHTTPListen:  *metricsHTTPListen,
+			frontendDrainGrace: *frontendDrainGrace,
+			maxMemoryBytes:     *maxMemoryBytes,
+			minFreeDiskBytes:   *minFreeDiskBytes,
+			diskWatermarkPath:  *diskWatermarkPath,
+		},
 	)
 	if !handled {
 		return 2

@@ -6,13 +6,23 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/resourceguard"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 )
+
+type standaloneOpsFlags struct {
+	metricsHTTPListen  string
+	frontendDrainGrace time.Duration
+	maxMemoryBytes     uint64
+	minFreeDiskBytes   uint64
+	diskWatermarkPath  string
+}
 
 // runServeThroughRuntime is the sole standalone serving entry point. It keeps
 // CLI-only parsing and process signal wiring in the command package while all
@@ -29,6 +39,7 @@ func runServeThroughRuntime(
 	backupRepository string, backupMaxBackups, backupMaxArtifacts int,
 	backupMaxArtifactBytes, backupMaxDiskBytes uint64, controllerInterval time.Duration,
 	schemaPlan string, schemaOnce bool, initialDirectory string,
+	ops standaloneOpsFlags,
 ) (code int, handled bool) {
 	if catalog == "" {
 		return 0, false
@@ -59,8 +70,23 @@ func runServeThroughRuntime(
 		fmt.Fprintf(os.Stderr, "gateway: initial node directory: %v\n", err)
 		return 2, true
 	}
+	var guard *resourceguard.Guard
+	if ops.maxMemoryBytes > 0 || ops.minFreeDiskBytes > 0 {
+		diskPath := ops.diskWatermarkPath
+		if diskPath == "" && ops.minFreeDiskBytes > 0 {
+			diskPath = filepath.Dir(catalog)
+		}
+		guard = resourceguard.New(resourceguard.Options{
+			MaxMemoryBytes:   ops.maxMemoryBytes,
+			DiskPath:         diskPath,
+			MinFreeDiskBytes: ops.minFreeDiskBytes,
+		})
+	}
 	config := Config{
-		InitialNodeDirectory: initialNodes,
+		InitialNodeDirectory:     initialNodes,
+		MetricsHTTPListenAddress: ops.metricsHTTPListen,
+		FrontendDrainGracePeriod: ops.frontendDrainGrace,
+		ResourceGuard:            guard,
 		CatalogPath:          catalog, CatalogRouteSeedPath: routeSeed,
 		DevStaticCatalog: static, DevPlaintext: plaintext,
 		CatalogBootstrapIfMissing: bootstrap,

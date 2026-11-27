@@ -9,6 +9,7 @@ import (
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/clusterversion"
 	"github.com/thesyncim/vibedb/internal/controllerlease"
+	"github.com/thesyncim/vibedb/internal/resourceguard"
 )
 
 func TestObservabilityHandlerHealthzReadyzAndMethodEnforcement(t *testing.T) {
@@ -148,6 +149,42 @@ func TestObservabilityHandlerHealthzReadyzAndMethodEnforcement(t *testing.T) {
 	} {
 		if !strings.Contains(body2, want) {
 			t.Fatalf("/metrics missing %q\nfull body:\n%s", want, body2)
+		}
+	}
+
+	// 8. ResourceGuard watermarks and rejection counters are exported on /metrics.
+	hRG := NewObservabilityHandler(ObservabilitySource{
+		ResourceGuard: func() resourceguard.Snapshot {
+			return resourceguard.Snapshot{
+				MemoryBytes:      512 << 20,
+				MaxMemoryBytes:   1 << 30,
+				FreeDiskBytes:    10 << 30,
+				MinFreeDiskBytes: 2 << 30,
+				MemoryTripped:    false,
+				DiskTripped:      true,
+				MemoryRejections: 3,
+				DiskRejections:   7,
+			}
+		},
+	})
+	rec = httptest.NewRecorder()
+	hRG.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /metrics (resourceguard) = %d", rec.Code)
+	}
+	rgBody := rec.Body.String()
+	for _, want := range []string{
+		`vibedb_resource_memory_bytes 536870912`,
+		`vibedb_resource_memory_limit_bytes 1073741824`,
+		`vibedb_resource_disk_free_bytes 10737418240`,
+		`vibedb_resource_disk_min_free_bytes 2147483648`,
+		`vibedb_resource_watermark_tripped{kind="memory"} 0`,
+		`vibedb_resource_watermark_tripped{kind="disk"} 1`,
+		`vibedb_resource_admission_rejections_total{kind="memory"} 3`,
+		`vibedb_resource_admission_rejections_total{kind="disk"} 7`,
+	} {
+		if !strings.Contains(rgBody, want) {
+			t.Fatalf("/metrics missing %q\nfull body:\n%s", want, rgBody)
 		}
 	}
 }

@@ -21,6 +21,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalanceexec"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/resourceguard"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
@@ -126,6 +127,10 @@ type Config struct {
 	// leadership status and monotonic epoch are exposed on /metrics and the
 	// lease is gracefully released during BeginFrontendDrain.
 	ControllerLease *controllerlease.Elector
+	// Optional hard process memory and filesystem free-space admission guard.
+	// When set, Executor enforces watermarks on reads/writes and /metrics
+	// exports live resource gauges and rejection counters.
+	ResourceGuard *resourceguard.Guard
 	// A participant forwards DDL once to this exact authenticated gateway
 	// principal. The owner retains the only schema journal and recovery loop.
 	DDLOwnerAddress string

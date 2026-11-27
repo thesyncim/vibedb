@@ -201,11 +201,11 @@ func requireLoopbackListen(address string) error {
 // shard refusal reloads the same crash-safe catalog path, publishing only a
 // strictly newer valid generation.
 func newGateway(catalogPath string) (*gateway.Executor, *gateway.CatalogHolder, error) {
-	return newGatewayWithDial(catalogPath, nil, serviceauthz.Authority{})
+	return newGatewayWithDial(catalogPath, nil, serviceauthz.Authority{}, nil)
 }
 
 func newGatewayWithDial(catalogPath string, dial gateway.DialFunc,
-	internalAuthority serviceauthz.Authority) (*gateway.Executor, *gateway.CatalogHolder, error) {
+	internalAuthority serviceauthz.Authority, guard gateway.ResourceAdmissionGuard) (*gateway.Executor, *gateway.CatalogHolder, error) {
 	snap, err := gateway.LoadSnapshot(catalogPath)
 	if err != nil {
 		return nil, nil, err
@@ -213,7 +213,7 @@ func newGatewayWithDial(catalogPath string, dial gateway.DialFunc,
 	holder := gateway.NewCatalogHolder(snap)
 	refresher := gateway.NewFileCatalogRefresher(catalogPath, holder)
 	exec := gateway.NewExecutor(gateway.NewClient(dial), holder, gateway.Options{
-		Refresh: refresher.Refresh, InternalAuthority: internalAuthority,
+		Refresh: refresher.Refresh, InternalAuthority: internalAuthority, ResourceGuard: guard,
 	})
 	return exec, holder, nil
 }
@@ -280,6 +280,7 @@ func newReplicatedCatalogGateway(
 	retryHome replication.RetryHome,
 	lease time.Duration,
 	participants gateway.GatewayParticipantScanner,
+	guard gateway.ResourceAdmissionGuard,
 	injected ...gateway.ReplicatedRoundTripper,
 ) (*gateway.Executor, *gateway.CatalogHolder, *gateway.ReplicatedCatalogAuthority,
 	*gateway.ReplicatedExecutor, *gateway.AuthenticatedReplicatedClient, error) {
@@ -890,7 +891,7 @@ func newReplicatedCatalogGateway(
 	}
 	executor := gateway.NewExecutor(
 		&gateway.ReplicatedSQLTransport{Executor: replicated}, holder, gateway.Options{
-			Refresh: authority.Refresh, InternalAuthority: internalAuthority,
+			Refresh: authority.Refresh, InternalAuthority: internalAuthority, ResourceGuard: guard,
 		},
 	)
 	return executor, holder, authority, replicated, replicatedPool, nil

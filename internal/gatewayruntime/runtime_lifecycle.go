@@ -101,6 +101,9 @@ func (runtime *Runtime) runServe() {
 		if runtime.config.ControllerLease != nil {
 			obsSrc.ControllerLease = runtime.config.ControllerLease.Status
 		}
+		if runtime.config.ResourceGuard != nil {
+			obsSrc.ResourceGuard = runtime.config.ResourceGuard.Snapshot
+		}
 		obsHandler := NewObservabilityHandler(obsSrc)
 		obsSrv, obsLn, obsDone, err := startGatewayObservabilityHTTP(
 			runtime.ctx, runtime.config.MetricsHTTPListenAddress,
