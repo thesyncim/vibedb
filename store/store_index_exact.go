@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/thesyncim/vibedb/internal/jsoncmp"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
 )
@@ -187,7 +188,7 @@ func storeIndexRawValueHash(seed maphash.Seed, v vibejson.RawValue) (uint64, boo
 		}
 		var h maphash.Hash
 		h.SetSeed(seed)
-		it := vibejson.JSONStringByteIter{Raw: v.Bytes()[1 : len(v.Bytes())-1]}
+		it := jsoncmp.JSONStringByteIter{Raw: v.Bytes()[1 : len(v.Bytes())-1]}
 		for {
 			b, ok := it.Next()
 			if !ok {
@@ -392,17 +393,17 @@ func storeIndexScalarEqual(a, b vibejson.RawValue) bool {
 		bv, _ := b.Bool()
 		return av == bv
 	case document.Number:
-		return vibejson.JSONNumberEqual(a.Bytes(), b.Bytes())
+		return jsoncmp.JSONNumberEqual(a.Bytes(), b.Bytes())
 	case document.String:
 		aRaw, bRaw := a.Bytes(), b.Bytes()
 		var af, bf uint8
 		if bytes.IndexByte(aRaw, '\\') >= 0 {
-			af = vibejson.TapeFlagEscaped
+			af = document.TapeFlagEscaped
 		}
 		if bytes.IndexByte(bRaw, '\\') >= 0 {
-			bf = vibejson.TapeFlagEscaped
+			bf = document.TapeFlagEscaped
 		}
-		return vibejson.RawJSONStringEqual(aRaw, af, bRaw, bf)
+		return rawJSONStringEqual(aRaw, af, bRaw, bf)
 	default:
 		return false
 	}

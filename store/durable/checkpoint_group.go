@@ -311,10 +311,10 @@ type CheckpointGroup struct {
 	members      []checkpointGroupMember
 	namedMembers []NamedCollection
 	byName       map[string]*Collection
-	opts     CheckpointGroupOptions
-	file     *os.File
-	fileInfo os.FileInfo
-	batch    checkpointGroupBatchWorkspace
+	opts         CheckpointGroupOptions
+	file         *os.File
+	fileInfo     os.FileInfo
+	batch        checkpointGroupBatchWorkspace
 
 	sequence            uint64
 	txnBase             uint64

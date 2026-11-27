@@ -242,7 +242,7 @@ func shapeTapeConforms(index vibejson.Index, rec *ShapeRecord) bool {
 	}
 	for m := range rec.Fields {
 		key := &entries[2*m+1]
-		if !vibejson.BytesEqualString(index.Src[key.Start+1:key.End-1], rec.Fields[m].raw) {
+		if !bytesEqualString(index.Src[key.Start+1:key.End-1], rec.Fields[m].raw) {
 			return false
 		}
 	}
@@ -290,7 +290,7 @@ func (s *Segment) shapeTapeCompact(index vibejson.Index) (vibejson.Index, ShapeT
 	}
 	// Raw scratch Segments carry no cache until their first conforming
 	// document; collection chunks arrive with one from initChunkSegment.
-	shape, ok := s.ensureShapeCache().Resolve(vibejson.NodeFromEntries(index.Src, entries))
+	shape, ok := s.ensureShapeCache().Resolve(nodeFromEntries(index.Src, entries))
 	if !ok {
 		// Non-flat, too wide, or a layout the sighting gate has not yet
 		// compiled; the second same-layout document promotes it.
@@ -348,7 +348,7 @@ func (s *Segment) widenShapeTape(i int, r ShapeTapeRef) vibejson.Index {
 	}
 	index := vibejson.Index{Src: s.DocAt(i).Src, Entries: s.synthShapeTape(i, r)}
 	if r.enriched {
-		vibejson.EnrichKeyHashes(&index)
+		enrichKeyHashes(&index)
 	}
 	if s.widened == nil {
 		s.widened = make(map[int][]vibejson.IndexEntry)
@@ -377,7 +377,7 @@ func (s *Segment) synthShapeTape(i int, r ShapeTapeRef) []vibejson.IndexEntry {
 		Start: r.Start,
 		End:   r.End,
 		Next:  uint32(len(entries)),
-		Info:  vibejson.PackInfo(uint32(len(fields)), document.Object, 0),
+		Info:  document.PackInfo(uint32(len(fields)), document.Object, 0),
 	}
 	for m := range fields {
 		if r.Narrow {
@@ -386,11 +386,11 @@ func (s *Segment) synthShapeTape(i int, r ShapeTapeRef) []vibejson.IndexEntry {
 			entries[2*m+2] = values[m]
 		}
 		j := int(entries[2*m+2].Start) - 1
-		for vibejson.IsJSONWhitespace(src[j]) {
+		for isJSONWhitespace(src[j]) {
 			j-- // back over any space between the colon and the value
 		}
 		j-- // src[j] was the colon
-		for vibejson.IsJSONWhitespace(src[j]) {
+		for isJSONWhitespace(src[j]) {
 			j-- // back over any space between the key and the colon
 		}
 		keyEnd := uint32(j) + 1 // src[j] is the key's closing quote

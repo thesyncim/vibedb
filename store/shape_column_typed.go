@@ -42,8 +42,8 @@ import (
 // scalars leave them zero, but the mask keeps the test independent of that
 // convention — and the escaped and key flags are zero on every number.
 const (
-	infoIntNumberMask = vibejson.InfoKindMask | uint32(vibejson.TapeFlagInt)<<vibejson.InfoFlagsShift
-	infoIntNumberBits = uint32(document.Number)<<vibejson.InfoKindShift | uint32(vibejson.TapeFlagInt)<<vibejson.InfoFlagsShift
+	infoIntNumberMask = document.InfoKindMask | uint32(document.TapeFlagInt)<<document.InfoFlagsShift
+	infoIntNumberBits = uint32(document.Number)<<document.InfoKindShift | uint32(document.TapeFlagInt)<<document.InfoFlagsShift
 )
 
 // AppendFieldInt64 resolves name against every document in s, in ordinal
@@ -82,13 +82,13 @@ func (c *ShapeCache) AppendFieldInt64(dst []int64, valid []bool, s *Segment, nam
 					// the accessor.
 					nv := s.NarrowAt(i, r, int(ord))
 					if nv.Info&infoIntNumberMask == infoIntNumberBits {
-						n, ok = vibejson.TapeInt64(&doc.Src[0], nv.Span&0xFFFF, nv.Span>>16)
+						n, ok = tapeInt64(&doc.Src[0], nv.Span&0xFFFF, nv.Span>>16)
 					} else {
 						c.wide = nv.widen()
 						n, ok = (vibejson.Node{Src: &doc.Src[0], Entry: &c.wide}).Int64()
 					}
 				} else if e := &doc.Entries[ord]; e.Info&infoIntNumberMask == infoIntNumberBits {
-					n, ok = vibejson.TapeInt64(&doc.Src[0], e.Start, e.End)
+					n, ok = tapeInt64(&doc.Src[0], e.Start, e.End)
 				} else {
 					n, ok = (vibejson.Node{Src: &doc.Src[0], Entry: e}).Int64()
 				}
@@ -115,7 +115,7 @@ func (c *ShapeCache) AppendFieldInt64(dst []int64, valid []bool, s *Segment, nam
 				// level further into this loop measures as a wash — the
 				// cell's cost is the routing proof, not the parse — so the
 				// shared kernel keeps the single spelling.
-				n, ok = vibejson.TapeInt64(root.Src, e.Start, e.End)
+				n, ok = tapeInt64(root.Src, e.Start, e.End)
 			} else {
 				// A fraction or exponent spelling, or another kind: the
 				// accessor is the verdict, on the proven entry.
@@ -156,7 +156,7 @@ func (c *ShapeCache) AppendFieldFloat64(dst []float64, valid []bool, s *Segment,
 				c.wide.Start, c.wide.End = span&0xffff, span>>16
 				doc := s.DocAt(i)
 				if c.wide.Info&infoIntNumberMask == infoIntNumberBits {
-					if n, intOK := vibejson.TapeInt64(&doc.Src[0], c.wide.Start, c.wide.End); intOK {
+					if n, intOK := tapeInt64(&doc.Src[0], c.wide.Start, c.wide.End); intOK {
 						f, ok = float64(n), true
 					} else {
 						f, ok = (vibejson.Node{Src: &doc.Src[0], Entry: &c.wide}).Float64()
@@ -180,7 +180,7 @@ func (c *ShapeCache) AppendFieldFloat64(dst []float64, valid []bool, s *Segment,
 				if r.Narrow {
 					nv := s.NarrowAt(i, r, int(ord))
 					if nv.Info&infoIntNumberMask == infoIntNumberBits {
-						if n, intOK := vibejson.TapeInt64(&doc.Src[0], nv.Span&0xffff, nv.Span>>16); intOK {
+						if n, intOK := tapeInt64(&doc.Src[0], nv.Span&0xffff, nv.Span>>16); intOK {
 							f, ok = float64(n), true
 						} else {
 							c.wide = nv.widen()
@@ -271,7 +271,7 @@ func (c *ShapeCache) ReduceFieldFloat64(s *Segment, name string) Float64Aggregat
 				c.wide.Start, c.wide.End = span&0xffff, span>>16
 				doc := s.DocAt(i)
 				if c.wide.Info&infoIntNumberMask == infoIntNumberBits {
-					if n, ok := vibejson.TapeInt64(&doc.Src[0], c.wide.Start, c.wide.End); ok {
+					if n, ok := tapeInt64(&doc.Src[0], c.wide.Start, c.wide.End); ok {
 						aggregate.Add(float64(n))
 					} else if f, ok := (vibejson.Node{Src: &doc.Src[0], Entry: &c.wide}).Float64(); ok {
 						aggregate.Add(f)
@@ -290,7 +290,7 @@ func (c *ShapeCache) ReduceFieldFloat64(s *Segment, name string) Float64Aggregat
 				if r.Narrow {
 					nv := s.NarrowAt(i, r, int(ord))
 					if nv.Info&infoIntNumberMask == infoIntNumberBits {
-						if n, intOK := vibejson.TapeInt64(&doc.Src[0], nv.Span&0xffff, nv.Span>>16); intOK {
+						if n, intOK := tapeInt64(&doc.Src[0], nv.Span&0xffff, nv.Span>>16); intOK {
 							f, ok = float64(n), true
 						} else {
 							c.wide = nv.widen()

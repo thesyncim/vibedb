@@ -6,6 +6,7 @@ import (
 	"unsafe"
 
 	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
 )
 
 // DocumentTemplate interns one exactly verified structural tape for a
@@ -77,7 +78,7 @@ func storeDocumentTemplateHash(index vibejson.Index) uint64 {
 		e := &index.Entries[i]
 		h ^= uint64(e.Info)*0x94d049bb133111eb + uint64(e.Next)
 		h = h<<27 | h>>(64-27)
-		if e.Flags()&vibejson.TapeFlagKey == 0 {
+		if e.Flags()&document.TapeFlagKey == 0 {
 			continue
 		}
 		for _, b := range index.Src[e.Start:e.End] {
@@ -101,7 +102,7 @@ func storeDocumentTemplateEqual(a, b vibejson.Index) bool {
 		if ae.Info != be.Info || ae.Next != be.Next {
 			return false
 		}
-		if ae.Flags()&vibejson.TapeFlagKey != 0 &&
+		if ae.Flags()&document.TapeFlagKey != 0 &&
 			!bytes.Equal(a.Src[ae.Start:ae.End], b.Src[be.Start:be.End]) {
 			return false
 		}
@@ -116,7 +117,7 @@ func newStoreDocumentTemplate(index vibejson.Index) *DocumentTemplate {
 	spanIndex := make([]uint16, len(entries))
 	spanCount := uint16(0)
 	for i := range entries {
-		if i == 0 || entries[i].Flags()&vibejson.TapeFlagKey != 0 {
+		if i == 0 || entries[i].Flags()&document.TapeFlagKey != 0 {
 			spanIndex[i] = ^uint16(0)
 			continue
 		}
@@ -295,7 +296,7 @@ func storeOwnedNarrowStorage(docs *Segment, row int, ref ShapeTapeRef) (uint8, u
 	for ordinal := range ref.Rec.Fields {
 		value := docs.NarrowAt(row, ref, ordinal)
 		start, end := value.Span&0xffff, value.Span>>16
-		if end-start > uint32(^uint8(0)) || value.Info>>vibejson.InfoKindShift > 0x7f {
+		if end-start > uint32(^uint8(0)) || value.Info>>document.InfoKindShift > 0x7f {
 			return storeOwnedDocNarrow, storeOwnedNarrowValueLen
 		}
 		packed9 = packed9 && start <= 0x1ff
@@ -327,7 +328,7 @@ func storeDocumentTemplateStorage(index vibejson.Index) (uint8, uint64) {
 	}
 	for i := 1; i < len(index.Entries); i++ {
 		entry := &index.Entries[i]
-		if entry.Flags()&vibejson.TapeFlagKey == 0 && entry.End-entry.Start > uint32(^uint8(0)) {
+		if entry.Flags()&document.TapeFlagKey == 0 && entry.End-entry.Start > uint32(^uint8(0)) {
 			return storeOwnedDocTemplate, storeOwnedTemplateSpanLen
 		}
 	}
@@ -337,7 +338,7 @@ func storeDocumentTemplateStorage(index vibejson.Index) (uint8, uint64) {
 func storeDocumentTemplateSpanCount(index vibejson.Index) int {
 	count := 0
 	for i := 1; i < len(index.Entries); i++ {
-		if index.Entries[i].Flags()&vibejson.TapeFlagKey == 0 {
+		if index.Entries[i].Flags()&document.TapeFlagKey == 0 {
 			count++
 		}
 	}

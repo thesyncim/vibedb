@@ -8,6 +8,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/storemem"
 	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
 )
 
 // storeMappedDocRef is the pointer-free description of one document in a
@@ -338,10 +339,10 @@ func (s *Segment) RawAt(i int) []byte {
 // leading/trailing whitespace scan only when they need the root entry.
 func storeRootSpan(src []byte) (uint32, uint32) {
 	start, end := 0, len(src)
-	for start < end && vibejson.IsJSONWhitespace(src[start]) {
+	for start < end && isJSONWhitespace(src[start]) {
 		start++
 	}
-	for end > start && vibejson.IsJSONWhitespace(src[end-1]) {
+	for end > start && isJSONWhitespace(src[end-1]) {
 		end--
 	}
 	return uint32(start), uint32(end)
@@ -376,22 +377,22 @@ func (s *Segment) NarrowAt(i int, ref ShapeTapeRef, ordinal int) ShapeNarrowValu
 	case storeOwnedDocNarrow8:
 		off += uint64(ordinal) * storeOwnedNarrow8ValueLen
 		value.Span = uint32(s.source[off]) | uint32(s.source[off+1])<<16
-		value.Info = uint32(s.source[off+2]) << vibejson.InfoKindShift
+		value.Info = uint32(s.source[off+2]) << document.InfoKindShift
 	case storeOwnedDocNarrow9:
 		off += uint64(ordinal) * storeOwnedNarrow9ValueLen
 		packed := uint32(s.source[off]) | uint32(s.source[off+1])<<8 | uint32(s.source[off+2])<<16
 		start := packed & 0x1ff
 		value.Span = start | (start+((packed>>9)&0xff))<<16
-		value.Info = packed >> 17 << vibejson.InfoKindShift
+		value.Info = packed >> 17 << document.InfoKindShift
 	case storeOwnedDocNarrowLength8:
 		off += uint64(ordinal) * storeOwnedNarrowLength8ValueLen
 		start := uint32(binary.LittleEndian.Uint16(s.source[off : off+2]))
 		value.Span = start | (start+uint32(s.source[off+2]))<<16
-		value.Info = uint32(s.source[off+3]) << vibejson.InfoKindShift
+		value.Info = uint32(s.source[off+3]) << document.InfoKindShift
 	case storeOwnedDocNarrow:
 		off += uint64(ordinal) * storeOwnedNarrowValueLen
 		value.Span = binary.LittleEndian.Uint32(s.source[off : off+4])
-		value.Info = uint32(s.source[off+4]) << vibejson.InfoKindShift
+		value.Info = uint32(s.source[off+4]) << document.InfoKindShift
 	default:
 		off += uint64(ordinal) * uint64(unsafe.Sizeof(ShapeNarrowValue{}))
 		value = *(*ShapeNarrowValue)(unsafe.Pointer(&s.source[off]))

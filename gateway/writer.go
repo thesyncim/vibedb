@@ -160,7 +160,7 @@ func (index *flatInsertColumnIndex) find(path string) (int, bool) {
 			return 0, false
 		}
 		column := index.columns[stored-1]
-		if vibejson.BytesEqualString(index.arena[column.start:column.end], path) {
+		if string(index.arena[column.start:column.end]) == path {
 			return column.ordinal, true
 		}
 		slot = (slot + 1) & int(mask)

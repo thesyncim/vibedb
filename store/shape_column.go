@@ -2,6 +2,7 @@ package store
 
 import (
 	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -249,7 +250,7 @@ func newFieldScan(name string) fieldScan {
 // lookup plus a vanishing resolution tax.
 func (fs *fieldScan) next(c *ShapeCache, root vibejson.Node) *vibejson.IndexEntry {
 	e := root.Entry
-	if fs.h0.rec != nil && e.Info&(vibejson.InfoCountMask|vibejson.InfoKindMask) == fs.h0.info && e.Next == fs.h0.next {
+	if fs.h0.rec != nil && e.Info&(document.InfoCountMask|document.InfoKindMask) == fs.h0.info && e.Next == fs.h0.next {
 		// The header words prove a flat object of the hinted shape's exact
 		// width, bounding every entry offset the hint read touches inside
 		// the document's 2*count+1 entry span — In's argument verbatim.
@@ -259,31 +260,31 @@ func (fs *fieldScan) next(c *ShapeCache, root vibejson.Node) *vibejson.IndexEntr
 			// absence per document, never trusting the hint for it.
 			return nil
 		}
-		ke := vibejson.EntryAt(e, uintptr(2*fs.h0.ord)+1)
-		if vibejson.BytesEqualString(byteview.SliceRange(root.Src, ke.Start+1, ke.End-1), fs.h0.raw) {
+		ke := entryAt(e, uintptr(2*fs.h0.ord)+1)
+		if bytesEqualString(byteview.SliceRange(root.Src, ke.Start+1, ke.End-1), fs.h0.raw) {
 			fs.streak, fs.backoff, fs.skip = 0, 0, 0
 			if tapeSuffixClaimsKey(root.Src, e, fs.h0.ord, fs.h0.count, fs.key.Key, fs.key.Hash, fs.rawLen) {
 				// Only the last-duplicate rule is in doubt: the exact
 				// lookup answers, but the run and its hint stand.
 				return nil
 			}
-			return vibejson.EntryAt(ke, 1)
+			return entryAt(ke, 1)
 		}
 		// The hinted position rejected: the layout changed under an
 		// unchanged header. Try the displaced shape, then re-resolve.
 	}
-	if fs.h1.rec != nil && e.Info&(vibejson.InfoCountMask|vibejson.InfoKindMask) == fs.h1.info && e.Next == fs.h1.next {
+	if fs.h1.rec != nil && e.Info&(document.InfoCountMask|document.InfoKindMask) == fs.h1.info && e.Next == fs.h1.next {
 		if fs.h1.has {
-			ke := vibejson.EntryAt(e, uintptr(2*fs.h1.ord)+1)
-			if vibejson.BytesEqualString(byteview.SliceRange(root.Src, ke.Start+1, ke.End-1), fs.h1.raw) {
+			ke := entryAt(e, uintptr(2*fs.h1.ord)+1)
+			if bytesEqualString(byteview.SliceRange(root.Src, ke.Start+1, ke.End-1), fs.h1.raw) {
 				fs.h0, fs.h1 = fs.h1, fs.h0
 				fs.streak, fs.backoff, fs.skip = 0, 0, 0
 				if tapeSuffixClaimsKey(root.Src, e, fs.h0.ord, fs.h0.count, fs.key.Key, fs.key.Hash, fs.rawLen) {
 					return nil
 				}
-				return vibejson.EntryAt(ke, 1)
+				return entryAt(ke, 1)
 			}
-		} else if fs.h0.rec == nil || e.Info&(vibejson.InfoCountMask|vibejson.InfoKindMask) != fs.h0.info || e.Next != fs.h0.next {
+		} else if fs.h0.rec == nil || e.Info&(document.InfoCountMask|document.InfoKindMask) != fs.h0.info || e.Next != fs.h0.next {
 			// The displaced shape lacks the field; promote its sticky
 			// absent run unless h0 already claimed this header.
 			fs.h0, fs.h1 = fs.h1, fs.h0
@@ -313,12 +314,12 @@ func (fs *fieldScan) next(c *ShapeCache, root vibejson.Node) *vibejson.IndexEntr
 		if fs.h0.has {
 			fs.h0.ord = int(ref.ord)
 			fs.h0.raw = rec.Fields[ref.ord].raw
-			ke := vibejson.EntryAt(e, uintptr(2*fs.h0.ord)+1)
-			if vibejson.BytesEqualString(byteview.SliceRange(root.Src, ke.Start+1, ke.End-1), fs.h0.raw) {
+			ke := entryAt(e, uintptr(2*fs.h0.ord)+1)
+			if bytesEqualString(byteview.SliceRange(root.Src, ke.Start+1, ke.End-1), fs.h0.raw) {
 				if tapeSuffixClaimsKey(root.Src, e, fs.h0.ord, fs.h0.count, fs.key.Key, fs.key.Hash, fs.rawLen) {
 					return nil
 				}
-				return vibejson.EntryAt(ke, 1)
+				return entryAt(ke, 1)
 			}
 			// Unreachable short of an engineered fingerprint collision:
 			// the shape was resolved from this very document.
@@ -376,14 +377,14 @@ func shapeHuntSkip(backoff int) int {
 // spanning 2*count+1 entries, with 0 <= ord < count; the scan touches key
 // entries 2m+1 for m in (ord, count), all inside that span.
 func tapeSuffixClaimsKey(src *byte, header *vibejson.IndexEntry, ord, count int, name string, queryHash uint32, rawLen uint32) bool {
-	const escapedInfo = uint32(vibejson.TapeFlagEscaped) << vibejson.InfoFlagsShift
+	const escapedInfo = uint32(document.TapeFlagEscaped) << document.InfoFlagsShift
 	m := ord + 1
 	if header.KeysHashed() {
 		for ; m+3 < count; m += 4 {
-			k0 := vibejson.EntryAt(header, uintptr(2*m)+1)
-			k1 := vibejson.EntryAt(header, uintptr(2*m)+3)
-			k2 := vibejson.EntryAt(header, uintptr(2*m)+5)
-			k3 := vibejson.EntryAt(header, uintptr(2*m)+7)
+			k0 := entryAt(header, uintptr(2*m)+1)
+			k1 := entryAt(header, uintptr(2*m)+3)
+			k2 := entryAt(header, uintptr(2*m)+5)
+			k3 := entryAt(header, uintptr(2*m)+7)
 			if k0.Next == queryHash || k1.Next == queryHash ||
 				k2.Next == queryHash || k3.Next == queryHash ||
 				(k0.Info|k1.Info|k2.Info|k3.Info)&escapedInfo != 0 {
@@ -391,7 +392,7 @@ func tapeSuffixClaimsKey(src *byte, header *vibejson.IndexEntry, ord, count int,
 			}
 		}
 		for ; m < count; m++ {
-			k := vibejson.EntryAt(header, uintptr(2*m)+1)
+			k := entryAt(header, uintptr(2*m)+1)
 			if k.Next == queryHash || k.Info&escapedInfo != 0 {
 				return true
 			}
@@ -399,11 +400,11 @@ func tapeSuffixClaimsKey(src *byte, header *vibejson.IndexEntry, ord, count int,
 		return false
 	}
 	for ; m < count; m++ {
-		k := vibejson.EntryAt(header, uintptr(2*m)+1)
+		k := entryAt(header, uintptr(2*m)+1)
 		if k.Info&escapedInfo != 0 {
 			return true
 		}
-		if k.End-k.Start == rawLen && vibejson.BytesEqualString(byteview.SliceRange(src, k.Start+1, k.End-1), name) {
+		if k.End-k.Start == rawLen && bytesEqualString(byteview.SliceRange(src, k.Start+1, k.End-1), name) {
 			return true
 		}
 	}
@@ -531,7 +532,7 @@ func (c *ShapeCache) AppendFields(dst [][]vibejson.RawValue, s *Segment, names .
 			skip--
 			dst = appendFieldsGet(dst, s, i, root, keys)
 			continue
-		case rec == nil || e.Info&(vibejson.InfoCountMask|vibejson.InfoKindMask) != hdrInfo || e.Next != hdrNext:
+		case rec == nil || e.Info&(document.InfoCountMask|document.InfoKindMask) != hdrInfo || e.Next != hdrNext:
 			// Header foreign to the inline shape: a new layout, a non-flat
 			// or non-object root, or the first document. Resolve gates and
 			// folds from scratch.
@@ -623,9 +624,9 @@ func appendFieldsGet(dst [][]vibejson.RawValue, s *Segment, doc int, root vibejs
 func appendFieldsResolved(dst [][]vibejson.RawValue, s *Segment, doc int, root vibejson.Node, slots []fieldColumn, keys []vibejson.CompiledKey) [][]vibejson.RawValue {
 	for j := range slots {
 		if ord := slots[j].ord; ord >= 0 {
-			ke := vibejson.EntryAt(root.Entry, uintptr(2*ord)+1)
-			if vibejson.BytesEqualString(byteview.SliceRange(root.Src, ke.Start+1, ke.End-1), slots[j].raw) {
-				value := vibejson.EntryAt(ke, 1)
+			ke := entryAt(root.Entry, uintptr(2*ord)+1)
+			if bytesEqualString(byteview.SliceRange(root.Src, ke.Start+1, ke.End-1), slots[j].raw) {
+				value := entryAt(ke, 1)
 				raw := vibejson.RawValue{Src: byteview.SliceRange(root.Src, value.Start, value.End)}
 				if s.ValueDict {
 					raw = s.valueRaw(doc, value.Start, raw)

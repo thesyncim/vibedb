@@ -150,9 +150,9 @@ type Collection struct {
 	tinFullBuilds        uint64
 	tinIncrementalBuilds uint64
 	tinPersistedLoads    uint64
-	closed     bool
-	closeDone  bool
-	closePhase collectionClosePhase
+	closed               bool
+	closeDone            bool
+	closePhase           collectionClosePhase
 	// closeErr is the terminal result of a completed Close, or a sticky
 	// persistence error already discovered while retryable cleanup (active
 	// readers or writer unlock) still prevents completion. writer protects it.
@@ -447,15 +447,15 @@ type Collection struct {
 	// source cursors, physical-generation guard, and disabled flag are
 	// writer-owned; atomic counters keep the optional filesystem results
 	// independently observable and cheap to sample.
-	holePunchRanges           atomic.Uint64
-	holePunchBytes            atomic.Uint64
-	holePunchSkippedRanges    atomic.Uint64
-	holePunchUnsupported      atomic.Uint64
-	holePunchErrors           atomic.Uint64
-	holePunchReusableCursor   uint64
-	holePunchPendingCursor    storeio.PunchableExtentCursor
-	holePunchAbsorbedCursor   uint64
-	holePunchCandidateSource  uint8
+	holePunchRanges            atomic.Uint64
+	holePunchBytes             atomic.Uint64
+	holePunchSkippedRanges     atomic.Uint64
+	holePunchUnsupported       atomic.Uint64
+	holePunchErrors            atomic.Uint64
+	holePunchReusableCursor    uint64
+	holePunchPendingCursor     storeio.PunchableExtentCursor
+	holePunchAbsorbedCursor    uint64
+	holePunchCandidateSource   uint8
 	holePunchDisabled          bool
 	holePunchGeneration        uint64
 	holePunchConsecutiveErrors uint32
@@ -463,8 +463,8 @@ type Collection struct {
 	holePunchBaseBackoff       time.Duration
 	holePunchNowFn             func() time.Time
 	holePunchCompletionVictim  uint32
-	holePunchCompletions      [fileStoreHolePunchCompletionSlots]storeio.FreeExtent
-	holePunchPartials         [fileStoreHolePunchSourceCount]fileStoreHolePunchPartial
+	holePunchCompletions       [fileStoreHolePunchCompletionSlots]storeio.FreeExtent
+	holePunchPartials          [fileStoreHolePunchSourceCount]fileStoreHolePunchPartial
 	// Tests may replace the platform helper per collection. Nil selects the
 	// production Linux/Darwin implementation (or the unsupported no-op).
 	holePunch func(*os.File, uint64, uint64) (bool, error)

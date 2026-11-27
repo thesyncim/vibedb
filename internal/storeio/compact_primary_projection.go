@@ -648,7 +648,7 @@ func prepareUnifiedProjectionShape(
 		return false
 	}
 	for _, e := range index.Entries {
-		if e.Flags()&vibejson.TapeFlagEscaped != 0 &&
+		if e.Flags()&document.TapeFlagEscaped != 0 &&
 			uint64(e.End-e.Start) > uint64(cap(keyScratch)) {
 			meta.unsupported = true
 			return false
@@ -700,7 +700,7 @@ func resolveCompactProjectionTemplate(resolver *UnifiedHoleResolver, entry compa
 		return UnifiedHoleContainer
 	}
 	for _, e := range index.Entries {
-		if e.Flags()&vibejson.TapeFlagEscaped != 0 && uint64(e.End-e.Start) > uint64(cap(keyScratch)) {
+		if e.Flags()&document.TapeFlagEscaped != 0 && uint64(e.End-e.Start) > uint64(cap(keyScratch)) {
 			return UnifiedHoleContainer
 		}
 	}
@@ -823,7 +823,7 @@ func resolveCompactProjectionTopLevelLast(
 		}
 		key := &entries[child]
 		value := child + 1
-		if key.Flags()&vibejson.TapeFlagKey == 0 {
+		if key.Flags()&document.TapeFlagKey == 0 {
 			return false
 		}
 		keyBytes, ok := compactProjectionKeyBytes(src, key, keyScratch)
@@ -867,7 +867,7 @@ func compactProjectionKeyBytes(
 		return nil, false
 	}
 	raw := src[key.Start:key.End]
-	if key.Flags()&vibejson.TapeFlagEscaped == 0 {
+	if key.Flags()&document.TapeFlagEscaped == 0 {
 		if len(raw) < 2 {
 			return nil, false
 		}

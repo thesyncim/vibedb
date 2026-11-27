@@ -1199,7 +1199,7 @@ func replicatedSQLExactPrimaryFilter(filter *sqlast.SelectStmt, primary string) 
 	}
 	var pointer [replication.MaxIdentityBytes]byte
 	encoded := where.Path.AppendPointer(pointer[:0])
-	return vibejson.BytesEqualString(encoded, primary)
+	return string(encoded) == primary
 }
 
 // replicatedSQLFinitePrimaryFilter accepts exactly one positive primary-key
@@ -1236,7 +1236,7 @@ func replicatedSQLFinitePrimaryFilter(filter *sqlast.SelectStmt, primary string)
 	}
 	var pointer [replication.MaxIdentityBytes]byte
 	encoded := where.Path.AppendPointer(pointer[:0])
-	return vibejson.BytesEqualString(encoded, primary)
+	return string(encoded) == primary
 }
 
 func replicatedSQLExactConstraint(

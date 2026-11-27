@@ -21,7 +21,6 @@ import (
 	"github.com/thesyncim/vibedb/internal/requestledger"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/shardservice"
-	vibejson "github.com/thesyncim/vibejson"
 )
 
 const (
@@ -2180,8 +2179,8 @@ func commandViewMatchesRoute(view replication.CommandView, route ReplicatedRoute
 	return view.ClusterID == route.Group.ClusterID &&
 		view.ClusterIncarnation == route.Group.ClusterIncarnation &&
 		view.TopologyRecoveryEpoch == route.Group.TopologyRecoveryEpoch &&
-		vibejson.BytesEqualString(view.Distribution, string(route.Distribution)) &&
-		vibejson.BytesEqualString(view.Shard, string(route.Shard)) &&
+		string(view.Distribution) == string(route.Distribution) &&
+		string(view.Shard) == string(route.Shard) &&
 		view.ShardIncarnation == route.Group.ShardIncarnation &&
 		view.GroupID == route.Group.GroupID &&
 		view.AllocationGeneration == route.AllocationGeneration &&

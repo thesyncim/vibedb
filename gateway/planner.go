@@ -583,13 +583,13 @@ func joinProvesColocation(on *sqlast.JoinCond, source int, placements []distribu
 		matched := false
 		for _, key := range on.Keys {
 			if key.Right == nil || key.Right.Source != source ||
-				!vibejson.BytesEqualString(key.Right.AppendPointer(nil), column) || key.Left == nil ||
+				string(key.Right.AppendPointer(nil)) != column || key.Left == nil ||
 				key.Left.Source < 0 || key.Left.Source >= source {
 				continue
 			}
 			left := placements[key.Left.Source]
 			if ordinal < len(left.Columns) &&
-				vibejson.BytesEqualString(key.Left.AppendPointer(nil), left.Columns[ordinal]) {
+				string(key.Left.AppendPointer(nil)) == left.Columns[ordinal] {
 				matched = true
 				break
 			}

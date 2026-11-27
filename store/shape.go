@@ -69,7 +69,7 @@ const (
 // the standard 64-bit finalizer (xor-shift, multiply) over both hash words.
 func shapeFinish(h uint64) uint64 {
 	h ^= h >> 33
-	h *= vibejson.KeyHashMul
+	h *= keyHashMul
 	h ^= h >> 29
 	h *= shapeMul2
 	h ^= h >> 32
@@ -333,34 +333,34 @@ func (c *ShapeCache) resolveFingerprint(v vibejson.Node, count int, fp uint64) (
 // multiply is a bijection. Both hash sources use the identical formula, so
 // one layout fingerprints alike however it was built.
 func (c *ShapeCache) fingerprint(v vibejson.Node, count int) uint64 {
-	h1 := shapeSeed ^ uint64(count)*vibejson.KeyHashMul
-	h2 := shapeMul2 ^ uint64(count)*vibejson.KeyHashSeed
+	h1 := shapeSeed ^ uint64(count)*keyHashMul
+	h2 := shapeMul2 ^ uint64(count)*keyHashSeed
 	m := 0
 	if v.Entry.KeysHashed() {
 		for ; m+1 < count; m += 2 {
-			ke1 := vibejson.EntryAt(v.Entry, uintptr(2*m)+1)
-			ke2 := vibejson.EntryAt(v.Entry, uintptr(2*m)+3)
-			h1 = (h1 ^ (uint64(ke1.Next) | uint64(ke1.End-ke1.Start)<<32)) * vibejson.KeyHashMul
-			h2 = (h2 ^ (uint64(ke2.Next) | uint64(ke2.End-ke2.Start)<<32)) * vibejson.KeyHashMul
+			ke1 := entryAt(v.Entry, uintptr(2*m)+1)
+			ke2 := entryAt(v.Entry, uintptr(2*m)+3)
+			h1 = (h1 ^ (uint64(ke1.Next) | uint64(ke1.End-ke1.Start)<<32)) * keyHashMul
+			h2 = (h2 ^ (uint64(ke2.Next) | uint64(ke2.End-ke2.Start)<<32)) * keyHashMul
 		}
 		if m < count {
-			ke := vibejson.EntryAt(v.Entry, uintptr(2*m)+1)
-			h1 = (h1 ^ (uint64(ke.Next) | uint64(ke.End-ke.Start)<<32)) * vibejson.KeyHashMul
+			ke := entryAt(v.Entry, uintptr(2*m)+1)
+			h1 = (h1 ^ (uint64(ke.Next) | uint64(ke.End-ke.Start)<<32)) * keyHashMul
 		}
 		return shapeFinish(h1 ^ h2*shapeMul2)
 	}
 	for ; m+1 < count; m += 2 {
-		ke1 := vibejson.EntryAt(v.Entry, uintptr(2*m)+1)
-		ke2 := vibejson.EntryAt(v.Entry, uintptr(2*m)+3)
-		hash1 := vibejson.HashKeyContent(byteview.SliceRange(v.Src, ke1.Start+1, ke1.End-1))
-		hash2 := vibejson.HashKeyContent(byteview.SliceRange(v.Src, ke2.Start+1, ke2.End-1))
-		h1 = (h1 ^ (uint64(hash1) | uint64(ke1.End-ke1.Start)<<32)) * vibejson.KeyHashMul
-		h2 = (h2 ^ (uint64(hash2) | uint64(ke2.End-ke2.Start)<<32)) * vibejson.KeyHashMul
+		ke1 := entryAt(v.Entry, uintptr(2*m)+1)
+		ke2 := entryAt(v.Entry, uintptr(2*m)+3)
+		hash1 := hashKeyContent(byteview.SliceRange(v.Src, ke1.Start+1, ke1.End-1))
+		hash2 := hashKeyContent(byteview.SliceRange(v.Src, ke2.Start+1, ke2.End-1))
+		h1 = (h1 ^ (uint64(hash1) | uint64(ke1.End-ke1.Start)<<32)) * keyHashMul
+		h2 = (h2 ^ (uint64(hash2) | uint64(ke2.End-ke2.Start)<<32)) * keyHashMul
 	}
 	if m < count {
-		ke := vibejson.EntryAt(v.Entry, uintptr(2*m)+1)
-		hash := vibejson.HashKeyContent(byteview.SliceRange(v.Src, ke.Start+1, ke.End-1))
-		h1 = (h1 ^ (uint64(hash) | uint64(ke.End-ke.Start)<<32)) * vibejson.KeyHashMul
+		ke := entryAt(v.Entry, uintptr(2*m)+1)
+		hash := hashKeyContent(byteview.SliceRange(v.Src, ke.Start+1, ke.End-1))
+		h1 = (h1 ^ (uint64(hash) | uint64(ke.End-ke.Start)<<32)) * keyHashMul
 	}
 	return shapeFinish(h1 ^ h2*shapeMul2)
 }
@@ -383,34 +383,34 @@ func (c *ShapeCache) compile(v vibejson.Node, count int, fp uint64) *ShapeRecord
 	rec := &c.recChunk[len(c.recChunk)-1]
 	*rec = ShapeRecord{
 		fingerprint: fp,
-		info:        vibejson.PackInfo(uint32(count), document.Object, 0),
+		info:        document.PackInfo(uint32(count), document.Object, 0),
 		next:        2*uint32(count) + 1,
 	}
 	if count > 0 {
-		capacity := vibejson.ProbeCapacity(count)
+		capacity := probeCapacity(count)
 		rec.Fields = c.allocFields(count)
 		rec.table = c.allocSlots(capacity)
 		rec.mask = uint32(capacity - 1)
 		hashed := v.Entry.KeysHashed()
 		for m := range count {
-			ke := vibejson.EntryAt(v.Entry, uintptr(2*m)+1)
+			ke := entryAt(v.Entry, uintptr(2*m)+1)
 			content := byteview.SliceRange(v.Src, ke.Start+1, ke.End-1)
 			raw := c.internBytes(content)
 			decoded := raw
 			var hash uint32
 			switch {
-			case ke.Flags()&vibejson.TapeFlagEscaped != 0:
+			case ke.Flags()&document.TapeFlagEscaped != 0:
 				c.scratch = vibejson.AppendDecodedJSONString(c.scratch[:0], content)
 				decoded = c.internBytes(c.scratch)
-				hash = vibejson.HashKey(decoded)
+				hash = hashKey(decoded)
 			case hashed:
 				// An unescaped key's decoded name is its content, whose hash
 				// enrichment already stored in the entry's next word.
 				hash = ke.Next
 			default:
-				hash = vibejson.HashKey(decoded)
+				hash = hashKey(decoded)
 			}
-			info := vibejson.PackInfo(0, document.String, vibejson.TapeFlagKey|ke.Flags()&vibejson.TapeFlagEscaped)
+			info := document.PackInfo(0, document.String, document.TapeFlagKey|ke.Flags()&document.TapeFlagEscaped)
 			rec.Fields[m] = shapeField{raw: raw, decoded: decoded, info: info}
 			// Claim the first free slot in the name's chain, or overwrite the
 			// chain's equal earlier duplicate so the later ordinal wins, the
@@ -563,7 +563,7 @@ func (s Shape) Field(name string) (FieldRef, bool) {
 	if rec == nil {
 		return FieldRef{}, false
 	}
-	ord, ok := rec.fieldOrd(name, vibejson.HashKey(name))
+	ord, ok := rec.fieldOrd(name, hashKey(name))
 	if !ok {
 		return FieldRef{}, false
 	}
@@ -615,12 +615,12 @@ func (r FieldRef) In(v vibejson.Node) (vibejson.Node, bool) {
 	// Kind and width in one masked compare (flags carry only the enrichment
 	// marker on object headers), flat layout in one more; together they bound
 	// every entry offset below inside the object's 2*count+1 entry span.
-	if e.Info&(vibejson.InfoCountMask|vibejson.InfoKindMask) != rec.info || e.Next != rec.next {
+	if e.Info&(document.InfoCountMask|document.InfoKindMask) != rec.info || e.Next != rec.next {
 		return vibejson.Node{}, false
 	}
-	ke := vibejson.EntryAt(e, uintptr(2*r.ord)+1)
-	if !vibejson.BytesEqualString(byteview.SliceRange(v.Src, ke.Start+1, ke.End-1), rec.Fields[r.ord].raw) {
+	ke := entryAt(e, uintptr(2*r.ord)+1)
+	if !bytesEqualString(byteview.SliceRange(v.Src, ke.Start+1, ke.End-1), rec.Fields[r.ord].raw) {
 		return vibejson.Node{}, false
 	}
-	return vibejson.Node{Src: v.Src, Entry: vibejson.EntryAt(ke, 1)}, true
+	return vibejson.Node{Src: v.Src, Entry: entryAt(ke, 1)}, true
 }

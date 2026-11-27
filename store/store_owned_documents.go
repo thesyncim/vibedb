@@ -10,6 +10,7 @@ import (
 
 	"github.com/thesyncim/vibedb/internal/storemem"
 	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
 )
 
 // compactDocuments moves a completed builder's exact source bytes and
@@ -123,7 +124,7 @@ func (b *Builder) compactDocuments(state *State) error {
 				width := int(narrowWidth)
 				for ordinal := 0; ordinal < count; ordinal++ {
 					value := docs.NarrowAt(i, ref, ordinal)
-					if value.Info&vibejson.InfoCountMask != 0 || value.Info>>vibejson.InfoKindShift > uint32(^uint8(0)) {
+					if value.Info&document.InfoCountMask != 0 || value.Info>>document.InfoKindShift > uint32(^uint8(0)) {
 						valid = false
 						return false
 					}
@@ -131,19 +132,19 @@ func (b *Builder) compactDocuments(state *State) error {
 					switch kind {
 					case storeOwnedDocNarrow8:
 						data[off], data[off+1] = byte(value.Span), byte(value.Span>>16)
-						data[off+2] = byte(value.Info >> vibejson.InfoKindShift)
+						data[off+2] = byte(value.Info >> document.InfoKindShift)
 					case storeOwnedDocNarrow9:
 						start, end := value.Span&0xffff, value.Span>>16
-						packed := start | (end-start)<<9 | (value.Info>>vibejson.InfoKindShift)<<17
+						packed := start | (end-start)<<9 | (value.Info>>document.InfoKindShift)<<17
 						data[off], data[off+1], data[off+2] = byte(packed), byte(packed>>8), byte(packed>>16)
 					case storeOwnedDocNarrowLength8:
 						start, end := value.Span&0xffff, value.Span>>16
 						binary.LittleEndian.PutUint16(data[off:off+2], uint16(start))
 						data[off+2] = byte(end - start)
-						data[off+3] = byte(value.Info >> vibejson.InfoKindShift)
+						data[off+3] = byte(value.Info >> document.InfoKindShift)
 					default:
 						binary.LittleEndian.PutUint32(data[off:off+4], value.Span)
-						data[off+4] = byte(value.Info >> vibejson.InfoKindShift)
+						data[off+4] = byte(value.Info >> document.InfoKindShift)
 					}
 				}
 				position += count * width

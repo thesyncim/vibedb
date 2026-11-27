@@ -228,7 +228,7 @@ func (snapshot *Snapshot) replicatedTableAtBytes(
 	}
 	entry := snapshot.replicatedTables[low]
 	profile, ok := snapshot.replicatedTableProfileAt(entry)
-	return entry, ok && vibejson.BytesEqualString(table, profile.Table)
+	return entry, ok && string(table) == profile.Table
 }
 
 // ResolveReplicatedTableKey maps one already-canonical ordered primary key to

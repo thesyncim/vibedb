@@ -6,6 +6,7 @@ import (
 	"unsafe"
 
 	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
 )
 
 // Template reads decode one row's spans against an immutable structural
@@ -89,11 +90,11 @@ func (s *Segment) storeTemplateKeySpan(i int, template *DocumentTemplate, ordina
 	valueSpan := s.TemplateSpan(i, template, ordinal+1)
 	src := s.DocAt(i).Src
 	j := int(valueSpan&0xffff) - 1
-	for vibejson.IsJSONWhitespace(src[j]) {
+	for isJSONWhitespace(src[j]) {
 		j--
 	}
 	j--
-	for vibejson.IsJSONWhitespace(src[j]) {
+	for isJSONWhitespace(src[j]) {
 		j--
 	}
 	end := uint32(j) + 1
@@ -116,7 +117,7 @@ func (s *Segment) synthStoreTemplate(i int, template *DocumentTemplate, dst []vi
 	}
 	for ordinal := range template.Index.Entries {
 		entry := &dst[base+ordinal]
-		if entry.Flags()&vibejson.TapeFlagKey == 0 {
+		if entry.Flags()&document.TapeFlagKey == 0 {
 			continue
 		}
 		entry.Start, entry.End = s.storeTemplateKeySpan(i, template, ordinal)

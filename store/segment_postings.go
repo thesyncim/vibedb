@@ -4,6 +4,7 @@ import (
 	"math"
 	"sort"
 
+	"github.com/thesyncim/vibedb/internal/jsoncmp"
 	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/document"
 )
@@ -202,7 +203,7 @@ func (p *docPostings) indexShapeValues(s *Segment, index vibejson.Index, ref Sha
 			entry = &index.Entries[m]
 		}
 		if h, ok := postValueHash(vibejson.Node{Src: base, Entry: entry}); ok {
-			p.addValue(vibejson.HashKey(rec.Fields[m].decoded), h, ord)
+			p.addValue(hashKey(rec.Fields[m].decoded), h, ord)
 		}
 	}
 }
@@ -375,7 +376,7 @@ func (s *Segment) AppendWhereContainsIndex(dst []int, path string, needle vibejs
 	if !scalar || !s.postingsReady() {
 		return s.appendWhereContainsScan(dst, path, root)
 	}
-	bucket := postBucket(vibejson.HashKey(path), valueHash)
+	bucket := postBucket(hashKey(path), valueHash)
 	key := vibejson.CompileKey(path)
 	for _, ord := range s.postings.value[bucket] {
 		if s.fieldContainsAt(int(ord), key, root) {
@@ -426,7 +427,7 @@ func (s *Segment) fieldContainsAt(doc int, key vibejson.CompiledKey, needle vibe
 // Node.Contains, including decoded string and arbitrary-precision decimal
 // equality.
 func narrowContains(src []byte, value ShapeNarrowValue, needle vibejson.Node) bool {
-	kind := document.Kind((value.Info & vibejson.InfoKindMask) >> vibejson.InfoKindShift)
+	kind := document.Kind((value.Info & document.InfoKindMask) >> document.InfoKindShift)
 	if kind != needle.Kind() {
 		return false
 	}
@@ -439,9 +440,9 @@ func narrowContains(src []byte, value ShapeNarrowValue, needle vibejson.Node) bo
 		return (raw[0] == 't') == want
 	case document.Number:
 		want, _ := needle.NumberBytes()
-		return vibejson.JSONNumberEqual(raw, want)
+		return jsoncmp.JSONNumberEqual(raw, want)
 	case document.String:
-		return vibejson.RawJSONStringEqual(raw, uint8(value.Info>>vibejson.InfoFlagsShift), needle.Raw().Bytes(), needle.Entry.Flags())
+		return rawJSONStringEqual(raw, uint8(value.Info>>document.InfoFlagsShift), needle.Raw().Bytes(), needle.Entry.Flags())
 	case document.Array:
 		n, _ := needle.ArrayLen()
 		return n == 0
@@ -459,7 +460,7 @@ func narrowContains(src []byte, value ShapeNarrowValue, needle vibejson.Node) bo
 // arbitrarily long spellings need no temporary materialization.
 func postKeyHash(key vibejson.Node) uint32 {
 	if content, ok := key.StringBytes(); ok {
-		return vibejson.HashKeyContent(content)
+		return hashKeyContent(content)
 	}
 	return hashDecodedJSONString(key.Raw().Bytes())
 }
@@ -558,7 +559,7 @@ func postFNV(b []byte) uint64 {
 // JSON string without allocating a decoded copy.
 func postDecodedStringFNV(raw []byte) uint64 {
 	h := uint64(postFNVOffset)
-	it := vibejson.JSONStringByteIter{Raw: raw[1 : len(raw)-1]}
+	it := jsoncmp.JSONStringByteIter{Raw: raw[1 : len(raw)-1]}
 	for {
 		b, ok := it.Next()
 		if !ok {
@@ -576,7 +577,7 @@ func postDecodedStringFNV(raw []byte) uint64 {
 func hashDecodedJSONString(raw []byte) uint32 {
 	content := raw[1 : len(raw)-1]
 	count := 0
-	it := vibejson.JSONStringByteIter{Raw: content}
+	it := jsoncmp.JSONStringByteIter{Raw: content}
 	for {
 		_, ok := it.Next()
 		if !ok {
@@ -585,8 +586,8 @@ func hashDecodedJSONString(raw []byte) uint32 {
 		count++
 	}
 
-	h := vibejson.KeyHashInit(count)
-	it = vibejson.JSONStringByteIter{Raw: content}
+	h := keyHashInit(count)
+	it = jsoncmp.JSONStringByteIter{Raw: content}
 	var word, last uint64
 	for i := 0; i < count; i++ {
 		b, _ := it.Next()
@@ -598,15 +599,15 @@ func hashDecodedJSONString(raw []byte) uint32 {
 		}
 		if i&7 == 7 {
 			if i+1 < count {
-				h = vibejson.KeyHashMix(h, word)
+				h = keyHashMix(h, word)
 			}
 			word = 0
 		}
 	}
 	if count >= 8 {
-		h = vibejson.KeyHashMix(h, last)
+		h = keyHashMix(h, last)
 	} else {
-		h = vibejson.KeyHashMix(h, word)
+		h = keyHashMix(h, word)
 	}
-	return vibejson.KeyHashFinish(h)
+	return keyHashFinish(h)
 }

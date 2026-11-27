@@ -216,7 +216,7 @@ func appendCanonicalEntry(
 		// rather than invent bytes.
 		return dst
 	}
-	if tracker != nil && e.Flags()&vibejson.TapeFlagKey == 0 && e.Next == 1 {
+	if tracker != nil && e.Flags()&document.TapeFlagKey == 0 && e.Next == 1 {
 		tracker.spans = append(tracker.spans, UnifiedTokenSpan{
 			Start: uint32(start - tracker.base),
 			End:   uint32(len(dst) - tracker.base),
@@ -249,7 +249,7 @@ func appendCanonicalObject(
 	for m := 0; m < count; m++ {
 		ke := &entries[key]
 		ref := canonicalMember{keyEntry: int32(key)}
-		if ke.Flags()&vibejson.TapeFlagEscaped == 0 {
+		if ke.Flags()&document.TapeFlagEscaped == 0 {
 			// Unescaped key: the decoded spelling is the raw content between
 			// the quotes, aliased from the source without copying.
 			ref.scratchOff = -1
@@ -397,7 +397,7 @@ func appendCanonicalKeyString(dst, src []byte, entries []vibejson.IndexEntry, ws
 	raw := src[ke.Start:ke.End]
 	// An unescaped string is canonical unless it contains a raw U+2028 or
 	// U+2029, which the encoder escapes for JSON/JavaScript compatibility.
-	escaped := ke.Flags()&vibejson.TapeFlagEscaped != 0
+	escaped := ke.Flags()&document.TapeFlagEscaped != 0
 	if !escaped && scanner.ValidUTF8NoLineSeparator(raw[1:len(raw)-1]) ||
 		escaped && rawQuotedStringIsCanonical(raw) {
 		return append(dst, raw...)
@@ -414,7 +414,7 @@ func appendCanonicalTapeString(dst, src []byte, entries []vibejson.IndexEntry, i
 	raw := src[e.Start:e.End]
 	// Same fast path as appendCanonicalKeyString: an unescaped string still
 	// needs a line-separator check before it can be copied verbatim.
-	escaped := e.Flags()&vibejson.TapeFlagEscaped != 0
+	escaped := e.Flags()&document.TapeFlagEscaped != 0
 	if !escaped && scanner.ValidUTF8NoLineSeparator(raw[1:len(raw)-1]) ||
 		escaped && rawQuotedStringIsCanonical(raw) {
 		return append(dst, raw...)
@@ -605,7 +605,7 @@ func canonicalCheckEntry(src []byte, entries []vibejson.IndexEntry, i int, pos u
 	switch e.Kind() {
 	case document.String:
 		raw := src[e.Start:e.End]
-		if e.Flags()&vibejson.TapeFlagEscaped == 0 {
+		if e.Flags()&document.TapeFlagEscaped == 0 {
 			text := raw[1 : len(raw)-1]
 			if validatedUTF8 {
 				if hasRawJSONLineSeparator(text) {
@@ -672,7 +672,7 @@ func canonicalCheckObject(src []byte, entries []vibejson.IndexEntry, i int, ws *
 		if ke.Start != p {
 			return 0, false
 		}
-		if ke.Flags()&vibejson.TapeFlagEscaped == 0 {
+		if ke.Flags()&document.TapeFlagEscaped == 0 {
 			text := src[ke.Start+1 : ke.End-1]
 			if validatedUTF8 {
 				if hasRawJSONLineSeparator(text) {
@@ -685,7 +685,7 @@ func canonicalCheckObject(src []byte, entries []vibejson.IndexEntry, i int, ws *
 			return 0, false
 		}
 		cur := canonicalMember{keyEntry: int32(key)}
-		if ke.Flags()&vibejson.TapeFlagEscaped == 0 {
+		if ke.Flags()&document.TapeFlagEscaped == 0 {
 			cur.scratchOff = -1
 			cur.length = int32(ke.End - ke.Start - 2)
 		} else {
