@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -21,7 +20,7 @@ func TestSnapshotPrepareAllowsConflictUpdateWithoutGlobalIndex(t *testing.T) {
 	}
 }
 
-func TestSnapshotPrepareRejectsConflictNothingWithReadyGlobalIndex(t *testing.T) {
+func TestSnapshotPrepareAllowsConflictWithReadyGlobalIndex(t *testing.T) {
 	config, endpoints := globalIndexCatalog(t)
 	snapshot, err := NewSnapshotWithIndexes(
 		config, endpoints, 1, []IndexDescriptor{testGlobalIndexDescriptor()},
@@ -30,17 +29,15 @@ func TestSnapshotPrepareRejectsConflictNothingWithReadyGlobalIndex(t *testing.T)
 		t.Fatal(err)
 	}
 
-	const text = `INSERT INTO messages (tenant_id, id, email) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`
-	prepared, err := snapshot.Prepare(context.Background(), text)
-	if !errors.Is(err, ErrDistributedWriteUnsupported) {
-		t.Fatalf("Prepare error = %v, want ErrDistributedWriteUnsupported", err)
+	const nothingText = `INSERT INTO messages (tenant_id, id, email) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`
+	prepared, err := snapshot.Prepare(context.Background(), nothingText)
+	if err != nil || prepared == nil {
+		t.Fatalf("indexed conflict skip Prepare error = %v, plan = %v", err, prepared)
 	}
-	if prepared != nil {
-		t.Fatal("indexed conflict skip returned a bindable plan")
-	}
+
 	prepared, err = snapshot.Prepare(context.Background(), `INSERT INTO messages (tenant_id,id,email) VALUES (?,?,?) ON CONFLICT DO UPDATE SET email=EXCLUDED.email`)
-	if !errors.Is(err, ErrDistributedWriteUnsupported) || prepared != nil {
-		t.Fatalf("indexed conflict update was not refused: %v %v", prepared, err)
+	if err != nil || prepared == nil {
+		t.Fatalf("indexed conflict update Prepare error = %v, plan = %v", err, prepared)
 	}
 }
 
