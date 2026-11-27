@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"sync"
 	"syscall"
@@ -20,6 +21,7 @@ import (
 	"github.com/thesyncim/vibedb/internal/raftstore"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
+	"github.com/thesyncim/vibedb/internal/resourceguard"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
 	"github.com/thesyncim/vibedb/internal/servicetls"
 	"github.com/thesyncim/vibedb/shardservice"
@@ -282,8 +284,14 @@ func runServeNode(args []string) int {
 	manifestPath := fs.String("manifest", "", "canonical prepared physical-node manifest")
 	reload := fs.Bool("reload-prepared-groups", false, "allow SIGHUP to append durably prepared groups from the same manifest")
 	executionLanes := fs.Int("execution-lanes", rf3DefaultExecutionLanes, "power-of-two Raft execution lanes shared by node groups")
+	metricsHTTPListen := fs.String("metrics-http-listen", "", "optional loopback HTTP observability listen address serving /healthz, /readyz, and Prometheus /metrics")
+	frontendDrainGrace := fs.Duration("frontend-drain-grace-period", 0, "optional bounded drain grace period after which lingering sessions are force-closed during frontend drain (0 waits indefinitely)")
+	maxMemoryBytes := fs.Uint64("max-memory-bytes", 0, "optional hard process memory admission ceiling in bytes (0 disables)")
+	minFreeDiskBytes := fs.Uint64("min-free-disk-bytes", 0, "optional hard minimum free filesystem bytes admission watermark (0 disables)")
+	diskWatermarkPath := fs.String("disk-watermark-path", "", "filesystem path sampled for -min-free-disk-bytes (defaults to manifest directory)")
+	slowQueryThreshold := fs.Duration("slow-query-threshold", 0, "optional duration threshold above which slow reads/writes are logged (0 disables)")
 	if err := fs.Parse(args); err != nil || *manifestPath == "" || fs.NArg() != 0 ||
-		!validRF3ExecutionLanes(*executionLanes) {
+		!validRF3ExecutionLanes(*executionLanes) || *frontendDrainGrace < 0 || *slowQueryThreshold < 0 {
 		usage()
 		return 2
 	}
@@ -295,6 +303,20 @@ func runServeNode(args []string) int {
 	if manifest.NodeLog == nil || len(manifest.Groups) == 0 && manifest.NodeIncarnation == 0 {
 		fmt.Fprintln(os.Stderr, "error RF3 node manifest: serve-node requires a grouped node_log and empty-node incarnation when groups are absent")
 		return 2
+	}
+	if manifest.Gateway != nil {
+		diskPath := *diskWatermarkPath
+		if diskPath == "" && *minFreeDiskBytes > 0 {
+			diskPath = filepath.Dir(*manifestPath)
+		}
+		manifest.Gateway.RuntimeOps = rf3ServeNodeRuntimeOps{
+			MetricsHTTPListenAddress: *metricsHTTPListen,
+			FrontendDrainGracePeriod: *frontendDrainGrace,
+			MaxMemoryBytes:           *maxMemoryBytes,
+			MinFreeDiskBytes:         *minFreeDiskBytes,
+			DiskWatermarkPath:        diskPath,
+			SlowQueryThreshold:       *slowQueryThreshold,
+		}
 	}
 	stopReload := configureRF3ManifestReload(&manifest, *manifestPath, *reload)
 	defer stopReload()
@@ -421,6 +443,14 @@ func prepareRF3EmbeddedGateway(
 			return nil, fmt.Errorf("%w: embedded gateway DDL owner identity", errRF3Serving)
 		}
 	}
+	var admissionGuard *resourceguard.Guard
+	if encoded.RuntimeOps.MaxMemoryBytes > 0 || encoded.RuntimeOps.MinFreeDiskBytes > 0 {
+		admissionGuard = resourceguard.New(resourceguard.Options{
+			MaxMemoryBytes:   encoded.RuntimeOps.MaxMemoryBytes,
+			DiskPath:         encoded.RuntimeOps.DiskWatermarkPath,
+			MinFreeDiskBytes: encoded.RuntimeOps.MinFreeDiskBytes,
+		})
+	}
 	config := gatewayruntime.Config{
 		CatalogPath: encoded.CatalogPath, CatalogRouteSeedPath: encoded.CatalogRouteSeedPath,
 		CatalogBootstrapIfMissing: encoded.CatalogBootstrapIfMissing,
@@ -431,7 +461,11 @@ func prepareRF3EmbeddedGateway(
 		CatalogSessionJournal:     encoded.CatalogSessionJournal, CatalogClientID: clientID,
 		CatalogRetryHome: retryHome, DurableAckKeyPath: encoded.DurableAckKeyPath,
 		Transport: client, RequireServiceDirectoryBinding: true,
-		ListenAddress:  encoded.ListenAddress,
+		ListenAddress:            encoded.ListenAddress,
+		MetricsHTTPListenAddress: encoded.RuntimeOps.MetricsHTTPListenAddress,
+		FrontendDrainGracePeriod: encoded.RuntimeOps.FrontendDrainGracePeriod,
+		ResourceGuard:            admissionGuard,
+		SlowQueryThreshold:       encoded.RuntimeOps.SlowQueryThreshold,
 		TLSCertificate: encoded.TLS.Certificate, TLSKey: encoded.TLS.Key,
 		TLSRoots: encoded.TLS.Roots, TLSIdentityOID: encoded.TLS.IdentityOID,
 		TLSHandshakeTimeout: handshakeTimeout, TLSProfile: frontendProfile,
