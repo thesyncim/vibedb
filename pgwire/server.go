@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -613,6 +614,48 @@ func (s *Server) cancelRequest(pid, secret int32) {
 	if sess != nil && sess.secret == secret {
 		sess.cancel()
 	}
+}
+
+type sessionActivity struct {
+	pid          int32
+	datname      string
+	usename      string
+	appName      string
+	clientAddr   string
+	backendStart string
+	state        string
+	query        string
+}
+
+func (s *Server) activitySnapshot() []sessionActivity {
+	s.mu.Lock()
+	list := make([]*session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		list = append(list, sess)
+	}
+	s.mu.Unlock()
+
+	out := make([]sessionActivity, 0, len(list))
+	for _, sess := range list {
+		sess.cancelMu.Lock()
+		act := sessionActivity{
+			pid:          sess.pid,
+			datname:      sess.database,
+			usename:      sess.user,
+			appName:      sess.activityAppName,
+			clientAddr:   sess.clientAddr,
+			backendStart: sess.startedAt.Format(time.RFC3339),
+			state:        sess.activityState,
+			query:        sess.activityQuery,
+		}
+		sess.cancelMu.Unlock()
+		if act.state == "" {
+			act.state = "idle"
+		}
+		out = append(out, act)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].pid < out[j].pid })
+	return out
 }
 
 // randomKey returns the secret half of a backend key. It comes from
