@@ -88,6 +88,11 @@ type Options struct {
 	// ResourceGuard optionally enforces hard process memory and disk free-space
 	// watermarks before admitting reads or writes. Nil disables watermark checks.
 	ResourceGuard ResourceAdmissionGuard
+	// SlowQueryThreshold and SlowQueryObserver optionally emit a SlowQueryEvent
+	// whenever a gateway read or write takes at least SlowQueryThreshold.
+	// Disabled (zero overhead) when SlowQueryThreshold <= 0 or observer is nil.
+	SlowQueryThreshold time.Duration
+	SlowQueryObserver  SlowQueryObserver
 }
 
 // ResourceAdmissionGuard enforces process-level memory and disk free-space
@@ -112,7 +117,9 @@ type Executor struct {
 	metrics           Metrics
 	internalAuthority serviceauthz.Authority
 	pressure          PressureObserver
-	resourceGuard     ResourceAdmissionGuard
+	resourceGuard      ResourceAdmissionGuard
+	slowQueryThreshold time.Duration
+	slowQueryObserver  SlowQueryObserver
 	// planMu guards the shared physical-plan cache; see plan_cache.go.
 	// Entries are immutable once published, so concurrent queries copy
 	// entries into per-call working state instead of locking around use.
@@ -146,8 +153,10 @@ func NewExecutor(client ShardTransport, catalog *CatalogHolder, opts Options) *E
 		maxRetry:          maxRetry,
 		routers:           newRouterPool(),
 		internalAuthority: opts.InternalAuthority,
-		pressure:          opts.Pressure,
-		resourceGuard:     opts.ResourceGuard,
+		pressure:           opts.Pressure,
+		resourceGuard:      opts.ResourceGuard,
+		slowQueryThreshold: opts.SlowQueryThreshold,
+		slowQueryObserver:  opts.SlowQueryObserver,
 	}
 }
 
@@ -274,9 +283,11 @@ func (e *Executor) queryWithProfileValidation(
 ) (res *Result, err error) {
 	started := time.Now()
 	defer func() {
+		dur := time.Since(started)
 		if err == nil {
-			e.metrics.ObserveReadLatency(time.Since(started))
+			e.metrics.ObserveReadLatency(dur)
 		}
+		e.observeSlowQuery("read", q.SQL, dur, res, err)
 	}()
 	if ctx == nil {
 		ctx = context.Background()
@@ -532,9 +543,11 @@ func (e *Executor) queryWithProfileValidation(
 func (e *Executor) Exec(ctx context.Context, q Query) (res *Result, err error) {
 	started := time.Now()
 	defer func() {
+		dur := time.Since(started)
 		if err == nil {
-			e.metrics.ObserveWriteLatency(time.Since(started))
+			e.metrics.ObserveWriteLatency(dur)
 		}
+		e.observeSlowQuery("write", q.SQL, dur, res, err)
 	}()
 	if ctx == nil {
 		ctx = context.Background()
