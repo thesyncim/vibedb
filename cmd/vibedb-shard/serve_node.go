@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/controllerlease"
 	"github.com/thesyncim/vibedb/internal/gatewayruntime"
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -290,8 +291,11 @@ func runServeNode(args []string) int {
 	minFreeDiskBytes := fs.Uint64("min-free-disk-bytes", 0, "optional hard minimum free filesystem bytes admission watermark (0 disables)")
 	diskWatermarkPath := fs.String("disk-watermark-path", "", "filesystem path sampled for -min-free-disk-bytes (defaults to manifest directory)")
 	slowQueryThreshold := fs.Duration("slow-query-threshold", 0, "optional duration threshold above which slow reads/writes are logged (0 disables)")
+	controllerLeaseDir := fs.String("controller-lease-dir", "", "optional shared directory for durable CAS-fenced controller lease failover across physical-node frontends")
+	controllerLeaseKey := fs.String("controller-lease-key", "vibedb/controller/primary", "lease key name inside -controller-lease-dir")
+	controllerLeaseTTL := fs.Duration("controller-lease-ttl", 10*time.Second, "controller lease TTL when -controller-lease-dir is set")
 	if err := fs.Parse(args); err != nil || *manifestPath == "" || fs.NArg() != 0 ||
-		!validRF3ExecutionLanes(*executionLanes) || *frontendDrainGrace < 0 || *slowQueryThreshold < 0 {
+		!validRF3ExecutionLanes(*executionLanes) || *frontendDrainGrace < 0 || *slowQueryThreshold < 0 || *controllerLeaseTTL < 0 {
 		usage()
 		return 2
 	}
@@ -316,6 +320,9 @@ func runServeNode(args []string) int {
 			MinFreeDiskBytes:         *minFreeDiskBytes,
 			DiskWatermarkPath:        diskPath,
 			SlowQueryThreshold:       *slowQueryThreshold,
+			ControllerLeaseDir:       *controllerLeaseDir,
+			ControllerLeaseKey:       *controllerLeaseKey,
+			ControllerLeaseTTL:       *controllerLeaseTTL,
 		}
 	}
 	stopReload := configureRF3ManifestReload(&manifest, *manifestPath, *reload)
@@ -451,6 +458,27 @@ func prepareRF3EmbeddedGateway(
 			MinFreeDiskBytes: encoded.RuntimeOps.MinFreeDiskBytes,
 		})
 	}
+	var leaseElector *controllerlease.Elector
+	if encoded.RuntimeOps.ControllerLeaseDir != "" {
+		store, lerr := controllerlease.NewFileStore(encoded.RuntimeOps.ControllerLeaseDir)
+		if lerr != nil {
+			_ = remote.Close()
+			return nil, fmt.Errorf("%w: controller lease store: %v", errRF3Serving, lerr)
+		}
+		holder := encoded.CatalogClientID
+		if holder == "" {
+			holder = encoded.ListenAddress
+		}
+		leaseElector, lerr = controllerlease.NewElector(store, controllerlease.Config{
+			Key:      encoded.RuntimeOps.ControllerLeaseKey,
+			Holder:   holder,
+			LeaseTTL: encoded.RuntimeOps.ControllerLeaseTTL,
+		})
+		if lerr != nil {
+			_ = remote.Close()
+			return nil, fmt.Errorf("%w: controller lease elector: %v", errRF3Serving, lerr)
+		}
+	}
 	config := gatewayruntime.Config{
 		CatalogPath: encoded.CatalogPath, CatalogRouteSeedPath: encoded.CatalogRouteSeedPath,
 		CatalogBootstrapIfMissing: encoded.CatalogBootstrapIfMissing,
@@ -466,6 +494,7 @@ func prepareRF3EmbeddedGateway(
 		FrontendDrainGracePeriod: encoded.RuntimeOps.FrontendDrainGracePeriod,
 		ResourceGuard:            admissionGuard,
 		SlowQueryThreshold:       encoded.RuntimeOps.SlowQueryThreshold,
+		ControllerLease:          leaseElector,
 		TLSCertificate: encoded.TLS.Certificate, TLSKey: encoded.TLS.Key,
 		TLSRoots: encoded.TLS.Roots, TLSIdentityOID: encoded.TLS.IdentityOID,
 		TLSHandshakeTimeout: handshakeTimeout, TLSProfile: frontendProfile,

@@ -409,6 +409,15 @@ func (runtime *Runtime) startOptionalServices() error {
 		}
 		servingContext = withClusterControlServer(servingContext, server)
 	}
+	if runtime.config.ControllerLease != nil {
+		done := make(chan struct{})
+		runtime.controllerLeaseDone = done
+		elector := runtime.config.ControllerLease
+		go func() {
+			defer close(done)
+			_ = elector.Run(controllerCtx)
+		}()
+	}
 	if runtime.hotShardRuntime != nil {
 		runtime.hotShardDone = runGatewayHotShardPublisher(
 			controllerCtx, runtime.hotShardRuntime, runtime.config.HotShardInterval, runtime.config.Logf,
@@ -419,8 +428,9 @@ func (runtime *Runtime) startOptionalServices() error {
 		runtime.splitControllerDone = done
 		go func() {
 			defer close(done)
-			runServingSplitController(controllerCtx, runtime.authority,
-				runtime.splitRuntime.controller, runtime.config.ControllerInterval, runtime.config.Logf)
+			runServingSplitControllerWithLease(controllerCtx, runtime.authority,
+				runtime.splitRuntime.controller, runtime.config.ControllerInterval,
+				runtime.config.ControllerLease, runtime.config.Logf)
 		}()
 	}
 	runtime.servingContext = servingContext

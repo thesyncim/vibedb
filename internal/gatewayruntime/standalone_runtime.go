@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/thesyncim/vibedb/internal/controllerlease"
 	"github.com/thesyncim/vibedb/internal/replication"
 	"github.com/thesyncim/vibedb/internal/resourceguard"
 	"github.com/thesyncim/vibedb/internal/servicetls"
@@ -23,6 +24,9 @@ type standaloneOpsFlags struct {
 	minFreeDiskBytes   uint64
 	diskWatermarkPath  string
 	slowQueryThreshold time.Duration
+	controllerLeaseDir string
+	controllerLeaseKey string
+	controllerLeaseTTL time.Duration
 }
 
 // runServeThroughRuntime is the sole standalone serving entry point. It keeps
@@ -83,12 +87,34 @@ func runServeThroughRuntime(
 			MinFreeDiskBytes: ops.minFreeDiskBytes,
 		})
 	}
+	var leaseElector *controllerlease.Elector
+	if ops.controllerLeaseDir != "" {
+		store, lerr := controllerlease.NewFileStore(ops.controllerLeaseDir)
+		if lerr != nil {
+			fmt.Fprintf(os.Stderr, "gateway: controller lease store: %v\n", lerr)
+			return 2, true
+		}
+		holder := clientIDText
+		if holder == "" {
+			holder = listen
+		}
+		leaseElector, lerr = controllerlease.NewElector(store, controllerlease.Config{
+			Key:      ops.controllerLeaseKey,
+			Holder:   holder,
+			LeaseTTL: ops.controllerLeaseTTL,
+		})
+		if lerr != nil {
+			fmt.Fprintf(os.Stderr, "gateway: controller lease elector: %v\n", lerr)
+			return 2, true
+		}
+	}
 	config := Config{
 		InitialNodeDirectory:     initialNodes,
 		MetricsHTTPListenAddress: ops.metricsHTTPListen,
 		FrontendDrainGracePeriod: ops.frontendDrainGrace,
 		ResourceGuard:            guard,
 		SlowQueryThreshold:       ops.slowQueryThreshold,
+		ControllerLease:          leaseElector,
 		CatalogPath:          catalog, CatalogRouteSeedPath: routeSeed,
 		DevStaticCatalog: static, DevPlaintext: plaintext,
 		CatalogBootstrapIfMissing: bootstrap,

@@ -273,6 +273,7 @@ type Runtime struct {
 	controlDone                     <-chan error
 	replicaControllersDone          <-chan struct{}
 	splitControllerDone             <-chan struct{}
+	controllerLeaseDone             <-chan struct{}
 	hotShardDone                    <-chan struct{}
 	metricsDone                     <-chan struct{}
 	routeSeedDone                   <-chan struct{}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/thesyncim/vibedb/autosplit"
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/controllerlease"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/splitcontroller"
 )
@@ -165,9 +166,25 @@ func runServingSplitController(
 	interval time.Duration,
 	logf func(string, ...any),
 ) {
+	runServingSplitControllerWithLease(ctx, directory, controller, interval, nil, logf)
+}
+
+func runServingSplitControllerWithLease(
+	ctx context.Context,
+	directory splitcontroller.ControllerDirectory,
+	controller *splitcontroller.ControllerService,
+	interval time.Duration,
+	elector *controllerlease.Elector,
+	logf func(string, ...any),
+) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	runServingSplitControllerLoop(ctx, func(ctx context.Context) (splitcontroller.ControllerPass, error) {
+		if elector != nil {
+			if _, ok := elector.Lease(); !ok {
+				return splitcontroller.ControllerPass{}, nil
+			}
+		}
 		started := time.Now()
 		pass, err := splitcontroller.RunDirectControllerPass(ctx, directory, controller)
 		gatewayControllerMetricsFromContext(ctx).observeSplit(pass, err, time.Since(started))

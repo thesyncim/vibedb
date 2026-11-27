@@ -18,6 +18,9 @@ type rf3ServeNodeRuntimeOps struct {
 	MinFreeDiskBytes         uint64
 	DiskWatermarkPath        string
 	SlowQueryThreshold       time.Duration
+	ControllerLeaseDir       string
+	ControllerLeaseKey       string
+	ControllerLeaseTTL       time.Duration
 }
 
 // rf3ManifestGateway is the persisted, serializable part of one embedded
