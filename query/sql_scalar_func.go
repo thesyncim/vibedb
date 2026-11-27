@@ -4,7 +4,6 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"math"
 	"regexp"
@@ -13,6 +12,10 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/document"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 func builtinScalarFuncValueType(name string) ValueType {
@@ -27,7 +30,7 @@ func builtinScalarFuncValueType(name string) ValueType {
 		return TypeBool
 	case "json_build_object", "jsonb_build_object", "json_build_array", "jsonb_build_array",
 		"to_json", "to_jsonb", "json_extract_path", "jsonb_extract_path",
-		"json_strip_nulls", "jsonb_strip_nulls", "string_to_array":
+		"json_strip_nulls", "jsonb_strip_nulls", "jsonb_set", "json_set", "string_to_array":
 		return TypeAny
 	default:
 		return TypeString
@@ -48,140 +51,218 @@ func builtinScalarFuncRepresentation(name string) OutputRepresentation {
 }
 
 func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (statementScalarValue, error) {
-	args := make([]statementScalarValue, len(node.funcArgs))
-	for i, idx := range node.funcArgs {
-		args[i] = r.values[idx]
-	}
+	argIdx := node.funcArgs
+	argc := len(argIdx)
 	name := node.funcName
 
 	// Non-strict functions (handle NULLs themselves).
 	switch name {
 	case "concat":
-		var b strings.Builder
-		for _, a := range args {
+		start := len(*arena)
+		for _, idx := range argIdx {
+			a := r.values[idx]
 			if a.isNull() {
 				continue
 			}
-			b.WriteString(scalarAsDisplayString(a))
+			*arena = appendScalarDisplay(*arena, a)
 		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: b.String()}}, nil
+		return arenaStringValue(arena, start), nil
 	case "concat_ws":
-		if len(args) < 1 {
+		if argc < 1 {
 			return statementScalarValue{}, fmt.Errorf("%w: concat_ws requires at least 1 argument", ErrScalarType)
 		}
-		if args[0].isNull() {
-			return statementScalarValue{value: scalar{kind: kindNull}}, nil
+		first := r.values[argIdx[0]]
+		if first.isNull() {
+			return nullScalarValue(), nil
 		}
-		sep := scalarAsDisplayString(args[0])
-		var parts []string
-		for _, a := range args[1:] {
+		var sep string
+		if first.value.kind == kindString {
+			sep = first.value.sval
+		} else {
+			sepStart := len(*arena)
+			*arena = appendScalarDisplay(*arena, first)
+			sep = byteview.String((*arena)[sepStart:len(*arena):len(*arena)])
+		}
+		start := len(*arena)
+		wrote := false
+		for _, idx := range argIdx[1:] {
+			a := r.values[idx]
 			if a.isNull() {
 				continue
 			}
-			parts = append(parts, scalarAsDisplayString(a))
+			if wrote {
+				*arena = append(*arena, sep...)
+			}
+			*arena = appendScalarDisplay(*arena, a)
+			wrote = true
 		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: strings.Join(parts, sep)}}, nil
+		return arenaStringValue(arena, start), nil
 	case "now", "current_timestamp", "clock_timestamp", "statement_timestamp":
-		return statementScalarValue{value: scalar{kind: kindString, sval: time.Now().UTC().Format(time.RFC3339Nano)}}, nil
+		start := len(*arena)
+		*arena = time.Now().UTC().AppendFormat(*arena, time.RFC3339Nano)
+		return arenaStringValue(arena, start), nil
 	case "current_date":
-		return statementScalarValue{value: scalar{kind: kindString, sval: time.Now().UTC().Format("2006-01-02")}}, nil
+		start := len(*arena)
+		*arena = time.Now().UTC().AppendFormat(*arena, "2006-01-02")
+		return arenaStringValue(arena, start), nil
 	case "gen_random_uuid":
 		var u [16]byte
 		_, _ = rand.Read(u[:])
 		u[6] = (u[6] & 0x0f) | 0x40
 		u[8] = (u[8] & 0x3f) | 0x80
-		s := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
-		return statementScalarValue{value: scalar{kind: kindString, sval: s}}, nil
+		start := len(*arena)
+		*arena = appendUUID(*arena, u)
+		return arenaStringValue(arena, start), nil
 	case "pi":
 		return statementScalarValue{value: arenaFloatScalar(arena, math.Pi)}, nil
 	case "json_build_array", "jsonb_build_array":
-		elems := make([]json.RawMessage, len(args))
-		for i, a := range args {
-			elems[i] = scalarAsJSONRaw(a)
+		start := len(*arena)
+		*arena = append(*arena, '[')
+		for i, idx := range argIdx {
+			if i > 0 {
+				*arena = append(*arena, ',')
+			}
+			*arena = appendScalarJSON(*arena, r.values[idx])
 		}
-		raw, err := json.Marshal(elems)
-		if err != nil {
-			return statementScalarValue{}, err
-		}
-		return statementScalarValue{cell: jsonCellFromBytes(arena, raw), direct: true}, nil
+		*arena = append(*arena, ']')
+		return arenaJSONValue(arena, start), nil
 	case "json_build_object", "jsonb_build_object":
-		if len(args)%2 != 0 {
+		if argc%2 != 0 {
 			return statementScalarValue{}, fmt.Errorf("%w: %s requires an even number of arguments", ErrScalarType, name)
 		}
-		obj := make(map[string]json.RawMessage, len(args)/2)
-		for i := 0; i < len(args); i += 2 {
-			if args[i].isNull() {
+		nPairs := argc / 2
+		if name == "jsonb_build_object" && nPairs > 1 {
+			var keyStack [16]string
+			var keys []string
+			if nPairs <= len(keyStack) {
+				keys = keyStack[:nPairs]
+			} else {
+				keys = make([]string, nPairs)
+			}
+			for i := 0; i < nPairs; i++ {
+				k := r.values[argIdx[i*2]]
+				if k.isNull() {
+					return statementScalarValue{}, fmt.Errorf("%w: %s key must not be null", ErrScalarType, name)
+				}
+				if k.value.kind == kindString {
+					keys[i] = k.value.sval
+				} else {
+					ks := len(*arena)
+					*arena = appendScalarDisplay(*arena, k)
+					keys[i] = byteview.String((*arena)[ks:len(*arena):len(*arena)])
+				}
+			}
+			start := len(*arena)
+			*arena = append(*arena, '{')
+			wrote := false
+			for i := 0; i < nPairs; i++ {
+				dup := false
+				for j := i + 1; j < nPairs; j++ {
+					if keys[j] == keys[i] {
+						dup = true
+						break
+					}
+				}
+				if dup {
+					continue
+				}
+				if wrote {
+					*arena = append(*arena, ',')
+				}
+				wrote = true
+				*arena = appendJSONString(*arena, keys[i])
+				*arena = append(*arena, ':')
+				*arena = appendScalarJSON(*arena, r.values[argIdx[i*2+1]])
+			}
+			*arena = append(*arena, '}')
+			return arenaJSONValue(arena, start), nil
+		}
+		start := len(*arena)
+		*arena = append(*arena, '{')
+		for i := 0; i < argc; i += 2 {
+			k := r.values[argIdx[i]]
+			if k.isNull() {
 				return statementScalarValue{}, fmt.Errorf("%w: %s key must not be null", ErrScalarType, name)
 			}
-			obj[scalarAsDisplayString(args[i])] = scalarAsJSONRaw(args[i+1])
+			if i > 0 {
+				*arena = append(*arena, ',')
+			}
+			if k.value.kind == kindString {
+				*arena = appendJSONString(*arena, k.value.sval)
+			} else {
+				var kbuf [64]byte
+				kb := appendScalarDisplay(kbuf[:0], k)
+				*arena = appendJSONString(*arena, byteview.String(kb))
+			}
+			*arena = append(*arena, ':')
+			*arena = appendScalarJSON(*arena, r.values[argIdx[i+1]])
 		}
-		raw, err := json.Marshal(obj)
-		if err != nil {
-			return statementScalarValue{}, err
-		}
-		return statementScalarValue{cell: jsonCellFromBytes(arena, raw), direct: true}, nil
+		*arena = append(*arena, '}')
+		return arenaJSONValue(arena, start), nil
 	case "to_json", "to_jsonb":
-		if len(args) != 1 {
+		if argc != 1 {
 			return statementScalarValue{}, fmt.Errorf("%w: %s requires 1 argument", ErrScalarType, name)
 		}
-		raw := scalarAsJSONRaw(args[0])
-		return statementScalarValue{cell: jsonCellFromBytes(arena, raw), direct: true}, nil
+		start := len(*arena)
+		*arena = appendScalarJSON(*arena, r.values[argIdx[0]])
+		return arenaJSONValue(arena, start), nil
 	case "json_typeof", "jsonb_typeof":
-		if len(args) != 1 {
+		if argc != 1 {
 			return statementScalarValue{}, fmt.Errorf("%w: %s requires 1 argument", ErrScalarType, name)
 		}
-		if args[0].isNull() {
-			return statementScalarValue{value: scalar{kind: kindNull}}, nil
+		v := r.values[argIdx[0]]
+		if v.isNull() {
+			return nullScalarValue(), nil
 		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: scalarJSONTypeOf(args[0])}}, nil
+		return statementScalarValue{value: scalar{kind: kindString, sval: scalarJSONTypeOf(v)}}, nil
 	}
 
 	// Strict functions: any NULL argument yields NULL.
-	for _, a := range args {
-		if a.isNull() {
-			return statementScalarValue{value: scalar{kind: kindNull}}, nil
+	for _, idx := range argIdx {
+		if r.values[idx].isNull() {
+			return nullScalarValue(), nil
 		}
 	}
 
 	switch name {
 	case "lower":
-		s, err := requireOneString(name, args)
+		s, err := r.requireOneString(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: strings.ToLower(s)}}, nil
+		return statementScalarValue{value: scalar{kind: kindString, sval: appendLower(arena, s)}}, nil
 	case "upper":
-		s, err := requireOneString(name, args)
+		s, err := r.requireOneString(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: strings.ToUpper(s)}}, nil
+		return statementScalarValue{value: scalar{kind: kindString, sval: appendUpper(arena, s)}}, nil
 	case "length", "char_length", "character_length":
-		s, err := requireOneString(name, args)
+		s, err := r.requireOneString(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		return statementScalarValue{value: arenaIntScalar(arena, int64(utf8.RuneCountInString(s)))}, nil
+		return statementScalarValue{value: arenaIntScalar(arena, int64(runeCountFast(s)))}, nil
 	case "octet_length":
-		s, err := requireOneString(name, args)
+		s, err := r.requireOneString(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
 		return statementScalarValue{value: arenaIntScalar(arena, int64(len(s)))}, nil
 	case "trim", "btrim":
-		if len(args) == 1 {
-			s, err := requireStringArg(name, args[0])
+		if argc == 1 {
+			s, err := requireStringArg(name, r.values[argIdx[0]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
 			return statementScalarValue{value: scalar{kind: kindString, sval: strings.TrimSpace(s)}}, nil
 		}
-		if len(args) == 2 {
-			s, err := requireStringArg(name, args[0])
+		if argc == 2 {
+			s, err := requireStringArg(name, r.values[argIdx[0]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
-			cut, err := requireStringArg(name, args[1])
+			cut, err := requireStringArg(name, r.values[argIdx[1]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
@@ -189,19 +270,19 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 		}
 		return statementScalarValue{}, fmt.Errorf("%w: %s takes 1 or 2 arguments", ErrScalarType, name)
 	case "ltrim":
-		if len(args) == 1 {
-			s, err := requireStringArg(name, args[0])
+		if argc == 1 {
+			s, err := requireStringArg(name, r.values[argIdx[0]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
-			return statementScalarValue{value: scalar{kind: kindString, sval: strings.TrimLeftFunc(s, unicode.IsSpace)}}, nil
+			return statementScalarValue{value: scalar{kind: kindString, sval: trimLeftSpaceFast(s)}}, nil
 		}
-		if len(args) == 2 {
-			s, err := requireStringArg(name, args[0])
+		if argc == 2 {
+			s, err := requireStringArg(name, r.values[argIdx[0]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
-			cut, err := requireStringArg(name, args[1])
+			cut, err := requireStringArg(name, r.values[argIdx[1]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
@@ -209,19 +290,19 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 		}
 		return statementScalarValue{}, fmt.Errorf("%w: %s takes 1 or 2 arguments", ErrScalarType, name)
 	case "rtrim":
-		if len(args) == 1 {
-			s, err := requireStringArg(name, args[0])
+		if argc == 1 {
+			s, err := requireStringArg(name, r.values[argIdx[0]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
-			return statementScalarValue{value: scalar{kind: kindString, sval: strings.TrimRightFunc(s, unicode.IsSpace)}}, nil
+			return statementScalarValue{value: scalar{kind: kindString, sval: trimRightSpaceFast(s)}}, nil
 		}
-		if len(args) == 2 {
-			s, err := requireStringArg(name, args[0])
+		if argc == 2 {
+			s, err := requireStringArg(name, r.values[argIdx[0]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
-			cut, err := requireStringArg(name, args[1])
+			cut, err := requireStringArg(name, r.values[argIdx[1]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
@@ -229,141 +310,102 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 		}
 		return statementScalarValue{}, fmt.Errorf("%w: %s takes 1 or 2 arguments", ErrScalarType, name)
 	case "replace":
-		if len(args) != 3 {
+		if argc != 3 {
 			return statementScalarValue{}, fmt.Errorf("%w: replace requires 3 arguments", ErrScalarType)
 		}
-		s, err := requireStringArg(name, args[0])
+		s, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		oldS, err := requireStringArg(name, args[1])
+		oldS, err := requireStringArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		newS, err := requireStringArg(name, args[2])
+		newS, err := requireStringArg(name, r.values[argIdx[2]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: strings.ReplaceAll(s, oldS, newS)}}, nil
+		return statementScalarValue{value: scalar{kind: kindString, sval: appendReplaceAll(arena, s, oldS, newS)}}, nil
 	case "substring", "substr":
-		if len(args) < 2 || len(args) > 3 {
+		if argc < 2 || argc > 3 {
 			return statementScalarValue{}, fmt.Errorf("%w: %s takes 2 or 3 arguments", ErrScalarType, name)
 		}
-		s, err := requireStringArg(name, args[0])
+		s, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		startF, err := requireNumberArg(name, args[1])
+		startF, err := requireNumberArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		runes := []rune(s)
-		start := int(startF) - 1
-		if start < 0 {
-			start = 0
-		}
-		if start >= len(runes) {
-			return statementScalarValue{value: scalar{kind: kindString, sval: ""}}, nil
-		}
-		end := len(runes)
-		if len(args) == 3 {
-			nF, err := requireNumberArg(name, args[2])
+		hasLen := argc == 3
+		var nF float64
+		if hasLen {
+			nF, err = requireNumberArg(name, r.values[argIdx[2]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
 			if nF < 0 {
 				return statementScalarValue{}, fmt.Errorf("%w: negative substring length", ErrScalarNumericRange)
 			}
-			if start+int(nF) < end {
-				end = start + int(nF)
-			}
 		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: string(runes[start:end])}}, nil
+		return statementScalarValue{value: scalar{kind: kindString, sval: substrSlice(s, startF, hasLen, nF)}}, nil
 	case "left":
-		if len(args) != 2 {
+		if argc != 2 {
 			return statementScalarValue{}, fmt.Errorf("%w: left requires 2 arguments", ErrScalarType)
 		}
-		s, err := requireStringArg(name, args[0])
+		s, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		nF, err := requireNumberArg(name, args[1])
+		nF, err := requireNumberArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		runes := []rune(s)
-		n := int(nF)
-		if n < 0 {
-			n = len(runes) + n
-		}
-		if n <= 0 {
-			return statementScalarValue{value: scalar{kind: kindString, sval: ""}}, nil
-		}
-		if n > len(runes) {
-			n = len(runes)
-		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: string(runes[:n])}}, nil
+		return statementScalarValue{value: scalar{kind: kindString, sval: leftSlice(s, nF)}}, nil
 	case "right":
-		if len(args) != 2 {
+		if argc != 2 {
 			return statementScalarValue{}, fmt.Errorf("%w: right requires 2 arguments", ErrScalarType)
 		}
-		s, err := requireStringArg(name, args[0])
+		s, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		nF, err := requireNumberArg(name, args[1])
+		nF, err := requireNumberArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		runes := []rune(s)
-		n := int(nF)
-		if n < 0 {
-			n = len(runes) + n
-		}
-		if n <= 0 {
-			return statementScalarValue{value: scalar{kind: kindString, sval: ""}}, nil
-		}
-		if n > len(runes) {
-			n = len(runes)
-		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: string(runes[len(runes)-n:])}}, nil
+		return statementScalarValue{value: scalar{kind: kindString, sval: rightSlice(s, nF)}}, nil
 	case "split_part":
-		if len(args) != 3 {
+		if argc != 3 {
 			return statementScalarValue{}, fmt.Errorf("%w: split_part requires 3 arguments", ErrScalarType)
 		}
-		s, err := requireStringArg(name, args[0])
+		s, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		delim, err := requireStringArg(name, args[1])
+		delim, err := requireStringArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		fieldF, err := requireNumberArg(name, args[2])
+		fieldF, err := requireNumberArg(name, r.values[argIdx[2]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		field := int(fieldF)
+		field := clampFloatToInt(fieldF)
 		if field == 0 {
 			return statementScalarValue{}, fmt.Errorf("%w: field position must not be zero", ErrScalarNumericRange)
 		}
-		parts := strings.Split(s, delim)
-		if field < 0 {
-			field = len(parts) + field + 1
-		}
-		if field < 1 || field > len(parts) {
-			return statementScalarValue{value: scalar{kind: kindString, sval: ""}}, nil
-		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: parts[field-1]}}, nil
+		return statementScalarValue{value: scalar{kind: kindString, sval: splitPartSlice(s, delim, field)}}, nil
 	case "strpos":
-		if len(args) != 2 {
+		if argc != 2 {
 			return statementScalarValue{}, fmt.Errorf("%w: strpos requires 2 arguments", ErrScalarType)
 		}
-		s, err := requireStringArg(name, args[0])
+		s, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		sub, err := requireStringArg(name, args[1])
+		sub, err := requireStringArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
@@ -371,108 +413,94 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 		if idx < 0 {
 			return statementScalarValue{value: arenaIntScalar(arena, 0)}, nil
 		}
-		pos := utf8.RuneCountInString(s[:idx]) + 1
+		pos := runeCountFast(s[:idx]) + 1
 		return statementScalarValue{value: arenaIntScalar(arena, int64(pos))}, nil
 	case "reverse":
-		s, err := requireOneString(name, args)
+		s, err := r.requireOneString(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		runes := []rune(s)
-		for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
-			runes[i], runes[j] = runes[j], runes[i]
-		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: string(runes)}}, nil
+		return statementScalarValue{value: scalar{kind: kindString, sval: appendReverse(arena, s)}}, nil
 	case "repeat":
-		if len(args) != 2 {
+		if argc != 2 {
 			return statementScalarValue{}, fmt.Errorf("%w: repeat requires 2 arguments", ErrScalarType)
 		}
-		s, err := requireStringArg(name, args[0])
+		s, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		nF, err := requireNumberArg(name, args[1])
+		nF, err := requireNumberArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
+		}
+		if nF <= 0 {
+			return statementScalarValue{value: scalar{kind: kindString, sval: ""}}, nil
+		}
+		if len(s) == 0 {
+			return statementScalarValue{value: scalar{kind: kindString, sval: ""}}, nil
+		}
+		if nF > float64((1<<20)/len(s)) {
+			return statementScalarValue{}, ErrScalarNumericRange
 		}
 		n := int(nF)
 		if n <= 0 {
 			return statementScalarValue{value: scalar{kind: kindString, sval: ""}}, nil
 		}
-		if len(s)*n > 1<<20 {
-			return statementScalarValue{}, ErrScalarNumericRange
+		start := len(*arena)
+		for i := 0; i < n; i++ {
+			*arena = append(*arena, s...)
 		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: strings.Repeat(s, n)}}, nil
+		return arenaStringValue(arena, start), nil
 	case "lpad", "rpad":
-		if len(args) < 2 || len(args) > 3 {
+		if argc < 2 || argc > 3 {
 			return statementScalarValue{}, fmt.Errorf("%w: %s takes 2 or 3 arguments", ErrScalarType, name)
 		}
-		s, err := requireStringArg(name, args[0])
+		s, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		nF, err := requireNumberArg(name, args[1])
+		nF, err := requireNumberArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
 		fill := " "
-		if len(args) == 3 {
-			fill, err = requireStringArg(name, args[2])
+		if argc == 3 {
+			fill, err = requireStringArg(name, r.values[argIdx[2]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
+		}
+		if nF <= 0 {
+			return statementScalarValue{value: scalar{kind: kindString, sval: ""}}, nil
+		}
+		if nF > float64(1<<20) {
+			return statementScalarValue{}, ErrScalarNumericRange
 		}
 		n := int(nF)
 		if n <= 0 {
 			return statementScalarValue{value: scalar{kind: kindString, sval: ""}}, nil
 		}
-		runes := []rune(s)
-		if len(runes) >= n {
-			return statementScalarValue{value: scalar{kind: kindString, sval: string(runes[:n])}}, nil
-		}
-		if fill == "" {
-			return statementScalarValue{value: scalar{kind: kindString, sval: s}}, nil
-		}
-		fillRunes := []rune(fill)
-		need := n - len(runes)
-		pad := make([]rune, need)
-		for i := 0; i < need; i++ {
-			pad[i] = fillRunes[i%len(fillRunes)]
-		}
-		if name == "lpad" {
-			return statementScalarValue{value: scalar{kind: kindString, sval: string(pad) + s}}, nil
-		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: s + string(pad)}}, nil
+		out := appendPad(arena, s, n, fill, name == "lpad")
+		return statementScalarValue{value: scalar{kind: kindString, sval: out}}, nil
 	case "initcap":
-		s, err := requireOneString(name, args)
+		s, err := r.requireOneString(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		var b strings.Builder
-		newWord := true
-		for _, ch := range s {
-			if unicode.IsLetter(ch) || unicode.IsDigit(ch) {
-				if newWord {
-					b.WriteRune(unicode.ToUpper(ch))
-					newWord = false
-				} else {
-					b.WriteRune(unicode.ToLower(ch))
-				}
-			} else {
-				b.WriteRune(ch)
-				newWord = true
-			}
-		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: b.String()}}, nil
+		return statementScalarValue{value: scalar{kind: kindString, sval: appendInitcap(arena, s)}}, nil
 	case "md5":
-		s, err := requireOneString(name, args)
+		s, err := r.requireOneString(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		sum := md5.Sum([]byte(s))
-		return statementScalarValue{value: scalar{kind: kindString, sval: hex.EncodeToString(sum[:])}}, nil
+		sum := md5.Sum(byteview.Bytes(s))
+		var hexBuf [32]byte
+		hex.Encode(hexBuf[:], sum[:])
+		start := len(*arena)
+		*arena = append(*arena, hexBuf[:]...)
+		return arenaStringValue(arena, start), nil
 	case "ascii":
-		s, err := requireOneString(name, args)
+		s, err := r.requireOneString(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
@@ -482,134 +510,138 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 		ch, _ := utf8.DecodeRuneInString(s)
 		return statementScalarValue{value: arenaIntScalar(arena, int64(ch))}, nil
 	case "chr":
-		nF, err := requireOneNumber(name, args)
+		nF, err := r.requireOneNumber(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: string(rune(int(nF)))}}, nil
+		ch := utf8.RuneError
+		if nF >= 0 && nF <= utf8.MaxRune {
+			ch = rune(int(nF))
+		}
+		start := len(*arena)
+		*arena = utf8.AppendRune(*arena, ch)
+		return arenaStringValue(arena, start), nil
 	case "starts_with":
-		if len(args) != 2 {
+		if argc != 2 {
 			return statementScalarValue{}, fmt.Errorf("%w: starts_with requires 2 arguments", ErrScalarType)
 		}
-		s, err := requireStringArg(name, args[0])
+		s, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		pref, err := requireStringArg(name, args[1])
+		pref, err := requireStringArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
 		return statementScalarValue{value: scalar{kind: kindBool, bval: strings.HasPrefix(s, pref)}}, nil
 	case "translate":
-		if len(args) != 3 {
+		if argc != 3 {
 			return statementScalarValue{}, fmt.Errorf("%w: translate requires 3 arguments", ErrScalarType)
 		}
-		s, err := requireStringArg(name, args[0])
+		s, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		from, err := requireStringArg(name, args[1])
+		from, err := requireStringArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		to, err := requireStringArg(name, args[2])
+		to, err := requireStringArg(name, r.values[argIdx[2]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		fromR, toR := []rune(from), []rune(to)
-		m := make(map[rune]rune, len(fromR))
-		del := make(map[rune]bool)
-		for i, ch := range fromR {
-			if _, seen := m[ch]; seen || del[ch] {
-				continue
-			}
-			if i < len(toR) {
-				m[ch] = toR[i]
-			} else {
-				del[ch] = true
-			}
-		}
-		var b strings.Builder
-		for _, ch := range s {
-			if del[ch] {
-				continue
-			}
-			if rep, ok := m[ch]; ok {
-				b.WriteRune(rep)
-			} else {
-				b.WriteRune(ch)
-			}
-		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: b.String()}}, nil
+		return statementScalarValue{value: scalar{kind: kindString, sval: appendTranslate(arena, s, from, to)}}, nil
 	case "abs":
-		n, err := requireOneNumber(name, args)
+		if argc != 1 {
+			return statementScalarValue{}, fmt.Errorf("%w: %s requires 1 argument", ErrScalarType, name)
+		}
+		arg0 := r.values[argIdx[0]]
+		if arg0.value.kind == kindNumber && arg0.value.isInt {
+			if arg0.value.ival == math.MinInt64 {
+				start := len(*arena)
+				*arena = append(*arena, "9223372036854775808"...)
+				return statementScalarValue{value: scalar{kind: kindNumber, num: (*arena)[start:len(*arena):len(*arena)]}}, nil
+			}
+			v := arg0.value.ival
+			if v < 0 {
+				v = -v
+			}
+			return statementScalarValue{value: arenaIntScalar(arena, v)}, nil
+		}
+		n, err := requireNumberArg(name, arg0)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
 		return statementScalarValue{value: arenaFloatScalar(arena, math.Abs(n))}, nil
 	case "ceil", "ceiling":
-		n, err := requireOneNumber(name, args)
+		n, err := r.requireOneNumber(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
 		return statementScalarValue{value: arenaFloatScalar(arena, math.Ceil(n))}, nil
 	case "floor":
-		n, err := requireOneNumber(name, args)
+		n, err := r.requireOneNumber(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
 		return statementScalarValue{value: arenaFloatScalar(arena, math.Floor(n))}, nil
 	case "round":
-		if len(args) == 1 {
-			n, err := requireNumberArg(name, args[0])
+		if argc == 1 {
+			n, err := requireNumberArg(name, r.values[argIdx[0]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
 			return statementScalarValue{value: arenaFloatScalar(arena, math.Round(n))}, nil
 		}
-		if len(args) == 2 {
-			n, err := requireNumberArg(name, args[0])
+		if argc == 2 {
+			n, err := requireNumberArg(name, r.values[argIdx[0]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
-			scale, err := requireNumberArg(name, args[1])
+			scale, err := requireNumberArg(name, r.values[argIdx[1]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
-			pow := math.Pow(10, math.Trunc(scale))
-			return statementScalarValue{value: arenaFloatScalar(arena, math.Round(n*pow)/pow)}, nil
+			res, err := roundOrTruncScale(n, scale, true)
+			if err != nil {
+				return statementScalarValue{}, err
+			}
+			return statementScalarValue{value: arenaFloatScalar(arena, res)}, nil
 		}
 		return statementScalarValue{}, fmt.Errorf("%w: round takes 1 or 2 arguments", ErrScalarType)
 	case "trunc":
-		if len(args) == 1 {
-			n, err := requireNumberArg(name, args[0])
+		if argc == 1 {
+			n, err := requireNumberArg(name, r.values[argIdx[0]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
 			return statementScalarValue{value: arenaFloatScalar(arena, math.Trunc(n))}, nil
 		}
-		if len(args) == 2 {
-			n, err := requireNumberArg(name, args[0])
+		if argc == 2 {
+			n, err := requireNumberArg(name, r.values[argIdx[0]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
-			scale, err := requireNumberArg(name, args[1])
+			scale, err := requireNumberArg(name, r.values[argIdx[1]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
-			pow := math.Pow(10, math.Trunc(scale))
-			return statementScalarValue{value: arenaFloatScalar(arena, math.Trunc(n*pow)/pow)}, nil
+			res, err := roundOrTruncScale(n, scale, false)
+			if err != nil {
+				return statementScalarValue{}, err
+			}
+			return statementScalarValue{value: arenaFloatScalar(arena, res)}, nil
 		}
 		return statementScalarValue{}, fmt.Errorf("%w: trunc takes 1 or 2 arguments", ErrScalarType)
 	case "power", "pow":
-		if len(args) != 2 {
+		if argc != 2 {
 			return statementScalarValue{}, fmt.Errorf("%w: %s requires 2 arguments", ErrScalarType, name)
 		}
-		a, err := requireNumberArg(name, args[0])
+		a, err := requireNumberArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		b, err := requireNumberArg(name, args[1])
+		b, err := requireNumberArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
@@ -619,7 +651,7 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 		}
 		return statementScalarValue{value: arenaFloatScalar(arena, res)}, nil
 	case "sqrt":
-		n, err := requireOneNumber(name, args)
+		n, err := r.requireOneNumber(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
@@ -628,23 +660,27 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 		}
 		return statementScalarValue{value: arenaFloatScalar(arena, math.Sqrt(n))}, nil
 	case "mod":
-		if len(args) != 2 {
+		if argc != 2 {
 			return statementScalarValue{}, fmt.Errorf("%w: mod requires 2 arguments", ErrScalarType)
 		}
-		a, err := requireNumberArg(name, args[0])
+		a, err := requireNumberArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		b, err := requireNumberArg(name, args[1])
+		b, err := requireNumberArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
 		if b == 0 {
 			return statementScalarValue{}, ErrScalarDivisionByZero
 		}
-		return statementScalarValue{value: arenaFloatScalar(arena, math.Mod(a, b))}, nil
+		res := math.Mod(a, b)
+		if math.IsNaN(res) || math.IsInf(res, 0) {
+			return statementScalarValue{}, ErrScalarNumericRange
+		}
+		return statementScalarValue{value: arenaFloatScalar(arena, res)}, nil
 	case "sign":
-		n, err := requireOneNumber(name, args)
+		n, err := r.requireOneNumber(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
@@ -656,59 +692,71 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 		}
 		return statementScalarValue{value: arenaIntScalar(arena, out)}, nil
 	case "ln":
-		n, err := requireOneNumber(name, args)
+		n, err := r.requireOneNumber(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
 		if n <= 0 {
 			return statementScalarValue{}, ErrScalarNumericRange
 		}
-		return statementScalarValue{value: arenaFloatScalar(arena, math.Log(n))}, nil
+		res := math.Log(n)
+		if math.IsNaN(res) || math.IsInf(res, 0) {
+			return statementScalarValue{}, ErrScalarNumericRange
+		}
+		return statementScalarValue{value: arenaFloatScalar(arena, res)}, nil
 	case "log", "log10":
-		if len(args) == 1 {
-			n, err := requireNumberArg(name, args[0])
+		if argc == 1 {
+			n, err := requireNumberArg(name, r.values[argIdx[0]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
 			if n <= 0 {
 				return statementScalarValue{}, ErrScalarNumericRange
 			}
-			return statementScalarValue{value: arenaFloatScalar(arena, math.Log10(n))}, nil
+			res := math.Log10(n)
+			if math.IsNaN(res) || math.IsInf(res, 0) {
+				return statementScalarValue{}, ErrScalarNumericRange
+			}
+			return statementScalarValue{value: arenaFloatScalar(arena, res)}, nil
 		}
-		if len(args) == 2 && name == "log" {
-			base, err := requireNumberArg(name, args[0])
+		if argc == 2 && name == "log" {
+			base, err := requireNumberArg(name, r.values[argIdx[0]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
-			val, err := requireNumberArg(name, args[1])
+			val, err := requireNumberArg(name, r.values[argIdx[1]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
 			if base <= 0 || base == 1 || val <= 0 {
 				return statementScalarValue{}, ErrScalarNumericRange
 			}
-			return statementScalarValue{value: arenaFloatScalar(arena, math.Log(val)/math.Log(base))}, nil
+			res := math.Log(val) / math.Log(base)
+			if math.IsNaN(res) || math.IsInf(res, 0) {
+				return statementScalarValue{}, ErrScalarNumericRange
+			}
+			return statementScalarValue{value: arenaFloatScalar(arena, res)}, nil
 		}
 		return statementScalarValue{}, fmt.Errorf("%w: %s invalid argument count", ErrScalarType, name)
 	case "exp":
-		n, err := requireOneNumber(name, args)
+		n, err := r.requireOneNumber(name, argIdx)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
 		res := math.Exp(n)
-		if math.IsInf(res, 0) {
+		if math.IsNaN(res) || math.IsInf(res, 0) {
 			return statementScalarValue{}, ErrScalarNumericRange
 		}
 		return statementScalarValue{value: arenaFloatScalar(arena, res)}, nil
 	case "date_trunc":
-		if len(args) != 2 {
+		if argc != 2 {
 			return statementScalarValue{}, fmt.Errorf("%w: date_trunc requires 2 arguments", ErrScalarType)
 		}
-		field, err := requireStringArg(name, args[0])
+		field, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		tsStr, err := requireStringArg(name, args[1])
+		tsStr, err := requireStringArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
@@ -718,32 +766,34 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 		}
 		tm = tm.UTC()
 		var trunc time.Time
-		switch strings.ToLower(field) {
-		case "year":
+		switch {
+		case strings.EqualFold(field, "year"):
 			trunc = time.Date(tm.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
-		case "month":
+		case strings.EqualFold(field, "month"):
 			trunc = time.Date(tm.Year(), tm.Month(), 1, 0, 0, 0, 0, time.UTC)
-		case "day":
+		case strings.EqualFold(field, "day"):
 			trunc = time.Date(tm.Year(), tm.Month(), tm.Day(), 0, 0, 0, 0, time.UTC)
-		case "hour":
+		case strings.EqualFold(field, "hour"):
 			trunc = time.Date(tm.Year(), tm.Month(), tm.Day(), tm.Hour(), 0, 0, 0, time.UTC)
-		case "minute":
+		case strings.EqualFold(field, "minute"):
 			trunc = time.Date(tm.Year(), tm.Month(), tm.Day(), tm.Hour(), tm.Minute(), 0, 0, time.UTC)
-		case "second":
+		case strings.EqualFold(field, "second"):
 			trunc = time.Date(tm.Year(), tm.Month(), tm.Day(), tm.Hour(), tm.Minute(), tm.Second(), 0, time.UTC)
 		default:
 			return statementScalarValue{}, fmt.Errorf("%w: unsupported date_trunc field %q", ErrScalarInvalidText, field)
 		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: trunc.Format(time.RFC3339)}}, nil
+		start := len(*arena)
+		*arena = trunc.AppendFormat(*arena, time.RFC3339)
+		return arenaStringValue(arena, start), nil
 	case "extract":
-		if len(args) != 2 {
+		if argc != 2 {
 			return statementScalarValue{}, fmt.Errorf("%w: extract requires 2 arguments", ErrScalarType)
 		}
-		field, err := requireStringArg(name, args[0])
+		field, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		tsStr, err := requireStringArg(name, args[1])
+		tsStr, err := requireStringArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
@@ -753,233 +803,297 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 		}
 		tm = tm.UTC()
 		var out float64
-		switch strings.ToLower(field) {
-		case "year":
+		switch {
+		case strings.EqualFold(field, "year"):
 			out = float64(tm.Year())
-		case "month":
+		case strings.EqualFold(field, "month"):
 			out = float64(tm.Month())
-		case "day":
+		case strings.EqualFold(field, "day"):
 			out = float64(tm.Day())
-		case "hour":
+		case strings.EqualFold(field, "hour"):
 			out = float64(tm.Hour())
-		case "minute":
+		case strings.EqualFold(field, "minute"):
 			out = float64(tm.Minute())
-		case "second":
+		case strings.EqualFold(field, "second"):
 			out = float64(tm.Second())
-		case "dow":
+		case strings.EqualFold(field, "dow"):
 			out = float64(tm.Weekday())
-		case "doy":
+		case strings.EqualFold(field, "doy"):
 			out = float64(tm.YearDay())
-		case "epoch":
+		case strings.EqualFold(field, "epoch"):
 			out = float64(tm.Unix()) + float64(tm.Nanosecond())/1e9
 		default:
 			return statementScalarValue{}, fmt.Errorf("%w: unsupported extract field %q", ErrScalarInvalidText, field)
 		}
 		return statementScalarValue{value: arenaFloatScalar(arena, out)}, nil
 	case "json_array_length", "jsonb_array_length", "cardinality":
-		if len(args) != 1 {
+		if argc != 1 {
 			return statementScalarValue{}, fmt.Errorf("%w: %s requires 1 argument", ErrScalarType, name)
 		}
-		raw := scalarAsJSONRaw(args[0])
-		var arr []json.RawMessage
-		if err := json.Unmarshal(raw, &arr); err != nil {
+		raw := scalarJSONBytes(r.values[argIdx[0]], arena)
+		var count int64
+		if err := vibejson.EachArray(raw, func(_ int, _ vibejson.RawValue) error {
+			count++
+			return nil
+		}); err != nil {
 			return statementScalarValue{}, fmt.Errorf("%w: %s expects a JSON array", ErrScalarType, name)
 		}
-		return statementScalarValue{value: arenaIntScalar(arena, int64(len(arr)))}, nil
+		return statementScalarValue{value: arenaIntScalar(arena, count)}, nil
 	case "array_length":
-		if len(args) != 2 {
+		if argc != 2 {
 			return statementScalarValue{}, fmt.Errorf("%w: array_length requires 2 arguments", ErrScalarType)
 		}
-		dim, err := requireNumberArg(name, args[1])
+		dim, err := requireNumberArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
 		if int(dim) != 1 {
-			return statementScalarValue{value: scalar{kind: kindNull}}, nil
+			return nullScalarValue(), nil
 		}
-		raw := scalarAsJSONRaw(args[0])
-		var arr []json.RawMessage
-		if err := json.Unmarshal(raw, &arr); err != nil {
+		raw := scalarJSONBytes(r.values[argIdx[0]], arena)
+		var count int64
+		if err := vibejson.EachArray(raw, func(_ int, _ vibejson.RawValue) error {
+			count++
+			return nil
+		}); err != nil {
 			return statementScalarValue{}, fmt.Errorf("%w: array_length expects a JSON array", ErrScalarType)
 		}
-		if len(arr) == 0 {
-			return statementScalarValue{value: scalar{kind: kindNull}}, nil
+		if count == 0 {
+			return nullScalarValue(), nil
 		}
-		return statementScalarValue{value: arenaIntScalar(arena, int64(len(arr)))}, nil
+		return statementScalarValue{value: arenaIntScalar(arena, count)}, nil
 	case "array_to_string":
-		if len(args) < 2 || len(args) > 3 {
+		if argc < 2 || argc > 3 {
 			return statementScalarValue{}, fmt.Errorf("%w: array_to_string takes 2 or 3 arguments", ErrScalarType)
 		}
-		delim, err := requireStringArg(name, args[1])
+		delim, err := requireStringArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		hasNullStr := len(args) == 3
+		hasNullStr := argc == 3
 		nullStr := ""
 		if hasNullStr {
-			nullStr, err = requireStringArg(name, args[2])
+			nullStr, err = requireStringArg(name, r.values[argIdx[2]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
 		}
-		var arr []any
-		if err := json.Unmarshal(scalarAsJSONRaw(args[0]), &arr); err != nil {
+		raw := scalarJSONBytes(r.values[argIdx[0]], arena)
+		start := len(*arena)
+		wrote := false
+		if err := vibejson.EachArray(raw, func(_ int, elem vibejson.RawValue) error {
+			if elem.IsNull() {
+				if !hasNullStr {
+					return nil
+				}
+				if wrote {
+					*arena = append(*arena, delim...)
+				}
+				*arena = append(*arena, nullStr...)
+				wrote = true
+				return nil
+			}
+			if wrote {
+				*arena = append(*arena, delim...)
+			}
+			if elem.Kind() == document.String {
+				var ok bool
+				var decErr error
+				*arena, ok, decErr = elem.AppendText(*arena)
+				if !ok || decErr != nil {
+					*arena = append(*arena, elem.Bytes()...)
+				}
+			} else {
+				*arena = append(*arena, elem.Bytes()...)
+			}
+			wrote = true
+			return nil
+		}); err != nil {
 			return statementScalarValue{}, fmt.Errorf("%w: array_to_string expects an array", ErrScalarType)
 		}
-		var parts []string
-		for _, elem := range arr {
-			if elem == nil {
-				if hasNullStr {
-					parts = append(parts, nullStr)
-				}
-				continue
-			}
-			parts = append(parts, fmt.Sprint(elem))
-		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: strings.Join(parts, delim)}}, nil
+		return arenaStringValue(arena, start), nil
 	case "string_to_array":
-		if len(args) != 2 {
+		if argc != 2 {
 			return statementScalarValue{}, fmt.Errorf("%w: string_to_array requires 2 arguments", ErrScalarType)
 		}
-		s, err := requireStringArg(name, args[0])
+		s, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		delim, err := requireStringArg(name, args[1])
+		delim, err := requireStringArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		parts := strings.Split(s, delim)
-		raw, err := json.Marshal(parts)
-		if err != nil {
-			return statementScalarValue{}, err
+		start := len(*arena)
+		*arena = append(*arena, '[')
+		if delim == "" {
+			first := true
+			for i := 0; i < len(s); {
+				_, size := utf8.DecodeRuneInString(s[i:])
+				if !first {
+					*arena = append(*arena, ',')
+				}
+				*arena = appendJSONString(*arena, s[i:i+size])
+				first = false
+				i += size
+			}
+		} else {
+			rem := s
+			first := true
+			for {
+				if !first {
+					*arena = append(*arena, ',')
+				}
+				first = false
+				idx := strings.Index(rem, delim)
+				if idx < 0 {
+					*arena = appendJSONString(*arena, rem)
+					break
+				}
+				*arena = appendJSONString(*arena, rem[:idx])
+				rem = rem[idx+len(delim):]
+			}
 		}
-		return statementScalarValue{cell: jsonCellFromBytes(arena, raw), direct: true}, nil
+		*arena = append(*arena, ']')
+		return arenaJSONValue(arena, start), nil
 	case "json_extract_path", "jsonb_extract_path", "json_extract_path_text", "jsonb_extract_path_text":
-		if len(args) < 1 {
+		if argc < 1 {
 			return statementScalarValue{}, fmt.Errorf("%w: %s requires at least 1 argument", ErrScalarType, name)
 		}
-		var current any
-		if err := json.Unmarshal(scalarAsJSONRaw(args[0]), &current); err != nil {
-			return statementScalarValue{value: scalar{kind: kindNull}}, nil
+		raw := trimASCIIBytes(scalarJSONBytes(r.values[argIdx[0]], arena))
+		if !vibejson.Valid(raw) {
+			return nullScalarValue(), nil
 		}
-		for _, pathArg := range args[1:] {
-			key, err := requireStringArg(name, pathArg)
+		cur := vibejson.RawValue{Src: raw}
+		for _, pathIdx := range argIdx[1:] {
+			key, err := requireStringArg(name, r.values[pathIdx])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
-			switch container := current.(type) {
-			case map[string]any:
-				next, exists := container[key]
-				if !exists {
-					return statementScalarValue{value: scalar{kind: kindNull}}, nil
+			switch cur.Kind() {
+			case document.Object:
+				var next vibejson.RawValue
+				found := false
+				if err := vibejson.EachObject(cur.Bytes(), func(k string, v vibejson.RawValue) error {
+					if k == key {
+						next = v
+						found = true
+					}
+					return nil
+				}); err != nil || !found {
+					return nullScalarValue(), nil
 				}
-				current = next
-			case []any:
+				cur = next
+			case document.Array:
 				idx, convErr := strconv.Atoi(key)
-				if convErr != nil || idx < 0 || idx >= len(container) {
-					return statementScalarValue{value: scalar{kind: kindNull}}, nil
+				if convErr != nil || idx < 0 {
+					return nullScalarValue(), nil
 				}
-				current = container[idx]
+				var next vibejson.RawValue
+				found := false
+				if err := vibejson.EachArray(cur.Bytes(), func(i int, v vibejson.RawValue) error {
+					if i == idx {
+						next = v
+						found = true
+					}
+					return nil
+				}); err != nil || !found {
+					return nullScalarValue(), nil
+				}
+				cur = next
 			default:
-				return statementScalarValue{value: scalar{kind: kindNull}}, nil
+				return nullScalarValue(), nil
 			}
 		}
-		if current == nil {
-			return statementScalarValue{value: scalar{kind: kindNull}}, nil
+		if cur.IsNull() {
+			return nullScalarValue(), nil
 		}
 		if strings.HasSuffix(name, "_text") {
-			if s, ok := current.(string); ok {
-				return statementScalarValue{value: scalar{kind: kindString, sval: s}}, nil
+			if cur.Kind() == document.String {
+				if content, clean := cur.StringBytes(); clean {
+					return statementScalarValue{value: scalar{kind: kindString, sval: byteview.String(content)}}, nil
+				}
+				start := len(*arena)
+				var ok bool
+				var err error
+				*arena, ok, err = cur.AppendText(*arena)
+				if !ok || err != nil {
+					*arena = append(*arena, cur.Bytes()...)
+				}
+				return arenaStringValue(arena, start), nil
 			}
-			raw, _ := json.Marshal(current)
-			return statementScalarValue{value: scalar{kind: kindString, sval: string(raw)}}, nil
+			return statementScalarValue{value: scalar{kind: kindString, sval: byteview.String(cur.Bytes())}}, nil
 		}
-		raw, _ := json.Marshal(current)
-		return statementScalarValue{cell: jsonCellFromBytes(arena, raw), direct: true}, nil
+		start := len(*arena)
+		*arena = append(*arena, cur.Bytes()...)
+		return arenaJSONValue(arena, start), nil
 	case "json_strip_nulls", "jsonb_strip_nulls":
-		if len(args) != 1 {
+		if argc != 1 {
 			return statementScalarValue{}, fmt.Errorf("%w: %s requires 1 argument", ErrScalarType, name)
 		}
-		var val any
-		if err := json.Unmarshal(scalarAsJSONRaw(args[0]), &val); err != nil {
+		raw := trimASCIIBytes(scalarJSONBytes(r.values[argIdx[0]], arena))
+		if err := vibejson.Validate(raw); err != nil {
 			return statementScalarValue{}, err
 		}
-		stripped := stripJSONNulls(val)
-		raw, err := json.Marshal(stripped)
+		start := len(*arena)
+		var err error
+		*arena, err = appendStripJSONNulls(*arena, vibejson.RawValue{Src: raw})
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		return statementScalarValue{cell: jsonCellFromBytes(arena, raw), direct: true}, nil
+		return arenaJSONValue(arena, start), nil
 	case "jsonb_pretty":
-		if len(args) != 1 {
+		if argc != 1 {
 			return statementScalarValue{}, fmt.Errorf("%w: jsonb_pretty requires 1 argument", ErrScalarType)
 		}
-		var val any
-		if err := json.Unmarshal(scalarAsJSONRaw(args[0]), &val); err != nil {
-			return statementScalarValue{}, err
-		}
-		raw, err := json.MarshalIndent(val, "", "    ")
+		raw := scalarJSONBytes(r.values[argIdx[0]], arena)
+		start := len(*arena)
+		var err error
+		*arena, err = vibejson.AppendIndent(*arena, raw, "", "    ")
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		return statementScalarValue{value: scalar{kind: kindString, sval: string(raw)}}, nil
+		return arenaStringValue(arena, start), nil
 	case "jsonb_set", "json_set":
-		if len(args) < 3 || len(args) > 4 {
+		if argc < 3 || argc > 4 {
 			return statementScalarValue{}, fmt.Errorf("%w: %s requires 3 or 4 arguments", ErrScalarType, name)
 		}
-		var target any
-		if err := json.Unmarshal(scalarAsJSONRaw(args[0]), &target); err != nil {
+		targetRaw, err := scalarJSONSetTarget(r.values[argIdx[0]], arena)
+		if err != nil {
 			return statementScalarValue{}, fmt.Errorf("%w: %s target is not valid JSON", ErrScalarType, name)
 		}
-		if s, ok := target.(string); ok {
-			var inner any
-			if json.Unmarshal([]byte(s), &inner) == nil {
-				target = inner
-			}
-		}
-		pathStr, err := requireStringArg(name, args[1])
+		pathStr, err := requireStringArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		segments := parsePGJSONPath(pathStr)
-		var newVal any
-		if args[2].direct {
-			if err := json.Unmarshal(scalarAsJSONRaw(args[2]), &newVal); err != nil {
-				newVal = string(scalarAsJSONRaw(args[2]))
-			}
-		} else if args[2].value.kind == kindString {
-			if err := json.Unmarshal([]byte(args[2].value.sval), &newVal); err != nil {
-				newVal = args[2].value.sval
-			}
-		} else {
-			_ = json.Unmarshal(scalarAsJSONRaw(args[2]), &newVal)
-		}
+		var pathBuf [16]string
+		segments := parsePGJSONPathInto(pathStr, pathBuf[:0], arena)
+		newValRaw := scalarJSONSetValue(r.values[argIdx[2]], arena)
 		createMissing := true
-		if len(args) == 4 && args[3].value.kind == kindBool {
-			createMissing = args[3].value.bval
+		if argc == 4 && r.values[argIdx[3]].value.kind == kindBool {
+			createMissing = r.values[argIdx[3]].value.bval
 		}
-		updated := jsonbSetPath(target, segments, newVal, createMissing)
-		raw, err := json.Marshal(updated)
+		start := len(*arena)
+		*arena, err = appendJSONSetPath(*arena, vibejson.RawValue{Src: targetRaw}, segments, newValRaw, createMissing)
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		return statementScalarValue{cell: jsonCellFromBytes(arena, raw), direct: true}, nil
+		return arenaJSONValue(arena, start), nil
 	case "regexp_like", "regexp_count", "regexp_substr":
-		if len(args) < 2 || len(args) > 3 {
+		if argc < 2 || argc > 3 {
 			return statementScalarValue{}, fmt.Errorf("%w: %s takes 2 or 3 arguments", ErrScalarType, name)
 		}
-		src, err := requireStringArg(name, args[0])
+		src, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		pat, err := requireStringArg(name, args[1])
+		pat, err := requireStringArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
 		flags := ""
-		if len(args) == 3 {
-			flags, err = requireStringArg(name, args[2])
+		if argc == 3 {
+			flags, err = requireStringArg(name, r.values[argIdx[2]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
@@ -996,29 +1110,29 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 		default:
 			loc := re.FindString(src)
 			if loc == "" && !re.MatchString(src) {
-				return statementScalarValue{value: scalar{kind: kindNull}}, nil
+				return nullScalarValue(), nil
 			}
 			return statementScalarValue{value: scalar{kind: kindString, sval: loc}}, nil
 		}
 	case "regexp_replace":
-		if len(args) < 3 || len(args) > 4 {
+		if argc < 3 || argc > 4 {
 			return statementScalarValue{}, fmt.Errorf("%w: regexp_replace takes 3 or 4 arguments", ErrScalarType)
 		}
-		src, err := requireStringArg(name, args[0])
+		src, err := requireStringArg(name, r.values[argIdx[0]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		pat, err := requireStringArg(name, args[1])
+		pat, err := requireStringArg(name, r.values[argIdx[1]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
-		repl, err := requireStringArg(name, args[2])
+		repl, err := requireStringArg(name, r.values[argIdx[2]])
 		if err != nil {
 			return statementScalarValue{}, err
 		}
 		flags := ""
-		if len(args) == 4 {
-			flags, err = requireStringArg(name, args[3])
+		if argc == 4 {
+			flags, err = requireStringArg(name, r.values[argIdx[3]])
 			if err != nil {
 				return statementScalarValue{}, err
 			}
@@ -1034,18 +1148,655 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 		if loc == nil {
 			return statementScalarValue{value: scalar{kind: kindString, sval: src}}, nil
 		}
-		out := make([]byte, 0, len(src))
-		out = append(out, src[:loc[0]]...)
-		out = re.ExpandString(out, repl, src, loc)
-		out = append(out, src[loc[1]:]...)
-		return statementScalarValue{value: scalar{kind: kindString, sval: string(out)}}, nil
+		start := len(*arena)
+		*arena = append(*arena, src[:loc[0]]...)
+		*arena = re.ExpandString(*arena, repl, src, loc)
+		*arena = append(*arena, src[loc[1]:]...)
+		return arenaStringValue(arena, start), nil
 	default:
 		return statementScalarValue{}, fmt.Errorf("%w: unknown scalar function %q", ErrScalarType, name)
 	}
 }
 
+func nullScalarValue() statementScalarValue {
+	return statementScalarValue{value: scalar{kind: kindNull}}
+}
+
+func arenaStringValue(arena *[]byte, start int) statementScalarValue {
+	return statementScalarValue{
+		value: scalar{kind: kindString, sval: byteview.String((*arena)[start:len(*arena):len(*arena)])},
+	}
+}
+
+func arenaJSONValue(arena *[]byte, start int) statementScalarValue {
+	end := len(*arena)
+	raw := (*arena)[start:end:end]
+	val := classifyRawInto(vibejson.RawValue{Src: raw}, arena)
+	return statementScalarValue{value: val, cell: cellFromScalar(val), exact: true}
+}
+
+func appendUUID(dst []byte, u [16]byte) []byte {
+	const hexDigits = "0123456789abcdef"
+	var buf [36]byte
+	pos := 0
+	for i, b := range u {
+		if i == 4 || i == 6 || i == 8 || i == 10 {
+			buf[pos] = '-'
+			pos++
+		}
+		buf[pos] = hexDigits[b>>4]
+		buf[pos+1] = hexDigits[b&0x0f]
+		pos += 2
+	}
+	return append(dst, buf[:]...)
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+func runeCountFast(s string) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return i + utf8.RuneCountInString(s[i:])
+		}
+	}
+	return len(s)
+}
+
+func appendLower(arena *[]byte, s string) string {
+	needsChange := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= utf8.RuneSelf {
+			start := len(*arena)
+			*arena = append(*arena, s[:i]...)
+			if needsChange {
+				dst := (*arena)[start : start+i]
+				for j := range dst {
+					if dst[j] >= 'A' && dst[j] <= 'Z' {
+						dst[j] += 'a' - 'A'
+					}
+				}
+			}
+			for i < len(s) {
+				b := s[i]
+				if b < utf8.RuneSelf {
+					if b >= 'A' && b <= 'Z' {
+						b += 'a' - 'A'
+					}
+					*arena = append(*arena, b)
+					i++
+					continue
+				}
+				ch, size := utf8.DecodeRuneInString(s[i:])
+				*arena = utf8.AppendRune(*arena, unicode.ToLower(ch))
+				i += size
+			}
+			return byteview.String((*arena)[start:len(*arena):len(*arena)])
+		}
+		if c >= 'A' && c <= 'Z' {
+			needsChange = true
+		}
+	}
+	if !needsChange {
+		return s
+	}
+	start := len(*arena)
+	*arena = append(*arena, s...)
+	dst := (*arena)[start:len(*arena)]
+	for i := range dst {
+		if dst[i] >= 'A' && dst[i] <= 'Z' {
+			dst[i] += 'a' - 'A'
+		}
+	}
+	return byteview.String((*arena)[start:len(*arena):len(*arena)])
+}
+
+func appendUpper(arena *[]byte, s string) string {
+	needsChange := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= utf8.RuneSelf {
+			start := len(*arena)
+			*arena = append(*arena, s[:i]...)
+			if needsChange {
+				dst := (*arena)[start : start+i]
+				for j := range dst {
+					if dst[j] >= 'a' && dst[j] <= 'z' {
+						dst[j] -= 'a' - 'A'
+					}
+				}
+			}
+			for i < len(s) {
+				b := s[i]
+				if b < utf8.RuneSelf {
+					if b >= 'a' && b <= 'z' {
+						b -= 'a' - 'A'
+					}
+					*arena = append(*arena, b)
+					i++
+					continue
+				}
+				ch, size := utf8.DecodeRuneInString(s[i:])
+				*arena = utf8.AppendRune(*arena, unicode.ToUpper(ch))
+				i += size
+			}
+			return byteview.String((*arena)[start:len(*arena):len(*arena)])
+		}
+		if c >= 'a' && c <= 'z' {
+			needsChange = true
+		}
+	}
+	if !needsChange {
+		return s
+	}
+	start := len(*arena)
+	*arena = append(*arena, s...)
+	dst := (*arena)[start:len(*arena)]
+	for i := range dst {
+		if dst[i] >= 'a' && dst[i] <= 'z' {
+			dst[i] -= 'a' - 'A'
+		}
+	}
+	return byteview.String((*arena)[start:len(*arena):len(*arena)])
+}
+
+func isASCIISpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r'
+}
+
+func trimLeftSpaceFast(s string) string {
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c >= utf8.RuneSelf {
+			return strings.TrimLeftFunc(s[i:], unicode.IsSpace)
+		}
+		if !isASCIISpace(c) {
+			return s[i:]
+		}
+		i++
+	}
+	return ""
+}
+
+func trimRightSpaceFast(s string) string {
+	i := len(s)
+	for i > 0 {
+		c := s[i-1]
+		if c >= utf8.RuneSelf {
+			return strings.TrimRightFunc(s[:i], unicode.IsSpace)
+		}
+		if !isASCIISpace(c) {
+			return s[:i]
+		}
+		i--
+	}
+	return ""
+}
+
+func appendReplaceAll(arena *[]byte, s, oldS, newS string) string {
+	if oldS == newS {
+		return s
+	}
+	if oldS == "" {
+		start := len(*arena)
+		*arena = append(*arena, newS...)
+		for i := 0; i < len(s); {
+			_, size := utf8.DecodeRuneInString(s[i:])
+			*arena = append(*arena, s[i:i+size]...)
+			*arena = append(*arena, newS...)
+			i += size
+		}
+		return byteview.String((*arena)[start:len(*arena):len(*arena)])
+	}
+	idx := strings.Index(s, oldS)
+	if idx < 0 {
+		return s
+	}
+	start := len(*arena)
+	pos := 0
+	for {
+		*arena = append(*arena, s[pos:pos+idx]...)
+		*arena = append(*arena, newS...)
+		pos += idx + len(oldS)
+		idx = strings.Index(s[pos:], oldS)
+		if idx < 0 {
+			*arena = append(*arena, s[pos:]...)
+			break
+		}
+	}
+	return byteview.String((*arena)[start:len(*arena):len(*arena)])
+}
+
+func clampFloatToInt(f float64) int {
+	if f >= float64(math.MaxInt32) {
+		return math.MaxInt32
+	}
+	if f <= float64(math.MinInt32) {
+		return math.MinInt32
+	}
+	return int(f)
+}
+
+func substrSlice(s string, startF float64, hasLen bool, nF float64) string {
+	if s == "" {
+		return ""
+	}
+	start := 0
+	if startF > 1 {
+		if startF > float64(len(s))+1 {
+			return ""
+		}
+		start = int(startF) - 1
+	}
+	maxLen := len(s)
+	limit := maxLen
+	if hasLen {
+		if nF <= 0 {
+			return ""
+		}
+		if nF < float64(maxLen) {
+			limit = int(nF)
+		}
+	}
+	if isASCII(s) {
+		if start >= len(s) {
+			return ""
+		}
+		end := len(s)
+		if hasLen && start+limit < end {
+			end = start + limit
+		}
+		return s[start:end]
+	}
+	runeIdx := 0
+	byteStart := -1
+	byteEnd := len(s)
+	targetEnd := -1
+	if hasLen {
+		targetEnd = start + limit
+	}
+	for i := 0; i < len(s); {
+		if runeIdx == start {
+			byteStart = i
+		}
+		if targetEnd >= 0 && runeIdx == targetEnd {
+			byteEnd = i
+			break
+		}
+		_, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		runeIdx++
+	}
+	if byteStart < 0 {
+		return ""
+	}
+	return s[byteStart:byteEnd]
+}
+
+func leftSlice(s string, nF float64) string {
+	if s == "" {
+		return ""
+	}
+	if isASCII(s) {
+		n := clampFloatToInt(nF)
+		if n < 0 {
+			n = len(s) + n
+		}
+		if n <= 0 {
+			return ""
+		}
+		if n >= len(s) {
+			return s
+		}
+		return s[:n]
+	}
+	n := clampFloatToInt(nF)
+	if n < 0 {
+		n = utf8.RuneCountInString(s) + n
+	}
+	if n <= 0 {
+		return ""
+	}
+	count := 0
+	for i := 0; i < len(s); {
+		if count == n {
+			return s[:i]
+		}
+		_, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		count++
+	}
+	return s
+}
+
+func rightSlice(s string, nF float64) string {
+	if s == "" {
+		return ""
+	}
+	if isASCII(s) {
+		n := clampFloatToInt(nF)
+		if n < 0 {
+			n = len(s) + n
+		}
+		if n <= 0 {
+			return ""
+		}
+		if n >= len(s) {
+			return s
+		}
+		return s[len(s)-n:]
+	}
+	n := clampFloatToInt(nF)
+	if n < 0 {
+		n = utf8.RuneCountInString(s) + n
+	}
+	if n <= 0 {
+		return ""
+	}
+	count := 0
+	for i := len(s); i > 0; {
+		if count == n {
+			return s[i:]
+		}
+		_, size := utf8.DecodeLastRuneInString(s[:i])
+		i -= size
+		count++
+	}
+	return s
+}
+
+func splitPartSlice(s, delim string, field int) string {
+	if delim == "" {
+		total := runeCountFast(s)
+		if field < 0 {
+			field = total + field + 1
+		}
+		if field < 1 || field > total {
+			return ""
+		}
+		if isASCII(s) {
+			return s[field-1 : field]
+		}
+		idx := 1
+		for i := 0; i < len(s); {
+			_, size := utf8.DecodeRuneInString(s[i:])
+			if idx == field {
+				return s[i : i+size]
+			}
+			i += size
+			idx++
+		}
+		return ""
+	}
+	if field < 0 {
+		total := strings.Count(s, delim) + 1
+		field = total + field + 1
+		if field < 1 || field > total {
+			return ""
+		}
+	}
+	part := 1
+	rem := s
+	for {
+		idx := strings.Index(rem, delim)
+		if idx < 0 {
+			if part == field {
+				return rem
+			}
+			return ""
+		}
+		if part == field {
+			return rem[:idx]
+		}
+		rem = rem[idx+len(delim):]
+		part++
+	}
+}
+
+func appendReverse(arena *[]byte, s string) string {
+	if len(s) <= 1 {
+		return s
+	}
+	start := len(*arena)
+	if isASCII(s) {
+		*arena = append(*arena, s...)
+		dst := (*arena)[start:len(*arena)]
+		for i, j := 0, len(dst)-1; i < j; i, j = i+1, j-1 {
+			dst[i], dst[j] = dst[j], dst[i]
+		}
+		return byteview.String((*arena)[start:len(*arena):len(*arena)])
+	}
+	for i := len(s); i > 0; {
+		_, size := utf8.DecodeLastRuneInString(s[:i])
+		*arena = append(*arena, s[i-size:i]...)
+		i -= size
+	}
+	return byteview.String((*arena)[start:len(*arena):len(*arena)])
+}
+
+func appendPad(arena *[]byte, s string, n int, fill string, leftPad bool) string {
+	runeLen := runeCountFast(s)
+	if runeLen >= n {
+		return leftSlice(s, float64(n))
+	}
+	if fill == "" {
+		return s
+	}
+	need := n - runeLen
+	start := len(*arena)
+	if !leftPad {
+		*arena = append(*arena, s...)
+	}
+	if isASCII(fill) {
+		for need > 0 {
+			chunk := len(fill)
+			if chunk > need {
+				chunk = need
+			}
+			*arena = append(*arena, fill[:chunk]...)
+			need -= chunk
+		}
+	} else {
+		fillRunes := runeCountFast(fill)
+		full := need / fillRunes
+		rem := need % fillRunes
+		for i := 0; i < full; i++ {
+			*arena = append(*arena, fill...)
+		}
+		if rem > 0 {
+			*arena = append(*arena, leftSlice(fill, float64(rem))...)
+		}
+	}
+	if leftPad {
+		*arena = append(*arena, s...)
+	}
+	return byteview.String((*arena)[start:len(*arena):len(*arena)])
+}
+
+func appendInitcap(arena *[]byte, s string) string {
+	if s == "" {
+		return ""
+	}
+	start := len(*arena)
+	newWord := true
+	if isASCII(s) {
+		*arena = append(*arena, s...)
+		dst := (*arena)[start:len(*arena)]
+		for i, c := range dst {
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+				if newWord {
+					if c >= 'a' && c <= 'z' {
+						dst[i] = c - ('a' - 'A')
+					}
+					newWord = false
+				} else if c >= 'A' && c <= 'Z' {
+					dst[i] = c + ('a' - 'A')
+				}
+			} else {
+				newWord = true
+			}
+		}
+		return byteview.String((*arena)[start:len(*arena):len(*arena)])
+	}
+	for _, ch := range s {
+		if unicode.IsLetter(ch) || unicode.IsDigit(ch) {
+			if newWord {
+				*arena = utf8.AppendRune(*arena, unicode.ToUpper(ch))
+				newWord = false
+			} else {
+				*arena = utf8.AppendRune(*arena, unicode.ToLower(ch))
+			}
+		} else {
+			*arena = utf8.AppendRune(*arena, ch)
+			newWord = true
+		}
+	}
+	return byteview.String((*arena)[start:len(*arena):len(*arena)])
+}
+
+func appendTranslate(arena *[]byte, s, from, to string) string {
+	if s == "" || from == "" {
+		return s
+	}
+	start := len(*arena)
+	if isASCII(s) && isASCII(from) && isASCII(to) {
+		var tbl [128]int16
+		for i := range tbl {
+			tbl[i] = -1
+		}
+		for i := 0; i < len(from); i++ {
+			ch := from[i]
+			if tbl[ch] != -1 {
+				continue
+			}
+			if i < len(to) {
+				tbl[ch] = int16(to[i])
+			} else {
+				tbl[ch] = -2
+			}
+		}
+		for i := 0; i < len(s); i++ {
+			mapped := tbl[s[i]]
+			if mapped == -2 {
+				continue
+			}
+			if mapped >= 0 {
+				*arena = append(*arena, byte(mapped))
+			} else {
+				*arena = append(*arena, s[i])
+			}
+		}
+		return byteview.String((*arena)[start:len(*arena):len(*arena)])
+	}
+	for _, ch := range s {
+		matchIdx := -1
+		fi := 0
+		for _, fc := range from {
+			if fc == ch {
+				matchIdx = fi
+				break
+			}
+			fi++
+		}
+		if matchIdx < 0 {
+			*arena = utf8.AppendRune(*arena, ch)
+			continue
+		}
+		ti := 0
+		found := false
+		for _, tc := range to {
+			if ti == matchIdx {
+				*arena = utf8.AppendRune(*arena, tc)
+				found = true
+				break
+			}
+			ti++
+		}
+		if !found {
+			// Deleted rune (matchIdx >= len(to runes)).
+			continue
+		}
+	}
+	return byteview.String((*arena)[start:len(*arena):len(*arena)])
+}
+
+func roundOrTruncScale(n, scale float64, doRound bool) (float64, error) {
+	sc := math.Trunc(scale)
+	if sc == 0 {
+		if doRound {
+			return math.Round(n), nil
+		}
+		return math.Trunc(n), nil
+	}
+	if sc < 0 {
+		pow := math.Pow(10, -sc)
+		if math.IsInf(pow, 0) {
+			// Huge negative scale: rounds/truncates to 0.
+			return 0, nil
+		}
+		scaled := n / pow
+		var res float64
+		if doRound {
+			res = math.Round(scaled) * pow
+		} else {
+			res = math.Trunc(scaled) * pow
+		}
+		if math.IsNaN(res) || math.IsInf(res, 0) {
+			return 0, ErrScalarNumericRange
+		}
+		return res, nil
+	}
+	pow := math.Pow(10, sc)
+	if math.IsInf(pow, 0) {
+		// Huge positive scale: float64 already has fewer fractional digits.
+		return n, nil
+	}
+	scaled := n * pow
+	if math.IsInf(scaled, 0) {
+		return n, nil
+	}
+	var res float64
+	if doRound {
+		res = math.Round(scaled) / pow
+	} else {
+		res = math.Trunc(scaled) / pow
+	}
+	if math.IsNaN(res) || math.IsInf(res, 0) {
+		return 0, ErrScalarNumericRange
+	}
+	return res, nil
+}
+
 func compilePGRegexp(pat, flags string) (*regexp.Regexp, error) {
 	return cachedPGRegexp(pat, flags)
+}
+
+var arithTimestampLayouts = [...]string{
+	time.RFC3339Nano,
+	time.RFC3339,
+	"2006-01-02 15:04:05.999999999Z07:00",
+	"2006-01-02 15:04:05Z07:00",
+	"2006-01-02 15:04:05.999999999",
+	"2006-01-02 15:04:05",
+	"2006-01-02T15:04:05.999999999",
+	"2006-01-02T15:04:05",
+}
+
+var flexibleTimestampLayouts = [...]string{
+	time.RFC3339Nano,
+	time.RFC3339,
+	"2006-01-02 15:04:05.999999999Z07:00",
+	"2006-01-02 15:04:05.999999999",
+	"2006-01-02 15:04:05",
+	"2006-01-02",
 }
 
 func evalTimestampIntervalArith(arena *[]byte, tsStr, intervalStr string, subtract bool) (scalar, bool) {
@@ -1061,28 +1812,19 @@ func evalTimestampIntervalArith(arena *[]byte, tsStr, intervalStr string, subtra
 		years, months, days, dur = -years, -months, -days, -dur
 	}
 	res := ts.AddDate(years, months, days).Add(dur)
-	var formatted string
+	start := len(*arena)
 	if !hasTime && dur == 0 {
-		formatted = res.Format("2006-01-02")
+		*arena = res.AppendFormat(*arena, "2006-01-02")
 	} else {
-		formatted = res.UTC().Format(time.RFC3339Nano)
+		*arena = res.UTC().AppendFormat(*arena, time.RFC3339Nano)
 	}
-	return scalar{kind: kindString, sval: formatted}, true
+	return scalar{kind: kindString, sval: byteview.String((*arena)[start:len(*arena):len(*arena)])}, true
 }
 
 func parseTimestampForArith(s string) (time.Time, bool, bool) {
 	s = strings.TrimSpace(s)
-	for _, layout := range []string{
-		time.RFC3339Nano,
-		time.RFC3339,
-		"2006-01-02 15:04:05.999999999Z07:00",
-		"2006-01-02 15:04:05Z07:00",
-		"2006-01-02 15:04:05.999999999",
-		"2006-01-02 15:04:05",
-		"2006-01-02T15:04:05.999999999",
-		"2006-01-02T15:04:05",
-	} {
-		if t, err := time.Parse(layout, s); err == nil {
+	for i := range arithTimestampLayouts {
+		if t, err := time.Parse(arithTimestampLayouts[i], s); err == nil {
 			return t, true, true
 		}
 	}
@@ -1092,137 +1834,353 @@ func parseTimestampForArith(s string) (time.Time, bool, bool) {
 	return time.Time{}, false, false
 }
 
-func parsePGInterval(s string) (years, months, days int, dur time.Duration, ok bool) {
-	fields := strings.Fields(s)
-	if len(fields) == 0 || len(fields)%2 != 0 {
-		return 0, 0, 0, 0, false
+func nextSpaceField(s string) (field, rest string, ok bool) {
+	i := 0
+	for i < len(s) && isASCIISpace(s[i]) {
+		i++
 	}
-	for i := 0; i < len(fields); i += 2 {
-		val, err := strconv.ParseFloat(fields[i], 64)
-		if err != nil {
+	if i == len(s) {
+		return "", "", false
+	}
+	start := i
+	for i < len(s) && !isASCIISpace(s[i]) {
+		i++
+	}
+	return s[start:i], s[i:], true
+}
+
+func parsePGInterval(s string) (years, months, days int, dur time.Duration, ok bool) {
+	rem := s
+	count := 0
+	for {
+		valTok, r1, ok1 := nextSpaceField(rem)
+		if !ok1 {
+			break
+		}
+		unitTok, r2, ok2 := nextSpaceField(r1)
+		if !ok2 {
 			return 0, 0, 0, 0, false
 		}
-		unit := strings.ToLower(strings.TrimSuffix(fields[i+1], ","))
-		switch unit {
-		case "year", "years", "yr", "yrs", "y":
+		rem = r2
+		count++
+		val, err := strconv.ParseFloat(valTok, 64)
+		if err != nil || math.IsNaN(val) || math.IsInf(val, 0) {
+			return 0, 0, 0, 0, false
+		}
+		unit := strings.TrimSuffix(unitTok, ",")
+		switch {
+		case strings.EqualFold(unit, "year"), strings.EqualFold(unit, "years"),
+			strings.EqualFold(unit, "yr"), strings.EqualFold(unit, "yrs"), strings.EqualFold(unit, "y"):
 			years += int(val)
-		case "month", "months", "mon", "mons":
+		case strings.EqualFold(unit, "month"), strings.EqualFold(unit, "months"),
+			strings.EqualFold(unit, "mon"), strings.EqualFold(unit, "mons"):
 			months += int(val)
-		case "week", "weeks", "w":
+		case strings.EqualFold(unit, "week"), strings.EqualFold(unit, "weeks"), strings.EqualFold(unit, "w"):
 			days += int(val) * 7
-		case "day", "days", "d":
+		case strings.EqualFold(unit, "day"), strings.EqualFold(unit, "days"), strings.EqualFold(unit, "d"):
 			days += int(val)
-		case "hour", "hours", "hr", "hrs", "h":
+		case strings.EqualFold(unit, "hour"), strings.EqualFold(unit, "hours"),
+			strings.EqualFold(unit, "hr"), strings.EqualFold(unit, "hrs"), strings.EqualFold(unit, "h"):
 			dur += time.Duration(val * float64(time.Hour))
-		case "minute", "minutes", "min", "mins", "m":
+		case strings.EqualFold(unit, "minute"), strings.EqualFold(unit, "minutes"),
+			strings.EqualFold(unit, "min"), strings.EqualFold(unit, "mins"), strings.EqualFold(unit, "m"):
 			dur += time.Duration(val * float64(time.Minute))
-		case "second", "seconds", "sec", "secs", "s":
+		case strings.EqualFold(unit, "second"), strings.EqualFold(unit, "seconds"),
+			strings.EqualFold(unit, "sec"), strings.EqualFold(unit, "secs"), strings.EqualFold(unit, "s"):
 			dur += time.Duration(val * float64(time.Second))
-		case "millisecond", "milliseconds", "ms":
+		case strings.EqualFold(unit, "millisecond"), strings.EqualFold(unit, "milliseconds"), strings.EqualFold(unit, "ms"):
 			dur += time.Duration(val * float64(time.Millisecond))
-		case "microsecond", "microseconds", "us":
+		case strings.EqualFold(unit, "microsecond"), strings.EqualFold(unit, "microseconds"), strings.EqualFold(unit, "us"):
 			dur += time.Duration(val * float64(time.Microsecond))
 		default:
 			return 0, 0, 0, 0, false
 		}
 	}
+	if count == 0 {
+		return 0, 0, 0, 0, false
+	}
 	return years, months, days, dur, true
 }
 
-func parsePGJSONPath(s string) []string {
+func parsePGJSONPathInto(s string, dst []string, arena *[]byte) []string {
 	s = strings.TrimSpace(s)
 	if len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}' {
 		inner := s[1 : len(s)-1]
 		if inner == "" {
-			return nil
+			return dst
 		}
-		parts := strings.Split(inner, ",")
-		for i := range parts {
-			parts[i] = strings.Trim(strings.TrimSpace(parts[i]), `"`)
+		rem := inner
+		for {
+			idx := strings.IndexByte(rem, ',')
+			var part string
+			if idx < 0 {
+				part = rem
+			} else {
+				part = rem[:idx]
+			}
+			part = strings.Trim(strings.TrimSpace(part), `"`)
+			dst = append(dst, part)
+			if idx < 0 {
+				break
+			}
+			rem = rem[idx+1:]
 		}
-		return parts
+		return dst
 	}
 	if len(s) >= 2 && s[0] == '[' && s[len(s)-1] == ']' {
-		var arr []string
-		if json.Unmarshal([]byte(s), &arr) == nil {
-			return arr
+		baseLen := len(dst)
+		err := vibejson.EachArray(byteview.Bytes(s), func(_ int, elem vibejson.RawValue) error {
+			if elem.Kind() != document.String {
+				return ErrScalarType
+			}
+			if content, clean := elem.StringBytes(); clean {
+				dst = append(dst, byteview.String(content))
+				return nil
+			}
+			start := len(*arena)
+			var ok bool
+			var decErr error
+			*arena, ok, decErr = elem.AppendText(*arena)
+			if !ok || decErr != nil {
+				return ErrScalarType
+			}
+			dst = append(dst, byteview.String((*arena)[start:len(*arena):len(*arena)]))
+			return nil
+		})
+		if err == nil {
+			return dst
 		}
+		dst = dst[:baseLen]
 	}
 	if s == "" {
-		return nil
+		return dst
 	}
-	return []string{s}
+	return append(dst, s)
 }
 
-func jsonbSetPath(target any, path []string, newVal any, createMissing bool) any {
+func trimASCIIBytes(b []byte) []byte {
+	start := 0
+	for start < len(b) && isASCIISpace(b[start]) {
+		start++
+	}
+	end := len(b)
+	for end > start && isASCIISpace(b[end-1]) {
+		end--
+	}
+	return b[start:end]
+}
+
+func scalarJSONSetTarget(v statementScalarValue, arena *[]byte) ([]byte, error) {
+	if !v.direct && !v.exact && v.value.kind == kindString {
+		trimmed := strings.TrimSpace(v.value.sval)
+		if len(trimmed) > 0 && vibejson.Valid(byteview.Bytes(trimmed)) {
+			return byteview.Bytes(trimmed), nil
+		}
+		start := len(*arena)
+		*arena = appendJSONString(*arena, v.value.sval)
+		return (*arena)[start:len(*arena):len(*arena)], nil
+	}
+	raw := trimASCIIBytes(scalarJSONBytes(v, arena))
+	if err := vibejson.Validate(raw); err != nil {
+		return nil, err
+	}
+	rv := vibejson.RawValue{Src: raw}
+	if rv.Kind() == document.String {
+		if content, clean := rv.StringBytes(); clean {
+			trimmed := trimASCIIBytes(content)
+			if len(trimmed) > 0 && vibejson.Valid(trimmed) {
+				return trimmed, nil
+			}
+		} else {
+			start := len(*arena)
+			if decoded, ok, err := rv.AppendText(*arena); ok && err == nil {
+				*arena = decoded
+				cand := trimASCIIBytes((*arena)[start:len(*arena):len(*arena)])
+				if len(cand) > 0 && vibejson.Valid(cand) {
+					return cand, nil
+				}
+			}
+		}
+	}
+	return raw, nil
+}
+
+func scalarJSONSetValue(v statementScalarValue, arena *[]byte) []byte {
+	if v.direct || v.exact {
+		raw := scalarJSONBytes(v, arena)
+		if vibejson.Valid(raw) {
+			return raw
+		}
+		start := len(*arena)
+		*arena = appendJSONString(*arena, byteview.String(raw))
+		return (*arena)[start:len(*arena):len(*arena)]
+	}
+	if v.value.kind == kindString {
+		if vibejson.Valid(byteview.Bytes(v.value.sval)) {
+			return byteview.Bytes(v.value.sval)
+		}
+		start := len(*arena)
+		*arena = appendJSONString(*arena, v.value.sval)
+		return (*arena)[start:len(*arena):len(*arena)]
+	}
+	return scalarJSONBytes(v, arena)
+}
+
+func appendJSONSetPath(dst []byte, target vibejson.RawValue, path []string, newVal []byte, createMissing bool) ([]byte, error) {
 	if len(path) == 0 {
-		return newVal
+		return append(dst, newVal...), nil
 	}
 	key := path[0]
-	switch container := target.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(container)+1)
-		for k, v := range container {
-			out[k] = v
-		}
-		if len(path) == 1 {
-			if _, exists := out[key]; exists || createMissing {
-				out[key] = newVal
+	switch target.Kind() {
+	case document.Object:
+		dst = append(dst, '{')
+		first := true
+		found := false
+		err := vibejson.EachObject(target.Bytes(), func(k string, v vibejson.RawValue) error {
+			if !first {
+				dst = append(dst, ',')
 			}
-			return out
-		}
-		if existing, exists := out[key]; exists {
-			out[key] = jsonbSetPath(existing, path[1:], newVal, createMissing)
-		}
-		return out
-	case []any:
-		idx, err := strconv.Atoi(key)
+			first = false
+			dst = appendJSONString(dst, k)
+			dst = append(dst, ':')
+			if k == key {
+				found = true
+				if len(path) == 1 {
+					dst = append(dst, newVal...)
+					return nil
+				}
+				var subErr error
+				dst, subErr = appendJSONSetPath(dst, v, path[1:], newVal, createMissing)
+				return subErr
+			}
+			dst = append(dst, v.Bytes()...)
+			return nil
+		})
 		if err != nil {
-			return target
+			return dst, err
+		}
+		if !found && createMissing && len(path) == 1 {
+			if !first {
+				dst = append(dst, ',')
+			}
+			dst = appendJSONString(dst, key)
+			dst = append(dst, ':')
+			dst = append(dst, newVal...)
+		}
+		dst = append(dst, '}')
+		return dst, nil
+	case document.Array:
+		idx, convErr := strconv.Atoi(key)
+		if convErr != nil {
+			return append(dst, target.Bytes()...), nil
+		}
+		arrLen := 0
+		if err := vibejson.EachArray(target.Bytes(), func(_ int, _ vibejson.RawValue) error {
+			arrLen++
+			return nil
+		}); err != nil {
+			return dst, err
 		}
 		if idx < 0 {
-			idx = len(container) + idx
+			idx = arrLen + idx
 		}
-		out := append([]any(nil), container...)
-		if idx < 0 || idx >= len(out) {
-			if createMissing && len(path) == 1 {
-				if idx >= len(out) {
-					return append(out, newVal)
-				}
-				return append([]any{newVal}, out...)
+		if idx < 0 || idx >= arrLen {
+			if !createMissing || len(path) != 1 {
+				return append(dst, target.Bytes()...), nil
 			}
-			return out
+			dst = append(dst, '[')
+			first := true
+			if idx < 0 {
+				dst = append(dst, newVal...)
+				first = false
+			}
+			if err := vibejson.EachArray(target.Bytes(), func(_ int, v vibejson.RawValue) error {
+				if !first {
+					dst = append(dst, ',')
+				}
+				first = false
+				dst = append(dst, v.Bytes()...)
+				return nil
+			}); err != nil {
+				return dst, err
+			}
+			if idx >= arrLen {
+				if !first {
+					dst = append(dst, ',')
+				}
+				dst = append(dst, newVal...)
+			}
+			dst = append(dst, ']')
+			return dst, nil
 		}
-		if len(path) == 1 {
-			out[idx] = newVal
-		} else {
-			out[idx] = jsonbSetPath(out[idx], path[1:], newVal, createMissing)
+		dst = append(dst, '[')
+		err := vibejson.EachArray(target.Bytes(), func(i int, v vibejson.RawValue) error {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			if i == idx {
+				if len(path) == 1 {
+					dst = append(dst, newVal...)
+					return nil
+				}
+				var subErr error
+				dst, subErr = appendJSONSetPath(dst, v, path[1:], newVal, createMissing)
+				return subErr
+			}
+			dst = append(dst, v.Bytes()...)
+			return nil
+		})
+		if err != nil {
+			return dst, err
 		}
-		return out
+		dst = append(dst, ']')
+		return dst, nil
 	default:
-		return target
+		return append(dst, target.Bytes()...), nil
 	}
 }
 
-func stripJSONNulls(v any) any {
-	switch x := v.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(x))
-		for k, val := range x {
-			if val == nil {
-				continue
+func appendStripJSONNulls(dst []byte, raw vibejson.RawValue) ([]byte, error) {
+	switch raw.Kind() {
+	case document.Object:
+		dst = append(dst, '{')
+		first := true
+		err := vibejson.EachObject(raw.Bytes(), func(k string, v vibejson.RawValue) error {
+			if v.IsNull() {
+				return nil
 			}
-			out[k] = stripJSONNulls(val)
+			if !first {
+				dst = append(dst, ',')
+			}
+			first = false
+			dst = appendJSONString(dst, k)
+			dst = append(dst, ':')
+			var subErr error
+			dst, subErr = appendStripJSONNulls(dst, v)
+			return subErr
+		})
+		if err != nil {
+			return dst, err
 		}
-		return out
-	case []any:
-		out := make([]any, len(x))
-		for i, val := range x {
-			out[i] = stripJSONNulls(val)
+		dst = append(dst, '}')
+		return dst, nil
+	case document.Array:
+		dst = append(dst, '[')
+		err := vibejson.EachArray(raw.Bytes(), func(i int, v vibejson.RawValue) error {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			var subErr error
+			dst, subErr = appendStripJSONNulls(dst, v)
+			return subErr
+		})
+		if err != nil {
+			return dst, err
 		}
-		return out
+		dst = append(dst, ']')
+		return dst, nil
 	default:
-		return v
+		return append(dst, raw.Bytes()...), nil
 	}
 }
 
@@ -1240,6 +2198,9 @@ func arenaIntScalar(arena *[]byte, n int64) scalar {
 }
 
 func arenaFloatScalar(arena *[]byte, f float64) scalar {
+	if f == 0 {
+		f = 0 // normalize -0 to +0
+	}
 	if math.Trunc(f) == f && f >= math.MinInt64 && f <= 9223372036854774784 {
 		return arenaIntScalar(arena, int64(f))
 	}
@@ -1248,21 +2209,11 @@ func arenaFloatScalar(arena *[]byte, f float64) scalar {
 	return scalar{kind: kindNumber, num: (*arena)[start:len(*arena):len(*arena)]}
 }
 
-func jsonCellFromBytes(arena *[]byte, raw []byte) Cell {
-	start := len(*arena)
-	*arena = append(*arena, raw...)
-	cell, err := ParseJSONCell((*arena)[start:len(*arena):len(*arena)])
-	if err != nil {
-		return NullCell()
-	}
-	return cell
-}
-
-func requireOneString(name string, args []statementScalarValue) (string, error) {
-	if len(args) != 1 {
+func (r *statementScalar) requireOneString(name string, argIdx []int32) (string, error) {
+	if len(argIdx) != 1 {
 		return "", fmt.Errorf("%w: %s requires 1 argument", ErrScalarType, name)
 	}
-	return requireStringArg(name, args[0])
+	return requireStringArg(name, r.values[argIdx[0]])
 }
 
 func requireStringArg(name string, v statementScalarValue) (string, error) {
@@ -1272,11 +2223,11 @@ func requireStringArg(name string, v statementScalarValue) (string, error) {
 	return "", fmt.Errorf("%w: %s requires a string argument", ErrScalarType, name)
 }
 
-func requireOneNumber(name string, args []statementScalarValue) (float64, error) {
-	if len(args) != 1 {
+func (r *statementScalar) requireOneNumber(name string, argIdx []int32) (float64, error) {
+	if len(argIdx) != 1 {
 		return 0, fmt.Errorf("%w: %s requires 1 argument", ErrScalarType, name)
 	}
-	return requireNumberArg(name, args[0])
+	return requireNumberArg(name, r.values[argIdx[0]])
 }
 
 func requireNumberArg(name string, v statementScalarValue) (float64, error) {
@@ -1284,15 +2235,17 @@ func requireNumberArg(name string, v statementScalarValue) (float64, error) {
 		if v.value.isInt {
 			return float64(v.value.ival), nil
 		}
-		f, err := strconv.ParseFloat(string(v.value.num), 64)
-		if err != nil {
+		f, err := strconv.ParseFloat(byteview.String(v.value.num), 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
 			return 0, ErrScalarNumericRange
 		}
 		return f, nil
 	}
-	if v.exact {
-		f, err := strconv.ParseFloat(string(v.cell.AppendJSON(nil)), 64)
-		if err != nil {
+	if v.exact && v.cell.kind == TypeNumber {
+		var buf [64]byte
+		raw := v.cell.AppendJSON(buf[:0])
+		f, err := strconv.ParseFloat(byteview.String(raw), 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
 			return 0, ErrScalarNumericRange
 		}
 		return f, nil
@@ -1300,80 +2253,123 @@ func requireNumberArg(name string, v statementScalarValue) (float64, error) {
 	return 0, fmt.Errorf("%w: %s requires a numeric argument", ErrScalarType, name)
 }
 
-func scalarAsDisplayString(v statementScalarValue) string {
+func appendScalarDisplay(dst []byte, v statementScalarValue) []byte {
 	switch v.value.kind {
 	case kindString:
-		return v.value.sval
+		return append(dst, v.value.sval...)
 	case kindBool:
 		if v.value.bval {
-			return "true"
+			return append(dst, trueBytes...)
 		}
-		return "false"
+		return append(dst, falseBytes...)
 	case kindNumber:
-		return string(v.value.num)
+		return append(dst, v.value.num...)
 	default:
 		if v.direct || v.exact {
-			return string(v.cell.AppendJSON(nil))
+			return v.cell.AppendJSON(dst)
 		}
-		return ""
+		return dst
 	}
 }
 
-func scalarAsJSONRaw(v statementScalarValue) json.RawMessage {
+func appendScalarJSON(dst []byte, v statementScalarValue) []byte {
 	if v.isNull() {
-		return json.RawMessage("null")
+		return append(dst, nullBytes...)
 	}
 	if v.direct || v.exact {
-		return json.RawMessage(v.cell.AppendJSON(nil))
+		return v.cell.AppendJSON(dst)
 	}
 	switch v.value.kind {
 	case kindString:
-		b, _ := json.Marshal(v.value.sval)
-		return b
+		return appendJSONString(dst, v.value.sval)
 	case kindBool:
 		if v.value.bval {
-			return json.RawMessage("true")
+			return append(dst, trueBytes...)
 		}
-		return json.RawMessage("false")
+		return append(dst, falseBytes...)
 	case kindNumber:
-		return json.RawMessage(v.value.num)
+		return append(dst, v.value.num...)
 	default:
-		return json.RawMessage("null")
+		return append(dst, nullBytes...)
 	}
+}
+
+func scalarJSONBytes(v statementScalarValue, arena *[]byte) []byte {
+	if v.isNull() {
+		return nullBytes
+	}
+	if (v.direct || v.exact) && v.cell.raw != nil {
+		return v.cell.raw
+	}
+	if v.value.kind == kindNumber && v.value.num != nil {
+		return v.value.num
+	}
+	if v.value.kind == kindBool {
+		if v.value.bval {
+			return trueBytes
+		}
+		return falseBytes
+	}
+	start := len(*arena)
+	*arena = appendScalarJSON(*arena, v)
+	return (*arena)[start:len(*arena):len(*arena)]
+}
+
+func jsonTypeFromRaw(raw []byte) string {
+	for _, b := range raw {
+		if isASCIISpace(b) {
+			continue
+		}
+		switch b {
+		case '{':
+			return "object"
+		case '[':
+			return "array"
+		case '"':
+			return "string"
+		case 't', 'f':
+			return "boolean"
+		case 'n':
+			return "null"
+		default:
+			return "number"
+		}
+	}
+	return "null"
 }
 
 func scalarJSONTypeOf(v statementScalarValue) string {
-	raw := scalarAsJSONRaw(v)
-	if len(raw) == 0 {
-		return "null"
+	if v.direct || v.exact {
+		switch v.cell.kind {
+		case TypeNull:
+			return "null"
+		case TypeBool:
+			return "boolean"
+		case TypeNumber:
+			return "number"
+		case TypeString:
+			return "string"
+		default:
+			return jsonTypeFromRaw(v.cell.raw)
+		}
 	}
-	switch raw[0] {
-	case '{':
-		return "object"
-	case '[':
-		return "array"
-	case '"':
+	switch v.value.kind {
+	case kindString:
 		return "string"
-	case 't', 'f':
+	case kindBool:
 		return "boolean"
-	case 'n':
+	case kindNumber:
+		return "number"
+	case kindNull:
 		return "null"
 	default:
-		return "number"
+		return jsonTypeFromRaw(v.value.raw)
 	}
 }
 
 func parseFlexibleTimestamp(s string) (time.Time, error) {
-	layouts := []string{
-		time.RFC3339Nano,
-		time.RFC3339,
-		"2006-01-02 15:04:05.999999999Z07:00",
-		"2006-01-02 15:04:05.999999999",
-		"2006-01-02 15:04:05",
-		"2006-01-02",
-	}
-	for _, layout := range layouts {
-		if t, err := time.Parse(layout, s); err == nil {
+	for i := range flexibleTimestampLayouts {
+		if t, err := time.Parse(flexibleTimestampLayouts[i], s); err == nil {
 			return t, nil
 		}
 	}

@@ -4,24 +4,31 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 )
 
 // pgRegexpCache caches compiled Go RE2 regular expressions keyed by
-// flags + "\x00" + pattern so prepared predicates, joins, and scalar
-// REGEXP_* functions never recompile the same pattern per row.
-// When the cache reaches maxEntries, it clears and starts fresh to bound memory.
+// (pattern, flags) so prepared predicates, joins, and scalar REGEXP_*
+// functions never recompile or allocate per row on warm cache hits.
+// When the cache reaches maxCachedRegexps, it clears and starts fresh to bound memory.
 const maxCachedRegexps = 4096
 
+type pgRegexpKey struct {
+	pat   string
+	flags string
+}
+
 var (
-	pgRegexpCache      sync.Map // string -> *regexp.Regexp
-	pgRegexpCacheCount atomic.Int64
+	pgRegexpCacheMu sync.RWMutex
+	pgRegexpCache   = make(map[pgRegexpKey]*regexp.Regexp)
 )
 
 func cachedPGRegexp(pat, flags string) (*regexp.Regexp, error) {
-	key := flags + "\x00" + pat
-	if v, ok := pgRegexpCache.Load(key); ok {
-		return v.(*regexp.Regexp), nil
+	key := pgRegexpKey{pat: pat, flags: flags}
+	pgRegexpCacheMu.RLock()
+	re := pgRegexpCache[key]
+	pgRegexpCacheMu.RUnlock()
+	if re != nil {
+		return re, nil
 	}
 	prefix := ""
 	if strings.ContainsRune(flags, 'i') {
@@ -37,15 +44,16 @@ func cachedPGRegexp(pat, flags string) (*regexp.Regexp, error) {
 	if err != nil {
 		return nil, err
 	}
-	if pgRegexpCacheCount.Load() >= maxCachedRegexps {
-		pgRegexpCache.Range(func(k, _ any) bool {
-			pgRegexpCache.Delete(k)
-			return true
-		})
-		pgRegexpCacheCount.Store(0)
+	ownedKey := pgRegexpKey{pat: strings.Clone(pat), flags: strings.Clone(flags)}
+	pgRegexpCacheMu.Lock()
+	if existing := pgRegexpCache[ownedKey]; existing != nil {
+		pgRegexpCacheMu.Unlock()
+		return existing, nil
 	}
-	if _, loaded := pgRegexpCache.LoadOrStore(key, re); !loaded {
-		pgRegexpCacheCount.Add(1)
+	if len(pgRegexpCache) >= maxCachedRegexps {
+		clear(pgRegexpCache)
 	}
+	pgRegexpCache[ownedKey] = re
+	pgRegexpCacheMu.Unlock()
 	return re, nil
 }
