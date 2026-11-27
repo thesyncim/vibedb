@@ -35,8 +35,8 @@ const (
 // short lock; existing authenticated streams are never revoked by a
 // directory update. The trust domain is already verified by PeerTLS.
 type NodeAuthorizer struct {
-	mu    sync.RWMutex
-	nodes []rafttransport.NodeID
+	nodes atomic.Pointer[[]rafttransport.NodeID]
+	mu    sync.Mutex
 }
 
 func NewNodeAuthorizer(nodes []rafttransport.NodeID) (*NodeAuthorizer, error) {
@@ -55,7 +55,9 @@ func NewNodeAuthorizer(nodes []rafttransport.NodeID) (*NodeAuthorizer, error) {
 			return nil, ErrInvalidProfile
 		}
 	}
-	return &NodeAuthorizer{nodes: owned}, nil
+	a := &NodeAuthorizer{}
+	a.nodes.Store(&owned)
+	return a, nil
 }
 
 func compareNode(left, right rafttransport.NodeID) int {
@@ -66,9 +68,11 @@ func (authorizer *NodeAuthorizer) allows(identity rafttransport.PeerIdentity) bo
 	if authorizer == nil {
 		return false
 	}
-	authorizer.mu.RLock()
-	defer authorizer.mu.RUnlock()
-	_, found := slices.BinarySearchFunc(authorizer.nodes, identity.Node, compareNode)
+	snap := authorizer.nodes.Load()
+	if snap == nil {
+		return false
+	}
+	_, found := slices.BinarySearchFunc(*snap, identity.Node, compareNode)
 	return found
 }
 
@@ -79,9 +83,11 @@ func (authorizer *NodeAuthorizer) Nodes() []rafttransport.NodeID {
 	if authorizer == nil {
 		return nil
 	}
-	authorizer.mu.RLock()
-	defer authorizer.mu.RUnlock()
-	return slices.Clone(authorizer.nodes)
+	snap := authorizer.nodes.Load()
+	if snap == nil {
+		return nil
+	}
+	return slices.Clone(*snap)
 }
 
 // Update replaces the complete allowlist at one directory revision. The
@@ -106,7 +112,7 @@ func (authorizer *NodeAuthorizer) Update(nodes []rafttransport.NodeID) error {
 		}
 	}
 	authorizer.mu.Lock()
-	authorizer.nodes = owned
+	authorizer.nodes.Store(&owned)
 	authorizer.mu.Unlock()
 	return nil
 }
@@ -132,7 +138,7 @@ func (authorizer *NodeAuthorizer) Replace(nodes []rafttransport.NodeID) error {
 		}
 	}
 	authorizer.mu.Lock()
-	authorizer.nodes = owned
+	authorizer.nodes.Store(&owned)
 	authorizer.mu.Unlock()
 	return nil
 }
@@ -159,33 +165,37 @@ func (authorizer *NodeAuthorizer) Merge(nodes []rafttransport.NodeID) error {
 	}
 	authorizer.mu.Lock()
 	defer authorizer.mu.Unlock()
+	var current []rafttransport.NodeID
+	if snap := authorizer.nodes.Load(); snap != nil {
+		current = *snap
+	}
 	// Bound the union, not the sum of the cuts: repeated or overlapping
 	// directory publications must remain valid even at the identity limit.
-	merged := make([]rafttransport.NodeID, 0, min(len(authorizer.nodes)+len(owned), AbsoluteMaxIdentities))
+	merged := make([]rafttransport.NodeID, 0, min(len(current)+len(owned), AbsoluteMaxIdentities))
 	left, right := 0, 0
-	for left < len(authorizer.nodes) && right < len(owned) {
+	for left < len(current) && right < len(owned) {
 		if len(merged) == AbsoluteMaxIdentities {
 			return ErrBound
 		}
-		switch compareNode(authorizer.nodes[left], owned[right]) {
+		switch compareNode(current[left], owned[right]) {
 		case -1:
-			merged = append(merged, authorizer.nodes[left])
+			merged = append(merged, current[left])
 			left++
 		case 1:
 			merged = append(merged, owned[right])
 			right++
 		default:
-			merged = append(merged, authorizer.nodes[left])
+			merged = append(merged, current[left])
 			left++
 			right++
 		}
 	}
-	if len(authorizer.nodes)-left+len(owned)-right > AbsoluteMaxIdentities-len(merged) {
+	if len(current)-left+len(owned)-right > AbsoluteMaxIdentities-len(merged) {
 		return ErrBound
 	}
-	merged = append(merged, authorizer.nodes[left:]...)
+	merged = append(merged, current[left:]...)
 	merged = append(merged, owned[right:]...)
-	authorizer.nodes = merged
+	authorizer.nodes.Store(&merged)
 	return nil
 }
 
