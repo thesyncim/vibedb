@@ -6,8 +6,6 @@ import (
 	"math/bits"
 	"slices"
 	"strings"
-
-	"github.com/thesyncim/vibedb/internal/tin"
 )
 
 // IndexKind names an online secondary-index family.
@@ -208,14 +206,15 @@ func (c *Collection) BackfillIndex(name string, maxChunks int) (IndexInfo, error
 				return IndexInfo{}, err
 			}
 			if c.tinCache == nil {
-				c.tinCache = make(map[*State]map[string]*tin.Index)
+				c.tinCache = make(map[*State]map[string]tinCacheEntry)
 			}
 			entry := c.tinCache[state]
 			if entry == nil {
-				entry = make(map[string]*tin.Index)
+				entry = make(map[string]tinCacheEntry)
 				c.tinCache[state] = entry
 			}
-			entry[name] = ix
+			entry[name] = tinCacheEntry{path: tdef.path, index: ix}
+			c.tinFullBuilds++
 		}
 		return tinIndexInfo(tdef), nil
 	}

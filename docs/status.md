@@ -59,9 +59,10 @@ Darwin durability uses its strongest implemented barrier; see
 
 - The root facade is a JSON API. Low-level opaque-value options are not a
   uniform alternative across direct, lazy, and transactional facade writes.
-- Tin postings are not maintained incrementally or persisted. Each searched
-  generation pays a collection scan, and the resident index must fit in memory.
-  See [search](api/search.md#limitations).
+- Tin postings are maintained incrementally across searched generations and
+  persisted in a SHA-256-checksummed collection sidecar (`.tin`) for zero-scan
+  reopen and incremental catch-up after restarts, but the active index must
+  fit in memory. See [search](api/search.md#limitations).
 - Online split covers base relations. A split plan that must move a global
   index fails closed, a split cannot relieve a single hot key, and repeated
   descendant splits are not qualified. See [topology changes](design/topology-changes.md#limitations).

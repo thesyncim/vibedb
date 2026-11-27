@@ -143,8 +143,13 @@ type Collection struct {
 	// so an executing snapshot's Close never invalidates a live reader, and
 	// eviction never touches a generation a caller could still resolve
 	// through its own build reference.
-	tinMu      sync.Mutex
-	tinBuilds  map[uint64]*tinSnapshotBuild
+	tinMu                sync.Mutex
+	tinBuilds            map[uint64]*tinSnapshotBuild
+	tinSidecarPath       string
+	tinSidecarLoaded     bool
+	tinFullBuilds        uint64
+	tinIncrementalBuilds uint64
+	tinPersistedLoads    uint64
 	closed     bool
 	closeDone  bool
 	closePhase collectionClosePhase
