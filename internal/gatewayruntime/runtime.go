@@ -2,9 +2,11 @@ package gatewayruntime
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -110,6 +112,10 @@ type Config struct {
 	// identity while remaining separate from the catalog session journal.
 	PGListenAddress string
 	PGDDLSocket     string
+	// Optional HTTP observability endpoint serving /healthz, /readyz, and
+	// Prometheus /metrics. Loopback-only unless MetricsHTTPTLSConfig is set.
+	MetricsHTTPListenAddress string
+	MetricsHTTPTLSConfig     *tls.Config
 	// A participant forwards DDL once to this exact authenticated gateway
 	// principal. The owner retains the only schema journal and recovery loop.
 	DDLOwnerAddress string
@@ -202,13 +208,16 @@ type Runtime struct {
 	frontend    *frontendAdmission
 	journalLock *os.File
 
-	routeSeedControl *gateway.ReplicatedCatalogRouteSeedControl
-	pg               interface{ Close() error }
-	pgWriter         interface{ Close() error }
-	pgWriterDone     <-chan struct{}
-	pgDDL            func(context.Context, serviceauthz.Authority, string) error
-	ddlForwardTLS    *servicetls.Client
-	ddlForwardOwner  *gatewayDDLForwardOwner
+	routeSeedControl      *gateway.ReplicatedCatalogRouteSeedControl
+	pg                    interface{ Close() error }
+	pgWriter              interface{ Close() error }
+	pgWriterDone          <-chan struct{}
+	pgDDL                 func(context.Context, serviceauthz.Authority, string) error
+	ddlForwardTLS         *servicetls.Client
+	ddlForwardOwner       *gatewayDDLForwardOwner
+	observabilityHTTP     *http.Server
+	observabilityListener net.Listener
+	observabilityDone     <-chan struct{}
 
 	replicaControlManifest  *gatewayReplicaControlManifest
 	provisionedSplitSources []gatewayProvisionedSplitSource
@@ -536,6 +545,11 @@ func (config Config) validate() error {
 		}
 		if config.DevStaticCatalog {
 			return fmt.Errorf("%w: PostgreSQL requires RF3 catalog", ErrInvalidConfig)
+		}
+	}
+	if config.MetricsHTTPListenAddress != "" && config.MetricsHTTPTLSConfig == nil {
+		if err := requireLoopbackListen(config.MetricsHTTPListenAddress); err != nil {
+			return fmt.Errorf("%w: observability HTTP endpoint without TLS: %v", ErrInvalidConfig, err)
 		}
 	}
 	return nil

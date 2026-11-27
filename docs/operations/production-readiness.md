@@ -112,9 +112,11 @@ Before running VibeDB anywhere that matters, account for each gap:
    no rolling upgrade; see [upgrades](upgrades.md).
 5. **Backups off the host.** The gateway writes backups to a server-local
    directory. Copying them elsewhere is outside VibeDB.
-6. **Monitoring.** The metrics surface exposes raw counters plus fixed-bucket
-   gateway read/write latency histograms (`read_latency_us`, `write_latency_us`),
-   but no built-in alerting or dashboarding; see [observability](observability.md).
+6. **Monitoring.** The gateway exposes both authenticated native `{"op":"metrics"}`
+   JSON snapshots and an optional Prometheus `/metrics`, `/healthz`, and `/readyz`
+   HTTP endpoint (`MetricsHTTPListenAddress`, loopback-only unless TLS is configured)
+   with counters and read/write latency histograms. Alerting rules and dashboards
+   remain operator-provided; see [observability](observability.md).
 7. **Capacity headroom.** Process RSS, disk, and file descriptors are not
    bounded by VibeDB as a whole; see [capacity planning](capacity-planning.md).
 

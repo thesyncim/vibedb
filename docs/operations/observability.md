@@ -10,7 +10,8 @@ counter than its source measures.
 
 | Need | Surface | Scope |
 | --- | --- | --- |
-| Routing and cached RF3 progress | Authenticated native `metrics` request | Gateway counters and independently collected member samples. |
+| Routing and cached RF3 progress | Authenticated native `metrics` request | Gateway counters, latency histograms, and independently collected member samples. |
+| Prometheus scraping and liveness/readiness probes | Gateway HTTP observability endpoint (`MetricsHTTPListenAddress`: `/metrics`, `/healthz`, `/readyz`) | Prometheus v0.0.4 counters, cumulative read/write duration histograms, and drain-aware readiness probes. |
 | Physical-node persistence and local dispatch work | SIGUSR1 node diagnostics | Detached counters from one serving process and its current group inventory. |
 | CPU, RSS, disk capacity, and network traffic | Host monitoring or a recorded profile | Operating-system measurements outside the gateway metrics response. |
 
