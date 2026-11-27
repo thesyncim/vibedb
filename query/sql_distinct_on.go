@@ -13,7 +13,29 @@ type statementDistinctOn struct {
 	onColIndices  []int
 	limitOperand  *sqlast.Operand
 	offsetOperand *sqlast.Operand
-	result        Result
+
+	// Reusable per-statement execution workspaces, cleared between runs and
+	// released by Statement.Release.
+	inExec     Exec
+	seen       extKeyTable
+	keyScratch []byte
+	valArena   []byte
+	result     Result
+}
+
+func (d *statementDistinctOn) release() {
+	if d == nil {
+		return
+	}
+	if d.input != nil {
+		d.input.Release()
+		d.input = nil
+	}
+	d.inExec.Release()
+	d.seen.release()
+	d.keyScratch = nil
+	d.valArena = nil
+	d.result.Release()
 }
 
 func prepareDistinctOnStatement(
@@ -83,9 +105,30 @@ func prepareDistinctOnStatement(
 
 func (s *Statement) runDistinctOnInto(e *Exec, src Source, args []any) (Cursor, error) {
 	d := s.distinctOn
-	inExec := &Exec{Options: e.Options}
-	defer inExec.Release()
-	cursor, err := d.input.RunInto(inExec, src, args)
+	d.seen.reset()
+	out := &d.result
+	if len(out.Columns) != d.visibleCount {
+		out.Columns = make([]ResultColumn, d.visibleCount)
+		for i := range d.visibleCount {
+			out.Columns[i].Header = s.names[i]
+		}
+	} else {
+		for i := range out.Columns {
+			clear(out.Columns[i].Cells)
+			out.Columns[i].Cells = out.Columns[i].Cells[:0]
+			out.Columns[i].Header = s.names[i]
+		}
+	}
+	out.RowCount = 0
+	d.valArena = d.valArena[:0]
+	cancel := e.Options.Cancel
+	if err := cancellationError(cancel); err != nil {
+		return Cursor{}, err
+	}
+
+	d.inExec.Options = e.Options
+	cursor, err := d.input.RunInto(&d.inExec, src, args)
+	e.Stats = d.inExec.Stats
 	if err != nil {
 		return Cursor{}, err
 	}
@@ -100,54 +143,45 @@ func (s *Statement) runDistinctOnInto(e *Exec, src Source, args []any) (Cursor, 
 		return Cursor{}, err
 	}
 
-	seen := make(map[string]struct{})
-	var rows [][]Cell
+	singleKey := len(d.onColIndices) == 1
 	skipped := 0
-	for cursor.Next() {
-		var kb []byte
-		for _, idx := range d.onColIndices {
-			c := cursor.Cell(idx)
-			if c.IsNull() {
-				kb = append(kb, 0)
-			} else {
-				kb = append(kb, 1)
-				kb = c.AppendJSON(kb)
-			}
-			kb = append(kb, 0xff)
+	rowCount := 0
+	for {
+		ok, err := cursor.NextWithCancel(cancel)
+		if err != nil {
+			return Cursor{}, err
 		}
-		key := string(kb)
-		if _, dup := seen[key]; dup {
+		if !ok {
+			break
+		}
+		kb := d.keyScratch[:0]
+		if singleKey {
+			kb = appendExtSingleKeyCell(kb, cursor.Cell(d.onColIndices[0]))
+		} else {
+			for _, idx := range d.onColIndices {
+				kb = appendExtKeyCell(kb, cursor.Cell(idx))
+			}
+		}
+		d.keyScratch = kb
+		if _, inserted := d.seen.findOrInsert(kb); !inserted {
 			continue
 		}
-		seen[key] = struct{}{}
 		if skipped < offset {
 			skipped++
 			continue
 		}
-		if hasLimit && len(rows) >= limit {
+		if hasLimit && rowCount >= limit {
 			break
 		}
-		row := make([]Cell, d.visibleCount)
-		for i := 0; i < d.visibleCount; i++ {
-			row[i] = cloneCellValue(cursor.Cell(i))
+		for i := range d.visibleCount {
+			var detached Cell
+			detached, d.valArena = ownResultCellInto(d.valArena, cursor.Cell(i))
+			out.Columns[i].Cells = append(out.Columns[i].Cells, detached)
 		}
-		rows = append(rows, row)
+		rowCount++
 	}
 
-	out := &d.result
-	out.RowCount = len(rows)
-	out.Columns = make([]ResultColumn, d.visibleCount)
-	for i := 0; i < d.visibleCount; i++ {
-		out.Columns[i] = ResultColumn{
-			Header: s.names[i],
-			Cells:  make([]Cell, len(rows)),
-		}
-	}
-	for r, row := range rows {
-		for c := 0; c < d.visibleCount; c++ {
-			out.Columns[c].Cells[r] = row[c]
-		}
-	}
+	out.RowCount = rowCount
 	return NewResultCursor(out)
 }
 
@@ -168,9 +202,23 @@ func evalRowBoundOperand(op *sqlast.Operand, args []any) (int, error) {
 		}
 		switch v := args[op.Ordinal].(type) {
 		case int:
+			if v < 0 {
+				return 0, fmt.Errorf("query: invalid row count %d", v)
+			}
 			return v, nil
 		case int64:
+			if v < 0 {
+				return 0, fmt.Errorf("query: invalid row count %d", v)
+			}
 			return int(v), nil
+		case *int64:
+			if v != nil {
+				if *v < 0 {
+					return 0, fmt.Errorf("query: invalid row count %d", *v)
+				}
+				return int(*v), nil
+			}
+			return 0, fmt.Errorf("query: invalid row count parameter type %T", v)
 		case Number:
 			n, err := strconv.Atoi(string(v))
 			if err != nil || n < 0 {

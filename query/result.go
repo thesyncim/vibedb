@@ -428,13 +428,24 @@ func (c Cell) AppendJSON(dst []byte) []byte {
 	if c.raw != nil {
 		return append(dst, c.raw...)
 	}
-	if c.kind != TypeNumber {
+	switch c.kind {
+	case TypeNumber:
+		if c.flag&cellInteger != 0 {
+			return strconv.AppendInt(dst, int64(c.word), 10)
+		}
+		return strconv.AppendFloat(dst, math.Float64frombits(c.word), 'g', -1, 64)
+	case TypeString:
+		return appendJSONString(dst, c.text)
+	case TypeBool:
+		if c.flag&cellTrue != 0 {
+			return append(dst, trueBytes...)
+		}
+		return append(dst, falseBytes...)
+	case TypeNull:
+		return append(dst, nullBytes...)
+	default:
 		return dst
 	}
-	if c.flag&cellInteger != 0 {
-		return strconv.AppendInt(dst, int64(c.word), 10)
-	}
-	return strconv.AppendFloat(dst, math.Float64frombits(c.word), 'g', -1, 64)
 }
 
 // String returns the cell's compact JSON representation.
