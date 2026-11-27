@@ -1265,6 +1265,17 @@ func (e *Engine) AppendWitness() (sequence uint64, groups int) {
 
 func (e *Engine) LogID() [16]byte { return e.log.state.LogID }
 
+// SetReclaimMinSegments configures the minimum number of dead sealed segments
+// required before physical WAL segment reclamation runs. Values <= 0 are ignored.
+func (e *Engine) SetReclaimMinSegments(minSegments int) {
+	if e == nil || minSegments <= 0 {
+		return
+	}
+	e.writeMu.Lock()
+	e.reclaimMinSegments = minSegments
+	e.writeMu.Unlock()
+}
+
 // FatalError reports whether an ambiguous storage mutation poisoned the
 // handle. A nil result means a returned operation error was pre-mutation.
 func (e *Engine) FatalError() error {

@@ -2481,6 +2481,9 @@ func (g *CheckpointGroup) checkpointLocked() error {
 				g.markerID, g.markerEpoch, g.txnBase, g.txn,
 			), g.markerEpoch,
 		)
+		if err == nil && !c.closed && !c.primaryStructuralActive && c.primaryUnderfilledCount > 0 {
+			c.mergeUnderfilledPrimaryLeavesLocked()
+		}
 		c.writer.Unlock()
 		if err != nil {
 			g.log.commitMu.Unlock()
