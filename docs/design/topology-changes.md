@@ -185,9 +185,10 @@ A sampler reads node-log pressure every 250 ms and scales all rates:
 
 ## Limitations
 
-- Online split is base-relation only. Global-index snapshot partitioning, tail
-  replay, and retained pruning are not integrated, so a globally indexed split
-  plan fails closed.
+- Online split qualifies base relations end-to-end. Global-index cut
+  validation, relation profiles, and multi-relation retained pruning are wired
+  in `rangesplit` and `splitcontroller`, while end-to-end process qualification
+  for globally indexed splits remains pending.
 - A split divides key ranges; it cannot relieve a single hot key.
 - Repeated descendant splits and range-scan routing proofs are not yet
   qualified.

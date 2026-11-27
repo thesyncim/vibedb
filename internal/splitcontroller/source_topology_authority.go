@@ -188,7 +188,7 @@ func validSourceTopologyCommand(plan *Plan, observed Observation, payload remote
 		return err == nil && actualErr == nil && sameSourceCaptureAuthority(expected.Command, actual.Command) &&
 			actual.PriorApplied >= expected.PriorApplied && actual.PriorTerm >= expected.PriorTerm
 	case replication.CommandRetainedPrune:
-		if action != ActionPruneRetained || observed.Certificate == nil || len(plan.indexRelations) != 0 {
+		if action != ActionPruneRetained || observed.Certificate == nil {
 			return false
 		}
 		certificate, err := gateway.OpenRetainedPruneCertificate(payload.RetainedPrune)
@@ -203,10 +203,11 @@ func validSourceTopologyCommand(plan *Plan, observed Observation, payload remote
 			proof.RouteGeneration != coords.RouteGeneration || proof.RetainedRange != plan.children[plan.retained].Range || proof.BatchDigest != command.Fingerprint {
 			return false
 		}
+		maxRelation := replication.RelationID(1 + len(plan.indexRelations))
 		batches := command.RelationBatches()
 		for batches.Next() {
 			batch := batches.Batch()
-			if batch.Relation != 1 {
+			if batch.Relation == 0 || batch.Relation > maxRelation {
 				return false
 			}
 			items := batch.Mutations()
