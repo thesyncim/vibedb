@@ -18,6 +18,8 @@ import (
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 	"github.com/thesyncim/vibedb/store/durable"
+	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 // One connection: startup, the message loop, and the simple query protocol.
@@ -2085,7 +2087,7 @@ func (s *session) executeRuntimeExecAsync(p *portal) (handled bool, err error) {
 		return false, nil
 	}
 	s.invalidateRuntimePortals(p)
-	args := slices.Clone(p.args)
+	args := detachBoundArgs(p.args)
 	// lowered is what stmt.runtime was itself compiled from (numbered
 	// parameters and schema-qualification already rewritten, see prepare);
 	// stmt.sql is the original client text, kept only for error messages.
@@ -2128,6 +2130,141 @@ func (s *session) executeRuntimeExecAsync(p *portal) (handled bool, err error) {
 	p.state = portalExhausted
 	s.directPending = append(s.directPending, pending)
 	return true, nil
+}
+
+// detachBoundArgs returns an owned copy of portal-bound arguments safe to read
+// concurrently after the portal is rebound by a subsequent pipelined Bind
+// message. Portal-bound scalars point into portal.valueSlots and alias
+// portal.argStore / portal.decodeStore via byteview.String, so a shallow
+// slices.Clone(p.args) races with the next Bind on the unnamed portal.
+//
+// All scalar boxes and byte payloads are packed into at most two contiguous
+// backing allocations (one []boundValueSlot and one []byte arena) so heap
+// allocations remain O(1) regardless of parameter count while preserving the
+// exact pointer-shaped scalar types expected by the SQL runtime.
+func detachBoundArgs(args []any) []any {
+	if len(args) == 0 {
+		return nil
+	}
+	var totalBytes int
+	var needSlots bool
+	for _, a := range args {
+		switch v := a.(type) {
+		case *string:
+			if v != nil {
+				needSlots = true
+				totalBytes += len(*v)
+			}
+		case *query.Number:
+			if v != nil {
+				needSlots = true
+				totalBytes += len(*v)
+			}
+		case *int64:
+			if v != nil {
+				needSlots = true
+			}
+		case *float64:
+			if v != nil {
+				needSlots = true
+			}
+		case *bool:
+			if v != nil {
+				needSlots = true
+			}
+		case *[]byte:
+			if v != nil {
+				totalBytes += len(*v)
+			}
+		case string:
+			needSlots = true
+			totalBytes += len(v)
+		case query.Number:
+			needSlots = true
+			totalBytes += len(v)
+		case []byte:
+			totalBytes += len(v)
+		case vibejson.RawValue:
+			totalBytes += len(v.Src)
+		}
+	}
+	out := make([]any, len(args))
+	var slots []boundValueSlot
+	if needSlots {
+		slots = make([]boundValueSlot, len(args))
+	}
+	var buf []byte
+	if totalBytes > 0 {
+		buf = make([]byte, 0, totalBytes)
+	}
+	copyString := func(s string) string {
+		if len(s) == 0 {
+			return ""
+		}
+		start := len(buf)
+		buf = append(buf, s...)
+		return byteview.String(buf[start:len(buf):len(buf)])
+	}
+	copyBytes := func(b []byte) []byte {
+		if b == nil {
+			return nil
+		}
+		if len(b) == 0 {
+			return []byte{}
+		}
+		start := len(buf)
+		buf = append(buf, b...)
+		return buf[start:len(buf):len(buf)]
+	}
+	for i, a := range args {
+		switch v := a.(type) {
+		case nil:
+			out[i] = nil
+		case *string:
+			if v != nil {
+				slots[i].text = copyString(*v)
+				out[i] = &slots[i].text
+			}
+		case *query.Number:
+			if v != nil {
+				slots[i].number = query.Number(copyString(string(*v)))
+				out[i] = &slots[i].number
+			}
+		case *int64:
+			if v != nil {
+				slots[i].integer = *v
+				out[i] = &slots[i].integer
+			}
+		case *float64:
+			if v != nil {
+				slots[i].floating = *v
+				out[i] = &slots[i].floating
+			}
+		case *bool:
+			if v != nil {
+				slots[i].boolean = *v
+				out[i] = &slots[i].boolean
+			}
+		case *[]byte:
+			if v != nil {
+				b := copyBytes(*v)
+				out[i] = &b
+			}
+		case string:
+			slots[i].text = copyString(v)
+			out[i] = &slots[i].text
+		case query.Number:
+			slots[i].number = query.Number(copyString(string(v)))
+			out[i] = &slots[i].number
+		case []byte:
+			out[i] = copyBytes(v)
+		case vibejson.RawValue:
+			out[i] = vibejson.RawValue{Src: copyBytes(v.Src)}
+		default:
+			out[i] = a
+		}
+	}
+	return out
 }
 
 

@@ -1,12 +1,18 @@
 package pgwire
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/thesyncim/vibedb/query"
+	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 )
 
 func TestNormalizeSQLForStats(t *testing.T) {
@@ -431,5 +437,250 @@ func TestHashNormalizedSQLMatchesNormalizeAndZeroAllocLongQuery(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("steady-state hot-path allocs for %d-byte SQL = %.1f, want 0", len(longQ), allocs)
+	}
+}
+
+func TestPgStatStatementsPipelinedAsyncExec(t *testing.T) {
+	b := atomicTestBackend{embeddedBackend{testDatabase(t, "users", nil)}}
+	s, err := NewServerWithBackend(b, Options{Auth: Trust(), Database: "pipedb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	c := dial(t, s)
+	c.startup(map[string]string{"user": "alice", "database": "pipedb"})
+
+	// Pipeline 4 autocommit extended-protocol INSERTs back-to-back (each with
+	// its own Sync, sent before reading any ReadyForQuery) so finishExtendedBatch
+	// defers responses and executeRuntimeExecAsync runs them concurrently on
+	// borrowed direct sessions while the read loop rebinds the unnamed portal.
+	const insertSQL = `INSERT INTO users ("_pgwire_key", id, name) VALUES ($1, $2, $3)`
+	c.send(msgParse, parseMsg("ins_user", insertSQL))
+	for i := 1; i <= 4; i++ {
+		k := fmt.Sprintf("k%d", i)
+		name := fmt.Sprintf("user-%d", i)
+		c.send(msgBind, bindMsg("", "ins_user", nil, [][]byte{[]byte(k), []byte(k), []byte(name)}, nil))
+		c.send(msgExecute, executeMsg("", 0))
+		c.send(msgSync, nil)
+	}
+	for i := 1; i <= 4; i++ {
+		requireWireOK(t, c.until(msgReadyForQuery))
+	}
+
+	// Verify all 4 pipelined writes committed with their exact distinct values
+	// (catching any portal valueSlots/argStore aliasing corruption).
+	gotUsers := rowsOf(t, c.query(`SELECT id, name FROM users ORDER BY id`))
+	if len(gotUsers) != 4 {
+		t.Fatalf("pipelined INSERTs committed %d rows, want 4: %v", len(gotUsers), gotUsers)
+	}
+	for i := 1; i <= 4; i++ {
+		wantID, wantName := fmt.Sprintf(`"k%d"`, i), fmt.Sprintf(`"user-%d"`, i)
+		if string(gotUsers[i-1][0]) != wantID || string(gotUsers[i-1][1]) != wantName {
+			t.Fatalf("row %d = (%q, %q), want (%q, %q)", i, gotUsers[i-1][0], gotUsers[i-1][1], wantID, wantName)
+		}
+	}
+
+	// Pipeline 2 DELETEs back-to-back via executeRuntimeExecAsync.
+	const deleteSQL = `DELETE FROM users WHERE id = $1`
+	c.send(msgParse, parseMsg("del_user", deleteSQL))
+	for _, id := range []string{"k1", "k2"} {
+		c.send(msgBind, bindMsg("", "del_user", nil, [][]byte{[]byte(id)}, nil))
+		c.send(msgExecute, executeMsg("", 0))
+		c.send(msgSync, nil)
+	}
+	for i := 0; i < 2; i++ {
+		requireWireOK(t, c.until(msgReadyForQuery))
+	}
+
+	rows := rowsOf(t, c.query(`SELECT datname, usename, calls, rows, total_exec_time, query FROM pg_stat_statements ORDER BY calls DESC`))
+	var foundInsert, foundDelete bool
+	for _, r := range rows {
+		datname, usename, calls, rowCount, totalMsStr, q := string(r[0]), string(r[1]), string(r[2]), string(r[3]), string(r[4]), string(r[5])
+		if datname != "pipedb" || usename != "alice" {
+			t.Fatalf("unexpected stat identity (%q, %q), want (pipedb, alice)", datname, usename)
+		}
+		if totalMs, err := strconv.ParseFloat(totalMsStr, 64); err != nil || totalMs < 0 {
+			t.Fatalf("invalid total_exec_time %q: %v", totalMsStr, err)
+		}
+		switch q {
+		case insertSQL:
+			foundInsert = true
+			if calls != "4" || rowCount != "4" {
+				t.Fatalf("pipelined INSERT stat calls/rows = (%q, %q), want (4, 4)", calls, rowCount)
+			}
+		case deleteSQL:
+			foundDelete = true
+			if calls != "2" || rowCount != "2" {
+				t.Fatalf("pipelined DELETE stat calls/rows = (%q, %q), want (2, 2)", calls, rowCount)
+			}
+		}
+	}
+	if !foundInsert || !foundDelete {
+		t.Fatalf("missing pipelined async stats (insert=%v, delete=%v): rows=%v", foundInsert, foundDelete, rows)
+	}
+}
+
+func TestPgStatStatementsPipelinedAsyncExecBinaryAndBackpressure(t *testing.T) {
+	b := atomicTestBackend{embeddedBackend{testDatabase(t, "items", nil)}}
+	s, err := NewServerWithBackend(b, Options{Auth: Trust(), Database: "binpipe"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	c := dial(t, s)
+	c.startup(map[string]string{"user": "bob", "database": "binpipe"})
+
+	// Pipeline 20 autocommit INSERTs (> directPipelineDepth=16) with binary
+	// parameters (text, int8, float8, bool, jsonb, and NULL) so both the async
+	// direct-session pool and the backpressure drain+sync fallback execute.
+	const n = 20
+	const insertSQL = `INSERT INTO items ("_pgwire_key", id, score, active, tag, note) VALUES ($1, $2, $3, $4, $5, $6)`
+	c.send(msgParse, parseMsg("ins_bin", insertSQL, oidText, oidInt8, oidFloat8, oidBool, oidJSONB, oidText))
+	formats := []int16{formatBinary, formatBinary, formatBinary, formatBinary, formatBinary, formatText}
+	for i := 1; i <= n; i++ {
+		key := fmt.Sprintf("k%02d", i)
+		var idBuf [8]byte
+		binary.BigEndian.PutUint64(idBuf[:], uint64(i*100))
+		var scoreBuf [8]byte
+		binary.BigEndian.PutUint64(scoreBuf[:], math.Float64bits(float64(i)+0.5))
+		var boolBuf [1]byte
+		if i%2 == 0 {
+			boolBuf[0] = 1
+		}
+		// Binary jsonb format: version byte 1 followed by JSON text.
+		jsonbVal := append([]byte{1}, fmt.Sprintf(`"tag-%02d"`, i)...)
+		var note []byte
+		if i%3 != 0 {
+			note = []byte(fmt.Sprintf("note-%02d", i))
+		}
+		c.send(msgBind, bindMsg("", "ins_bin", formats, [][]byte{
+			[]byte(key), idBuf[:], scoreBuf[:], boolBuf[:], jsonbVal, note,
+		}, nil))
+		c.send(msgExecute, executeMsg("", 0))
+		c.send(msgSync, nil)
+	}
+	for i := 0; i < n; i++ {
+		requireWireOK(t, c.until(msgReadyForQuery))
+	}
+
+	got := rowsOf(t, c.query(`SELECT id, score, active, tag, note FROM items ORDER BY id`))
+	if len(got) != n {
+		t.Fatalf("pipelined binary INSERTs committed %d rows, want %d", len(got), n)
+	}
+	for i := 1; i <= n; i++ {
+		r := got[i-1]
+		wantID := strconv.Itoa(i * 100)
+		wantScore := strconv.FormatFloat(float64(i)+0.5, 'f', -1, 64)
+		wantActive := "false"
+		if i%2 == 0 {
+			wantActive = "true"
+		}
+		wantTag := fmt.Sprintf(`"tag-%02d"`, i)
+		if string(r[0]) != wantID || string(r[1]) != wantScore || string(r[2]) != wantActive || string(r[3]) != wantTag {
+			t.Fatalf("row %d = (%q,%q,%q,%q), want (%q,%q,%q,%q)",
+				i, r[0], r[1], r[2], r[3], wantID, wantScore, wantActive, wantTag)
+		}
+		if i%3 == 0 {
+			if r[4] != nil {
+				t.Fatalf("row %d note = %q, want NULL", i, r[4])
+			}
+		} else {
+			wantNote := fmt.Sprintf(`"note-%02d"`, i)
+			if string(r[4]) != wantNote {
+				t.Fatalf("row %d note = %q, want %q", i, r[4], wantNote)
+			}
+		}
+	}
+
+	statRows := rowsOf(t, c.query(`SELECT calls, rows, query FROM pg_stat_statements WHERE query = 'INSERT INTO items ("_pgwire_key", id, score, active, tag, note) VALUES ($1, $2, $3, $4, $5, $6)'`))
+	if len(statRows) != 1 || string(statRows[0][0]) != strconv.Itoa(n) || string(statRows[0][1]) != strconv.Itoa(n) {
+		t.Fatalf("pipelined binary+backpressure stats = %v, want 1 row with calls=%d rows=%d", statRows, n, n)
+	}
+}
+
+func TestDetachBoundArgsIsolationAndBoundedAllocs(t *testing.T) {
+	argStore := []byte("hello-world9007199254740993")
+	decodeStore := []byte("decoded-json-text")
+	rawBytes := []byte("raw-bytes")
+	rawJSON := []byte(`{"k":1}`)
+	slots := []boundValueSlot{
+		{text: byteview.String(argStore[:11])},
+		{number: query.Number(byteview.String(argStore[11:]))},
+		{integer: 42},
+		{floating: 3.5},
+		{boolean: true},
+		{text: byteview.String(decodeStore)},
+	}
+	orig := []any{
+		&slots[0].text,
+		&slots[1].number,
+		&slots[2].integer,
+		&slots[3].floating,
+		&slots[4].boolean,
+		&slots[5].text,
+		rawBytes,
+		vibejson.RawValue{Src: rawJSON},
+		nil,
+	}
+
+	detached := detachBoundArgs(orig)
+
+	// Overwrite every source backing buffer and slot to simulate a concurrent
+	// pipelined Bind on the unnamed portal.
+	for i := range argStore {
+		argStore[i] = 'X'
+	}
+	for i := range decodeStore {
+		decodeStore[i] = 'Y'
+	}
+	for i := range rawBytes {
+		rawBytes[i] = 'Z'
+	}
+	for i := range rawJSON {
+		rawJSON[i] = ' '
+	}
+	clear(slots)
+
+	if got := *(detached[0].(*string)); got != "hello-world" {
+		t.Fatalf("detached[0] = %q, want %q", got, "hello-world")
+	}
+	if got := *(detached[1].(*query.Number)); got != "9007199254740993" {
+		t.Fatalf("detached[1] = %q, want %q", got, "9007199254740993")
+	}
+	if got := *(detached[2].(*int64)); got != 42 {
+		t.Fatalf("detached[2] = %d, want 42", got)
+	}
+	if got := *(detached[3].(*float64)); got != 3.5 {
+		t.Fatalf("detached[3] = %v, want 3.5", got)
+	}
+	if got := *(detached[4].(*bool)); !got {
+		t.Fatalf("detached[4] = %v, want true", got)
+	}
+	if got := *(detached[5].(*string)); got != "decoded-json-text" {
+		t.Fatalf("detached[5] = %q, want %q", got, "decoded-json-text")
+	}
+	if got := string(detached[6].([]byte)); got != "raw-bytes" {
+		t.Fatalf("detached[6] = %q, want %q", got, "raw-bytes")
+	}
+	if got := string(detached[7].(vibejson.RawValue).Src); got != `{"k":1}` {
+		t.Fatalf("detached[7] = %q, want %q", got, `{"k":1}`)
+	}
+	if detached[8] != nil {
+		t.Fatalf("detached[8] = %v, want nil", detached[8])
+	}
+
+	// Verify O(1) bounded allocations (3 allocs: out slice, slots slice, byte arena)
+	// for 8 non-nil parameters.
+	s0, s1 := "alpha", "beta"
+	num := query.Number("1234567890")
+	i64, f64, bval := int64(7), 2.5, true
+	benchArgs := []any{&s0, &s1, &num, &i64, &f64, &bval, &s0, &s1}
+	allocs := testing.AllocsPerRun(100, func() {
+		_ = detachBoundArgs(benchArgs)
+	})
+	if allocs > 3 {
+		t.Fatalf("detachBoundArgs allocs for 8 params = %.1f, want <= 3", allocs)
 	}
 }

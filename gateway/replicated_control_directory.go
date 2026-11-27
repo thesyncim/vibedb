@@ -2,11 +2,14 @@ package gateway
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -71,16 +74,30 @@ func (snapshot ReplicatedControlDirectorySnapshot) Valid() bool {
 	return true
 }
 
+// replicatedControlDirectoryState is an immutable, pre-sorted cut published via
+// atomic.Pointer so all readers operate completely lock-free with zero sorting
+// or map iteration on the read hot path.
+type replicatedControlDirectoryState struct {
+	revision                     uint64
+	catalogGeneration            uint64
+	nodes                        []NodeRecord
+	shardControlEndpoints        []ReplicatedEndpoint
+	gatewayControlEndpoints      []GatewayControlDirectoryEndpoint
+	gatewayControlEndpointsHist  []GatewayControlDirectoryEndpoint
+}
+
 // ReplicatedControlDirectory is a monotonic in-process view of the
 // catalog-authorized node directory. Current participants are replaced by a
 // newer cut, while historical control endpoints remain addressable so an
 // immutable drain fence can finish after the node disappears from the latest
 // cut. Historical retention is bounded by the catalog directory bound.
+//
+// Readers are completely lock-free via atomic.Pointer copy-on-write snapshots;
+// Apply serializes writers under writeMu and validates atomically before
+// publishing a new immutable snapshot.
 type ReplicatedControlDirectory struct {
-	mu                 sync.RWMutex
-	revision           uint64
-	catalogGeneration  uint64
-	current            map[rafttransport.NodeID]NodeRecord
+	state              atomic.Pointer[replicatedControlDirectoryState]
+	writeMu            sync.Mutex
 	historicalShards   map[controlDirectoryIdentity]string
 	historicalGateways map[gatewayDirectoryIdentity]GatewayControlDirectoryEndpoint
 }
@@ -102,8 +119,6 @@ func NewReplicatedControlDirectory(snapshot ReplicatedControlDirectorySnapshot) 
 		return nil, ErrReplicatedControlDirectory
 	}
 	directory := &ReplicatedControlDirectory{
-		revision: snapshot.Revision, catalogGeneration: snapshot.CatalogGeneration,
-		current:            make(map[rafttransport.NodeID]NodeRecord, len(snapshot.Nodes)),
 		historicalShards:   make(map[controlDirectoryIdentity]string, len(snapshot.Nodes)),
 		historicalGateways: make(map[gatewayDirectoryIdentity]GatewayControlDirectoryEndpoint, len(snapshot.Nodes)),
 	}
@@ -121,20 +136,28 @@ func (directory *ReplicatedControlDirectory) Apply(snapshot ReplicatedControlDir
 	if directory == nil || !snapshot.Valid() {
 		return ErrReplicatedControlDirectory
 	}
-	directory.mu.Lock()
-	defer directory.mu.Unlock()
-	if snapshot.Revision < directory.revision || snapshot.CatalogGeneration < directory.catalogGeneration {
+	directory.writeMu.Lock()
+	defer directory.writeMu.Unlock()
+	cur := directory.state.Load()
+	var curRevision, curCatalogGen uint64
+	var curNodes []NodeRecord
+	if cur != nil {
+		curRevision, curCatalogGen, curNodes = cur.revision, cur.catalogGeneration, cur.nodes
+	}
+	if snapshot.Revision < curRevision || snapshot.CatalogGeneration < curCatalogGen {
 		return fmt.Errorf("%w: incoming revision=%d catalog=%d current revision=%d catalog=%d",
 			ErrReplicatedControlRevision, snapshot.Revision, snapshot.CatalogGeneration,
-			directory.revision, directory.catalogGeneration)
+			curRevision, curCatalogGen)
 	}
-	if snapshot.Revision == directory.revision {
-		if !sameControlDirectoryRecords(directory.current, snapshot.Nodes) {
+	if cur != nil && snapshot.Revision == curRevision {
+		if !slices.EqualFunc(curNodes, snapshot.Nodes, equalNodeRecord) {
 			return fmt.Errorf("%w: same revision=%d physical records changed incoming=%d current=%d",
-				ErrReplicatedControlRevision, snapshot.Revision, len(snapshot.Nodes), len(directory.current))
+				ErrReplicatedControlRevision, snapshot.Revision, len(snapshot.Nodes), len(curNodes))
 		}
-		if snapshot.CatalogGeneration > directory.catalogGeneration {
-			directory.catalogGeneration = snapshot.CatalogGeneration
+		if snapshot.CatalogGeneration > curCatalogGen {
+			next := *cur
+			next.catalogGeneration = snapshot.CatalogGeneration
+			directory.state.Store(&next)
 		}
 		return nil
 	}
@@ -142,25 +165,24 @@ func (directory *ReplicatedControlDirectory) Apply(snapshot ReplicatedControlDir
 }
 
 func (directory *ReplicatedControlDirectory) applyLocked(snapshot ReplicatedControlDirectorySnapshot) error {
-	if directory.current == nil {
-		directory.current = make(map[rafttransport.NodeID]NodeRecord, len(snapshot.Nodes))
-	}
-	if directory.historicalShards == nil {
-		directory.historicalShards = make(map[controlDirectoryIdentity]string, len(snapshot.Nodes))
-	}
-	if directory.historicalGateways == nil {
-		directory.historicalGateways = make(map[gatewayDirectoryIdentity]GatewayControlDirectoryEndpoint, len(snapshot.Nodes))
-	}
+	// Stage historical mutations into cloned maps so any validation or capacity
+	// failure leaves the existing directory state completely untouched.
+	nextShards := make(map[controlDirectoryIdentity]string, len(directory.historicalShards)+len(snapshot.Nodes))
+	maps.Copy(nextShards, directory.historicalShards)
+	nextGateways := make(map[gatewayDirectoryIdentity]GatewayControlDirectoryEndpoint, len(directory.historicalGateways)+len(snapshot.Nodes))
+	maps.Copy(nextGateways, directory.historicalGateways)
+
+	gatewayEndpoints := make([]GatewayControlDirectoryEndpoint, 0, len(snapshot.Nodes))
 	for _, record := range snapshot.Nodes {
 		if record.ControlAddress == "" || record.NodeID == (rafttransport.NodeID{}) || record.Incarnation == 0 {
 			return ErrReplicatedControlDirectory
 		}
 		shardIdentity := controlDirectoryIdentity{node: record.NodeID, incarnation: record.Incarnation}
-		if prior, found := directory.historicalShards[shardIdentity]; found && prior != record.ControlAddress {
+		if prior, found := nextShards[shardIdentity]; found && prior != record.ControlAddress {
 			return ErrReplicatedControlDirectory
 		}
-		directory.historicalShards[shardIdentity] = record.ControlAddress
-		if len(directory.historicalShards) > maxReplicatedControlDirectoryIdentities {
+		nextShards[shardIdentity] = record.ControlAddress
+		if len(nextShards) > maxReplicatedControlDirectoryIdentities {
 			return ErrReplicatedControlDirectory
 		}
 		if record.Gateway.NodeID != (rafttransport.NodeID{}) {
@@ -178,54 +200,116 @@ func (directory *ReplicatedControlDirectory) applyLocked(snapshot ReplicatedCont
 			}
 			identity := gatewayDirectoryIdentity{node: gatewayEndpoint.Member.Node,
 				incarnation: gatewayEndpoint.Member.Incarnation, session: gatewayEndpoint.SessionID}
-			if prior, found := directory.historicalGateways[identity]; found &&
+			if prior, found := nextGateways[identity]; found &&
 				(prior.Address != gatewayEndpoint.Address || prior.ServiceKeyDigest != gatewayEndpoint.ServiceKeyDigest ||
 					prior.ServiceID != gatewayEndpoint.ServiceID || prior.ParticipantDigest != gatewayEndpoint.ParticipantDigest ||
 					prior.SessionRevision != gatewayEndpoint.SessionRevision) {
 				return ErrReplicatedControlDirectory
 			}
-			directory.historicalGateways[identity] = gatewayEndpoint
-			if len(directory.historicalGateways) > maxReplicatedControlDirectoryIdentities {
+			nextGateways[identity] = gatewayEndpoint
+			if len(nextGateways) > maxReplicatedControlDirectoryIdentities {
 				return ErrReplicatedControlDirectory
+			}
+			if record.Lifecycle != NodeDecommissioned {
+				gatewayEndpoints = append(gatewayEndpoints, gatewayEndpoint)
 			}
 		}
 	}
-	directory.current = make(map[rafttransport.NodeID]NodeRecord, len(snapshot.Nodes))
-	for _, record := range snapshot.Nodes {
-		directory.current[record.NodeID] = record
+
+	// snapshot.Valid() already verified snapshot.Nodes is strictly ascending by NodeID.
+	nodes := cloneNodeRecords(snapshot.Nodes)
+
+	shardEndpoints := make([]ReplicatedEndpoint, 0, len(nextShards))
+	for identity, address := range nextShards {
+		shardEndpoints = append(shardEndpoints, ReplicatedEndpoint{
+			Node: identity.node, NodeIncarnation: identity.incarnation, ControlAddress: address,
+		})
 	}
-	directory.revision, directory.catalogGeneration = snapshot.Revision, snapshot.CatalogGeneration
+	slices.SortFunc(shardEndpoints, func(left, right ReplicatedEndpoint) int {
+		if compared := bytes.Compare(left.Node[:], right.Node[:]); compared != 0 {
+			return compared
+		}
+		return cmp.Compare(left.NodeIncarnation, right.NodeIncarnation)
+	})
+
+	if len(gatewayEndpoints) == 0 {
+		gatewayEndpoints = []GatewayControlDirectoryEndpoint{}
+	} else {
+		slices.SortFunc(gatewayEndpoints, compareGatewayControlDirectoryEndpoint)
+	}
+
+	gatewayEndpointsHist := make([]GatewayControlDirectoryEndpoint, 0, len(nextGateways))
+	for _, endpoint := range nextGateways {
+		gatewayEndpointsHist = append(gatewayEndpointsHist, endpoint)
+	}
+	slices.SortFunc(gatewayEndpointsHist, compareGatewayControlDirectoryEndpoint)
+
+	directory.historicalShards = nextShards
+	directory.historicalGateways = nextGateways
+	directory.state.Store(&replicatedControlDirectoryState{
+		revision:                    snapshot.Revision,
+		catalogGeneration:           snapshot.CatalogGeneration,
+		nodes:                       nodes,
+		shardControlEndpoints:       shardEndpoints,
+		gatewayControlEndpoints:     gatewayEndpoints,
+		gatewayControlEndpointsHist: gatewayEndpointsHist,
+	})
 	return nil
 }
 
-func sameControlDirectoryRecords(current map[rafttransport.NodeID]NodeRecord, records []NodeRecord) bool {
-	if len(current) != len(records) {
+func equalNodeRecord(left, right NodeRecord) bool {
+	if left.Replacement == right.Replacement {
+		return left == right
+	}
+	if left.Replacement == nil || right.Replacement == nil || *left.Replacement != *right.Replacement {
 		return false
 	}
-	for _, record := range records {
-		if prior, found := current[record.NodeID]; !found || prior != record {
-			return false
+	left.Replacement = nil
+	right.Replacement = nil
+	return left == right
+}
+
+func cloneNodeRecords(records []NodeRecord) []NodeRecord {
+	cloned := slices.Clone(records)
+	for i := range cloned {
+		if cloned[i].Replacement != nil {
+			proof := *cloned[i].Replacement
+			cloned[i].Replacement = &proof
 		}
 	}
-	return true
+	return cloned
+}
+
+func compareGatewayControlDirectoryEndpoint(left, right GatewayControlDirectoryEndpoint) int {
+	if compared := bytes.Compare(left.Member.Node[:], right.Member.Node[:]); compared != 0 {
+		return compared
+	}
+	if compared := cmp.Compare(left.Member.Incarnation, right.Member.Incarnation); compared != 0 {
+		return compared
+	}
+	return bytes.Compare(left.SessionID[:], right.SessionID[:])
 }
 
 func (directory *ReplicatedControlDirectory) Revision() uint64 {
 	if directory == nil {
 		return 0
 	}
-	directory.mu.RLock()
-	defer directory.mu.RUnlock()
-	return directory.revision
+	state := directory.state.Load()
+	if state == nil {
+		return 0
+	}
+	return state.revision
 }
 
 func (directory *ReplicatedControlDirectory) CatalogGeneration() uint64 {
 	if directory == nil {
 		return 0
 	}
-	directory.mu.RLock()
-	defer directory.mu.RUnlock()
-	return directory.catalogGeneration
+	state := directory.state.Load()
+	if state == nil {
+		return 0
+	}
+	return state.catalogGeneration
 }
 
 // Nodes returns the current physical cut. Historical records deliberately do
@@ -235,16 +319,11 @@ func (directory *ReplicatedControlDirectory) Nodes() []NodeRecord {
 	if directory == nil {
 		return nil
 	}
-	directory.mu.RLock()
-	defer directory.mu.RUnlock()
-	result := make([]NodeRecord, 0, len(directory.current))
-	for _, record := range directory.current {
-		result = append(result, record)
+	state := directory.state.Load()
+	if state == nil {
+		return nil
 	}
-	slices.SortFunc(result, func(left, right NodeRecord) int {
-		return bytes.Compare(left.NodeID[:], right.NodeID[:])
-	})
-	return result
+	return cloneNodeRecords(state.nodes)
 }
 
 // ShardControlEndpoints returns the union of current and historical physical
@@ -254,26 +333,11 @@ func (directory *ReplicatedControlDirectory) ShardControlEndpoints() []Replicate
 	if directory == nil {
 		return nil
 	}
-	directory.mu.RLock()
-	defer directory.mu.RUnlock()
-	result := make([]ReplicatedEndpoint, 0, len(directory.historicalShards))
-	for identity, address := range directory.historicalShards {
-		result = append(result, ReplicatedEndpoint{Node: identity.node,
-			NodeIncarnation: identity.incarnation, ControlAddress: address})
+	state := directory.state.Load()
+	if state == nil {
+		return nil
 	}
-	slices.SortFunc(result, func(left, right ReplicatedEndpoint) int {
-		if compared := bytes.Compare(left.Node[:], right.Node[:]); compared != 0 {
-			return compared
-		}
-		if left.NodeIncarnation < right.NodeIncarnation {
-			return -1
-		}
-		if left.NodeIncarnation > right.NodeIncarnation {
-			return 1
-		}
-		return 0
-	})
-	return result
+	return slices.Clone(state.shardControlEndpoints)
 }
 
 // GatewayControlEndpoints returns only the current participant roster. An
@@ -283,34 +347,11 @@ func (directory *ReplicatedControlDirectory) GatewayControlEndpoints() []Gateway
 	if directory == nil {
 		return nil
 	}
-	directory.mu.RLock()
-	defer directory.mu.RUnlock()
-	result := make([]GatewayControlDirectoryEndpoint, 0, len(directory.current))
-	for _, record := range directory.current {
-		if record.Lifecycle == NodeDecommissioned || record.Gateway.NodeID == (rafttransport.NodeID{}) {
-			continue
-		}
-		result = append(result, GatewayControlDirectoryEndpoint{
-			Member:           ClusterCatalogDrainMember{Node: record.Gateway.NodeID, Incarnation: record.Gateway.Incarnation},
-			ServiceKeyDigest: record.Gateway.ServiceKeyDigest, ServiceID: record.Gateway.ServiceID,
-			SessionID: record.Gateway.SessionID, SessionRevision: record.Gateway.SessionRevision,
-			ParticipantDigest: record.Gateway.ParticipantDigest, Address: record.GatewayAddress,
-			DirectoryRevision: record.Revision,
-		})
+	state := directory.state.Load()
+	if state == nil {
+		return nil
 	}
-	slices.SortFunc(result, func(left, right GatewayControlDirectoryEndpoint) int {
-		if compared := bytes.Compare(left.Member.Node[:], right.Member.Node[:]); compared != 0 {
-			return compared
-		}
-		if left.Member.Incarnation < right.Member.Incarnation {
-			return -1
-		}
-		if left.Member.Incarnation > right.Member.Incarnation {
-			return 1
-		}
-		return bytes.Compare(left.SessionID[:], right.SessionID[:])
-	})
-	return result
+	return slices.Clone(state.gatewayControlEndpoints)
 }
 
 // GatewayControlEndpointsWithHistory returns every participant identity ever
@@ -322,25 +363,11 @@ func (directory *ReplicatedControlDirectory) GatewayControlEndpointsWithHistory(
 	if directory == nil {
 		return nil
 	}
-	directory.mu.RLock()
-	defer directory.mu.RUnlock()
-	result := make([]GatewayControlDirectoryEndpoint, 0, len(directory.historicalGateways))
-	for _, endpoint := range directory.historicalGateways {
-		result = append(result, endpoint)
+	state := directory.state.Load()
+	if state == nil {
+		return nil
 	}
-	slices.SortFunc(result, func(left, right GatewayControlDirectoryEndpoint) int {
-		if compared := bytes.Compare(left.Member.Node[:], right.Member.Node[:]); compared != 0 {
-			return compared
-		}
-		if left.Member.Incarnation < right.Member.Incarnation {
-			return -1
-		}
-		if left.Member.Incarnation > right.Member.Incarnation {
-			return 1
-		}
-		return bytes.Compare(left.SessionID[:], right.SessionID[:])
-	})
-	return result
+	return slices.Clone(state.gatewayControlEndpointsHist)
 }
 
 // ReadFrom consumes the complete node cut supplied by a catalog-backed
