@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -23,8 +24,8 @@ import (
 // prepared-statement cache. A request that cannot acquire a slot continues on
 // the ordinary constructor/prepare path.
 const (
-	replicatedReadReuseSlotCount   = 8
-	replicatedReadReuseMaxBytes    = 2 << 20
+	replicatedReadReuseSlotCount   = 16
+	replicatedReadReuseMaxBytes    = 4 << 20
 	replicatedReadReuseMaxSQL      = 64 << 10
 	replicatedReadReuseMaxParams   = 32
 	replicatedReadReuseMaxPath     = 256
@@ -139,14 +140,11 @@ func (l *ReplicatedReadLease) Abort(err error) error {
 func (l *ReplicatedReadLease) Close() error { return l.Release() }
 
 func (l *ReplicatedReadLease) live() error {
-	if l == nil || l.cache == nil || l.slot == nil {
+	if l == nil || l.cache == nil || l.slot == nil || l.generation == 0 {
 		return ErrReplicatedReadLeaseClosed
 	}
-	l.cache.mu.Lock()
-	valid := !l.cache.closed && l.slot.active && l.slot.lease == l &&
-		l.slot.generation == l.generation
-	l.cache.mu.Unlock()
-	if !valid {
+	idx := l.slot.slotIdx
+	if l.cache.closedAtomic.Load() || l.cache.liveLease[idx].Load() != l || l.cache.liveGen[idx].Load() != l.generation {
 		return ErrReplicatedReadLeaseClosed
 	}
 	return nil
@@ -188,6 +186,7 @@ func (k replicatedReadReuseKey) equal(other replicatedReadReuseKey) bool {
 }
 
 type replicatedReadReuseSlot struct {
+	slotIdx      uint8
 	active       bool
 	generation   uint64
 	lease        *ReplicatedReadLease
@@ -199,14 +198,17 @@ type replicatedReadReuseSlot struct {
 }
 
 type replicatedReadReuseCache struct {
-	mu        sync.Mutex
-	closed    bool
-	retained  int64
-	nextGen   uint64
-	hits      uint64
-	misses    uint64
-	evictions uint64
-	slots     [replicatedReadReuseSlotCount]replicatedReadReuseSlot
+	mu           sync.Mutex
+	closed       bool
+	closedAtomic atomic.Bool
+	retained     int64
+	nextGen      uint64
+	hits         uint64
+	misses       uint64
+	evictions    uint64
+	liveGen      [replicatedReadReuseSlotCount]atomic.Uint64
+	liveLease    [replicatedReadReuseSlotCount]atomic.Pointer[ReplicatedReadLease]
+	slots        [replicatedReadReuseSlotCount]replicatedReadReuseSlot
 }
 
 type replicatedReadReuseStats struct {
@@ -237,10 +239,18 @@ func (a *ReplicatedApply) replicatedReadReuseCache() *replicatedReadReuseCache {
 	if a == nil {
 		return nil
 	}
+	if c := a.readReuseAtomic.Load(); c != nil {
+		return c
+	}
 	a.readReuseMu.Lock()
 	defer a.readReuseMu.Unlock()
 	if a.readReuse == nil {
-		a.readReuse = new(replicatedReadReuseCache)
+		cache := new(replicatedReadReuseCache)
+		for i := range cache.slots {
+			cache.slots[i].slotIdx = uint8(i)
+		}
+		a.readReuse = cache
+		a.readReuseAtomic.Store(cache)
 	}
 	return a.readReuse
 }
@@ -375,7 +385,7 @@ func (a *ReplicatedApply) AcquireReplicatedPointRead(
 	options query.ExecOptions,
 ) (*ReplicatedReadLease, error) {
 	return a.acquireReplicatedPointRead(ctx, relation, keyBytes, found, raw, primaryPath,
-		text, parameterTypes, partialAggregate, options, nil)
+		text, parameterTypes, partialAggregate, options, nil, false)
 }
 
 // AcquireReplicatedPointReadInto uses caller-owned lease storage. dst must be
@@ -390,22 +400,54 @@ func (a *ReplicatedApply) AcquireReplicatedPointReadInto(ctx context.Context,
 		return ErrReplicatedReadLeaseClosed
 	}
 	_, err := a.acquireReplicatedPointRead(ctx, relation, keyBytes, found, raw, primaryPath,
-		text, parameterTypes, partialAggregate, options, dst)
+		text, parameterTypes, partialAggregate, options, dst, false)
+	return err
+}
+
+// AcquireReplicatedTrustedPointReadInto is the trusted RF3 leader point-read
+// fast path for a PointReadResult produced directly by Machine.PointReadInto.
+// Because PointReadInto already validated key ownership against the live range
+// and read a validated stored document, verifying the fence's manifest digest
+// avoids re-parsing and re-validating the JSON payload before query execution.
+func (a *ReplicatedApply) AcquireReplicatedTrustedPointReadInto(ctx context.Context,
+	relation replication.RelationID, keyBytes []byte, point replicatedstate.PointReadResult, primaryPath []byte,
+	text string, parameterTypes []ParamType, partialAggregate bool, options query.ExecOptions,
+	dst *ReplicatedReadLease,
+) error {
+	if dst == nil || dst.cache != nil || dst.slot != nil {
+		return ErrReplicatedReadLeaseClosed
+	}
+	if point.Fence.Applied == 0 || point.Fence.RelationManifestDigest == ([32]byte{}) {
+		return ErrReplicatedApplyMismatch
+	}
+	manifest, err := a.machine.RelationManifestDigest()
+	if err != nil {
+		return err
+	}
+	if point.Fence.RelationManifestDigest != manifest {
+		return ErrReplicatedApplyMismatch
+	}
+	_, err = a.acquireReplicatedPointRead(ctx, relation, keyBytes, point.Found, point.Value, primaryPath,
+		text, parameterTypes, partialAggregate, options, dst, true, manifest)
 	return err
 }
 
 func (a *ReplicatedApply) acquireReplicatedPointRead(ctx context.Context,
 	relation replication.RelationID, keyBytes []byte, found bool, raw, primaryPath []byte,
 	text string, parameterTypes []ParamType, partialAggregate bool, options query.ExecOptions,
-	dst *ReplicatedReadLease,
+	dst *ReplicatedReadLease, trustedPoint bool, knownManifest ...[32]byte,
 ) (*ReplicatedReadLease, error) {
 	if partialAggregate || !replicatedReadReuseTextBound(text) ||
 		!replicatedReadReuseParamTypesBound(parameterTypes) ||
 		len(primaryPath) > replicatedReadReuseMaxPath {
 		return nil, ErrReplicatedReadReuseUnsupported
 	}
+	var manifest [32]byte
+	if len(knownManifest) > 0 {
+		manifest = knownManifest[0]
+	}
 	key, err := a.readReuseKey(
-		relation, byteview.String(primaryPath), text, parameterTypes, [32]byte{},
+		relation, byteview.String(primaryPath), text, parameterTypes, manifest,
 	)
 	if err != nil {
 		return nil, err
@@ -430,7 +472,7 @@ func (a *ReplicatedApply) acquireReplicatedPointRead(ctx context.Context,
 		}
 	}()
 	if lease != nil {
-		constructErr := a.bindPointExecution(ctx, relation, keyBytes, found, raw, primaryPath, options, slot.reader)
+		constructErr := a.bindPointExecutionChecked(ctx, relation, keyBytes, found, raw, primaryPath, options, slot.reader, trustedPoint)
 		if constructErr != nil {
 			_ = cache.finish(lease, constructErr)
 			return nil, constructErr
@@ -536,6 +578,8 @@ func (c *replicatedReadReuseCache) reserveInto(key replicatedReadReuseKey, dst *
 			}
 			*lease = ReplicatedReadLease{cache: c, slot: slot, generation: slot.generation}
 			slot.lease = lease
+			c.liveGen[slot.slotIdx].Store(slot.generation)
+			c.liveLease[slot.slotIdx].Store(lease)
 			c.mu.Unlock()
 			return slot, lease, nil
 		}
@@ -599,6 +643,8 @@ func (c *replicatedReadReuseCache) leaseForInto(slot *replicatedReadReuseSlot, d
 	}
 	*lease = ReplicatedReadLease{cache: c, slot: slot, generation: slot.generation}
 	slot.lease = lease
+	c.liveGen[slot.slotIdx].Store(slot.generation)
+	c.liveLease[slot.slotIdx].Store(lease)
 	return lease
 }
 
@@ -637,19 +683,15 @@ func (c *replicatedReadReuseCache) finish(
 	if lease == nil || lease.cache != c || lease.slot == nil {
 		return nil
 	}
-	c.mu.Lock()
-	if !lease.slot.active || lease.slot.lease != lease ||
-		lease.slot.generation != lease.generation {
-		c.mu.Unlock()
+	slot := lease.slot
+	gen := lease.generation
+	idx := slot.slotIdx
+	if gen == 0 || c.liveGen[idx].Load() != gen || !c.liveLease[idx].CompareAndSwap(lease, nil) {
 		return ErrReplicatedReadLeaseClosed
 	}
-	slot := lease.slot
-	// Invalidate the generation before any cleanup can call back into the
-	// cache. The slot remains active until the cleanup decision is installed.
-	slot.lease = nil
+	c.liveGen[idx].Store(0)
 	lease.slot = nil
 	lease.cache = nil
-	c.mu.Unlock()
 	settled := false
 	retire := func() {
 		reader := c.retire(slot)
@@ -694,13 +736,15 @@ func (c *replicatedReadReuseCache) finish(
 		return nil
 	}
 	c.mu.Lock()
-	if c.closed || c.retained-slot.retainedByte > replicatedReadReuseMaxBytes-retained {
+	if c.closed || !slot.active || slot.lease != lease || slot.generation != gen ||
+		c.retained-slot.retainedByte > replicatedReadReuseMaxBytes-retained {
 		c.mu.Unlock()
 		retire()
 		return nil
 	}
 	c.retained += retained - slot.retainedByte
 	slot.retainedByte = retained
+	slot.lease = nil
 	slot.active = false
 	settled = true
 	c.mu.Unlock()
@@ -795,6 +839,8 @@ func (c *replicatedReadReuseCache) detachSlotLocked(
 	c.evictions++
 	slot.active = false
 	slot.generation = 0
+	c.liveGen[slot.slotIdx].Store(0)
+	c.liveLease[slot.slotIdx].Store(nil)
 	slot.lease = nil
 	slot.key = replicatedReadReuseKey{}
 	slot.reader = nil
@@ -836,6 +882,7 @@ func (c *replicatedReadReuseCache) shutdown() {
 		return
 	}
 	c.closed = true
+	c.closedAtomic.Store(true)
 	var retire [replicatedReadReuseSlotCount]*ReplicatedReadSession
 	count := 0
 	for i := range c.slots {
@@ -916,29 +963,43 @@ func (a *ReplicatedApply) readReuseDataKey(
 		return replicatedReadReuseKey{}, ErrReplicatedApplyClosed
 	}
 	a.database.mu.RLock()
+	defer a.database.mu.RUnlock()
+	if err := a.checkLocked(); err != nil {
+		return replicatedReadReuseKey{}, err
+	}
 	base := a.database.catalog.ReplicatedShardStore
+	if base == nil || layoutIdentityToken(a.database.layoutEpoch) == nil {
+		return replicatedReadReuseKey{}, ErrReplicatedReadReuseUnsupported
+	}
 	var relation replication.RelationID
 	var primaryPath string
-	if base != nil {
-		for ordinal := range base.Relations {
-			if base.Relations[ordinal].Table == base.UserTable {
-				relation = replication.RelationID(ordinal + 1)
-				if table := a.database.tables[base.UserTable]; table != nil && table.meta != nil {
-					primaryPath = table.meta.PrimaryKey
-				}
-				break
+	for ordinal := range base.Relations {
+		if base.Relations[ordinal].Table == base.UserTable {
+			relation = replication.RelationID(ordinal + 1)
+			if table := a.database.tables[base.UserTable]; table != nil && table.meta != nil {
+				primaryPath = table.meta.PrimaryKey
 			}
+			break
 		}
 	}
-	a.database.mu.RUnlock()
 	if relation == 0 || primaryPath == "" {
 		return replicatedReadReuseKey{}, ErrReplicatedReadReuseUnsupported
 	}
-	key, err := a.readReuseKey(relation, primaryPath, text, parameterTypes, manifest)
-	if err != nil {
-		return key, err
+	if manifest == ([32]byte{}) {
+		var err error
+		manifest, err = a.machine.RelationManifestDigest()
+		if err != nil {
+			return replicatedReadReuseKey{}, err
+		}
 	}
-	return key, nil
+	return replicatedReadReuseKey{
+		sql: text, paramTypes: parameterTypes,
+		relation: relation, primaryPath: primaryPath,
+		schemaGeneration: uint64(base.Binding.Authority.SchemaGeneration),
+		allocationGen:    uint64(base.Binding.AllocationGeneration),
+		layoutToken:      layoutIdentityToken(a.database.layoutEpoch),
+		manifestDigest:   manifest,
+	}, nil
 }
 
 // bindReplicatedReadReuseKey records the physical relation proved by the

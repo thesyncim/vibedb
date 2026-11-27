@@ -63,15 +63,19 @@ func (m *Machine) PointReadInto(
 	}
 	// Apply and activation hold m.mu until the entire bundle is published. The
 	// live primary router includes acknowledged overlay mutations even when
-	// the rooted physical graph still belongs to an older checkpoint.
-	_, blocked, intentErr := lookupTransactionIntentOwner(
-		pointSnapshot{live: m.system.Collection}, relation, key,
-	)
-	if intentErr != nil {
-		return PointReadResult{}, m.fail(intentErr)
-	}
-	if blocked {
-		return PointReadResult{}, ErrTransactionIntentActive
+	// the rooted physical graph still belongs to an older checkpoint. When the
+	// machine exclusively owns its collections via CheckpointGroup and tracks
+	// zero active intent rows, no intent key can exist in system.Collection.
+	if m.checkpointGroup == nil || m.state.TransactionIntentRows != 0 {
+		_, blocked, intentErr := lookupTransactionIntentOwner(
+			pointSnapshot{live: m.system.Collection}, relation, key,
+		)
+		if intentErr != nil {
+			return PointReadResult{}, m.fail(intentErr)
+		}
+		if blocked {
+			return PointReadResult{}, ErrTransactionIntentActive
+		}
 	}
 	value, found, err := selected.target.Collection.AppendRaw(dst[:0], key)
 	if err != nil {

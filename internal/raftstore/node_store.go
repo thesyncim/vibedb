@@ -31,8 +31,8 @@ const (
 	nodeMetaHeaderBytes = 48
 
 	DefaultNodeSegmentBytes       = 24 << 20
-	DefaultNodeMaxWaveBytes       = 20 << 20
-	DefaultNodeMaxSegmentEvents   = 32 << 10
+	DefaultNodeMaxWaveBytes       = 16 << 20
+	DefaultNodeMaxSegmentEvents   = 64 << 10
 	DefaultNodeRecentWaves        = 4 << 10
 	DefaultNodeMaxEntriesPerGroup = raftmodel.MaxMessageEntries
 	DefaultNodeReaderSlots        = 4

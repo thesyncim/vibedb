@@ -1035,17 +1035,20 @@ func (runtime *Runtime) ReadPointAuthorityTokenReadOnly() (token raftauthority.A
 	if err != nil {
 		return raftauthority.AuthorityToken{}, false, err
 	}
+	if len(state.outbound) != 0 {
+		return raftauthority.AuthorityToken{}, true, nil
+	}
+	now, nowErr := state.clock.Now()
+	if nowErr != nil {
+		return raftauthority.AuthorityToken{}, false, nowErr
+	}
 	var found bool
 	if state.renewal != nil {
-		expired, expiredErr := state.renewal.Expired()
-		if expiredErr != nil {
-			return raftauthority.AuthorityToken{}, false, expiredErr
-		}
-		if expired {
+		if state.renewal.ExpiredAt(now) {
 			return raftauthority.AuthorityToken{}, true, nil
 		}
 		if state.renewal.HasQuorum() {
-			if candidate, tokenErr := state.renewal.Token(observation); tokenErr == nil {
+			if candidate, tokenErr := state.renewal.TokenAt(now, observation); tokenErr == nil {
 				token = candidate
 				found = true
 			}
@@ -1055,25 +1058,14 @@ func (runtime *Runtime) ReadPointAuthorityTokenReadOnly() (token raftauthority.A
 		if state.round == nil {
 			return raftauthority.AuthorityToken{}, true, nil
 		}
-		expired, expiredErr := state.round.Expired()
-		if expiredErr != nil {
-			return raftauthority.AuthorityToken{}, false, expiredErr
-		}
-		if expired {
+		if state.round.ExpiredAt(now) {
 			return raftauthority.AuthorityToken{}, true, nil
 		}
-		candidate, tokenErr := state.round.Token(observation)
+		candidate, tokenErr := state.round.TokenAt(now, observation)
 		if tokenErr != nil {
 			return raftauthority.AuthorityToken{}, true, nil
 		}
 		token = candidate
-	}
-	if len(state.outbound) != 0 {
-		return raftauthority.AuthorityToken{}, true, nil
-	}
-	now, nowErr := state.clock.Now()
-	if nowErr != nil {
-		return raftauthority.AuthorityToken{}, true, nil
 	}
 	usable, usableErr := state.policy.UsableDuration()
 	if usableErr != nil {

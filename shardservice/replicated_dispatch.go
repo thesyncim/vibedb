@@ -154,18 +154,25 @@ func (server *ReplicatedServer) DispatchReplicated(ctx context.Context, call Rep
 			server.frames.release(charge)
 		}
 	}()
-	var requestCtx context.Context
+	requestCtx := ctx
 	var cancel context.CancelFunc
+	fastSyncSQLRead := call.SQL != nil && call.Request.Operation == ReplicatedQueryLeader
 	if deadline, ok := ctx.Deadline(); ok && !deadline.After(time.Now().Add(server.requestTimeout)) {
-		requestCtx, cancel = context.WithCancel(ctx)
+		if !fastSyncSQLRead {
+			requestCtx, cancel = context.WithCancel(ctx)
+			defer cancel()
+			if binding.ctx.Done() != nil {
+				stop := context.AfterFunc(binding.ctx, cancel)
+				defer stop()
+			}
+		}
 	} else {
 		requestCtx, cancel = context.WithTimeout(ctx, server.requestTimeout)
-	}
-	defer cancel()
-	// A binding context that can never be done needs no arm.
-	if binding.ctx.Done() != nil {
-		stop := context.AfterFunc(binding.ctx, cancel)
-		defer stop()
+		defer cancel()
+		if binding.ctx.Done() != nil {
+			stop := context.AfterFunc(binding.ctx, cancel)
+			defer stop()
+		}
 	}
 	// Lock-free generation + binding liveness check: ReplicatedServerTLS.Rotate
 	// and closeActive atomically bump generationAtomic and cancel binding.ctx
@@ -198,6 +205,14 @@ func (server *ReplicatedServer) DispatchReplicated(ctx context.Context, call Rep
 	}
 	server.semanticDispatch.Add(1)
 	response := server.executeReplicatedAuthenticatedCallValidated(requestCtx, request, true, semanticSQL, true)
+	if fastSyncSQLRead && (binding.generation != binding.storage.generationAtomic.Load() ||
+		server.local.Load() != binding || binding.ctx.Err() != nil ||
+		server.state.Load() == replicatedServerClosed) {
+		if response != nil && response.readLease != nil {
+			response.readLease.Release()
+		}
+		return nil, ErrReplicatedAuthentication
+	}
 	reply, replyErr := semanticReplyFromExecutedResponse(response)
 	if replyErr != nil {
 		if response != nil && response.readLease != nil {

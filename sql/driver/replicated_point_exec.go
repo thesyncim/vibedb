@@ -33,6 +33,13 @@ func (p *replicatedPointExecution) reset() {
 func (a *ReplicatedApply) bindPointExecution(ctx context.Context, relation replication.RelationID,
 	key []byte, found bool, raw, path []byte, options query.ExecOptions, reader *ReplicatedReadSession,
 ) error {
+	return a.bindPointExecutionChecked(ctx, relation, key, found, raw, path, options, reader, false)
+}
+
+func (a *ReplicatedApply) bindPointExecutionChecked(ctx context.Context, relation replication.RelationID,
+	key []byte, found bool, raw, path []byte, options query.ExecOptions, reader *ReplicatedReadSession,
+	trustedPoint bool,
+) error {
 	if a == nil || a.database == nil || ctx == nil || reader == nil {
 		return ErrReplicatedApplyClosed
 	}
@@ -57,7 +64,7 @@ func (a *ReplicatedApply) bindPointExecution(ctx context.Context, relation repli
 	if !capacity.Initialized {
 		return ErrReplicatedApplyMismatch
 	}
-	layout, _, _, err := a.pointReadSessionLayoutLocked(relation, path, key, found, raw, &reader.pointProof)
+	layout, _, _, err := a.pointReadSessionLayoutCheckedLocked(relation, path, key, found, raw, &reader.pointProof, trustedPoint)
 	if err != nil {
 		return err
 	}

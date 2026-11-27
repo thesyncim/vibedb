@@ -71,7 +71,9 @@ type postgresSession struct {
 	intermediate        int64
 	statements          map[pgwire.BackendStatement]struct{}
 	readCache           postgresReadCache
+	writeCache          postgresWriteCache
 	params              []shardservice.Param
+	paramTextBuf        []byte
 	materialized        query.Result
 	materializedRelease func() error
 	cancelMu            sync.Mutex
@@ -102,6 +104,14 @@ type postgresReadCache struct {
 	resultParamTypes  []driver.ParamType
 	catalogGeneration uint64
 	execution         preparedQueryExecution
+}
+
+type postgresWriteCache struct {
+	text              string
+	kind              sqlast.Kind
+	table             string
+	params            int
+	catalogGeneration uint64
 }
 
 func (s *postgresSession) State() driver.SessionState { return s.state }
@@ -252,6 +262,7 @@ func (s *postgresSession) Close() error {
 		_ = statement.Close()
 	}
 	s.releaseReadCache()
+	s.writeCache = postgresWriteCache{}
 	s.params = nil
 	s.materialized.Release()
 	return nil
@@ -375,6 +386,9 @@ func (s *postgresSession) prepare(
 		return nil, err
 	}
 	if cached := s.takeCachedRead(text, parameterTypes); cached != nil {
+		return cached, nil
+	}
+	if cached := s.takeCachedWrite(text, parameterTypes); cached != nil {
 		return cached, nil
 	}
 	// Wire request storage may be reused after this call. The compiled tree and
@@ -681,6 +695,7 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 	params := slices.Grow(s.params[:0], len(args))[:len(args)]
 	clear(params)
 	s.params = params
+	s.paramTextBuf = s.paramTextBuf[:0]
 	defer clear(s.params)
 	for i, value := range args {
 		switch v := value.(type) {
@@ -731,9 +746,13 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 		case []byte:
 			params[i] = shardservice.StringBytesParam(v)
 		case int64:
-			params[i] = shardservice.NumberParam(strconv.FormatInt(v, 10))
+			start := len(s.paramTextBuf)
+			s.paramTextBuf = strconv.AppendInt(s.paramTextBuf, v, 10)
+			params[i] = shardservice.NumberBytesParam(s.paramTextBuf[start:])
 		case float64:
-			params[i] = shardservice.NumberParam(strconv.FormatFloat(v, 'g', -1, 64))
+			start := len(s.paramTextBuf)
+			s.paramTextBuf = strconv.AppendFloat(s.paramTextBuf, v, 'g', -1, 64)
+			params[i] = shardservice.NumberBytesParam(s.paramTextBuf[start:])
 		case query.Number:
 			params[i] = shardservice.NumberParam(string(v))
 		default:

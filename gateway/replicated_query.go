@@ -25,12 +25,16 @@ type replicatedSQLSnapshotKey struct{}
 var ErrReplicatedSQLPlanUnsupported = errors.New("gateway: RF3 SQL does not yet support global-index or repartition exchange plans")
 
 type replicatedSQLAttempt struct {
-	snapshot     *Snapshot
-	mu           sync.Mutex
-	observations []ReplicatedGroupReadObservation
+	snapshot         *Snapshot
+	skipObservations bool
+	mu               sync.Mutex
+	observations     []ReplicatedGroupReadObservation
 }
 
 func (a *replicatedSQLAttempt) resultObservations() []ReplicatedGroupReadObservation {
+	if a.skipObservations {
+		return nil
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	slices.SortFunc(a.observations, func(x, y ReplicatedGroupReadObservation) int { return bytes.Compare(x.RouteID[:], y.RouteID[:]) })
@@ -225,7 +229,7 @@ func (executor *ReplicatedExecutor) QuerySQLTyped(ctx context.Context, route Rep
 			if result.Kind == shardservice.ResponseError {
 				return nil, nil, shardError(result)
 			}
-			if execution, ok := ctx.Value(replicatedSQLSnapshotKey{}).(*replicatedSQLAttempt); ok {
+			if execution, ok := ctx.Value(replicatedSQLSnapshotKey{}).(*replicatedSQLAttempt); ok && !execution.skipObservations {
 				execution.mu.Lock()
 				execution.observations = append(execution.observations, ReplicatedGroupReadObservation{Group: route.Group, RouteID: replicatedRouteID(route), Applied: response.ReadApplied, Retries: attempt})
 				execution.mu.Unlock()

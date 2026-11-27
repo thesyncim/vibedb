@@ -195,6 +195,21 @@ func (client *ReplicatedNodeClient) DoReplicatedCall(
 	return client.doReplicatedCall(ctx, endpoint, call)
 }
 
+func (client *ReplicatedNodeClient) doLocalReplicatedCallPreStamped(ctx context.Context, endpoint ReplicatedEndpoint, call *shardservice.ReplicatedCall) (*shardservice.ReplicatedReply, error) {
+	if client == nil || ctx == nil || call == nil || !validAuthenticatedEndpoint(endpoint) {
+		return nil, ErrReplicatedRoute
+	}
+	if call.SQL != nil {
+		client.semanticSQLCalls.Add(1)
+	}
+	client.localCalls.Add(1)
+	lease, err := client.localServer.DispatchReplicated(ctx, *call)
+	if err != nil {
+		return nil, err
+	}
+	return shardservice.DetachReplicatedReply(lease)
+}
+
 func (client *ReplicatedNodeClient) doReplicatedCall(ctx context.Context, endpoint ReplicatedEndpoint, call *shardservice.ReplicatedCall) (*shardservice.ReplicatedReply, error) {
 	forwarded := *call
 	forwarded.Request = call.Request
@@ -406,7 +421,9 @@ func (executor *ReplicatedExecutor) doReplicatedCall(
 		reply *shardservice.ReplicatedReply
 		err   error
 	)
-	if semantic, ok := executor.client.(ReplicatedCallRoundTripper); ok {
+	if nodeClient, ok := executor.client.(*ReplicatedNodeClient); ok && endpoint.Node == nodeClient.localNode {
+		reply, err = nodeClient.doLocalReplicatedCallPreStamped(attemptCtx, endpoint, call)
+	} else if semantic, ok := executor.client.(ReplicatedCallRoundTripper); ok {
 		reply, err = semantic.DoReplicatedCall(attemptCtx, endpoint, call)
 	} else {
 		reply, err = doRemoteReplicatedCall(attemptCtx, executor.client, endpoint, call)
