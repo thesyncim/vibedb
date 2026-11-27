@@ -143,42 +143,6 @@ func materializeSQLReadCursor(cursor query.Cursor, names []string, limit int, ca
 			return nil, nil, errSQLReadFrameBound
 		}
 	}
-	rows := 0
-	var arenaBytes int64
-	probe := cursor
-	for {
-		next, err := probe.NextWithCancel(cancel)
-		if err != nil {
-			return nil, nil, err
-		}
-		if !next {
-			break
-		}
-		rows++
-		if rows > maxRows || len(names) == 0 {
-			return nil, nil, errSQLReadFrameBound
-		}
-		for col := range names {
-			cell := probe.Cell(col)
-			if !take(1) {
-				return nil, nil, errSQLReadFrameBound
-			}
-			if cell.IsNull() {
-				continue
-			}
-			payload := cell.Payload()
-			var scratch [32]byte
-			if payload == nil {
-				payload = cell.AppendJSON(scratch[:0])
-				arenaBytes += int64(len(payload))
-			} else {
-				arenaBytes += query.OwnedCellBytes(cell)
-			}
-			if !take(4) || !take(len(payload)) {
-				return nil, nil, errSQLReadFrameBound
-			}
-		}
-	}
 	cols := len(names)
 	columns := make([]Column, cols)
 	for i, name := range names {
@@ -188,48 +152,71 @@ func materializeSQLReadCursor(cursor query.Cursor, names []string, limit int, ca
 		Kind:    ResponseRows,
 		Columns: columns,
 	}
-	if rows == 0 {
+	next, err := cursor.NextWithCancel(cancel)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !next {
 		return resp, nil, nil
 	}
-	totalCells := rows * cols
-	cellArena := make([]Cell, totalCells)
-	typedCells := make([]query.Cell, totalCells)
-	rowSlices := make([][]Cell, rows)
-	var byteArena []byte
-	if arenaBytes > 0 {
-		byteArena = make([]byte, 0, arenaBytes)
+	if cols == 0 {
+		return nil, nil, errSQLReadFrameBound
 	}
-	rowIdx := 0
+	cellArena := make([]Cell, 0, cols)
+	typedCells := make([]query.Cell, 0, cols)
+	var byteArena []byte
+	rows := 0
 	for {
-		next, err := cursor.NextWithCancel(cancel)
+		rows++
+		if rows > maxRows {
+			return nil, nil, errSQLReadFrameBound
+		}
+		if rows == 2 && cap(cellArena) < 64*cols {
+			nextCells := make([]Cell, len(cellArena), 64*cols)
+			copy(nextCells, cellArena)
+			cellArena = nextCells
+			nextTyped := make([]query.Cell, len(typedCells), 64*cols)
+			copy(nextTyped, typedCells)
+			typedCells = nextTyped
+		}
+		for col := range cols {
+			if !take(1) {
+				return nil, nil, errSQLReadFrameBound
+			}
+			cell := cursor.Cell(col)
+			if cell.IsNull() {
+				cellArena = append(cellArena, Cell{Null: true})
+				typedCells = append(typedCells, query.NullCell())
+				continue
+			}
+			owned, nextArena := query.OwnCellInto(byteArena, cell)
+			byteArena = nextArena
+			typedCells = append(typedCells, owned)
+			var raw []byte
+			if payload := owned.Payload(); len(payload) != 0 {
+				raw = payload
+			} else {
+				start := len(byteArena)
+				byteArena = owned.AppendJSON(byteArena)
+				raw = byteArena[start:len(byteArena):len(byteArena)]
+			}
+			if !take(4) || !take(len(raw)) {
+				return nil, nil, errSQLReadFrameBound
+			}
+			cellArena = append(cellArena, Cell{Bytes: raw})
+		}
+		next, err = cursor.NextWithCancel(cancel)
 		if err != nil {
 			return nil, nil, err
 		}
 		if !next {
 			break
 		}
-		base := rowIdx * cols
-		row := cellArena[base : base+cols : base+cols]
-		for col := range cols {
-			cell := cursor.Cell(col)
-			if cell.IsNull() {
-				row[col] = Cell{Null: true}
-				typedCells[base+col] = query.NullCell()
-				continue
-			}
-			owned, nextArena := query.OwnCellInto(byteArena, cell)
-			byteArena = nextArena
-			typedCells[base+col] = owned
-			if payload := owned.Payload(); len(payload) != 0 {
-				row[col] = Cell{Bytes: payload}
-			} else {
-				start := len(byteArena)
-				byteArena = owned.AppendJSON(byteArena)
-				row[col] = Cell{Bytes: byteArena[start:len(byteArena):len(byteArena)]}
-			}
-		}
-		rowSlices[rowIdx] = row
-		rowIdx++
+	}
+	rowSlices := make([][]Cell, rows)
+	for r := range rows {
+		base := r * cols
+		rowSlices[r] = cellArena[base : base+cols : base+cols]
 	}
 	resp.Rows = rowSlices
 	return resp, typedCells, nil

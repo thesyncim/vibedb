@@ -396,8 +396,19 @@ func (executor *ReplicatedExecutor) doReplicatedCall(
 	endpoint ReplicatedEndpoint,
 	call *shardservice.ReplicatedCall,
 ) (*shardservice.ReplicatedReply, error) {
-	attemptCtx, cancel := tightenTimeout(ctx, executor.attemptTimeout)
-	defer cancel()
+	nodeClient, isLocalNodeClient := executor.client.(*ReplicatedNodeClient)
+	isLocalSyncSQLRead := isLocalNodeClient && endpoint.Node == nodeClient.localNode &&
+		call.SQL != nil && call.Request.Operation == shardservice.ReplicatedQueryLeader
+	attemptCtx := ctx
+	if !isLocalSyncSQLRead || executor.attemptTimeout <= 0 {
+		var cancel context.CancelFunc
+		attemptCtx, cancel = tightenTimeout(ctx, executor.attemptTimeout)
+		defer cancel()
+	} else if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		attemptCtx, cancel = tightenTimeout(ctx, executor.attemptTimeout)
+		defer cancel()
+	}
 	// Attempts are sequential and no transport mutates the call (the server
 	// only borrows the request for synchronous SQL reads and clones
 	// everything else before executing, the wire path copies the envelope

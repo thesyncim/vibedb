@@ -18,8 +18,9 @@ import (
 // typed request for the local path; the authenticated remote adapter is the
 // only layer that turns it into the legacy Query bytes field.
 type ReplicatedCall struct {
-	Request ReplicatedRequest
-	SQL     *ShardRequest
+	Request       ReplicatedRequest
+	SQL           *ShardRequest
+	SQLFrameBytes int
 }
 
 // ReplicatedReply is the transport-neutral result envelope. SQL is populated
@@ -297,9 +298,13 @@ func ReplicatedCallFrameBytes(call *ReplicatedCall) (int, error) {
 		call.SQL.Authority != call.Request.Authority {
 		return 0, ErrReplicatedWire
 	}
-	inner, err := RequestFrameBytes(call.SQL)
-	if err != nil {
-		return 0, err
+	inner := call.SQLFrameBytes
+	if inner <= 0 {
+		var err error
+		inner, err = RequestFrameBytes(call.SQL)
+		if err != nil {
+			return 0, err
+		}
 	}
 	if inner > MaxReplicatedSQLRequestBytes {
 		return 0, ErrReplicatedWire

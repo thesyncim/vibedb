@@ -156,9 +156,11 @@ func (executor *ReplicatedExecutor) QuerySQLTyped(ctx context.Context, route Rep
 	if authority, ok := serviceauthz.FromContext(ctx); ok {
 		req.Authority = authority
 	}
-	if size, err := shardservice.RequestFrameBytes(req); err != nil {
+	size, err := shardservice.RequestFrameBytes(req)
+	if err != nil {
 		return nil, nil, err
-	} else if size > shardservice.MaxReplicatedSQLRequestBytes {
+	}
+	if size > shardservice.MaxReplicatedSQLRequestBytes {
 		return nil, nil, ErrResultLimit
 	}
 	// The call shell comes from a pool and is built once: attempts are
@@ -173,6 +175,7 @@ func (executor *ReplicatedExecutor) QuerySQLTyped(ctx context.Context, route Rep
 	call.Request.Capability = serviceauthz.CapabilityDataRead
 	call.Request.MaxValueBytes = shardservice.MaxReplicatedSQLResultBytes
 	call.SQL = req
+	call.SQLFrameBytes = size
 	defer putReplicatedCall(call)
 	preferred := route.Replicas[0].Member
 	var joined error
