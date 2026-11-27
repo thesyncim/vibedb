@@ -184,8 +184,9 @@ type Config struct {
 	BackupMaxArtifacts     int
 	BackupMaxArtifactBytes uint64
 	BackupMaxDiskBytes     uint64
-	ControllerInterval     time.Duration
-	SchemaRolloutPlan      string
+	ControllerInterval       time.Duration
+	FrontendDrainGracePeriod time.Duration
+	SchemaRolloutPlan        string
 	SchemaRolloutOnce      bool
 
 	Logf func(format string, args ...any)
@@ -322,6 +323,9 @@ func Open(parent context.Context, config Config) (*Runtime, error) {
 		frontend: newFrontendAdmission(config.FrontendDrainIdentity,
 			config.FrontendAdmissionDrained, config.PGListenAddress != ""),
 		ready: make(chan struct{}), serveDone: make(chan struct{}), drainDone: make(chan struct{})}
+	if config.FrontendDrainGracePeriod > 0 {
+		runtime.frontend.setGracePeriod(config.FrontendDrainGracePeriod)
+	}
 	if runtime.config.Logf == nil {
 		runtime.config.Logf = func(format string, args ...any) {
 			fmt.Fprintf(os.Stderr, format+"\n", args...)
@@ -539,6 +543,9 @@ func (config Config) validate() error {
 	if config.TLSHandshakeTimeout <= 0 || config.ControllerInterval <= 0 || config.HotShardInterval <= 0 {
 		return fmt.Errorf("%w: handshake and controller intervals must be positive", ErrInvalidConfig)
 	}
+	if config.FrontendDrainGracePeriod < 0 {
+		return fmt.Errorf("%w: FrontendDrainGracePeriod cannot be negative", ErrInvalidConfig)
+	}
 	if config.MaxNativeReadConcurrency <= 0 || config.MaxNativeReadConcurrency > gateway.AbsoluteMaxReplicatedReadConcurrency ||
 		config.MaxNativeReadBytes == 0 || config.MaxNativeReadBytes > gateway.AbsoluteMaxReplicatedReadInFlight ||
 		config.MaxNativeScatterConcurrency <= 0 || config.MaxNativeScatterConcurrency > gateway.AbsoluteMaxReplicatedScatterConcurrency {
@@ -698,6 +705,7 @@ func (runtime *Runtime) finishDrain() {
 		return
 	}
 	runtime.drainFin.Do(func() {
+		runtime.frontend.stopGraceTimer()
 		runtime.cancel()
 		runtime.setDrainError(runtime.closeListeners())
 		runtime.waitOptionalServices()

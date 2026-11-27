@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
@@ -100,6 +101,9 @@ type frontendAdmission struct {
 	nativeActive           uint64
 	pg                     *pgwire.Server
 	tokens                 map[serviceauthz.FrontendConnToken]frontendTokenState
+	nativeConns            map[serviceauthz.FrontendConnToken]net.Conn
+	gracePeriod            time.Duration
+	graceTimer             *time.Timer
 	grants                 [3]frontendGrantState
 }
 
@@ -116,7 +120,8 @@ type frontendGrantState struct {
 func newFrontendAdmission(identity FrontendDrainIdentity, initiallyDraining, pgRequired bool) *frontendAdmission {
 	frontend := &frontendAdmission{
 		identity: identity, draining: initiallyDraining, pgRequired: pgRequired,
-		tokens: make(map[serviceauthz.FrontendConnToken]frontendTokenState),
+		tokens:      make(map[serviceauthz.FrontendConnToken]frontendTokenState),
+		nativeConns: make(map[serviceauthz.FrontendConnToken]net.Conn),
 	}
 	if initiallyDraining {
 		frontend.revision = 1
@@ -482,7 +487,65 @@ func (frontend *frontendAdmission) begin(native net.Listener) FrontendDrainAck {
 		frontend.pgAdmissionDrained = true
 		frontend.mu.Unlock()
 	}
+	frontend.mu.Lock()
+	if frontend.gracePeriod > 0 && frontend.graceTimer == nil {
+		frontend.graceTimer = time.AfterFunc(frontend.gracePeriod, frontend.forceCloseLingering)
+	}
+	frontend.mu.Unlock()
 	return frontend.status()
+}
+
+func (frontend *frontendAdmission) setGracePeriod(d time.Duration) {
+	if frontend == nil {
+		return
+	}
+	frontend.mu.Lock()
+	frontend.gracePeriod = d
+	frontend.mu.Unlock()
+}
+
+func (frontend *frontendAdmission) stopGraceTimer() {
+	if frontend == nil {
+		return
+	}
+	frontend.mu.Lock()
+	timer := frontend.graceTimer
+	frontend.graceTimer = nil
+	frontend.mu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
+}
+
+func (frontend *frontendAdmission) trackNativeConn(token serviceauthz.FrontendConnToken, conn net.Conn) {
+	if frontend == nil || conn == nil {
+		return
+	}
+	frontend.mu.Lock()
+	if frontend.nativeConns == nil {
+		frontend.nativeConns = make(map[serviceauthz.FrontendConnToken]net.Conn)
+	}
+	frontend.nativeConns[token] = conn
+	frontend.mu.Unlock()
+}
+
+func (frontend *frontendAdmission) forceCloseLingering() {
+	if frontend == nil {
+		return
+	}
+	frontend.mu.Lock()
+	conns := make([]net.Conn, 0, len(frontend.nativeConns))
+	for _, conn := range frontend.nativeConns {
+		conns = append(conns, conn)
+	}
+	pg := frontend.pg
+	frontend.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+	if pg != nil {
+		_ = pg.Close()
+	}
 }
 
 func (frontend *frontendAdmission) bindPG(server *pgwire.Server) {
@@ -590,6 +653,7 @@ func (frontend *frontendAdmission) releaseNative(token serviceauthz.FrontendConn
 	}
 	frontend.mu.Lock()
 	delete(frontend.tokens, token)
+	delete(frontend.nativeConns, token)
 	if frontend.nativeActive > 0 {
 		frontend.nativeActive--
 	}
@@ -819,8 +883,10 @@ func (listener *frontendAdmissionListener) Accept() (net.Conn, error) {
 		_ = conn.Close()
 		return nil, errFrontendAdmissionDrained
 	}
-	return &frontendTrackedConn{Conn: conn, token: token, scope: serviceauthz.FrontendScopeNative,
-		frontend: listener.frontend, release: func() { listener.frontend.releaseNative(token) }}, nil
+	tracked := &frontendTrackedConn{Conn: conn, token: token, scope: serviceauthz.FrontendScopeNative,
+		frontend: listener.frontend, release: func() { listener.frontend.releaseNative(token) }}
+	listener.frontend.trackNativeConn(token, tracked)
+	return tracked, nil
 }
 
 // frontendPGAdmissionListener mints the connection token before pgwire reads
