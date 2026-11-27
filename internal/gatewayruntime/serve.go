@@ -201,11 +201,12 @@ func requireLoopbackListen(address string) error {
 // shard refusal reloads the same crash-safe catalog path, publishing only a
 // strictly newer valid generation.
 func newGateway(catalogPath string) (*gateway.Executor, *gateway.CatalogHolder, error) {
-	return newGatewayWithDial(catalogPath, nil, serviceauthz.Authority{}, nil)
+	return newGatewayWithDial(catalogPath, nil, serviceauthz.Authority{}, nil, 0, nil)
 }
 
 func newGatewayWithDial(catalogPath string, dial gateway.DialFunc,
-	internalAuthority serviceauthz.Authority, guard gateway.ResourceAdmissionGuard) (*gateway.Executor, *gateway.CatalogHolder, error) {
+	internalAuthority serviceauthz.Authority, guard gateway.ResourceAdmissionGuard,
+	slowThreshold time.Duration, slowObserver gateway.SlowQueryObserver) (*gateway.Executor, *gateway.CatalogHolder, error) {
 	snap, err := gateway.LoadSnapshot(catalogPath)
 	if err != nil {
 		return nil, nil, err
@@ -213,7 +214,8 @@ func newGatewayWithDial(catalogPath string, dial gateway.DialFunc,
 	holder := gateway.NewCatalogHolder(snap)
 	refresher := gateway.NewFileCatalogRefresher(catalogPath, holder)
 	exec := gateway.NewExecutor(gateway.NewClient(dial), holder, gateway.Options{
-		Refresh: refresher.Refresh, InternalAuthority: internalAuthority, ResourceGuard: guard,
+		Refresh: refresher.Refresh, InternalAuthority: internalAuthority,
+		ResourceGuard: guard, SlowQueryThreshold: slowThreshold, SlowQueryObserver: slowObserver,
 	})
 	return exec, holder, nil
 }
@@ -281,6 +283,8 @@ func newReplicatedCatalogGateway(
 	lease time.Duration,
 	participants gateway.GatewayParticipantScanner,
 	guard gateway.ResourceAdmissionGuard,
+	slowThreshold time.Duration,
+	slowObserver gateway.SlowQueryObserver,
 	injected ...gateway.ReplicatedRoundTripper,
 ) (*gateway.Executor, *gateway.CatalogHolder, *gateway.ReplicatedCatalogAuthority,
 	*gateway.ReplicatedExecutor, *gateway.AuthenticatedReplicatedClient, error) {
@@ -891,7 +895,8 @@ func newReplicatedCatalogGateway(
 	}
 	executor := gateway.NewExecutor(
 		&gateway.ReplicatedSQLTransport{Executor: replicated}, holder, gateway.Options{
-			Refresh: authority.Refresh, InternalAuthority: internalAuthority, ResourceGuard: guard,
+			Refresh: authority.Refresh, InternalAuthority: internalAuthority,
+			ResourceGuard: guard, SlowQueryThreshold: slowThreshold, SlowQueryObserver: slowObserver,
 		},
 	)
 	return executor, holder, authority, replicated, replicatedPool, nil

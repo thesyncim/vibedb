@@ -131,6 +131,9 @@ type Config struct {
 	// When set, Executor enforces watermarks on reads/writes and /metrics
 	// exports live resource gauges and rejection counters.
 	ResourceGuard *resourceguard.Guard
+	// Optional slow-query threshold. When > 0, reads and writes taking at least
+	// this duration emit a structured slow_query log line via Logf.
+	SlowQueryThreshold time.Duration
 	// A participant forwards DDL once to this exact authenticated gateway
 	// principal. The owner retains the only schema journal and recovery loop.
 	DDLOwnerAddress string

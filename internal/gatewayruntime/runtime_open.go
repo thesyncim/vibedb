@@ -149,9 +149,23 @@ func (runtime *Runtime) open() error {
 	if config.ResourceGuard != nil {
 		admissionGuard = config.ResourceGuard
 	}
+	var slowObserver gateway.SlowQueryObserver
+	if config.SlowQueryThreshold > 0 && config.Logf != nil {
+		logf := config.Logf
+		slowObserver = func(ev gateway.SlowQueryEvent) {
+			if ev.Err != nil {
+				logf("gateway slow_query op=%s dur=%s route=%s shards=%d rows=%d err=%v sql=%q",
+					ev.Operation, ev.Duration, ev.RouteKind, ev.Shards, ev.Rows, ev.Err, ev.SQL)
+				return
+			}
+			logf("gateway slow_query op=%s dur=%s route=%s shards=%d rows=%d sql=%q",
+				ev.Operation, ev.Duration, ev.RouteKind, ev.Shards, ev.Rows, ev.SQL)
+		}
+	}
 	if config.DevStaticCatalog {
 		runtime.exec, runtime.holder, err = newGatewayWithDial(
-			config.CatalogPath, config.ShardDial, runtime.config.InternalAuthority, admissionGuard,
+			config.CatalogPath, config.ShardDial, runtime.config.InternalAuthority,
+			admissionGuard, config.SlowQueryThreshold, slowObserver,
 		)
 		if err != nil {
 			return fmt.Errorf("load catalog: %w", err)
@@ -187,7 +201,7 @@ func (runtime *Runtime) open() error {
 			config.CatalogBootstrapIfMissing, config.CatalogRelation, config.CatalogAttempts,
 			config.CatalogAttemptTimeout, config.TLSHandshakeTimeout, config.MaxShardConnections,
 			config.MaxShardHandshakes, config.CatalogSessionJournal, clientID, retryHome,
-			config.CatalogSessionLease, runtime, admissionGuard, config.Transport,
+			config.CatalogSessionLease, runtime, admissionGuard, config.SlowQueryThreshold, slowObserver, config.Transport,
 		)
 		if err != nil {
 			return fmt.Errorf("open replicated catalog: %w", err)
