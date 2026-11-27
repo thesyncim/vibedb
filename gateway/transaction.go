@@ -197,7 +197,7 @@ func (e *Executor) planTransaction(
 			return nil, err
 		}
 		if len(prepared.writeGlobalIndexes) != 0 &&
-			(bound.kind == sqlast.KindUpdate || bound.kind == sqlast.KindDelete) {
+			(bound.kind == sqlast.KindUpdate || bound.kind == sqlast.KindDelete || prepared.writeInsertConflict) {
 			if err := e.captureIndexedMutation(ctx, prepared, bound, *call, profile); err != nil {
 				return nil, err
 			}

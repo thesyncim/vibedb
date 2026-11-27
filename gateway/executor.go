@@ -602,7 +602,7 @@ func (e *Executor) Exec(ctx context.Context, q Query) (res *Result, err error) {
 			return nil, err
 		}
 		if call != nil && len(prepared.writeGlobalIndexes) != 0 &&
-			(bound.kind == sqlast.KindUpdate || bound.kind == sqlast.KindDelete) {
+			(bound.kind == sqlast.KindUpdate || bound.kind == sqlast.KindDelete || prepared.writeInsertConflict) {
 			err = e.captureIndexedMutation(opctx, prepared, bound, *call, profile)
 			if err != nil {
 				if isStaleErr(err) && attempt < e.maxRetry {
