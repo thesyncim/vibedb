@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"maps"
 	"slices"
 	"strings"
 
@@ -12,6 +13,13 @@ import (
 // one cloned SQL key plus pointers to immutable plans, so the table stays
 // small while covering an application's whole query set.
 const executorPlanCacheMax = 128
+
+// executorPlanSnapshot is an immutable map snapshot published via
+// Executor.planSnap for lock-free, zero-allocation concurrent reads across all
+// CPU cores without RWMutex cache-line bouncing.
+type executorPlanSnapshot struct {
+	entries map[string]executorPlanEntry
+}
 
 // executorPlanEntry is one cached physical planning outcome. The prepared
 // statement itself stays in the snapshot's own plan cache; only the
@@ -28,16 +36,26 @@ type executorPlanEntry struct {
 	planning          queryplanner.OptimizerStatistics
 }
 
+func (e executorPlanEntry) matchesPublished(generation uint64, cache *preparedQueryExecution) bool {
+	return e.generation == generation &&
+		e.routeKind == cache.routeKind &&
+		e.maxAggregateBytes == cache.maxAggregateBytes &&
+		e.physical == cache.physical &&
+		slices.Equal(e.targets, cache.targets)
+}
+
 // cachedPhysical returns the physical plan cached for sqlText at generation,
-// or false. The caller copies the entry into its per-call working state;
-// shared memory is never mutated.
+// or false. Reads are completely lock-free via the immutable COW snapshot; the
+// caller copies the entry into its per-call working state.
 func (e *Executor) cachedPhysical(sqlText string, generation uint64) (executorPlanEntry, bool) {
 	if e == nil || len(sqlText) > maxCachedSQLBytes {
 		return executorPlanEntry{}, false
 	}
-	e.planMu.RLock()
-	entry, ok := e.planCache[sqlText]
-	e.planMu.RUnlock()
+	snap := e.planSnap.Load()
+	if snap == nil {
+		return executorPlanEntry{}, false
+	}
+	entry, ok := snap.entries[sqlText]
 	if !ok || entry.generation != generation || entry.physical == nil {
 		return executorPlanEntry{}, false
 	}
@@ -59,19 +77,23 @@ func (e *Executor) publishPhysical(
 		len(sqlText) > maxCachedSQLBytes {
 		return
 	}
-	// Keep the lock across lookup and publication. On a warm hit the existing
-	// immutable entry already owns its key and target slice, so publishing the
-	// same physical plan must not clone either one again. The request SQL is
-	// used only for the lookup while the lock is held; it is never retained.
+	// Lock-free fast path: on a warm hit the immutable snapshot already carries
+	// this exact plan, so avoid acquiring planMu or allocating anything.
+	if snap := e.planSnap.Load(); snap != nil {
+		if existing, exists := snap.entries[sqlText]; exists && existing.matchesPublished(generation, cache) {
+			return
+		}
+	}
+
+	// Cold publication or replacement: serialize mutations under planMu and
+	// publish a fresh immutable snapshot for lock-free readers.
 	e.planMu.Lock()
 	defer e.planMu.Unlock()
 	if e.planCache == nil {
 		e.planCache = make(map[string]executorPlanEntry, executorPlanCacheMax)
 	}
 	if existing, exists := e.planCache[sqlText]; exists {
-		if existing.generation == generation && existing.routeKind == cache.routeKind &&
-			existing.maxAggregateBytes == cache.maxAggregateBytes &&
-			existing.physical == cache.physical && slices.Equal(existing.targets, cache.targets) {
+		if existing.matchesPublished(generation, cache) {
 			return
 		}
 		// A replacement is a cold publication. Re-own the request SQL before
@@ -93,6 +115,7 @@ func (e *Executor) publishPhysical(
 			physical:          cache.physical,
 			planning:          cache.planning,
 		}
+		e.storePlanSnapshotLocked()
 		return
 	}
 	// New entries own both the SQL key and target slice. Ingress SQL may alias
@@ -112,4 +135,11 @@ func (e *Executor) publishPhysical(
 	}
 	e.planOrder = append(e.planOrder, key)
 	e.planCache[key] = entry
+	e.storePlanSnapshotLocked()
+}
+
+func (e *Executor) storePlanSnapshotLocked() {
+	cloned := make(map[string]executorPlanEntry, len(e.planCache))
+	maps.Copy(cloned, e.planCache)
+	e.planSnap.Store(&executorPlanSnapshot{entries: cloned})
 }
