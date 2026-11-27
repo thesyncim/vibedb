@@ -163,7 +163,7 @@ func (s *session) finishExtendedBatch() error {
 		if !s.failed && s.sql.State() == sqldriver.SessionInTransaction &&
 			s.takeCancel() {
 			s.markTransactionFailed()
-			s.w.errorResponse(queryCanceled())
+			s.w.errorResponse(s.queryCanceledError())
 		}
 		var err error
 		switch s.sql.State() {

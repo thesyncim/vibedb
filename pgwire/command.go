@@ -34,12 +34,11 @@ import (
 // makes it safe.
 //
 // Other namespaces are refused: public is the only wire namespace, resolving
-// directly to the stored catalog. statement_timeout is also refused:
-// CancelRequest is supported, but the server has no
-// per-statement timer policy, so accepting a timeout would promise a deadline
-// it did not schedule. Silent acceptance would make a client misread its own
-// configuration, which is exactly the outcome a silent accept is worse than an
-// error for.
+// directly to the stored catalog. statement_timeout and
+// idle_in_transaction_session_timeout are enforced per statement and per idle
+// transaction window, respectively. Silent acceptance of an unenforced
+// parameter would make a client misread its own configuration, which is
+// exactly the outcome a silent accept is worse than an error for.
 
 // A statementKind is what the leading keyword says a statement is.
 type statementKind int
@@ -993,7 +992,7 @@ var parameters = map[string]*parameter{
 	},
 	"idle_in_transaction_session_timeout": {
 		initial: "0", check: requireDurationGUC,
-		why: "accepted for client/ORM startup and pooler compatibility",
+		why: "enforced on idle open transactions via socket read deadline and FATAL 25P03 termination when > 0",
 	},
 	"default_transaction_isolation": {
 		initial: "read committed", check: requireIsolationGUC,

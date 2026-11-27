@@ -81,6 +81,7 @@ const (
 	sqlstateStatementCompletionUnknown    = "40003"
 	sqlstateNoActiveTransaction           = "25P01"
 	sqlstateFailedTransaction             = "25P02"
+	sqlstateIdleInTransactionTimeout      = "25P03"
 	sqlstateInvalidSavepointSpecification = "3B001"
 	sqlstateActiveSQLTransaction          = "25001"
 	sqlstateReadOnlyTransaction           = "25006"
