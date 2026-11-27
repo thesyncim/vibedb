@@ -142,6 +142,11 @@ func (runtime *Runtime) BeginFrontendDrain() FrontendDrainAck {
 	if runtime == nil {
 		return FrontendDrainAck{}
 	}
+	if runtime.config.ControllerLease != nil {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = runtime.config.ControllerLease.Release(releaseCtx)
+		cancel()
+	}
 	return runtime.frontend.begin(runtime.listener)
 }
 

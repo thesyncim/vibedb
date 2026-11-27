@@ -61,11 +61,15 @@ flowchart LR
 - A node listens on six endpoints: Raft peer, RF3 native, snapshot transfer,
   replica control, gateway control, and the frontend's native client listener.
   All use TLS with VibeDB identities. The optional pgwire listener is
-  loopback-only, trust-authenticated, and plaintext.
+  loopback-only with Trust authentication by default, or remote-accessible when
+  configured with both TLS (`PGTLSConfig`) and SCRAM-SHA-256 credentials
+  (`PGUsers`) carrying explicit SQL-only capability subsets.
 - One frontend is the designated topology controller: it runs the move,
   split, scaling, and backup controllers. In the local launcher this is
-  physical node 1. It cannot be decommissioned because controller handoff is
-  not implemented.
+  physical node 1. CAS-fenced controller lease election with monotonic epoch
+  fencing and graceful drain handoff (`internal/controllerlease`) is available
+  at the gateway runtime boundary, while full launcher-level controller
+  decommission orchestration remains in progress.
 - A node log serves at most 64 groups in the checked-in manifests. Every
   table and every split child consumes one group slot on each of its three
   nodes. See [capacity planning](capacity-planning.md).

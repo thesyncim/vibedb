@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/clusterversion"
+	"github.com/thesyncim/vibedb/internal/controllerlease"
 )
 
 const (
@@ -27,11 +29,13 @@ const (
 // handler (/healthz, /readyz, /metrics). All callbacks must be safe for
 // concurrent invocation and non-blocking.
 type ObservabilitySource struct {
-	Alive      func() bool
-	Ready      func() (bool, string)
-	Metrics    func() gateway.MetricsSnapshot
-	Dist       func() *gateway.DistributedMetrics
-	Controller func() *gatewayControllerMetrics
+	Alive           func() bool
+	Ready           func() (bool, string)
+	Metrics         func() gateway.MetricsSnapshot
+	Dist            func() *gateway.DistributedMetrics
+	Controller      func() *gatewayControllerMetrics
+	ControllerLease func() controllerlease.Status
+	ClusterVersion  func() (local clusterversion.NodeVersion, active clusterversion.Version)
 }
 
 // NewObservabilityHandler builds a bounded, stdlib-only HTTP handler exposing:
@@ -99,6 +103,15 @@ func NewObservabilityHandler(src ObservabilitySource) http.Handler {
 				writePrometheusControllerMetrics(&buf, ctrl.Snapshot())
 			}
 		}
+		if src.ControllerLease != nil {
+			writePrometheusControllerLeaseMetrics(&buf, src.ControllerLease())
+		}
+		localVer := clusterversion.LocalNodeVersion()
+		activeVer := clusterversion.Version{}
+		if src.ClusterVersion != nil {
+			localVer, activeVer = src.ClusterVersion()
+		}
+		writePrometheusClusterVersionMetrics(&buf, localVer, activeVer)
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
@@ -218,6 +231,40 @@ func writePrometheusControllerMetrics(buf *bytes.Buffer, c gatewayControllerMetr
 	buf.WriteString("# TYPE vibedb_controller_faults_total counter\n")
 	fmt.Fprintf(buf, "vibedb_controller_faults_total{controller=\"split\"} %d\n", c.SplitFaults)
 	fmt.Fprintf(buf, "vibedb_controller_faults_total{controller=\"replica_move\"} %d\n", c.MoveFaults)
+}
+
+func writePrometheusControllerLeaseMetrics(buf *bytes.Buffer, st controllerlease.Status) {
+	buf.WriteString("# HELP vibedb_controller_lease_leader Whether this gateway frontend currently holds the CAS-fenced controller lease (1=leader, 0=standby).\n")
+	buf.WriteString("# TYPE vibedb_controller_lease_leader gauge\n")
+	leaderVal := 0
+	if st.Leader {
+		leaderVal = 1
+	}
+	fmt.Fprintf(buf, "vibedb_controller_lease_leader{holder=%q} %d\n", st.Holder, leaderVal)
+
+	buf.WriteString("# HELP vibedb_controller_lease_epoch Monotonic CAS-fenced controller lease epoch observed by this frontend.\n")
+	buf.WriteString("# TYPE vibedb_controller_lease_epoch gauge\n")
+	fmt.Fprintf(buf, "vibedb_controller_lease_epoch{holder=%q} %d\n", st.Holder, st.Epoch)
+}
+
+func writePrometheusClusterVersionMetrics(buf *bytes.Buffer, local clusterversion.NodeVersion, active clusterversion.Version) {
+	if !local.Valid() {
+		local = clusterversion.LocalNodeVersion()
+	}
+	buf.WriteString("# HELP vibedb_cluster_binary_version_info Running VibeDB binary cluster protocol version window.\n")
+	buf.WriteString("# TYPE vibedb_cluster_binary_version_info gauge\n")
+	fmt.Fprintf(
+		buf,
+		"vibedb_cluster_binary_version_info{current=%q,min_supported=%q,max_supported=%q} 1\n",
+		local.BinaryVersion.String(),
+		local.MinSupported.String(),
+		local.MaxSupported.String(),
+	)
+	if active.Valid() {
+		buf.WriteString("# HELP vibedb_cluster_active_version_info Negotiated cluster-wide active feature version.\n")
+		buf.WriteString("# TYPE vibedb_cluster_active_version_info gauge\n")
+		fmt.Fprintf(buf, "vibedb_cluster_active_version_info{active=%q} 1\n", active.String())
+	}
 }
 
 func startGatewayObservabilityHTTP(

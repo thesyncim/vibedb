@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/thesyncim/vibedb/gateway"
+	"github.com/thesyncim/vibedb/internal/clusterversion"
+	"github.com/thesyncim/vibedb/internal/controllerlease"
 )
 
 func TestObservabilityHandlerHealthzReadyzAndMethodEnforcement(t *testing.T) {
@@ -121,5 +123,31 @@ func TestObservabilityHandlerHealthzReadyzAndMethodEnforcement(t *testing.T) {
 	// 6. Non-loopback plaintext observability address is rejected.
 	if _, _, _, err := startGatewayObservabilityHTTP(t.Context(), "0.0.0.0:9090", nil, h, func(string, ...any) {}); err == nil {
 		t.Fatal("expected non-loopback plaintext observability HTTP to be rejected")
+	}
+
+	// 7. Cluster version info & controller lease gauges are emitted in /metrics.
+	h2 := NewObservabilityHandler(ObservabilitySource{
+		ControllerLease: func() controllerlease.Status {
+			return controllerlease.Status{Holder: "frontend-1", Epoch: 4, Leader: true}
+		},
+		ClusterVersion: func() (clusterversion.NodeVersion, clusterversion.Version) {
+			return clusterversion.LocalNodeVersion(), clusterversion.V1_1
+		},
+	})
+	rec = httptest.NewRecorder()
+	h2.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /metrics (version+lease) = %d", rec.Code)
+	}
+	body2 := rec.Body.String()
+	for _, want := range []string{
+		`vibedb_controller_lease_leader{holder="frontend-1"} 1`,
+		`vibedb_controller_lease_epoch{holder="frontend-1"} 4`,
+		`vibedb_cluster_binary_version_info{current="1.1",min_supported="1.0",max_supported="1.1"} 1`,
+		`vibedb_cluster_active_version_info{active="1.1"} 1`,
+	} {
+		if !strings.Contains(body2, want) {
+			t.Fatalf("/metrics missing %q\nfull body:\n%s", want, body2)
+		}
 	}
 }

@@ -75,7 +75,7 @@ func (runtime *Runtime) runServe() {
 	}
 
 	if runtime.config.MetricsHTTPListenAddress != "" {
-		obsHandler := NewObservabilityHandler(ObservabilitySource{
+		obsSrc := ObservabilitySource{
 			Alive: func() bool { return runtime.ctx.Err() == nil },
 			Ready: func() (bool, string) {
 				if runtime.ctx.Err() != nil {
@@ -97,7 +97,11 @@ func (runtime *Runtime) runServe() {
 			},
 			Dist:       func() *gateway.DistributedMetrics { return runtime.distributedMetrics },
 			Controller: func() *gatewayControllerMetrics { return runtime.controllerMetrics },
-		})
+		}
+		if runtime.config.ControllerLease != nil {
+			obsSrc.ControllerLease = runtime.config.ControllerLease.Status
+		}
+		obsHandler := NewObservabilityHandler(obsSrc)
 		obsSrv, obsLn, obsDone, err := startGatewayObservabilityHTTP(
 			runtime.ctx, runtime.config.MetricsHTTPListenAddress,
 			runtime.config.MetricsHTTPTLSConfig, obsHandler, logf,
