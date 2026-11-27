@@ -93,26 +93,9 @@ func (s *session) virtualCatalogShim(
 	// Sort if ORDER BY was specified.
 	if q.orderCol != "" {
 		if idx, exists := colIndex[q.orderCol]; exists {
+			mode := virtualCatalogSortMode(q.orderCol)
 			sort.SliceStable(filtered, func(i, j int) bool {
-				var a, b string
-				if filtered[i][idx] != nil {
-					a = *filtered[i][idx]
-				}
-				if filtered[j][idx] != nil {
-					b = *filtered[j][idx]
-				}
-				if fa, errA := strconv.ParseFloat(a, 64); errA == nil && !math.IsNaN(fa) && !math.IsInf(fa, 0) {
-					if fb, errB := strconv.ParseFloat(b, 64); errB == nil && !math.IsNaN(fb) && !math.IsInf(fb, 0) {
-						if q.orderDesc {
-							return fa > fb
-						}
-						return fa < fb
-					}
-				}
-				if q.orderDesc {
-					return a > b
-				}
-				return a < b
+				return compareVirtualCatalogCell(filtered[i][idx], filtered[j][idx], mode, q.orderDesc)
 			})
 		}
 	}
@@ -149,6 +132,76 @@ func (s *session) virtualCatalogShim(
 		projRows[r] = out
 	}
 	return catalogResult(projCols, projRows), true, nil
+}
+
+type virtualCatalogSortKind uint8
+
+const (
+	virtualSortString virtualCatalogSortKind = iota
+	virtualSortInt64
+	virtualSortFloat64
+)
+
+func virtualCatalogSortMode(col string) virtualCatalogSortKind {
+	switch col {
+	case "pid", "queryid", "calls", "rows":
+		return virtualSortInt64
+	case "total_exec_time", "min_exec_time", "max_exec_time", "mean_exec_time":
+		return virtualSortFloat64
+	default:
+		return virtualSortString
+	}
+}
+
+// compareVirtualCatalogCell defines a strict weak ordering over virtual catalog
+// cells using column-typed comparisons so int64 columns (such as 64-bit queryid)
+// never lose precision via float64 and mixed text values never create cycles.
+func compareVirtualCatalogCell(ap, bp *string, mode virtualCatalogSortKind, desc bool) bool {
+	var a, b string
+	if ap != nil {
+		a = *ap
+	}
+	if bp != nil {
+		b = *bp
+	}
+	switch mode {
+	case virtualSortInt64:
+		ia, errA := strconv.ParseInt(a, 10, 64)
+		ib, errB := strconv.ParseInt(b, 10, 64)
+		if errA == nil && errB == nil {
+			if desc {
+				return ia > ib
+			}
+			return ia < ib
+		}
+		if (errA == nil) != (errB == nil) {
+			if desc {
+				return errA != nil
+			}
+			return errA == nil
+		}
+	case virtualSortFloat64:
+		fa, errA := strconv.ParseFloat(a, 64)
+		fb, errB := strconv.ParseFloat(b, 64)
+		okA := errA == nil && !math.IsNaN(fa) && !math.IsInf(fa, 0)
+		okB := errB == nil && !math.IsNaN(fb) && !math.IsInf(fb, 0)
+		if okA && okB {
+			if desc {
+				return fa > fb
+			}
+			return fa < fb
+		}
+		if okA != okB {
+			if desc {
+				return !okA
+			}
+			return okA
+		}
+	}
+	if desc {
+		return a > b
+	}
+	return a < b
 }
 
 type virtualCatalogProj struct {

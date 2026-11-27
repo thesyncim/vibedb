@@ -1,27 +1,35 @@
 package pgwire
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 )
 
 func TestStatementTimeoutEnforcedAndRecoverable(t *testing.T) {
-	c := connect(t)
+	s := newTestServer(t, Options{MaxIntermediateBytes: UnlimitedResults})
+	c := dial(t, s)
+	c.startup(map[string]string{"user": "alice", "database": "appdb"})
 
 	if got := commandTagOf(t, c.query(`CREATE TABLE seed (n INTEGER PRIMARY KEY)`)); got != "CREATE TABLE" {
 		t.Fatalf("CREATE TABLE seed: %q", got)
 	}
-	if got := commandTagOf(t, c.query(`INSERT INTO seed (n) VALUES (1)`)); got != "INSERT 0 1" {
-		t.Fatalf("INSERT seed: %q", got)
+	// Populate 100 rows so a 4-way cross join produces 100M combinations without
+	// hitting the recursive CTE 1000-iteration cap on fast CPUs.
+	for i := 1; i <= 100; i++ {
+		msgs := c.query(fmt.Sprintf(`INSERT INTO seed (n) VALUES (%d)`, i))
+		if got := commandTagOf(t, msgs); got != "INSERT 0 1" {
+			t.Fatalf("INSERT seed %d: %q (msgs=%v)", i, got, msgs)
+		}
 	}
-	if got := commandTagOf(t, c.query(`SET statement_timeout = '15ms'`)); got != "SET" {
+	if got := commandTagOf(t, c.query(`SET statement_timeout = '5ms'`)); got != "SET" {
 		t.Fatalf("SET statement_timeout: %q", got)
 	}
 
-	// Recursive CTE generating 10M rows exceeds 15ms and must be canceled with
+	// 4-way cross join (100M rows) exceeds 5ms and must be canceled with
 	// SQLSTATE 57014 and a statement-timeout message.
-	msgs := c.query(`WITH RECURSIVE t(n) AS (SELECT n + 0 FROM seed UNION ALL SELECT n + 1 FROM t WHERE n < 10000000) SELECT count(*) FROM t`)
+	msgs := c.query(`SELECT count(*) FROM seed a CROSS JOIN seed b CROSS JOIN seed c CROSS JOIN seed d`)
 	expectError(t, msgs, sqlstateQueryCanceled)
 
 	foundTimeoutMsg := false

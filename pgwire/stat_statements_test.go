@@ -263,3 +263,173 @@ func BenchmarkStmtStatsRecordHotPath(b *testing.B) {
 		}
 	})
 }
+
+func BenchmarkStmtStatsRecordHotPathLongQuery(b *testing.B) {
+	reg := newStmtStatsRegistry(DefaultMaxStatementStats)
+	q := "SELECT " + strings.Repeat("col_long_identifier_name, ", 24) + "id FROM wide_analytics_events WHERE tenant_id = 42 AND region = 'us-east-1' AND status = 'active'"
+	if len(q) <= 256 {
+		b.Fatalf("expected long query > 256 bytes, got %d", len(q))
+	}
+	reg.record("appdb", "alice", q, time.Millisecond, 1)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			reg.record("appdb", "alice", q, 250*time.Microsecond, 1)
+		}
+	})
+}
+
+func TestPgStatStatementsResetDeferredToExecute(t *testing.T) {
+	s := newTestServer(t, Options{})
+	c := dial(t, s)
+	c.startup(map[string]string{"user": "alice", "database": "appdb"})
+
+	_ = c.query(`CREATE TABLE rtest (id INTEGER PRIMARY KEY)`)
+	_ = c.query(`INSERT INTO rtest (id) VALUES (1)`)
+
+	// Malformed query containing pg_stat_statements_reset() must NOT reset stats
+	// (note: a single trailing word is a valid SQL column alias, so use FROM).
+	_ = c.query(`SELECT pg_stat_statements_reset() FROM nonexistent_table`)
+	if rows := rowsOf(t, c.query(`SELECT queryid FROM pg_stat_statements`)); len(rows) == 0 {
+		t.Fatal("malformed query with pg_stat_statements_reset() unexpectedly reset stats")
+	}
+
+	// Parse + Describe without Execute must NOT reset stats.
+	c.send(msgParse, parseMsg("reset_stmt", `SELECT pg_stat_statements_reset()`))
+	c.send(msgDescribe, describeMsg('S', "reset_stmt"))
+	c.send(msgSync, nil)
+	_ = c.until(msgReadyForQuery)
+	if rows := rowsOf(t, c.query(`SELECT queryid FROM pg_stat_statements`)); len(rows) == 0 {
+		t.Fatal("Parse+Describe of pg_stat_statements_reset() unexpectedly reset stats")
+	}
+
+	// First Execute of prepared reset_stmt MUST reset stats.
+	c.send(msgBind, bindMsg("", "reset_stmt", nil, nil, nil))
+	c.send(msgExecute, executeMsg("", 0))
+	c.send(msgSync, nil)
+	_ = c.until(msgReadyForQuery)
+	if rows := rowsOf(t, c.query(`SELECT queryid FROM pg_stat_statements`)); len(rows) != 0 {
+		t.Fatalf("after 1st prepared reset, pg_stat_statements = %v, want empty", rows)
+	}
+
+	// Record another statement, then re-execute the SAME prepared reset_stmt.
+	_ = c.query(`INSERT INTO rtest (id) VALUES (2)`)
+	if rows := rowsOf(t, c.query(`SELECT queryid FROM pg_stat_statements`)); len(rows) == 0 {
+		t.Fatal("expected non-empty pg_stat_statements before 2nd prepared reset")
+	}
+	c.send(msgBind, bindMsg("", "reset_stmt", nil, nil, nil))
+	c.send(msgExecute, executeMsg("", 0))
+	c.send(msgSync, nil)
+	_ = c.until(msgReadyForQuery)
+	if rows := rowsOf(t, c.query(`SELECT queryid FROM pg_stat_statements`)); len(rows) != 0 {
+		t.Fatalf("after 2nd prepared reset, pg_stat_statements = %v, want empty", rows)
+	}
+}
+
+func TestPgStatStatementsSuspendedPortalRecordedOnce(t *testing.T) {
+	s := newTestServer(t, Options{})
+	c := dial(t, s)
+	c.startup(map[string]string{"user": "alice", "database": "appdb"})
+
+	_ = c.query(`CREATE TABLE ptest (id INTEGER PRIMARY KEY)`)
+	_ = c.query(`INSERT INTO ptest (id) VALUES (1), (2), (3)`)
+	_ = c.query(`SELECT pg_stat_statements_reset()`)
+
+	_ = c.query(`BEGIN`)
+	c.send(msgParse, parseMsg("sel_all", `SELECT id FROM ptest ORDER BY id`))
+	c.send(msgBind, bindMsg("p1", "sel_all", nil, nil, nil))
+	// Fetch 1 row at a time (suspending portal twice before exhaustion).
+	totalRows := 0
+	for i := 0; i < 4; i++ {
+		c.send(msgExecute, executeMsg("p1", 1))
+		c.send(msgSync, nil)
+		msgs := c.until(msgReadyForQuery)
+		totalRows += len(rowsOf(t, msgs))
+	}
+	_ = c.query(`COMMIT`)
+	if totalRows != 3 {
+		t.Fatalf("suspended portal fetched %d rows, want 3", totalRows)
+	}
+
+	rows := rowsOf(t, c.query(`SELECT calls, rows, query FROM pg_stat_statements`))
+	if len(rows) != 1 {
+		t.Fatalf("pg_stat_statements len = %d, want 1 (%v)", len(rows), rows)
+	}
+	if string(rows[0][0]) != "1" || string(rows[0][1]) != "3" {
+		t.Fatalf("suspended portal stat calls/rows = (%q, %q), want (1, 3)", rows[0][0], rows[0][1])
+	}
+}
+
+func TestVirtualCatalogOrderByStrictWeakOrderingAndInt64Precision(t *testing.T) {
+	// Two 64-bit integers that collide when converted to float64 (2^53+1 vs 2^53+2).
+	a := strconv.FormatInt((1<<53)+1, 10)
+	b := strconv.FormatInt((1<<53)+2, 10)
+	if !compareVirtualCatalogCell(&a, &b, virtualSortInt64, false) {
+		t.Fatalf("int64 ASC failed to distinguish %s < %s", a, b)
+	}
+	if compareVirtualCatalogCell(&b, &a, virtualSortInt64, false) {
+		t.Fatalf("int64 ASC asymmetry for %s vs %s", b, a)
+	}
+	if !compareVirtualCatalogCell(&b, &a, virtualSortInt64, true) {
+		t.Fatalf("int64 DESC failed to distinguish %s > %s", b, a)
+	}
+
+	// Verify strict weak ordering (irreflexive, asymmetric, transitive) across
+	// mixed numeric-looking and non-numeric strings for all sort modes.
+	vals := []*string{nil, strPtr(""), strPtr("2"), strPtr("10"), strPtr("1a"), strPtr("-5"), strPtr("2.5"), strPtr("NaN")}
+	for _, mode := range []virtualCatalogSortKind{virtualSortString, virtualSortInt64, virtualSortFloat64} {
+		for _, desc := range []bool{false, true} {
+			for i, x := range vals {
+				if compareVirtualCatalogCell(x, x, mode, desc) {
+					t.Fatalf("mode=%d desc=%v not irreflexive on idx=%d", mode, desc, i)
+				}
+				for j, y := range vals {
+					xy := compareVirtualCatalogCell(x, y, mode, desc)
+					yx := compareVirtualCatalogCell(y, x, mode, desc)
+					if xy && yx {
+						t.Fatalf("mode=%d desc=%v not asymmetric on (%d, %d)", mode, desc, i, j)
+					}
+					if xy {
+						for k, z := range vals {
+							if compareVirtualCatalogCell(y, z, mode, desc) && !compareVirtualCatalogCell(x, z, mode, desc) {
+								t.Fatalf("mode=%d desc=%v not transitive on (%d, %d, %d)", mode, desc, i, j, k)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestHashNormalizedSQLMatchesNormalizeAndZeroAllocLongQuery(t *testing.T) {
+	samples := []string{
+		"",
+		"   -- comment only",
+		"SELECT 1; ; ",
+		"SELECT 1; SELECT 2;",
+		`SELECT "col1;" FROM t WHERE a = 'x' AND b = 42; -- end`,
+		"SELECT " + strings.Repeat("col_long_identifier_name, ", 24) + "id FROM wide_table WHERE id = 12345 AND name = 'alice'",
+	}
+	var buf [256]byte
+	for _, q := range samples {
+		wantID, norm := normalizeSQLForStats(buf[:0], q)
+		gotID, ok := hashNormalizedSQL(q)
+		if (len(norm) > 0) != ok || gotID != wantID {
+			t.Fatalf("hashNormalizedSQL(%q) = (%d, %v), want (%d, %v)", q, gotID, ok, wantID, len(norm) > 0)
+		}
+	}
+
+	// Verify 0 heap allocations on the steady-state hot path for a >600-byte SQL query.
+	reg := newStmtStatsRegistry(DefaultMaxStatementStats)
+	longQ := "SELECT " + strings.Repeat("col_long_identifier_name, ", 24) + "id FROM wide_table WHERE id = 12345 AND name = 'alice'"
+	reg.record("appdb", "alice", longQ, time.Millisecond, 1)
+	allocs := testing.AllocsPerRun(100, func() {
+		reg.record("appdb", "alice", longQ, time.Millisecond, 1)
+	})
+	if allocs != 0 {
+		t.Fatalf("steady-state hot-path allocs for %d-byte SQL = %.1f, want 0", len(longQ), allocs)
+	}
+}

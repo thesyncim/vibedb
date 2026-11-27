@@ -2443,6 +2443,16 @@ func (s *session) executeFixed(p *portal, limit int32) error {
 	if p.stmt.showIsolation {
 		fixed, _ = s.showResult("transaction_isolation")
 	}
+	if fixed.eval != nil {
+		if p.discoveryRows == nil {
+			p.discoveryRows = &fixedResult{
+				cols: fixed.cols,
+				rows: fixed.eval(),
+				tag:  fixed.tag,
+			}
+		}
+		fixed = p.discoveryRows
+	}
 	if fixed.discovery != nil {
 		if p.discoveryRows == nil {
 			result, err := s.executeDiscovery(fixed.discovery, p.args)

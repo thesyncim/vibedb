@@ -116,22 +116,26 @@ func (r *stmtStatsRegistry) record(database, user, rawSQL string, dur time.Durat
 	if r == nil || r.maxEntries <= 0 || rawSQL == "" {
 		return
 	}
-	var stack [256]byte
-	queryID, norm := normalizeSQLForStats(stack[:0], rawSQL)
-	if len(norm) == 0 {
+	queryID, ok := hashNormalizedSQL(rawSQL)
+	if !ok {
 		return
 	}
 	key := stmtStatsKey{database: database, user: user, queryID: queryID}
 
-	// Lock-free, zero-allocation fast path for known statement fingerprints.
+	// Lock-free, zero-allocation fast path for known statement fingerprints
+	// regardless of SQL length.
 	if tbl := r.table.Load(); tbl != nil {
-		if entry, ok := tbl.entries[key]; ok {
+		if entry, exists := tbl.entries[key]; exists {
 			entry.record(dur, rows)
 			return
 		}
 	}
 
-	// Cold path: insert new fingerprint via copy-on-write map publication.
+	// Cold path: materialize normalized SQL text (capped) and insert new
+	// fingerprint via copy-on-write map publication.
+	var stack [256]byte
+	_, norm := normalizeSQLForStatsCapped(stack[:0], rawSQL, maxStatementStatQueryBytes+utf8.UTFMax)
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -241,6 +245,56 @@ func (r *stmtStatsRegistry) snapshot() []stmtStatsSnapshot {
 	return out
 }
 
+type sqlNormSink struct {
+	buf        []byte
+	collect    bool
+	maxCollect int
+	h          uint64
+	count      int
+	trimH      uint64
+	trimCount  int
+}
+
+func (s *sqlNormSink) writeByte(b byte) {
+	if s.collect && (s.maxCollect <= 0 || len(s.buf) < s.maxCollect) {
+		s.buf = append(s.buf, b)
+	}
+	s.h ^= uint64(b)
+	s.h *= fnvPrime64
+	s.count++
+	if b != ';' && b != ' ' {
+		s.trimH = s.h
+		s.trimCount = s.count
+	}
+}
+
+func (s *sqlNormSink) writePlaceholder() {
+	s.writeByte('$')
+	s.writeByte('?')
+}
+
+func (s *sqlNormSink) writeString(str string) {
+	for i := 0; i < len(str); i++ {
+		s.writeByte(str[i])
+	}
+}
+
+// hashNormalizedSQL computes the pg_stat_statements FNV-1a queryID in a single
+// streaming pass with zero allocations regardless of SQL length. It produces
+// the exact same queryID as normalizeSQLForStats.
+func hashNormalizedSQL(raw string) (int64, bool) {
+	sink := sqlNormSink{h: fnvOffset64}
+	scanNormalizedSQL(&sink, raw)
+	if sink.trimCount == 0 {
+		return 0, false
+	}
+	id := int64(sink.trimH)
+	if id == 0 {
+		id = 1
+	}
+	return id, true
+}
+
 // normalizeSQLForStats normalizes SQL text for pg_stat_statements fingerprinting:
 //   - strips line (-- ...) and nested block (/* ... */) comments
 //   - collapses runs of whitespace to a single ASCII space
@@ -249,23 +303,48 @@ func (r *stmtStatsRegistry) snapshot() []stmtStatsSnapshot {
 //   - preserves double-quoted identifiers and positional parameters ($1, $2, ?)
 //   - trims leading/trailing whitespace and trailing semicolons
 //
-// It appends into dst (typically a stack buffer) to avoid heap allocations on
-// the steady-state hot path, and returns a non-zero 64-bit FNV-1a queryID.
+// It appends into dst and returns a non-zero 64-bit FNV-1a queryID.
 func normalizeSQLForStats(dst []byte, raw string) (int64, []byte) {
+	return normalizeSQLForStatsCapped(dst, raw, 0)
+}
+
+func normalizeSQLForStatsCapped(dst []byte, raw string, maxCollect int) (int64, []byte) {
+	baseLen := len(dst)
+	sink := sqlNormSink{
+		buf:        dst,
+		collect:    true,
+		maxCollect: maxCollect,
+		h:          fnvOffset64,
+	}
+	scanNormalizedSQL(&sink, raw)
+	if sink.trimCount == 0 {
+		return 0, sink.buf[:baseLen]
+	}
+	if maxLen := baseLen + sink.trimCount; maxLen < len(sink.buf) {
+		sink.buf = sink.buf[:maxLen]
+	}
+	id := int64(sink.trimH)
+	if id == 0 {
+		id = 1
+	}
+	return id, sink.buf
+}
+
+func scanNormalizedSQL(sink *sqlNormSink, raw string) {
 	n := len(raw)
 	i := 0
 	pendingSpace := false
 	prevWasIdent := false
 
 	emitSpace := func() {
-		if len(dst) > 0 {
+		if sink.count > 0 {
 			pendingSpace = true
 		}
 		prevWasIdent = false
 	}
 	flushSpace := func() {
-		if pendingSpace && len(dst) > 0 {
-			dst = append(dst, ' ')
+		if pendingSpace && sink.count > 0 {
+			sink.writeByte(' ')
 			pendingSpace = false
 		}
 	}
@@ -312,7 +391,7 @@ func normalizeSQLForStats(dst []byte, raw string) (int64, []byte) {
 		// Escaped string literal: E'...' or e'...'
 		if (c == 'E' || c == 'e') && !prevWasIdent && i+1 < n && raw[i+1] == '\'' {
 			flushSpace()
-			dst = append(dst, '$', '?')
+			sink.writePlaceholder()
 			i += 2
 			for i < n {
 				if raw[i] == '\\' && i+1 < n {
@@ -336,7 +415,7 @@ func normalizeSQLForStats(dst []byte, raw string) (int64, []byte) {
 		// Single-quoted string literal: '...'
 		if c == '\'' {
 			flushSpace()
-			dst = append(dst, '$', '?')
+			sink.writePlaceholder()
 			i++
 			for i < n {
 				if raw[i] == '\'' {
@@ -369,7 +448,7 @@ func normalizeSQLForStats(dst []byte, raw string) (int64, []byte) {
 				}
 				i++
 			}
-			dst = append(dst, raw[start:i]...)
+			sink.writeString(raw[start:i])
 			prevWasIdent = true
 			continue
 		}
@@ -379,7 +458,7 @@ func normalizeSQLForStats(dst []byte, raw string) (int64, []byte) {
 			if endTag, ok := matchDollarQuoteTag(raw, i); ok {
 				tag := raw[i:endTag]
 				flushSpace()
-				dst = append(dst, '$', '?')
+				sink.writePlaceholder()
 				i = endTag
 				for i < n {
 					if raw[i] == '$' && i+len(tag) <= n && raw[i:i+len(tag)] == tag {
@@ -392,10 +471,10 @@ func normalizeSQLForStats(dst []byte, raw string) (int64, []byte) {
 				continue
 			}
 			flushSpace()
-			dst = append(dst, '$')
+			sink.writeByte('$')
 			i++
 			for i < n && raw[i] >= '0' && raw[i] <= '9' {
-				dst = append(dst, raw[i])
+				sink.writeByte(raw[i])
 				i++
 			}
 			prevWasIdent = true
@@ -405,7 +484,7 @@ func normalizeSQLForStats(dst []byte, raw string) (int64, []byte) {
 		// Standalone numeric literal (not part of an identifier such as col1).
 		if !prevWasIdent && ((c >= '0' && c <= '9') || (c == '.' && i+1 < n && raw[i+1] >= '0' && raw[i+1] <= '9')) {
 			flushSpace()
-			dst = append(dst, '$', '?')
+			sink.writePlaceholder()
 			i = skipSQLNumber(raw, i)
 			prevWasIdent = false
 			continue
@@ -414,7 +493,7 @@ func normalizeSQLForStats(dst []byte, raw string) (int64, []byte) {
 		// Identifier or keyword character
 		if isIdentChar(c) {
 			flushSpace()
-			dst = append(dst, c)
+			sink.writeByte(c)
 			i++
 			prevWasIdent = true
 			continue
@@ -422,29 +501,10 @@ func normalizeSQLForStats(dst []byte, raw string) (int64, []byte) {
 
 		// Punctuation / operator
 		flushSpace()
-		dst = append(dst, c)
+		sink.writeByte(c)
 		i++
 		prevWasIdent = false
 	}
-
-	// Trim trailing whitespace and semicolons.
-	for len(dst) > 0 && (dst[len(dst)-1] == ';' || isSQLSpace(dst[len(dst)-1])) {
-		dst = dst[:len(dst)-1]
-	}
-	if len(dst) == 0 {
-		return 0, dst
-	}
-
-	h := uint64(fnvOffset64)
-	for _, b := range dst {
-		h ^= uint64(b)
-		h *= fnvPrime64
-	}
-	id := int64(h)
-	if id == 0 {
-		id = 1
-	}
-	return id, dst
 }
 
 func isIdentChar(c byte) bool {
