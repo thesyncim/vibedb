@@ -125,8 +125,9 @@ Key gaps:
 
 - No rolling upgrade, downgrade, or cross-build restore; every process must run
   one build.
-- Online split covers base relations only; a split that must move a global
-  index fails closed.
+- Online split supports base relations and global-index cut validation and
+  multi-relation retained pruning; end-to-end process qualification for globally
+  indexed splits and repeated descendant splits is not yet landed.
 - Scaling commands ship together with `vibedb cluster init-operator` and
   `vibedb cluster init-node` to mint operator profiles, empty-node preparation
   manifests, and public node descriptors from a cluster CA; external CA

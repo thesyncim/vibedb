@@ -424,4 +424,5 @@ func testSourceTopologyPruneAuthorityWithCertificate(t *testing.T, plan *Plan, c
 	if validSourceTopologyPruneCertificate(&other, payload, observed, certificate) {
 		t.Fatal("prune retained geometry widened")
 	}
+	testGlobalIndexRetainedPruneAuthorityWithCertificate(t, plan, cutover)
 }

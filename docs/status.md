@@ -63,9 +63,11 @@ Darwin durability uses its strongest implemented barrier; see
   persisted in a SHA-256-checksummed collection sidecar (`.tin`) for zero-scan
   reopen and incremental catch-up after restarts, but the active index must
   fit in memory. See [search](api/search.md#limitations).
-- Online split covers base relations. A split plan that must move a global
-  index fails closed, a split cannot relieve a single hot key, and repeated
-  descendant splits are not qualified. See [topology changes](design/topology-changes.md#limitations).
+- Online split qualifies base relations end-to-end; global-index cut
+  validation and multi-relation retained pruning are wired in
+  `splitcontroller`, while end-to-end process qualification for globally
+  indexed splits and repeated descendant splits remains pending, and a split
+  cannot relieve a single hot key. See [topology changes](design/topology-changes.md#limitations).
 - Scaling inputs can be generated from an existing cluster CA with
   `vibedb cluster init-operator` (operator credential and profile) and
   `vibedb cluster init-node` (empty-node preparation manifest and public node

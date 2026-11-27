@@ -36,8 +36,8 @@ type RF3RetainedPruneProposerOptions struct {
 }
 
 // NewRF3RetainedPruneProposerForPlan binds the destructive proposal to the
-// immutable split geometry. Plans with global indexes remain closed until the
-// complete relation-aware capture and image-certificate path is installed.
+// immutable split geometry across base relation 1 and every planned global
+// index relation (2..1+len(plan.indexRelations)).
 func NewRF3RetainedPruneProposerForPlan(
 	plan *Plan,
 	observed Observation,
@@ -45,12 +45,20 @@ func NewRF3RetainedPruneProposerForPlan(
 	maxKeys int,
 	maxKeyBytes int,
 ) (*RF3RetainedPruneProposer, error) {
-	if plan == nil || observed.Certificate == nil || len(plan.indexRelations) != 0 ||
+	if plan == nil || observed.Certificate == nil ||
 		plan.retained >= plan.childCount {
 		return nil, ErrInvalidPlan
 	}
+	var indexRelations []replication.RelationID
+	if len(plan.indexRelations) != 0 {
+		indexRelations = make([]replication.RelationID, len(plan.indexRelations))
+		for i, rel := range plan.indexRelations {
+			indexRelations[i] = replication.RelationID(rel.Relation)
+		}
+	}
 	return NewRF3RetainedPruneProposer(RF3RetainedPruneProposerOptions{
 		Operation: plan.operation, Session: session, Relation: 1,
+		Relations: indexRelations,
 		MaxKeys: maxKeys, MaxKeyBytes: maxKeyBytes,
 		Certificate: *observed.Certificate, RetainedRange: plan.children[plan.retained].Range,
 	})
