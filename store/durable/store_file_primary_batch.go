@@ -2156,6 +2156,12 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		}
 		image = encoded
 	}
+	if leaf.docDelta < 0 && len(final) > 0 && c.primaryUnderfilledCount < primaryLeafMergeBudgetPerFold {
+		if hdr, _, hdrErr := storeio.OpenPage(image); hdrErr == nil &&
+			primaryLeafIsUnderfilled(len(final), int(hdr.PayloadLength), len(image)) {
+			c.recordUnderfilledPrimaryLeafLocked(final[0].Key)
+		}
+	}
 	leaf.imageOffset = len(c.batchPrimaryLeafArena)
 	c.batchPrimaryLeafArena = append(c.batchPrimaryLeafArena, image...)
 	leaf.imageLength = len(c.batchPrimaryLeafArena) - leaf.imageOffset

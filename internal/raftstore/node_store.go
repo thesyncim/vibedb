@@ -33,6 +33,7 @@ const (
 	DefaultNodeSegmentBytes       = 24 << 20
 	DefaultNodeMaxWaveBytes       = 16 << 20
 	DefaultNodeMaxSegmentEvents   = 64 << 10
+	DefaultNodeReclaimMinSegments = 2
 	DefaultNodeRecentWaves        = 4 << 10
 	DefaultNodeMaxEntriesPerGroup = raftmodel.MaxMessageEntries
 	DefaultNodeReaderSlots        = 4
@@ -284,6 +285,7 @@ func CreateNodeStore(dir string, identity NodeIdentity, key Key, bootstraps []No
 		_ = lock.Close()
 		return nil, err
 	}
+	engine.SetReclaimMinSegments(DefaultNodeReclaimMinSegments)
 	storedDescriptors := make([]GroupDescriptor, len(descriptors), options.MaxGroups)
 	copy(storedDescriptors, descriptors)
 	storedOrder := make([]uint32, len(order), options.MaxGroups)
@@ -366,6 +368,7 @@ func OpenNodeStore(dir string, expected NodeIdentity, key Key, options NodeStore
 	if engine.LogID() != logID {
 		return fail(engine, ErrIdentityMismatch)
 	}
+	engine.SetReclaimMinSegments(DefaultNodeReclaimMinSegments)
 	store := &NodeStore{dir: dir, identity: identity, key: key, bounds: bounds, engine: engine, lock: lock, crypto: cryptoState, cryptoWork: newObjectCryptoWorkspace(cryptoState.dataKey, cryptoState.nonceKey)}
 	store.plainArena = make([]byte, 0, options.MaxWaveBytes)
 	if err = engine.ReserveWithFrameArena(store.plainArena, options.MaxSegmentEvents, options.RecentWaves); err == nil {
