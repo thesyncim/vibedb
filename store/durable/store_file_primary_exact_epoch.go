@@ -68,13 +68,13 @@ import (
 // probes stay ~1 slot at the worst admitted load factor (1/4). Never
 // resize under readers.
 const (
-	primaryExactOverlayTermRecordCap  = 8192
-	primaryExactOverlayTileRecordCap  = 4096
-	primaryExactOverlayTermEntryCap   = 4096
-	primaryExactOverlayTileEntryCap   = 2048
-	primaryExactOverlayTermTableSlots = 16384
-	primaryExactOverlayTileTableSlots = 8192
-	primaryExactOverlayTermBytesCap   = 1 << 20
+	primaryExactOverlayTermRecordCap  = 32768
+	primaryExactOverlayTileRecordCap  = 16384
+	primaryExactOverlayTermEntryCap   = 16384
+	primaryExactOverlayTileEntryCap   = 8192
+	primaryExactOverlayTermTableSlots = 65536
+	primaryExactOverlayTileTableSlots = 32768
+	primaryExactOverlayTermBytesCap   = 4 << 20
 )
 
 // primaryExactTermRecord is one absolute posting overwrite: term (named by

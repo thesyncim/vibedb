@@ -879,11 +879,27 @@ func (h *CatalogHolder) pinCurrent() catalogLease {
 	}
 	for {
 		slot := h.currentSlot.Load()
-		if slot == nil {
+		snapshot := h.ptr.Load()
+		if snapshot == nil {
 			return catalogLease{}
 		}
+		if slot == nil || slot.snapshot != snapshot {
+			h.leaseMu.Lock()
+			h.initLeaseTrackerLocked()
+			snapshot = h.ptr.Load()
+			if snapshot == nil {
+				h.leaseMu.Unlock()
+				return catalogLease{}
+			}
+			slot = h.currentSlot.Load()
+			if slot == nil || slot.snapshot != snapshot {
+				h.installSnapshotLocked(snapshot)
+				slot = h.currentSlot.Load()
+			}
+			h.leaseMu.Unlock()
+		}
 		slot.active.Add(1)
-		if h.currentSlot.Load() == slot {
+		if h.currentSlot.Load() == slot && h.ptr.Load() == slot.snapshot {
 			return catalogLease{holder: h, snapshot: slot.snapshot, slot: slot, generation: slot.generation}
 		}
 		if slot.active.Add(-1) == 0 && h.leaseWaiterCount.Load() > 0 {

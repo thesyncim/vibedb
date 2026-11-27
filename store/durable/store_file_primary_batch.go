@@ -471,7 +471,7 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 	if len(c.batchPrimaryLeaves) == 0 || len(c.batchPrimaryMutations) == 0 {
 		return stagedPrimaryBatch{}, false, false, nil
 	}
-	allowDeletes := state.root.IndexCount == 0 && !primarySlotGeometryMaintained(state.root)
+	allowDeletes := state.root.Options&storeio.StateOptionTinIndexes == 0
 	for index := range c.batchPrimaryMutations {
 		mutation := &c.batchPrimaryMutations[index]
 		if mutation.remove {
@@ -554,10 +554,12 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 				}
 				var stableSlot uint8
 				var oldLen int
+				var oldRaw []byte
 				switch disposition {
 				case primaryUnifiedOverlayValue:
 					stableSlot = overlaySlot
 					oldLen = len(current)
+					oldRaw = current
 				case primaryUnifiedOverlayMissing:
 					if stripe.Len() > storeio.CommonPrimaryLeafWideSlots {
 						lease.Release()
@@ -583,6 +585,7 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 							storeio.ErrCommonPrimaryLeafCorrupt
 					}
 					oldLen = len(c.overflowValueScratch)
+					oldRaw = c.overflowValueScratch
 				default:
 					lease.Release()
 					return stagedPrimaryBatch{}, true, false,
@@ -594,6 +597,13 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 				}
 				mutation.found = true
 				mutation.oldSlot = stableSlot
+				if state.root.IndexCount != 0 {
+					off := len(c.batchOldRawArena)
+					c.batchOldRawArena = append(c.batchOldRawArena, oldRaw...)
+					mutation.oldRawOff = off
+					mutation.oldRawLen = len(oldRaw)
+					mutation.capturedOldRaw = true
+				}
 				rawDelta -= oldLen
 				leafRowDelta--
 				overlayDocDelta--
@@ -808,6 +818,9 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 	if exactPressure {
 		overlay.abortBatch(&prepared)
 		c.unwindPrimaryExactPrepared(&preparedExact)
+		if conditional {
+			return stagedPrimaryBatch{}, true, false, ErrCheckpointGroupPressure
+		}
 		return stagedPrimaryBatch{}, false, overlay.hasPending(), nil
 	}
 	return stagedPrimaryBatch{
@@ -1730,17 +1743,20 @@ func (c *Collection) preparePrimaryBatchExactOverlayDeltas(
 	}
 	for i := range c.batchPrimaryMutations {
 		mutation := &c.batchPrimaryMutations[i]
-		if mutation.remove {
-			c.unwindPrimaryExactPrepared(&prepared)
-			return primaryExactPrepared{}, true, nil
+		if mutation.remove && !mutation.found {
+			continue
 		}
 		var oldRaw []byte
 		if mutation.capturedOldRaw {
 			oldRaw = c.batchOldRawArena[mutation.oldRawOff : mutation.oldRawOff+mutation.oldRawLen]
 		}
+		var newRaw []byte
+		if !mutation.remove {
+			newRaw = mutation.value
+		}
 		ok, deltaErr := c.preparePrimaryExactDeltaRaw(
 			epoch, &prepared, mutation.resident,
-			oldRaw, mutation.value, false, mutation.found,
+			oldRaw, newRaw, mutation.remove, mutation.found,
 			mutation.oldSlot, mutation.oldSlot, generation,
 		)
 		if deltaErr != nil {

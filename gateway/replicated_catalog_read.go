@@ -67,7 +67,7 @@ func (authority *ReplicatedCatalogAuthority) prepareReadCatalogCut(
 				return err
 			}
 		}
-		holder.ptr.Store(certified)
+		holder.installSnapshotLocked(certified)
 		holder.signalLeaseChangeLocked()
 		return nil
 	}, nil
