@@ -17,7 +17,7 @@ coverage table describes harness support, not an executed result.
 | --- | --- | --- |
 | Did a hot path allocate more? | `go run ./bench/gate` | Same-machine `allocs/op` and `B/op` comparison to a Git base; never gates time |
 | How does one embedded workload behave? | `bench/competitive/cmd/mixed` | One isolated engine/process workload with latency, throughput, memory, and disk observations |
-| Are repeated mixed runs comparable? | `cmd/mixedsuite` | Deterministic execution order; its current summary TSV is not machine-safe (see below) |
+| Are repeated mixed runs comparable? | `cmd/mixedsuite` | Deterministic Latin-square execution order with raw per-run rows and matching summary TSV |
 | What is the file/RSS footprint? | `cmd/footprint` | Apparent bytes, allocated blocks, Go memory, RSS, and corpus metadata |
 | Does a live set grow on disk? | `cmd/churndisk` | Bounded churn/storage samples; nonstandard shapes are diagnostic |
 | Where does one host/workload saturate? | `cmd/saturation` | Host-specific plateau search, not universal capacity |
@@ -42,13 +42,6 @@ The curated gate rejects any gated `allocs/op` increase and a `B/op` increase
 greater than five percent. It neither reads, reports, nor gates `ns/op`. The
 local default compares with the merge base of `main`; pull-request CI supplies
 the exact PR base.
-
-### Known `mixedsuite` output defect
-
-The current summary header declares fewer grouping columns than each summary
-row emits. The runner's execution order is deterministic, but downstream tools
-must not treat its summary TSV as a stable machine-readable schema until that
-defect is fixed. Raw per-run evidence remains the safer input.
 
 ## Publication requirements
 
@@ -113,7 +106,6 @@ engineering report automatically becomes an endorsed registry entry.
   engineering reports apply only to their recorded revision and hardware.
 - The allocation gate never measures time; a pass is not a latency or
   throughput result.
-- `mixedsuite` summary TSV has a header/row mismatch (above).
 - No harness in this repository establishes horizontal scaling or
   production capacity; see the [coverage matrix](../bench/competitive/COVERAGE.md)
   for what is outside its scope.

@@ -680,8 +680,9 @@ func writeSummaries(w io.Writer, header []string, records []runRecord) error {
 	slices.Sort(keys)
 	fmt.Fprintf(
 		w,
-		"record\tengine\tdurability\tworkload\tcard\toperation\tmetric\t"+
+		"record\t%s\tmetric\t"+
 			"samples\tmedian\tmad\tq1\tq3\tiqr\tmin\tmax\n",
+		strings.Join(groupColumns, "\t"),
 	)
 	for _, key := range keys {
 		g := groups[key]
