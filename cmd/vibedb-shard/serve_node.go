@@ -313,17 +313,20 @@ func runServeNode(args []string) int {
 		if diskPath == "" && *minFreeDiskBytes > 0 {
 			diskPath = filepath.Dir(*manifestPath)
 		}
-		manifest.Gateway.RuntimeOps = rf3ServeNodeRuntimeOps{
+		ops := rf3ServeNodeRuntimeOps{
 			MetricsHTTPListenAddress: *metricsHTTPListen,
 			FrontendDrainGracePeriod: *frontendDrainGrace,
 			MaxMemoryBytes:           *maxMemoryBytes,
 			MinFreeDiskBytes:         *minFreeDiskBytes,
 			DiskWatermarkPath:        diskPath,
 			SlowQueryThreshold:       *slowQueryThreshold,
-			ControllerLeaseDir:       *controllerLeaseDir,
-			ControllerLeaseKey:       *controllerLeaseKey,
-			ControllerLeaseTTL:       *controllerLeaseTTL,
 		}
+		if *controllerLeaseDir != "" {
+			ops.ControllerLeaseDir = *controllerLeaseDir
+			ops.ControllerLeaseKey = *controllerLeaseKey
+			ops.ControllerLeaseTTL = *controllerLeaseTTL
+		}
+		manifest.Gateway.RuntimeOps = ops
 	}
 	stopReload := configureRF3ManifestReload(&manifest, *manifestPath, *reload)
 	defer stopReload()
