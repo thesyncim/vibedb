@@ -305,32 +305,16 @@ type primaryExactEpoch struct {
 }
 
 func newPrimaryExactEpoch(indexCount int) *primaryExactEpoch {
-	return newPrimaryExactEpochScaled(indexCount, 1)
-}
-
-func newPrimaryExactEpochScaled(indexCount, scale int) *primaryExactEpoch {
-	if scale < 1 {
-		scale = 1
-	}
 	return &primaryExactEpoch{
 		exact:       make([]primaryExactResident, indexCount),
-		termTable:   make([]atomic.Pointer[primaryExactTermEntry], primaryExactOverlayTermTableSlots*scale),
-		tileTable:   make([]atomic.Pointer[primaryExactTileEntry], primaryExactOverlayTileTableSlots*scale),
-		termEntries: make([]primaryExactTermEntry, primaryExactOverlayTermEntryCap*scale),
-		tileEntries: make([]primaryExactTileEntry, primaryExactOverlayTileEntryCap*scale),
-		termRecords: make([]primaryExactTermRecord, primaryExactOverlayTermRecordCap*scale),
-		tileRecords: make([]primaryExactTileRecord, primaryExactOverlayTileRecordCap*scale),
-		termBytes:   make([]byte, primaryExactOverlayTermBytesCap*scale),
+		termTable:   make([]atomic.Pointer[primaryExactTermEntry], primaryExactOverlayTermTableSlots),
+		tileTable:   make([]atomic.Pointer[primaryExactTileEntry], primaryExactOverlayTileTableSlots),
+		termEntries: make([]primaryExactTermEntry, primaryExactOverlayTermEntryCap),
+		tileEntries: make([]primaryExactTileEntry, primaryExactOverlayTileEntryCap),
+		termRecords: make([]primaryExactTermRecord, primaryExactOverlayTermRecordCap),
+		tileRecords: make([]primaryExactTileRecord, primaryExactOverlayTileRecordCap),
+		termBytes:   make([]byte, primaryExactOverlayTermBytesCap),
 	}
-}
-
-func (c *Collection) exactEpochScale() int {
-	if c != nil {
-		if g := c.checkpointGroup.Load(); g != nil && g.opts.OverlaySlotGeometry {
-			return 8
-		}
-	}
-	return 1
 }
 
 // reset prepares a retired epoch for reuse once the reclaim floor has passed
@@ -596,7 +580,7 @@ func (c *Collection) takePrimaryExactEpochLocked(indexCount int) *primaryExactEp
 		}
 		return epoch
 	}
-	return newPrimaryExactEpochScaled(indexCount, c.exactEpochScale())
+	return newPrimaryExactEpoch(indexCount)
 }
 
 // primaryExactBucketOverride carries a freshly re-derived bucket

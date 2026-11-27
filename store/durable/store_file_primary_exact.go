@@ -355,7 +355,7 @@ func (c *Collection) buildPrimaryExactEpoch(
 	if err != nil {
 		return nil, err
 	}
-	epoch := newPrimaryExactEpochScaled(root.Len(), c.exactEpochScale())
+	epoch := newPrimaryExactEpoch(root.Len())
 	epoch.live = newPrimaryLiveTable(live)
 	epoch.baseGen = state.root.Generation
 	// Views close over this epoch's flat table, not the collection field: a
