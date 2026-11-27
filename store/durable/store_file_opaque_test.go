@@ -45,8 +45,9 @@ func TestOpaqueValuesCreateUpdateAndZeroOptionReopen(t *testing.T) {
 			collection.HasOpaqueValues(), collection.HasSchema(),
 			collection.HasIndexes())
 	}
-	if collection.primaryConcurrentContexts != nil {
-		t.Fatal("opaque collection constructed a JSON concurrent lane")
+	if collection.primaryUnifiedOverlay != nil ||
+		collection.primaryConcurrentContexts != nil {
+		t.Fatal("opaque collection constructed a JSON overlay/concurrent lane")
 	}
 	if _, err := collection.CreateIndex(store.IndexDefinition{
 		Name: "value", Paths: []string{"/value"},
@@ -93,7 +94,7 @@ func TestOpaqueValuesCreateUpdateAndZeroOptionReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if !reopened.HasOpaqueValues() ||
+	if !reopened.HasOpaqueValues() || reopened.primaryUnifiedOverlay != nil ||
 		reopened.primaryConcurrentContexts != nil {
 		t.Fatalf("zero-option reopen lost opaque capability: opaque=%v overlay=%v concurrent=%v",
 			reopened.HasOpaqueValues(), reopened.primaryUnifiedOverlay != nil,

@@ -752,6 +752,10 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 		}
 		lease.Release()
 	}
+	if len(c.batchOverlayMutations) == 0 &&
+		skippedDeletes == len(c.batchPrimaryMutations) {
+		return stagedPrimaryBatch{}, true, false, nil
+	}
 	if len(c.batchOverlayMutations) == 0 ||
 		len(c.batchOverlayMutations)+skippedDeletes != len(c.batchPrimaryMutations) {
 		return stagedPrimaryBatch{}, false, false, nil
