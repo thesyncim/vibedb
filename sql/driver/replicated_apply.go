@@ -683,7 +683,11 @@ func (d *Database) openReplicatedApplyWithSchemaAudit(
 	}
 	if core.checkpointGroup == nil {
 		core.checkpointGroup, err = durable.NewCheckpointGroup(
-			core.txnLog, groupMembers, durable.CheckpointGroupOptions{CheckpointEvery: replicatedCheckpointEvery},
+			core.txnLog, groupMembers, durable.CheckpointGroupOptions{
+				CheckpointEvery:       replicatedCheckpointEvery,
+				BufferedJournalWrites: true,
+				OverlaySlotGeometry:   true,
+			},
 		)
 		if err != nil {
 			return nil, identity, fmt.Errorf(

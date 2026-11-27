@@ -221,3 +221,126 @@ func materializeSQLReadCursor(cursor query.Cursor, names []string, limit int, ca
 	resp.Rows = rowSlices
 	return resp, typedCells, nil
 }
+
+var directSQLRowsResponse = &ShardResponse{Kind: ResponseRows}
+
+// materializeSQLReadCursorDirect writes owned query.Cell values directly into
+// target.Result and target.Arena on the local fused SQL read path, avoiding
+// intermediate ShardResponse row/cell slices, TypedCells transpose arrays,
+// unused JSON conversions, and per-query arena allocations while enforcing the
+// exact same frame-size and row bounds as encodeSQLReadCursor.
+func materializeSQLReadCursorDirect(
+	cursor query.Cursor,
+	names []string,
+	limit int,
+	cancel *query.CancelFlag,
+	target *DirectSQLTarget,
+) (*ShardResponse, error) {
+	target.Populated = false
+	target.RowCount = 0
+	target.WireBytes = 0
+	if len(names) > maxColumns {
+		return nil, errFieldTooLarge
+	}
+	limit = min(limit, maxFrameBody+5)
+	size := 16
+	take := func(n int) bool {
+		if n < 0 || n > limit-size {
+			return false
+		}
+		size += n
+		return true
+	}
+	if !take(0) {
+		return nil, errSQLReadFrameBound
+	}
+	for _, name := range names {
+		if !take(8) || !take(len(name)) {
+			return nil, errSQLReadFrameBound
+		}
+	}
+	cols := len(names)
+	dst := target.Result
+	prevCols := dst.Columns
+	if cap(prevCols) < cols {
+		for i := range prevCols {
+			clear(prevCols[i].Cells)
+		}
+		dst.Columns = make([]query.ResultColumn, cols)
+	} else {
+		for i := cols; i < len(prevCols); i++ {
+			clear(prevCols[i].Cells)
+			prevCols[i] = query.ResultColumn{}
+		}
+		dst.Columns = prevCols[:cols]
+	}
+	for i, name := range names {
+		cells := dst.Columns[i].Cells
+		clear(cells)
+		dst.Columns[i] = query.ResultColumn{Header: name, Cells: cells[:0]}
+	}
+	dst.RowCount = 0
+	var arena []byte
+	if target.Arena != nil {
+		arena = (*target.Arena)[:0]
+	}
+	next, err := cursor.NextWithCancel(cancel)
+	if err != nil {
+		return nil, err
+	}
+	if !next {
+		if target.Arena != nil {
+			*target.Arena = arena
+		}
+		target.Populated = true
+		target.RowCount = 0
+		target.WireBytes = uint64(size)
+		return directSQLRowsResponse, nil
+	}
+	if cols == 0 {
+		return nil, errSQLReadFrameBound
+	}
+	rows := 0
+	for {
+		rows++
+		if rows > maxRows {
+			return nil, errSQLReadFrameBound
+		}
+		for col := range cols {
+			if !take(1) {
+				return nil, errSQLReadFrameBound
+			}
+			cell := cursor.Cell(col)
+			if cell.IsNull() {
+				dst.Columns[col].Cells = append(dst.Columns[col].Cells, query.NullCell())
+				continue
+			}
+			owned, nextArena := query.OwnCellInto(arena, cell)
+			arena = nextArena
+			dst.Columns[col].Cells = append(dst.Columns[col].Cells, owned)
+			wireLen := len(owned.Payload())
+			if wireLen == 0 {
+				var scratch [32]byte
+				wireLen = len(owned.AppendJSON(scratch[:0]))
+			}
+			if !take(4) || !take(wireLen) {
+				return nil, errSQLReadFrameBound
+			}
+		}
+		next, err = cursor.NextWithCancel(cancel)
+		if err != nil {
+			return nil, err
+		}
+		if !next {
+			break
+		}
+	}
+	dst.RowCount = rows
+	if target.Arena != nil {
+		*target.Arena = arena
+	}
+	target.Populated = true
+	target.RowCount = rows
+	target.WireBytes = uint64(size)
+	return directSQLRowsResponse, nil
+}

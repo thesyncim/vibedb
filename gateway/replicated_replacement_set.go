@@ -155,7 +155,7 @@ func (h *CatalogHolder) publishReplicaReplacementSetAfter(expected uint64, next 
 	if err != nil {
 		return err
 	}
-	h.ptr.Store(certified)
+	h.installSnapshotLocked(certified)
 	h.signalLeaseChangeLocked()
 	return nil
 }

@@ -606,13 +606,21 @@ func cloneEndpoints(endpoints map[distribution.EndpointID]string) map[distributi
 // mixed or partially published state. Publication and operational pinning share
 // one short lock so, after a generation is published, no new operation can pin
 // an older write plan. Per-row planning and execution remain lock-free.
-type CatalogHolder struct {
-	ptr atomic.Pointer[Snapshot]
+type catalogGenerationSlot struct {
+	snapshot   *Snapshot
+	generation uint64
+	active     atomic.Int64
+}
 
-	leaseMu      sync.Mutex
-	activeLeases map[uint64]uint64
-	leaseChanged chan struct{}
-	leaseWaiters uint64
+type CatalogHolder struct {
+	ptr         atomic.Pointer[Snapshot]
+	currentSlot atomic.Pointer[catalogGenerationSlot]
+
+	leaseMu          sync.Mutex
+	leaseSlots       []*catalogGenerationSlot
+	leaseChanged     chan struct{}
+	leaseWaiters     uint64
+	leaseWaiterCount atomic.Uint64
 	// refresh coalesces authenticated on-demand repairs for both the SQL
 	// executor and native replicated reader. Keeping the gate beside the
 	// publication holder means callers sharing one holder cannot stampede the
@@ -623,16 +631,25 @@ type CatalogHolder struct {
 // NewCatalogHolder returns a holder seeded with initial, which may be nil.
 func NewCatalogHolder(initial *Snapshot) *CatalogHolder {
 	h := &CatalogHolder{
-		activeLeases: make(map[uint64]uint64),
 		leaseChanged: make(chan struct{}),
 	}
 	if initial != nil {
 		snapshot, err := initialCatalogState(initial)
 		if err == nil {
-			h.ptr.Store(snapshot)
+			h.installSnapshotLocked(snapshot)
 		}
 	}
 	return h
+}
+
+func (h *CatalogHolder) installSnapshotLocked(s *Snapshot) {
+	slot := &catalogGenerationSlot{
+		snapshot:   s,
+		generation: s.Generation(),
+	}
+	h.leaseSlots = append(h.leaseSlots, slot)
+	h.ptr.Store(s)
+	h.currentSlot.Store(slot)
 }
 
 // Publish atomically installs s only when its generation is strictly newer
@@ -682,7 +699,7 @@ func (h *CatalogHolder) PublishAfter(expectedGeneration uint64, s *Snapshot) err
 	if err != nil {
 		return err
 	}
-	h.ptr.Store(next)
+	h.installSnapshotLocked(next)
 	h.signalLeaseChangeLocked()
 	return nil
 }
@@ -713,7 +730,7 @@ func (h *CatalogHolder) publishReplicaReplacementAfter(
 	if err != nil {
 		return err
 	}
-	h.ptr.Store(next)
+	h.installSnapshotLocked(next)
 	h.signalLeaseChangeLocked()
 	return nil
 }
@@ -746,7 +763,7 @@ func (h *CatalogHolder) publishReplicaReplacementPostRemoveAfter(
 	); err != nil {
 		return err
 	}
-	h.ptr.Store(s)
+	h.installSnapshotLocked(s)
 	h.signalLeaseChangeLocked()
 	return nil
 }
@@ -773,7 +790,7 @@ func (h *CatalogHolder) publishNewerChecked(s *Snapshot) error {
 	if err != nil {
 		return err
 	}
-	h.ptr.Store(next)
+	h.installSnapshotLocked(next)
 	h.signalLeaseChangeLocked()
 	return nil
 }
@@ -793,6 +810,7 @@ func (h *CatalogHolder) Current() *Snapshot {
 type catalogLease struct {
 	holder     *CatalogHolder
 	snapshot   *Snapshot
+	slot       *catalogGenerationSlot
 	generation uint64
 	released   bool
 }
@@ -859,16 +877,35 @@ func (h *CatalogHolder) pinCurrent() catalogLease {
 	if h == nil {
 		return catalogLease{}
 	}
-	h.leaseMu.Lock()
-	defer h.leaseMu.Unlock()
-	h.initLeaseTrackerLocked()
-	snapshot := h.ptr.Load()
-	if snapshot == nil {
-		return catalogLease{}
+	for {
+		slot := h.currentSlot.Load()
+		snapshot := h.ptr.Load()
+		if snapshot == nil {
+			return catalogLease{}
+		}
+		if slot == nil || slot.snapshot != snapshot {
+			h.leaseMu.Lock()
+			h.initLeaseTrackerLocked()
+			snapshot = h.ptr.Load()
+			if snapshot == nil {
+				h.leaseMu.Unlock()
+				return catalogLease{}
+			}
+			slot = h.currentSlot.Load()
+			if slot == nil || slot.snapshot != snapshot {
+				h.installSnapshotLocked(snapshot)
+				slot = h.currentSlot.Load()
+			}
+			h.leaseMu.Unlock()
+		}
+		slot.active.Add(1)
+		if h.currentSlot.Load() == slot && h.ptr.Load() == slot.snapshot {
+			return catalogLease{holder: h, snapshot: slot.snapshot, slot: slot, generation: slot.generation}
+		}
+		if slot.active.Add(-1) == 0 && h.leaseWaiterCount.Load() > 0 {
+			h.notifyLeaseWaiters()
+		}
 	}
-	generation := snapshot.Generation()
-	h.activeLeases[generation]++
-	return catalogLease{holder: h, snapshot: snapshot, generation: generation}
 }
 
 func (l *catalogLease) release() {
@@ -876,22 +913,18 @@ func (l *catalogLease) release() {
 		return
 	}
 	l.released = true
-	h := l.holder
-	h.leaseMu.Lock()
-	defer h.leaseMu.Unlock()
-	active := h.activeLeases[l.generation]
-	if active <= 1 {
-		delete(h.activeLeases, l.generation)
-	} else {
-		h.activeLeases[l.generation] = active - 1
+	if l.slot != nil && l.slot.active.Add(-1) == 0 && l.holder.leaseWaiterCount.Load() > 0 {
+		l.holder.notifyLeaseWaiters()
 	}
+}
+
+func (h *CatalogHolder) notifyLeaseWaiters() {
+	h.leaseMu.Lock()
 	h.signalLeaseChangeLocked()
+	h.leaseMu.Unlock()
 }
 
 func (h *CatalogHolder) initLeaseTrackerLocked() {
-	if h.activeLeases == nil {
-		h.activeLeases = make(map[uint64]uint64)
-	}
 	if h.leaseChanged == nil {
 		h.leaseChanged = make(chan struct{})
 	}
@@ -1000,18 +1033,27 @@ func (h *CatalogHolder) DrainStatus(generation uint64) CatalogDrainStatus {
 
 func (h *CatalogHolder) drainStatusLocked(generation uint64) CatalogDrainStatus {
 	status := CatalogDrainStatus{}
+	currentSlot := h.currentSlot.Load()
 	if current := h.ptr.Load(); current != nil {
 		status.CurrentGeneration = current.Generation()
 	}
-	for activeGeneration, count := range h.activeLeases {
-		if activeGeneration >= generation || count == 0 {
+	kept := h.leaseSlots[:0]
+	for _, slot := range h.leaseSlots {
+		active := slot.active.Load()
+		if active <= 0 && slot != currentSlot {
 			continue
 		}
-		status.ActiveOlderOperations += count
-		if status.OldestActiveGeneration == 0 || activeGeneration < status.OldestActiveGeneration {
-			status.OldestActiveGeneration = activeGeneration
+		kept = append(kept, slot)
+		if slot.generation >= generation || active <= 0 {
+			continue
+		}
+		status.ActiveOlderOperations += uint64(active)
+		if status.OldestActiveGeneration == 0 || slot.generation < status.OldestActiveGeneration {
+			status.OldestActiveGeneration = slot.generation
 		}
 	}
+	clear(h.leaseSlots[len(kept):])
+	h.leaseSlots = kept
 	return status
 }
 
@@ -1036,6 +1078,7 @@ func (h *CatalogHolder) WaitOlderDrained(ctx context.Context, generation uint64)
 		}
 		changed := h.leaseChanged
 		h.leaseWaiters++
+		h.leaseWaiterCount.Store(h.leaseWaiters)
 		h.leaseMu.Unlock()
 		var err error
 		select {
@@ -1045,6 +1088,7 @@ func (h *CatalogHolder) WaitOlderDrained(ctx context.Context, generation uint64)
 		}
 		h.leaseMu.Lock()
 		h.leaseWaiters--
+		h.leaseWaiterCount.Store(h.leaseWaiters)
 		h.leaseMu.Unlock()
 		if err != nil {
 			return status, err

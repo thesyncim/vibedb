@@ -207,8 +207,68 @@ type TxnMarker struct {
 	scratch    []byte
 	// markerSync and writeAt are injected so a fault seam can wrap the real
 	// barriers and appends; production wires the platform helpers.
-	markerSync func(*os.File) error
-	writeAt    func(p []byte, off int64) (int, error)
+	markerSync     func(*os.File) error
+	writeAt        func(p []byte, off int64) (int, error)
+	bufferedWrites bool
+	writeBuf       []byte
+	writeBufOff    int64
+}
+
+const txnMarkerWriteBufSize = 16 * 1024
+
+// SetBufferedWrites enables or disables 16 KiB user-space write coalescing for
+// decision and retirement appends. Disabling flushes buffered bytes first.
+func (m *TxnMarker) SetBufferedWrites(enabled bool) error {
+	if m == nil {
+		return nil
+	}
+	if !enabled {
+		if err := m.Flush(); err != nil {
+			return err
+		}
+	}
+	m.bufferedWrites = enabled
+	return nil
+}
+
+// Flush writes any buffered record bytes to the underlying file descriptor
+// without issuing an OS fsync barrier.
+func (m *TxnMarker) Flush() error {
+	if m == nil || len(m.writeBuf) == 0 {
+		return nil
+	}
+	err := writeTxnMarkerFull(m.writeAt, m.writeBuf, m.writeBufOff)
+	m.writeBuf = m.writeBuf[:0]
+	return err
+}
+
+func (m *TxnMarker) writeRegionBytes(data []byte, offset int64) error {
+	if !m.bufferedWrites {
+		return writeTxnMarkerFull(m.writeAt, data, offset)
+	}
+	if len(m.writeBuf) > 0 && m.writeBufOff+int64(len(m.writeBuf)) != offset {
+		if err := m.Flush(); err != nil {
+			return err
+		}
+	}
+	if len(m.writeBuf)+len(data) > txnMarkerWriteBufSize {
+		if len(m.writeBuf) > 0 {
+			if err := m.Flush(); err != nil {
+				return err
+			}
+		}
+		if len(data) >= txnMarkerWriteBufSize {
+			return writeTxnMarkerFull(m.writeAt, data, offset)
+		}
+	}
+	if m.writeBuf == nil {
+		m.writeBuf = make([]byte, 0, txnMarkerWriteBufSize)
+	}
+	if len(m.writeBuf) == 0 {
+		m.writeBufOff = offset
+	}
+	m.writeBuf = append(m.writeBuf, data...)
+	return nil
 }
 
 // TxnMarkerInspection is a read-only offline scan. It never proves physical
@@ -1524,6 +1584,9 @@ func (m *TxnMarker) writeHeaderFaultable(slot uint32, header TxnMarkerHeader) er
 }
 
 func (m *TxnMarker) scanDecisions(dst *TxnDecisions) error {
+	if err := m.Flush(); err != nil {
+		return err
+	}
 	m.cursor = 0
 	m.nextSequence = m.header.BaseSequence + 1
 	*dst = TxnDecisions{
@@ -1659,7 +1722,7 @@ func (m *TxnMarker) AppendDecision(
 		return 0, err
 	}
 	offset := int64(txnMarkerRegionStart) + int64(m.cursor)
-	if err := writeTxnMarkerFull(m.writeAt, m.scratch[:padded], offset); err != nil {
+	if err := m.writeRegionBytes(m.scratch[:padded], offset); err != nil {
 		return 0, err
 	}
 	m.cursor = end
@@ -1695,7 +1758,7 @@ func (m *TxnMarker) AppendRetirement(storeID [16]byte) (uint64, error) {
 		return 0, err
 	}
 	offset := int64(txnMarkerRegionStart) + int64(m.cursor)
-	if err := writeTxnMarkerFull(m.writeAt, m.scratch[:padded], offset); err != nil {
+	if err := m.writeRegionBytes(m.scratch[:padded], offset); err != nil {
 		return 0, err
 	}
 	m.cursor = end
@@ -1711,6 +1774,9 @@ func (m *TxnMarker) AppendRetirement(storeID [16]byte) (uint64, error) {
 // Sync issues the power-safe barrier on the decision-log file alone. The
 // decision sync is the sole atomic commit point for multi-collection commits.
 func (m *TxnMarker) Sync() error {
+	if err := m.Flush(); err != nil {
+		return err
+	}
 	return m.markerSync(m.file)
 }
 
@@ -1750,6 +1816,7 @@ func (m *TxnMarker) RecycleAtRecoveryAnchor(anchor TxnMarkerRecoveryAnchor) erro
 		return fmt.Errorf("%w: recycle count exhausted", ErrInvalidWrite)
 	}
 	if anchor.BaseSequence == m.header.BaseSequence && m.cursor != 0 {
+		m.writeBuf = m.writeBuf[:0]
 		sector := m.scratch[:TxnMarkerMinSectorSize]
 		clear(sector)
 		if err := writeTxnMarkerFull(m.writeAt, sector, txnMarkerRegionStart); err != nil {
@@ -1780,6 +1847,7 @@ func (m *TxnMarker) recycleTo(newEpoch, baseSequence uint64) error {
 	m.header = next
 	m.headerSlot = slot
 	m.cursor = 0
+	m.writeBuf = m.writeBuf[:0]
 	m.nextSequence = baseSequence + 1
 	m.lastTxnID = 0
 	m.retired = nil
@@ -1790,6 +1858,10 @@ func (m *TxnMarker) recycleTo(newEpoch, baseSequence uint64) error {
 func (m *TxnMarker) Close() error {
 	if m == nil {
 		return nil
+	}
+	var flushErr error
+	if m.file != nil {
+		flushErr = m.Flush()
 	}
 	file := m.file
 	root := m.root
@@ -1804,7 +1876,7 @@ func (m *TxnMarker) Close() error {
 	if root != nil {
 		rootErr = root.Close()
 	}
-	return errors.Join(fileErr, rootErr)
+	return errors.Join(flushErr, fileErr, rootErr)
 }
 
 // Remove verifies the reserved entry against the open descriptor, closes the

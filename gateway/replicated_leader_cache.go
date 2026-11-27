@@ -3,6 +3,7 @@ package gateway
 import (
 	"encoding/binary"
 	"sync"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/raftmember"
 	"github.com/thesyncim/vibedb/internal/raftservice"
@@ -38,6 +39,7 @@ func (entry *replicatedLeaderHintEntry) matches(key replicatedLeaderHintKey) boo
 // set prevents unrelated shard traffic from contending while keeping lookup,
 // publication, and invalidation allocation-free after construction.
 type replicatedLeaderHintSet struct {
+	hot     atomic.Pointer[replicatedLeaderHintEntry]
 	mu      sync.RWMutex
 	entries [replicatedLeaderHintWays]replicatedLeaderHintEntry
 	next    uint8
@@ -126,16 +128,20 @@ func (cache *replicatedLeaderHintCache) lookup(
 	if set == nil {
 		return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{}, false
 	}
-	set.mu.RLock()
 	var entry replicatedLeaderHintEntry
-	for way := uint8(0); way < set.ways; way++ {
-		candidate := &set.entries[way]
-		if candidate.matches(key) {
-			entry = *candidate
-			break
+	if hot := set.hot.Load(); hot != nil && hot.matches(key) {
+		entry = *hot
+	} else {
+		set.mu.RLock()
+		for way := uint8(0); way < set.ways; way++ {
+			candidate := &set.entries[way]
+			if candidate.matches(key) {
+				entry = *candidate
+				break
+			}
 		}
+		set.mu.RUnlock()
 	}
-	set.mu.RUnlock()
 	current, _, found := replicatedEndpoint(route, entry.endpoint.Member)
 	if !entry.valid || !found || current.NodeIncarnation != entry.catalogIncarnation {
 		return ReplicatedEndpoint{}, shardservice.ReplicatedMemberState{}, false
@@ -172,6 +178,15 @@ func (cache *replicatedLeaderHintCache) publish(
 	if set == nil {
 		return
 	}
+	// Lock-free fast check: steady-state reads hit the unchanged hot leader hint
+	// without acquiring set.mu at all.
+	if hot := set.hot.Load(); hot != nil && hot.matches(key) &&
+		hot.catalogIncarnation == next.catalogIncarnation &&
+		hot.catalogReplicaSet == next.catalogReplicaSet &&
+		sameReplicatedEndpoint(hot.endpoint, next.endpoint) &&
+		hot.state == next.state {
+		return
+	}
 	// Steady-state reads hit an unchanged leader hint; check under RLock first
 	// so concurrent readers do not serialize on an exclusive write lock.
 	set.mu.RLock()
@@ -184,6 +199,8 @@ func (cache *replicatedLeaderHintCache) publish(
 				entry.state == next.state
 			set.mu.RUnlock()
 			if unchanged {
+				published := next
+				set.hot.Store(&published)
 				return
 			}
 			goto writeHint
@@ -201,6 +218,8 @@ writeHint:
 				(endpoint.Member != entry.endpoint.Member || endpoint.StoreID != entry.endpoint.StoreID ||
 					endpoint.NodeIncarnation >= entry.endpoint.NodeIncarnation) {
 				*entry = next
+				published := next
+				set.hot.Store(&published)
 			}
 			set.mu.Unlock()
 			return
@@ -215,6 +234,8 @@ writeHint:
 	}
 	set.entries[way] = next
 	set.next = (way + 1) % set.ways
+	published := next
+	set.hot.Store(&published)
 	set.mu.Unlock()
 }
 
@@ -236,6 +257,10 @@ func (cache *replicatedLeaderHintCache) invalidate(
 		if entry.matches(key) && sameReplicatedEndpoint(entry.endpoint, endpoint) &&
 			entry.state == state {
 			*entry = replicatedLeaderHintEntry{}
+			if hot := set.hot.Load(); hot != nil && hot.matches(key) &&
+				sameReplicatedEndpoint(hot.endpoint, endpoint) && hot.state == state {
+				set.hot.Store(nil)
+			}
 			break
 		}
 	}

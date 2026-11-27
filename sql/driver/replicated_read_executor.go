@@ -185,6 +185,18 @@ func (k replicatedReadReuseKey) equal(other replicatedReadReuseKey) bool {
 	return true
 }
 
+const (
+	readReuseSlotIdle    uint32 = 0
+	readReuseSlotParked  uint32 = 1
+	readReuseSlotActive  uint32 = 2
+	readReuseSlotClosing uint32 = 3
+)
+
+type readReuseSlotState struct {
+	v atomic.Uint32
+	_ [60]byte
+}
+
 type replicatedReadReuseSlot struct {
 	slotIdx      uint8
 	active       bool
@@ -202,10 +214,11 @@ type replicatedReadReuseCache struct {
 	closed       bool
 	closedAtomic atomic.Bool
 	retained     int64
-	nextGen      uint64
-	hits         uint64
+	nextGen      atomic.Uint64
+	hits         atomic.Uint64
 	misses       uint64
 	evictions    uint64
+	slotState    [replicatedReadReuseSlotCount]readReuseSlotState
 	liveGen      [replicatedReadReuseSlotCount]atomic.Uint64
 	liveLease    [replicatedReadReuseSlotCount]atomic.Pointer[ReplicatedReadLease]
 	slots        [replicatedReadReuseSlotCount]replicatedReadReuseSlot
@@ -224,11 +237,11 @@ func (c *replicatedReadReuseCache) stats() replicatedReadReuseStats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	stats := replicatedReadReuseStats{
-		Hits: c.hits, Misses: c.misses, Evictions: c.evictions,
+		Hits: c.hits.Load(), Misses: c.misses, Evictions: c.evictions,
 		RetainedBytes: c.retained,
 	}
 	for i := range c.slots {
-		if c.slots[i].reader != nil && !c.slots[i].active {
+		if c.slotState[i].v.Load() == readReuseSlotParked {
 			stats.RetainedSlots++
 		}
 	}
@@ -556,65 +569,89 @@ func (c *replicatedReadReuseCache) reserve(
 	return c.reserveInto(key, nil)
 }
 
+func (c *replicatedReadReuseCache) nextGeneration() uint64 {
+	gen := c.nextGen.Add(1)
+	if gen == 0 {
+		gen = c.nextGen.Add(1)
+	}
+	return gen
+}
+
 func (c *replicatedReadReuseCache) reserveInto(key replicatedReadReuseKey, dst *ReplicatedReadLease,
 ) (*replicatedReadReuseSlot, *ReplicatedReadLease, error) {
+	if c.closedAtomic.Load() {
+		return nil, nil, ErrReplicatedApplyClosed
+	}
+	// Lock-free fast path: claim a parked slot atomically via CAS without
+	// taking c.mu. Slot fields (key, reader, prepared) are immutable while
+	// parked and exclusively owned once CAS transitions parked -> active.
+	for i := range c.slots {
+		if c.slotState[i].v.Load() != readReuseSlotParked {
+			continue
+		}
+		if !c.slotState[i].v.CompareAndSwap(readReuseSlotParked, readReuseSlotActive) {
+			continue
+		}
+		slot := &c.slots[i]
+		if c.closedAtomic.Load() {
+			reader := c.retire(slot)
+			closeReplicatedReadSlot(reader)
+			return nil, nil, ErrReplicatedApplyClosed
+		}
+		if slot.reader != nil && slot.key.equal(key) {
+			c.hits.Add(1)
+			gen := c.nextGeneration()
+			slot.active, slot.generation = true, gen
+			lease := dst
+			if lease == nil {
+				lease = &ReplicatedReadLease{}
+			}
+			*lease = ReplicatedReadLease{cache: c, slot: slot, generation: gen}
+			slot.lease = lease
+			c.liveGen[i].Store(gen)
+			c.liveLease[i].Store(lease)
+			return slot, lease, nil
+		}
+		c.slotState[i].v.Store(readReuseSlotParked)
+		if c.closedAtomic.Load() && c.slotState[i].v.CompareAndSwap(readReuseSlotParked, readReuseSlotActive) {
+			reader := c.retire(slot)
+			closeReplicatedReadSlot(reader)
+			return nil, nil, ErrReplicatedApplyClosed
+		}
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return nil, nil, ErrReplicatedApplyClosed
 	}
 	for i := range c.slots {
-		slot := &c.slots[i]
-		if !slot.active && slot.reader != nil && slot.key.equal(key) {
-			c.hits++
-			c.nextGen++
-			if c.nextGen == 0 {
-				c.nextGen++
-			}
-			slot.active, slot.generation = true, c.nextGen
-			lease := dst
-			if lease == nil {
-				lease = &ReplicatedReadLease{}
-			}
-			*lease = ReplicatedReadLease{cache: c, slot: slot, generation: slot.generation}
-			slot.lease = lease
-			c.liveGen[slot.slotIdx].Store(slot.generation)
-			c.liveLease[slot.slotIdx].Store(lease)
-			c.mu.Unlock()
-			return slot, lease, nil
+		if !c.slotState[i].v.CompareAndSwap(readReuseSlotIdle, readReuseSlotActive) {
+			continue
 		}
-	}
-	for i := range c.slots {
 		slot := &c.slots[i]
-		if slot.reader == nil && !slot.active {
-			c.misses++
-			c.nextGen++
-			if c.nextGen == 0 {
-				c.nextGen++
-			}
-			slot.active, slot.generation, slot.key = true, c.nextGen, key.owned()
-			c.mu.Unlock()
-			return slot, nil, nil
-		}
+		c.misses++
+		slot.active, slot.generation, slot.key = true, c.nextGeneration(), key.owned()
+		c.mu.Unlock()
+		return slot, nil, nil
 	}
 	// A schema/layout publication can leave an idle slot with the same SQL
 	// text but a stale physical identity. Reclaim one such bounded slot so a
 	// full fixed cache recovers without routing the shape forever to the cold
 	// path. Close the old session after releasing cache.mu.
 	for i := range c.slots {
+		if !c.slotState[i].v.CompareAndSwap(readReuseSlotParked, readReuseSlotActive) {
+			continue
+		}
 		slot := &c.slots[i]
-		if slot.active || slot.reader == nil ||
-			slot.key.sql != key.sql || slot.key.relation != key.relation {
+		if slot.reader == nil || slot.key.sql != key.sql || slot.key.relation != key.relation {
+			c.slotState[i].v.Store(readReuseSlotParked)
 			continue
 		}
 		oldReader := slot.reader
 		c.detachSlotLocked(slot)
 		c.misses++
-		c.nextGen++
-		if c.nextGen == 0 {
-			c.nextGen++
-		}
-		slot.active, slot.generation, slot.key = true, c.nextGen, key.owned()
+		slot.active, slot.generation, slot.key = true, c.nextGeneration(), key.owned()
+		c.slotState[i].v.Store(readReuseSlotActive)
 		c.mu.Unlock()
 		closeReplicatedReadSlot(oldReader)
 		return slot, nil, nil
@@ -630,20 +667,15 @@ func (c *replicatedReadReuseCache) leaseFor(
 }
 
 func (c *replicatedReadReuseCache) leaseForInto(slot *replicatedReadReuseSlot, dst *ReplicatedReadLease) *ReplicatedReadLease {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.nextGen++
-	if c.nextGen == 0 {
-		c.nextGen++
-	}
-	slot.active, slot.generation = true, c.nextGen
+	gen := c.nextGeneration()
+	slot.active, slot.generation = true, gen
 	lease := dst
 	if lease == nil {
 		lease = &ReplicatedReadLease{}
 	}
-	*lease = ReplicatedReadLease{cache: c, slot: slot, generation: slot.generation}
+	*lease = ReplicatedReadLease{cache: c, slot: slot, generation: gen}
 	slot.lease = lease
-	c.liveGen[slot.slotIdx].Store(slot.generation)
+	c.liveGen[slot.slotIdx].Store(gen)
 	c.liveLease[slot.slotIdx].Store(lease)
 	return lease
 }
@@ -672,6 +704,7 @@ func (c *replicatedReadReuseCache) cancelReservation(
 	c.mu.Lock()
 	if slot != nil && slot.active && slot.reader == nil {
 		slot.active, slot.lease, slot.key = false, nil, replicatedReadReuseKey{}
+		c.slotState[slot.slotIdx].v.Store(readReuseSlotIdle)
 	}
 	c.mu.Unlock()
 }
@@ -735,6 +768,20 @@ func (c *replicatedReadReuseCache) finish(
 		retire()
 		return nil
 	}
+	// Lock-free fast return: when retained bytes are unchanged (steady state)
+	// and the cache is open, park the slot directly without acquiring c.mu.
+	if !c.closedAtomic.Load() && slot.retainedByte == retained &&
+		slot.active && slot.lease == lease && slot.generation == gen {
+		slot.lease = nil
+		slot.active = false
+		c.slotState[idx].v.Store(readReuseSlotParked)
+		if c.closedAtomic.Load() && c.slotState[idx].v.CompareAndSwap(readReuseSlotParked, readReuseSlotActive) {
+			retire()
+			return nil
+		}
+		settled = true
+		return nil
+	}
 	c.mu.Lock()
 	if c.closed || !slot.active || slot.lease != lease || slot.generation != gen ||
 		c.retained-slot.retainedByte > replicatedReadReuseMaxBytes-retained {
@@ -746,6 +793,7 @@ func (c *replicatedReadReuseCache) finish(
 	slot.retainedByte = retained
 	slot.lease = nil
 	slot.active = false
+	c.slotState[idx].v.Store(readReuseSlotParked)
 	settled = true
 	c.mu.Unlock()
 	return nil
@@ -847,6 +895,7 @@ func (c *replicatedReadReuseCache) detachSlotLocked(
 	slot.prepared = nil
 	slot.cacheable = false
 	slot.retainedByte = 0
+	c.slotState[slot.slotIdx].v.Store(readReuseSlotIdle)
 }
 
 func (c *replicatedReadReuseCache) retire(
@@ -886,8 +935,12 @@ func (c *replicatedReadReuseCache) shutdown() {
 	var retire [replicatedReadReuseSlotCount]*ReplicatedReadSession
 	count := 0
 	for i := range c.slots {
+		if !c.slotState[i].v.CompareAndSwap(readReuseSlotParked, readReuseSlotClosing) {
+			continue
+		}
 		slot := &c.slots[i]
-		if slot.active || slot.reader == nil {
+		if slot.reader == nil {
+			c.slotState[i].v.Store(readReuseSlotIdle)
 			continue
 		}
 		retire[count], count = slot.reader, count+1

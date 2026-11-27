@@ -42,6 +42,22 @@ func primarySlotGeometryMaintained(root storeio.StateRoot) bool {
 		root.Options&storeio.StateOptionTinIndexes != 0
 }
 
+// primaryBatchMaintainOverlaySlots reports whether leaves should stay within
+// the 256-slot geometry so every row has a stable 8-bit PostingSlot. Replicated
+// CheckpointGroup collections with primaryUnifiedOverlay maintain 256-slot
+// leaves even when unindexed so high-churn UPDATEs and bulk DELETEs absorb
+// directly into the in-memory overlay instead of re-encoding wide stripes.
+func (c *Collection) primaryBatchMaintainOverlaySlots(root storeio.StateRoot) bool {
+	if primarySlotGeometryMaintained(root) {
+		return true
+	}
+	if c == nil || c.primaryUnifiedOverlay == nil {
+		return false
+	}
+	g := c.checkpointGroup.Load()
+	return g != nil && g.opts.OverlaySlotGeometry
+}
+
 func primaryUnifiedOverlayFoldExtent(
 	payloadBytes int, quantum, maxLeafBytes uint32,
 ) (uint32, bool) {
@@ -295,7 +311,7 @@ func (c *Collection) stagePrimaryBatchOrdinaryOverlayLocked(
 	batch *WriteBatch,
 ) (staged stagedPrimaryBatch, handled bool, err error) {
 	if c == nil || batch == nil || len(batch.entries) == 0 ||
-		c.primaryUnifiedOverlay == nil || c.options.OpaqueValues {
+		c.primaryUnifiedOverlay == nil {
 		return stagedPrimaryBatch{}, false, nil
 	}
 	if len(c.primaryPendingOverflowRetire) != 0 ||
@@ -316,7 +332,7 @@ func (c *Collection) stagePrimaryBatchOrdinaryOverlayLocked(
 			}
 		}
 		staged, handled, pressure, err :=
-			c.tryStagePrimaryBatchOrdinaryOverlayLocked(batch)
+			c.tryStagePrimaryBatchOrdinaryOverlayLocked(batch, false)
 		if err != nil {
 			return staged, true, err
 		}
@@ -333,6 +349,39 @@ func (c *Collection) stagePrimaryBatchOrdinaryOverlayLocked(
 		if err := c.materializePrimaryOverlayPressureLocked(); err != nil {
 			return stagedPrimaryBatch{}, true, err
 		}
+	}
+	return stagedPrimaryBatch{}, false, nil
+}
+
+// stagePrimaryBatchConditionalOverlayLocked stages inline replacements and
+// unindexed deletes (plus OpaqueValues system-collection updates) into
+// primaryUnifiedOverlay inside a CheckpointGroup. Unlike the ordinary lane,
+// overlay pressure falls through to multi-bucket volatile COW absorb (zero
+// disk fsync) instead of forcing a synchronous CheckpointGroup checkpoint.
+func (c *Collection) stagePrimaryBatchConditionalOverlayLocked(
+	batch *WriteBatch,
+) (staged stagedPrimaryBatch, handled bool, err error) {
+	if c == nil || batch == nil || len(batch.entries) == 0 ||
+		c.checkpointGroup.Load() == nil || c.primaryUnifiedOverlay == nil {
+		return stagedPrimaryBatch{}, false, nil
+	}
+	if len(c.primaryPendingOverflowRetire) != 0 ||
+		len(c.primaryMutationAdmitted) != 0 ||
+		len(c.batchPrimaryAdmitted) != 0 {
+		return stagedPrimaryBatch{}, false, nil
+	}
+	staged, handled, pressure, err :=
+		c.tryStagePrimaryBatchOrdinaryOverlayLocked(batch, true)
+	if err != nil {
+		return staged, true, err
+	}
+	if handled {
+		return staged, true, nil
+	}
+	if pressure {
+		// Fall through to multi-bucket volatile COW absorb in RAM instead of
+		// forcing a synchronous disk fsync checkpoint.
+		return stagedPrimaryBatch{}, false, nil
 	}
 	return stagedPrimaryBatch{}, false, nil
 }
@@ -392,6 +441,7 @@ func (c *Collection) primaryBatchShouldSkipInsertOverlay(
 
 func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 	batch *WriteBatch,
+	conditional bool,
 ) (staged stagedPrimaryBatch, handled bool, pressure bool, err error) {
 	state := c.state.Load()
 	if state == nil || state.root.PrimaryRoot == (storeio.PageRef{}) {
@@ -421,9 +471,16 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 	if len(c.batchPrimaryLeaves) == 0 || len(c.batchPrimaryMutations) == 0 {
 		return stagedPrimaryBatch{}, false, false, nil
 	}
+	allowDeletes := state.root.Options&storeio.StateOptionTinIndexes == 0
 	for index := range c.batchPrimaryMutations {
 		mutation := &c.batchPrimaryMutations[index]
-		if mutation.remove || mutation.stored.IsOverflow() ||
+		if mutation.remove {
+			if !allowDeletes {
+				return stagedPrimaryBatch{}, false, false, nil
+			}
+			continue
+		}
+		if mutation.stored.IsOverflow() ||
 			len(mutation.stored.Inline) == 0 ||
 			len(mutation.stored.Inline) > c.options.InlineValueBytes {
 			return stagedPrimaryBatch{}, false, false, nil
@@ -437,6 +494,7 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 	c.batchOverlayMutations = c.batchOverlayMutations[:0]
 	c.batchOldRawArena = c.batchOldRawArena[:0]
 	overlayDocDelta := 0
+	skippedDeletes := 0
 	router := c.primaryRouter.Load()
 	if router == nil {
 		return stagedPrimaryBatch{}, false, false, nil
@@ -474,6 +532,7 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 		leafWasEmpty := stripe.Len()+pendingRows == 0
 		filledEmpty := false
 		leafInserts := 0
+		leafRowDelta := 0
 		rawDelta := 0
 		for mutationAt := leaf.mutationAt; mutationAt < leaf.mutationEnd; mutationAt++ {
 			mutation := &c.batchPrimaryMutations[mutationAt]
@@ -487,6 +546,80 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 				leaf.resident.Bucket, mutation.resident.Hash, mutation.key,
 				state.root.Generation,
 			)
+			if mutation.remove {
+				if disposition == primaryUnifiedOverlayDeleted ||
+					(disposition == primaryUnifiedOverlayMissing && !baseFound) {
+					skippedDeletes++
+					continue
+				}
+				var stableSlot uint8
+				var oldLen int
+				var oldRaw []byte
+				switch disposition {
+				case primaryUnifiedOverlayValue:
+					stableSlot = overlaySlot
+					oldLen = len(current)
+					oldRaw = current
+				case primaryUnifiedOverlayMissing:
+					if stripe.Len() > storeio.CommonPrimaryLeafWideSlots {
+						lease.Release()
+						return stagedPrimaryBatch{}, false, false, nil
+					}
+					if _, overflow := stripe.OverflowRef(rank); overflow {
+						lease.Release()
+						return stagedPrimaryBatch{}, false, false, nil
+					}
+					var slotOK bool
+					stableSlot, slotOK = stripe.PostingSlot(rank)
+					if !slotOK {
+						lease.Release()
+						return stagedPrimaryBatch{}, false, false, nil
+					}
+					var decoded bool
+					c.overflowValueScratch, decoded = stripe.AppendValue(
+						c.overflowValueScratch[:0], rank,
+					)
+					if !decoded {
+						lease.Release()
+						return stagedPrimaryBatch{}, true, false,
+							storeio.ErrCommonPrimaryLeafCorrupt
+					}
+					oldLen = len(c.overflowValueScratch)
+					oldRaw = c.overflowValueScratch
+				default:
+					lease.Release()
+					return stagedPrimaryBatch{}, true, false,
+						storeio.ErrCommonPrimaryLeafCorrupt
+				}
+				if oldLen <= 0 {
+					lease.Release()
+					return stagedPrimaryBatch{}, false, false, nil
+				}
+				mutation.found = true
+				mutation.oldSlot = stableSlot
+				if state.root.IndexCount != 0 {
+					off := len(c.batchOldRawArena)
+					c.batchOldRawArena = append(c.batchOldRawArena, oldRaw...)
+					mutation.oldRawOff = off
+					mutation.oldRawLen = len(oldRaw)
+					mutation.capturedOldRaw = true
+				}
+				rawDelta -= oldLen
+				leafRowDelta--
+				overlayDocDelta--
+				c.batchOverlayMutations = append(c.batchOverlayMutations, primaryUnifiedOverlayBatchMutation{
+					bucket:          leaf.resident.Bucket,
+					hash:            mutation.resident.Hash,
+					key:             mutation.key,
+					rawDelta:        -oldLen,
+					countDelta:      -1,
+					kind:            primaryUnifiedOverlayDelete,
+					stableSlot:      stableSlot,
+					fixedLeafBytes:  overlay.maxLeafBytes,
+					reservationWide: true,
+				})
+				continue
+			}
 			found := baseFound
 			stableSlot := uint8(0)
 			oldLen := 0
@@ -503,6 +636,12 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 				return stagedPrimaryBatch{}, false, false, nil
 			case primaryUnifiedOverlayMissing:
 				if !baseFound {
+					if conditional && !c.options.OpaqueValues {
+						// Keep bulk user-table INSERTs on the append-only tail-split
+						// COW path instead of churning overlay buckets.
+						lease.Release()
+						return stagedPrimaryBatch{}, false, false, nil
+					}
 					if leaf.resident.Ref.Length ==
 						storeio.CommonPrimaryLeafMaxExtentBytes {
 						// A packed max-extent leaf still needs the COW builder
@@ -565,7 +704,7 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 			value := mutation.stored.Inline
 			if found &&
 				leaf.resident.Ref.Length == storeio.CommonPrimaryLeafMaxExtentBytes &&
-				!bytes.Equal(value, oldRaw) {
+				len(value) > oldLen {
 				lease.Release()
 				return stagedPrimaryBatch{}, false, false, nil
 			}
@@ -588,6 +727,7 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 				mutation.capturedOldRaw = true
 			}
 			rawDelta += mutationDelta
+			leafRowDelta += countDelta
 			overlayDocDelta += countDelta
 			c.batchOverlayMutations = append(c.batchOverlayMutations, primaryUnifiedOverlayBatchMutation{
 				bucket:          leaf.resident.Bucket,
@@ -601,6 +741,12 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 				fixedLeafBytes:  overlay.maxLeafBytes,
 				reservationWide: true,
 			})
+		}
+		if leafRowDelta < 0 && stripe.Len()+pendingRows+leafRowDelta <= 0 {
+			// Emptying a leaf updates router empty-leaf accounting; let the
+			// COW path maintain that structural transition cleanly.
+			lease.Release()
+			return stagedPrimaryBatch{}, false, false, nil
 		}
 		if stripe.EncodedPayloadBytes()+pendingRaw+rawDelta > maxPayload {
 			// Uncompressed overlay reservation is not a topology signal.
@@ -616,7 +762,12 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 		}
 		lease.Release()
 	}
-	if len(c.batchOverlayMutations) != len(c.batchPrimaryMutations) {
+	if len(c.batchOverlayMutations) == 0 &&
+		skippedDeletes == len(c.batchPrimaryMutations) {
+		return stagedPrimaryBatch{}, true, false, nil
+	}
+	if len(c.batchOverlayMutations) == 0 ||
+		len(c.batchOverlayMutations)+skippedDeletes != len(c.batchPrimaryMutations) {
 		return stagedPrimaryBatch{}, false, false, nil
 	}
 	if err := c.validatePrimaryUniqueBatch(); err != nil {
@@ -629,8 +780,27 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 			return stagedPrimaryBatch{}, true, false, storeio.ErrInvalidWrite
 		}
 	}
+	if conditional {
+		if err := c.reservePrimaryUnifiedOverlayRetentionLocked(
+			c.batchPrimaryLeaves,
+		); err != nil {
+			return stagedPrimaryBatch{}, true, false, err
+		}
+		if err := c.ensurePrimaryBatchConditionalJournalRoom(
+			c.batchJournalEntries,
+		); err != nil {
+			return stagedPrimaryBatch{}, true, false, err
+		}
+	}
 	if c.state.Load() != state {
 		return stagedPrimaryBatch{}, false, false, nil
+	}
+	if conditional {
+		c.clearPrimaryVolatileRetiredLocked()
+		if c.cache == nil || c.cache.DirtyCapacityAvailable() <
+			c.primaryTailCurrentChargeBytes.Load() {
+			return stagedPrimaryBatch{}, true, false, ErrCheckpointGroupPressure
+		}
 	}
 	prepared, prepareErr := overlay.prepareBatch(generation, c.batchOverlayMutations)
 	if prepareErr != nil {
@@ -648,6 +818,9 @@ func (c *Collection) tryStagePrimaryBatchOrdinaryOverlayLocked(
 	if exactPressure {
 		overlay.abortBatch(&prepared)
 		c.unwindPrimaryExactPrepared(&preparedExact)
+		if conditional {
+			return stagedPrimaryBatch{}, true, false, ErrCheckpointGroupPressure
+		}
 		return stagedPrimaryBatch{}, false, overlay.hasPending(), nil
 	}
 	return stagedPrimaryBatch{
@@ -1058,6 +1231,64 @@ func (c *Collection) reservePrimaryUnifiedOverlayRetentionLocked(
 	return nil
 }
 
+// canAbsorbAllOverlayIntoBatchCOW reports whether the current batch can fold
+// every pending overlay bucket into volatile COW leaves in memory in the same
+// generation without forcing a synchronous disk fsync checkpoint.
+func (c *Collection) canAbsorbAllOverlayIntoBatchCOW() bool {
+	if c == nil || c.primaryUnifiedOverlay == nil ||
+		!c.primaryUnifiedOverlay.hasPending() ||
+		len(c.primaryPendingOverflowRetire) != 0 ||
+		c.primaryTailSplit != nil {
+		return false
+	}
+	state := c.state.Load()
+	return state != nil && state.root.IndexCount == 0
+}
+
+// appendPendingOverlayLeavesLocked appends any pending overlay bucket not
+// already touched by the current batch as an overlay-only leaf so one volatile
+// COW pass absorbs the entire overlay window in RAM with zero disk fsync.
+func (c *Collection) appendPendingOverlayLeavesLocked(state *fileStoreState) error {
+	var overlayBuckets [primaryUnifiedOverlayBuckets]storeio.BucketID
+	var overlayKeys [primaryUnifiedOverlayBuckets][]byte
+	count, err := c.primaryUnifiedOverlay.pendingBuckets(
+		&overlayBuckets, &overlayKeys,
+	)
+	if err != nil {
+		if errors.Is(err, storeio.ErrPageCachePinned) {
+			return ErrCheckpointGroupPressure
+		}
+		return err
+	}
+	for i := 0; i < count; i++ {
+		bucket := overlayBuckets[i]
+		present := false
+		for j := range c.batchPrimaryLeaves {
+			if c.batchPrimaryLeaves[j].resident.Bucket == bucket {
+				present = true
+				break
+			}
+		}
+		if present {
+			continue
+		}
+		if len(c.batchPrimaryLeaves) >= cap(c.primaryPendingParents) {
+			return ErrCheckpointGroupPressure
+		}
+		resident, routeErr := c.currentPrimaryResidentRoute(state, overlayKeys[i])
+		if routeErr != nil {
+			return routeErr
+		}
+		c.batchPrimaryLeaves = append(c.batchPrimaryLeaves, primaryBatchLeaf{
+			resident:         resident,
+			firstKey:         overlayKeys[i],
+			pendingIndex:     c.primaryPendingParentIndex(bucket),
+			tailLineageIndex: -1,
+		})
+	}
+	return nil
+}
+
 func (c *Collection) stagePrimaryBatchForJournalLocked(
 	batch *WriteBatch, conditional bool,
 ) (stagedPrimaryBatch, error) {
@@ -1079,6 +1310,9 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 		if staged, handled, err := c.stagePrimaryBatchUnifiedOverlayLocked(batch); handled {
 			return staged, err
 		}
+		if staged, handled, err := c.stagePrimaryBatchConditionalOverlayLocked(batch); handled {
+			return staged, err
+		}
 	} else if c.primaryTailSplit == nil {
 		if staged, handled, err := c.stagePrimaryBatchOrdinaryOverlayLocked(batch); handled {
 			return staged, err
@@ -1086,8 +1320,9 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 	}
 	c.absorbOverlayOnCOW = false
 	if c.primaryUnifiedOverlay.hasPending() {
-		absorb := c.batchOverlayPlanned && len(c.batchPrimaryLeaves) == 1 &&
-			c.canAbsorbOverlayIntoBatchCOW(c.batchPrimaryLeaves[0].resident.Bucket)
+		absorb := (c.batchOverlayPlanned && len(c.batchPrimaryLeaves) == 1 &&
+			c.canAbsorbOverlayIntoBatchCOW(c.batchPrimaryLeaves[0].resident.Bucket)) ||
+			c.canAbsorbAllOverlayIntoBatchCOW()
 		if absorb {
 			c.absorbOverlayOnCOW = true
 		} else if err := c.materializePrimaryParentsLocked(
@@ -1122,7 +1357,12 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 		if err := c.planPrimaryBatch(state, batch); err != nil {
 			return stagedPrimaryBatch{}, err
 		}
-		tailCandidate := !suppressTailOnce &&
+		if c.absorbOverlayOnCOW && c.primaryUnifiedOverlay.hasPending() {
+			if err := c.appendPendingOverlayLeavesLocked(state); err != nil {
+				return stagedPrimaryBatch{}, err
+			}
+		}
+		tailCandidate := !c.absorbOverlayOnCOW && !suppressTailOnce &&
 			c.primaryTailBatchCandidate(state, conditional)
 		if c.primaryTailSplit != nil && !tailCandidate {
 			return stagedPrimaryBatch{}, ErrCheckpointGroupPressure
@@ -1154,7 +1394,17 @@ func (c *Collection) stagePrimaryBatchForJournalLocked(
 		splitKey, generation, buildErr := c.buildPrimaryBatchLeaves(state)
 		if errors.Is(buildErr, ErrPrimaryLeafSplitRequired) {
 			lastErr = buildErr
+			wasAbsorb := c.absorbOverlayOnCOW
 			c.absorbOverlayOnCOW = false
+			if wasAbsorb && c.primaryUnifiedOverlay.hasPending() &&
+				c.primaryUnifiedOverlay.bucketCount.Load() > 1 {
+				if err := c.materializePrimaryParentsLocked(
+					primaryMaterializationBarrier,
+				); err != nil {
+					return stagedPrimaryBatch{}, err
+				}
+				continue
+			}
 			if tailCandidate {
 				staged, tailErr := c.preparePrimaryTailBatchSplitLocked(
 					state, state.root.Generation+1,
@@ -1493,17 +1743,20 @@ func (c *Collection) preparePrimaryBatchExactOverlayDeltas(
 	}
 	for i := range c.batchPrimaryMutations {
 		mutation := &c.batchPrimaryMutations[i]
-		if mutation.remove {
-			c.unwindPrimaryExactPrepared(&prepared)
-			return primaryExactPrepared{}, true, nil
+		if mutation.remove && !mutation.found {
+			continue
 		}
 		var oldRaw []byte
 		if mutation.capturedOldRaw {
 			oldRaw = c.batchOldRawArena[mutation.oldRawOff : mutation.oldRawOff+mutation.oldRawLen]
 		}
+		var newRaw []byte
+		if !mutation.remove {
+			newRaw = mutation.value
+		}
 		ok, deltaErr := c.preparePrimaryExactDeltaRaw(
 			epoch, &prepared, mutation.resident,
-			oldRaw, mutation.value, false, mutation.found,
+			oldRaw, newRaw, mutation.remove, mutation.found,
 			mutation.oldSlot, mutation.oldSlot, generation,
 		)
 		if deltaErr != nil {
@@ -2018,7 +2271,9 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	); err != nil {
 		return nil, err
 	}
-	if c.absorbOverlayOnCOW {
+	overlayApplied := false
+	if c.absorbOverlayOnCOW && c.primaryUnifiedOverlay.pendingBucket(leaf.resident.Bucket) {
+		overlayApplied = true
 		baseRows = slices.Grow(baseRows, storeio.CommonPrimaryLeafWideSlots)
 		appliedRows, applyErr := c.primaryUnifiedOverlay.applyBucket(
 			baseRows, leaf.resident.Bucket, state.root.Generation,
@@ -2046,7 +2301,7 @@ func (c *Collection) buildPrimaryBatchLeaf(
 	}
 	leaf.applied = applied
 	c.structuralRows = final
-	if leaf.applied == 0 {
+	if leaf.applied == 0 && !overlayApplied {
 		leaf.skip = true
 		return nil, nil
 	}
@@ -2088,7 +2343,7 @@ func (c *Collection) buildPrimaryBatchLeaf(
 			ErrPrimaryLeafSplitRequired, storeio.ErrCommonPrimaryLeafFull,
 		)
 	}
-	maintainSlots := primarySlotGeometryMaintained(state.root)
+	maintainSlots := c.primaryBatchMaintainOverlaySlots(state.root)
 	if len(final) > storeio.CommonPrimaryLeafWideSlots && maintainSlots {
 		c.primaryLeafSplitRequired.Add(1)
 		return c.primaryBatchProspectiveSplitKey(final), errors.Join(
@@ -2156,7 +2411,7 @@ func (c *Collection) buildPrimaryBatchLeaf(
 		}
 		image = encoded
 	}
-	if leaf.docDelta < 0 && len(final) > 0 && c.primaryUnderfilledCount < primaryLeafMergeBudgetPerFold {
+	if (leaf.docDelta < 0 || len(final) < stripe.Len()) && len(final) > 0 && c.primaryUnderfilledCount < primaryLeafMergeBudgetPerFold {
 		if hdr, _, hdrErr := storeio.OpenPage(image); hdrErr == nil &&
 			primaryLeafIsUnderfilled(len(final), int(hdr.PayloadLength), len(image)) {
 			c.recordUnderfilledPrimaryLeafLocked(final[0].Key)

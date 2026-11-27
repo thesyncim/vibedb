@@ -14,6 +14,18 @@ import (
 	"github.com/thesyncim/vibedb/query"
 )
 
+// DirectSQLTarget allows an in-process local fused SQL read to materialize
+// owned query.Cell values directly into the caller's reusable query.Result
+// and byte arena, skipping intermediate ShardResponse row/cell slices,
+// TypedCells transpose buffers, and unused JSON encodings.
+type DirectSQLTarget struct {
+	Result    *query.Result
+	Arena     *[]byte
+	Populated bool
+	RowCount  int
+	WireBytes uint64
+}
+
 // ReplicatedCall is the transport-neutral operation envelope. SQL remains a
 // typed request for the local path; the authenticated remote adapter is the
 // only layer that turns it into the legacy Query bytes field.
@@ -21,6 +33,7 @@ type ReplicatedCall struct {
 	Request       ReplicatedRequest
 	SQL           *ShardRequest
 	SQLFrameBytes int
+	DirectSQL     *DirectSQLTarget
 }
 
 // ReplicatedReply is the transport-neutral result envelope. SQL is populated
@@ -205,7 +218,7 @@ func (server *ReplicatedServer) DispatchReplicated(ctx context.Context, call Rep
 		request, semanticSQL = &owned.Request, owned.SQL
 	}
 	server.semanticDispatch.Add(1)
-	response := server.executeReplicatedAuthenticatedCallValidated(requestCtx, request, true, semanticSQL, true)
+	response := server.executeReplicatedAuthenticatedCallDirect(requestCtx, request, true, semanticSQL, true, call.DirectSQL)
 	if fastSyncSQLRead && (binding.generation != binding.storage.generationAtomic.Load() ||
 		server.local.Load() != binding || binding.ctx.Err() != nil ||
 		server.state.Load() == replicatedServerClosed) {

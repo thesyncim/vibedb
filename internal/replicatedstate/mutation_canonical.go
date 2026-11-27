@@ -77,6 +77,23 @@ func (m *Machine) reserveCanonicalMutations() bool {
 				continue
 			}
 			bound := canonicalMutationUpperBytes(mutation.Value)
+			if mutation.Kind == replication.MutationJSONInt64Delta {
+				// Apply-time JSON delta/patch descriptors are compact compared
+				// to the materialized document they rewrite; reserve enough
+				// canonicalization headroom for the full materialized document
+				// (including potential U+2028/U+2029 escaping).
+				docBound := m.relations[ordinal].target.Limits.MaxDocumentBytes
+				if docBound > 0 {
+					if docBound <= maxCanonicalMutationBytes/2 {
+						docBound *= 2
+					} else {
+						docBound = maxCanonicalMutationBytes
+					}
+					if docBound > bound {
+						bound = docBound
+					}
+				}
+			}
 			if bound > maxCanonicalMutationBytes-budget {
 				return false
 			}

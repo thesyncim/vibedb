@@ -46,22 +46,22 @@ func preparedDirectInt64Delta(
 	assignments := update.Assignments
 	if len(assignments) == 1 {
 		assignment := assignments[0]
-		if assignment.Expr == nil || assignment.Value.Kind != sqlast.OperandExpression ||
-			assignment.Column == "" || !declaredIntegerColumn(info, assignment.Column) {
-			return nil, false
+		if assignment.Expr != nil && assignment.Value.Kind == sqlast.OperandExpression &&
+			assignment.Column != "" && declaredIntegerColumn(info, assignment.Column) {
+			if delta, ok := scalarInt64Delta(assignment.Expr, assignment.Column, statement.bound.updateArgs); ok {
+				descriptor, err := replication.AppendJSONInt64Delta(nil, assignment.Column, delta)
+				return descriptor, err == nil
+			}
 		}
-		delta, ok := scalarInt64Delta(assignment.Expr, assignment.Column, statement.bound.updateArgs)
-		if !ok {
-			return nil, false
-		}
-		descriptor, err := replication.AppendJSONInt64Delta(nil, assignment.Column, delta)
-		return descriptor, err == nil
+		return preparedDirectColumnPatch(info, assignments, statement.bound.updateArgs)
 	}
+	allDelta := true
 	fields := make([]replication.JSONInt64DeltaField, len(assignments))
 	for index, assignment := range assignments {
 		if assignment.Expr == nil || assignment.Value.Kind != sqlast.OperandExpression ||
 			assignment.Column == "" || !declaredIntegerColumn(info, assignment.Column) {
-			return nil, false
+			allDelta = false
+			break
 		}
 		for prior := 0; prior < index; prior++ {
 			if fields[prior].Column == assignment.Column {
@@ -70,12 +70,173 @@ func preparedDirectInt64Delta(
 		}
 		delta, ok := scalarInt64Delta(assignment.Expr, assignment.Column, statement.bound.updateArgs)
 		if !ok {
-			return nil, false
+			allDelta = false
+			break
 		}
 		fields[index] = replication.JSONInt64DeltaField{Column: assignment.Column, Delta: delta}
 	}
-	descriptor, err := replication.AppendJSONInt64Deltas(nil, fields)
+	if allDelta {
+		descriptor, err := replication.AppendJSONInt64Deltas(nil, fields)
+		return descriptor, err == nil
+	}
+	return preparedDirectColumnPatch(info, assignments, statement.bound.updateArgs)
+}
+
+// preparedDirectColumnPatch lowers a direct single-row PK UPDATE with literal
+// or parameter assignments (e.g. UPDATE t SET v = $1, payload = $2 WHERE k = $3)
+// into a single-RTT JCP1 apply-time patch, eliminating the gateway preimage
+// ReadIndex RPC and optimistic SHA-256 digest retries under concurrent churn.
+func preparedDirectColumnPatch(
+	info sqldriver.TableInfo,
+	assignments []sqlast.UpdateAssignment,
+	args []any,
+) ([]byte, bool) {
+	if len(assignments) == 0 || len(assignments) > replication.MaxJSONInt64DeltaFields {
+		return nil, false
+	}
+	var inline [8]replication.JSONColumnPatchField
+	var fields []replication.JSONColumnPatchField
+	if len(assignments) <= len(inline) {
+		fields = inline[:0]
+	} else {
+		fields = make([]replication.JSONColumnPatchField, 0, len(assignments))
+	}
+	var valArena []byte
+	for index, assignment := range assignments {
+		if assignment.Expr != nil || assignment.Column == "" || !declaredColumnExists(info, assignment.Column) {
+			return nil, false
+		}
+		for prior := 0; prior < index; prior++ {
+			if fields[prior].Column == assignment.Column {
+				return nil, false
+			}
+		}
+		start := len(valArena)
+		var ok bool
+		valArena, ok = appendDirectPatchOperandJSON(valArena, assignment.Value, args)
+		if !ok {
+			return nil, false
+		}
+		fields = append(fields, replication.JSONColumnPatchField{
+			Column:  assignment.Column,
+			RawJSON: valArena[start:len(valArena):len(valArena)],
+		})
+	}
+	descriptor, err := replication.AppendJSONColumnPatch(nil, fields)
 	return descriptor, err == nil
+}
+
+func declaredColumnExists(info sqldriver.TableInfo, column string) bool {
+	var buf [64]byte
+	pointer := appendJSONColumnPointer(buf[:0], column)
+	for _, declared := range info.Columns {
+		if len(declared.Path) == len(pointer) && declared.Path == string(pointer) {
+			return true
+		}
+	}
+	return false
+}
+
+func appendDirectPatchOperandJSON(dst []byte, operand sqlast.Operand, args []any) ([]byte, bool) {
+	switch operand.Kind {
+	case sqlast.OperandNull:
+		return append(dst, "null"...), true
+	case sqlast.OperandBool:
+		if operand.Bool {
+			return append(dst, "true"...), true
+		}
+		return append(dst, "false"...), true
+	case sqlast.OperandString:
+		return strconv.AppendQuote(dst, operand.Text), true
+	case sqlast.OperandNumber:
+		if operand.Text == "" {
+			return dst, false
+		}
+		return append(dst, operand.Text...), true
+	case sqlast.OperandParam:
+		if operand.Ordinal < 0 || operand.Ordinal >= len(args) {
+			return dst, false
+		}
+		return appendDirectPatchValueJSON(dst, args[operand.Ordinal])
+	default:
+		return dst, false
+	}
+}
+
+func appendDirectPatchValueJSON(dst []byte, value any) ([]byte, bool) {
+	switch v := value.(type) {
+	case nil:
+		return append(dst, "null"...), true
+	case bool:
+		if v {
+			return append(dst, "true"...), true
+		}
+		return append(dst, "false"...), true
+	case *bool:
+		if v == nil {
+			return append(dst, "null"...), true
+		}
+		if *v {
+			return append(dst, "true"...), true
+		}
+		return append(dst, "false"...), true
+	case int:
+		return strconv.AppendInt(dst, int64(v), 10), true
+	case int64:
+		return strconv.AppendInt(dst, v, 10), true
+	case *int64:
+		if v == nil {
+			return append(dst, "null"...), true
+		}
+		return strconv.AppendInt(dst, *v, 10), true
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return dst, false
+		}
+		return strconv.AppendFloat(dst, v, 'g', -1, 64), true
+	case *float64:
+		if v == nil {
+			return append(dst, "null"...), true
+		}
+		if math.IsNaN(*v) || math.IsInf(*v, 0) {
+			return dst, false
+		}
+		return strconv.AppendFloat(dst, *v, 'g', -1, 64), true
+	case query.Number:
+		if v == "" {
+			return dst, false
+		}
+		return append(dst, string(v)...), true
+	case *query.Number:
+		if v == nil {
+			return append(dst, "null"...), true
+		}
+		if *v == "" {
+			return dst, false
+		}
+		return append(dst, string(*v)...), true
+	case string:
+		return strconv.AppendQuote(dst, v), true
+	case *string:
+		if v == nil {
+			return append(dst, "null"...), true
+		}
+		return strconv.AppendQuote(dst, *v), true
+	case []byte:
+		return strconv.AppendQuote(dst, string(v)), true
+	case *[]byte:
+		if v == nil {
+			return append(dst, "null"...), true
+		}
+		return strconv.AppendQuote(dst, string(*v)), true
+	case vibejson.RawValue:
+		if len(v.Src) == 0 {
+			return dst, false
+		}
+		return append(dst, v.Src...), true
+	default:
+		return dst, false
+	}
 }
 
 func declaredIntegerColumn(info sqldriver.TableInfo, column string) bool {

@@ -367,3 +367,41 @@ func TestJSONInt64DeltasNullMissingAndInvalidDescriptorAreDeterministic(t *testi
 		t.Fatalf("invalid multi changed row=%q found=%v err=%v", value, found, err)
 	}
 }
+
+func TestJSONColumnPatchAddsNewColumnInCanonicalOrder(t *testing.T) {
+	fixture := newRelationBundleFixture(t, true)
+	key := []byte("online-1")
+	seed := fixture.command(t, 1, replication.RelationMutationBatch{
+		Relation: 1,
+		Mutations: []replication.Mutation{{
+			Kind:  replication.MutationPut,
+			Key:   key,
+			Value: []byte(`{"id":"online-1","value":7}`),
+		}},
+	})
+	if _, err := fixture.machine.ApplyNormal(normalMeta(3), seed); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := replication.AppendJSONColumnPatch(nil, []replication.JSONColumnPatchField{
+		{Column: "marker", RawJSON: []byte(`"after-alter"`)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion, rows := applyJSONDelta(t, fixture, 2, 4, true, replication.Mutation{
+		Kind:  replication.MutationJSONInt64Delta,
+		Key:   key,
+		Value: descriptor,
+	})
+	if completion.ResultCode != ResultApplied || rows != 1 {
+		t.Fatalf("column patch completion=%+v rows=%d", completion, rows)
+	}
+	got, found, err := fixture.base.Collection.AppendRaw(nil, key)
+	if err != nil || !found {
+		t.Fatalf("read patched row found=%v err=%v", found, err)
+	}
+	want := `{"id":"online-1","marker":"after-alter","value":7}`
+	if string(got) != want {
+		t.Fatalf("patched row=%s want=%s", got, want)
+	}
+}

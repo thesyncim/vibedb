@@ -294,6 +294,7 @@ type primaryExactEpoch struct {
 	// whole overlay cost of the post-fold probe gate.
 	termRecordCount atomic.Uint32
 	tileRecordCount atomic.Uint32
+	tileEntryCount  atomic.Uint32
 
 	// liveStorage is the epoch-owned backing for the flat live table a dirty
 	// fold clones into: the previous epoch's slots are copied verbatim and
@@ -340,6 +341,7 @@ func (e *primaryExactEpoch) reset() {
 	e.termBytesN = 0
 	e.termRecordCount.Store(0)
 	e.tileRecordCount.Store(0)
+	e.tileEntryCount.Store(0)
 	clear(e.liveStorage.slots)
 	e.liveStorage.count = 0
 }
@@ -436,6 +438,7 @@ func (e *primaryExactEpoch) reserveTileEntry(
 	}
 	entry = &e.tileEntries[e.tileEntryN]
 	e.tileEntryN++
+	e.tileEntryCount.Store(uint32(e.tileEntryN))
 	*entry = primaryExactTileEntry{tileID: tileID}
 	mask := uint32(len(e.tileTable) - 1)
 	at := primaryExactTileSlotHash(tileID) & mask
@@ -513,7 +516,7 @@ func (e *primaryExactEpoch) liveTileBound() uint64 {
 	if e.live != nil {
 		count = uint64(e.live.count)
 	}
-	return count + uint64(e.tileRecordCount.Load())
+	return count + uint64(e.tileEntryCount.Load())
 }
 
 // retiredPrimaryExactEpoch is one superseded epoch on the generation-keyed

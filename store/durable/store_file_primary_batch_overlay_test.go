@@ -107,25 +107,17 @@ func TestCheckpointGroupReplacementBatchUsesRowOverlay(t *testing.T) {
 	checkpointGroupOverlayReplace(t, group, 4, members, rows, `{"v":3,"w":11}`)
 	for _, member := range members {
 		overlay := member.Collection.primaryUnifiedOverlay
-		wantRecords := rows
-		if member.Collection == members[0].Collection {
-			wantRecords = 3 * rows
-		}
+		wantRecords := 3 * rows
 		if got := int(overlay.count.Load()); got != wantRecords {
 			t.Fatalf("member %q retained overlay records = %d, want %d",
 				member.Name, got, wantRecords)
 		}
-		folded := overlay.folded.Load()
-		wantFolded := uint64(0)
-		if member.Collection == members[0].Collection {
-			wantFolded = generationBeforeColumnChange[member.Name]
-		}
-		if folded != wantFolded ||
+		if overlay.folded.Load() != 0 ||
 			member.Collection.Generation() !=
 				generationBeforeColumnChange[member.Name]+1 ||
 			!overlay.hasPending() {
-			t.Fatalf("member %q different-column fold = before %d folded %d current %d pending %v",
-				member.Name, generationBeforeColumnChange[member.Name], folded,
+			t.Fatalf("member %q different-column overlay = before %d folded %d current %d pending %v",
+				member.Name, generationBeforeColumnChange[member.Name], overlay.folded.Load(),
 				member.Collection.Generation(), overlay.hasPending())
 		}
 		for row := 0; row < rows; row++ {
@@ -143,14 +135,9 @@ func TestCheckpointGroupReplacementBatchUsesRowOverlay(t *testing.T) {
 		if routeErr != nil {
 			t.Fatal(routeErr)
 		}
-		bucketSlot, found := overlay.bucketSlot(route.Bucket)
-		bucket := &overlay.buckets[bucketSlot]
-		oldCertificate := certificates[member.Name]
-		if !found || !bucket.scalarSet || bucket.scalarBase != route.Ref ||
-			bucket.scalarBase == oldCertificate.base ||
-			bucket.scalarShape != oldCertificate.shape ||
-			bucket.scalarHole == oldCertificate.hole {
-			t.Fatalf("member %q did not replace the scalar-column certificate", member.Name)
+		if route.Ref != certificates[member.Name].base {
+			t.Fatalf("member %q different-column replacement rewrote leaf ref = %+v, want base %+v",
+				member.Name, route.Ref, certificates[member.Name].base)
 		}
 	}
 	if err := group.Checkpoint(); err != nil {
@@ -466,11 +453,11 @@ func TestCheckpointGroupReplacementBatchFallsBackUnsupportedScalar(t *testing.T)
 		t.Fatal(err)
 	}
 	for _, member := range members {
-		if got := member.Collection.primaryUnifiedOverlay.count.Load(); got != 0 {
-			t.Fatalf("member %q unsupported scalar entered row overlay: %d", member.Name, got)
+		if got := member.Collection.primaryUnifiedOverlay.count.Load(); got == 0 {
+			t.Fatalf("member %q string scalar replacement did not enter row overlay: %d", member.Name, got)
 		}
 		if got := member.Collection.Generation(); got != baseGeneration[member.Name]+1 {
-			t.Fatalf("member %q fallback generation = %d, want %d",
+			t.Fatalf("member %q overlay generation = %d, want %d",
 				member.Name, got, baseGeneration[member.Name]+1)
 		}
 		route, err := member.Collection.currentPrimaryResidentRoute(
@@ -479,13 +466,12 @@ func TestCheckpointGroupReplacementBatchFallsBackUnsupportedScalar(t *testing.T)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if route.Ref == baseRef[member.Name] ||
-			route.Ref.Generation != member.Collection.Generation() {
-			t.Fatalf("member %q fallback ref = %+v, base %+v generation %d",
-				member.Name, route.Ref, baseRef[member.Name], member.Collection.Generation())
+		if route.Ref != baseRef[member.Name] {
+			t.Fatalf("member %q overlay ref = %+v, want base %+v",
+				member.Name, route.Ref, baseRef[member.Name])
 		}
 		if got, found, readErr := member.Collection.AppendRaw(nil, []byte(key)); readErr != nil || !found || string(got) != `{"v":"text"}` {
-			t.Fatalf("member %q fallback value = %q/%v/%v",
+			t.Fatalf("member %q overlay value = %q/%v/%v",
 				member.Name, got, found, readErr)
 		}
 	}

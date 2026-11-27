@@ -75,6 +75,7 @@ type postgresSession struct {
 	params              []shardservice.Param
 	paramTextBuf        []byte
 	materialized        query.Result
+	materializedArena   []byte
 	materializedRelease func() error
 	cancelMu            sync.Mutex
 	cancel              context.CancelFunc
@@ -88,6 +89,11 @@ func (s *postgresSession) releaseMaterialized() error {
 		s.materialized.Columns[i].Cells = s.materialized.Columns[i].Cells[:0]
 	}
 	s.materialized.RowCount = 0
+	if cap(s.materializedArena) > 1<<20 {
+		s.materializedArena = nil
+	} else {
+		s.materializedArena = s.materializedArena[:0]
+	}
 	return nil
 }
 
@@ -265,6 +271,7 @@ func (s *postgresSession) Close() error {
 	s.writeCache = postgresWriteCache{}
 	s.params = nil
 	s.materialized.Release()
+	s.materializedArena = nil
 	return nil
 }
 
@@ -761,6 +768,9 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 	}
 	profile := s.backend.Executor.profileFor(ClassBatch)
 	profile.MaxConcurrency = min(profile.MaxConcurrency, 4)
+	if profile.PerShardDeadline > 0 && (profile.GlobalDeadline <= 0 || profile.PerShardDeadline < profile.GlobalDeadline) {
+		profile.GlobalDeadline = profile.PerShardDeadline
+	}
 	if s.rows > 0 {
 		profile.MaxAggregateRows = min(profile.MaxAggregateRows, uint64(s.rows))
 		profile.PerShardRows = min(profile.PerShardRows, profile.MaxAggregateRows)
@@ -769,17 +779,52 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 		profile.MaxAggregateBytes = min(profile.MaxAggregateBytes, uint64(s.bytes))
 		profile.PerShardBytes = min(profile.PerShardBytes, profile.MaxAggregateBytes)
 	}
-	result, err := s.backend.Executor.queryPreparedWithProfile(ctx, Query{
+	directTarget := shardservice.DirectSQLTarget{
+		Result: &s.materialized,
+		Arena:  &s.materializedArena,
+	}
+	result, err := s.backend.Executor.queryPreparedWithProfileInto(ctx, Query{
 		SQL: p.compiled.SQL(), Params: params, ParamTypes: p.paramTypes, Class: ClassBatch,
-	}, profile, p.compiled.NumParams(), &p.execution)
+	}, profile, p.compiled.NumParams(), &p.execution, &directTarget)
 	if err != nil {
 		// A failed read exposes no rows or effects. Once the certified catalog
 		// refresh is exhausted, report a serialization failure so the caller
 		// can retry the same statement after publication catches up.
+		if directTarget.Populated {
+			_ = s.releaseMaterialized()
+		}
 		if errors.Is(err, ErrStaleGeneration) {
 			return errors.Join(driver.ErrTransactionConflict, err)
 		}
 		return err
+	}
+	materialized := &s.materialized
+	installed := false
+	defer func() {
+		if !installed {
+			_ = s.releaseMaterialized()
+		}
+	}()
+	if directTarget.Populated {
+		if s.rows > 0 && directTarget.RowCount > s.rows {
+			return ErrResultLimit
+		}
+		if s.bytes > 0 {
+			retained := int64(directTarget.RowCount)*int64(len(materialized.Columns))*64 +
+				int64(2*len(s.materializedArena))
+			if retained > s.bytes {
+				return ErrResultLimit
+			}
+		}
+		cursor, err := query.NewResultCursor(materialized)
+		if err != nil {
+			return err
+		}
+		if err := rows.SetMaterialized(cursor, s.materializedRelease); err != nil {
+			return err
+		}
+		installed = true
+		return nil
 	}
 	if s.rows > 0 && len(result.Rows) > s.rows {
 		return ErrResultLimit
@@ -795,13 +840,6 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 			return ErrResultLimit
 		}
 	}
-	materialized := &s.materialized
-	installed := false
-	defer func() {
-		if !installed {
-			_ = s.releaseMaterialized()
-		}
-	}()
 	previousColumns := materialized.Columns
 	if cap(previousColumns) < len(result.Columns) {
 		for i := range previousColumns {

@@ -209,11 +209,11 @@ func TestPrimaryBatchPhaseUnwindOnPrepareFailure(t *testing.T) {
 		coll.writer.Unlock()
 		t.Fatal("expected live staged batch")
 	}
-	if len(coll.batchPrimaryAdmitted) == 0 {
+	if len(coll.batchPrimaryAdmitted) == 0 && !staged.preparedOverlay.live {
 		coll.unwindStagedPrimaryBatch(&staged)
 		coll.releaseFileWriteBatch(batch)
 		coll.writer.Unlock()
-		t.Fatal("expected admitted frames before unwind")
+		t.Fatal("expected admitted frames or live overlay before unwind")
 	}
 	// Fail between stage and prepare: full unwind, no journal fence.
 	coll.unwindStagedPrimaryBatch(&staged)

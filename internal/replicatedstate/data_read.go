@@ -96,12 +96,13 @@ func (m *Machine) DataReadCutInto(
 	if minimumApplied == 0 {
 		return ErrReadBehind
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
 	if err := m.checkUsable(); err != nil {
+		m.mu.RUnlock()
 		return err
 	}
 	if m.publication.Applied < minimumApplied {
+		m.mu.RUnlock()
 		return ErrReadBehind
 	}
 	var all [replication.MaxRelationsPerBundle]replication.RelationID
@@ -115,24 +116,32 @@ func (m *Machine) DataReadCutInto(
 	full := completeOwnershipRange(m.state.Binding.OwnedRange)
 	for _, id := range ids {
 		if id == 0 || int(id) > len(m.relations) || m.relations[id-1].id != id {
+			m.mu.RUnlock()
 			return ErrInvalidCollection
 		}
 		bit := uint64(1) << (id - 1)
 		if selected&bit != 0 {
+			m.mu.RUnlock()
 			return ErrInvalidCollection
 		}
 		if _, ok := m.relations[id-1].target.Validator.(OwnershipPointValidator); !ok && !full {
+			m.mu.RUnlock()
 			return ErrWrongBinding
 		}
 		selected |= bit
 	}
 	if m.state.TransactionIntentRows != 0 {
+		m.mu.RUnlock()
 		return ErrTransactionIntentActive
 	}
 	// SnapshotInto retains its workspace; no row copy, system scan, or backup
 	// certificate is needed. Apply already maintains the publication invariant.
 	if err := durable.SnapshotCollectionsInto(&dst.cut, m.members); err != nil {
-		return m.fail(err)
+		m.mu.RUnlock()
+		m.mu.Lock()
+		failed := m.fail(err)
+		m.mu.Unlock()
+		return failed
 	}
 	for _, id := range ids {
 		relation := &m.relations[id-1]
@@ -140,7 +149,12 @@ func (m *Machine) DataReadCutInto(
 		if !ok || snapshot == nil {
 			clear(dst.relations[:])
 			clear(dst.validators[:])
-			return m.fail(errors.Join(ErrInconsistentSnapshot, dst.cut.Close()))
+			closeErr := dst.cut.Close()
+			m.mu.RUnlock()
+			m.mu.Lock()
+			failed := m.fail(errors.Join(ErrInconsistentSnapshot, closeErr))
+			m.mu.Unlock()
+			return failed
 		}
 		dst.relations[id-1] = snapshot
 		dst.validators[id-1], _ = relation.target.Validator.(OwnershipPointValidator)
@@ -154,6 +168,7 @@ func (m *Machine) DataReadCutInto(
 	}
 	dst.selected, dst.open = selected, true
 	dst.owner = m
+	m.mu.RUnlock()
 	return nil
 }
 
