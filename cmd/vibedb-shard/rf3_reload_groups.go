@@ -15,6 +15,19 @@ import (
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
 )
 
+// stripRF3RuntimeOps returns a shallow copy of m whose CLI-only Gateway
+// RuntimeOps (json:"-") are zeroed without mutating m.Gateway. SIGHUP reload
+// reads manifests from disk where RuntimeOps is always zero, so config
+// invariance checks must compare only the persisted manifest fields.
+func stripRF3RuntimeOps(m rf3Manifest) rf3Manifest {
+	if m.Gateway != nil {
+		gw := *m.Gateway
+		gw.RuntimeOps = rf3ServeNodeRuntimeOps{}
+		m.Gateway = &gw
+	}
+	return m
+}
+
 // Reload is append-only and local-operator authorized. It consumes already
 // prepared immutable artifacts, never creates storage or replaces a live
 // group. Existing query routes and execution lanes are unchanged.
@@ -37,7 +50,7 @@ func validateRF3GroupAppend(current, next rf3Manifest) error {
 			return err
 		}
 	}
-	a, b := current.withGroup(old[0]), next.withGroup(all[0])
+	a, b := stripRF3RuntimeOps(current.withGroup(old[0])), stripRF3RuntimeOps(next.withGroup(all[0]))
 	a.Digest, b.Digest = [32]byte{}, [32]byte{}
 	a.SplitControl.MaxOperations = a.SplitControl.operationLimit()
 	b.SplitControl.MaxOperations = b.SplitControl.operationLimit()
@@ -81,7 +94,7 @@ func validateRF3GroupTransition(current, next rf3Manifest) error {
 			return err
 		}
 	}
-	a, b := current.withGroup(old[0]), next.withGroup(all[0])
+	a, b := stripRF3RuntimeOps(current.withGroup(old[0])), stripRF3RuntimeOps(next.withGroup(all[0]))
 	a.Digest, b.Digest = [32]byte{}, [32]byte{}
 	a.SplitControl.MaxOperations = a.SplitControl.operationLimit()
 	b.SplitControl.MaxOperations = b.SplitControl.operationLimit()
@@ -215,6 +228,10 @@ func reloadPreparedRF3Groups(ctx context.Context, current *rf3Manifest, profile 
 	next, err := loadRF3Manifest(current.reloadPath)
 	if err != nil {
 		return err
+	}
+	if current.Gateway != nil && next.Gateway != nil {
+		// Preserve CLI-supplied process ops across manifest reloads.
+		next.Gateway.RuntimeOps = current.Gateway.RuntimeOps
 	}
 	if err := validateRF3GroupTransition(*current, next); err != nil {
 		return err
