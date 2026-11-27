@@ -107,11 +107,16 @@ type Config struct {
 	MaxNativeReadBytes          uint64
 	MaxNativeScatterConcurrency int
 
-	// Optional local PostgreSQL frontend. Its journals are derived from
-	// CatalogSessionJournal and therefore retain the same private frontend
-	// identity while remaining separate from the catalog session journal.
-	PGListenAddress string
-	PGDDLSocket     string
+	// Optional PostgreSQL frontend. Loopback-only with Trust auth when PGUsers
+	// is empty; non-loopback addresses require both PGTLSConfig and PGUsers
+	// (SCRAM-SHA-256 with explicit per-user SQL capability subsets). Its
+	// journals are derived from CatalogSessionJournal.
+	PGListenAddress  string
+	PGDDLSocket      string
+	PGTLSConfig      *tls.Config
+	PGUsers          []PGUserCredential
+	PGDatabase       string
+	PGMaxConnections int
 	// Optional HTTP observability endpoint serving /healthz, /readyz, and
 	// Prometheus /metrics. Loopback-only unless MetricsHTTPTLSConfig is set.
 	MetricsHTTPListenAddress string
@@ -540,7 +545,13 @@ func (config Config) validate() error {
 		return fmt.Errorf("%w: native read admission bounds are invalid", ErrInvalidConfig)
 	}
 	if config.PGListenAddress != "" {
-		if err := requireLoopbackListen(config.PGListenAddress); err != nil {
+		if err := validatePGEndpointOptions(PGEndpointOptions{
+			Address:        config.PGListenAddress,
+			TLSConfig:      config.PGTLSConfig,
+			Users:          config.PGUsers,
+			Database:       config.PGDatabase,
+			MaxConnections: config.PGMaxConnections,
+		}); err != nil {
 			return fmt.Errorf("%w: PostgreSQL endpoint: %v", ErrInvalidConfig, err)
 		}
 		if config.DevStaticCatalog {

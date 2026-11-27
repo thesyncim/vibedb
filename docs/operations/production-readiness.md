@@ -123,8 +123,10 @@ Before running VibeDB anywhere that matters, account for each gap:
 ## Limitations
 
 - No release, support window, or license is published.
-- SQL access to an RF3 cluster is the loopback development pgwire listener.
-  Remote SQL clients have no authenticated SQL listener to connect to.
+- SQL access to an RF3 cluster defaults to a loopback development pgwire
+  listener when no SCRAM users are configured; remote pgwire listeners require
+  both TLS (`RequireTLS`) and SCRAM-SHA-256 user credentials with explicit
+  SQL-only capability subsets (`PGTLSConfig` + `PGUsers`).
 - The native client protocol is exact-build and unstable; do not build a
   long-lived client against it.
 - Host loss has not been qualified on separate machines. Six local processes

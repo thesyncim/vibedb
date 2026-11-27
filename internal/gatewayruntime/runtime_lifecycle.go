@@ -57,8 +57,13 @@ func (runtime *Runtime) runServe() {
 			defer close(writerDone)
 			writer.Run(runtime.ctx)
 		}()
-		pg, err := startGatewayPostgreSQLWithFrontend(runtime.ctx, runtime.config.PGListenAddress,
-			runtime.exec, runtime.config.InternalAuthority, writer.Write, logf, runtime.frontend, runtime.pgDDL)
+		pg, err := startGatewayPostgreSQLWithOptions(runtime.ctx, PGEndpointOptions{
+			Address:        runtime.config.PGListenAddress,
+			TLSConfig:      runtime.config.PGTLSConfig,
+			Users:          runtime.config.PGUsers,
+			Database:       runtime.config.PGDatabase,
+			MaxConnections: runtime.config.PGMaxConnections,
+		}, runtime.exec, runtime.config.InternalAuthority, writer.Write, logf, runtime.frontend, runtime.pgDDL)
 		if err != nil {
 			runtime.setServeError(err)
 			return

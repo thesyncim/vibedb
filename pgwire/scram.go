@@ -120,6 +120,11 @@ type Verifier struct {
 	serverKey  []byte
 }
 
+// Valid reports whether v holds a complete, usable SCRAM-SHA-256 verifier.
+func (v Verifier) Valid() bool {
+	return v.valid()
+}
+
 func (v Verifier) valid() bool {
 	return len(v.salt) >= saltLength &&
 		v.iterations >= defaultIterations &&
