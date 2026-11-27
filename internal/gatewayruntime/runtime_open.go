@@ -145,9 +145,13 @@ func (runtime *Runtime) open() error {
 			return fmt.Errorf("own gateway recovery journals: %w", err)
 		}
 	}
+	var admissionGuard gateway.ResourceAdmissionGuard
+	if config.ResourceGuard != nil {
+		admissionGuard = config.ResourceGuard
+	}
 	if config.DevStaticCatalog {
 		runtime.exec, runtime.holder, err = newGatewayWithDial(
-			config.CatalogPath, config.ShardDial, runtime.config.InternalAuthority,
+			config.CatalogPath, config.ShardDial, runtime.config.InternalAuthority, admissionGuard,
 		)
 		if err != nil {
 			return fmt.Errorf("load catalog: %w", err)
@@ -183,7 +187,7 @@ func (runtime *Runtime) open() error {
 			config.CatalogBootstrapIfMissing, config.CatalogRelation, config.CatalogAttempts,
 			config.CatalogAttemptTimeout, config.TLSHandshakeTimeout, config.MaxShardConnections,
 			config.MaxShardHandshakes, config.CatalogSessionJournal, clientID, retryHome,
-			config.CatalogSessionLease, runtime, config.Transport,
+			config.CatalogSessionLease, runtime, admissionGuard, config.Transport,
 		)
 		if err != nil {
 			return fmt.Errorf("open replicated catalog: %w", err)
