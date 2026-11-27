@@ -86,9 +86,9 @@ func TestReviewSharedPlanSameTargetParameterAdmission(t *testing.T) {
 	if got := decodeInts(t, first.Rows); !equalInts(got, []int64{1}) {
 		t.Fatalf("first rows = %v, want [1]", got)
 	}
-	executor.planMu.RLock()
+	executor.planMu.Lock()
 	entry, ok := executor.planCache[q.SQL]
-	executor.planMu.RUnlock()
+	executor.planMu.Unlock()
 	if !ok || entry.physical == nil {
 		t.Fatal("first query did not publish a physical plan")
 	}
@@ -107,9 +107,9 @@ func TestReviewSharedPlanSameTargetParameterAdmission(t *testing.T) {
 	if got := decodeInts(t, second.Rows); len(got) != 0 {
 		t.Fatalf("second rows = %v, want no rows", got)
 	}
-	executor.planMu.RLock()
+	executor.planMu.Lock()
 	again, ok := executor.planCache[q.SQL]
-	executor.planMu.RUnlock()
+	executor.planMu.Unlock()
 	if !ok || again.physical != physical {
 		t.Fatal("same-target predicate/LIMIT query re-optimized instead of reusing the physical plan")
 	}

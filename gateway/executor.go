@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/thesyncim/vibedb/distribution"
@@ -120,10 +121,10 @@ type Executor struct {
 	resourceGuard      ResourceAdmissionGuard
 	slowQueryThreshold time.Duration
 	slowQueryObserver  SlowQueryObserver
-	// planMu guards the shared physical-plan cache; see plan_cache.go.
-	// Entries are immutable once published, so concurrent queries copy
-	// entries into per-call working state instead of locking around use.
-	planMu    sync.RWMutex
+	// planSnap serves lock-free concurrent reads from an immutable COW map
+	// snapshot; planMu serializes cold publications and evictions only.
+	planSnap  atomic.Pointer[executorPlanSnapshot]
+	planMu    sync.Mutex
 	planCache map[string]executorPlanEntry
 	planOrder []string
 }
