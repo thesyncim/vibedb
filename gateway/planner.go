@@ -90,6 +90,10 @@ type PreparedPlan struct {
 	// Building, CatchingUp, Ready, and Draining. Local indexes add no
 	// prepared-plan footprint.
 	writeGlobalIndexes []preparedGlobalIndex
+	// writeInsertConflict is true for INSERT ... ON CONFLICT DO NOTHING/UPDATE
+	// statements whose global-index mutations must be derived branch-aware via
+	// base-shard image capture rather than unconditional INSERT puts.
+	writeInsertConflict bool
 	// readGlobalIndexes contains finite-domain routing programs for READY global
 	// indexes on the driving table. Bind selects at most one complete key domain;
 	// the ordinary base-shard route remains preferred when it is already a point.

@@ -334,18 +334,8 @@ func (s *Snapshot) prepareWrite(plan *PreparedPlan, source string) error {
 	if err := s.prepareGlobalIndexWrites(plan, wholeDocIns, insertColumns); err != nil {
 		return err
 	}
-	if stmt.Kind == sqlast.KindInsert && stmt.Insert.OnConflictDoNothing &&
-		len(plan.writeGlobalIndexes) != 0 {
-		return &PlanError{
-			Table:  plan.table,
-			Reason: "ON CONFLICT DO NOTHING with global indexes requires branch-aware index maintenance",
-			cause:  ErrDistributedWriteUnsupported,
-		}
-	}
-	if stmt.Kind == sqlast.KindInsert && stmt.Insert.OnConflictUpdate != nil && len(plan.writeGlobalIndexes) != 0 {
-		return &PlanError{Table: plan.table,
-			Reason: "ON CONFLICT DO UPDATE with global indexes requires branch-aware index maintenance",
-			cause:  ErrDistributedWriteUnsupported}
+	if stmt.Kind == sqlast.KindInsert && stmt.Insert.HasConflictAction() {
+		plan.writeInsertConflict = true
 	}
 	return nil
 }
@@ -588,7 +578,7 @@ func (p *PreparedPlan) bindGlobalIndexInserts(
 	bound *BoundWritePlan,
 	args []any,
 ) error {
-	if len(p.writeGlobalIndexes) == 0 {
+	if len(p.writeGlobalIndexes) == 0 || p.writeInsertConflict {
 		return nil
 	}
 	rows := p.statement.Insert.Rows
@@ -693,7 +683,8 @@ func (p *PreparedPlan) bindGlobalIndexCapture(
 	if len(p.writeGlobalIndexes) == 0 {
 		return nil
 	}
-	if bound == nil || (bound.kind != sqlast.KindUpdate && bound.kind != sqlast.KindDelete) {
+	if bound == nil || (bound.kind != sqlast.KindUpdate && bound.kind != sqlast.KindDelete &&
+		!(bound.kind == sqlast.KindInsert && p.writeInsertConflict)) {
 		return ErrGlobalIndexMaintenanceUnsupported
 	}
 	firstProgram := &p.writeGlobalIndexes[0].program
@@ -715,8 +706,21 @@ func (p *PreparedPlan) bindGlobalIndexCapture(
 	var oldWorkspace, newWorkspace GlobalIndexWorkspace
 	for rowOrdinal := range rows {
 		row := rows[rowOrdinal]
-		if len(row) != 3 || row[0].Null || row[1].Null || len(row[0].Bytes) == 0 ||
-			len(row[1].Bytes) == 0 || !vibejson.Valid(row[1].Bytes) {
+		if len(row) != 3 || row[0].Null || len(row[0].Bytes) == 0 {
+			return &PlanError{
+				Table: p.table, Reason: "base shard returned a malformed mutation capture row",
+				cause: ErrGlobalIndexMaintenanceUnsupported,
+			}
+		}
+		absentBefore := row[1].Null
+		if absentBefore {
+			if bound.kind != sqlast.KindInsert {
+				return &PlanError{
+					Table: p.table, Reason: "base shard returned a malformed mutation capture row",
+					cause: ErrGlobalIndexMaintenanceUnsupported,
+				}
+			}
+		} else if len(row[1].Bytes) == 0 || !vibejson.Valid(row[1].Bytes) {
 			return &PlanError{
 				Table: p.table, Reason: "base shard returned a malformed mutation capture row",
 				cause: ErrGlobalIndexMaintenanceUnsupported,
@@ -724,10 +728,10 @@ func (p *PreparedPlan) bindGlobalIndexCapture(
 		}
 		var replacement []byte
 		switch bound.kind {
-		case sqlast.KindUpdate:
+		case sqlast.KindUpdate, sqlast.KindInsert:
 			if row[2].Null || len(row[2].Bytes) == 0 || !vibejson.Valid(row[2].Bytes) {
 				return &PlanError{
-					Table: p.table, Reason: "base shard returned a malformed UPDATE post-image",
+					Table: p.table, Reason: "base shard returned a malformed post-image",
 					cause: ErrGlobalIndexMaintenanceUnsupported,
 				}
 			}
@@ -742,19 +746,25 @@ func (p *PreparedPlan) bindGlobalIndexCapture(
 		default:
 			return ErrGlobalIndexMaintenanceUnsupported
 		}
-		expectation := capturedPrimaryExpectation{
-			key: row[0].Bytes, digest: sha256.Sum256(row[1].Bytes),
+		expectation := capturedPrimaryExpectation{key: row[0].Bytes}
+		if !absentBefore {
+			expectation.digest = sha256.Sum256(row[1].Bytes)
 		}
-		if bound.kind == sqlast.KindUpdate {
+		if bound.kind == sqlast.KindUpdate || bound.kind == sqlast.KindInsert {
 			expectation.postimageDigest = sha256.Sum256(replacement)
 		}
 		expected = append(expected, expectation)
-		oldIndex, err := oldWorkspace.indexDocument(row[1].Bytes)
-		if err != nil {
-			return err
+		var oldIndex vibejson.Index
+		if !absentBefore {
+			var err error
+			oldIndex, err = oldWorkspace.indexDocument(row[1].Bytes)
+			if err != nil {
+				return err
+			}
 		}
 		var newIndex vibejson.Index
-		if bound.kind == sqlast.KindUpdate {
+		if bound.kind == sqlast.KindUpdate || bound.kind == sqlast.KindInsert {
+			var err error
 			newIndex, err = newWorkspace.indexDocument(replacement)
 			if err != nil {
 				return err
@@ -762,6 +772,22 @@ func (p *PreparedPlan) bindGlobalIndexCapture(
 		}
 		for indexOrdinal := range p.writeGlobalIndexes {
 			prepared := &p.writeGlobalIndexes[indexOrdinal]
+			if absentBefore {
+				newRoute, err := prepared.program.routeIndexedDocument(newIndex, len(replacement), &newWorkspace)
+				if err != nil {
+					return fmt.Errorf("global index %s inserted row %d: %w",
+						prepared.program.metadata.Name, rowOrdinal, err)
+				}
+				if !sameWriteTarget(newRoute.BaseTarget, baseTarget) ||
+					!bytes.Equal(newRoute.BasePrimaryKey, row[0].Bytes) {
+					return &CatalogError{Reason: "global index inserted locator does not identify the base row"}
+				}
+				bound.appendGlobalIndexRoute(
+					prepared, newRoute,
+					shardservice.MutationGlobalIndexPut,
+				)
+				continue
+			}
 			oldRoute, err := prepared.program.routeIndexedDocument(oldIndex, len(row[1].Bytes), &oldWorkspace)
 			if err != nil {
 				return fmt.Errorf("global index %s captured row %d: %w",
@@ -806,7 +832,7 @@ func (p *PreparedPlan) bindGlobalIndexCapture(
 	})
 	bound.expectedKeys = make([][]byte, len(expected))
 	bound.expectedDigests = make([][sha256.Size]byte, len(expected))
-	if bound.kind == sqlast.KindUpdate {
+	if bound.kind == sqlast.KindUpdate || bound.kind == sqlast.KindInsert {
 		bound.postimageKeys = make([][]byte, len(expected))
 		bound.postimageDigests = make([][sha256.Size]byte, len(expected))
 	}
@@ -819,7 +845,7 @@ func (p *PreparedPlan) bindGlobalIndexCapture(
 		}
 		bound.expectedKeys[i] = expected[i].key
 		bound.expectedDigests[i] = expected[i].digest
-		if bound.kind == sqlast.KindUpdate {
+		if bound.kind == sqlast.KindUpdate || bound.kind == sqlast.KindInsert {
 			bound.postimageKeys[i] = expected[i].key
 			bound.postimageDigests[i] = expected[i].postimageDigest
 		}

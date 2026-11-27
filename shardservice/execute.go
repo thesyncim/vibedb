@@ -957,9 +957,10 @@ func (c *shardConn) executeMutationCapture(req *ShardRequest) *ShardResponse {
 		return classifyError(err)
 	}
 	defer release()
-	if prep.Kind() != sqlast.KindUpdate && prep.Kind() != sqlast.KindDelete {
+	if prep.Kind() != sqlast.KindUpdate && prep.Kind() != sqlast.KindDelete &&
+		!(req.MutationImageCapture && prep.Kind() == sqlast.KindInsert) {
 		return NewErrorResponse(ErrorMalformedRequest,
-			"shardservice: mutation capture requires UPDATE or DELETE")
+			"shardservice: mutation capture requires UPDATE, DELETE, or INSERT ON CONFLICT")
 	}
 	capacity := maxRows
 	if capacity < 0 || capacity > 256 {
@@ -995,13 +996,17 @@ func (c *shardConn) executeMutationCapture(req *ShardRequest) *ShardResponse {
 					return errMutationCaptureLimit
 				}
 			}
+			beforeCell := Cell{Null: true}
+			if before != nil {
+				beforeCell = Cell{Bytes: append([]byte(nil), before...)}
+			}
 			afterCell := Cell{Null: true}
 			if after != nil {
 				afterCell = Cell{Bytes: append([]byte(nil), after...)}
 			}
 			rows = append(rows, []Cell{
 				{Bytes: append([]byte(nil), key...)},
-				{Bytes: append([]byte(nil), before...)},
+				beforeCell,
 				afterCell,
 			})
 			retained += int64(len(key))

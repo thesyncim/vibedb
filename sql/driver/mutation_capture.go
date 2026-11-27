@@ -189,10 +189,14 @@ func (p *Prepared) CaptureMutationImagesInto(
 			"vibedb: mutation image capture requires a visitor",
 		))
 	}
+	isConflictInsert := p.statement.mutation != nil &&
+		p.Kind() == sqlast.KindInsert &&
+		p.statement.mutation.Tree().Insert != nil &&
+		p.statement.mutation.Tree().Insert.HasConflictAction()
 	if p.statement.mutation == nil ||
-		(p.Kind() != sqlast.KindUpdate && p.Kind() != sqlast.KindDelete) {
+		(p.Kind() != sqlast.KindUpdate && p.Kind() != sqlast.KindDelete && !isConflictInsert) {
 		return p.fail(errors.New(
-			"vibedb: mutation image capture requires UPDATE or DELETE",
+			"vibedb: mutation image capture requires UPDATE, DELETE, or INSERT ON CONFLICT",
 		))
 	}
 	if err := p.session.ready(ctx); err != nil {
@@ -449,6 +453,9 @@ func (s *stmt) captureMutationImagesInto(
 		return err
 	}
 
+	if s.mutation.Kind() == query.DMLInsert {
+		return s.captureInsertConflictImagesLocked(ctx, args, t, limits, visit)
+	}
 	var (
 		assignments []sqlast.UpdateAssignment
 		document    []byte
@@ -802,6 +809,14 @@ func (s *Session) validatePrimaryDocumentDigests(
 		if err != nil {
 			return s.fail(err)
 		}
+		if installGuard && digests[i] == ([sha256.Size]byte{}) {
+			// Absent-key precondition (INSERT ON CONFLICT with global indexes):
+			// the key must NOT exist at commit time.
+			if found {
+				return s.fail(ErrDistributedTransactionConflict)
+			}
+			continue
+		}
 		if !found {
 			return s.fail(ErrDistributedTransactionConflict)
 		}
@@ -820,6 +835,202 @@ func (s *Session) validatePrimaryDocumentDigests(
 	}
 	if installGuard {
 		tx.primaryMutationGuard = guard
+	}
+	return nil
+}
+
+// captureInsertConflictImagesLocked evaluates an INSERT ... ON CONFLICT
+// statement against a read-only snapshot of t and visits (key, before, after)
+// for every candidate row without mutating t:
+//   - Absent row (insert branch): before=nil, after=canonicalNewDoc
+//   - Conflict + DO NOTHING (or DO UPDATE WHERE false): before=oldDoc, after=oldDoc
+//     (exact no-op with full before+after preconditions so a concurrent DELETE
+//     between capture and commit aborts cleanly instead of drifting global indexes)
+//   - Conflict + DO UPDATE: before=oldDoc, after=canonicalUpdatedDoc
+func (s *stmt) captureInsertConflictImagesLocked(
+	ctx context.Context,
+	args []any,
+	t *table,
+	limits durable.Options,
+	visit func(key, before, after []byte) error,
+) error {
+	statement := s.mutation
+	tree := statement.Tree().Insert
+	if tree == nil || !tree.HasConflictAction() {
+		return errors.New("vibedb: mutation image capture requires INSERT ON CONFLICT")
+	}
+	c := s.conn
+	conflictUpdate := tree.OnConflictUpdate
+	if conflictUpdate != nil {
+		if err := validateUpsertConflictAction(
+			tree.Table, mutationTargetRelation(tree.Table, tree.Alias),
+			t.meta, conflictUpdate,
+		); err != nil {
+			return err
+		}
+		if err := validateColumnAssignmentBindings(conflictUpdate.Assignments, args); err != nil {
+			return err
+		}
+		if err := statement.ValidateConflictUpdateExpressionBindings(args); err != nil {
+			return err
+		}
+	}
+
+	candidates := make([]seedDocument, 0, len(tree.Rows))
+	var seen map[string]struct{}
+	if len(tree.Rows) > 1 {
+		seen = make(map[string]struct{}, len(tree.Rows))
+	}
+	candidateBytes := 0
+	for i := range tree.Rows {
+		if err := contextCheckpoint(ctx); err != nil {
+			return err
+		}
+		document, key, err := resolveInsertRow(
+			statement, tree, &tree.Rows[i], args,
+			t.meta, t.primary, limits,
+		)
+		if err == nil && len(t.primaries) > 1 {
+			key, err = tableDocumentKey(t, document, limits.MaxKeyBytes)
+		}
+		if err != nil {
+			return err
+		}
+		if err := validateDocument(t.schema, document, limits.MaxDocumentBytes, &c.insertTape); err != nil {
+			return err
+		}
+		if err := validateCheckConstraints(t.meta, document); err != nil {
+			return err
+		}
+		if _, duplicate := seen[key]; duplicate {
+			if tree.OnConflictDoNothing {
+				continue
+			}
+			return fmt.Errorf(
+				"%w: candidate key %q appears twice in one VALUES batch",
+				ErrUpsertCardinality, key,
+			)
+		}
+		if seen != nil {
+			seen[key] = struct{}{}
+		}
+		if len(key) > limits.MaxBatchBytes-candidateBytes ||
+			len(document) > limits.MaxBatchBytes-candidateBytes-len(key) {
+			return fmt.Errorf(
+				"vibedb: INSERT exceeds the %d-byte durable batch limit: %w",
+				limits.MaxBatchBytes, durable.ErrBatchTooLarge,
+			)
+		}
+		candidateBytes += len(key) + len(document)
+		candidates = append(candidates, seedDocument{key: key, document: document})
+	}
+	if err := c.routeInsertSeeds(tree.Table, candidates); err != nil {
+		return err
+	}
+
+	type capturedConflictRow struct {
+		key    []byte
+		before []byte
+		after  []byte
+	}
+	captured := make([]capturedConflictRow, 0, len(candidates))
+
+	var snapshot *durable.Snapshot
+	if t.collection != nil {
+		var err error
+		snapshot, err = t.collection.Snapshot()
+		if err != nil {
+			return err
+		}
+		defer snapshot.Close()
+	}
+	scratch := c.pointRaw[:0]
+	defer func() { c.pointRaw = scratch[:0] }()
+
+	for i := range candidates {
+		if err := contextCheckpoint(ctx); err != nil {
+			return err
+		}
+		cand := candidates[i]
+		var found bool
+		if snapshot != nil {
+			var err error
+			scratch, found, err = snapshot.AppendRaw(scratch[:0], []byte(cand.key))
+			if err != nil {
+				return err
+			}
+		}
+		if !found {
+			canonAfter, err := canonicalMutationCapturePostimage(cand.document, limits.MaxDocumentBytes)
+			if err != nil {
+				return err
+			}
+			captured = append(captured, capturedConflictRow{
+				key:    []byte(cand.key),
+				before: nil,
+				after:  canonAfter,
+			})
+			continue
+		}
+		beforeCopy := append([]byte(nil), scratch...)
+		if tree.OnConflictDoNothing {
+			captured = append(captured, capturedConflictRow{
+				key:    []byte(cand.key),
+				before: beforeCopy,
+				after:  beforeCopy,
+			})
+			continue
+		}
+		finalDoc, matched, err := materializeConflictUpdate(
+			statement, &c.exec, scratch, cand.document, args, limits.MaxDocumentBytes,
+		)
+		if err != nil {
+			return err
+		}
+		if !matched {
+			captured = append(captured, capturedConflictRow{
+				key:    []byte(cand.key),
+				before: beforeCopy,
+				after:  beforeCopy,
+			})
+			continue
+		}
+		if err := validateDocument(t.schema, finalDoc, limits.MaxDocumentBytes, &c.insertTape); err != nil {
+			return err
+		}
+		if err := validateCheckConstraints(t.meta, finalDoc); err != nil {
+			return err
+		}
+		if err := c.checkUpsertShardKeyImmutable(tree.Table, scratch, finalDoc); err != nil {
+			return err
+		}
+		newKey, err := documentKey(finalDoc, t.meta.PrimaryKey, t.primary, limits.MaxKeyBytes)
+		if err == nil && len(t.primaries) > 1 {
+			newKey, err = tableDocumentKey(t, finalDoc, limits.MaxKeyBytes)
+		}
+		if err != nil {
+			return err
+		}
+		if newKey != cand.key {
+			return fmt.Errorf(
+				"%w: replacement key %q does not match selected key %q",
+				ErrUpdatePrimaryKey, newKey, cand.key,
+			)
+		}
+		canonAfter, err := canonicalMutationCapturePostimage(finalDoc, limits.MaxDocumentBytes)
+		if err != nil {
+			return err
+		}
+		captured = append(captured, capturedConflictRow{
+			key:    []byte(cand.key),
+			before: beforeCopy,
+			after:  canonAfter,
+		})
+	}
+	for i := range captured {
+		if err := visit(captured[i].key, captured[i].before, captured[i].after); err != nil {
+			return err
+		}
 	}
 	return nil
 }
