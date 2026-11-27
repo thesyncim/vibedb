@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"maps"
 	"sync"
+	"sync/atomic"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
 	"github.com/thesyncim/vibedb/internal/replication"
@@ -380,11 +382,13 @@ type replicatedIssuerGrantCache struct {
 }
 
 type replicatedIssuerGrantCacheShard struct {
-	mu       sync.RWMutex
+	snap     atomic.Pointer[map[replicatedIssuerGrantCacheKey]ReplicatedIssuerLaneGrant]
+	mu       sync.Mutex
 	entries  map[replicatedIssuerGrantCacheKey]ReplicatedIssuerLaneGrant
 	order    []replicatedIssuerGrantCacheKey
 	next     int
 	capacity int
+	_        [64]byte // prevent cross-shard false sharing under concurrent RF3 writes
 }
 
 func newReplicatedIssuerGrantCache(capacity int) *replicatedIssuerGrantCache {
@@ -418,6 +422,11 @@ func (cache *replicatedIssuerGrantCache) put(grant ReplicatedIssuerLaneGrant) {
 	}
 	key := replicatedIssuerCacheKey(grant)
 	shard := cache.shard(key.GrantDigest)
+	if snap := shard.snap.Load(); snap != nil {
+		if _, exists := (*snap)[key]; exists {
+			return
+		}
+	}
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 	if _, exists := shard.entries[key]; exists {
@@ -434,6 +443,9 @@ func (cache *replicatedIssuerGrantCache) put(grant ReplicatedIssuerLaneGrant) {
 		}
 	}
 	shard.entries[key] = grant
+	cloned := make(map[replicatedIssuerGrantCacheKey]ReplicatedIssuerLaneGrant, len(shard.entries))
+	maps.Copy(cloned, shard.entries)
+	shard.snap.Store(&cloned)
 }
 
 func (cache *replicatedIssuerGrantCache) get(reference ReplicatedIssuerReference) (ReplicatedIssuerLaneGrant, bool) {
@@ -442,9 +454,11 @@ func (cache *replicatedIssuerGrantCache) get(reference ReplicatedIssuerReference
 	}
 	key := replicatedIssuerGrantCacheKey(reference)
 	shard := cache.shard(key.GrantDigest)
-	shard.mu.RLock()
-	grant, found := shard.entries[key]
-	shard.mu.RUnlock()
+	snap := shard.snap.Load()
+	if snap == nil {
+		return ReplicatedIssuerLaneGrant{}, false
+	}
+	grant, found := (*snap)[key]
 	return grant, found
 }
 
