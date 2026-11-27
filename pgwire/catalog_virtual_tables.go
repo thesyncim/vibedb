@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,9 +32,12 @@ func (s *session) virtualCatalogShim(
 	}
 	var allCols []column
 	var allRows [][]*string
-	if q.table == "pg_catalog.pg_stat_activity" || q.table == "pg_stat_activity" {
+	switch q.table {
+	case "pg_catalog.pg_stat_activity", "pg_stat_activity":
 		allCols, allRows = buildStatActivityRows(s.server)
-	} else {
+	case "pg_catalog.pg_stat_statements", "pg_stat_statements":
+		allCols, allRows = buildStatStatementsRows(s.server)
+	default:
 		tables, err := s.sql.Tables(s.operationContext())
 		if err != nil {
 			return nil, false, nil
@@ -96,6 +100,14 @@ func (s *session) virtualCatalogShim(
 				}
 				if filtered[j][idx] != nil {
 					b = *filtered[j][idx]
+				}
+				if fa, errA := strconv.ParseFloat(a, 64); errA == nil && !math.IsNaN(fa) && !math.IsInf(fa, 0) {
+					if fb, errB := strconv.ParseFloat(b, 64); errB == nil && !math.IsNaN(fb) && !math.IsInf(fb, 0) {
+						if q.orderDesc {
+							return fa > fb
+						}
+						return fa < fb
+					}
 				}
 				if q.orderDesc {
 					return a > b
@@ -193,7 +205,8 @@ func parseVirtualCatalogQuery(raw string) (virtualCatalogQuery, bool) {
 		"pg_catalog.pg_tables", "pg_tables",
 		"pg_catalog.pg_views", "pg_views",
 		"pg_catalog.pg_indexes", "pg_indexes",
-		"pg_catalog.pg_stat_activity", "pg_stat_activity":
+		"pg_catalog.pg_stat_activity", "pg_stat_activity",
+		"pg_catalog.pg_stat_statements", "pg_stat_statements":
 	default:
 		return virtualCatalogQuery{}, false
 	}
@@ -378,6 +391,41 @@ func buildStatActivityRows(srv *Server) ([]column, [][]*string) {
 			strPtr(a.backendStart),
 			strPtr(a.state),
 			strPtr(a.query),
+		})
+	}
+	return cols, rows
+}
+
+func buildStatStatementsRows(srv *Server) ([]column, [][]*string) {
+	cols := textCols(
+		"queryid",
+		"datname",
+		"usename",
+		"calls",
+		"total_exec_time",
+		"min_exec_time",
+		"max_exec_time",
+		"mean_exec_time",
+		"rows",
+		"query",
+	)
+	if srv == nil {
+		return cols, nil
+	}
+	snaps := srv.statementStatsSnapshot()
+	rows := make([][]*string, 0, len(snaps))
+	for _, st := range snaps {
+		rows = append(rows, []*string{
+			strPtr(strconv.FormatInt(st.queryID, 10)),
+			strPtr(st.datname),
+			strPtr(st.usename),
+			strPtr(strconv.FormatUint(st.calls, 10)),
+			strPtr(strconv.FormatFloat(st.totalExecTime, 'f', 3, 64)),
+			strPtr(strconv.FormatFloat(st.minExecTime, 'f', 3, 64)),
+			strPtr(strconv.FormatFloat(st.maxExecTime, 'f', 3, 64)),
+			strPtr(strconv.FormatFloat(st.meanExecTime, 'f', 3, 64)),
+			strPtr(strconv.FormatInt(st.rows, 10)),
+			strPtr(st.query),
 		})
 	}
 	return cols, rows
