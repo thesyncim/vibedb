@@ -147,11 +147,7 @@ func appendDirectPatchOperandJSON(dst []byte, operand sqlast.Operand, args []any
 		}
 		return append(dst, "false"...), true
 	case sqlast.OperandString:
-		encoded, err := vibejson.Marshal(&operand.Text)
-		if err != nil {
-			return dst, false
-		}
-		return append(dst, encoded...), true
+		return strconv.AppendQuote(dst, operand.Text), true
 	case sqlast.OperandNumber:
 		if operand.Text == "" {
 			return dst, false
@@ -220,37 +216,19 @@ func appendDirectPatchValueJSON(dst []byte, value any) ([]byte, bool) {
 		}
 		return append(dst, string(*v)...), true
 	case string:
-		encoded, err := vibejson.Marshal(&v)
-		if err != nil {
-			return dst, false
-		}
-		return append(dst, encoded...), true
+		return strconv.AppendQuote(dst, v), true
 	case *string:
 		if v == nil {
 			return append(dst, "null"...), true
 		}
-		encoded, err := vibejson.Marshal(v)
-		if err != nil {
-			return dst, false
-		}
-		return append(dst, encoded...), true
+		return strconv.AppendQuote(dst, *v), true
 	case []byte:
-		s := string(v)
-		encoded, err := vibejson.Marshal(&s)
-		if err != nil {
-			return dst, false
-		}
-		return append(dst, encoded...), true
+		return strconv.AppendQuote(dst, string(v)), true
 	case *[]byte:
 		if v == nil {
 			return append(dst, "null"...), true
 		}
-		s := string(*v)
-		encoded, err := vibejson.Marshal(&s)
-		if err != nil {
-			return dst, false
-		}
-		return append(dst, encoded...), true
+		return strconv.AppendQuote(dst, string(*v)), true
 	case vibejson.RawValue:
 		if len(v.Src) == 0 {
 			return dst, false

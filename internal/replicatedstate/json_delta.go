@@ -104,12 +104,7 @@ func materializeJSONColumnPatch(
 	addedCount := 0
 	for i := range fields {
 		if fields[i].member < 0 {
-			colText := string(fields[i].column)
-			addedKey, marshalErr := vibejson.Marshal(&colText)
-			if marshalErr != nil {
-				return nil, ResultInvalidDocument
-			}
-			fields[i].addedKey = addedKey
+			fields[i].addedKey = strconv.AppendQuote(nil, string(fields[i].column))
 			addedCount++
 		}
 	}
