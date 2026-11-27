@@ -12,12 +12,13 @@ throughout; see the [method](../benchmarks/seamless-scale-in-out-method.md).
 explains the node lifecycle, frontend drain, and migration pacing behind
 these commands.
 
-> [!IMPORTANT]
-> The control commands ship; their inputs do not. No shipped command creates
-> the operator credential, the empty-node preparation manifest, or the public
-> node descriptor. The qualification builds them with test fixtures. Until
-> provisioning tooling exists, this procedure is for evaluators who can author
-> those inputs from the [source grammar](#source-map).
+> [!NOTE]
+> Generate the required scaling inputs from your cluster CA using
+> `vibedb cluster init-operator` (mints the operator credential and canonical
+> `operator-profile.vibejson`) and `vibedb cluster init-node` (mints the node
+> credential, node-log key, `prepare-node.vibejson`, and public
+> `node-descriptor.vibejson`). Pass `--policy <path> --update-policy` to
+> register the new principals in `authorization-policy.vibejson`.
 
 ## How an operation runs
 

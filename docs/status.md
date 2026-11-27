@@ -65,9 +65,11 @@ Darwin durability uses its strongest implemented barrier; see
 - Online split covers base relations. A split plan that must move a global
   index fails closed, a split cannot relieve a single hot key, and repeated
   descendant splits are not qualified. See [topology changes](design/topology-changes.md#limitations).
-- Scale-out inputs have no shipped generator. No command creates the operator
-  credential, empty-node preparation manifest, or public node descriptor; the
-  qualification builds them with test fixtures.
+- Scaling inputs can be generated from an existing cluster CA with
+  `vibedb cluster init-operator` (operator credential and profile) and
+  `vibedb cluster init-node` (empty-node preparation manifest and public node
+  descriptor). External CA management and multi-host process supervision remain
+  operator-provided.
 - Controllers run on one designated frontend, and a retiring frontend waits
   indefinitely for its clients to disconnect.
 - Follower applied-floor reads and multi-group read vectors have narrower
