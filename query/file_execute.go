@@ -113,6 +113,13 @@ type ExecOptions struct {
 	// filter's error is one-sided and the exact probe behind it is
 	// authoritative.
 	JoinFilterScanRatio int
+
+	// GrowWorkBudgetOnIndexDecline requests ErrWorkBudget instead of a silent
+	// full-table-scan fallback when a durable secondary-index candidate plan
+	// exceeds the current MemoryBytes budget. Tiered callers (such as RF3
+	// shard reads on non-final tiers) can then escalate to a larger tier and
+	// cache the hint instead of scanning the full table.
+	GrowWorkBudgetOnIndexDecline bool
 }
 
 // fileWorkspace owns the reusable storage one durable execution needs beyond
@@ -853,6 +860,7 @@ func (p *plan) runFileSnapshotBatched(
 	}
 	candidateMasks, plannerBytes, err := p.fileCandidateMasksBounded(
 		snapshot, &e.file.index, &e.Workspace, work.remaining()/2,
+		e.Options.GrowWorkBudgetOnIndexDecline,
 	)
 	if err != nil {
 		return result, stats, err

@@ -2,10 +2,13 @@ package durable
 
 import (
 	"bytes"
+	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/thesyncim/vibedb/internal/storeio"
 	"github.com/thesyncim/vibedb/store"
+	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibejson/x/byteview"
 )
 
@@ -623,7 +626,14 @@ func countExactContributionDiff(
 // (empty) overlay window. A diff that fits drained but not the current window
 // earns a checkpoint-and-retry instead of a full rebuild: after the drain the
 // same emission is guaranteed room by these same caps.
-func (d exactDiffCost) fitsDrainedExactWindow() bool {
+func (d exactDiffCost) fitsDrainedExactWindow(epoch *primaryExactEpoch) bool {
+	if epoch != nil {
+		return d.termRecords <= len(epoch.termRecords) &&
+			d.tileRecords <= len(epoch.tileRecords) &&
+			d.terms <= len(epoch.termEntries) &&
+			d.tiles <= len(epoch.tileEntries) &&
+			d.termBytes <= len(epoch.termBytes)
+	}
 	return d.termRecords <= primaryExactOverlayTermRecordCap &&
 		d.tileRecords <= primaryExactOverlayTileRecordCap &&
 		d.terms <= primaryExactOverlayTermEntryCap &&
@@ -634,21 +644,22 @@ func (d exactDiffCost) fitsDrainedExactWindow() bool {
 // exactWindowRoom returns the current overlay window's remaining record,
 // entry, and byte room, saturated at zero.
 func exactWindowRoom(epoch *primaryExactEpoch) exactDiffCost {
-	room := exactDiffCost{
-		termRecords: primaryExactOverlayTermRecordCap,
-		tileRecords: primaryExactOverlayTileRecordCap,
-		terms:       primaryExactOverlayTermEntryCap,
-		tiles:       primaryExactOverlayTileEntryCap,
-		termBytes:   primaryExactOverlayTermBytesCap,
-	}
 	if epoch == nil {
-		return room
+		return exactDiffCost{
+			termRecords: primaryExactOverlayTermRecordCap,
+			tileRecords: primaryExactOverlayTileRecordCap,
+			terms:       primaryExactOverlayTermEntryCap,
+			tiles:       primaryExactOverlayTileEntryCap,
+			termBytes:   primaryExactOverlayTermBytesCap,
+		}
 	}
-	room.termRecords -= epoch.termRecordN
-	room.tileRecords -= epoch.tileRecordN
-	room.terms -= epoch.termEntryN
-	room.tiles -= epoch.tileEntryN
-	room.termBytes -= epoch.termBytesN
+	room := exactDiffCost{
+		termRecords: len(epoch.termRecords) - epoch.termRecordN,
+		tileRecords: len(epoch.tileRecords) - epoch.tileRecordN,
+		terms:       len(epoch.termEntries) - epoch.termEntryN,
+		tiles:       len(epoch.tileEntries) - epoch.tileEntryN,
+		termBytes:   len(epoch.termBytes) - epoch.termBytesN,
+	}
 	if room.termRecords < 0 {
 		room.termRecords = 0
 	}
@@ -712,7 +723,7 @@ func (c *Collection) preparePrimaryExactBucketDiff(
 	cost := countExactContributionDiff(
 		baseLive, finalLive, baseByIndex, finalByIndex,
 	)
-	checkpoint = cost.fitsDrainedExactWindow()
+	checkpoint = cost.fitsDrainedExactWindow(epoch)
 	if !cost.fitsExactWindowRoom(exactWindowRoom(epoch)) {
 		return false, checkpoint, nil
 	}
@@ -856,6 +867,45 @@ func (c *Collection) preparePrimaryExactBufferedMutation(
 	)
 }
 
+// extractTopLevelExactFields extracts the requested top-level unescaped JSON
+// object members in a single zero-copy ObjectIter pass. Returns false if the
+// document is not a valid object or contains escaped keys so the caller falls
+// back to exact pointer evaluation.
+func extractTopLevelExactFields(
+	raw []byte,
+	colNames []string,
+	out []vibejson.RawValue,
+	present []bool,
+) bool {
+	parsed, err := vibejson.ParseOptions(raw, vibejson.Options{ZeroCopy: true})
+	if err != nil {
+		return false
+	}
+	iter, ok := parsed.Node().ObjectIter()
+	if !ok {
+		return false
+	}
+	for {
+		key, val, next := iter.NextRaw()
+		if !next {
+			break
+		}
+		rawKey, clean := key.StringBytes()
+		if !clean {
+			return false
+		}
+		keyStr := byteview.String(rawKey)
+		for i, name := range colNames {
+			if keyStr == name {
+				out[i] = val
+				present[i] = true
+				break
+			}
+		}
+	}
+	return true
+}
+
 // preparePrimaryExactDeltaRaw is the representation-independent exact-index
 // write rule. oldRaw is the logical pre-image already resolved by the primary
 // mutation lane; compact VCS1 can therefore share the same slot-stable posting
@@ -905,40 +955,183 @@ func (c *Collection) preparePrimaryExactDeltaRaw(
 		), nil
 	}
 
-	for indexID, exact := range indexes {
-		var oldTerm, newTerm []byte
-		oldPresent, newPresent := false, false
-		if found {
-			oldTerm, oldPresent, err = appendPrimaryExactDocumentTerm(
-				oldCanonical[:0], oldComponents[:], exact, oldRaw,
-			)
-			if err != nil {
-				return false, err
+	// Fast single-pass extraction for multi-index tables whose indexed paths
+	// are simple top-level unescaped columns (the common SQL CREATE INDEX shape).
+	// Avoids re-scanning oldRaw and src once per index and skips term encoding
+	// altogether when a column's raw JSON bytes did not change.
+	const maxFastExactCols = 32
+	fastMulti := false
+	var colNames [maxFastExactCols]string
+	var colCount int
+	var indexCols [maxFastExactCols][store.MaxIndexColumns]int8
+	if len(indexes) >= 2 && len(indexes) <= maxFastExactCols {
+		fastMulti = true
+		for indexID, exact := range indexes {
+			for ci := 0; ci < int(exact.N); ci++ {
+				spec := exact.Specs[ci]
+				if len(spec) < 2 || spec[0] != '/' || strings.IndexAny(spec[1:], "/~") >= 0 {
+					fastMulti = false
+					break
+				}
+				name := spec[1:]
+				slot := -1
+				for k := 0; k < colCount; k++ {
+					if colNames[k] == name {
+						slot = k
+						break
+					}
+				}
+				if slot < 0 {
+					if colCount >= maxFastExactCols {
+						fastMulti = false
+						break
+					}
+					slot = colCount
+					colNames[colCount] = name
+					colCount++
+				}
+				indexCols[indexID][ci] = int8(slot)
+			}
+			if !fastMulti {
+				break
 			}
 		}
-		if !deleting {
-			newTerm, newPresent, err = appendPrimaryExactDocumentTerm(
-				newCanonical[:0], newComponents[:], exact, src,
-			)
-			if err != nil {
-				return false, err
+	}
+
+	var oldVals, newVals [maxFastExactCols]vibejson.RawValue
+	var oldHas, newHas [maxFastExactCols]bool
+	if fastMulti {
+		if found && !extractTopLevelExactFields(oldRaw, colNames[:colCount], oldVals[:colCount], oldHas[:colCount]) {
+			fastMulti = false
+		}
+		if fastMulti && !deleting && !extractTopLevelExactFields(src, colNames[:colCount], newVals[:colCount], newHas[:colCount]) {
+			fastMulti = false
+		}
+	}
+
+	if fastMulti {
+		for indexID, exact := range indexes {
+			n := int(exact.N)
+			if found && !deleting {
+				same := true
+				for ci := 0; ci < n; ci++ {
+					cSlot := indexCols[indexID][ci]
+					if oldHas[cSlot] != newHas[cSlot] ||
+						(oldHas[cSlot] && !bytes.Equal(oldVals[cSlot].Bytes(), newVals[cSlot].Bytes())) {
+						same = false
+						break
+					}
+				}
+				if same {
+					continue
+				}
+			}
+			var oldTerm, newTerm []byte
+			oldPresent, newPresent := false, false
+			if found {
+				oldPresent = true
+				for ci := 0; ci < n; ci++ {
+					cSlot := indexCols[indexID][ci]
+					if !oldHas[cSlot] {
+						oldPresent = false
+						break
+					}
+					comp, compOK := primaryExactComponent(oldVals[cSlot])
+					if !compOK {
+						oldPresent = false
+						break
+					}
+					oldComponents[ci] = comp
+				}
+				if oldPresent {
+					var keyOK bool
+					oldTerm, keyOK = storeio.AppendIndexTermKey(oldCanonical[:0], oldComponents[:n])
+					if !keyOK {
+						return false, fmt.Errorf(
+							"%w: exact term exceeds ordered-primary bound",
+							ErrPrimaryCutoverUnsupported,
+						)
+					}
+				}
+			}
+			if !deleting {
+				newPresent = true
+				for ci := 0; ci < n; ci++ {
+					cSlot := indexCols[indexID][ci]
+					if !newHas[cSlot] {
+						newPresent = false
+						break
+					}
+					comp, compOK := primaryExactComponent(newVals[cSlot])
+					if !compOK {
+						newPresent = false
+						break
+					}
+					newComponents[ci] = comp
+				}
+				if newPresent {
+					var keyOK bool
+					newTerm, keyOK = storeio.AppendIndexTermKey(newCanonical[:0], newComponents[:n])
+					if !keyOK {
+						return false, fmt.Errorf(
+							"%w: exact term exceeds ordered-primary bound",
+							ErrPrimaryCutoverUnsupported,
+						)
+					}
+				}
+			}
+			if oldPresent && newPresent && bytes.Equal(oldTerm, newTerm) {
+				continue
+			}
+			if oldPresent {
+				ok, err = emitTerm(indexID, oldTerm, false)
+				if err != nil || !ok {
+					return ok, err
+				}
+			}
+			if newPresent {
+				ok, err = emitTerm(indexID, newTerm, true)
+				if err != nil || !ok {
+					return ok, err
+				}
 			}
 		}
-		if oldPresent && newPresent && bytes.Equal(oldTerm, newTerm) {
-			// The dominant case: same slot, same term — the index is
-			// untouched and this mutation writes nothing for it.
-			continue
-		}
-		if oldPresent {
-			ok, err = emitTerm(indexID, oldTerm, false)
-			if err != nil || !ok {
-				return ok, err
+	} else {
+		for indexID, exact := range indexes {
+			var oldTerm, newTerm []byte
+			oldPresent, newPresent := false, false
+			if found {
+				oldTerm, oldPresent, err = appendPrimaryExactDocumentTerm(
+					oldCanonical[:0], oldComponents[:], exact, oldRaw,
+				)
+				if err != nil {
+					return false, err
+				}
 			}
-		}
-		if newPresent {
-			ok, err = emitTerm(indexID, newTerm, true)
-			if err != nil || !ok {
-				return ok, err
+			if !deleting {
+				newTerm, newPresent, err = appendPrimaryExactDocumentTerm(
+					newCanonical[:0], newComponents[:], exact, src,
+				)
+				if err != nil {
+					return false, err
+				}
+			}
+			if oldPresent && newPresent && bytes.Equal(oldTerm, newTerm) {
+				// The dominant case: same slot, same term — the index is
+				// untouched and this mutation writes nothing for it.
+				continue
+			}
+			if oldPresent {
+				ok, err = emitTerm(indexID, oldTerm, false)
+				if err != nil || !ok {
+					return ok, err
+				}
+			}
+			if newPresent {
+				ok, err = emitTerm(indexID, newTerm, true)
+				if err != nil || !ok {
+					return ok, err
+				}
 			}
 		}
 	}

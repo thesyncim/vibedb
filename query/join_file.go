@@ -627,7 +627,7 @@ func (j *planJoin) collectFile(
 	var err error
 	if !runtimeSQLJoinComparison(j) {
 		masks, plannedBytes, err = j.inner.fileCandidateMasksBounded(
-			inner, &f.index, scan, remaining,
+			inner, &f.index, scan, remaining, false,
 		)
 		if err != nil {
 			return false, err

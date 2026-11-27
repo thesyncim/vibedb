@@ -838,6 +838,7 @@ func executeFencedSQLBudget(ctx context.Context, source interface {
 	options := query.ExecOptions{
 		Cancel: flag, ResultRows: rows, ResultBytes: int64(maxBytes),
 		MemoryBytes: budget.workingBytes, IntermediateBytes: budget.workingBytes,
+		GrowWorkBudgetOnIndexDecline: budget.workingBytes < replicatedSQLWorkingBytes,
 		AggregateBytes: budget.workingBytes,
 	}
 	if reusable, ok := source.(replicatedSQLDataReadReuseSource); ok {
@@ -932,6 +933,7 @@ func executeFencedSQLPointBudget(
 	options := query.ExecOptions{
 		Cancel: flag, ResultRows: rows, ResultBytes: int64(maxBytes),
 		MemoryBytes: budget.workingBytes, IntermediateBytes: budget.workingBytes,
+		GrowWorkBudgetOnIndexDecline: budget.workingBytes < replicatedSQLWorkingBytes,
 		AggregateBytes: budget.workingBytes,
 	}
 	if reusable, ok := source.(interface {
