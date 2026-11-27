@@ -57,8 +57,13 @@ func (runtime *Runtime) runServe() {
 			defer close(writerDone)
 			writer.Run(runtime.ctx)
 		}()
-		pg, err := startGatewayPostgreSQLWithFrontend(runtime.ctx, runtime.config.PGListenAddress,
-			runtime.exec, runtime.config.InternalAuthority, writer.Write, logf, runtime.frontend, runtime.pgDDL)
+		pg, err := startGatewayPostgreSQLWithOptions(runtime.ctx, PGEndpointOptions{
+			Address:        runtime.config.PGListenAddress,
+			TLSConfig:      runtime.config.PGTLSConfig,
+			Users:          runtime.config.PGUsers,
+			Database:       runtime.config.PGDatabase,
+			MaxConnections: runtime.config.PGMaxConnections,
+		}, runtime.exec, runtime.config.InternalAuthority, writer.Write, logf, runtime.frontend, runtime.pgDDL)
 		if err != nil {
 			runtime.setServeError(err)
 			return
@@ -67,6 +72,43 @@ func (runtime *Runtime) runServe() {
 		if runtime.frontend != nil {
 			runtime.frontend.bindPG(pg)
 		}
+	}
+
+	if runtime.config.MetricsHTTPListenAddress != "" {
+		obsHandler := NewObservabilityHandler(ObservabilitySource{
+			Alive: func() bool { return runtime.ctx.Err() == nil },
+			Ready: func() (bool, string) {
+				if runtime.ctx.Err() != nil {
+					return false, "closing"
+				}
+				if runtime.frontend != nil && runtime.frontend.isDraining() {
+					return false, "draining"
+				}
+				if runtime.holder == nil || runtime.holder.Current() == nil {
+					return false, "no_catalog"
+				}
+				return true, ""
+			},
+			Metrics: func() gateway.MetricsSnapshot {
+				if runtime.exec == nil {
+					return gateway.MetricsSnapshot{}
+				}
+				return runtime.exec.Metrics()
+			},
+			Dist:       func() *gateway.DistributedMetrics { return runtime.distributedMetrics },
+			Controller: func() *gatewayControllerMetrics { return runtime.controllerMetrics },
+		})
+		obsSrv, obsLn, obsDone, err := startGatewayObservabilityHTTP(
+			runtime.ctx, runtime.config.MetricsHTTPListenAddress,
+			runtime.config.MetricsHTTPTLSConfig, obsHandler, logf,
+		)
+		if err != nil {
+			runtime.setServeError(err)
+			return
+		}
+		runtime.observabilityHTTP = obsSrv
+		runtime.observabilityListener = obsLn
+		runtime.observabilityDone = obsDone
 	}
 
 	if runtime.ctx.Err() != nil {
@@ -135,6 +177,9 @@ func (runtime *Runtime) waitOptionalServices() {
 	// before a live catalog session rollover or terminal seed handoff is retired.
 	if runtime.pg != nil {
 		runtime.setDrainError(runtime.pg.Close())
+	}
+	if runtime.observabilityHTTP != nil {
+		runtime.setDrainError(stopGatewayObservabilityHTTP(runtime.observabilityHTTP, runtime.observabilityDone))
 	}
 	if runtime.pgWriter != nil {
 		runtime.setDrainError(runtime.pgWriter.Close())

@@ -95,8 +95,12 @@ its generated client identity only `data_read` and `data_write`. That
 credential cannot request metrics (`topology`), run cluster control
 (`topology`, plus `membership` for mutations), or start backups (`backup`).
 
-No shipped command rotates certificates, edits the policy, or integrates an
-external secret store. Treat every generated root as containing private keys.
+`vibedb cluster rotate-cert` rotates leaf certificates in place while preserving
+their VibeDB binary identity (and optionally updates `node-descriptor.vibejson`
+SPKI digests), and `vibedb cluster policy (show|grant|revoke)` edits and
+verifies `authorization-policy.vibejson` atomically. External secret-store
+integration remains operator-provided; treat every generated root as containing
+private keys.
 
 ## What an evaluation deployment must provide
 
@@ -112,17 +116,21 @@ Before running VibeDB anywhere that matters, account for each gap:
    no rolling upgrade; see [upgrades](upgrades.md).
 5. **Backups off the host.** The gateway writes backups to a server-local
    directory. Copying them elsewhere is outside VibeDB.
-6. **Monitoring.** The metrics surface exposes raw counters plus fixed-bucket
-   gateway read/write latency histograms (`read_latency_us`, `write_latency_us`),
-   but no built-in alerting or dashboarding; see [observability](observability.md).
+6. **Monitoring.** The gateway exposes both authenticated native `{"op":"metrics"}`
+   JSON snapshots and an optional Prometheus `/metrics`, `/healthz`, and `/readyz`
+   HTTP endpoint (`MetricsHTTPListenAddress`, loopback-only unless TLS is configured)
+   with counters and read/write latency histograms. Alerting rules and dashboards
+   remain operator-provided; see [observability](observability.md).
 7. **Capacity headroom.** Process RSS, disk, and file descriptors are not
    bounded by VibeDB as a whole; see [capacity planning](capacity-planning.md).
 
 ## Limitations
 
 - No release, support window, or license is published.
-- SQL access to an RF3 cluster is the loopback development pgwire listener.
-  Remote SQL clients have no authenticated SQL listener to connect to.
+- SQL access to an RF3 cluster defaults to a loopback development pgwire
+  listener when no SCRAM users are configured; remote pgwire listeners require
+  both TLS (`RequireTLS`) and SCRAM-SHA-256 user credentials with explicit
+  SQL-only capability subsets (`PGTLSConfig` + `PGUsers`).
 - The native client protocol is exact-build and unstable; do not build a
   long-lived client against it.
 - Host loss has not been qualified on separate machines. Six local processes

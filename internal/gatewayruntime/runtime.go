@@ -2,9 +2,11 @@ package gatewayruntime
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -105,11 +107,20 @@ type Config struct {
 	MaxNativeReadBytes          uint64
 	MaxNativeScatterConcurrency int
 
-	// Optional local PostgreSQL frontend. Its journals are derived from
-	// CatalogSessionJournal and therefore retain the same private frontend
-	// identity while remaining separate from the catalog session journal.
-	PGListenAddress string
-	PGDDLSocket     string
+	// Optional PostgreSQL frontend. Loopback-only with Trust auth when PGUsers
+	// is empty; non-loopback addresses require both PGTLSConfig and PGUsers
+	// (SCRAM-SHA-256 with explicit per-user SQL capability subsets). Its
+	// journals are derived from CatalogSessionJournal.
+	PGListenAddress  string
+	PGDDLSocket      string
+	PGTLSConfig      *tls.Config
+	PGUsers          []PGUserCredential
+	PGDatabase       string
+	PGMaxConnections int
+	// Optional HTTP observability endpoint serving /healthz, /readyz, and
+	// Prometheus /metrics. Loopback-only unless MetricsHTTPTLSConfig is set.
+	MetricsHTTPListenAddress string
+	MetricsHTTPTLSConfig     *tls.Config
 	// A participant forwards DDL once to this exact authenticated gateway
 	// principal. The owner retains the only schema journal and recovery loop.
 	DDLOwnerAddress string
@@ -202,13 +213,16 @@ type Runtime struct {
 	frontend    *frontendAdmission
 	journalLock *os.File
 
-	routeSeedControl *gateway.ReplicatedCatalogRouteSeedControl
-	pg               interface{ Close() error }
-	pgWriter         interface{ Close() error }
-	pgWriterDone     <-chan struct{}
-	pgDDL            func(context.Context, serviceauthz.Authority, string) error
-	ddlForwardTLS    *servicetls.Client
-	ddlForwardOwner  *gatewayDDLForwardOwner
+	routeSeedControl      *gateway.ReplicatedCatalogRouteSeedControl
+	pg                    interface{ Close() error }
+	pgWriter              interface{ Close() error }
+	pgWriterDone          <-chan struct{}
+	pgDDL                 func(context.Context, serviceauthz.Authority, string) error
+	ddlForwardTLS         *servicetls.Client
+	ddlForwardOwner       *gatewayDDLForwardOwner
+	observabilityHTTP     *http.Server
+	observabilityListener net.Listener
+	observabilityDone     <-chan struct{}
 
 	replicaControlManifest  *gatewayReplicaControlManifest
 	provisionedSplitSources []gatewayProvisionedSplitSource
@@ -531,11 +545,22 @@ func (config Config) validate() error {
 		return fmt.Errorf("%w: native read admission bounds are invalid", ErrInvalidConfig)
 	}
 	if config.PGListenAddress != "" {
-		if err := requireLoopbackListen(config.PGListenAddress); err != nil {
+		if err := validatePGEndpointOptions(PGEndpointOptions{
+			Address:        config.PGListenAddress,
+			TLSConfig:      config.PGTLSConfig,
+			Users:          config.PGUsers,
+			Database:       config.PGDatabase,
+			MaxConnections: config.PGMaxConnections,
+		}); err != nil {
 			return fmt.Errorf("%w: PostgreSQL endpoint: %v", ErrInvalidConfig, err)
 		}
 		if config.DevStaticCatalog {
 			return fmt.Errorf("%w: PostgreSQL requires RF3 catalog", ErrInvalidConfig)
+		}
+	}
+	if config.MetricsHTTPListenAddress != "" && config.MetricsHTTPTLSConfig == nil {
+		if err := requireLoopbackListen(config.MetricsHTTPListenAddress); err != nil {
+			return fmt.Errorf("%w: observability HTTP endpoint without TLS: %v", ErrInvalidConfig, err)
 		}
 	}
 	return nil

@@ -26,10 +26,15 @@ const (
 // PostgreSQLBackend exposes distributed reads and optional durable autocommit
 // writes, never an embedded database or a replica-local mutation path.
 type PostgreSQLBackend struct {
-	Executor   *Executor
-	Authorize  func(pgwire.SessionIdentity) (serviceauthz.Authority, error)
-	Write      func(context.Context, serviceauthz.Authority, Query) (*Result, error)
-	WriteBatch func(context.Context, serviceauthz.Authority, []Query) (*Result, error)
+	Executor *Executor
+	Authorize func(pgwire.SessionIdentity) (serviceauthz.Authority, error)
+	// AuthorizeCapabilities optionally resolves both the backing Authority and
+	// the explicit SQL capability subset (CapabilityDataRead,
+	// CapabilityDataWrite, CapabilitySchema) granted to this PostgreSQL user.
+	// When non-nil it takes precedence over Authorize.
+	AuthorizeCapabilities func(pgwire.SessionIdentity) (serviceauthz.Authority, serviceauthz.Capability, error)
+	Write                 func(context.Context, serviceauthz.Authority, Query) (*Result, error)
+	WriteBatch            func(context.Context, serviceauthz.Authority, []Query) (*Result, error)
 	// DDL is a cold, coordinated schema operation. It must return success only
 	// after the serving catalog is durable; it is never a replica-local Exec.
 	DDL func(context.Context, serviceauthz.Authority, string) error
@@ -39,19 +44,47 @@ type PostgreSQLBackend struct {
 }
 
 func (b *PostgreSQLBackend) NewSession(ctx context.Context, identity pgwire.SessionIdentity) (pgwire.BackendSession, error) {
-	if b == nil || ctx == nil || b.Executor == nil || b.Executor.catalog == nil || b.Executor.catalog.Current() == nil || b.Authorize == nil {
+	if b == nil || ctx == nil || b.Executor == nil || b.Executor.catalog == nil || b.Executor.catalog.Current() == nil ||
+		(b.Authorize == nil && b.AuthorizeCapabilities == nil) {
 		return nil, ErrReplicatedUnauthorized
 	}
-	authority, err := b.Authorize(identity)
+	var (
+		authority    serviceauthz.Authority
+		capabilities serviceauthz.Capability
+		err          error
+	)
+	if b.AuthorizeCapabilities != nil {
+		authority, capabilities, err = b.AuthorizeCapabilities(identity)
+	} else {
+		authority, err = b.Authorize(identity)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if _, err := serviceauthz.WithAuthority(ctx, authority); err != nil {
 		return nil, err
 	}
-	session := &postgresSession{backend: b, authority: authority, state: driver.SessionIdle, statements: make(map[pgwire.BackendStatement]struct{}), rows: 100000, bytes: shardservice.MaxReplicatedSQLResultBytes}
+	session := &postgresSession{
+		backend:      b,
+		authority:    authority,
+		capabilities: capabilities,
+		state:        driver.SessionIdle,
+		statements:   make(map[pgwire.BackendStatement]struct{}),
+		rows:         100000,
+		bytes:        shardservice.MaxReplicatedSQLResultBytes,
+	}
 	session.materializedRelease = session.releaseMaterialized
 	return session, nil
+}
+
+func (s *postgresSession) requireCapability(required serviceauthz.Capability) error {
+	if s == nil {
+		return ErrReplicatedUnauthorized
+	}
+	if s.capabilities != 0 && s.capabilities&required != required {
+		return ErrReplicatedUnauthorized
+	}
+	return nil
 }
 
 type postgresSavepoint struct {
@@ -64,6 +97,7 @@ const maxPostgresSavepoints = 64
 type postgresSession struct {
 	backend             *PostgreSQLBackend
 	authority           serviceauthz.Authority
+	capabilities        serviceauthz.Capability
 	state               driver.SessionState
 	flag                *query.CancelFlag
 	rows                int
@@ -414,6 +448,9 @@ func (s *postgresSession) prepare(
 	}
 	if parsed.Kind != sqlast.KindSelect {
 		return s.prepareWrite(ctx, text, &parsed, queryParameterTypes)
+	}
+	if err := s.requireCapability(serviceauthz.CapabilityDataRead); err != nil {
+		return nil, err
 	}
 	if s.backend != nil {
 		if expanded, changed := s.backend.viewRegistry().expandViewSQL(text); changed {

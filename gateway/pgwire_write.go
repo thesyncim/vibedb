@@ -64,6 +64,14 @@ func (s *postgresSession) prepareWrite(
 	if postgresDDLKind(parsed.Kind) {
 		return s.prepareDDL(text, parsed)
 	}
+	if err := s.requireCapability(serviceauthz.CapabilityDataWrite); err != nil {
+		return nil, err
+	}
+	if parsed.Kind == sqlast.KindInsert && parsed.Insert.Source != nil {
+		if err := s.requireCapability(serviceauthz.CapabilityDataRead); err != nil {
+			return nil, err
+		}
+	}
 	if s.backend.Write == nil {
 		return nil, driver.ErrReadOnlyTransaction
 	}

@@ -25,6 +25,9 @@ func postgresDDLKind(kind sqlast.Kind) bool {
 type postgresDDLStatement struct{ postgresWriteStatement }
 
 func (s *postgresSession) prepareDDL(text string, parsed *sqlast.Statement) (pgwire.BackendStatement, error) {
+	if err := s.requireCapability(serviceauthz.CapabilitySchema); err != nil {
+		return nil, err
+	}
 	if err := rejectReplicatedUniqueIndex(text, parsed); err != nil {
 		return nil, err
 	}
