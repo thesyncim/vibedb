@@ -118,6 +118,31 @@ func TestSummarizeReportsMedianMADQuartilesAndRange(t *testing.T) {
 	}
 }
 
+func TestWriteSummariesHeaderMatchesEmittedColumns(t *testing.T) {
+	header := []string{
+		"engine", "durability", "workload", "card", "document-shape",
+		"exact-indexes", "clients", "operation", "durability-payload-known",
+		"ops-per-sec",
+	}
+	records := []runRecord{
+		{row: rawRow{values: []string{"vibedb", "sync", "oltp", "1000", "flat", "2", "4", "read", "true", "1234.5"}}},
+		{row: rawRow{values: []string{"vibedb", "sync", "oltp", "1000", "flat", "2", "4", "read", "true", "1250.0"}}},
+	}
+	var out bytes.Buffer
+	if err := writeSummaries(&out, header, records); err != nil {
+		t.Fatalf("writeSummaries: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 lines (header + 1 summary row), got %d:\n%s", len(lines), out.String())
+	}
+	hdrCols := strings.Split(lines[0], "\t")
+	rowCols := strings.Split(lines[1], "\t")
+	if len(hdrCols) != len(rowCols) {
+		t.Fatalf("summary header columns (%d) != row columns (%d)\nheader: %v\nrow:    %v", len(hdrCols), len(rowCols), hdrCols, rowCols)
+	}
+}
+
 func TestParseMixedOutputRequiresMachineReadableShape(t *testing.T) {
 	const valid = `engine durability workload card document-shape docs measured warmup checkpoint forced-cp exact-indexes clients operation calls p50-us p95-us p99-us p99.9-us max-us total-ops/s disk-MiB alloc-MiB heap-MiB runtime-MiB peak-rss-MiB durability-payload-known logical-write-B durability-payload-B durability-payload/logical
 vibedb buffered-visible ycsb-a low inline 10 20 2 64 0 0 1 read 10 1 2 3 4 5 1000 1 1 2 3 4 true 100 200 2

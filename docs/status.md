@@ -76,8 +76,6 @@ Darwin durability uses its strongest implemented barrier; see
   semantics than a linearizable global snapshot.
 - Resource budgets cover their named caches, workspaces, or overlays. They do
   not establish a fixed total process-memory ceiling.
-- The competitive `mixedsuite` summary header does not describe every emitted
-  grouping field. Use raw per-run rows; see [performance methodology](performance.md#known-mixedsuite-output-defect).
 
 The distributed ledger lists partial qualification for each feature, and
 [defaults and limits](reference/limits.md) lists the exact bounds.
