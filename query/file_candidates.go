@@ -42,6 +42,7 @@ func (p *plan) fileCandidateMasksBounded(
 	index *durable.IndexSession,
 	w *Workspace,
 	memoryBytes int64,
+	growOnDecline bool,
 ) ([]store.Mask, int64, error) {
 	if err := w.checkCanceled(); err != nil {
 		return nil, 0, err
@@ -64,6 +65,13 @@ func (p *plan) fileCandidateMasksBounded(
 	}
 	planned := p.fileIndexPlanMemoryBytes(bound, workspaceBytes)
 	if memoryBytes < 0 || planned > memoryBytes {
+		if growOnDecline && bound.CatalogBytes > 0 {
+			return nil, 0, &WorkBudgetError{
+				Resource: "durable candidate-planner workspace",
+				Bytes:    planned,
+				Limit:    memoryBytes,
+			}
+		}
 		return nil, 0, nil
 	}
 	masks, err := p.fileCandidateMasks(snapshot, index, w)

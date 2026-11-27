@@ -1859,6 +1859,14 @@ func (c *Collection) mergeUnderfilledPrimaryLeavesLocked() {
 	if count == 0 || c.closed {
 		return
 	}
+	if state := c.state.Load(); state != nil && state.root.IndexCount != 0 {
+		// On indexed collections, every structural leaf merge re-encodes
+		// and fsyncs all secondary exact indexes. Compact leaves already
+		// shrink their physical extent class dynamically on rewrite, so
+		// skip non-empty sibling merges here to avoid multi-index rebuild
+		// stalls during delete churn.
+		return
+	}
 	prev := c.primaryStructuralActive
 	c.primaryStructuralActive = true
 	defer func() { c.primaryStructuralActive = prev }()
