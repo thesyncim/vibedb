@@ -251,6 +251,56 @@ func (ix *Index) Docs() int {
 	return ix.nDocs
 }
 
+// Clone returns an independent copy of ix whose sealed posting lists share
+// their immutable packed payloads with ix. Mutating the clone (via Add,
+// AddBytes, or Remove) transparently unseals only the posting lists for
+// terms touched by the mutation, leaving ix and all untouched sealed lists
+// unmodified and safe for concurrent readers.
+func (ix *Index) Clone() *Index {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	ix.ensureSorted()
+	cp := &Index{
+		docs:      make(map[DocID]docMeta, len(ix.docs)),
+		post:      make(map[uint64]*postings, len(ix.post)),
+		nDocs:     ix.nDocs,
+		tokens:    ix.tokens,
+		sorted:    ix.sorted,
+		dict:      make(map[uint64]string, len(ix.dict)),
+		spellIdx:  append([]spellEntry(nil), ix.spellIdx...),
+		maxSpell:  ix.maxSpell,
+		minDocLen: ix.minDocLen,
+	}
+	for id, meta := range ix.docs {
+		cp.docs[id] = meta
+	}
+	for h, p := range ix.post {
+		if p.sealed != nil {
+			cp.post[h] = &postings{sealed: p.sealed}
+			continue
+		}
+		ids := make([]DocID, len(p.ids))
+		copy(ids, p.ids)
+		off := make([]uint32, len(p.off))
+		copy(off, p.off)
+		pos := make([]uint32, len(p.pos))
+		copy(pos, p.pos)
+		cp.post[h] = &postings{ids: ids, off: off, pos: pos}
+	}
+	for h, sp := range ix.dict {
+		cp.dict[h] = sp
+	}
+	if len(ix.docLens) > 0 {
+		cp.docLens = make(map[uint32]*docLenChunk, len(ix.docLens))
+		for k, c := range ix.docLens {
+			arr := make([]uint32, len(c.arr))
+			copy(arr, c.arr)
+			cp.docLens[k] = &docLenChunk{base: c.base, arr: arr}
+		}
+	}
+	return cp
+}
+
 // Add indexes text under id, replacing any previous document with the same
 // id. Text is normalized exactly like query terms (case and accent folding),
 // so index and query sides agree by construction.

@@ -148,8 +148,10 @@ type Collection struct {
 	exactAliases uint32
 	// tinDefs records full-text index definitions by name; tinCache pins
 	// built tin indexes per snapshot State (see store_index_tin.go).
-	tinDefs  map[string]tinDefinition
-	tinCache map[*State]map[string]*tin.Index
+	tinDefs              map[string]tinDefinition
+	tinCache             map[*State]map[string]tinCacheEntry
+	tinFullBuilds        uint64
+	tinIncrementalBuilds uint64
 	// tinSegCache pins segmented tin builds per State, keyed by index
 	// name and segment count.
 	tinSegCache map[*State]map[tinSegKey][]*tin.Index

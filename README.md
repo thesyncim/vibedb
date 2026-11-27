@@ -132,8 +132,9 @@ Key gaps:
   manifests, and public node descriptors from a cluster CA; external CA
   management and multi-host process supervision remain operator-provided.
 - No global MVCC snapshot across Raft groups; no Kubernetes operator.
-- Tin search rebuilds postings in memory per searched generation; postings
-  are not persisted or maintained incrementally.
+- Tin search maintains postings incrementally across generations by diffing
+  changed chunks or primary leaves (sharing untouched sealed posting lists),
+  but postings remain memory-resident and are not persisted across restarts.
 - PostgreSQL wire support covers selected client flows, not PostgreSQL
   compatibility. Several [benchmark reports](docs/benchmarks/README.md) record
   VibeDB slower than the comparison system.

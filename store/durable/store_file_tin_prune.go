@@ -151,42 +151,105 @@ func tinSlotWalk(
 	return nil
 }
 
-// joinTinSlots builds the ordinal-to-slot table by joining the leaf walk
-// against the indexed key sequence. It returns nil unless the join proves
-// itself exact: every indexed key resolves to exactly one visited slot.
-// Document keys are unique, so no-duplicates plus a full count is the
-// whole proof — a rewritten leaf, a missed bucket, or any skew fails it
-// and declines every probe. All allocations here are build-time (once per
-// generation); queries only index the retained table.
-func joinTinSlots(keys [][]byte, snap *Snapshot) *tinSlotMap {
+// joinTinSlotsWithLeaves builds the ordinal-to-slot table by joining the leaf
+// walk against the indexed key sequence, and also captures the per-bucket leaf
+// PageRefs and key sets when the snapshot's primary router stayed pinned to
+// snap.Generation() across the entire walk. It returns nil slots unless the
+// join proves itself exact: every indexed key resolves to exactly one visited
+// slot. Document keys are unique, so no-duplicates plus a full count is the
+// whole proof — a rewritten leaf, a missed bucket, or any skew fails it and
+// declines every probe.
+func joinTinSlotsWithLeaves(
+	keys [][]byte,
+	snap *Snapshot,
+) (
+	*tinSlotMap,
+	map[string]uint64,
+	map[storeio.BucketID]storeio.PageRef,
+	map[storeio.BucketID][][]byte,
+) {
+	router := snap.primaryRouter
+	if router == nil || snap.state == nil {
+		return nil, nil, nil, nil
+	}
+	generation := snap.Generation()
+	routerStable := router.Generation() == generation
 	slots := make([]TinSlotHit, len(keys))
 	pos := make(map[string]int, len(keys))
 	for o, key := range keys {
 		s := string(key)
 		if _, dup := pos[s]; dup {
-			return nil
+			return nil, nil, nil, nil
 		}
 		pos[s] = o
 	}
 	found := make([]bool, len(keys))
 	seen := 0
-	err := tinSlotWalk(snap, func(key []byte, chunk uint32, bit uint8) error {
-		o, ok := pos[string(key)]
-		if !ok {
-			return errTinSlotSkew
-		}
-		if found[o] {
-			return errTinSlotSkew
-		}
-		found[o] = true
-		slots[o] = TinSlotHit{Chunk: chunk, Bit: bit}
-		seen++
-		return nil
-	})
-	if err != nil || seen != len(keys) {
-		return nil
+	var (
+		leafRefs   map[storeio.BucketID]storeio.PageRef
+		bucketKeys map[storeio.BucketID][][]byte
+	)
+	if routerStable {
+		leafRefs = make(map[storeio.BucketID]storeio.PageRef, router.Len())
+		bucketKeys = make(map[storeio.BucketID][][]byte, router.Len())
 	}
-	return &tinSlotMap{slots: slots, rows: len(keys)}
+	c := snap.collection
+	state := snap.state
+	bounds := c.primaryLeafBounds(state)
+	var scratch []byte
+	for rank := 0; rank < router.Len(); rank++ {
+		route, ok := router.RouteAtRank(rank)
+		if !ok {
+			return nil, nil, nil, nil
+		}
+		if routerStable {
+			leafRefs[route.Bucket] = route.Ref
+		}
+		lease, err := router.AcquireLeaf(c.cache, route)
+		if err != nil {
+			return nil, nil, nil, nil
+		}
+		bucket := uint32(route.Bucket)
+		scratch, err = storeio.VisitPrimaryLeafPostingRows(
+			lease.Page(), state.root.StoreID, route.Bucket, bounds, scratch,
+			func(slot uint8, key, _ []byte, _ bool) error {
+				o, ok := pos[string(key)]
+				if !ok || found[o] {
+					return errTinSlotSkew
+				}
+				found[o] = true
+				slots[o] = TinSlotHit{Chunk: bucket<<2 | uint32(slot>>6), Bit: slot & 63}
+				seen++
+				if routerStable {
+					bucketKeys[route.Bucket] = append(bucketKeys[route.Bucket], keys[o])
+				}
+				return nil
+			},
+		)
+		lease.Release()
+		if err != nil {
+			return nil, nil, nil, nil
+		}
+	}
+	if seen != len(keys) {
+		return nil, nil, nil, nil
+	}
+	slotMap := &tinSlotMap{slots: slots, rows: len(keys)}
+	if !routerStable || router.Generation() != generation {
+		return slotMap, nil, nil, nil
+	}
+	keyToOrdinal := make(map[string]uint64, len(keys))
+	for k, o := range pos {
+		keyToOrdinal[k] = uint64(o)
+	}
+	return slotMap, keyToOrdinal, leafRefs, bucketKeys
+}
+
+// joinTinSlots builds the ordinal-to-slot table by joining the leaf walk
+// against the indexed key sequence.
+func joinTinSlots(keys [][]byte, snap *Snapshot) *tinSlotMap {
+	slotMap, _, _, _ := joinTinSlotsWithLeaves(keys, snap)
+	return slotMap
 }
 
 // AppendCandidateMasks maps ascending match ordinals to strictly ascending

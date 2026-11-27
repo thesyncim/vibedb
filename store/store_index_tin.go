@@ -109,8 +109,17 @@ func (c *Collection) dropTinIndexLocked(name string) bool {
 	return true
 }
 
+// tinCacheEntry pairs one cached tin index with the path it was built over so
+// incremental maintenance never reuses a dropped-and-recreated index name that
+// now targets a different JSON path.
+type tinCacheEntry struct {
+	path  string
+	index *tin.Index
+}
+
 // TinIndex returns the tin index built over snapshot s for the named index,
-// building it on first use by scanning s's own chunks. The returned index
+// building it on first use (incrementally from the closest cached State's
+// chunk diff when available, or by scanning s's chunks). The returned index
 // must not be mutated: it is shared by every concurrent reader of s.
 func (c *Collection) TinIndex(s Snapshot, name string) (*tin.Index, error) {
 	c.mu.Lock()
@@ -124,35 +133,77 @@ func (c *Collection) TinIndex(s Snapshot, name string) (*tin.Index, error) {
 		return nil, fmt.Errorf("%w: snapshot has no state", ErrIndexNotFound)
 	}
 	if entry, ok := c.tinCache[state]; ok {
-		if ix, ok := entry[name]; ok {
-			return ix, nil
+		if cached, ok := entry[name]; ok && cached.path == tdef.path {
+			return cached.index, nil
 		}
-	} else if len(c.tinCache) >= maxTinCacheStates {
+	}
+	var (
+		baseState *State
+		baseIx    *tin.Index
+		baseDist  uint64
+	)
+	for st, entry := range c.tinCache {
+		if st == nil || st == state {
+			continue
+		}
+		cached, ok := entry[name]
+		if !ok || cached.index == nil || cached.path != tdef.path {
+			continue
+		}
+		var dist uint64
+		if state.Generation >= st.Generation {
+			dist = state.Generation - st.Generation
+		} else {
+			dist = st.Generation - state.Generation
+		}
+		if baseState == nil || dist < baseDist {
+			baseState = st
+			baseIx = cached.index
+			baseDist = dist
+		}
+	}
+	var (
+		ix          *tin.Index
+		incremental bool
+		err         error
+	)
+	if baseState != nil {
+		ix, incremental, err = buildTinIndexIncremental(baseState, baseIx, state, tdef)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !incremental {
+		ix, err = buildTinIndex(state, tdef)
+		if err != nil {
+			return nil, err
+		}
+		c.tinFullBuilds++
+	} else {
+		c.tinIncrementalBuilds++
+	}
+	if len(c.tinCache) >= maxTinCacheStates {
 		// Bound retained builds: executing snapshots hold their own
 		// references, so eviction never invalidates a live reader.
 		for st := range c.tinCache {
-			if st != c.state.Load() {
+			if st != c.state.Load() && st != state {
 				delete(c.tinCache, st)
 				break
 			}
 		}
 		if len(c.tinCache) >= maxTinCacheStates {
-			c.tinCache = make(map[*State]map[string]*tin.Index)
+			c.tinCache = make(map[*State]map[string]tinCacheEntry)
 		}
 	}
-	ix, err := buildTinIndex(state, tdef)
-	if err != nil {
-		return nil, err
-	}
 	if c.tinCache == nil {
-		c.tinCache = make(map[*State]map[string]*tin.Index)
+		c.tinCache = make(map[*State]map[string]tinCacheEntry)
 	}
 	entry := c.tinCache[state]
 	if entry == nil {
-		entry = make(map[string]*tin.Index)
+		entry = make(map[string]tinCacheEntry)
 		c.tinCache[state] = entry
 	}
-	entry[name] = ix
+	entry[name] = tinCacheEntry{path: tdef.path, index: ix}
 	return ix, nil
 }
 
@@ -303,6 +354,81 @@ func buildTinIndex(state *State, tdef tinDefinition) (*tin.Index, error) {
 		return true
 	})
 	return ix, err
+}
+
+// buildTinIndexIncremental derives state's tin index from prevIx by diffing
+// persistent chunk pointers between prevState and state. Unchanged chunks
+// share identical *Chunk pointers and are skipped without decoding or
+// tokenizing. When more than half of the chunks changed, it declines so the
+// caller performs a fresh full scan instead.
+func buildTinIndexIncremental(
+	prevState *State,
+	prevIx *tin.Index,
+	state *State,
+	tdef tinDefinition,
+) (*tin.Index, bool, error) {
+	if prevState == nil || prevIx == nil || state == nil {
+		return nil, false, nil
+	}
+	var (
+		changed     []uint32
+		removed     []uint32
+		totalChunks int
+		prevChunks  int
+	)
+	state.Chunks.Each(func(id uint32, chunk *Chunk) bool {
+		totalChunks++
+		if prevState.Chunks.Get(id) != chunk {
+			changed = append(changed, id)
+		}
+		return true
+	})
+	prevState.Chunks.Each(func(id uint32, _ *Chunk) bool {
+		prevChunks++
+		if state.Chunks.Get(id) == nil {
+			removed = append(removed, id)
+		}
+		return true
+	})
+	if len(changed) == 0 && len(removed) == 0 {
+		return prevIx, true, nil
+	}
+	if prevChunks == 0 || (totalChunks > 2 && len(changed)+len(removed) > totalChunks/2) {
+		return nil, false, nil
+	}
+	ix := prevIx.Clone()
+	for _, id := range removed {
+		prevChunk := prevState.Chunks.Get(id)
+		if prevChunk == nil {
+			continue
+		}
+		for live := prevChunk.Live; live != 0; live &= live - 1 {
+			slot := bits.TrailingZeros64(live)
+			ix.Remove(TinDocID(id, slot))
+		}
+	}
+	var scratch []byte
+	for _, id := range changed {
+		prevChunk := prevState.Chunks.Get(id)
+		nextChunk := state.Chunks.Get(id)
+		if prevChunk != nil {
+			for gone := prevChunk.Live &^ nextChunk.Live; gone != 0; gone &= gone - 1 {
+				slot := bits.TrailingZeros64(gone)
+				ix.Remove(TinDocID(id, slot))
+			}
+		}
+		for live := nextChunk.Live; live != 0; live &= live - 1 {
+			slot := bits.TrailingZeros64(live)
+			text, nextScratch, ok := tinSlotBytes(nextChunk, slot, tdef.pointer, scratch)
+			if ok {
+				scratch = nextScratch
+				ix.AddBytes(TinDocID(id, slot), text)
+			} else if prevChunk != nil && prevChunk.Live&(uint64(1)<<uint(slot)) != 0 {
+				ix.Remove(TinDocID(id, slot))
+			}
+		}
+	}
+	return ix, true, nil
 }
 
 // addChunkToIndex indexes one chunk's live text slots into ix with global

@@ -14,8 +14,9 @@ interfaces:
 | SQL and pgwire | `CREATE INDEX name ON table(path) USING tin` | `path ==> 'tinql'` and `SCORE()` |
 
 Full-text search is a development feature. Read [limitations](#limitations)
-before relying on it for a large or write-heavy collection: an index is
-rebuilt in memory for every new collection generation that is searched.
+before relying on it for a large collection: postings are maintained
+incrementally in memory across generations, but are not persisted across
+restarts.
 
 ## Search from Go
 
@@ -260,9 +261,13 @@ flowchart LR
 Scope: one collection. The index is always derived from the same generation
 that the query reads, so results never mix postings from different states.
 
-- The first search after a write builds a new index by reading every document
-  in that generation. On disk profiles the build parses each stored document.
-  Later searches of the same generation reuse the cached build.
+- The first search builds a baseline index by reading every document in that
+  generation. Later searches of the same generation reuse the cached build, and
+  searches of newer generations derive their build incrementally from the
+  closest cached generation by diffing changed chunks (on `Memory`) or changed
+  primary leaves (on `Durable` / `Buffered`), sharing untouched sealed posting
+  lists. Bulk changes (>50% of chunks or leaves), overflow values, or
+  concurrent router advances fall back cleanly to a full generation scan.
 - In SQL and typed queries, the index restricts the scan to candidate rows,
   which are then rechecked. On an in-memory snapshot, a lone `==>` with one
   `ORDER BY SCORE()` key and a `LIMIT` reads the index's ranked hits instead
@@ -288,11 +293,12 @@ outside the transaction.
 
 ## Limitations
 
-- **Rebuild on change.** Postings are not maintained incrementally. Each new
-  generation that is searched pays a full scan of the collection, and a
-  write between every pair of searches makes every search pay it. On the
-  `Memory` profile the build holds the collection's writer lock, so writes to
-  that collection wait for it.
+- **Incremental maintenance fallbacks.** Searches across generations maintain
+  postings incrementally by diffing changed chunks or primary leaves, but bulk
+  changes (>50% of chunks or leaves), overflow rows, schema changes, or
+  ordinal-table compaction fall back to a full generation scan. On the `Memory`
+  profile the build holds the collection's writer lock, so writes to that
+  collection wait for it.
 - **Resident memory.** Durable declarations are persisted, but postings are
   never written to disk. Each cached build (up to four generations per
   collection, plus segmented builds on large in-memory snapshots) holds the
