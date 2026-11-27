@@ -158,8 +158,12 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 	ctx context.Context, requestKey requestledger.RequestKey, tenant []byte,
 	queries []Query, mode DurableSQLExecutionMode,
 ) (result DurableSQLRequestResult, err error) {
+	started := time.Now()
 	admitted := false
 	defer func() {
+		if err == nil && executor != nil && executor.planner != nil {
+			executor.planner.metrics.ObserveWriteLatency(time.Since(started))
+		}
 		if err != nil && !admitted {
 			err = errors.Join(ErrDurableSQLNotAdmitted, err)
 		}

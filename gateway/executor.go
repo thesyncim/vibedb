@@ -259,7 +259,13 @@ func (e *Executor) queryWithProfileValidation(
 	preparedParams int,
 	directTarget *shardservice.DirectSQLTarget,
 	preparedCache ...*preparedQueryExecution,
-) (*Result, error) {
+) (res *Result, err error) {
+	started := time.Now()
+	defer func() {
+		if err == nil {
+			e.metrics.ObserveReadLatency(time.Since(started))
+		}
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -506,7 +512,13 @@ func (e *Executor) queryWithProfileValidation(
 // refused before any network I/O so a write never partially commits. An empty
 // route is a successful local no-op: no shard is contacted. Atomic
 // multi-statement and cross-shard writes dispatch through ExecBatch.
-func (e *Executor) Exec(ctx context.Context, q Query) (*Result, error) {
+func (e *Executor) Exec(ctx context.Context, q Query) (res *Result, err error) {
+	started := time.Now()
+	defer func() {
+		if err == nil {
+			e.metrics.ObserveWriteLatency(time.Since(started))
+		}
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
