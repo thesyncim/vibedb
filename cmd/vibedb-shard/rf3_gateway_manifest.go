@@ -6,9 +6,19 @@ import (
 	"math"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/thesyncim/vibejson"
 )
+
+type rf3ServeNodeRuntimeOps struct {
+	MetricsHTTPListenAddress string
+	FrontendDrainGracePeriod time.Duration
+	MaxMemoryBytes           uint64
+	MinFreeDiskBytes         uint64
+	DiskWatermarkPath        string
+	SlowQueryThreshold       time.Duration
+}
 
 // rf3ManifestGateway is the persisted, serializable part of one embedded
 // frontend. Runtime interfaces, listeners and transports are deliberately
@@ -43,6 +53,7 @@ type rf3ManifestGateway struct {
 	MaxNativeScatterConcurrency uint64                   `json:"max_native_scatter_concurrency"`
 	TableCatalogs               []string                 `json:"table_catalogs"`
 	TableCatalogsPath           string                   `json:"table_catalogs_path"`
+	RuntimeOps                  rf3ServeNodeRuntimeOps   `json:"-"`
 	HotShardCapacityPath        string                   `json:"hot_shard_capacity"`
 	HotShardIntervalMillis      uint64                   `json:"hot_shard_interval_millis"`
 	ReplicaControlManifestPath  string                   `json:"replica_control_manifest"`
