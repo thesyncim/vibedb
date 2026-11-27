@@ -1373,6 +1373,7 @@ type shimFunctions struct {
 	database string
 	user     string
 	pid      int32
+	server   *Server
 }
 
 // A shimColumn is one recognized select-list item.
@@ -1490,6 +1491,34 @@ func (fn shimFunctions) parseShimItem(s *scanner) (shimColumn, bool) {
 	case strings.EqualFold(word, "current_catalog"):
 		v := fn.database
 		return shimColumn{name: "current_catalog", value: &v, typ: typeText}, true
+	}
+	// Single-argument backend control functions: pg_cancel_backend(pid) and
+	// pg_terminate_backend(pid).
+	if strings.EqualFold(word, "pg_cancel_backend") || strings.EqualFold(word, "pg_terminate_backend") {
+		if !s.symbol('(') {
+			return shimColumn{}, false
+		}
+		pidLit, ok := s.number()
+		if !ok || !s.symbol(')') {
+			return shimColumn{}, false
+		}
+		pidVal, err := strconv.ParseInt(pidLit, 10, 32)
+		if err != nil {
+			return shimColumn{}, false
+		}
+		var signaled bool
+		name := "pg_cancel_backend"
+		if strings.EqualFold(word, "pg_terminate_backend") {
+			name = "pg_terminate_backend"
+			signaled = fn.server.terminateBackendByPID(fn.user, int32(pidVal))
+		} else {
+			signaled = fn.server.cancelBackendByPID(fn.user, int32(pidVal))
+		}
+		v := "f"
+		if signaled {
+			v = "t"
+		}
+		return shimColumn{name: name, value: &v, typ: typeBool}, true
 	}
 	// The remaining forms are function calls and must be followed by "()".
 	if !s.symbol('(') || !s.symbol(')') {

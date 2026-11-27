@@ -616,6 +616,55 @@ func (s *Server) cancelRequest(pid, secret int32) {
 	}
 }
 
+func (s *Server) canSignalSession(callerUser string, target *session) bool {
+	if target == nil {
+		return false
+	}
+	if target.user == callerUser {
+		return true
+	}
+	// Under Trust auth (loopback dev), any session may signal any local session.
+	// Under authenticated SCRAM, a user may only signal their own sessions.
+	_, isTrust := s.opts.Auth.(trustAuth)
+	return s.opts.Auth == nil || isTrust
+}
+
+// cancelBackendByPID implements pg_cancel_backend(pid), returning true if an
+// authorized target session was found and signaled.
+func (s *Server) cancelBackendByPID(callerUser string, pid int32) bool {
+	if s == nil || pid <= 0 {
+		return false
+	}
+	s.mu.Lock()
+	target := s.sessions[pid]
+	s.mu.Unlock()
+	if !s.canSignalSession(callerUser, target) {
+		return false
+	}
+	target.cancel()
+	return true
+}
+
+// terminateBackendByPID implements pg_terminate_backend(pid), canceling any
+// active query and closing the target connection so open transactions roll back
+// immediately.
+func (s *Server) terminateBackendByPID(callerUser string, pid int32) bool {
+	if s == nil || pid <= 0 {
+		return false
+	}
+	s.mu.Lock()
+	target := s.sessions[pid]
+	s.mu.Unlock()
+	if !s.canSignalSession(callerUser, target) {
+		return false
+	}
+	target.shutdownCancel()
+	if target.conn != nil {
+		_ = target.conn.Close()
+	}
+	return true
+}
+
 type sessionActivity struct {
 	pid          int32
 	datname      string
