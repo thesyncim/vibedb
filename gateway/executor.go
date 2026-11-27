@@ -85,6 +85,16 @@ type Options struct {
 	// Pressure receives bounded, catalog-fenced routing samples for autonomous
 	// hot-shard scheduling. It is advisory and never grants serving authority.
 	Pressure PressureObserver
+	// ResourceGuard optionally enforces hard process memory and disk free-space
+	// watermarks before admitting reads or writes. Nil disables watermark checks.
+	ResourceGuard ResourceAdmissionGuard
+}
+
+// ResourceAdmissionGuard enforces process-level memory and disk free-space
+// watermarks before admitting gateway operations.
+type ResourceAdmissionGuard interface {
+	AdmitRead() error
+	AdmitWrite() error
 }
 
 // defaultMaxRetries bounds stale-generation retries when Options leaves it zero.
@@ -102,6 +112,7 @@ type Executor struct {
 	metrics           Metrics
 	internalAuthority serviceauthz.Authority
 	pressure          PressureObserver
+	resourceGuard     ResourceAdmissionGuard
 	// planMu guards the shared physical-plan cache; see plan_cache.go.
 	// Entries are immutable once published, so concurrent queries copy
 	// entries into per-call working state instead of locking around use.
@@ -136,6 +147,7 @@ func NewExecutor(client ShardTransport, catalog *CatalogHolder, opts Options) *E
 		routers:           newRouterPool(),
 		internalAuthority: opts.InternalAuthority,
 		pressure:          opts.Pressure,
+		resourceGuard:     opts.ResourceGuard,
 	}
 }
 
@@ -268,6 +280,11 @@ func (e *Executor) queryWithProfileValidation(
 	}()
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if e.resourceGuard != nil {
+		if err := e.resourceGuard.AdmitRead(); err != nil {
+			return nil, err
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -521,6 +538,11 @@ func (e *Executor) Exec(ctx context.Context, q Query) (res *Result, err error) {
 	}()
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if e.resourceGuard != nil {
+		if err := e.resourceGuard.AdmitWrite(); err != nil {
+			return nil, err
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -839,6 +861,11 @@ func (e *Executor) writeDocShardKeyMatchesTarget(bound *BoundWritePlan, mapper *
 func (e *Executor) Explain(ctx context.Context, q Query) (*Explanation, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if e.resourceGuard != nil {
+		if err := e.resourceGuard.AdmitRead(); err != nil {
+			return nil, err
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

@@ -173,6 +173,11 @@ func (executor *DurableSQLRequestExecutor) ExecuteMode(
 		requestledger.Digest(sha256.Sum256(tenant)) != requestKey.TenantDigest {
 		return DurableSQLRequestResult{}, ErrDurableSQLRequest
 	}
+	if executor.planner.resourceGuard != nil {
+		if err := executor.planner.resourceGuard.AdmitWrite(); err != nil {
+			return DurableSQLRequestResult{}, err
+		}
+	}
 	profile, err := executor.profile(queries)
 	if err != nil {
 		return DurableSQLRequestResult{}, err
