@@ -16,6 +16,7 @@ import (
 
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/clusterbackup"
+	"github.com/thesyncim/vibedb/internal/controllerlease"
 	"github.com/thesyncim/vibedb/internal/nodecontrol"
 	"github.com/thesyncim/vibedb/internal/rafttransport"
 	"github.com/thesyncim/vibedb/internal/rebalanceexec"
@@ -121,6 +122,10 @@ type Config struct {
 	// Prometheus /metrics. Loopback-only unless MetricsHTTPTLSConfig is set.
 	MetricsHTTPListenAddress string
 	MetricsHTTPTLSConfig     *tls.Config
+	// Optional CAS-fenced controller lease elector. When set, its live
+	// leadership status and monotonic epoch are exposed on /metrics and the
+	// lease is gracefully released during BeginFrontendDrain.
+	ControllerLease *controllerlease.Elector
 	// A participant forwards DDL once to this exact authenticated gateway
 	// principal. The owner retains the only schema journal and recovery loop.
 	DDLOwnerAddress string
