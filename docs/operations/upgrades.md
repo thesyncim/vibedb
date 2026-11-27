@@ -12,14 +12,16 @@ not yet qualified end-to-end.
   104-byte build preface with wire/disk grammar digests and capability bits;
   mismatches fail closed. Treat the exact Git commit (not just the preface) as
   the compatibility unit.
-- **Version window (`internal/clusterversion`):** Inspect local and peer
-  compatibility windows before any change with:
+- **Version window (`internal/clusterversion`):** Inspect the running binary's
+  protocol version window and validate peer compatibility before any rollout:
 
   ```sh
-  vibedb cluster version --profile /path/operator-profile.vibejson --check-peers
+  vibedb cluster version --json
+  vibedb cluster version --check-peers 1.0,1.1 --active 1.0 --json
   ```
 
-  Prometheus `/metrics` also exports the node's cluster version window.
+  Prometheus `/metrics` also exports `vibedb_cluster_binary_version_info` and
+  `vibedb_cluster_active_version_info`.
 
 ## Moving data to a new build
 
@@ -33,4 +35,4 @@ not yet qualified end-to-end.
 
 ## Source map
 
-- [internal/buildgate/profile.go](../../internal/buildgate/profile.go) · [internal/clusterversion/](../../internal/clusterversion/) · [cmd/vibedb/cluster_dev.go](../../cmd/vibedb/cluster_dev.go)
+- [internal/buildgate/profile.go](../../internal/buildgate/profile.go) · [internal/clusterversion/](../../internal/clusterversion/) · [cmd/vibedb/cluster_version.go](../../cmd/vibedb/cluster_version.go)

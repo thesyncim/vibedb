@@ -36,8 +36,11 @@ single-consumer and own snapshot and result lifetimes.
 - **Joins:** Builder aliasless joins are semijoins; at most one fan-out join in
   builder queries. SQL supports `INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`/`USING`
   with bounded `ON` predicates.
-- **Aggregates & windows:** Exact JSON-decimal arithmetic; separate exact
-  aggregate state budget (16 MiB default).
+- **Aggregates, `DISTINCT ON`, and windows:** Exact JSON-decimal arithmetic
+  with a dedicated exact aggregate state budget (16 MiB default). Extended
+  aggregates (`STRING_AGG`, `ARRAY_AGG`, `JSON_AGG`/`JSONB_AGG`, `BOOL_AND`/
+  `BOOL_OR`, `DISTINCT`/`FILTER`) and `DISTINCT ON` reuse execution arenas for
+  zero-allocation steady-state execution.
 - **CTEs & set ops:** Materialization, view expansion (depth 32, 1,024 refs),
   and recursion (1,000 iterations / 100,000 rows / 64 MiB) are hard-bounded.
 - **Plan inspection:** `Query.Explain()` outputs logical plan JSON; SQL
@@ -60,5 +63,5 @@ top-K heaps ([distributed optimizer](../distributed-optimizer.md)).
 ## Source map
 
 - Compilation & execution: [query/compiler.go](../../query/compiler.go), [execute.go](../../query/execute.go), [candidates.go](../../query/candidates.go)
-- Operators: [query/join.go](../../query/join.go), [aggregate.go](../../query/aggregate.go), [window_statement.go](../../query/window_statement.go), [explain.go](../../query/explain.go)
+- Operators: [query/join.go](../../query/join.go), [aggregate.go](../../query/aggregate.go), [sql_agg_ext.go](../../query/sql_agg_ext.go), [sql_distinct_on.go](../../query/sql_distinct_on.go), [window_statement.go](../../query/window_statement.go), [explain.go](../../query/explain.go)
 - Full-text & optimizer: [query/match.go](../../query/match.go), [tin_topk.go](../../query/tin_topk.go), [planner/doc.go](../../planner/doc.go)
