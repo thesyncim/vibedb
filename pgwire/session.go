@@ -1471,7 +1471,7 @@ func (s *session) prepare(
 
 	// A SELECT tries the compatibility shim before the stored-row front end.
 	if kind == kindSelect {
-		shim := shimFunctions{database: s.database, user: s.user, pid: s.pid}
+		shim := shimFunctions{database: s.database, user: s.user, pid: s.pid, server: s.server}
 		fixed, ok, err := shim.parseFixedSelectCancelable(
 			text, s.cancelCheck,
 		)
