@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"sync/atomic"
 )
 
 var (
@@ -38,9 +39,14 @@ func (o GenerationLeaseOptions) normalized() (GenerationLeaseOptions, error) {
 }
 
 type generationLeaseSlot struct {
+	word  atomic.Uint64
+	token atomic.Uint64
+	_     [48]byte
+}
+
+type generationHighLease struct {
 	generation uint64
 	token      uint64
-	active     bool
 }
 
 // GenerationLeaseStats is an O(configured lease slots) accounting snapshot.
@@ -62,11 +68,11 @@ const (
 // lifetime independent of Go GC timing and let copy-on-write reclamation prove
 // that no reader can still dereference a retired extent.
 type GenerationLeases struct {
-	mu    sync.Mutex
-	slots []generationLeaseSlot
-	free  []uint32
-	next  uint64
-	state generationLeaseState
+	slots  []generationLeaseSlot
+	next   atomic.Uint64
+	state  atomic.Uint32
+	highMu sync.Mutex
+	high   []generationHighLease
 }
 
 // NewGenerationLeases allocates the complete fixed lease table.
@@ -75,14 +81,9 @@ func NewGenerationLeases(options GenerationLeaseOptions) (*GenerationLeases, err
 	if err != nil {
 		return nil, err
 	}
-	l := &GenerationLeases{
+	return &GenerationLeases{
 		slots: make([]generationLeaseSlot, normalized.MaxLeases),
-		free:  make([]uint32, normalized.MaxLeases),
-	}
-	for i := range l.free {
-		l.free[i] = uint32(len(l.free) - 1 - i)
-	}
-	return l, nil
+	}, nil
 }
 
 // GenerationLease is a single-owner snapshot token. Do not copy it after
@@ -91,6 +92,7 @@ type GenerationLease struct {
 	owner *GenerationLeases
 	index uint32
 	token uint64
+	high  bool
 }
 
 // Release stops protecting the generation.
@@ -99,47 +101,90 @@ func (l *GenerationLease) Release() {
 		return
 	}
 	owner := l.owner
-	owner.release(l.index, l.token)
+	owner.release(l.index, l.token, l.high)
 	l.owner = nil
 	l.token = 0
+	l.high = false
 }
 
 // Acquire protects generation until the returned lease is released. It never
-// grows tracking memory.
+// grows tracking memory on the normal generation path.
 func (l *GenerationLeases) Acquire(generation uint64) (GenerationLease, error) {
 	if l == nil {
 		return GenerationLease{}, ErrGenerationLeasesClosed
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.state != leasesOpen {
+	if generation >= readEpochActive {
+		return l.acquireHigh(generation)
+	}
+	if generationLeaseState(l.state.Load()) != leasesOpen {
 		return GenerationLease{}, ErrGenerationLeasesClosed
 	}
-	if len(l.free) == 0 {
-		return GenerationLease{}, ErrLeaseCapacity
-	}
-	last := len(l.free) - 1
-	index := l.free[last]
-	l.free = l.free[:last]
-	l.next++
-	if l.next == 0 {
-		l.next++
-	}
-	token := l.next
-	l.slots[index] = generationLeaseSlot{generation: generation, token: token, active: true}
-	return GenerationLease{owner: l, index: index, token: token}, nil
-}
-
-func (l *GenerationLeases) release(index uint32, token uint64) {
-	l.mu.Lock()
-	if int(index) < len(l.slots) {
+	word := generation | readEpochActive
+	n := uint32(len(l.slots))
+	start := epochSlotHint() % n
+	for probe := uint32(0); probe < n; probe++ {
+		index := (start + probe) % n
 		slot := &l.slots[index]
-		if slot.active && slot.token == token {
-			*slot = generationLeaseSlot{}
-			l.free = append(l.free, index)
+		if slot.word.CompareAndSwap(0, word) {
+			if generationLeaseState(l.state.Load()) != leasesOpen {
+				slot.word.Store(0)
+				return GenerationLease{}, ErrGenerationLeasesClosed
+			}
+			token := l.next.Add(1)
+			if token == 0 {
+				token = l.next.Add(1)
+			}
+			slot.token.Store(token)
+			return GenerationLease{owner: l, index: index, token: token}, nil
 		}
 	}
-	l.mu.Unlock()
+	return GenerationLease{}, ErrLeaseCapacity
+}
+
+func (l *GenerationLeases) acquireHigh(generation uint64) (GenerationLease, error) {
+	l.highMu.Lock()
+	defer l.highMu.Unlock()
+	if generationLeaseState(l.state.Load()) != leasesOpen {
+		return GenerationLease{}, ErrGenerationLeasesClosed
+	}
+	active := uint64(len(l.high))
+	for i := range l.slots {
+		if l.slots[i].word.Load() != 0 {
+			active++
+		}
+	}
+	if active >= uint64(len(l.slots)) {
+		return GenerationLease{}, ErrLeaseCapacity
+	}
+	token := l.next.Add(1)
+	if token == 0 {
+		token = l.next.Add(1)
+	}
+	l.high = append(l.high, generationHighLease{generation: generation, token: token})
+	return GenerationLease{owner: l, token: token, high: true}, nil
+}
+
+func (l *GenerationLeases) release(index uint32, token uint64, high bool) {
+	if high {
+		l.highMu.Lock()
+		for i := range l.high {
+			if l.high[i].token == token {
+				last := len(l.high) - 1
+				l.high[i] = l.high[last]
+				l.high[last] = generationHighLease{}
+				l.high = l.high[:last]
+				break
+			}
+		}
+		l.highMu.Unlock()
+		return
+	}
+	if int(index) < len(l.slots) {
+		slot := &l.slots[index]
+		if slot.token.CompareAndSwap(token, 0) {
+			slot.word.Store(0)
+		}
+	}
 }
 
 // Minimum returns the oldest active generation. If no reader is active it
@@ -149,14 +194,21 @@ func (l *GenerationLeases) Minimum(current uint64) uint64 {
 	if l == nil {
 		return generationSuccessor(current)
 	}
-	l.mu.Lock()
 	minimum := generationSuccessor(current)
 	for i := range l.slots {
-		if l.slots[i].active && l.slots[i].generation < minimum {
-			minimum = l.slots[i].generation
+		if word := l.slots[i].word.Load(); word != 0 {
+			if gen := word &^ readEpochActive; gen < minimum {
+				minimum = gen
+			}
 		}
 	}
-	l.mu.Unlock()
+	l.highMu.Lock()
+	for i := range l.high {
+		if l.high[i].generation < minimum {
+			minimum = l.high[i].generation
+		}
+	}
+	l.highMu.Unlock()
 	return minimum
 }
 
@@ -168,9 +220,14 @@ func (l *GenerationLeases) AnyActive() bool {
 	if l == nil {
 		return false
 	}
-	l.mu.Lock()
-	active := len(l.free) != len(l.slots)
-	l.mu.Unlock()
+	for i := range l.slots {
+		if l.slots[i].word.Load() != 0 {
+			return true
+		}
+	}
+	l.highMu.Lock()
+	active := len(l.high) != 0
+	l.highMu.Unlock()
 	return active
 }
 
@@ -179,19 +236,26 @@ func (l *GenerationLeases) Stats(current uint64) GenerationLeaseStats {
 	if l == nil {
 		return GenerationLeaseStats{MinimumGeneration: generationSuccessor(current)}
 	}
-	l.mu.Lock()
 	stats := GenerationLeaseStats{
 		Capacity:          uint64(len(l.slots)),
-		Active:            uint64(len(l.slots) - len(l.free)),
 		MinimumGeneration: generationSuccessor(current),
 	}
 	for i := range l.slots {
-		if l.slots[i].active &&
-			l.slots[i].generation < stats.MinimumGeneration {
-			stats.MinimumGeneration = l.slots[i].generation
+		if word := l.slots[i].word.Load(); word != 0 {
+			stats.Active++
+			if gen := word &^ readEpochActive; gen < stats.MinimumGeneration {
+				stats.MinimumGeneration = gen
+			}
 		}
 	}
-	l.mu.Unlock()
+	l.highMu.Lock()
+	for i := range l.high {
+		stats.Active++
+		if l.high[i].generation < stats.MinimumGeneration {
+			stats.MinimumGeneration = l.high[i].generation
+		}
+	}
+	l.highMu.Unlock()
 	return stats
 }
 
@@ -202,11 +266,7 @@ func (l *GenerationLeases) BeginClose() {
 	if l == nil {
 		return
 	}
-	l.mu.Lock()
-	if l.state == leasesOpen {
-		l.state = leasesClosing
-	}
-	l.mu.Unlock()
+	l.state.CompareAndSwap(uint32(leasesOpen), uint32(leasesClosing))
 }
 
 // Closing reports whether BeginClose has rejected future acquisitions.
@@ -214,10 +274,7 @@ func (l *GenerationLeases) Closing() bool {
 	if l == nil {
 		return true
 	}
-	l.mu.Lock()
-	closing := l.state != leasesOpen
-	l.mu.Unlock()
-	return closing
+	return generationLeaseState(l.state.Load()) != leasesOpen
 }
 
 // Close prevents new leases. It returns ErrLeasesActive until every existing
@@ -226,16 +283,14 @@ func (l *GenerationLeases) Close() error {
 	if l == nil {
 		return nil
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.state == leasesClosed {
+	if generationLeaseState(l.state.Load()) == leasesClosed {
 		return nil
 	}
-	l.state = leasesClosing
-	if len(l.free) != len(l.slots) {
+	l.state.CompareAndSwap(uint32(leasesOpen), uint32(leasesClosing))
+	if l.AnyActive() {
 		return ErrLeasesActive
 	}
-	l.state = leasesClosed
+	l.state.Store(uint32(leasesClosed))
 	return nil
 }
 

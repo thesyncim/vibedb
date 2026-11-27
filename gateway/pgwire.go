@@ -768,6 +768,9 @@ func (p *postgresStatement) QueryInto(ctx context.Context, args []any, rows *pgw
 	}
 	profile := s.backend.Executor.profileFor(ClassBatch)
 	profile.MaxConcurrency = min(profile.MaxConcurrency, 4)
+	if profile.PerShardDeadline > 0 && (profile.GlobalDeadline <= 0 || profile.PerShardDeadline < profile.GlobalDeadline) {
+		profile.GlobalDeadline = profile.PerShardDeadline
+	}
 	if s.rows > 0 {
 		profile.MaxAggregateRows = min(profile.MaxAggregateRows, uint64(s.rows))
 		profile.PerShardRows = min(profile.PerShardRows, profile.MaxAggregateRows)

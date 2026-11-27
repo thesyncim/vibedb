@@ -234,6 +234,23 @@ func appendDirectPatchValueJSON(dst []byte, value any) ([]byte, bool) {
 			return dst, false
 		}
 		return append(dst, encoded...), true
+	case []byte:
+		s := string(v)
+		encoded, err := vibejson.Marshal(&s)
+		if err != nil {
+			return dst, false
+		}
+		return append(dst, encoded...), true
+	case *[]byte:
+		if v == nil {
+			return append(dst, "null"...), true
+		}
+		s := string(*v)
+		encoded, err := vibejson.Marshal(&s)
+		if err != nil {
+			return dst, false
+		}
+		return append(dst, encoded...), true
 	case vibejson.RawValue:
 		if len(v.Src) == 0 {
 			return dst, false
