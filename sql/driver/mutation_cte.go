@@ -3,11 +3,14 @@ package driver
 import (
 	"context"
 	sqldriver "database/sql/driver"
-	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
+	"time"
+
+	vibejson "github.com/thesyncim/vibejson"
+	vibejsonsimd "github.com/thesyncim/vibejson/simd"
 
 	sqlast "github.com/thesyncim/vibedb/sql"
 )
@@ -149,8 +152,14 @@ func sqlLiteralForCTEValue(v sqldriver.Value) string {
 		return "'" + strings.ReplaceAll(x, "'", "''") + "'"
 	case []byte:
 		return "'" + strings.ReplaceAll(string(x), "'", "''") + "'"
+	case time.Time:
+		var buf [64]byte
+		if raw, err := vibejsonsimd.AppendTime(buf[:0], x); err == nil {
+			return "'" + strings.ReplaceAll(string(raw), "'", "''") + "'"
+		}
+		return "'" + x.Format(time.RFC3339Nano) + "'"
 	default:
-		raw, _ := json.Marshal(x)
+		raw, _ := vibejson.Marshal(&x)
 		return "'" + strings.ReplaceAll(string(raw), "'", "''") + "'"
 	}
 }

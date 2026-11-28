@@ -3,7 +3,6 @@ package driver
 import (
 	"context"
 	sqldriver "database/sql/driver"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -1836,13 +1835,13 @@ func encodeFlatInsertDocumentWithExprs(
 		}
 		evalCursor = cur
 	}
-	var buf []byte
+	buf := make([]byte, 0, len(insert.Columns)*24+2)
 	buf = append(buf, '{')
 	for i, col := range insert.Columns {
 		if i > 0 {
 			buf = append(buf, ',')
 		}
-		buf = strconv.AppendQuote(buf, col.Spec())
+		buf = appendJSONString(buf, col.Spec())
 		buf = append(buf, ':')
 		if exprMap[i] >= 0 {
 			cell := evalCursor.Cell(exprMap[i])
@@ -1863,11 +1862,10 @@ func encodeFlatInsertDocumentWithExprs(
 		if err != nil {
 			return nil, err
 		}
-		raw, err := json.Marshal(val)
+		buf, err = appendScalarJSON(buf, val)
 		if err != nil {
 			return nil, err
 		}
-		buf = append(buf, raw...)
 	}
 	buf = append(buf, '}')
 	if len(buf) > maxDocumentBytes {
@@ -3104,6 +3102,13 @@ func (c *conn) updateFromJoinLockedReturning(
 	seen := make(map[string]struct{})
 	var seeds []seedDocument
 	var keys []string
+	var patchBuf [8]jsonObjectPatch
+	patches := patchBuf[:0]
+	if len(assignments) > len(patchBuf) {
+		patches = make([]jsonObjectPatch, len(assignments))
+	} else {
+		patches = patchBuf[:len(assignments)]
+	}
 	for cursor.Next() {
 		oldDoc := cursor.Cell(0).Payload()
 		key, err := tableDocumentKey(t, oldDoc, limits.MaxKeyBytes)
@@ -3114,19 +3119,22 @@ func (c *conn) updateFromJoinLockedReturning(
 			continue
 		}
 		seen[key] = struct{}{}
-		var docMap map[string]json.RawMessage
-		if err := json.Unmarshal(oldDoc, &docMap); err != nil {
-			return nil, err
-		}
 		for i, a := range assignments {
 			cell := cursor.Cell(1 + i)
 			val := cell.JSON()
 			if cell.IsNull() || len(val) == 0 {
-				val = []byte("null")
+				val = jsonNullBytes
+			} else if cell.Kind() == query.TypeNumber {
+				if integer, ok := canonicalComputedInteger(val, limits.MaxDocumentBytes); ok {
+					val = integer
+				}
 			}
-			docMap[a.Column] = json.RawMessage(append([]byte(nil), val...))
+			patches[i] = jsonObjectPatch{
+				column: a.Column,
+				value:  val,
+			}
 		}
-		patched, err := json.Marshal(docMap)
+		patched, err := patchJSONObject(oldDoc, patches, limits.MaxDocumentBytes)
 		if err != nil {
 			return nil, err
 		}
