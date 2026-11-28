@@ -1,13 +1,10 @@
 package driver
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"strconv"
-	"unicode/utf8"
 
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
@@ -235,10 +232,7 @@ func applyColumnAssignments(
 				return nil, err
 			}
 		}
-		key, err := json.Marshal(assignments[i].Column)
-		if err != nil {
-			return nil, fmt.Errorf("vibedb: encode column name: %w", err)
-		}
+		key := appendJSONString(make([]byte, 0, len(assignments[i].Column)+2), assignments[i].Column)
 		materialized[i] = materializedAssignment{
 			key: key, value: value,
 			lastMember: -1,
@@ -827,7 +821,7 @@ func appendUpdateColumnPointer(dst []byte, column string) []byte {
 	return dst
 }
 
-func encodeAssignmentScalar(operand sqlast.Operand, args []any) (json.RawMessage, error) {
+func encodeAssignmentScalar(operand sqlast.Operand, args []any) ([]byte, error) {
 	value, err := flatInsertOperandValue(operand, args)
 	if err != nil {
 		return nil, err
@@ -836,34 +830,32 @@ func encodeAssignmentScalar(operand sqlast.Operand, args []any) (json.RawMessage
 		switch v := value.(type) {
 		case *bool:
 			if v == nil {
-				value = nil
-			} else {
-				value = *v
+				return jsonNullBytes, nil
 			}
+			if *v {
+				return jsonTrueBytes, nil
+			}
+			return jsonFalseBytes, nil
 		case *int64:
 			if v == nil {
-				value = nil
-			} else {
-				value = *v
+				return jsonNullBytes, nil
 			}
+			value = *v
 		case *float64:
 			if v == nil {
-				value = nil
-			} else {
-				value = *v
+				return jsonNullBytes, nil
 			}
+			value = *v
 		case *string:
 			if v == nil {
-				value = nil
-			} else {
-				value = *v
+				return jsonNullBytes, nil
 			}
+			value = *v
 		case *query.Number:
 			if v == nil {
-				value = nil
-			} else {
-				value = *v
+				return jsonNullBytes, nil
 			}
+			value = *v
 		default:
 			goto encode
 		}
@@ -871,50 +863,31 @@ func encodeAssignmentScalar(operand sqlast.Operand, args []any) (json.RawMessage
 encode:
 	switch v := value.(type) {
 	case nil:
-		return json.RawMessage("null"), nil
+		return jsonNullBytes, nil
+	case bool:
+		if v {
+			return jsonTrueBytes, nil
+		}
+		return jsonFalseBytes, nil
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return appendScalarJSON(make([]byte, 0, 20), value)
+	case float32, float64:
+		return appendScalarJSON(make([]byte, 0, 24), value)
+	case string:
+		return appendScalarJSON(make([]byte, 0, len(v)+2), value)
+	case []byte:
+		return appendScalarJSON(make([]byte, 0, len(v)+2), value)
 	case query.Number:
 		if !validJSONNumber(string(v)) {
 			return nil, errors.New("vibedb: invalid numeric parameter")
 		}
-		return json.RawMessage(v), nil
+		return []byte(v), nil
 	case vibejson.RawValue:
 		number, ok := v.NumberBytes()
-		if !ok || !validJSONNumber(string(number)) {
+		if !ok {
 			return nil, errors.New("vibedb: invalid numeric parameter")
 		}
-		return json.RawMessage(number), nil
-	case []byte:
-		if !utf8.Valid(v) {
-			return nil, errors.New("vibedb: column string must be valid UTF-8")
-		}
-		encoded, err := json.Marshal(string(v))
-		return encoded, err
-	case string:
-		if !utf8.ValidString(v) {
-			return nil, errors.New("vibedb: column string must be valid UTF-8")
-		}
-	case float32:
-		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
-			return nil, errors.New("vibedb: numeric parameters must be finite")
-		}
-	case float64:
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return nil, errors.New("vibedb: numeric parameters must be finite")
-		}
+		return number, nil
 	}
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return nil, fmt.Errorf("vibedb: encode column value: %w", err)
-	}
-	return encoded, nil
-}
-
-func validJSONNumber(value string) bool {
-	if value == "" || !json.Valid([]byte(value)) {
-		return false
-	}
-	decoder := json.NewDecoder(bytes.NewBufferString(value))
-	decoder.UseNumber()
-	var number json.Number
-	return decoder.Decode(&number) == nil
+	return appendScalarJSON(nil, value)
 }
