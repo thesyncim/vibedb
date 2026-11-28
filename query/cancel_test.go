@@ -364,10 +364,10 @@ func TestGroupedDurableCancellationClearsSlotIndexes(t *testing.T) {
 	assertPoolDrained(t, &exec, "after grouped cancellation")
 	assertCanceledExecClean(t, &exec)
 	for i := range exec.file.slots {
-		if len(exec.file.slots[i].byKey) != 0 {
+		if exec.file.slots[i].byKey.len() != 0 {
 			t.Fatalf(
 				"canceled grouped slot %d retained %d arena-backed keys",
-				i, len(exec.file.slots[i].byKey),
+				i, exec.file.slots[i].byKey.len(),
 			)
 		}
 	}
@@ -594,8 +594,11 @@ func assertCanceledExecClean(t *testing.T, exec *Exec) {
 			t.Fatalf("canceled durable worker %d retained join bindings", i)
 		}
 	}
+	if exec.file.groupIndex.len() != 0 {
+		t.Fatalf("canceled durable group index retained %d keys", exec.file.groupIndex.len())
+	}
 	for i := range exec.file.slots {
-		if len(exec.file.slots[i].byKey) != 0 {
+		if exec.file.slots[i].byKey.len() != 0 {
 			t.Fatalf("canceled durable slot %d retained group keys", i)
 		}
 	}
