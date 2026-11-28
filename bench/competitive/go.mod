@@ -8,7 +8,7 @@ require (
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/dgraph-io/badger/v4 v4.9.5
 	github.com/thesyncim/vibedb v0.0.0
-	github.com/thesyncim/vibejson v0.9.0
+	github.com/thesyncim/vibejson v0.10.0
 	go.etcd.io/bbolt v1.5.0
 	go.etcd.io/raft/v3 v3.7.0
 	golang.org/x/sys v0.47.0
