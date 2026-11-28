@@ -2,13 +2,13 @@ package pgwire
 
 import (
 	"bytes"
-	"encoding/csv"
-	"encoding/json"
 	"fmt"
-	"io"
+	"math"
 	"strconv"
 	"strings"
 
+	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -34,15 +34,18 @@ const (
 )
 
 type copyCommand struct {
-	dir       copyDirection
-	table     string
-	columns   []string
-	query     string // non-empty for COPY (SELECT ...) TO STDOUT
-	format    copyFormat
-	delimiter byte
-	quote     byte
-	nullStr   string
-	header    bool
+	dir          copyDirection
+	table        string
+	columns      []string
+	query        string // non-empty for COPY (SELECT ...) TO STDOUT
+	format       copyFormat
+	delimiter    byte
+	quote        byte
+	escape       byte
+	nullStr      string
+	header       bool
+	forceNull    []string // column names, or ["*"] for FORCE_NULL *
+	forceNotNull []string // column names, or ["*"] for FORCE_NOT_NULL *
 }
 
 // parseCopyCommand parses PostgreSQL COPY statements:
@@ -60,10 +63,12 @@ func parseCopyCommand(src string) (*copyCommand, error) {
 		format:    copyFormatText,
 		delimiter: '\t',
 		quote:     '"',
+		escape:    '"',
 		nullStr:   `\N`,
 	}
 	delimiterSet := false
 	nullSet := false
+	escapeSet := false
 
 	s.skip()
 	if s.pos < len(s.src) && s.src[s.pos] == '(' {
@@ -210,7 +215,7 @@ afterTarget:
 					s.pos++
 					break
 				}
-				if err := parseCopyOption(&s, cmd, &delimiterSet, &nullSet); err != nil {
+				if err := parseCopyOption(&s, cmd, &delimiterSet, &nullSet, &escapeSet); err != nil {
 					return nil, err
 				}
 				s.skip()
@@ -230,7 +235,7 @@ afterTarget:
 				if s.pos >= len(s.src) || s.src[s.pos] == ';' {
 					break
 				}
-				if err := parseCopyOption(&s, cmd, &delimiterSet, &nullSet); err != nil {
+				if err := parseCopyOption(&s, cmd, &delimiterSet, &nullSet, &escapeSet); err != nil {
 					return nil, err
 				}
 			}
@@ -243,6 +248,53 @@ afterTarget:
 		}
 		if !nullSet {
 			cmd.nullStr = ""
+		}
+	}
+	if !escapeSet {
+		cmd.escape = cmd.quote
+	}
+	if cmd.delimiter == '\n' || cmd.delimiter == '\r' {
+		return nil, newError(sqlstateInvalidParameterValue,
+			"COPY delimiter cannot be newline or carriage return")
+	}
+	if cmd.format == copyFormatText && cmd.delimiter == '\\' {
+		return nil, newError(sqlstateInvalidParameterValue,
+			"COPY delimiter cannot be backslash in text format")
+	}
+	if strings.ContainsAny(cmd.nullStr, "\r\n") {
+		return nil, newError(sqlstateInvalidParameterValue,
+			"COPY null representation cannot use newline or carriage return")
+	}
+	if strings.IndexByte(cmd.nullStr, cmd.delimiter) >= 0 {
+		return nil, newError(sqlstateInvalidParameterValue,
+			"COPY delimiter cannot appear in the NULL specification")
+	}
+	if cmd.format == copyFormatCSV {
+		if cmd.quote == '\n' || cmd.quote == '\r' {
+			return nil, newError(sqlstateInvalidParameterValue,
+				"COPY quote cannot be newline or carriage return")
+		}
+		if cmd.escape == '\n' || cmd.escape == '\r' {
+			return nil, newError(sqlstateInvalidParameterValue,
+				"COPY escape cannot be newline or carriage return")
+		}
+		if cmd.delimiter == cmd.quote {
+			return nil, newError(sqlstateInvalidParameterValue,
+				"COPY delimiter and quote must be different")
+		}
+		if cmd.delimiter == cmd.escape {
+			return nil, newError(sqlstateInvalidParameterValue,
+				"COPY delimiter and escape must be different")
+		}
+	}
+	if len(cmd.forceNull) > 0 || len(cmd.forceNotNull) > 0 {
+		if cmd.format != copyFormatCSV {
+			return nil, newError(sqlstateFeatureNotSupported,
+				"COPY FORCE_NULL/FORCE_NOT_NULL is only supported in CSV mode")
+		}
+		if cmd.dir != copyFromStdin {
+			return nil, newError(sqlstateFeatureNotSupported,
+				"COPY FORCE_NULL/FORCE_NOT_NULL is only supported in COPY FROM")
 		}
 	}
 	return cmd, nil
@@ -329,7 +381,7 @@ func parseCopyStringLit(s *scanner) (string, error) {
 	return "", newError(sqlstateSyntaxError, "unterminated string literal in COPY option")
 }
 
-func parseCopyOption(s *scanner, cmd *copyCommand, delimiterSet, nullSet *bool) error {
+func parseCopyOption(s *scanner, cmd *copyCommand, delimiterSet, nullSet, escapeSet *bool) error {
 	opt := strings.ToUpper(s.word())
 	switch opt {
 	case "FORMAT":
@@ -385,6 +437,53 @@ func parseCopyOption(s *scanner, cmd *copyCommand, delimiterSet, nullSet *bool) 
 			return newError(sqlstateInvalidParameterValue, "COPY quote must be a single one-byte character")
 		}
 		cmd.quote = val[0]
+	case "ESCAPE":
+		if strings.EqualFold(s.peekWord(), "AS") {
+			_ = s.word()
+		}
+		val, err := parseCopyStringLit(s)
+		if err != nil {
+			return err
+		}
+		if len(val) != 1 {
+			return newError(sqlstateInvalidParameterValue, "COPY escape must be a single one-byte character")
+		}
+		cmd.escape = val[0]
+		*escapeSet = true
+	case "FORCE_NULL":
+		cols, err := parseCopyColumnList(s)
+		if err != nil {
+			return err
+		}
+		cmd.forceNull = append(cmd.forceNull, cols...)
+	case "FORCE_NOT_NULL":
+		cols, err := parseCopyColumnList(s)
+		if err != nil {
+			return err
+		}
+		cmd.forceNotNull = append(cmd.forceNotNull, cols...)
+	case "FORCE":
+		if strings.EqualFold(s.peekWord(), "NOT") {
+			_ = s.word()
+			if !strings.EqualFold(s.word(), "NULL") {
+				return newError(sqlstateSyntaxError, "expected NULL after FORCE NOT in COPY")
+			}
+			for {
+				col, err := parseCopyIdent(s)
+				if err != nil {
+					return err
+				}
+				cmd.forceNotNull = append(cmd.forceNotNull, col)
+				s.skip()
+				if s.pos < len(s.src) && s.src[s.pos] == ',' {
+					s.pos++
+					continue
+				}
+				break
+			}
+		} else {
+			return newError(sqlstateSyntaxError, "expected NOT NULL after FORCE in COPY")
+		}
 	case "HEADER":
 		next := strings.ToUpper(s.peekWord())
 		switch next {
@@ -406,6 +505,64 @@ func parseCopyOption(s *scanner, cmd *copyCommand, delimiterSet, nullSet *bool) 
 		return newError(sqlstateSyntaxError, fmt.Sprintf("unrecognized COPY option %q", opt))
 	}
 	return nil
+}
+
+func parseCopyColumnList(s *scanner) ([]string, error) {
+	s.skip()
+	if s.pos < len(s.src) && s.src[s.pos] == '*' {
+		s.pos++
+		return []string{"*"}, nil
+	}
+	if s.pos >= len(s.src) || s.src[s.pos] != '(' {
+		return nil, newError(sqlstateSyntaxError, "expected '(' or '*' in COPY column list option")
+	}
+	s.pos++
+	var cols []string
+	for {
+		col, err := parseCopyIdent(s)
+		if err != nil {
+			return nil, err
+		}
+		cols = append(cols, col)
+		s.skip()
+		if s.pos < len(s.src) && s.src[s.pos] == ',' {
+			s.pos++
+			continue
+		}
+		if s.pos < len(s.src) && s.src[s.pos] == ')' {
+			s.pos++
+			return cols, nil
+		}
+		return nil, newError(sqlstateSyntaxError, "expected ',' or ')' in COPY column list option")
+	}
+}
+
+func resolveCopyForceFlags(cols []string, names []string) ([]bool, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	flags := make([]bool, len(cols))
+	for _, name := range names {
+		if name == "*" {
+			for i := range flags {
+				flags[i] = true
+			}
+			continue
+		}
+		matched := false
+		for i, col := range cols {
+			if strings.EqualFold(col, name) {
+				flags[i] = true
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return nil, newError(sqlstateInvalidParameterValue,
+				fmt.Sprintf("COPY column %q does not exist in target column list", name))
+		}
+	}
+	return flags, nil
 }
 
 func (s *session) executeCopy(cmd *copyCommand) error {
@@ -455,32 +612,71 @@ func (s *session) resolveCopyColumns(cmd *copyCommand) ([]string, map[string]sql
 	return cols, colMap, nil
 }
 
+var (
+	copyTrueBytes  = []byte{'t'}
+	copyFalseBytes = []byte{'f'}
+)
+
+type copyField struct {
+	data   []byte
+	isNull bool
+}
+
+type copyLineParser struct {
+	fields  []copyField
+	scratch []byte
+}
+
+type copyValueSlot struct {
+	i64     int64
+	f64     float64
+	boolean bool
+	str     string
+}
+
 func (s *session) executeCopyFromStdin(cmd *copyCommand) error {
 	cols, colMap, err := s.resolveCopyColumns(cmd)
 	if err != nil {
 		return err
 	}
+	forceNull, err := resolveCopyForceFlags(cols, cmd.forceNull)
+	if err != nil {
+		return err
+	}
+	forceNotNull, err := resolveCopyForceFlags(cols, cmd.forceNotNull)
+	if err != nil {
+		return err
+	}
+	colInfos := make([]sqldriver.ColumnInfo, len(cols))
+	for i, colName := range cols {
+		colInfos[i] = colMap[strings.ToLower(colName)]
+	}
 	ctx := s.operationContext()
 
-	// Build prepared INSERT INTO table (c1, c2, ...) VALUES (?, ?, ...).
+	// Build prepared INSERT INTO table (c1, c2, ...) VALUES (?, ?, ...),
+	// or whole-document INSERT INTO table VALUES (?) for COPY tbl ("$doc").
 	var sb strings.Builder
 	sb.WriteString("INSERT INTO ")
 	sb.WriteString(quoteCopyIdent(cmd.table))
-	sb.WriteString(" (")
-	for i, c := range cols {
-		if i > 0 {
-			sb.WriteString(", ")
+	if len(cols) == 1 && cols[0] == "$doc" {
+		sb.WriteString(" VALUES (?)")
+	} else {
+		sb.WriteString(" (")
+		for i, c := range cols {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(quoteCopyIdent(c))
 		}
-		sb.WriteString(quoteCopyIdent(c))
-	}
-	sb.WriteString(") VALUES (")
-	for i := range cols {
-		if i > 0 {
-			sb.WriteString(", ")
+		sb.WriteString(") VALUES (")
+		for i := range cols {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteByte('?')
 		}
-		sb.WriteByte('?')
+		sb.WriteByte(')')
 	}
-	sb.WriteByte(')')
 
 	stmt, err := s.sql.Prepare(ctx, sb.String())
 	if err != nil {
@@ -514,6 +710,8 @@ func (s *session) executeCopyFromStdin(cmd *copyCommand) error {
 		lineNum   int64
 		eofMarker bool
 		copyErr   error
+		parser    = copyLineParser{fields: make([]copyField, 0, len(cols))}
+		slots     = make([]copyValueSlot, len(cols))
 		args      = make([]any, len(cols))
 	)
 
@@ -523,33 +721,29 @@ func (s *session) executeCopyFromStdin(cmd *copyCommand) error {
 		if len(line) > 0 && line[len(line)-1] == '\r' {
 			line = line[:len(line)-1]
 		}
-		if cmd.format == copyFormatText && string(line) == `\.` {
+		if cmd.format == copyFormatText && len(line) == 2 && line[0] == '\\' && line[1] == '.' {
 			eofMarker = true
 			return nil
 		}
 		if cmd.header && lineNum == 1 {
 			return nil
 		}
-		if len(line) == 0 && cmd.format == copyFormatCSV {
-			return nil
-		}
-		fields, nulls, parseErr := parseCopyLine(line, cmd)
-		if parseErr != nil {
+		if parseErr := parser.parseLine(line, cmd, forceNull, forceNotNull); parseErr != nil {
 			return parseErr
 		}
-		if len(fields) != len(cols) {
+		if len(parser.fields) != len(cols) {
 			return newError(sqlstateCopyDataException,
-				fmt.Sprintf("COPY line %d: expected %d columns, got %d", lineNum, len(cols), len(fields)))
+				fmt.Sprintf("COPY line %d: expected %d columns, got %d", lineNum, len(cols), len(parser.fields)))
 		}
-		for i, colName := range cols {
-			if nulls[i] {
+		for i, f := range parser.fields {
+			if f.isNull {
 				args[i] = nil
 				continue
 			}
-			val, convErr := convertCopyField(fields[i], colMap[strings.ToLower(colName)])
+			val, convErr := convertCopyFieldSlot(f.data, colInfos[i], &slots[i])
 			if convErr != nil {
 				return newError(sqlstateInvalidTextRepresentation,
-					fmt.Sprintf("COPY line %d, column %s: %v", lineNum, colName, convErr))
+					fmt.Sprintf("COPY line %d, column %s: %v", lineNum, cols[i], convErr))
 			}
 			args[i] = val
 		}
@@ -571,22 +765,47 @@ func (s *session) executeCopyFromStdin(cmd *copyCommand) error {
 			if copyErr != nil || eofMarker {
 				continue
 			}
-			pending = append(pending, body...)
-			for {
-				nl := bytes.IndexByte(pending, '\n')
+			var buf []byte
+			usingPending := len(pending) > 0
+			if usingPending {
+				pending = append(pending, body...)
+				buf = pending
+			} else {
+				buf = body
+			}
+			consumed := 0
+			for consumed < len(buf) {
+				var nl int
+				if cmd.format == copyFormatCSV {
+					nl = scanCSVRecord(buf[consumed:], cmd.delimiter, cmd.quote, cmd.escape)
+				} else {
+					nl = bytes.IndexByte(buf[consumed:], '\n')
+				}
 				if nl < 0 {
 					break
 				}
-				line := pending[:nl]
+				line := buf[consumed : consumed+nl]
+				consumed += nl + 1
 				if err := processLine(line); err != nil {
 					copyErr = err
 					break
 				}
-				pending = pending[nl+1:]
 				if eofMarker {
-					pending = pending[:0]
+					consumed = len(buf)
 					break
 				}
+			}
+			if copyErr != nil || eofMarker {
+				pending = pending[:0]
+			} else if usingPending {
+				if consumed == len(pending) {
+					pending = pending[:0]
+				} else if consumed > 0 {
+					rem := copy(pending, pending[consumed:])
+					pending = pending[:rem]
+				}
+			} else if consumed < len(body) {
+				pending = append(pending[:0], body[consumed:]...)
 			}
 		case msgCopyDone:
 			if copyErr == nil && !eofMarker && len(pending) > 0 {
@@ -660,29 +879,24 @@ func (s *session) executeCopyToStdout(cmd *copyCommand) error {
 	colNames := stmt.Columns()
 	s.w.copyOutResponse(formatText, len(colNames))
 
-	var lineBuf bytes.Buffer
+	lineBuf := make([]byte, 0, 256)
+	cellScratch := make([]byte, 0, 64)
 	if cmd.header {
-		formatCopyRow(&lineBuf, colNames, nil, cmd)
-		s.w.copyData(lineBuf.Bytes())
+		lineBuf = appendCopyHeaderRow(lineBuf[:0], colNames, cmd)
+		s.w.copyData(lineBuf)
 	}
 
 	var count int64
-	vals := make([]string, len(colNames))
-	nulls := make([]bool, len(colNames))
 	for rows.Next() {
+		lineBuf = lineBuf[:0]
 		for i := range colNames {
-			cell := rows.Cell(i)
-			if cell.IsNull() {
-				nulls[i] = true
-				vals[i] = ""
-			} else {
-				nulls[i] = false
-				vals[i] = formatCopyCell(cell)
+			if i > 0 {
+				lineBuf = append(lineBuf, cmd.delimiter)
 			}
+			lineBuf, cellScratch = appendCopyCell(lineBuf, cellScratch, rows.Cell(i), cmd)
 		}
-		lineBuf.Reset()
-		formatCopyRow(&lineBuf, vals, nulls, cmd)
-		s.w.copyData(lineBuf.Bytes())
+		lineBuf = append(lineBuf, '\n')
+		s.w.copyData(lineBuf)
 		count++
 	}
 	if err := rows.Close(); err != nil {
@@ -697,166 +911,528 @@ func quoteCopyIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
-func parseCopyLine(line []byte, cmd *copyCommand) ([]string, []bool, error) {
-	if cmd.format == copyFormatCSV {
-		r := csv.NewReader(bytes.NewReader(line))
-		r.Comma = rune(cmd.delimiter)
-		r.FieldsPerRecord = -1
-		fields, err := r.Read()
-		if err != nil && err != io.EOF {
-			return nil, nil, newError(sqlstateCopyDataException, fmt.Sprintf("invalid CSV line: %v", err))
-		}
-		nulls := make([]bool, len(fields))
-		for i, f := range fields {
-			if f == cmd.nullStr {
-				nulls[i] = true
+// scanCSVRecord returns the index of the first unquoted '\n' in buf,
+// or -1 if buf does not yet contain a complete CSV record.
+func scanCSVRecord(buf []byte, delim, quote, escape byte) int {
+	inQuote := false
+	atFieldStart := true
+	for i := 0; i < len(buf); i++ {
+		c := buf[i]
+		if inQuote {
+			if c == escape {
+				if escape == quote {
+					if i+1 < len(buf) {
+						if buf[i+1] == quote {
+							i++
+							continue
+						}
+						inQuote = false
+					} else {
+						// Quote at end of chunk: wait for next chunk or CopyDone.
+						return -1
+					}
+				} else {
+					if i+1 < len(buf) {
+						i++
+						continue
+					}
+					return -1
+				}
+			} else if c == quote {
+				inQuote = false
 			}
-		}
-		return fields, nulls, nil
-	}
-	// PostgreSQL text format: delimiter-separated with backslash escapes.
-	rawParts := bytes.Split(line, []byte{cmd.delimiter})
-	fields := make([]string, len(rawParts))
-	nulls := make([]bool, len(rawParts))
-	for i, part := range rawParts {
-		if string(part) == cmd.nullStr {
-			nulls[i] = true
 			continue
 		}
-		fields[i] = unescapeCopyText(part)
+		if atFieldStart && c == quote {
+			inQuote = true
+			atFieldStart = false
+			continue
+		}
+		if c == '\n' {
+			return i
+		}
+		atFieldStart = (c == delim)
 	}
-	return fields, nulls, nil
+	return -1
 }
 
-func unescapeCopyText(b []byte) string {
-	if bytes.IndexByte(b, '\\') < 0 {
-		return string(b)
+func (p *copyLineParser) parseLine(line []byte, cmd *copyCommand, forceNull, forceNotNull []bool) error {
+	p.fields = p.fields[:0]
+	p.scratch = p.scratch[:0]
+	if cmd.format == copyFormatCSV {
+		return p.parseCSVLine(line, cmd, forceNull, forceNotNull)
 	}
-	var out strings.Builder
-	out.Grow(len(b))
-	for i := 0; i < len(b); i++ {
+	return p.parseTextLine(line, cmd)
+}
+
+func (p *copyLineParser) parseTextLine(line []byte, cmd *copyCommand) error {
+	delim := cmd.delimiter
+	nullStr := cmd.nullStr
+	if bytes.IndexByte(line, '\\') < 0 {
+		// Fast path: no backslashes anywhere in the line — zero unescaping needed.
+		pos := 0
+		for {
+			idx := bytes.IndexByte(line[pos:], delim)
+			var part []byte
+			if idx < 0 {
+				part = line[pos:]
+			} else {
+				part = line[pos : pos+idx]
+			}
+			if len(part) == len(nullStr) && string(part) == nullStr {
+				p.fields = append(p.fields, copyField{isNull: true})
+			} else {
+				p.fields = append(p.fields, copyField{data: part})
+			}
+			if idx < 0 {
+				return nil
+			}
+			pos += idx + 1
+		}
+	}
+	// Backslash-aware scan: an escaped delimiter (e.g. \|) stays inside the field.
+	start := 0
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if c == '\\' {
+			if i+1 >= len(line) {
+				return newError(sqlstateCopyDataException, "invalid TEXT line: trailing backslash at end of line")
+			}
+			i++
+			continue
+		}
+		if c == delim {
+			part := line[start:i]
+			if len(part) == len(nullStr) && string(part) == nullStr {
+				p.fields = append(p.fields, copyField{isNull: true})
+			} else {
+				p.fields = append(p.fields, copyField{data: p.unescapeText(part)})
+			}
+			start = i + 1
+		}
+	}
+	part := line[start:]
+	if len(part) == len(nullStr) && string(part) == nullStr {
+		p.fields = append(p.fields, copyField{isNull: true})
+	} else {
+		p.fields = append(p.fields, copyField{data: p.unescapeText(part)})
+	}
+	return nil
+}
+
+func (p *copyLineParser) parseCSVLine(line []byte, cmd *copyCommand, forceNull, forceNotNull []bool) error {
+	n := len(line)
+	delim := cmd.delimiter
+	quote := cmd.quote
+	escape := cmd.escape
+	nullStr := cmd.nullStr
+	if n == 0 {
+		// An empty CSV line represents a single empty unquoted field (e.g. NULL in a 1-column table).
+		isNull := len(nullStr) == 0
+		if forceNotNull != nil && len(forceNotNull) > 0 && forceNotNull[0] {
+			isNull = false
+		}
+		p.fields = append(p.fields, copyField{isNull: isNull})
+		return nil
+	}
+	i := 0
+	for {
+		colIdx := len(p.fields)
+		var data []byte
+		quoted := false
+
+		if i < n && line[i] == quote {
+			quoted = true
+			i++ // skip opening quote
+			start := i
+			needScratch := false
+			closed := false
+			for i < n {
+				c := line[i]
+				if c == escape {
+					if escape == quote {
+						if i+1 < n && line[i+1] == quote {
+							needScratch = true
+							break
+						}
+						// Closing quote
+						data = line[start:i]
+						i++
+						closed = true
+						break
+					}
+					needScratch = true
+					break
+				}
+				if c == quote {
+					data = line[start:i]
+					i++
+					closed = true
+					break
+				}
+				i++
+			}
+			if needScratch {
+				sStart := len(p.scratch)
+				p.scratch = append(p.scratch, line[start:i]...)
+				for i < n {
+					c := line[i]
+					if c == escape {
+						if escape == quote {
+							if i+1 < n && line[i+1] == quote {
+								p.scratch = append(p.scratch, quote)
+								i += 2
+								continue
+							}
+							i++
+							closed = true
+							break
+						}
+						if i+1 >= n {
+							return newError(sqlstateCopyDataException, "invalid CSV line: unterminated escape sequence")
+						}
+						p.scratch = append(p.scratch, line[i+1])
+						i += 2
+						continue
+					}
+					if c == quote {
+						i++
+						closed = true
+						break
+					}
+					p.scratch = append(p.scratch, c)
+					i++
+				}
+				data = p.scratch[sStart:len(p.scratch):len(p.scratch)]
+			}
+			if !closed {
+				return newError(sqlstateCopyDataException, "invalid CSV line: unterminated quoted field")
+			}
+			if i < n && line[i] != delim {
+				return newError(sqlstateCopyDataException, "invalid CSV line: unexpected character after closing quote")
+			}
+		} else {
+			start := i
+			for i < n && line[i] != delim {
+				if line[i] == quote {
+					return newError(sqlstateCopyDataException, "invalid CSV line: unescaped quote in unquoted field")
+				}
+				i++
+			}
+			data = line[start:i]
+		}
+
+		var isNull bool
+		if forceNotNull != nil && colIdx < len(forceNotNull) && forceNotNull[colIdx] {
+			isNull = false
+		} else if forceNull != nil && colIdx < len(forceNull) && forceNull[colIdx] {
+			isNull = len(data) == len(nullStr) && string(data) == nullStr
+		} else {
+			isNull = !quoted && len(data) == len(nullStr) && string(data) == nullStr
+		}
+		p.fields = append(p.fields, copyField{data: data, isNull: isNull})
+
+		if i >= n {
+			return nil
+		}
+		// line[i] == delim
+		i++
+		if i == n {
+			// Trailing delimiter produces one final empty unquoted field.
+			colIdx = len(p.fields)
+			var tailNull bool
+			if forceNotNull != nil && colIdx < len(forceNotNull) && forceNotNull[colIdx] {
+				tailNull = false
+			} else {
+				tailNull = len(nullStr) == 0
+			}
+			p.fields = append(p.fields, copyField{isNull: tailNull})
+			return nil
+		}
+	}
+}
+
+func (p *copyLineParser) unescapeText(b []byte) []byte {
+	first := bytes.IndexByte(b, '\\')
+	if first < 0 {
+		return b
+	}
+	start := len(p.scratch)
+	p.scratch = append(p.scratch, b[:first]...)
+	for i := first; i < len(b); i++ {
 		if b[i] == '\\' && i+1 < len(b) {
 			i++
-			switch b[i] {
+			c := b[i]
+			switch c {
 			case 'b':
-				out.WriteByte('\b')
+				p.scratch = append(p.scratch, '\b')
 			case 'f':
-				out.WriteByte('\f')
+				p.scratch = append(p.scratch, '\f')
 			case 'n':
-				out.WriteByte('\n')
+				p.scratch = append(p.scratch, '\n')
 			case 'r':
-				out.WriteByte('\r')
+				p.scratch = append(p.scratch, '\r')
 			case 't':
-				out.WriteByte('\t')
+				p.scratch = append(p.scratch, '\t')
 			case 'v':
-				out.WriteByte('\v')
+				p.scratch = append(p.scratch, '\v')
 			case '\\':
-				out.WriteByte('\\')
+				p.scratch = append(p.scratch, '\\')
+			case '0', '1', '2', '3', '4', '5', '6', '7':
+				val := c - '0'
+				for k := 0; k < 2 && i+1 < len(b); k++ {
+					next := b[i+1]
+					if next < '0' || next > '7' {
+						break
+					}
+					val = (val << 3) | (next - '0')
+					i++
+				}
+				p.scratch = append(p.scratch, val)
+			case 'x':
+				if i+1 < len(b) {
+					if d1, ok := copyHexDigit(b[i+1]); ok {
+						i++
+						val := d1
+						if i+1 < len(b) {
+							if d2, ok := copyHexDigit(b[i+1]); ok {
+								i++
+								val = (val << 4) | d2
+							}
+						}
+						p.scratch = append(p.scratch, val)
+						continue
+					}
+				}
+				p.scratch = append(p.scratch, 'x')
 			default:
-				out.WriteByte(b[i])
+				p.scratch = append(p.scratch, c)
 			}
 			continue
 		}
-		out.WriteByte(b[i])
+		p.scratch = append(p.scratch, b[i])
 	}
-	return out.String()
+	return p.scratch[start:len(p.scratch):len(p.scratch)]
 }
 
-func convertCopyField(raw string, col sqldriver.ColumnInfo) (any, error) {
+func copyHexDigit(b byte) (byte, bool) {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0', true
+	case b >= 'a' && b <= 'f':
+		return b - 'a' + 10, true
+	case b >= 'A' && b <= 'F':
+		return b - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func parseCopyBool(raw []byte) (bool, bool) {
+	switch len(raw) {
+	case 1:
+		switch raw[0] | 0x20 {
+		case 't', 'y':
+			return true, true
+		case 'f', 'n':
+			return false, true
+		}
+		if raw[0] == '1' {
+			return true, true
+		}
+		if raw[0] == '0' {
+			return false, true
+		}
+	case 2:
+		c0, c1 := raw[0]|0x20, raw[1]|0x20
+		if c0 == 'o' && c1 == 'n' {
+			return true, true
+		}
+		if c0 == 'n' && c1 == 'o' {
+			return false, true
+		}
+	case 3:
+		c0, c1, c2 := raw[0]|0x20, raw[1]|0x20, raw[2]|0x20
+		if c0 == 'y' && c1 == 'e' && c2 == 's' {
+			return true, true
+		}
+		if c0 == 'o' && c1 == 'f' && c2 == 'f' {
+			return false, true
+		}
+	case 4:
+		if raw[0]|0x20 == 't' && raw[1]|0x20 == 'r' && raw[2]|0x20 == 'u' && raw[3]|0x20 == 'e' {
+			return true, true
+		}
+	case 5:
+		if raw[0]|0x20 == 'f' && raw[1]|0x20 == 'a' && raw[2]|0x20 == 'l' && raw[3]|0x20 == 's' && raw[4]|0x20 == 'e' {
+			return false, true
+		}
+	}
+	return false, false
+}
+
+func isCopyIntBytes(raw []byte) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	i := 0
+	if raw[0] == '-' || raw[0] == '+' {
+		i = 1
+		if i == len(raw) {
+			return false
+		}
+	}
+	for ; i < len(raw); i++ {
+		if raw[i] < '0' || raw[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func convertCopyFieldSlot(raw []byte, col sqldriver.ColumnInfo, slot *copyValueSlot) (any, error) {
 	t := col.Types &^ sqlast.TypeNull
 	switch t {
 	case sqlast.TypeInteger:
-		v, err := strconv.ParseInt(raw, 10, 64)
+		v, err := strconv.ParseInt(byteview.String(raw), 10, 64)
 		if err != nil {
 			return nil, err
 		}
-		return v, nil
+		slot.i64 = v
+		return &slot.i64, nil
 	case sqlast.TypeNumber, sqlast.TypeInteger | sqlast.TypeNumber:
-		if v, err := strconv.ParseInt(raw, 10, 64); err == nil {
-			return v, nil
+		s := byteview.String(raw)
+		if isCopyIntBytes(raw) {
+			if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+				slot.i64 = v
+				return &slot.i64, nil
+			}
 		}
-		v, err := strconv.ParseFloat(raw, 64)
-		if err != nil {
-			return nil, err
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil, fmt.Errorf("invalid input syntax for type numeric: %q", raw)
 		}
-		return v, nil
+		slot.f64 = v
+		return &slot.f64, nil
 	case sqlast.TypeBool:
-		switch strings.ToLower(raw) {
-		case "t", "true", "y", "yes", "on", "1":
-			return true, nil
-		case "f", "false", "n", "no", "off", "0":
-			return false, nil
-		default:
+		b, ok := parseCopyBool(raw)
+		if !ok {
 			return nil, fmt.Errorf("invalid input syntax for type boolean: %q", raw)
 		}
+		slot.boolean = b
+		return &slot.boolean, nil
 	case sqlast.TypeObject, sqlast.TypeArray, sqlast.TypeObject | sqlast.TypeArray:
-		if !json.Valid([]byte(raw)) {
+		if err := vibejson.Validate(raw); err != nil {
 			return nil, fmt.Errorf("invalid input syntax for type json")
 		}
-		return json.RawMessage(raw), nil
+		return vibejson.RawValue{Src: raw}, nil
 	default:
-		return raw, nil
+		slot.str = byteview.String(raw)
+		return &slot.str, nil
 	}
 }
 
-func formatCopyCell(cell query.Cell) string {
+func appendCopyHeaderRow(dst []byte, colNames []string, cmd *copyCommand) []byte {
+	for i, name := range colNames {
+		if i > 0 {
+			dst = append(dst, cmd.delimiter)
+		}
+		raw := byteview.Bytes(name)
+		if cmd.format == copyFormatCSV {
+			dst = appendCopyCSVField(dst, raw, cmd.delimiter, cmd.quote, cmd.escape, cmd.nullStr, false)
+		} else {
+			dst = appendCopyTextField(dst, raw, cmd.delimiter)
+		}
+	}
+	return append(dst, '\n')
+}
+
+func appendCopyCell(dst, cellScratch []byte, cell query.Cell, cmd *copyCommand) ([]byte, []byte) {
+	if cell.IsNull() {
+		return append(dst, cmd.nullStr...), cellScratch
+	}
+	var val []byte
 	switch cell.Type() {
 	case query.TypeString:
-		raw := cell.AppendJSON(nil)
-		var unquoted string
-		if json.Unmarshal(raw, &unquoted) == nil {
-			return unquoted
-		}
-		return string(raw)
+		val, _ = cell.TextBytes()
 	case query.TypeBool:
-		b, _ := cell.Bool()
-		if b {
-			return "t"
+		if b, _ := cell.Bool(); b {
+			val = copyTrueBytes
+		} else {
+			val = copyFalseBytes
 		}
-		return "f"
 	default:
-		return string(cell.AppendJSON(nil))
+		if raw := cell.Payload(); raw != nil {
+			val = raw
+		} else {
+			cellScratch = cell.AppendJSON(cellScratch[:0])
+			val = cellScratch
+		}
 	}
+	if cmd.format == copyFormatCSV {
+		return appendCopyCSVField(dst, val, cmd.delimiter, cmd.quote, cmd.escape, cmd.nullStr, true), cellScratch
+	}
+	return appendCopyTextField(dst, val, cmd.delimiter), cellScratch
 }
 
-func formatCopyRow(buf *bytes.Buffer, vals []string, nulls []bool, cmd *copyCommand) {
-	if cmd.format == copyFormatCSV {
-		w := csv.NewWriter(buf)
-		w.Comma = rune(cmd.delimiter)
-		out := make([]string, len(vals))
-		for i, v := range vals {
-			if nulls != nil && nulls[i] {
-				out[i] = cmd.nullStr
+func appendCopyTextField(dst, src []byte, delimiter byte) []byte {
+	start := 0
+	for i := 0; i < len(src); i++ {
+		c := src[i]
+		var esc byte
+		switch c {
+		case '\\':
+			esc = '\\'
+		case '\b':
+			esc = 'b'
+		case '\f':
+			esc = 'f'
+		case '\n':
+			esc = 'n'
+		case '\r':
+			esc = 'r'
+		case '\t':
+			esc = 't'
+		case '\v':
+			esc = 'v'
+		default:
+			if c == delimiter {
+				esc = delimiter
 			} else {
-				out[i] = v
+				continue
 			}
 		}
-		_ = w.Write(out)
-		w.Flush()
-		return
+		dst = append(dst, src[start:i]...)
+		dst = append(dst, '\\', esc)
+		start = i + 1
 	}
-	for i, v := range vals {
-		if i > 0 {
-			buf.WriteByte(cmd.delimiter)
-		}
-		if nulls != nil && nulls[i] {
-			buf.WriteString(cmd.nullStr)
-			continue
-		}
-		for j := 0; j < len(v); j++ {
-			switch v[j] {
-			case '\\':
-				buf.WriteString(`\\`)
-			case '\n':
-				buf.WriteString(`\n`)
-			case '\r':
-				buf.WriteString(`\r`)
-			case '\t':
-				buf.WriteString(`\t`)
-			default:
-				buf.WriteByte(v[j])
+	return append(dst, src[start:]...)
+}
+
+func appendCopyCSVField(dst, src []byte, delimiter, quote, escape byte, nullStr string, checkNull bool) []byte {
+	needsQuote := checkNull && len(src) == len(nullStr) && string(src) == nullStr
+	if !needsQuote {
+		for i := 0; i < len(src); i++ {
+			c := src[i]
+			if c == delimiter || c == quote || c == '\n' || c == '\r' || (escape != quote && c == escape) {
+				needsQuote = true
+				break
 			}
 		}
 	}
-	buf.WriteByte('\n')
+	if !needsQuote {
+		return append(dst, src...)
+	}
+	dst = append(dst, quote)
+	start := 0
+	for i := 0; i < len(src); i++ {
+		c := src[i]
+		if c == quote || c == escape {
+			dst = append(dst, src[start:i]...)
+			dst = append(dst, escape, c)
+			start = i + 1
+		}
+	}
+	dst = append(dst, src[start:]...)
+	return append(dst, quote)
 }
