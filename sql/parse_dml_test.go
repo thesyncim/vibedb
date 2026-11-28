@@ -533,7 +533,7 @@ func TestRejectsUnboundedCatalogDDLSyntax(t *testing.T) {
 		{"DROP without an object kind", `DROP`, -1, "TABLE, INDEX, VIEW, or MATERIALIZED VIEW"},
 		{"DROP VIEW without a name", `DROP VIEW`, -1, "view name"},
 		{"DROP several views", `DROP VIEW v, w`, strings.Index(`DROP VIEW v, w`, ","), "trailing input"},
-		{"DROP another object kind", `DROP SEQUENCE v`, -1, "DROP SEQUENCE"},
+		{"DROP another object kind", `DROP SCHEMA v`, -1, "DROP SCHEMA"},
 		{"DROP TABLE dangling comma", `DROP TABLE docs,`, -1, "collection name"},
 		{"DROP INDEX without a name", `DROP INDEX`, -1, "index name"},
 		{"DROP INDEX with incomplete IF", `DROP INDEX IF by_age`, -1, "EXISTS after IF"},

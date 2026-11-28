@@ -204,6 +204,9 @@ type statementScalar struct {
 	// sort only when the executing Workspace names this same plan,
 	// so a restriction can never skip work for a foreign plan.
 	tinTopKPlan *plan
+	// sequences is borrowed from ExecOptions.Sequences for the duration of
+	// execute and cleared on return.
+	sequences SequenceProvider
 }
 
 func (s *Statement) scalarStatement() *statementScalar {
@@ -1530,7 +1533,11 @@ func (r *statementScalar) execute(
 	intermediateResource string,
 ) (cursor Cursor, err error) {
 	result := &exec.Result
-	defer r.clearValues()
+	r.sequences = options.Sequences
+	defer func() {
+		r.sequences = nil
+		r.clearValues()
+	}()
 	defer func() {
 		if err != nil {
 			result.abortResult()

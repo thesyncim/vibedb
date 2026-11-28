@@ -108,6 +108,30 @@ var (
 	ErrTooManyTables = errors.New("vibedb: SQL catalog exceeds the table-count bound")
 	// ErrTooManyViews bounds the durable view graph and reopen validation work.
 	ErrTooManyViews = errors.New("vibedb: SQL catalog exceeds the view-count bound")
+	// ErrSequenceNotFound reports a statement or function naming a sequence
+	// absent from the durable SQL catalog.
+	ErrSequenceNotFound = errors.New("vibedb: SQL sequence does not exist")
+	// ErrSequenceExists reports CREATE SEQUENCE without IF NOT EXISTS naming an
+	// existing sequence or relation.
+	ErrSequenceExists = errors.New("vibedb: SQL sequence already exists")
+	// ErrSequenceExhausted reports nextval reaching MAXVALUE or MINVALUE on a
+	// NO CYCLE sequence (PostgreSQL SQLSTATE 2200H).
+	ErrSequenceExhausted = errors.New("vibedb: sequence generator limit exceeded")
+	// ErrSequenceStateNotInitialized reports currval or lastval called before
+	// nextval has been invoked in the current session (PostgreSQL SQLSTATE 55000).
+	ErrSequenceStateNotInitialized = errors.New("vibedb: sequence value is not yet defined in this session")
+	// ErrSequenceValueOutOfRange reports setval or sequence value outside
+	// [MINVALUE, MAXVALUE] (PostgreSQL SQLSTATE 22003).
+	ErrSequenceValueOutOfRange = errors.New("vibedb: sequence value is out of bounds")
+	// ErrInvalidSequenceDefinition reports invalid CREATE/ALTER SEQUENCE
+	// options such as INCREMENT 0 or CACHE <= 0 (PostgreSQL SQLSTATE 22023).
+	ErrInvalidSequenceDefinition = errors.New("vibedb: invalid SQL sequence definition")
+	// ErrIdentityAlwaysViolation reports INSERT supplying a non-DEFAULT value
+	// for a GENERATED ALWAYS AS IDENTITY column without OVERRIDING SYSTEM VALUE
+	// (PostgreSQL SQLSTATE 428C9).
+	ErrIdentityAlwaysViolation = errors.New("vibedb: cannot insert a non-DEFAULT value into GENERATED ALWAYS AS IDENTITY column")
+	// ErrTooManySequences bounds the durable sequence catalog.
+	ErrTooManySequences = errors.New("vibedb: SQL catalog exceeds the sequence-count bound")
 	// ErrTooManyRetiredTables bounds old storage incarnations whose active
 	// snapshots prevent immediate descriptor release and physical cleanup.
 	ErrTooManyRetiredTables = errors.New("vibedb: too many SQL table incarnations are retiring")

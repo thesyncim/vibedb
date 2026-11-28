@@ -179,6 +179,25 @@ type CreateTableStmt struct {
 // STRING" is a real constraint on a real document shape; refusing it would make
 // the schema describe only the top level of documents whose interesting parts
 // are never at the top level.
+// SerialKind identifies SMALLSERIAL, SERIAL, or BIGSERIAL shorthand column types.
+type SerialKind uint8
+
+const (
+	SerialNone SerialKind = iota
+	SerialSmall
+	SerialInt
+	SerialBig
+)
+
+// IdentityKind identifies GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY.
+type IdentityKind uint8
+
+const (
+	IdentityNone IdentityKind = iota
+	IdentityAlways
+	IdentityByDefault
+)
+
 type ColumnDef struct {
 	// Path is the constrained path.
 	Path *PathExpr
@@ -194,6 +213,11 @@ type ColumnDef struct {
 	PrimaryKey bool
 	// Unique records that this column carried an inline UNIQUE constraint.
 	Unique bool
+	// Serial records SMALLSERIAL, SERIAL, or BIGSERIAL.
+	Serial SerialKind
+	// Identity records GENERATED ALWAYS / BY DEFAULT AS IDENTITY.
+	Identity        IdentityKind
+	IdentityOptions *SequenceOptions
 	// HasDefault and DefaultExpr record a column-level DEFAULT expression.
 	HasDefault  bool
 	DefaultExpr *ScalarExpr

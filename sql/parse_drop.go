@@ -18,6 +18,9 @@ func (p *Parser) parseDrop(dst *Statement) error {
 	case p.atKeyword(kwView):
 		dst.Kind, dst.DropView = KindDropView, &p.dropView
 		return p.parseDropView()
+	case tokenTextEqual(p.tok, "SEQUENCE"):
+		dst.Kind, dst.DropSequence = KindDropSequence, &p.dropSeq
+		return p.parseDropSequence()
 	case p.atKeyword(kwMaterialized):
 		return p.parseUnsupportedDrop()
 	default:
@@ -365,7 +368,7 @@ func tokenTextEqual(tok token, value string) bool {
 
 func recognizedDropObjectKind(value string) bool {
 	switch strings.ToUpper(value) {
-	case "VIEW", "MATERIALIZED", "SCHEMA", "DATABASE", "SEQUENCE",
+	case "VIEW", "MATERIALIZED", "SCHEMA", "DATABASE",
 		"TYPE", "DOMAIN", "FUNCTION", "PROCEDURE", "TRIGGER", "POLICY",
 		"ROLE", "USER", "EXTENSION", "COLLATION":
 		return true

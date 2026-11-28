@@ -381,6 +381,20 @@ func (d *database) dropTableLockedContext(
 	retiredBefore := len(d.retired)
 	meta := d.catalog.Tables[name]
 	storagePath := d.tablePathForMeta(meta)
+	var ownedSeqNames []string
+	var ownedSeqMetas map[string]*sequenceMeta
+	for seqName, seqMeta := range d.catalog.Sequences {
+		if seqMeta != nil && seqMeta.OwnerTable == name {
+			if ownedSeqMetas == nil {
+				ownedSeqMetas = make(map[string]*sequenceMeta)
+			}
+			ownedSeqNames = append(ownedSeqNames, seqName)
+			ownedSeqMetas[seqName] = seqMeta
+		}
+	}
+	for _, seqName := range ownedSeqNames {
+		delete(d.catalog.Sequences, seqName)
+	}
 	delete(d.catalog.Tables, name)
 	delete(d.tables, name)
 	if retire {
@@ -393,6 +407,9 @@ func (d *database) dropTableLockedContext(
 	published, err := d.persistCatalogLocked()
 	if err != nil {
 		if !published {
+			for seqName, seqMeta := range ownedSeqMetas {
+				d.catalog.Sequences[seqName] = seqMeta
+			}
 			d.catalog.Tables[name] = meta
 			d.tables[name] = t
 			d.retired = d.retired[:retiredBefore]
@@ -408,6 +425,19 @@ func (d *database) dropTableLockedContext(
 			d.advanceLayoutEpochLocked()
 		}
 		return nil, err
+	}
+	if len(ownedSeqNames) > 0 {
+		d.seqMu.Lock()
+		for _, seqName := range ownedSeqNames {
+			if rt, ok := d.sequences[seqName]; ok {
+				rt.mu.Lock()
+				rt.dropped = true
+				rt.mu.Unlock()
+				delete(d.sequences, seqName)
+			}
+		}
+		d.seqMu.Unlock()
+		_ = d.deletePersistedSequenceEntries(ownedSeqNames)
 	}
 	d.advanceLayoutEpochLocked()
 	if err := d.settleDroppedTablesLocked(); err != nil {
@@ -512,20 +542,63 @@ func (d *database) createTableLockedContext(
 	}
 	schemaMetaVal := schemaMetaFrom(definition.Schema)
 	var checkSQLs []string
+	var createdSequences map[string]*sequenceMeta
 	if ct := statement.Tree().CreateTable; ct != nil {
 		if schemaMetaVal != nil {
 			defaultByPath := make(map[string]string)
+			identityByPath := make(map[string]string)
+			identitySeqByPath := make(map[string]string)
 			for _, col := range ct.Columns {
-				if col.HasDefault && col.DefaultSQL != "" && col.Path != nil {
-					defaultByPath[string(col.Path.AppendPointer(nil))] = col.DefaultSQL
+				if col.Path != nil {
+					colPath := string(col.Path.AppendPointer(nil))
+					colName := strings.TrimPrefix(colPath, "/")
+					if col.HasDefault && col.DefaultSQL != "" {
+						defaultByPath[colPath] = col.DefaultSQL
+					}
+					if col.Serial != sqlast.SerialNone || col.Identity != sqlast.IdentityNone {
+						if createdSequences == nil {
+							createdSequences = make(map[string]*sequenceMeta)
+						}
+						seqName := d.allocateOwnedSequenceNameLocked(definition.Name, colName, createdSequences)
+						d.seqGen++
+						var seqOpts sqlast.SequenceOptions
+						defaultDT := "BIGINT"
+						if col.Serial != sqlast.SerialNone {
+							defaultDT = serialDefaultDataType(col.Serial)
+						} else if col.IdentityOptions != nil {
+							seqOpts = *col.IdentityOptions
+						}
+						seqMeta, seqErr := buildSequenceMetaFromOptions(
+							seqName, seqOpts, defaultDT, definition.Name, colName, d.seqGen,
+						)
+						if seqErr != nil {
+							return nil, seqErr
+						}
+						createdSequences[seqName] = seqMeta
+						identitySeqByPath[colPath] = seqName
+						if col.Serial != sqlast.SerialNone {
+							defaultByPath[colPath] = "nextval('" + escapeSQLSingleQuote(seqName) + "')"
+						} else if col.Identity == sqlast.IdentityAlways {
+							identityByPath[colPath] = "always"
+						} else if col.Identity == sqlast.IdentityByDefault {
+							identityByPath[colPath] = "by_default"
+						}
+					}
 				}
 				if col.CheckSQL != "" {
 					checkSQLs = append(checkSQLs, col.CheckSQL)
 				}
 			}
 			for i := range schemaMetaVal.Fields {
-				if defSQL, ok := defaultByPath[schemaMetaVal.Fields[i].Path]; ok {
+				p := schemaMetaVal.Fields[i].Path
+				if defSQL, ok := defaultByPath[p]; ok {
 					schemaMetaVal.Fields[i].DefaultSQL = defSQL
+				}
+				if idKind, ok := identityByPath[p]; ok {
+					schemaMetaVal.Fields[i].Identity = idKind
+				}
+				if idSeq, ok := identitySeqByPath[p]; ok {
+					schemaMetaVal.Fields[i].IdentitySequence = idSeq
 				}
 			}
 		} else {
@@ -539,6 +612,11 @@ func (d *database) createTableLockedContext(
 			if chkSQL != "" {
 				checkSQLs = append(checkSQLs, chkSQL)
 			}
+		}
+	}
+	if len(createdSequences) > 0 {
+		if err := checkCatalogSequenceCount(len(d.catalog.Sequences) + len(createdSequences)); err != nil {
+			return nil, fmt.Errorf("vibedb: CREATE TABLE %q: %w", definition.Name, err)
 		}
 	}
 	meta := &tableMeta{
@@ -560,16 +638,41 @@ func (d *database) createTableLockedContext(
 	if err := contextCheckpoint(ctx); err != nil {
 		return nil, err
 	}
+	for seqName, seqMeta := range createdSequences {
+		d.catalog.Sequences[seqName] = seqMeta
+	}
 	d.catalog.Tables[definition.Name] = meta
 	d.tables[definition.Name] = candidate
 	if published, err := d.persistCatalogLocked(); err != nil {
 		if !published {
+			for seqName := range createdSequences {
+				delete(d.catalog.Sequences, seqName)
+			}
 			delete(d.catalog.Tables, definition.Name)
 			delete(d.tables, definition.Name)
 		} else {
 			d.advanceLayoutEpochLocked()
 		}
 		return nil, err
+	}
+	if len(createdSequences) > 0 {
+		d.seqMu.Lock()
+		if d.sequences == nil {
+			d.sequences = make(map[string]*runtimeSequence)
+		}
+		for seqName, seqMeta := range createdSequences {
+			d.sequences[seqName] = &runtimeSequence{
+				name:         seqName,
+				meta:         *seqMeta,
+				curValue:     seqMeta.Start,
+				curCalled:    false,
+				logRemaining: 0,
+			}
+		}
+		d.seqMu.Unlock()
+		for seqName, seqMeta := range createdSequences {
+			_ = d.persistSequenceEntry(seqName, seqMeta.Start, false, seqMeta.Generation)
+		}
 	}
 	d.advanceLayoutEpochLocked()
 	return result{}, nil
@@ -1044,7 +1147,7 @@ func (c *conn) insertLocked(
 		}
 		document, key, err := resolveInsertRow(
 			statement, tree, &tree.Rows[i], args,
-			t.meta, t.primary, limits,
+			t.meta, t.primary, limits, &c.seqSession,
 		)
 		if err == nil && len(t.primaries) > 1 {
 			key, err = tableDocumentKey(t, document, limits.MaxKeyBytes)
@@ -1332,6 +1435,13 @@ func (c *conn) insertSelectLocked(
 				}
 			}
 			document = cell.Payload()
+		}
+		document, err = applyColumnDefaultsAndIdentity(
+			document, t.meta, limits.MaxDocumentBytes, tree.Overriding, &c.seqSession,
+		)
+		if err != nil {
+			c.pointRaw = conflictScratch
+			return nil, err
 		}
 		if err := validateDocumentWithIntermediateBudget(
 			t.schema, document, limits.MaxDocumentBytes, &c.insertTape,
@@ -1713,6 +1823,7 @@ func resolveInsertRow(
 	meta *tableMeta,
 	primary vibejson.CompiledPointer,
 	limits durable.Options,
+	seqProvider query.SequenceProvider,
 ) ([]byte, string, error) {
 	var document []byte
 	var err error
@@ -1720,7 +1831,7 @@ func resolveInsertRow(
 		document, err = operandDocument(statement, row.Values[0], args)
 	} else if len(row.Exprs) > 0 {
 		document, err = encodeFlatInsertDocumentWithExprs(
-			statement.SQL(), insert, row, args, limits.MaxDocumentBytes,
+			statement.SQL(), insert, row, args, limits.MaxDocumentBytes, seqProvider,
 		)
 	} else {
 		document, err = encodeFlatInsertDocument(
@@ -1732,7 +1843,9 @@ func resolveInsertRow(
 	if err != nil {
 		return nil, "", err
 	}
-	document, err = applyColumnDefaults(document, meta, limits.MaxDocumentBytes)
+	document, err = applyColumnDefaultsAndIdentity(
+		document, meta, limits.MaxDocumentBytes, insert.Overriding, seqProvider,
+	)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1775,10 +1888,15 @@ func (d *flatInsertDocument) MarshalVibeJSON(
 	w vibejson.TrustedAppender,
 ) vibejson.TrustedAppender {
 	w = w.RawByteUnchecked('{')
-	for output, ordinal := range d.ordinals {
-		if output != 0 {
+	wrote := 0
+	for _, ordinal := range d.ordinals {
+		if d.row.Values[ordinal].Kind == sqlast.OperandDefault {
+			continue
+		}
+		if wrote != 0 {
 			w = w.RawByteUnchecked(',')
 		}
+		wrote++
 		column := d.insert.Columns[ordinal]
 		w = w.String(column.Segments[0].Key).RawByteUnchecked(':')
 		if d.err != nil {
@@ -1803,6 +1921,7 @@ func encodeFlatInsertDocumentWithExprs(
 	row *sqlast.InsertRow,
 	args []any,
 	maxDocumentBytes int,
+	seqProvider query.SequenceProvider,
 ) ([]byte, error) {
 	if len(insert.Columns) != len(row.Values) {
 		return nil, errors.New("vibedb: internal flat INSERT shape is incomplete")
@@ -1817,6 +1936,7 @@ func encodeFlatInsertDocumentWithExprs(
 		}
 	}
 	var evalExec query.Exec
+	evalExec.Options.Sequences = seqProvider
 	var evalCursor query.Cursor
 	if len(cols) > 0 {
 		sel := &sqlast.SelectStmt{Columns: cols, Params: len(args)}
@@ -1837,10 +1957,15 @@ func encodeFlatInsertDocumentWithExprs(
 	}
 	buf := make([]byte, 0, len(insert.Columns)*24+2)
 	buf = append(buf, '{')
+	wrote := 0
 	for i, col := range insert.Columns {
-		if i > 0 {
+		if row.Values[i].Kind == sqlast.OperandDefault {
+			continue
+		}
+		if wrote > 0 {
 			buf = append(buf, ',')
 		}
+		wrote++
 		buf = appendJSONString(buf, col.Spec())
 		buf = append(buf, ':')
 		if exprMap[i] >= 0 {
@@ -1895,6 +2020,9 @@ func encodeFlatInsertDocument(
 		structuralBytes += uint64(len(insert.Columns) - 1) // commas
 	}
 	for index := range insert.Columns {
+		if row.Values[index].Kind == sqlast.OperandDefault {
+			continue
+		}
 		value, err := flatInsertOperandValue(row.Values[index], args)
 		if err != nil {
 			return nil, err

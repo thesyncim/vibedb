@@ -936,6 +936,8 @@ const (
 	// consumers that have not opted into scalar assignment evaluation must
 	// reject it instead of silently treating a zero Operand as an empty string.
 	OperandExpression
+	// OperandDefault marks an explicit DEFAULT keyword in an INSERT VALUES row.
+	OperandDefault
 )
 
 // An Operand is a literal or a placeholder.

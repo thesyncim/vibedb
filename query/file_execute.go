@@ -36,6 +36,15 @@ import (
 // additions and still use fail-closed admission. MemoryBytes is separate from
 // the returned Result; ResultRows and ResultBytes independently bound
 // materialized output for every source.
+// SequenceProvider evaluates PostgreSQL sequence functions (nextval, currval,
+// setval, lastval) against the caller's catalog and session state.
+type SequenceProvider interface {
+	NextVal(name string) (int64, error)
+	CurrVal(name string) (int64, error)
+	SetVal(name string, value int64, isCalled bool) (int64, error)
+	LastVal() (int64, error)
+}
+
 type ExecOptions struct {
 	Workers     int
 	BatchRows   int
@@ -48,6 +57,9 @@ type ExecOptions struct {
 	// have been cleaned up. Clear a canceled flag with [CancelFlag.Reset] only
 	// after the execution has returned.
 	Cancel *CancelFlag
+	// Sequences evaluates PostgreSQL sequence functions (nextval, currval,
+	// setval, lastval) against the caller's catalog and session state.
+	Sequences SequenceProvider
 	// ResultRows bounds rows materialized before HAVING/OFFSET cursor filtering.
 	// ResultBytes bounds logical ResultColumn/Cell storage plus every cell's
 	// retained variable-width representation, including bytes borrowed from a

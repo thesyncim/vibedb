@@ -28,6 +28,7 @@ const (
 	maxCatalogViewQueryBytes   = 1 << 20
 	maxCatalogViewColumns      = 1024
 	maxCatalogViewDependencies = 1024
+	maxCatalogSequences        = 512
 )
 
 // maxCatalogTables bounds both the in-memory catalog and the descriptors an
@@ -50,11 +51,28 @@ type catalogFile struct {
 	Version              int                           `json:"version"`
 	Tables               map[string]*tableMeta         `json:"tables"`
 	Views                map[string]*viewMeta          `json:"views,omitempty"`
+	Sequences            map[string]*sequenceMeta      `json:"sequences,omitempty"`
 	ShardStore           *ShardStoreIdentity           `json:"shard_store,omitempty"`
 	ShardStoreFence      *ShardStoreFence              `json:"shard_store_fence,omitempty"`
 	ReplicatedShardStore *ReplicatedShardStoreIdentity `json:"replicated_shard_store,omitempty"`
 	ReplicatedChildApply *replicatedApplyMeta          `json:"replicated_child_apply,omitempty"`
 	ReplicatedApply      *replicatedApplyMeta          `json:"replicated_apply,omitempty"`
+}
+
+// sequenceMeta is the durable catalog definition of one SQL sequence.
+type sequenceMeta struct {
+	DataType       string `json:"data_type,omitempty"`
+	Increment      int64  `json:"increment"`
+	MinValue       int64  `json:"min_value"`
+	MaxValue       int64  `json:"max_value"`
+	Start          int64  `json:"start"`
+	Cache          int64  `json:"cache"`
+	Cycle          bool   `json:"cycle,omitempty"`
+	IsCalled       bool   `json:"is_called,omitempty"`
+	PersistedValue int64  `json:"persisted_value"`
+	Generation     uint64 `json:"generation,omitempty"`
+	OwnerTable     string `json:"owner_table,omitempty"`
+	OwnerColumn    string `json:"owner_column,omitempty"`
 }
 
 // viewMeta is immutable after publication. Prepared statements retain its
@@ -85,10 +103,12 @@ type schemaMeta struct {
 }
 
 type schemaFieldMeta struct {
-	Path       string `json:"path"`
-	Types      uint16 `json:"types"`
-	Required   bool   `json:"required,omitempty"`
-	DefaultSQL string `json:"default_sql,omitempty"`
+	Path             string `json:"path"`
+	Types            uint16 `json:"types"`
+	Required         bool   `json:"required,omitempty"`
+	DefaultSQL       string `json:"default_sql,omitempty"`
+	Identity         string `json:"identity,omitempty"`
+	IdentitySequence string `json:"identity_sequence,omitempty"`
 }
 
 type indexMeta struct {
@@ -215,6 +235,11 @@ type database struct {
 	detachCollection func(*durable.Collection) error
 	catalog          catalogFile
 	tables           map[string]*table
+	seqMu            sync.RWMutex
+	seqPersistMu     sync.Mutex
+	sequences        map[string]*runtimeSequence
+	seqPersisted     map[string]seqStateEntry
+	seqGen           uint64
 	retired          []retiredTable
 	// txnReattach contains authoritative catalog collections that were
 	// successfully detached for a tentative DDL cut but could not be re-adopted
@@ -355,6 +380,8 @@ func openDatabaseWithShardStorePolicy(
 		schemaSourceRecovery:       shardPolicy.schemaSourceRecovery,
 	}
 	d.catalog.Views = make(map[string]*viewMeta)
+	d.catalog.Sequences = make(map[string]*sequenceMeta)
+	d.sequences = make(map[string]*runtimeSequence)
 	opened := false
 	defer func() {
 		if !opened {
@@ -387,6 +414,9 @@ func openDatabaseWithShardStorePolicy(
 		}
 		if d.catalog.Views == nil {
 			d.catalog.Views = make(map[string]*viewMeta)
+		}
+		if d.catalog.Sequences == nil {
+			d.catalog.Sequences = make(map[string]*sequenceMeta)
 		}
 	}
 	var initializeIdentity *ShardStoreIdentity
@@ -699,6 +729,9 @@ func openDatabaseWithShardStorePolicy(
 		}
 	}
 	if err := d.validateViewCatalog(); err != nil {
+		return nil, err
+	}
+	if err := d.loadSequenceCatalog(); err != nil {
 		return nil, err
 	}
 	if err := d.openCatalogCollectionsWithTransactionsLocked(shardPolicy.openOptions); err != nil {
@@ -1730,6 +1763,9 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 	if err := checkCatalogViewCount(len(catalog.Views)); err != nil {
 		return maxCatalogBytes + 1, err
 	}
+	if err := checkCatalogSequenceCount(len(catalog.Sequences)); err != nil {
+		return maxCatalogBytes + 1, err
+	}
 	size := 256
 	add := func(part int) bool {
 		if part < 0 || part > maxCatalogBytes-size {
@@ -1805,7 +1841,10 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 				return size, catalogSizeError(size)
 			}
 			for i := range meta.Schema.Fields {
-				if !add(encodedJSONStringBytes(meta.Schema.Fields[i].Path) + 256) {
+				f := &meta.Schema.Fields[i]
+				part := encodedJSONStringBytes(f.Path) + encodedJSONStringBytes(f.DefaultSQL) +
+					encodedJSONStringBytes(f.Identity) + encodedJSONStringBytes(f.IdentitySequence) + 256
+				if !add(part) {
 					return size, catalogSizeError(size)
 				}
 			}
@@ -1850,7 +1889,28 @@ func catalogSizeUpperBound(catalog catalogFile) (int, error) {
 			}
 		}
 	}
+	for name, meta := range catalog.Sequences {
+		if !add(encodedJSONStringBytes(name) + 512) {
+			return size, catalogSizeError(size)
+		}
+		if meta == nil {
+			continue
+		}
+		if !add(encodedJSONStringBytes(meta.OwnerTable) + encodedJSONStringBytes(meta.OwnerColumn) + 256) {
+			return size, catalogSizeError(size)
+		}
+	}
 	return size, nil
+}
+
+func checkCatalogSequenceCount(sequences int) error {
+	if sequences <= maxCatalogSequences {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: catalog has %d sequences, maximum is %d",
+		ErrTooManySequences, sequences, maxCatalogSequences,
+	)
 }
 
 func checkCatalogTableCount(tables int) error {

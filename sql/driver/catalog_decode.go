@@ -52,11 +52,12 @@ var catalogVibeEncoder = func() vibejson.Encoder[catalogFileVibe] {
 }()
 
 var (
-	catalogRootFields        = vibejson.MakeFieldSet("version", "tables", "views", "shard_store", "shard_store_fence", "replicated_shard_store", "replicated_apply", "replicated_child_apply")
+	catalogRootFields        = vibejson.MakeFieldSet("version", "tables", "views", "shard_store", "shard_store_fence", "replicated_shard_store", "replicated_apply", "replicated_child_apply", "sequences")
 	tableMetaFields          = vibejson.MakeFieldSet("primary_key", "schema", "indexes", "storage", "materialized", "sealed_recovery_journal_bytes", "primary_keys", "checks")
 	viewMetaFields           = vibejson.MakeFieldSet("query", "columns", "outputs", "view_dependencies", "table_dependencies")
+	sequenceMetaFields       = vibejson.MakeFieldSet("increment", "min_value", "max_value", "start", "cache", "cycle", "is_called", "persisted_value", "generation", "owner_table", "owner_column", "data_type")
 	schemaMetaFields         = vibejson.MakeFieldSet("root", "fields")
-	schemaFieldFields        = vibejson.MakeFieldSet("path", "types", "required", "default_sql")
+	schemaFieldFields        = vibejson.MakeFieldSet("path", "types", "required", "default_sql", "identity", "identity_sequence")
 	indexMetaFields          = vibejson.MakeFieldSet("name", "paths", "unique")
 	shardStoreIdentityFields = vibejson.MakeFieldSet("distribution", "shard", "allocation_generation", "log_id")
 	shardStoreFenceFields    = vibejson.MakeFieldSet("ownership_epoch", "routing_version")
@@ -282,6 +283,10 @@ func (c *catalogFileVibe) MarshalVibeJSON(w vibejson.TrustedAppender) vibejson.T
 		w = w.RawUnchecked(`,"views":`)
 		w = appendCatalogViews(w, catalog.Views)
 	}
+	if len(catalog.Sequences) != 0 {
+		w = w.RawUnchecked(`,"sequences":`)
+		w = appendCatalogSequences(w, catalog.Sequences)
+	}
 	if catalog.ShardStore != nil {
 		w = w.RawUnchecked(`,"shard_store":`)
 		w = appendShardStoreIdentity(w, *catalog.ShardStore)
@@ -346,6 +351,55 @@ func appendCatalogViews(w vibejson.TrustedAppender, values map[string]*viewMeta)
 		} else {
 			w = appendViewMeta(w, *values[name])
 		}
+	}
+	return w.RawByteUnchecked('}')
+}
+
+func appendCatalogSequences(w vibejson.TrustedAppender, values map[string]*sequenceMeta) vibejson.TrustedAppender {
+	w = w.RawByteUnchecked('{')
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for ordinal, name := range names {
+		if ordinal != 0 {
+			w = w.RawByteUnchecked(',')
+		}
+		w = w.String(name).RawByteUnchecked(':')
+		if values[name] == nil {
+			w = w.RawUnchecked("null")
+		} else {
+			w = appendSequenceMeta(w, *values[name])
+		}
+	}
+	return w.RawByteUnchecked('}')
+}
+
+func appendSequenceMeta(w vibejson.TrustedAppender, m sequenceMeta) vibejson.TrustedAppender {
+	w = w.RawUnchecked(`{"increment":`).Int(m.Increment).
+		RawUnchecked(`,"min_value":`).Int(m.MinValue).
+		RawUnchecked(`,"max_value":`).Int(m.MaxValue).
+		RawUnchecked(`,"start":`).Int(m.Start).
+		RawUnchecked(`,"cache":`).Int(m.Cache)
+	if m.Cycle {
+		w = w.RawUnchecked(`,"cycle":true`)
+	}
+	if m.IsCalled {
+		w = w.RawUnchecked(`,"is_called":true`)
+	}
+	w = w.RawUnchecked(`,"persisted_value":`).Int(m.PersistedValue)
+	if m.Generation != 0 {
+		w = w.RawUnchecked(`,"generation":`).Uint(m.Generation)
+	}
+	if m.OwnerTable != "" {
+		w = w.RawUnchecked(`,"owner_table":`).String(m.OwnerTable)
+	}
+	if m.OwnerColumn != "" {
+		w = w.RawUnchecked(`,"owner_column":`).String(m.OwnerColumn)
+	}
+	if m.DataType != "" {
+		w = w.RawUnchecked(`,"data_type":`).String(m.DataType)
 	}
 	return w.RawByteUnchecked('}')
 }
@@ -425,6 +479,12 @@ func appendSchemaMeta(w vibejson.TrustedAppender, m schemaMeta) vibejson.Trusted
 			}
 			if f.DefaultSQL != "" {
 				w = w.RawUnchecked(`,"default_sql":`).String(f.DefaultSQL)
+			}
+			if f.Identity != "" {
+				w = w.RawUnchecked(`,"identity":`).String(f.Identity)
+			}
+			if f.IdentitySequence != "" {
+				w = w.RawUnchecked(`,"identity_sequence":`).String(f.IdentitySequence)
 			}
 			w = w.RawByteUnchecked('}')
 		}
@@ -526,6 +586,8 @@ func decodeCatalogFile(c *vibejson.DecodeCursor, dst *catalogFile) error {
 		case 7:
 			decoded.ReplicatedChildApply = new(replicatedApplyMeta)
 			err = decodeReplicatedApplyMetaVibe(c, decoded.ReplicatedChildApply)
+		case 8:
+			err = decodeCatalogSequences(c, &decoded.Sequences)
 		}
 		if err != nil {
 			return err
@@ -622,6 +684,101 @@ func decodeCatalogViews(c *vibejson.DecodeCursor, dst *map[string]*viewMeta) err
 			return fmt.Errorf("view %q: %w", name, err)
 		}
 		decoded[strings.Clone(name)] = meta
+	}
+	*dst = decoded
+	return nil
+}
+
+func decodeCatalogSequences(c *vibejson.DecodeCursor, dst *map[string]*sequenceMeta) error {
+	if err := c.BeginObject("SQL catalog sequences"); err != nil {
+		return errors.New("vibedb: SQL catalog sequences must be a JSON object")
+	}
+	decoded := make(map[string]*sequenceMeta)
+	for first := true; ; first = false {
+		name, ok, err := c.NextField(first)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+		if _, duplicate := decoded[name]; duplicate {
+			return duplicateCatalogMember("sequences", name)
+		}
+		if len(name) > maxCatalogTableNameBytes {
+			return errors.New("vibedb: SQL catalog sequence name exceeds its byte bound")
+		}
+		if err := checkCatalogSequenceCount(len(decoded) + 1); err != nil {
+			return err
+		}
+		null, err := c.Null()
+		if err != nil {
+			return err
+		}
+		if null {
+			decoded[strings.Clone(name)] = nil
+			continue
+		}
+		meta := new(sequenceMeta)
+		if err := decodeSequenceMetaVibe(c, meta); err != nil {
+			return fmt.Errorf("sequence %q: %w", name, err)
+		}
+		decoded[strings.Clone(name)] = meta
+	}
+	*dst = decoded
+	return nil
+}
+
+func decodeSequenceMetaVibe(c *vibejson.DecodeCursor, dst *sequenceMeta) error {
+	if err := c.BeginObject("SQL catalog sequence metadata"); err != nil {
+		return errors.New("vibedb: SQL catalog sequence metadata must be a JSON object")
+	}
+	var decoded sequenceMeta
+	var seen uint64
+	for first := true; ; first = false {
+		name, ok, err := c.NextField(first)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+		index, known := sequenceMetaFields.Lookup(name, true)
+		if !known {
+			return unknownCatalogMember("sequence", name)
+		}
+		if err := markCatalogField(&seen, index, "sequence", name); err != nil {
+			return err
+		}
+		switch index {
+		case 0:
+			err = c.Int(&decoded.Increment)
+		case 1:
+			err = c.Int(&decoded.MinValue)
+		case 2:
+			err = c.Int(&decoded.MaxValue)
+		case 3:
+			err = c.Int(&decoded.Start)
+		case 4:
+			err = c.Int(&decoded.Cache)
+		case 5:
+			err = c.Bool(&decoded.Cycle)
+		case 6:
+			err = c.Bool(&decoded.IsCalled)
+		case 7:
+			err = c.Int(&decoded.PersistedValue)
+		case 8:
+			err = c.Uint(&decoded.Generation)
+		case 9:
+			err = decodeBoundedCatalogString(c, &decoded.OwnerTable, maxCatalogTableNameBytes, "sequence owner_table")
+		case 10:
+			err = decodeBoundedCatalogString(c, &decoded.OwnerColumn, maxCatalogTableNameBytes, "sequence owner_column")
+		case 11:
+			err = decodeBoundedCatalogString(c, &decoded.DataType, 32, "sequence data_type")
+		}
+		if err != nil {
+			return err
+		}
 	}
 	*dst = decoded
 	return nil
@@ -812,6 +969,10 @@ func decodeSchemaFieldVibe(c *vibejson.DecodeCursor, dst *schemaFieldMeta) error
 			err = c.Bool(&decoded.Required)
 		case 3:
 			err = decodeBoundedCatalogString(c, &decoded.DefaultSQL, maxCatalogBytes, "schema field default")
+		case 4:
+			err = decodeBoundedCatalogString(c, &decoded.Identity, maxCatalogBytes, "schema field identity")
+		case 5:
+			err = decodeBoundedCatalogString(c, &decoded.IdentitySequence, maxCatalogBytes, "schema field identity sequence")
 		}
 		if err != nil {
 			return err

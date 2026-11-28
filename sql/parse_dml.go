@@ -79,17 +79,23 @@ func KindOf(src string) Kind {
 	case tok.kw == kwDelete:
 		return KindDelete
 	case tok.kw == kwCreate:
-		// The two CREATE kinds differ in their second word, which is one more
-		// token than a router needs: both go to Exec, and both are told apart by
-		// the parse that follows. KindCreateTable stands for "a CREATE of some
-		// kind" here, and callers that need the distinction have the parsed
-		// statement by the time they do.
+		if next := lx.next(); next.kind == tokIdent && tokenTextEqual(next, "SEQUENCE") {
+			return KindCreateSequence
+		}
 		return KindCreateTable
 	case tokenTextEqual(tok, "ALTER"):
+		if next := lx.next(); next.kind == tokIdent && tokenTextEqual(next, "SEQUENCE") {
+			return KindAlterSequence
+		}
 		return KindAlterTable
 	case tok.kw == kwDrop:
-		if next := lx.next(); next.kind == tokIdent && next.kw == kwIndex {
-			return KindDropIndex
+		if next := lx.next(); next.kind == tokIdent {
+			if next.kw == kwIndex {
+				return KindDropIndex
+			}
+			if tokenTextEqual(next, "SEQUENCE") {
+				return KindDropSequence
+			}
 		}
 		return KindDropTable
 	case tok.kw == kwTruncate:
@@ -136,8 +142,7 @@ func (p *Parser) parseAnyStatement(dst *Statement) error {
 	case p.atKeyword(kwCreate):
 		return p.parseCreate(dst)
 	case tokenTextEqual(p.tok, "ALTER"):
-		dst.Kind, dst.AlterTable = KindAlterTable, &p.alter
-		return p.parseAlterTable()
+		return p.parseAlter(dst)
 	case p.atKeyword(kwDrop):
 		return p.parseDrop(dst)
 	case p.atKeyword(kwTruncate):
@@ -246,6 +251,23 @@ func (p *Parser) parseInsert() error {
 		if err := p.parseInsertColumns(); err != nil {
 			return err
 		}
+	}
+	if tokenTextEqual(p.tok, "OVERRIDING") {
+		p.advance()
+		switch {
+		case tokenTextEqual(p.tok, "SYSTEM"):
+			p.advance()
+			p.ins.Overriding = InsertOverridingSystemValue
+		case tokenTextEqual(p.tok, "USER"):
+			p.advance()
+			p.ins.Overriding = InsertOverridingUserValue
+		default:
+			return p.errHere("expected SYSTEM or USER after OVERRIDING")
+		}
+		if !tokenTextEqual(p.tok, "VALUE") {
+			return p.errHere("expected VALUE after OVERRIDING SYSTEM/USER")
+		}
+		p.advance()
 	}
 	switch {
 	case p.atKeyword(kwSelect), p.atKeyword(kwWith),
@@ -987,6 +1009,11 @@ func (p *Parser) parseInsertRow() (InsertRow, error) {
 			}
 			if p.atKeyword(kwNull) {
 				values[i] = Operand{Kind: OperandNull, Pos: p.tok.pos}
+				p.advance()
+				continue
+			}
+			if p.atKeyword(kwDefault) {
+				values[i] = Operand{Kind: OperandDefault, Pos: p.tok.pos}
 				p.advance()
 				continue
 			}

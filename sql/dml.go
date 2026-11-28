@@ -52,6 +52,12 @@ const (
 	// KindRollbackToSavepoint is ROLLBACK TO [SAVEPOINT] name, carried in
 	// [Statement.RollbackToSavepoint].
 	KindRollbackToSavepoint
+	// KindCreateSequence is CREATE SEQUENCE, carried in [Statement.CreateSequence].
+	KindCreateSequence
+	// KindAlterSequence is ALTER SEQUENCE, carried in [Statement.AlterSequence].
+	KindAlterSequence
+	// KindDropSequence is DROP SEQUENCE, carried in [Statement.DropSequence].
+	KindDropSequence
 )
 
 // String answers the statement's leading keyword.
@@ -85,6 +91,12 @@ func (k Kind) String() string {
 		return "RELEASE"
 	case KindRollbackToSavepoint:
 		return "ROLLBACK TO"
+	case KindCreateSequence:
+		return "CREATE SEQUENCE"
+	case KindAlterSequence:
+		return "ALTER SEQUENCE"
+	case KindDropSequence:
+		return "DROP SEQUENCE"
 	}
 	return "SELECT"
 }
@@ -128,6 +140,9 @@ type Statement struct {
 	Savepoint           *SavepointStmt
 	ReleaseSavepoint    *SavepointStmt
 	RollbackToSavepoint *SavepointStmt
+	CreateSequence      *CreateSequenceStmt
+	AlterSequence       *AlterSequenceStmt
+	DropSequence        *DropSequenceStmt
 }
 
 // ReturnsRows reports whether this parsed statement must execute through a
@@ -215,6 +230,15 @@ func (s *Statement) Params() int {
 // There is no caller-supplied physical-key form and no generated sequence.
 // Keeping identity in the document makes CREATE TABLE's PRIMARY KEY declaration
 // the one source of truth for INSERT, point predicates, indexes, and reopen.
+// InsertOverriding records an optional OVERRIDING {SYSTEM | USER} VALUE clause.
+type InsertOverriding uint8
+
+const (
+	InsertOverridingNone InsertOverriding = iota
+	InsertOverridingSystemValue
+	InsertOverridingUserValue
+)
+
 type InsertStmt struct {
 	// Table is the collection written to.
 	Table string
@@ -225,6 +249,8 @@ type InsertStmt struct {
 	Alias string
 	// AliasPos is the byte offset of Alias. It is zero when Alias is empty.
 	AliasPos int
+	// Overriding records OVERRIDING SYSTEM VALUE or OVERRIDING USER VALUE.
+	Overriding InsertOverriding
 	// Source is the query whose single output column supplies complete JSON
 	// documents. It is nil for VALUES. The source tree is deliberately distinct
 	// from Returning: the former is evaluated against the pre-statement
