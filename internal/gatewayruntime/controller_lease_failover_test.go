@@ -2,6 +2,7 @@ package gatewayruntime
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,17 +39,31 @@ func TestServingSplitControllerGatedByControllerLeaseFailover(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	e1Ctx, cancelE1 := context.WithCancel(ctx)
+	defer cancelE1()
 
 	// Pre-elect e1 so e2 starts strictly as standby.
 	if ok, epoch, err := e1.Step(ctx); err != nil || !ok || epoch != 1 {
 		t.Fatalf("e1 initial Step = (%v, %d, %v)", ok, epoch, err)
 	}
 
-	go func() { _ = e1.Run(ctx) }()
-	go func() { _ = e2.Run(ctx) }()
+	var wg sync.WaitGroup
+	e1Done := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(e1Done)
+		_ = e1.Run(e1Ctx)
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = e2.Run(ctx)
+	}()
 
 	var e1Passes, e2Passes atomic.Int64
 	runGated := func(el *controllerlease.Elector, counter *atomic.Int64) {
+		defer wg.Done()
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
 		runServingSplitControllerLoop(ctx, func(context.Context) (splitcontroller.ControllerPass, error) {
@@ -66,6 +81,7 @@ func TestServingSplitControllerGatedByControllerLeaseFailover(t *testing.T) {
 			}
 		}, func(string, ...any) {})
 	}
+	wg.Add(2)
 	go runGated(e1, &e1Passes)
 	go runGated(e2, &e2Passes)
 
@@ -81,8 +97,10 @@ func TestServingSplitControllerGatedByControllerLeaseFailover(t *testing.T) {
 		t.Fatalf("standby e2 executed %d passes while e1 held lease, want 0", got)
 	}
 
-	// Release e1 gracefully (simulating frontend drain); e2 must acquire epoch >= 2
-	// and start executing passes promptly.
+	// Stop e1's elector loop and release gracefully (simulating frontend drain);
+	// e2 must acquire epoch >= 2 and start executing passes promptly.
+	cancelE1()
+	<-e1Done
 	if err := e1.Release(ctx); err != nil {
 		t.Fatalf("e1.Release: %v", err)
 	}
@@ -94,4 +112,5 @@ func TestServingSplitControllerGatedByControllerLeaseFailover(t *testing.T) {
 		t.Fatalf("after failover, e2 passes = %d, want >= 2", e2Passes.Load())
 	}
 	cancel()
+	wg.Wait()
 }

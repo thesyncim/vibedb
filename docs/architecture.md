@@ -61,10 +61,10 @@ count, and replication factor are independent.
 
 - **Embedded writes:** Validate & canonicalize JSON → build immutable logical
   generation (rows + exact indexes together) → apply durability fence → publish
-  atomically. Three publication layers stay distinct: **logical** (visible
-  rows/indexes), **topology** (content-equivalent physical shape, so
-  `Generation` can advance on a rejected batch), and **durable** (recoverable
-  journal/root cut).
+  atomically. Three publication layers stay distinct: **logical** (logical
+  failure-atomic publication of visible rows/indexes), **topology** (a
+  content-equivalent topology generation where `Generation may advance` on a
+  rejected batch), and **durable** (recoverable journal/root cut).
 - **Embedded transactions:** Single-collection commits use the collection batch
   path. Multi-collection durable commits prepare each participant journal, sync
   all `K` prepares, append/sync one decision in `txn.vtm` (`K+1` syncs), then

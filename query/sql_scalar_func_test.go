@@ -310,7 +310,7 @@ func TestSQLScalarFuncNullPropagation(t *testing.T) {
 
 func TestSQLScalarFuncNumericEdgeCases(t *testing.T) {
 	docs := []string{
-		fmt.Sprintf(`{"id":1,"min_i64":%d,"max_i64":%d,"x":1234.567}`, math.MinInt64, math.MaxInt64),
+		fmt.Sprintf(`{"id":1,"min_i64":%d,"max_i64":%d,"x":1234.567}`, int64(math.MinInt64), int64(math.MaxInt64)),
 	}
 	res := mustRunScalarSQL(t, docs, `
 		SELECT ABS(min_i64), ABS(max_i64),
