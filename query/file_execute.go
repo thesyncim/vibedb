@@ -17,6 +17,7 @@ import (
 	"github.com/thesyncim/vibedb/store"
 	"github.com/thesyncim/vibedb/store/durable"
 	"github.com/thesyncim/vibejson/x/byteview"
+	"github.com/thesyncim/vibejson/x/keyhash"
 )
 
 // ExecOptions controls execution resource bounds. The zero value selects one
@@ -215,7 +216,7 @@ type fileWorkspace struct {
 	// per execution, and nothing here needs a group's address to be stable: a
 	// slice that grows moves its elements, but an index into it does not change.
 	rows         []fileRow
-	groupIndex   map[string]int
+	groupIndex   fileGroupIndex
 	groupSet     []fileGroup
 	mergedGroups []fileGroup
 	rowRuns      []spillRun
@@ -272,7 +273,7 @@ func (w *fileWorkspace) release() {
 	w.compact = [2]fileArena{}
 	w.slots = nil
 	w.rows = nil
-	w.groupIndex = nil
+	w.groupIndex.release()
 	w.groupSet = nil
 	w.mergedGroups = nil
 	w.rowRuns = nil
@@ -368,13 +369,13 @@ func (w *fileWorkspace) abort() {
 		w.slots[i].rows = w.slots[i].rows[:0]
 		clear(w.slots[i].groups)
 		w.slots[i].groups = w.slots[i].groups[:0]
-		clear(w.slots[i].byKey)
+		w.slots[i].byKey.reset()
 		w.slots[i].partial = filePartial{}
 		w.slots[i].ready = false
 	}
 	clear(w.rows)
 	w.rows = w.rows[:0]
-	clear(w.groupIndex)
+	w.groupIndex.reset()
 	clear(w.groupSet)
 	w.groupSet = w.groupSet[:0]
 	clear(w.mergedGroups)
@@ -428,7 +429,7 @@ type fileSlot struct {
 	accs    []aggAcc
 	rows    []fileRow
 	groups  []fileGroup
-	byKey   map[string]int
+	byKey   fileGroupIndex
 	partial filePartial
 	ready   bool
 }
@@ -961,11 +962,8 @@ func (p *plan) runFileSnapshotBatched(
 	// mutate underneath it: harmless today because clear neither hashes nor
 	// compares, and a silent corruption the moment anything else touches the map
 	// in that window.
-	if e.file.groupIndex == nil {
-		e.file.groupIndex = make(map[string]int)
-	}
-	byKey := e.file.groupIndex
-	clear(byKey)
+	byKey := &e.file.groupIndex
+	byKey.reset()
 	clear(e.file.groupSet)
 	groups := e.file.groupSet[:0]
 	// The arenas are rewound here, on the driver, before any worker is woken.
@@ -1073,7 +1071,9 @@ func (p *plan) runFileSnapshotBatched(
 					return
 				}
 				g := &part.groups[i]
-				if id, ok := byKey[g.key]; ok {
+				h := keyhash.String(g.key)
+				id, pos, ok := byKey.lookupStringSlot(g.key, h, groups)
+				if ok {
 					dst := &groups[id]
 					if err := mergeAggs(
 						dst.accs, g.accs, p.columns, &e.Workspace.aggregateBudget,
@@ -1087,7 +1087,7 @@ func (p *plan) runFileSnapshotBatched(
 					}
 					continue
 				}
-				byKey[g.key] = len(groups)
+				byKey.insertAt(pos, h, len(groups))
 				groups = append(groups, *g)
 				groupBytes += g.bytes
 			}
@@ -1106,7 +1106,7 @@ func (p *plan) runFileSnapshotBatched(
 					// of it. The index has to go with them: writeGroups sorted
 					// the frontier in place, so the positions it holds are no
 					// longer the groups they named.
-					clear(byKey)
+					byKey.reset()
 					clear(groups)
 					groups = groups[:0]
 					groupBytes = 0
@@ -1305,6 +1305,7 @@ func (p *plan) runFileSnapshotBatched(
 	if firstErr != nil {
 		clear(rows)
 		e.file.rows = rows[:0]
+		byKey.reset()
 		clear(groups)
 		e.file.groupSet = groups[:0]
 		return result, stats, firstErr
@@ -1626,11 +1627,8 @@ func (p *plan) makeFilePartial(
 	}
 	switch {
 	case p.grouped:
-		if slot.byKey == nil {
-			slot.byKey = make(map[string]int)
-		}
-		byKey := slot.byKey
-		clear(byKey)
+		byKey := &slot.byKey
+		byKey.reset()
 		prev := slot.groups
 		groups := prev[:0]
 		for at, row := range selected {
@@ -1644,7 +1642,8 @@ func (p *plan) makeFilePartial(
 			// per grouped row, which no amount of Exec reuse could warm away
 			// because nothing retained what the growth bought.
 			w.groupKey = p.groupKey(w.groupKey[:0], ctx, row)
-			id, ok := byKey[string(w.groupKey)]
+			h := keyhash.Bytes(w.groupKey)
+			id, pos, ok := byKey.lookupBytesSlot(w.groupKey, h, groups)
 			if !ok {
 				id = len(groups)
 				// One copy serves both the lookup key and the group's own
@@ -1655,7 +1654,6 @@ func (p *plan) makeFilePartial(
 					part.err = arenaErr
 					return part
 				}
-				byKey[key] = id
 				g := fileGroup{key: key, first: batch.base + uint64(row)}
 				g.scalars, g.bytes, arenaErr = ownScalars(
 					arena, ctx, row, nil, nil, p.groupCols,
@@ -1671,6 +1669,7 @@ func (p *plan) makeFilePartial(
 				}
 				g.bytes += int64(len(g.key)) + int64(len(g.accs))*aggAccStructBytes + 64
 				groups = append(groups, g)
+				byKey.insertAt(pos, h, id)
 				part.bytes += g.bytes
 			}
 			if err := p.accumulate(groups[id].accs, ctx, row, budget); err != nil {
