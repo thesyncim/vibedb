@@ -3,12 +3,15 @@ package driver
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
+	"github.com/thesyncim/vibejson"
 	jsondoc "github.com/thesyncim/vibejson/document"
 	"github.com/thesyncim/vibejson/x/byteview"
 
 	"github.com/thesyncim/vibedb/query"
+	sqlast "github.com/thesyncim/vibedb/sql"
 	"github.com/thesyncim/vibedb/store/durable"
 )
 
@@ -17,10 +20,13 @@ import (
 var ErrCheckViolation = errors.New("vibedb: CHECK constraint violated")
 
 type defaultFieldSlot struct {
-	key        string
-	defaultSQL string
-	value      []byte
-	present    bool
+	key         string
+	defaultSQL  string
+	identity    string
+	identitySeq string
+	value       []byte
+	present     bool
+	replace     bool
 }
 
 func isJSONWhitespace(b byte) bool {
@@ -36,6 +42,18 @@ func applyColumnDefaults(
 	meta *tableMeta,
 	maxDocumentBytes int,
 ) ([]byte, error) {
+	return applyColumnDefaultsAndIdentity(
+		document, meta, maxDocumentBytes, sqlast.InsertOverridingNone, nil,
+	)
+}
+
+func applyColumnDefaultsAndIdentity(
+	document []byte,
+	meta *tableMeta,
+	maxDocumentBytes int,
+	overriding sqlast.InsertOverriding,
+	seqProvider query.SequenceProvider,
+) ([]byte, error) {
 	if meta == nil || meta.Schema == nil || len(meta.Schema.Fields) == 0 {
 		return document, nil
 	}
@@ -43,7 +61,7 @@ func applyColumnDefaults(
 	slots := slotsBuf[:0]
 	for i := range meta.Schema.Fields {
 		f := meta.Schema.Fields[i]
-		if f.DefaultSQL == "" {
+		if f.DefaultSQL == "" && f.Identity == "" {
 			continue
 		}
 		key := strings.TrimPrefix(f.Path, "/")
@@ -59,8 +77,10 @@ func applyColumnDefaults(
 		}
 		if !dup {
 			slots = append(slots, defaultFieldSlot{
-				key:        key,
-				defaultSQL: f.DefaultSQL,
+				key:         key,
+				defaultSQL:  f.DefaultSQL,
+				identity:    f.Identity,
+				identitySeq: f.IdentitySequence,
 			})
 		}
 	}
@@ -107,23 +127,69 @@ func applyColumnDefaults(
 		}
 	}
 	missing := 0
+	replacements := 0
 	for i := range slots {
-		if !slots[i].present {
+		if slots[i].present {
+			switch slots[i].identity {
+			case "always":
+				switch overriding {
+				case sqlast.InsertOverridingNone:
+					return nil, fmt.Errorf(
+						"%w: column %q is an identity column defined as GENERATED ALWAYS; use OVERRIDING SYSTEM VALUE to override",
+						ErrIdentityAlwaysViolation, slots[i].key,
+					)
+				case sqlast.InsertOverridingUserValue:
+					slots[i].replace = true
+					replacements++
+				case sqlast.InsertOverridingSystemValue:
+					// User-supplied value is explicitly allowed.
+				}
+			case "by_default":
+				if overriding == sqlast.InsertOverridingUserValue {
+					slots[i].replace = true
+					replacements++
+				}
+			}
+		} else {
 			missing++
 		}
 	}
-	if missing == 0 {
+	if missing == 0 && replacements == 0 {
 		return document, nil
 	}
 	for i := range slots {
-		if slots[i].present {
+		if slots[i].present && !slots[i].replace {
 			continue
 		}
-		val, evalErr := evalDefaultExpressionJSON(slots[i].defaultSQL, maxDocumentBytes)
+		if slots[i].identity != "" && slots[i].identitySeq != "" {
+			if seqProvider == nil {
+				return nil, fmt.Errorf("vibedb: evaluate IDENTITY for %q: sequence provider unavailable", slots[i].key)
+			}
+			v, seqErr := seqProvider.NextVal(slots[i].identitySeq)
+			if seqErr != nil {
+				return nil, fmt.Errorf("vibedb: evaluate IDENTITY for %q: %w", slots[i].key, seqErr)
+			}
+			slots[i].value = strconv.AppendInt(nil, v, 10)
+			continue
+		}
+		if slots[i].identitySeq != "" && seqProvider != nil &&
+			slots[i].defaultSQL == "nextval('"+escapeSQLSingleQuote(slots[i].identitySeq)+"')" {
+			v, seqErr := seqProvider.NextVal(slots[i].identitySeq)
+			if seqErr != nil {
+				return nil, fmt.Errorf("vibedb: evaluate DEFAULT for %q: %w", slots[i].key, seqErr)
+			}
+			slots[i].value = strconv.AppendInt(nil, v, 10)
+			continue
+		}
+		val, evalErr := evalDefaultExpressionJSON(slots[i].defaultSQL, maxDocumentBytes, seqProvider)
 		if evalErr != nil {
 			return nil, fmt.Errorf("vibedb: evaluate DEFAULT for %q: %w", slots[i].key, evalErr)
 		}
 		slots[i].value = val
+	}
+
+	if replacements > 0 && isObj {
+		return rewriteJSONObjectWithSlots(root, slots, maxDocumentBytes)
 	}
 
 	var prefix []byte
@@ -182,13 +248,78 @@ func applyColumnDefaults(
 	return out, nil
 }
 
-func evalDefaultExpressionJSON(defaultSQL string, maxDocumentBytes int) ([]byte, error) {
+func rewriteJSONObjectWithSlots(
+	root vibejson.Node,
+	slots []defaultFieldSlot,
+	maxDocumentBytes int,
+) ([]byte, error) {
+	iter, _ := root.ObjectIter()
+	out := make([]byte, 0, 128)
+	out = append(out, '{')
+	wrote := 0
+	var keyScratch [64]byte
+	keyText := keyScratch[:0]
+	for {
+		key, val, hasNext := iter.NextRaw()
+		if !hasNext {
+			break
+		}
+		var keyStr string
+		if raw, clean := key.StringBytes(); clean {
+			keyStr = string(raw)
+		} else {
+			var textErr error
+			keyText, _, textErr = key.AppendText(keyText[:0])
+			if textErr != nil {
+				return nil, textErr
+			}
+			keyStr = string(keyText)
+		}
+		if wrote > 0 {
+			out = append(out, ',')
+		}
+		out = appendJSONString(out, keyStr)
+		out = append(out, ':')
+		replaced := false
+		for i := range slots {
+			if slots[i].replace && slots[i].key == keyStr {
+				out = append(out, slots[i].value...)
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			out = append(out, val.Bytes()...)
+		}
+		wrote++
+	}
+	for i := range slots {
+		if slots[i].present {
+			continue
+		}
+		if wrote > 0 {
+			out = append(out, ',')
+		}
+		out = appendJSONString(out, slots[i].key)
+		out = append(out, ':')
+		out = append(out, slots[i].value...)
+		wrote++
+	}
+	out = append(out, '}')
+	if maxDocumentBytes > 0 && len(out) > maxDocumentBytes {
+		return nil, durable.ErrDocumentTooLarge
+	}
+	return out, nil
+}
+
+func evalDefaultExpressionJSON(defaultSQL string, maxDocumentBytes int, seqProvider query.SequenceProvider) ([]byte, error) {
 	stmt, err := query.PrepareStatement("SELECT " + defaultSQL)
 	if err != nil {
 		return nil, err
 	}
 	defer stmt.Release()
 	var exec query.Exec
+	exec.Options.Sequences = seqProvider
 	defer exec.Release()
 	cur, err := stmt.RunInto(&exec, query.Source{}, nil)
 	if err != nil {

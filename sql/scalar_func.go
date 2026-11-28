@@ -49,6 +49,8 @@ func builtinScalarFuncName(tok token) (string, bool) {
 			return "current_date", true
 		case equalFoldASCII(s, "current_timestamp"):
 			return "current_timestamp", true
+		case equalFoldASCII(s, "currval"):
+			return "currval", true
 		}
 	case 'd':
 		if equalFoldASCII(s, "date_trunc") {
@@ -112,6 +114,8 @@ func builtinScalarFuncName(tok token) (string, bool) {
 		}
 	case 'l':
 		switch {
+		case equalFoldASCII(s, "lastval"):
+			return "lastval", true
 		case equalFoldASCII(s, "left"):
 			return "left", true
 		case equalFoldASCII(s, "length"):
@@ -137,7 +141,10 @@ func builtinScalarFuncName(tok token) (string, bool) {
 			return "mod", true
 		}
 	case 'n':
-		if equalFoldASCII(s, "now") {
+		switch {
+		case equalFoldASCII(s, "nextval"):
+			return "nextval", true
+		case equalFoldASCII(s, "now"):
 			return "now", true
 		}
 	case 'o':
@@ -180,6 +187,8 @@ func builtinScalarFuncName(tok token) (string, bool) {
 		}
 	case 's':
 		switch {
+		case equalFoldASCII(s, "setval"):
+			return "setval", true
 		case equalFoldASCII(s, "sign"):
 			return "sign", true
 		case equalFoldASCII(s, "split_part"):

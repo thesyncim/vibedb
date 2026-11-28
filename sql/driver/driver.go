@@ -200,13 +200,16 @@ func (c *dbConnector) Connect(ctx context.Context) (sqldriver.Conn, error) {
 		return nil, ErrReplicatedChildStageBusy
 	}
 	c.refs++
-	return &conn{
+	cn := &conn{
 		db: c.db, owner: c,
 		directWritesFenced: c.db.catalog.ReplicatedShardStore != nil,
 		exec: query.Exec{Options: query.ExecOptions{
 			Workers: driverQueryWorkers,
 		}},
-	}, nil
+		seqSession: connSeqSession{db: c.db},
+	}
+	cn.exec.Options.Sequences = &cn.seqSession
+	return cn, nil
 }
 
 func (c *dbConnector) Driver() sqldriver.Driver { return Driver{} }
@@ -307,7 +310,8 @@ type conn struct {
 	// routing is the per-connection Router used by the cluster facade's write
 	// preflight. It is created on first placed write and stays nil for the
 	// default single-store path.
-	routing *distribution.Router
+	routing    *distribution.Router
+	seqSession connSeqSession
 }
 
 var (
@@ -605,6 +609,15 @@ func (c *conn) prepareContextMode(
 			return nil, err
 		}
 		s.views = &preparedViewState{ddl: ddl}
+		return s, nil
+	}
+	if tree.Kind == sqlast.KindCreateSequence || tree.Kind == sqlast.KindAlterSequence || tree.Kind == sqlast.KindDropSequence {
+		var ddl *preparedSequenceDDL
+		ddl, err = c.prepareSequenceDDL(src, tree)
+		if err != nil {
+			return nil, err
+		}
+		s.seqDDL = ddl
 		return s, nil
 	}
 	if isSavepointKind(tree.Kind) {

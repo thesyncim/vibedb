@@ -24,7 +24,8 @@ func builtinScalarFuncValueType(name string) ValueType {
 		"abs", "ceil", "ceiling", "floor", "round", "trunc", "power", "pow", "sqrt",
 		"mod", "sign", "ln", "log", "log10", "exp", "pi",
 		"extract", "json_array_length", "jsonb_array_length",
-		"array_length", "cardinality", "regexp_count":
+		"array_length", "cardinality", "regexp_count",
+		"nextval", "currval", "setval", "lastval":
 		return TypeNumber
 	case "starts_with", "regexp_like":
 		return TypeBool
@@ -115,6 +116,87 @@ func (r *statementScalar) evalFunc(node *statementScalarNode, arena *[]byte) (st
 		return arenaStringValue(arena, start), nil
 	case "pi":
 		return statementScalarValue{value: arenaFloatScalar(arena, math.Pi)}, nil
+	case "nextval":
+		if argc != 1 {
+			return statementScalarValue{}, fmt.Errorf("%w: nextval requires 1 argument", ErrScalarType)
+		}
+		if r.values[argIdx[0]].isNull() {
+			return nullScalarValue(), nil
+		}
+		seqName, err := requireStringArg(name, r.values[argIdx[0]])
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		if r.sequences == nil {
+			return statementScalarValue{}, fmt.Errorf("%w: nextval requires an active database sequence catalog", ErrScalarType)
+		}
+		v, err := r.sequences.NextVal(seqName)
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		return statementScalarValue{value: arenaIntScalar(arena, v)}, nil
+	case "currval":
+		if argc != 1 {
+			return statementScalarValue{}, fmt.Errorf("%w: currval requires 1 argument", ErrScalarType)
+		}
+		if r.values[argIdx[0]].isNull() {
+			return nullScalarValue(), nil
+		}
+		seqName, err := requireStringArg(name, r.values[argIdx[0]])
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		if r.sequences == nil {
+			return statementScalarValue{}, fmt.Errorf("%w: currval requires an active database sequence catalog", ErrScalarType)
+		}
+		v, err := r.sequences.CurrVal(seqName)
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		return statementScalarValue{value: arenaIntScalar(arena, v)}, nil
+	case "lastval":
+		if argc != 0 {
+			return statementScalarValue{}, fmt.Errorf("%w: lastval takes no arguments", ErrScalarType)
+		}
+		if r.sequences == nil {
+			return statementScalarValue{}, fmt.Errorf("%w: lastval requires an active database sequence catalog", ErrScalarType)
+		}
+		v, err := r.sequences.LastVal()
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		return statementScalarValue{value: arenaIntScalar(arena, v)}, nil
+	case "setval":
+		if argc != 2 && argc != 3 {
+			return statementScalarValue{}, fmt.Errorf("%w: setval requires 2 or 3 arguments", ErrScalarType)
+		}
+		if r.values[argIdx[0]].isNull() || r.values[argIdx[1]].isNull() || (argc == 3 && r.values[argIdx[2]].isNull()) {
+			return nullScalarValue(), nil
+		}
+		seqName, err := requireStringArg(name, r.values[argIdx[0]])
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		val, err := requireInt64Arg(name, r.values[argIdx[1]])
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		isCalled := true
+		if argc == 3 {
+			b, err := requireBoolArg(name, r.values[argIdx[2]])
+			if err != nil {
+				return statementScalarValue{}, err
+			}
+			isCalled = b
+		}
+		if r.sequences == nil {
+			return statementScalarValue{}, fmt.Errorf("%w: setval requires an active database sequence catalog", ErrScalarType)
+		}
+		v, err := r.sequences.SetVal(seqName, val, isCalled)
+		if err != nil {
+			return statementScalarValue{}, err
+		}
+		return statementScalarValue{value: arenaIntScalar(arena, v)}, nil
 	case "json_build_array", "jsonb_build_array":
 		start := len(*arena)
 		*arena = append(*arena, '[')
@@ -2228,6 +2310,42 @@ func (r *statementScalar) requireOneNumber(name string, argIdx []int32) (float64
 		return 0, fmt.Errorf("%w: %s requires 1 argument", ErrScalarType, name)
 	}
 	return requireNumberArg(name, r.values[argIdx[0]])
+}
+
+func requireInt64Arg(name string, v statementScalarValue) (int64, error) {
+	if v.value.kind == kindNumber {
+		if v.value.isInt {
+			return v.value.ival, nil
+		}
+		n, err := strconv.ParseInt(byteview.String(v.value.num), 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("%w: %s requires an integer argument", ErrScalarNumericRange, name)
+		}
+		return n, nil
+	}
+	if v.exact && v.cell.kind == TypeNumber {
+		var buf [64]byte
+		raw := v.cell.AppendJSON(buf[:0])
+		n, err := strconv.ParseInt(byteview.String(raw), 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("%w: %s requires an integer argument", ErrScalarNumericRange, name)
+		}
+		return n, nil
+	}
+	return 0, fmt.Errorf("%w: %s requires an integer argument", ErrScalarType, name)
+}
+
+func requireBoolArg(name string, v statementScalarValue) (bool, error) {
+	if v.value.kind == kindBool {
+		return v.value.bval, nil
+	}
+	if v.exact && v.cell.kind == TypeBool {
+		b, ok := v.cell.Bool()
+		if ok {
+			return b, nil
+		}
+	}
+	return false, fmt.Errorf("%w: %s requires a boolean argument", ErrScalarType, name)
 }
 
 func requireNumberArg(name string, v statementScalarValue) (float64, error) {

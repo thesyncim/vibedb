@@ -27,6 +27,7 @@ type stmt struct {
 	mutation           *query.DMLStatement
 	insertSource       *insertSelectPlan
 	views              *preparedViewState
+	seqDDL             *preparedSequenceDDL
 	pointPredicate     *sqlast.Expr
 	pointPath          string
 	pointCandidate     bool
@@ -178,7 +179,7 @@ func (s *stmt) preflightExec(got int) error {
 	if s.tree != nil && isSavepointKind(s.tree.Kind) {
 		return s.checkArgumentCount(got)
 	}
-	if s.mutation == nil && (s.views == nil || s.views.ddl == nil) {
+	if s.mutation == nil && (s.views == nil || s.views.ddl == nil) && s.seqDDL == nil {
 		return errors.New("vibedb: SELECT returns rows; use Query")
 	}
 	if s.query != nil {
@@ -1207,16 +1208,19 @@ func (s *stmt) exec(ctx context.Context, args []any) (sqldriver.Result, error) {
 		}
 		return result{}, nil
 	}
-	if s.mutation != nil || (s.views != nil && s.views.ddl != nil) {
+	if s.mutation != nil || (s.views != nil && s.views.ddl != nil) || s.seqDDL != nil {
 		if err := s.conn.requireDirectWriteAllowed(); err != nil {
 			return nil, err
 		}
 	}
-	if s.mutation == nil && (s.views == nil || s.views.ddl == nil) {
+	if s.mutation == nil && (s.views == nil || s.views.ddl == nil) && s.seqDDL == nil {
 		return nil, errors.New("vibedb: SELECT returns rows; use Query")
 	}
 	if s.views != nil && s.views.ddl != nil {
 		return s.conn.execViewDDL(ctx, s.views.ddl)
+	}
+	if s.seqDDL != nil {
+		return s.conn.execSequenceDDL(ctx, s.seqDDL)
 	}
 	if s.conn.tx != nil {
 		if err := contextCheckpoint(ctx); err != nil {

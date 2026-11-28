@@ -141,6 +141,9 @@ type Parser struct {
 	savepoint        SavepointStmt
 	releaseSavepoint SavepointStmt
 	rollbackTo       SavepointStmt
+	createSeq        CreateSequenceStmt
+	alterSeq         AlterSequenceStmt
+	dropSeq          DropSequenceStmt
 
 	// DML filters and RETURNING projections reuse the clause buffers below.
 	// These retained copies keep a filter's slice headers valid while a

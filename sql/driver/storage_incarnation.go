@@ -354,6 +354,7 @@ func (d *database) replaceTableStorageLockedContext(
 	meta.Storage = identity
 	meta.Indexes = cloneIndexMeta(indexes)
 	meta.Schema = schemaMetaFrom(schema)
+	preserveSchemaFieldMetadata(meta.Schema, old.meta.Schema)
 	meta.Materialized = false
 	candidate := &table{
 		meta: meta, schema: schema, primary: old.primary,

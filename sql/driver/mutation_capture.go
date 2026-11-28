@@ -888,7 +888,7 @@ func (s *stmt) captureInsertConflictImagesLocked(
 		}
 		document, key, err := resolveInsertRow(
 			statement, tree, &tree.Rows[i], args,
-			t.meta, t.primary, limits,
+			t.meta, t.primary, limits, &c.seqSession,
 		)
 		if err == nil && len(t.primaries) > 1 {
 			key, err = tableDocumentKey(t, document, limits.MaxKeyBytes)

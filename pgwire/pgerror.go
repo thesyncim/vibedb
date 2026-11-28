@@ -66,6 +66,8 @@ const (
 	sqlstateCharacterNotInRepertoire      = "22021"
 	sqlstateDivisionByZero                = "22012"
 	sqlstateNumericValueOutOfRange        = "22003"
+	sqlstateSequenceGeneratorLimitExceeded = "2200H"
+	sqlstateGeneratedAlways               = "428C9"
 	sqlstateInvalidTextRepresentation     = "22P02"
 	sqlstateInvalidBinaryRepresentation   = "22P03"
 	sqlstateInvalidParameterValue         = "22023"
@@ -423,6 +425,23 @@ func asPGErrorAcyclic(err error) (mapped *pgError) {
 		return newError(sqlstateUndefinedTable, err.Error())
 	case errors.Is(err, sqldriver.ErrViewNotFound):
 		return newError(sqlstateUndefinedTable, err.Error())
+	case errors.Is(err, sqldriver.ErrSequenceNotFound):
+		return newError(sqlstateUndefinedTable, err.Error())
+	case errors.Is(err, sqldriver.ErrSequenceExists):
+		return newError(sqlstateDuplicateTable, err.Error())
+	case errors.Is(err, sqldriver.ErrSequenceExhausted):
+		return newError(sqlstateSequenceGeneratorLimitExceeded, err.Error())
+	case errors.Is(err, sqldriver.ErrSequenceStateNotInitialized):
+		return newError(sqlstateObjectNotInPrereqState, err.Error())
+	case errors.Is(err, sqldriver.ErrSequenceValueOutOfRange):
+		return newError(sqlstateNumericValueOutOfRange, err.Error())
+	case errors.Is(err, sqldriver.ErrInvalidSequenceDefinition):
+		return newError(sqlstateInvalidParameterValue, err.Error())
+	case errors.Is(err, sqldriver.ErrIdentityAlwaysViolation):
+		return newError(sqlstateGeneratedAlways, err.Error()).
+			withHint("Use OVERRIDING SYSTEM VALUE to override.")
+	case errors.Is(err, sqldriver.ErrTooManySequences):
+		return newError(sqlstateProgramLimitExceeded, err.Error())
 	case errors.Is(err, sqldriver.ErrViewChanged):
 		return newError(sqlstateFeatureNotSupported, err.Error()).
 			withHint("prepare the statement again so it binds the current view definition")

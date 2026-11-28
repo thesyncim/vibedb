@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"unsafe"
 
 	"github.com/thesyncim/vibedb/internal/replicatedstate"
@@ -1306,7 +1307,7 @@ func (t *tx) execMutationCore(
 			}
 			document, key, err := resolveInsertRow(
 				statement, tree, &tree.Rows[i], args,
-				txTableMeta, state.primary, limits,
+				txTableMeta, state.primary, limits, &t.conn.seqSession,
 			)
 			if err != nil {
 				return nil, err
@@ -1778,6 +1779,18 @@ func (t *tx) stageInsertSelect(
 	prospectiveBytes := state.stagedBytes
 	insert := statement.Tree().Insert
 	placement := c.clusterBinding(insert.Table)
+	var txTableMeta *tableMeta
+	if tbl := c.db.tables[insert.Table]; tbl != nil {
+		txTableMeta = tbl.meta
+	}
+	var colKeyJSON [][]byte
+	var rowDocBuf []byte
+	if len(insert.Columns) > 0 {
+		colKeyJSON = make([][]byte, len(insert.Columns))
+		for i, col := range insert.Columns {
+			colKeyJSON[i] = strconv.AppendQuote(nil, col.Spec())
+		}
+	}
 	cancellable := ctx.Done() != nil
 	row := 0
 	for {
@@ -1795,15 +1808,42 @@ func (t *tx) stageInsertSelect(
 				return dst, err
 			}
 		}
-		cell := cursor.Cell(0)
-		if cell.Kind() != query.TypeJSON {
-			c.pointRaw = scratch
-			return dst, &query.InsertSelectShapeError{
-				Pos: insertSelectOutputPosition(insert), Columns: 1,
-				Type: cell.Kind(), Row: row,
+		var document []byte
+		if len(colKeyJSON) > 0 {
+			rowDocBuf = append(rowDocBuf[:0], '{')
+			for ci, keyBytes := range colKeyJSON {
+				if ci > 0 {
+					rowDocBuf = append(rowDocBuf, ',')
+				}
+				rowDocBuf = append(rowDocBuf, keyBytes...)
+				rowDocBuf = append(rowDocBuf, ':')
+				cell := cursor.Cell(ci)
+				if cell.IsNull() {
+					rowDocBuf = append(rowDocBuf, "null"...)
+				} else {
+					rowDocBuf = cell.AppendJSON(rowDocBuf)
+				}
 			}
+			rowDocBuf = append(rowDocBuf, '}')
+			document = append([]byte(nil), rowDocBuf...)
+		} else {
+			cell := cursor.Cell(0)
+			if cell.Kind() != query.TypeJSON {
+				c.pointRaw = scratch
+				return dst, &query.InsertSelectShapeError{
+					Pos: insertSelectOutputPosition(insert), Columns: 1,
+					Type: cell.Kind(), Row: row,
+				}
+			}
+			document = cell.Payload()
 		}
-		document := cell.Payload()
+		document, err = applyColumnDefaultsAndIdentity(
+			document, txTableMeta, state.limits.MaxDocumentBytes, insert.Overriding, &c.seqSession,
+		)
+		if err != nil {
+			c.pointRaw = scratch
+			return dst, err
+		}
 		if err := validateDocumentWithIntermediateBudget(
 			state.schema, document, state.limits.MaxDocumentBytes,
 			&state.validationTape, &intermediate,

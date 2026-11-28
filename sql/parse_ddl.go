@@ -46,6 +46,9 @@ func (p *Parser) parseCreate(dst *Statement) error {
 		p.advance()
 		dst.Kind, dst.CreateView = KindCreateView, &p.view
 		return p.parseCreateView(-1)
+	case tokenTextEqual(p.tok, "SEQUENCE"):
+		dst.Kind, dst.CreateSequence = KindCreateSequence, &p.createSeq
+		return p.parseCreateSequence()
 	case p.atKeyword(kwMaterialized):
 		position := p.tok.pos
 		p.advance()
@@ -68,7 +71,7 @@ func (p *Parser) parseCreate(dst *Statement) error {
 
 func isUnsupportedCreateObject(name string) bool {
 	switch asciiUpper(name) {
-	case "SCHEMA", "SEQUENCE", "TYPE", "DOMAIN", "FUNCTION", "PROCEDURE",
+	case "SCHEMA", "TYPE", "DOMAIN", "FUNCTION", "PROCEDURE",
 		"TRIGGER", "EXTENSION", "ROLE", "USER", "POLICY", "DATABASE",
 		"PUBLICATION", "SUBSCRIPTION", "TABLESPACE", "COLLATION",
 		"AGGREGATE", "OPERATOR", "RULE", "SERVER", "FOREIGN", "TEMP", "TEMPORARY", "UNLOGGED":
@@ -96,12 +99,22 @@ func asciiUpper(s string) string {
 // Other ALTER actions are refused precisely. Adding one field is enough to use
 // the ordinary replicated shadow-copy pipeline: existing documents are checked
 // against the target schema before its catalog generation is activated.
-func (p *Parser) parseAlterTable() error {
-	p.alter = AlterTableStmt{}
+func (p *Parser) parseAlter(dst *Statement) error {
 	p.advance() // ALTER
-	if !p.acceptKeyword(kwTable) {
-		return p.featureNotSupportedHere("ALTER supports TABLE in the bounded catalog subset")
+	switch {
+	case p.acceptKeyword(kwTable):
+		dst.Kind, dst.AlterTable = KindAlterTable, &p.alter
+		return p.parseAlterTableBody()
+	case tokenTextEqual(p.tok, "SEQUENCE"):
+		dst.Kind, dst.AlterSequence = KindAlterSequence, &p.alterSeq
+		return p.parseAlterSequence()
+	default:
+		return p.featureNotSupportedHere("ALTER supports TABLE and SEQUENCE in the bounded catalog subset")
 	}
+}
+
+func (p *Parser) parseAlterTableBody() error {
+	p.alter = AlterTableStmt{}
 	if p.acceptKeyword(kwIf) {
 		if err := p.expectKeyword(kwExists, "EXISTS after IF"); err != nil {
 			return err
@@ -628,15 +641,21 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 		return column, p.errAt(path.Pos, "a column names a path inside the document; \"$doc\" denotes the whole replacement document")
 	}
 	column.Path = path
-	kind, err := p.parseColumnType()
+	kind, serial, err := p.parseColumnTypeWithSerial()
 	if err != nil {
 		return column, err
 	}
+	column.Serial = serial
 	// SQL columns are nullable unless constrained otherwise. Carry null in the
 	// type set itself so the AST and the lowered store schema say the same
 	// thing: absence is allowed by Required=false, while an explicit JSON null
 	// is allowed by TypeNull.
-	column.Type = kind | TypeNull
+	if serial != SerialNone {
+		column.Required = true
+		column.Type = kind
+	} else {
+		column.Type = kind | TypeNull
+	}
 	var nullability uint8
 	for {
 		switch {
@@ -661,6 +680,12 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 			if column.PrimaryKey {
 				return column, p.errHere("PRIMARY KEY and NULL are contradictory column constraints")
 			}
+			if column.Serial != SerialNone {
+				return column, p.errHere("SERIAL and NULL are contradictory column constraints")
+			}
+			if column.Identity != IdentityNone {
+				return column, p.errHere("GENERATED AS IDENTITY and NULL are contradictory column constraints")
+			}
 			p.advance()
 			nullability = 1
 			column.Required = false
@@ -684,6 +709,12 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 				return column, p.errAt(column.Pos, "a PRIMARY KEY cannot have the type NULL")
 			}
 		case p.atKeyword(kwDefault):
+			if column.Identity != IdentityNone {
+				return column, p.errHere("multiple default values specified for column: cannot combine DEFAULT and GENERATED AS IDENTITY")
+			}
+			if column.Serial != SerialNone {
+				return column, p.errHere("multiple default values specified for column: cannot combine DEFAULT and SERIAL")
+			}
 			p.advance()
 			defStart := p.tok.pos
 			defExpr, err := p.parseScalarExpression(scalarSelect)
@@ -696,6 +727,57 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 			if defStart >= 0 && defEnd >= defStart && defEnd <= len(p.lx.src) {
 				column.DefaultSQL = strings.TrimSpace(p.lx.src[defStart:defEnd])
 			}
+		case tokenTextEqual(p.tok, "GENERATED"):
+			if column.Identity != IdentityNone {
+				return column, p.errHere("multiple identity specifications for column")
+			}
+			if column.HasDefault || column.Serial != SerialNone {
+				return column, p.errHere("cannot combine GENERATED AS IDENTITY with DEFAULT or SERIAL")
+			}
+			if column.explicitNull {
+				return column, p.errHere("GENERATED AS IDENTITY and NULL are contradictory column constraints")
+			}
+			if column.Type&TypeInteger == 0 {
+				return column, p.errHere("identity column type must be an integer type")
+			}
+			p.advance() // GENERATED
+			var idKind IdentityKind
+			switch {
+			case tokenTextEqual(p.tok, "ALWAYS"):
+				p.advance()
+				idKind = IdentityAlways
+			case p.atKeyword(kwBy):
+				p.advance()
+				if err := p.expectKeyword(kwDefault, "DEFAULT after BY"); err != nil {
+					return column, err
+				}
+				idKind = IdentityByDefault
+			default:
+				return column, p.errHere("expected ALWAYS or BY DEFAULT after GENERATED")
+			}
+			if err := p.expectKeyword(kwAs, "AS after GENERATED ALWAYS/BY DEFAULT"); err != nil {
+				return column, err
+			}
+			if !tokenTextEqual(p.tok, "IDENTITY") {
+				return column, p.errHere("expected IDENTITY after GENERATED ... AS")
+			}
+			p.advance()
+			var idOpts *SequenceOptions
+			if p.tok.kind == tokLParen {
+				p.advance()
+				opts, err := p.parseSequenceOptions(false, true)
+				if err != nil {
+					return column, err
+				}
+				if err := p.expect(tokRParen, "')' after identity sequence options"); err != nil {
+					return column, err
+				}
+				idOpts = &opts
+			}
+			column.Identity = idKind
+			column.IdentityOptions = idOpts
+			column.Required = true
+			column.Type &^= TypeNull
 		case p.atKeyword(kwUnique):
 			p.advance()
 			column.Unique = true
@@ -727,8 +809,13 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 
 // parseColumnType reads one type name and answers the JSON types it admits.
 func (p *Parser) parseColumnType() (JSONType, error) {
+	kind, _, err := p.parseColumnTypeWithSerial()
+	return kind, err
+}
+
+func (p *Parser) parseColumnTypeWithSerial() (JSONType, SerialKind, error) {
 	if p.tok.kind != tokIdent && p.tok.kind != tokQuotedIdent {
-		return 0, p.errHere("expected a column type: one of NULL, BOOL, NUMBER, INTEGER, STRING, ARRAY, OBJECT, or ANY")
+		return 0, SerialNone, p.errHere("expected a column type: one of NULL, BOOL, NUMBER, INTEGER, STRING, ARRAY, OBJECT, or ANY")
 	}
 	var fold [maxTypeNameLen]byte
 	name := foldASCII(&fold, p.tok.text)
@@ -736,11 +823,20 @@ func (p *Parser) parseColumnType() (JSONType, error) {
 	kind, ok := jsonTypeOf(name)
 	if !ok {
 		if reason, refused := refusedTypeReason(name); refused {
-			return 0, p.errfAt(pos, "the type %s has no JSON equivalent: %s. The types are NULL, BOOL, NUMBER, INTEGER, STRING, ARRAY, OBJECT, and ANY", p.tok.text, reason)
+			return 0, SerialNone, p.errfAt(pos, "the type %s has no JSON equivalent: %s. The types are NULL, BOOL, NUMBER, INTEGER, STRING, ARRAY, OBJECT, and ANY", p.tok.text, reason)
 		}
-		return 0, p.errfAt(pos, "unknown type %q: the types are NULL, BOOL, NUMBER, INTEGER, STRING, ARRAY, OBJECT, and ANY", p.tok.text)
+		return 0, SerialNone, p.errfAt(pos, "unknown type %q: the types are NULL, BOOL, NUMBER, INTEGER, STRING, ARRAY, OBJECT, and ANY", p.tok.text)
 	}
 	upperName := string(name)
+	var serial SerialKind
+	switch upperName {
+	case "SMALLSERIAL", "SERIAL2":
+		serial = SerialSmall
+	case "SERIAL", "SERIAL4":
+		serial = SerialInt
+	case "BIGSERIAL", "SERIAL8":
+		serial = SerialBig
+	}
 	p.advance()
 	// Handle standard PostgreSQL multi-word type spellings:
 	// DOUBLE PRECISION, CHARACTER VARYING, BIT VARYING,
@@ -759,29 +855,29 @@ func (p *Parser) parseColumnType() (JSONType, error) {
 	if p.tok.kind == tokLParen {
 		p.advance()
 		if p.tok.kind != tokNumber {
-			return 0, p.errHere("expected positive integer type modifier")
+			return 0, SerialNone, p.errHere("expected positive integer type modifier")
 		}
 		p.advance()
 		if p.tok.kind == tokComma {
 			p.advance()
 			if p.tok.kind != tokNumber {
-				return 0, p.errHere("expected scale integer in type modifier")
+				return 0, SerialNone, p.errHere("expected scale integer in type modifier")
 			}
 			p.advance()
 		}
 		if err := p.expect(tokRParen, "')' after type modifier"); err != nil {
-			return 0, err
+			return 0, SerialNone, err
 		}
 	}
 	if upperName == "TIMESTAMP" || upperName == "TIME" {
 		if tokenTextEqual(p.tok, "WITH") || tokenTextEqual(p.tok, "WITHOUT") {
 			p.advance()
 			if !tokenTextEqual(p.tok, "TIME") {
-				return 0, p.errHere("expected TIME ZONE")
+				return 0, SerialNone, p.errHere("expected TIME ZONE")
 			}
 			p.advance()
 			if !tokenTextEqual(p.tok, "ZONE") {
-				return 0, p.errHere("expected ZONE after TIME")
+				return 0, SerialNone, p.errHere("expected ZONE after TIME")
 			}
 			p.advance()
 		}
@@ -790,11 +886,12 @@ func (p *Parser) parseColumnType() (JSONType, error) {
 	if p.tok.kind == tokLBracket {
 		p.advance()
 		if err := p.expect(tokRBracket, "']' for array type"); err != nil {
-			return 0, err
+			return 0, SerialNone, err
 		}
 		kind = TypeArray
+		serial = SerialNone
 	}
-	return kind, nil
+	return kind, serial, nil
 }
 
 // jsonTypeOf maps a folded type spelling to its JSON type set.
@@ -807,7 +904,7 @@ func jsonTypeOf(name []byte) (JSONType, bool) {
 	case "NUMBER", "FLOAT", "FLOAT4", "FLOAT8", "REAL", "DOUBLE", "DECIMAL", "NUMERIC", "MONEY":
 		return TypeNumber, true
 	case "INTEGER", "INT", "INT2", "INT4", "INT8", "BIGINT", "SMALLINT", "TINYINT",
-		"SERIAL", "SMALLSERIAL", "BIGSERIAL", "OID":
+		"SERIAL", "SMALLSERIAL", "BIGSERIAL", "SERIAL2", "SERIAL4", "SERIAL8", "OID":
 		return TypeInteger, true
 	case "STRING", "TEXT", "VARCHAR", "CLOB", "CHAR", "CHARACTER", "NCHAR", "BPCHAR", "NAME",
 		"DATE", "TIME", "DATETIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL",
@@ -837,8 +934,6 @@ func refusedTypeReason(name []byte) (string, bool) {
 		return "JSON has no byte string; store it as STRING with an encoding your application chooses", true
 	case "ENUM":
 		return "the schema constrains types rather than value sets, so an enumeration would be accepted and never checked", true
-	case "SERIAL", "SMALLSERIAL", "BIGSERIAL", "SERIAL2", "SERIAL4", "SERIAL8":
-		return "SERIAL creates a sequence-backed generated default, but this engine has neither sequences nor generated values; use INTEGER and supply the value explicitly", true
 	case "MONEY":
 		return "MONEY has fixed fractional and locale-dependent currency semantics this engine cannot enforce; use NUMBER for an exact JSON decimal", true
 	case "CHAR", "CHARACTER", "NCHAR":
