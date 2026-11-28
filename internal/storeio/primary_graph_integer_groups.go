@@ -7,10 +7,11 @@ import "fmt"
 // against compact stripe templates; no document or JSON segment is rebuilt.
 // The filter is single-consumer and reusable across snapshots.
 type UnifiedIntegerGroupFilter struct {
-	group  UnifiedHoleResolver
-	sum    UnifiedHoleResolver
-	hasSum bool
-	batch  IntegerGroupBatch
+	group      UnifiedHoleResolver
+	sum        UnifiedHoleResolver
+	hasSum     bool
+	batch      IntegerGroupBatch
+	keyScratch [1024]byte
 }
 
 // UnifiedIntegerGroupProgress reports rows visited by a successful strict
@@ -36,6 +37,24 @@ func NewUnifiedIntegerGroupFilter(
 		f.hasSum = true
 	}
 	return f, nil
+}
+
+// SupportsIntegerGroups reports whether the cursor's current leaf passes
+// strict integer-group admission without requiring caller-owned shape scratch.
+func (c *PrimaryGraphCursor) SupportsIntegerGroups(
+	f *UnifiedIntegerGroupFilter,
+) bool {
+	if c == nil || f == nil {
+		return false
+	}
+	if c.done {
+		return true
+	}
+	var sumResolver *UnifiedHoleResolver
+	if f.hasSum {
+		sumResolver = &f.sum
+	}
+	return c.leaf.SupportsIntegerGroups(&f.group, sumResolver, f.keyScratch[:])
 }
 
 // FilterIntegerGroups scans every leaf in physical order. A false return is

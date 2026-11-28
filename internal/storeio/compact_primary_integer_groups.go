@@ -1118,6 +1118,82 @@ type IntegerGroupBatch struct {
 	Sums   [32]int64
 }
 
+// SupportsIntegerGroups reports whether this compact stripe's templates and
+// streams pass strict integer-group admission without requiring caller-owned
+// shape workspace buffers. keyScratch is caller-owned scratch for escaped
+// template key decoding (pass a >=1024-byte slice to avoid heap allocation).
+func (v *CompactPrimaryStripeView) SupportsIntegerGroups(
+	groupResolver, sumResolver *UnifiedHoleResolver,
+	keyScratch []byte,
+) bool {
+	if v == nil || groupResolver == nil || len(v.overflow) != 0 || v.shapeCount < 0 {
+		return false
+	}
+	if v.shapeCount == 0 {
+		return v.rows == 0
+	}
+	if v.shapeCount == 1 {
+		entry, ok := v.shapeEntry(0)
+		if !ok || entry.rows != v.rows {
+			return false
+		}
+		groupHole := resolveCompactProjectionTemplate(groupResolver, entry.template, keyScratch)
+		if groupHole < 0 || groupHole >= entry.template.holes {
+			return false
+		}
+		groupStream, ok := compactIntegerStreamRawAt(entry, groupHole, v.rows)
+		if !ok {
+			return false
+		}
+		var groupDec integerStreamFastDecoder
+		if !prepareIntegerStreamFast(groupStream, &groupDec) {
+			return false
+		}
+		if sumResolver != nil {
+			sumHole := resolveCompactProjectionTemplate(sumResolver, entry.template, keyScratch)
+			if sumHole < 0 || sumHole >= entry.template.holes {
+				return false
+			}
+			if sumHole != groupHole {
+				sumStream, ok := compactIntegerStreamRawAt(entry, sumHole, v.rows)
+				if !ok {
+					return false
+				}
+				var sumDec integerStreamFastDecoder
+				if !prepareIntegerStreamFast(sumStream, &sumDec) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	for shape := 0; shape < v.shapeCount; shape++ {
+		entry, ok := v.shapeEntry(shape)
+		if !ok || entry.rows < 0 {
+			return false
+		}
+		groupHole := resolveCompactProjectionTemplate(groupResolver, entry.template, keyScratch)
+		if groupHole < 0 || groupHole >= entry.template.holes {
+			return false
+		}
+		if _, ok := compactIntegerStreamAt(entry, groupHole, v.rows); !ok {
+			return false
+		}
+		if sumResolver != nil {
+			sumHole := resolveCompactProjectionTemplate(sumResolver, entry.template, keyScratch)
+			if sumHole < 0 || sumHole >= entry.template.holes {
+				return false
+			}
+			if sumHole != groupHole {
+				if _, ok := compactIntegerStreamAt(entry, sumHole, v.rows); !ok {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
 func (v *CompactPrimaryStripeView) VisitResolvedIntegerGroups(
 	groupResolver, sumResolver *UnifiedHoleResolver,
 	shapeSeen []int, shapeWork []IntegerGroupShapeWorkspace,
@@ -1269,6 +1345,7 @@ func (v *CompactPrimaryStripeView) visitResolvedIntegerGroups(
 		shapeSeen[0] = v.rows
 		return true, nil
 	}
+	defer clear(shapeWork[:v.shapeCount])
 	for shape := 0; shape < v.shapeCount; shape++ {
 		entry, ok := v.shapeEntry(shape)
 		if !ok || entry.rows < 0 {
