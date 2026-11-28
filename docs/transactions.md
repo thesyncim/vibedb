@@ -34,9 +34,11 @@ Serializable) and savepoints, see [SQL API](api/sql.md#transactions-and-savepoin
 - **Locking:** Commit locks all read/written collections in name order.
   Single-collection transactions commit in parallel across different collections;
   multi-collection transactions take a database-wide commit lock.
-- **Profile support:** `Durable` supports crash-atomic multi-collection commits;
-  `Memory` is visibility-atomic; `Buffered` rejects multi-collection writes with
-  `ErrTxUnsupportedLane`.
+- **Profile support:** `Durable` supports crash-atomic multi-collection commits
+  (single-collection `Update` provides logical failure-atomic publication, while
+  topology preparation may publish a content-equivalent topology generation so
+  `Generation may advance` on failure); `Memory` is visibility-atomic;
+  `Buffered` rejects multi-collection writes with `ErrTxUnsupportedLane`.
 - **Durable multi-collection commit (`K ≥ 2` dirty collections):**
 
 ```mermaid

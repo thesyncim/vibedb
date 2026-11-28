@@ -162,14 +162,14 @@ func TestExtAggInt64OverflowPromotesToExactBigRat(t *testing.T) {
 		t.Fatalf("neg SUM got %s, want -18446744073709551616", got)
 	}
 	if got, ok := rows[0][3].Int64(); !ok || got != math.MinInt64 {
-		t.Fatalf("neg AVG got (%d, %v), want (%d, true)", got, ok, math.MinInt64)
+		t.Fatalf("neg AVG got (%d, %v), want (%d, true)", got, ok, int64(math.MinInt64))
 	}
 	// pos: MaxInt64 * 2 = 18446744073709551614, avg = MaxInt64
 	if got := string(rows[1][2].JSON()); got != "18446744073709551614" {
 		t.Fatalf("pos SUM got %s, want 18446744073709551614", got)
 	}
 	if got, ok := rows[1][3].Int64(); !ok || got != math.MaxInt64 {
-		t.Fatalf("pos AVG got (%d, %v), want (%d, true)", got, ok, math.MaxInt64)
+		t.Fatalf("pos AVG got (%d, %v), want (%d, true)", got, ok, int64(math.MaxInt64))
 	}
 }
 

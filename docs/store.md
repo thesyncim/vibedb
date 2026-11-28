@@ -40,8 +40,9 @@ file descriptors, page geometry, `OpaqueValues`, or I/O backends.
   `DurabilitySync`, `CheckpointPowerSafe`.
 - `OpaqueValues: true` stores arbitrary nonempty bytes without JSON parsing,
   schemas, or indexes.
-- **Batches:** `Collection.Update` is logically failure-atomic (rows + exact
-  indexes together). Topology preparation may advance `Generation` even if a
+- **Batches:** `Collection.Update` provides logical failure-atomic publication
+  (rows + exact indexes together). Topology preparation may publish a
+  content-equivalent topology generation so `Generation may advance` even if a
   later step fails.
 - **Snapshots & open cost:** Close snapshots promptly (`SnapshotInto` reuses
   storage) or retired extents will block writers. Opening an exact-indexed
