@@ -2,10 +2,11 @@ package pgwire
 
 import (
 	_ "embed"
-	"encoding/json"
 	"strconv"
 	"strings"
 
+	"github.com/thesyncim/vibejson"
+	"github.com/thesyncim/vibejson/x/byteview"
 	"github.com/thesyncim/vibedb/query"
 	sqlast "github.com/thesyncim/vibedb/sql"
 	sqldriver "github.com/thesyncim/vibedb/sql/driver"
@@ -47,21 +48,21 @@ type discoveryQuery struct {
 
 var discoveryShapes = func() []discoveryShape {
 	var shapes []discoveryShape
-	if err := json.Unmarshal([]byte(golandQueriesJSON), &shapes); err != nil {
+	if err := vibejson.Unmarshal(byteview.Bytes(golandQueriesJSON), &shapes); err != nil {
 		panic(err)
 	}
 	var jdbc []discoveryShape
-	if err := json.Unmarshal([]byte(jdbcQueriesJSON), &jdbc); err != nil {
+	if err := vibejson.Unmarshal(byteview.Bytes(jdbcQueriesJSON), &jdbc); err != nil {
 		panic(err)
 	}
 	shapes = append(shapes, jdbc...)
 	var incremental []discoveryShape
-	if err := json.Unmarshal([]byte(golandIncrementalQueriesJSON), &incremental); err != nil {
+	if err := vibejson.Unmarshal(byteview.Bytes(golandIncrementalQueriesJSON), &incremental); err != nil {
 		panic(err)
 	}
 	shapes = append(shapes, incremental...)
 	var aux []discoveryShape
-	if err := json.Unmarshal([]byte(golandAuxQueriesJSON), &aux); err != nil {
+	if err := vibejson.Unmarshal(byteview.Bytes(golandAuxQueriesJSON), &aux); err != nil {
 		panic(err)
 	}
 	shapes = append(shapes, aux...)
