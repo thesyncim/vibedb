@@ -39,6 +39,40 @@ func NewIntegerGroupFilter(groupPath, sumPath string) (*IntegerGroupFilter, erro
 	return &IntegerGroupFilter{inner: inner}, nil
 }
 
+// SupportsIntegerGroups checks whether the snapshot's first leaf passes strict
+// integer-group admission without allocating or requiring shape workspace.
+// Callers use this to avoid speculatively allocating per-shape scratch when
+// grouping on non-integer columns.
+func (s *Snapshot) SupportsIntegerGroups(f *IntegerGroupFilter) (bool, error) {
+	if s == nil || s.collection == nil || s.state == nil {
+		return false, ErrClosed
+	}
+	if f == nil || f.inner == nil {
+		return false, fmt.Errorf("vibedb: nil unified integer group filter")
+	}
+	state := s.state
+	catalogBounds := storeio.GlobalTabletCatalogBounds{
+		StoreID:                state.root.StoreID,
+		SelectedRootGeneration: state.root.Generation,
+		FileEnd:                state.fileEnd,
+		NextLogicalID:          state.root.NextLogicalID,
+	}
+	leafBounds := storeio.CommonPrimaryLeafBounds{
+		FileEnd:           state.fileEnd,
+		NextLogicalID:     state.root.NextLogicalID,
+		AllocationQuantum: state.root.PageSize,
+	}
+	var cursor storeio.PrimaryGraphCursor
+	if err := storeio.InitPrimaryGraphCursor(
+		&cursor, s.collection.cache, state.root.PrimaryRoot,
+		catalogBounds, leafBounds, nil, nil,
+	); err != nil {
+		return false, err
+	}
+	defer cursor.Close()
+	return cursor.SupportsIntegerGroups(f.inner), nil
+}
+
 // FilterIntegerGroups scans the snapshot selected by this durable Snapshot.
 // The callback is invoked in snapshot physical order with the row ordinal,
 // group key, and optional SUM value. The snapshot's captured state root and
@@ -99,10 +133,10 @@ func (s *Snapshot) FilterIntegerGroupsWithScratch(
 	}
 	shapeWork = shapeWork[:storeio.CompactPrimaryStripeMaxRows]
 	defer func() {
+		// visitResolvedIntegerGroups clears shapeWork[:v.shapeCount] on every
+		// multi-shape leaf and never writes shapeWork on single-shape leaves,
+		// so no page-backed stream views escape without an 884 KiB full clear.
 		clear(shapeSeen)
-		// compactStreamView retains page-backed slices. Zeroing the whole
-		// reusable array is required even when the caller keeps its capacity.
-		clear(shapeWork)
 	}()
 	var progress storeio.UnifiedIntegerGroupProgress
 	supported, err := cursor.FilterIntegerGroups(
@@ -165,8 +199,9 @@ func (s *Snapshot) FilterIntegerGroupsBatchWithScratch(
 	}
 	shapeWork = shapeWork[:storeio.CompactPrimaryStripeMaxRows]
 	defer func() {
+		// visitResolvedIntegerGroups clears shapeWork[:v.shapeCount] on every
+		// multi-shape leaf and never writes shapeWork on single-shape leaves.
 		clear(shapeSeen)
-		clear(shapeWork)
 	}()
 	var progress storeio.UnifiedIntegerGroupProgress
 	supported, err := cursor.FilterIntegerGroupsBatch(

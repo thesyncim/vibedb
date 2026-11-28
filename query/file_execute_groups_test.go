@@ -3,6 +3,7 @@ package query
 import (
 	"errors"
 	"fmt"
+	"os"
 	"testing"
 	"unsafe"
 
@@ -386,5 +387,199 @@ func TestIntegerGroupWorkspaceCapacityAccountingAndReset(t *testing.T) {
 	}
 	if workspace.groups[0].count != 1 || workspace.groups[0].sum != 2 {
 		t.Fatal("old aggregate survived reset")
+	}
+}
+
+func TestIntegerGroupWorkspaceGenerationWraparoundAndWarmReuse(t *testing.T) {
+	var workspace integerGroupWorkspace
+	defer workspace.release()
+	const bound = 4 << 20
+	if !workspace.prepare(2, bound) {
+		t.Fatal("prepare failed")
+	}
+	// Force slotGen to wrap around on the next reset.
+	workspace.slotGen = ^uint32(0)
+	if err := workspace.add(42, 10, 0, true, bound); err != nil {
+		t.Fatal(err)
+	}
+	if !workspace.prepare(2, bound) {
+		t.Fatal("prepare across wraparound failed")
+	}
+	if workspace.slotGen != 1 {
+		t.Fatalf("slotGen=%d after wraparound, want 1", workspace.slotGen)
+	}
+	if err := workspace.add(42, 5, 1, true, bound); err != nil {
+		t.Fatal(err)
+	}
+	if len(workspace.groups) != 1 || workspace.groups[0].count != 1 || workspace.groups[0].sum != 5 {
+		t.Fatalf("post-wraparound group=%+v, want count=1 sum=5", workspace.groups)
+	}
+}
+
+func TestFileIntegerGroupsStringKeySkipsSpeculativeWorkspaceAllocation(t *testing.T) {
+	const rows = 256
+	snapshot, _ := filePackedIntegerExtremaSnapshot(t, rows,
+		durable.Options{Collection: store.Options{ChunkDocuments: 64}},
+		func(row int) []byte {
+			return fmt.Appendf(nil, `{"k":"grp-%02d","v":%d}`, row%8, row)
+		},
+	)
+	q := Select(Path("k"), Count()).GroupBy("k")
+	var execution Exec
+	execution.Options.Workers = 1
+	defer execution.Release()
+	for range 3 {
+		if err := q.RunInto(&execution, FromFile(snapshot)); err != nil {
+			t.Fatal(err)
+		}
+		if execution.Result.RowCount != 8 {
+			t.Fatalf("got %d rows, want 8", execution.Result.RowCount)
+		}
+		if execution.Stats.GroupedIntegerRows != 0 {
+			t.Fatalf("string key used integer lane: %+v", execution.Stats)
+		}
+		if execution.file.integerGroups.isPrepared() ||
+			cap(execution.file.integerGroups.shapeWork) != 0 ||
+			cap(execution.file.integerGroups.shapeSeen) != 0 {
+			t.Fatal("string-key GROUP BY speculatively allocated integerGroupWorkspace")
+		}
+	}
+}
+
+func TestFileIntegerGroupsExecSwitchBetweenIntegerAndString(t *testing.T) {
+	const rows = 256
+	snapshot, _ := filePackedIntegerExtremaSnapshot(t, rows,
+		durable.Options{Collection: store.Options{ChunkDocuments: 64}},
+		func(row int) []byte {
+			return fmt.Appendf(nil, `{"n":%d,"s":"grp-%02d","v":%d}`, row%8, row%8, row)
+		},
+	)
+	intQ := Select(Path("n"), Count(), Sum("v")).GroupBy("n")
+	strQ := Select(Path("s"), Count()).GroupBy("s")
+
+	var execution Exec
+	execution.Options.Workers = 1
+	defer execution.Release()
+
+	// Run integer GROUP BY first (populates integerGroupWorkspace).
+	if err := intQ.RunInto(&execution, FromFile(snapshot)); err != nil {
+		t.Fatal(err)
+	}
+	if execution.Stats.GroupedIntegerRows != rows || !execution.file.integerGroups.isPrepared() {
+		t.Fatalf("expected integer lane to populate workspace: stats=%+v", execution.Stats)
+	}
+
+	// Switch to string GROUP BY on the same Exec: must release integer workspace
+	// so it does not linger uncounted while generic executor runs.
+	if err := strQ.RunInto(&execution, FromFile(snapshot)); err != nil {
+		t.Fatal(err)
+	}
+	if execution.Stats.GroupedIntegerRows != 0 || execution.Result.RowCount != 8 {
+		t.Fatalf("string switch stats=%+v rows=%d", execution.Stats, execution.Result.RowCount)
+	}
+	if execution.file.integerGroups.isPrepared() {
+		t.Fatal("integer workspace was not released on fallback to string GROUP BY")
+	}
+
+	// Switch back to integer GROUP BY: must cleanly re-prepare and succeed.
+	if err := intQ.RunInto(&execution, FromFile(snapshot)); err != nil {
+		t.Fatal(err)
+	}
+	if execution.Stats.GroupedIntegerRows != rows || execution.Result.RowCount != 8 {
+		t.Fatalf("integer re-entry stats=%+v rows=%d", execution.Stats, execution.Result.RowCount)
+	}
+}
+
+func TestFileIntegerGroupsSupportsZeroAllocsEmptyAndMixedLeaves(t *testing.T) {
+	// 1. Empty snapshot: SupportsIntegerGroups must return true, nil with 0 allocs.
+	emptyFile, err := os.CreateTemp(t.TempDir(), "empty-*.vdb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = emptyFile.Close() })
+	emptyOpts := durable.Options{Collection: store.Options{ChunkDocuments: 64}}
+	emptySource := &store.Collection{}
+	if _, err := emptySource.Put("seed", []byte(`{"k":1,"v":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := durable.CreateFromPrimary(emptySource, emptyFile, emptyOpts); err != nil {
+		t.Fatal(err)
+	}
+	emptyStore, err := durable.Open(emptyFile, emptyOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = emptyStore.Close() })
+	if deleted, err := emptyStore.Delete([]byte("seed")); err != nil || !deleted {
+		t.Fatalf("delete seed=(%v, %v)", deleted, err)
+	}
+	emptySnap, err := emptyStore.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = emptySnap.Close() })
+	filter, err := durable.NewIntegerGroupFilter("/k", "/v")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := emptySnap.SupportsIntegerGroups(filter)
+	if err != nil || !ok {
+		t.Fatalf("empty snapshot SupportsIntegerGroups=(%v, %v), want (true, nil)", ok, err)
+	}
+
+	// 2. String-key snapshot: SupportsIntegerGroups must return false, nil with 0 allocs.
+	strSnap, _ := filePackedIntegerExtremaSnapshot(t, 128,
+		durable.Options{Collection: store.Options{ChunkDocuments: 64}},
+		func(row int) []byte {
+			return fmt.Appendf(nil, `{"k":"s-%02d","v":%d}`, row%8, row)
+		},
+	)
+	ok, err = strSnap.SupportsIntegerGroups(filter)
+	if err != nil || ok {
+		t.Fatalf("string snapshot SupportsIntegerGroups=(%v, %v), want (false, nil)", ok, err)
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		sup, probeErr := strSnap.SupportsIntegerGroups(filter)
+		if probeErr != nil || sup {
+			t.Fatalf("probe=(%v, %v), want (false, nil)", sup, probeErr)
+		}
+	}); allocs != 0 {
+		t.Fatalf("SupportsIntegerGroups allocated %v times/op, want 0", allocs)
+	}
+
+	// 3. Multi-leaf mixed-type snapshot: leaf 0 is integer, later leaf is string.
+	// Reusing the same Exec must repeatedly decline cleanly and match the oracle.
+	const mixedRows = 2 * storeio.CompactPrimaryStripeMaxRows
+	mixedSnap, mixedHeap := filePackedIntegerExtremaSnapshot(t, mixedRows,
+		durable.Options{Collection: store.Options{ChunkDocuments: 64}},
+		func(row int) []byte {
+			if row < storeio.CompactPrimaryStripeMaxRows {
+				return fmt.Appendf(nil, `{"k":%d,"v":1}`, row%4)
+			}
+			return fmt.Appendf(nil, `{"k":"str-%d","v":1}`, row%4)
+		},
+	)
+	q := Select(Path("k"), Count(), Sum("v")).GroupBy("k")
+	var oracle Exec
+	oracle.Options.Workers = 1
+	if err := q.RunInto(&oracle, FromSnapshot(mixedHeap)); err != nil {
+		t.Fatalf("oracle: %v", err)
+	}
+	var exec Exec
+	exec.Options.Workers = 1
+	defer exec.Release()
+	for run := range 3 {
+		if err := q.RunInto(&exec, FromFile(mixedSnap)); err != nil {
+			t.Fatalf("run %d: %v", run, err)
+		}
+		if exec.Stats.GroupedIntegerRows != 0 {
+			t.Fatalf("run %d: mixed-type snapshot used integer lane: %+v", run, exec.Stats)
+		}
+		if exec.file.integerGroups.isPrepared() {
+			t.Fatalf("run %d: integer workspace not released after leaf-1 decline", run)
+		}
+		if exec.Result.RowCount != oracle.Result.RowCount {
+			t.Fatalf("run %d: row count=%d, want %d", run, exec.Result.RowCount, oracle.Result.RowCount)
+		}
 	}
 }

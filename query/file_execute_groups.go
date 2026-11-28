@@ -93,6 +93,7 @@ func (p *plan) integerGroupsPlan() (integerGroupsPlan, bool) {
 type integerGroupSlot struct {
 	key   int64
 	group int32
+	gen   uint32
 }
 
 type integerGroupValue struct {
@@ -115,6 +116,14 @@ type integerGroupWorkspace struct {
 	shapeSeen []int
 	shapeWork []storeio.IntegerGroupShapeWorkspace
 	columns   int
+	slotGen   uint32
+}
+
+func (w *integerGroupWorkspace) isPrepared() bool {
+	return w != nil &&
+		cap(w.shapeSeen) >= storeio.CompactPrimaryStripeMaxRows &&
+		cap(w.shapeWork) >= storeio.CompactPrimaryStripeMaxRows &&
+		cap(w.slots) >= 16
 }
 
 func (w *integerGroupWorkspace) release() {
@@ -129,15 +138,17 @@ func (w *integerGroupWorkspace) release() {
 	w.shapeSeen = nil
 	w.shapeWork = nil
 	w.columns = 0
+	w.slotGen = 0
 }
 
 func (w *integerGroupWorkspace) reset() {
 	if w == nil {
 		return
 	}
-	clear(w.slots)
-	for i := range w.slots {
-		w.slots[i].group = -1
+	w.slotGen++
+	if w.slotGen == 0 {
+		clear(w.slots)
+		w.slotGen = 1
 	}
 	w.groups = w.groups[:0]
 	clear(w.file)
@@ -244,18 +255,19 @@ func (w *integerGroupWorkspace) ensureCapacity(
 	if !ok || resident > memoryBytes {
 		return errIntegerGroupsDeclined
 	}
+	if w.slotGen == 0 {
+		w.slotGen = 1
+	}
 	if slots != cap(w.slots) {
 		oldGroups := w.groups
 		w.slots = make([]integerGroupSlot, slots)
-		for i := range w.slots {
-			w.slots[i].group = -1
-		}
+		gen := w.slotGen
 		for id := range oldGroups {
 			at := int(integerGroupHash(oldGroups[id].key) & uint64(slots-1))
-			for w.slots[at].group >= 0 {
+			for w.slots[at].gen == gen {
 				at = (at + 1) & (slots - 1)
 			}
-			w.slots[at] = integerGroupSlot{key: oldGroups[id].key, group: int32(id)}
+			w.slots[at] = integerGroupSlot{key: oldGroups[id].key, group: int32(id), gen: gen}
 		}
 	}
 	if groups > cap(w.groups) {
@@ -335,6 +347,7 @@ func (w *integerGroupWorkspace) addBatch(
 	slots := w.slots
 	mask := uint64(len(slots) - 1)
 	groups := w.groups
+	gen := w.slotGen
 	for i, key := range keys {
 		row := startRow + uint64(i)
 		if len(groups)*10+10 > cap(slots)*7 {
@@ -345,11 +358,12 @@ func (w *integerGroupWorkspace) addBatch(
 			slots = w.slots
 			mask = uint64(len(slots) - 1)
 			groups = w.groups
+			gen = w.slotGen
 		}
 		at := int(integerGroupHash(key) & mask)
 		for {
 			slot := &slots[at]
-			if slot.group < 0 {
+			if slot.gen != gen {
 				if len(groups) >= integerGroupMaxInt() || len(groups) > int(1<<31-1) {
 					w.groups = groups
 					return errIntegerGroupsDeclined
@@ -358,7 +372,7 @@ func (w *integerGroupWorkspace) addBatch(
 				groups = append(groups, integerGroupValue{
 					key: key, first: row,
 				})
-				slot.key, slot.group = key, id
+				slot.key, slot.group, slot.gen = key, id, gen
 			}
 			if slot.key == key {
 				g := &groups[slot.group]
@@ -485,12 +499,6 @@ func (p *plan) runDirectFileIntegerGroups(
 		return directFileIntegerGroupStats{}, true, store.ErrTooLarge
 	}
 	workspace := &e.file.integerGroups
-	if !workspace.prepare(len(p.columns), memoryBytes) {
-		// A declined native attempt must not leave its caller-owned scratch
-		// counted nowhere while the generic executor starts its own budget.
-		workspace.release()
-		return directFileIntegerGroupStats{}, false, nil
-	}
 	groupPath := shape.group.indexPath()
 	sumPath := ""
 	if shape.hasSum {
@@ -500,6 +508,21 @@ func (p *plan) runDirectFileIntegerGroups(
 	if err != nil {
 		workspace.release()
 		return directFileIntegerGroupStats{}, true, err
+	}
+	if !workspace.isPrepared() {
+		supported, err := snapshot.SupportsIntegerGroups(filter)
+		if err != nil {
+			return directFileIntegerGroupStats{}, true, err
+		}
+		if !supported {
+			return directFileIntegerGroupStats{}, false, nil
+		}
+	}
+	if !workspace.prepare(len(p.columns), memoryBytes) {
+		// A declined native attempt must not leave its caller-owned scratch
+		// counted nowhere while the generic executor starts its own budget.
+		workspace.release()
+		return directFileIntegerGroupStats{}, false, nil
 	}
 	var scanErr error
 	filtered, err := snapshot.FilterIntegerGroupsBatchWithScratch(

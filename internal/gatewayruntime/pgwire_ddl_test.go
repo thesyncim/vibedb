@@ -77,3 +77,38 @@ func TestGatewayDevTableRegistrationHonorsCancellation(t *testing.T) {
 		t.Fatalf("canceled registration calls=%d err=%v", calls, err)
 	}
 }
+
+func TestOpenGatewayDDLProvisionMarkerDetection(t *testing.T) {
+	// Malformed payloads carrying bundle marker fields must return the bundle
+	// validation error rather than retrying through the legacy catalog decoder.
+	for _, raw := range []string{
+		`{"format":0}`,
+		`{"format":1}`,
+		`{"catalog":"{}"}`,
+		`{"split_source":"{}"}`,
+		`{"format":99,"catalog":"{}","split_source":"{}"}`,
+	} {
+		_, _, err := openGatewayDDLProvision([]byte(raw))
+		if !errors.Is(err, gateway.ErrInvalidTableProvisionBundle) {
+			t.Fatalf("openGatewayDDLProvision(%s) err=%v, want ErrInvalidTableProvisionBundle", raw, err)
+		}
+	}
+	// Payloads without valid bundle marker fields (including explicit nulls,
+	// unrelated fields, type-mismatched markers, or invalid JSON) fall through
+	// to the legacy catalog decoder and return its error.
+	for _, raw := range []string{
+		`{"format":null,"catalog":null,"split_source":null}`,
+		`{"unrelated":1}`,
+		`{"format":"bad"}`,
+		`{"catalog":123}`,
+		`{not-json`,
+	} {
+		_, _, err := openGatewayDDLProvision([]byte(raw))
+		if err == nil {
+			t.Fatalf("openGatewayDDLProvision(%s) unexpectedly succeeded", raw)
+		}
+		if errors.Is(err, gateway.ErrInvalidTableProvisionBundle) {
+			t.Fatalf("openGatewayDDLProvision(%s) err=%v, should fall through to legacy decoder", raw, err)
+		}
+	}
+}

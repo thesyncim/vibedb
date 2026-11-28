@@ -2,7 +2,6 @@ package gatewayruntime
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thesyncim/vibejson"
 	"github.com/thesyncim/vibedb/gateway"
 	"github.com/thesyncim/vibedb/internal/raftservice"
 	"github.com/thesyncim/vibedb/internal/serviceauthz"
@@ -164,7 +164,7 @@ func openGatewayDDLProvision(raw []byte) (*gateway.Snapshot, *gatewaySplitSource
 		Catalog     *string `json:"catalog"`
 		SplitSource *string `json:"split_source"`
 	}
-	if json.Unmarshal(raw, &marker) == nil &&
+	if vibejson.Unmarshal(raw, &marker) == nil &&
 		(marker.Format != nil || marker.Catalog != nil || marker.SplitSource != nil) {
 		return nil, nil, bundleErr
 	}
